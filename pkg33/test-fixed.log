@@ -1,0 +1,99 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+== Versions ==
+C:\Program Files\Git\cmd\git.exe
+C:\Program Files\Git\mingw64\bin\git.exe
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+C:\Program Files\Git\usr\bin\link.exe
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\link.exe
+C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\rc.exe
+%USERPROFILE%\tools\zig-x86_64-windows-0.15.2\zig.exe
+git version 2.55.0.windows.3
+0.15.2
+Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64
+== WSL ==
+skipped (set DEV_WINDOWS_CHECK_WSL=1 to probe WSL)
+test
++- run test ghostty-test stderr
+[pty] (warn): conpty.dll is not next to noctty.exe; using the in-box conhost, which re-renders output, answers DA/DSR/DECRQM itself, drops OSC 4/10/11/12 and XTGETTCAP replies, and may strip Kitty graphics (APC) and Sixel (DCS)
+
+Build Summary: 43/43 steps succeeded; 94/95 tests passed; 1 skipped
+test success
++- run test ghostty-test 94 passed 1 skipped 1s MaxRSS:66M
+   +- compile test ghostty-test Debug native-native.win10_rs5-msvc success 38s MaxRSS:3G
+      +- WriteFile help_strings.zig success
+      |  +- run exe helpgen success 50ms MaxRSS:7M
+      |     +- compile exe helpgen Debug native success 2s MaxRSS:328M
+      |        +- options cached
+      +- WriteFile freetype-zig.h cached
+      +- compile lib freetype Debug native-native.win10_rs5-msvc cached 61ms MaxRSS:64M
+      |  +- WriteFile  cached
+      |  +- compile lib z Debug native-native.win10_rs5-msvc cached 2s MaxRSS:64M
+      |  +- WriteFile pnglibconf.h cached
+      |  +- compile lib png Debug native-native.win10_rs5-msvc cached 44ms MaxRSS:64M
+      |  |  +- WriteFile  (reused)
+      |  |  +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      |  |  +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      |  +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      |  +- compile lib png Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- WriteFile  cached
+      +- compile lib harfbuzz Debug native-native.win10_rs5-msvc cached 59ms MaxRSS:64M
+      |  +- WriteFile freetype-zig.h (reused)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      +- WriteFile pnglibconf.h (reused)
+      +- compile lib png Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- WriteFile  (reused)
+      +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      +- WriteFile  cached
+      +- compile lib oniguruma Debug native-native.win10_rs5-msvc cached 2s MaxRSS:64M
+      |  +- configure cmake header dependency to config.h cached
+      +- WriteFile  cached
+      +- compile lib sentry Debug native-native.win10_rs5-msvc cached 44ms MaxRSS:64M
+      |  +- WriteFile  cached
+      |  +- compile lib breakpad Debug native-native.win10_rs5-msvc cached 2s MaxRSS:64M
+      |  +- compile lib breakpad Debug native-native.win10_rs5-msvc (reused)
+      +- WriteFile  cached
+      +- compile lib simdutf Debug native-native.win10_rs5-msvc cached 61ms MaxRSS:64M
+      +- WriteFile hwy cached
+      +- compile lib highway Debug native-native.win10_rs5-msvc cached 61ms MaxRSS:64M
+      +- WriteFile  cached
+      +- compile lib utfcpp Debug native-native.win10_rs5-msvc cached 60ms MaxRSS:64M
+      +- WriteFile  cached
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc cached 58ms MaxRSS:64M
+      |  +- WriteFile freetype-zig.h (reused)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      +- compile lib harfbuzz Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib png Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib oniguruma Debug native-native.win10_rs5-msvc (+1 more reused dependencies)
+      +- compile lib sentry Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib simdutf Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib highway Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib utfcpp Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- options cached
+      +- options cached
+      +- translate-c cached 61ms MaxRSS:64M
+      +- WriteFile  (reused)
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- WriteFile help_strings.zig (+1 more reused dependencies)
+      +- options cached
+      |  +- compile exe version-fixture Debug native-native.win10_rs5-msvc cached 61ms MaxRSS:64M
+      +- options cached
+      +- options cached
+      +- run exe uucode_build_tables (tables.zig) cached
+      |  +- compile exe uucode_build_tables Debug native cached 61ms MaxRSS:64M
+      +- options cached
+      +- run exe uucode_build_tables (tables.zig) cached
+      |  +- compile exe uucode_build_tables Debug native cached 2s MaxRSS:64M
+      |     +- WriteFile build_config2.zig cached
+      +- WriteFile build_config2.zig (reused)
+

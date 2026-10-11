@@ -1,0 +1,56 @@
+{
+  "Limit": "Hidden desktop, portable copies, LOCALAPPDATA/APPDATA redirected. Window not foreground, so unfocused pacing applies equally to every side. GetTickCount64 resolution is about 15.6 ms.",
+  "Summary": null,
+  "Gpu": [
+    "Meta Virtual Monitor 15.52.32.370",
+    "SudoMaker Virtual Display Adapter 1.10.9.289",
+    "NVIDIA GeForce RTX 5070 Ti 32.0.16.1742",
+    "AMD Radeon(TM) Graphics 32.0.21045.5002"
+  ],
+  "Results": [],
+  "Layouts": [
+    {
+      "Case": "default",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,60 1258x729],Static[24,63 1234x36] scale=1.5 contentTop=60 band=63..99 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "tab-bar-never",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,0 1258x744],Static[24,3 1234x36] scale=1.5 contentTop=0 band=3..39 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "decoration-none",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,48 1258x741],Static[24,51 1234x36] scale=1.5 contentTop=48 band=51..87 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "padding-40",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,60 1258x729],Static[24,63 1234x36] scale=1.5 contentTop=60 band=63..99 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "split-right",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,60 1258x729],Static[24,63 1234x36] scale=1.5 contentTop=60 band=63..99 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "split-down",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,60 1258x729],Static[24,63 1234x36] scale=1.5 contentTop=60 band=63..99 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "search-open",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=Static[24,63 1234x36],Static[0,60 1258x60],Edit[12,69 910x42],Button[937,69 45x42],Button[985,69 45x42],Button[1045,69 45x42],Button[1093,69 45x42],Button[1141,69 45x42],Button[1201,69 45x42] scale=1.5 contentTop=60 band=63..99 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    },
+    {
+      "Case": "inspector",
+      "BannerChildVisible": true,
+      "Map": "panes=1 kidsInBand=noctty.win32[0,123 1258x666],Static[24,126 1234x36] scale=1.5 contentTop=123 band=126..162 x=24..1234 sampledPoints=7260 hostPaintReaches=0 columns[]"
+    }
+  ],
+  "RemainingOwnedProcesses": 0,
+  "IdleSeconds": 10,
+  "Banner": []
+}

@@ -1,0 +1,109 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+== Versions ==
+C:\Program Files\Git\cmd\git.exe
+C:\Program Files\Git\mingw64\bin\git.exe
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+C:\Program Files\Git\usr\bin\link.exe
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\link.exe
+C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\rc.exe
+%USERPROFILE%\tools\zig-x86_64-windows-0.15.2\zig.exe
+git version 2.55.0.windows.3
+0.15.2
+Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64
+== WSL ==
+skipped (set DEV_WINDOWS_CHECK_WSL=1 to probe WSL)
+test
++- run test ghostty-test 93/95 passed, 1 failed, 1 skipped
+[pty] (warn): conpty.dll is not next to noctty.exe; using the in-box conhost, which re-renders output, answers DA/DSR/DECRQM itself, drops OSC 4/10/11/12 and XTGETTCAP replies, and may strip Kitty graphics (APC) and Sixel (DCS)
+error: 'apprt.win32.App.test.App.init leaves the shell compositor stopped so banners fall back to GDI' failed: %USERPROFILE%\tools\zig-x86_64-windows-0.15.2\lib\std\testing.zig:607:14: 0x7ff603e17ebf in expect (ghostty-test_zcu.obj)
+    if (!ok) return error.TestUnexpectedResult;
+             ^
+%USERPROFILE%\.t3\worktrees\winghostty\wt-pkg33\src\apprt\win32.zig:8814:9: 0x7ff603e186d6 in test.App.init leaves the shell compositor stopped so banners fall back to GDI (ghostty-test_zcu.obj)
+        try std.testing.expect(!app.shell_compositor_driver.isStarted());
+        ^
+error: while executing test 'synthetic.cli.test_0', the following test command failed:
+".\\.zig-cache\\o\\2323ad779d6c4b7802879d698fedc0d1\\ghostty-test.exe" "--cache-dir=.\\.zig-cache" --seed=0xa8d47e17 --listen=-
+
+Build Summary: 41/43 steps succeeded; 1 failed; 93/95 tests passed; 1 skipped; 1 failed
+test transitive failure
++- run test ghostty-test 93/95 passed, 1 failed, 1 skipped
+   +- compile test ghostty-test Debug native-native.win10_rs5-msvc cached 112ms MaxRSS:65M
+      +- WriteFile help_strings.zig cached
+      |  +- run exe helpgen cached
+      |     +- compile exe helpgen Debug native cached 87ms MaxRSS:64M
+      |        +- options cached
+      +- WriteFile freetype-zig.h cached
+      +- compile lib freetype Debug native-native.win10_rs5-msvc cached 48ms MaxRSS:64M
+      |  +- WriteFile  cached
+      |  +- compile lib z Debug native-native.win10_rs5-msvc cached 87ms MaxRSS:64M
+      |  +- WriteFile pnglibconf.h cached
+      |  +- compile lib png Debug native-native.win10_rs5-msvc cached 62ms MaxRSS:64M
+      |  |  +- WriteFile  (reused)
+      |  |  +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      |  |  +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      |  +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      |  +- compile lib png Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- WriteFile  cached
+      +- compile lib harfbuzz Debug native-native.win10_rs5-msvc cached 64ms MaxRSS:64M
+      |  +- WriteFile freetype-zig.h (reused)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      +- WriteFile pnglibconf.h (reused)
+      +- compile lib png Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- WriteFile  (reused)
+      +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      +- WriteFile  cached
+      +- compile lib oniguruma Debug native-native.win10_rs5-msvc cached 62ms MaxRSS:64M
+      |  +- configure cmake header dependency to config.h cached
+      +- WriteFile  cached
+      +- compile lib sentry Debug native-native.win10_rs5-msvc cached 61ms MaxRSS:64M
+      |  +- WriteFile  cached
+      |  +- compile lib breakpad Debug native-native.win10_rs5-msvc cached 88ms MaxRSS:64M
+      |  +- compile lib breakpad Debug native-native.win10_rs5-msvc (reused)
+      +- WriteFile  cached
+      +- compile lib simdutf Debug native-native.win10_rs5-msvc cached 62ms MaxRSS:64M
+      +- WriteFile hwy cached
+      +- compile lib highway Debug native-native.win10_rs5-msvc cached 62ms MaxRSS:64M
+      +- WriteFile  cached
+      +- compile lib utfcpp Debug native-native.win10_rs5-msvc cached 53ms MaxRSS:64M
+      +- WriteFile  cached
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc cached 64ms MaxRSS:64M
+      |  +- WriteFile freetype-zig.h (reused)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      |  +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      +- compile lib freetype Debug native-native.win10_rs5-msvc (+6 more reused dependencies)
+      +- compile lib harfbuzz Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib png Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib z Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib oniguruma Debug native-native.win10_rs5-msvc (+1 more reused dependencies)
+      +- compile lib sentry Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib simdutf Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib highway Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib utfcpp Debug native-native.win10_rs5-msvc (reused)
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- options cached
+      +- options cached
+      +- translate-c cached 88ms MaxRSS:64M
+      +- WriteFile  (reused)
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- compile lib dcimgui Debug native-native.win10_rs5-msvc (+3 more reused dependencies)
+      +- WriteFile help_strings.zig (+1 more reused dependencies)
+      +- options cached
+      |  +- compile exe version-fixture Debug native-native.win10_rs5-msvc cached 88ms MaxRSS:64M
+      +- options cached
+      +- options cached
+      +- run exe uucode_build_tables (tables.zig) cached
+      |  +- compile exe uucode_build_tables Debug native cached 52ms MaxRSS:64M
+      +- options cached
+      +- run exe uucode_build_tables (tables.zig) cached
+      |  +- compile exe uucode_build_tables Debug native cached 62ms MaxRSS:64M
+      |     +- WriteFile build_config2.zig cached
+      +- WriteFile build_config2.zig (reused)
+
+error: the following build command failed with exit code 1:
+.zig-cache\o\5534bfb8ab283f37f48d162209704747\build.exe %USERPROFILE%\tools\zig-x86_64-windows-0.15.2\zig.exe %USERPROFILE%\tools\zig-x86_64-windows-0.15.2\lib %USERPROFILE%\.t3\worktrees\winghostty\wt-pkg33 .zig-cache %USERPROFILE%\AppData\Local\zig --seed 0xa8d47e17 -Zbbf6eb1284d98564 test -Demit-test-exe=true -Dtest-filter=compositor --summary all
