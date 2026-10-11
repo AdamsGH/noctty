@@ -6895,7 +6895,17 @@ const dialog_test = struct {
         const repainted = try Capture.take(hwnd);
         defer repainted.deinit();
         const all: RECT = .{ .left = 0, .top = 0, .right = @intCast(shown.width), .bottom = @intCast(shown.height) };
-        try std.testing.expectEqual(@as(usize, 0), shown.countDifferent(repainted, all, 0, 0));
+        const stale = shown.countDifferent(repainted, all, 0, 0);
+        if (stale != 0) {
+            var box: RECT = .{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = -1, .bottom = -1 };
+            for (shown.pixels, repainted.pixels, 0..) |a, b, index| if (a != b) {
+                const x: i32 = @intCast(index % shown.width);
+                const y: i32 = @intCast(index / shown.width);
+                box = .{ .left = @min(box.left, x), .top = @min(box.top, y), .right = @max(box.right, x + 1), .bottom = @max(box.bottom, y + 1) };
+            };
+            std.debug.print("stale pixels {d} in ({d},{d})-({d},{d}) of a {d}x{d} client\n", .{ stale, box.left, box.top, box.right, box.bottom, shown.width, shown.height });
+        }
+        try std.testing.expectEqual(@as(usize, 0), stale);
     }
 
     /// `child`'s window rect in `parent`'s client coordinates.
@@ -7061,9 +7071,15 @@ const dialog_test = struct {
 
         /// Shrink to the minimum size, where a single column of Appearance
         /// fields no longer fits and the form scrolls.
+        /// The window is kept inside the work area, at its corner: a CI
+        /// runner's screen is 1024x768, and the pixel tests read what the
+        /// window shows, which a part past the screen's edge may not hold.
         fn makeFormScrollable(self: *Fixture) !void {
-            const swp_nomove: UINT = 0x0002;
-            _ = SetWindowPos(self.hwnd(), null, 0, 0, self.settings.px(720), self.settings.px(520), SWP_NOZORDER | SWP_NOACTIVATE | swp_nomove);
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(self.hwnd(), &work);
+            const width = @min(self.settings.px(720), work.right - work.left);
+            const height = @min(self.settings.px(520), work.bottom - work.top);
+            _ = SetWindowPos(self.hwnd(), null, work.left, work.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
             try std.testing.expect(self.settings.content_scroll_max > 0);
         }
     };
