@@ -308,8 +308,14 @@ const Mouse = struct {
 
     /// The point at which the left mouse click happened. This is in screen
     /// coordinates so that scrolling preserves the location.
+    ///
+    /// The pin lives in the PageList of `left_click_screen`, and RIS destroys
+    /// the alternate screen with every pin it tracks, so read it only through
+    /// `activeLeftClickPin` and `leftClickPageList`, which also check the
+    /// screen's generation.
     left_click_pin: ?*terminal.Pin = null,
     left_click_screen: terminal.ScreenSet.Key = .primary,
+    left_click_screen_generation: usize = 0,
 
     /// The starting xpos/ypos of the left click. Note that if scrolling occurs,
     /// these will point to different "cells", but the xpos/ypos will stay
@@ -343,7 +349,57 @@ const Mouse = struct {
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
     link_point: ?terminal.point.Coordinate = null,
+
+    /// Return the PageList that owns the left-click pin, or null if the screen
+    /// has been removed/reinitialized since the pin was tracked.
+    fn leftClickPageList(self: *const Mouse, screens: *const terminal.ScreenSet) ?*terminal.PageList {
+        if (screens.generation(self.left_click_screen) != self.left_click_screen_generation) return null;
+        const screen = screens.get(self.left_click_screen) orelse return null;
+        return &screen.pages;
+    }
+
+    /// Return the left-click pin only if it still belongs to the active screen.
+    fn activeLeftClickPin(self: *const Mouse, screens: *const terminal.ScreenSet) ?*terminal.Pin {
+        const pin = self.left_click_pin orelse return null;
+        if (self.left_click_screen != screens.active_key) return null;
+        _ = self.leftClickPageList(screens) orelse return null;
+        return pin;
+    }
 };
+
+test "Surface: a left-click pin does not outlive its screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Click on the alternate screen.
+    _ = try t.switchScreen(.alternate);
+    const pages = &t.screens.active.pages;
+    const pin = try pages.trackPin(pages.pin(.{ .viewport = .{} }).?);
+    const mouse: Mouse = .{
+        .left_click_pin = pin,
+        .left_click_screen = .alternate,
+        .left_click_screen_generation = t.screens.generation(.alternate),
+    };
+    try testing.expectEqual(pin, mouse.activeLeftClickPin(&t.screens).?);
+
+    // An ordinary switch away and back keeps the pin, so a selection can
+    // continue once its screen is active again.
+    _ = try t.switchScreen(.primary);
+    try testing.expect(mouse.activeLeftClickPin(&t.screens) == null);
+    try testing.expectEqual(pages, mouse.leftClickPageList(&t.screens).?);
+    _ = try t.switchScreen(.alternate);
+    try testing.expectEqual(pin, mouse.activeLeftClickPin(&t.screens).?);
+
+    // RIS destroys the alternate screen and the pin with it. Re-entering the
+    // alternate screen creates a new one under the same key, which must not
+    // resolve the pin, or untrack it from a PageList it never belonged to.
+    t.fullReset();
+    _ = try t.switchScreen(.alternate);
+    try testing.expect(mouse.activeLeftClickPin(&t.screens) == null);
+    try testing.expect(mouse.leftClickPageList(&t.screens) == null);
+}
 
 /// Keyboard state for the surface.
 pub const Keyboard = struct {
@@ -394,7 +450,53 @@ pub const Keyboard = struct {
         }
         return false;
     }
+
+    /// Continue a key sequence with the leader's `set`, queueing `req`, the
+    /// encoded leader key, so it can be replayed if the sequence turns out
+    /// invalid. Takes ownership of `req`: if queueing it fails, it is freed
+    /// and the previous sequence state is kept.
+    fn enterSequence(
+        self: *Keyboard,
+        alloc: Allocator,
+        set: *const input.Binding.Set,
+        req: ?termio.Message.WriteReq,
+    ) Allocator.Error!void {
+        if (req) |r| self.sequence_queued.append(alloc, r) catch |err| {
+            r.deinit();
+            return err;
+        };
+        self.sequence_set = set;
+    }
 };
+
+test "keyboard keeps its sequence state when a leader key cannot be queued" {
+    const testing = std.testing;
+    const set: input.Binding.Set = .{};
+    var keyboard: Keyboard = .{};
+    defer {
+        for (keyboard.sequence_queued.items) |req| req.deinit();
+        keyboard.sequence_queued.deinit(testing.allocator);
+    }
+
+    // The request outgrows the inline buffer, so it owns an allocation.
+    const req = try termio.Message.WriteReq.init(testing.allocator, "x" ** 64);
+    try testing.expect(req == .alloc);
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        keyboard.enterSequence(failing.allocator(), &set, req),
+    );
+    try testing.expect(keyboard.sequence_set == null);
+    try testing.expectEqual(@as(usize, 0), keyboard.sequence_queued.items.len);
+
+    try keyboard.enterSequence(
+        testing.allocator,
+        &set,
+        try termio.Message.WriteReq.init(testing.allocator, "y" ** 64),
+    );
+    try testing.expectEqual(&set, keyboard.sequence_set.?);
+    try testing.expectEqual(@as(usize, 1), keyboard.sequence_queued.items.len);
+}
 
 test "keyboard tracks overlapping consumed presses independently" {
     const testing = std.testing;
@@ -1129,7 +1231,7 @@ pub fn drainTerminalOutput(
     self.terminal_output_transport.drain(ctx, callback);
 }
 
-/// Queue a message for the IO thread.
+/// Queue a message for the IO thread, taking ownership of `msg`.
 ///
 /// We centralize all our logic into this spot so we can intercept
 /// messages for example in readonly mode.
@@ -1144,7 +1246,10 @@ fn queueIo(
             .write_small,
             .write_stable,
             .write_alloc,
-            => return,
+            => {
+                msg.deinit();
+                return;
+            },
 
             else => {},
         }
@@ -1160,6 +1265,21 @@ fn queueIo(
     }
 
     self.io.queueMessage(msg, mutex);
+}
+
+test "queueIo frees allocated writes in readonly mode" {
+    const testing = std.testing;
+
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.readonly = true;
+
+    // queueIo must free allocated writes in read-only mode.
+    const data = try testing.allocator.dupe(u8, "\x1b]lGhostty\x1b\\");
+    surface.queueIo(.{ .write_alloc = .{
+        .alloc = testing.allocator,
+        .data = data,
+    } }, .unlocked);
 }
 
 /// Whether a key press has to record its own submission. Enter submits the
@@ -1603,9 +1723,9 @@ fn selectionScrollTick(self: *Surface) !void {
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
-    // If our screen changed while this is happening, we stop our
-    // selection scroll.
-    if (self.mouse.left_click_screen != t.screens.active_key) {
+    // If our left-click pin no longer belongs to the active screen, we stop
+    // our selection scroll.
+    if (self.mouse.activeLeftClickPin(&t.screens) == null) {
         self.queueIo(
             .{ .selection_scroll = false },
             .locked,
@@ -2072,7 +2192,7 @@ fn mouseRefreshLinks(
         // mouse actions.
         const left_idx = @intFromEnum(input.MouseButton.left);
         if (self.mouse.click_state[left_idx] == .press) click: {
-            const pin = self.mouse.left_click_pin orelse break :click;
+            const pin = self.mouse.activeLeftClickPin(&self.io.terminal.screens) orelse break :click;
             const click_pt = self.io.terminal.screens.active.pages.pointFromPin(
                 .viewport,
                 pin.*,
@@ -2611,14 +2731,18 @@ pub fn pwd(
 }
 
 /// Resolves a relative file path to an absolute path using the terminal's pwd.
+///
+/// Must be called without the renderer state mutex held: it takes the mutex
+/// to copy the pwd, then checks the filesystem without it.
 fn resolvePathForOpening(
     self: *Surface,
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
-        const terminal_pwd = self.io.terminal.getPwd() orelse {
+        const terminal_pwd = try self.pwd(self.alloc) orelse {
             return null;
         };
+        defer self.alloc.free(terminal_pwd);
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
 
@@ -3082,18 +3206,14 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
-    const prev_ = self.io.terminal.screens.active.selection;
     try self.io.terminal.screens.active.select(sel_);
 
     // If copy on select is false then exit early.
     if (self.config.copy_on_select == .false) return;
 
     // Set our selection clipboard. If the selection is cleared we do not
-    // clear the clipboard. If the selection is set, we only set the clipboard
-    // again if it changed, since setting the clipboard can be an expensive
-    // operation.
+    // clear the clipboard.
     const sel = sel_ orelse return;
-    if (prev_) |prev| if (sel.eql(prev)) return;
 
     switch (self.config.copy_on_select) {
         .false => unreachable, // handled above with an early exit
@@ -3612,7 +3732,6 @@ pub fn keyCallback(
             return .closed;
         }
 
-        errdefer write_req.deinit();
         // Read before `queueIo` takes ownership of the bytes.
         const bytes_submit = submissionsInBytes(write_req.slice()) > 0;
         self.queueIo(switch (write_req) {
@@ -3757,15 +3876,14 @@ fn maybeHandleBinding(
     // Determine if this entry has an action or if its a leader key.
     const leaf: input.Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
         .leader => |set| {
-            // Setup the next set we'll look at.
-            self.keyboard.sequence_set = set;
-
-            // Store this event so that we can drain and encode on invalid.
-            // We don't need to cap this because it is naturally capped by
-            // the config validation.
-            if (try self.encodeKey(event, insp_ev)) |req| {
-                try self.keyboard.sequence_queued.append(self.alloc, req);
-            }
+            // Setup the next set we'll look at, storing this event so that we
+            // can drain and encode on invalid. We don't need to cap this
+            // because it is naturally capped by the config validation.
+            try self.keyboard.enterSequence(
+                self.alloc,
+                set,
+                try self.encodeKey(event, insp_ev),
+            );
 
             // Start or continue our key sequence
             _ = self.rt_app.performAction(
@@ -5134,15 +5252,14 @@ pub fn mouseButtonCallback(
         }
 
         if (self.mouse.left_click_pin) |prev| {
-            if (t.screens.get(self.mouse.left_click_screen)) |pin_screen| {
-                pin_screen.pages.untrackPin(prev);
-            }
+            if (self.mouse.leftClickPageList(&t.screens)) |pages| pages.untrackPin(prev);
             self.mouse.left_click_pin = null;
         }
 
         // Store it
         self.mouse.left_click_pin = pin;
         self.mouse.left_click_screen = t.screens.active_key;
+        self.mouse.left_click_screen_generation = t.screens.generation(t.screens.active_key);
         self.mouse.left_click_xpos = pos.x;
         self.mouse.left_click_ypos = pos.y;
 
@@ -5583,33 +5700,39 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
 /// Attempt to invoke the action of any link that is under the
 /// given position.
 ///
-/// Requires the renderer state mutex is held.
+/// Takes the renderer state mutex itself, so the caller must not hold it.
+/// The link is resolved and copied out of the terminal under the mutex,
+/// because the IO thread prunes and reuses the pages it lives in. It is
+/// opened after the mutex is released, because the Win32 opener runs
+/// ShellExecuteW, which can pump messages.
 fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
-    const link = try self.linkAtPos(pos) orelse return false;
-    switch (link.action) {
-        .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+    const action: input.Link.Action, const target: [:0]const u8 = target: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const link = try self.linkAtPos(pos) orelse return false;
+        const url: [:0]const u8 = switch (link.action) {
+            .open => try self.io.terminal.screens.active.selectionString(self.alloc, .{
                 .sel = link.selection,
                 .trim = false,
-            });
-            defer self.alloc.free(str);
+            }),
 
-            const resolved_path = try self.resolvePathForOpening(str);
-            defer if (resolved_path) |p| self.alloc.free(p);
-
-            const url_to_open = resolved_path orelse str;
-            try self.openUrl(.{ .kind = .unknown, .url = url_to_open });
-        },
-
-        ._open_osc8 => {
-            const uri = self.osc8URI(link.selection.start()) orelse {
+            // The URI is a slice of page memory, so it must be copied.
+            ._open_osc8 => try self.alloc.dupeZ(u8, self.osc8URI(link.selection.start()) orelse {
                 log.warn("failed to get URI for OSC8 hyperlink", .{});
                 return false;
-            };
-            try self.openUrl(.{ .kind = .unknown, .url = uri });
-        },
-    }
+            }),
+        };
+        break :target .{ link.action, url };
+    };
+    defer self.alloc.free(target);
 
+    const resolved_path = switch (action) {
+        .open => try self.resolvePathForOpening(target),
+        ._open_osc8 => null,
+    };
+    defer if (resolved_path) |p| self.alloc.free(p);
+
+    try self.openUrl(.{ .kind = .unknown, .url = resolved_path orelse target });
     return true;
 }
 
@@ -5678,7 +5801,7 @@ pub fn mousePressureCallback(
 
         // This should always be set in this state but we don't want
         // to handle state inconsistency here.
-        const pin = self.mouse.left_click_pin orelse break :select;
+        const pin = self.mouse.activeLeftClickPin(&self.io.terminal.screens) orelse break :select;
         const sel = self.io.terminal.screens.active.selectWord(
             pin.*,
             self.config.selection_word_chars,
@@ -5843,11 +5966,12 @@ pub fn cursorPosCallback(
         // count because we don't want to handle selection.
         if (self.mouse.left_click_count == 0) break :select;
 
-        // If our terminal screen changed then we don't process this. We don't
-        // invalidate our pin or mouse state because if the screen switches
-        // back then we can continue our selection.
+        // If our left-click pin no longer belongs to the active screen then we
+        // don't process this. We don't invalidate our pin or mouse state
+        // because if the same screen switches back then we can continue our
+        // selection.
         const t: *terminal.Terminal = self.renderer_state.terminal;
-        if (self.mouse.left_click_screen != t.screens.active_key) break :select;
+        if (self.mouse.activeLeftClickPin(&t.screens) == null) break :select;
 
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
@@ -5902,7 +6026,7 @@ fn dragLeftClickDouble(
     drag_pin: terminal.Pin,
 ) !void {
     const screen: *terminal.Screen = self.io.terminal.screens.active;
-    const click_pin = self.mouse.left_click_pin.?.*;
+    const click_pin = (self.mouse.activeLeftClickPin(&self.io.terminal.screens) orelse return).*;
 
     // Get the word closest to our starting click.
     const word_start = screen.selectWordBetween(
@@ -5947,7 +6071,7 @@ fn dragLeftClickTriple(
     drag_pin: terminal.Pin,
 ) !void {
     const screen: *terminal.Screen = self.io.terminal.screens.active;
-    const click_pin = self.mouse.left_click_pin.?.*;
+    const click_pin = (self.mouse.activeLeftClickPin(&self.io.terminal.screens) orelse return).*;
 
     // Get the line selection under our current drag point. If there isn't a
     // line, do nothing.
@@ -5974,8 +6098,9 @@ fn dragLeftClickSingle(
     drag_x: f64,
 ) !void {
     // This logic is in a separate function so that it can be unit tested.
+    const click_pin = self.mouse.activeLeftClickPin(&self.io.terminal.screens) orelse return;
     try self.io.terminal.screens.active.select(mouseSelection(
-        self.mouse.left_click_pin.?.*,
+        click_pin.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
         @intFromFloat(@max(0.0, drag_x)),
@@ -7361,7 +7486,8 @@ fn writeScreenFile(
 ) !void {
     // Create a temporary directory to store our scrollback.
     var tmp_dir = try internal_os.TempDir.init();
-    errdefer tmp_dir.deinit();
+    var retain_tmp_dir = false;
+    defer if (retain_tmp_dir) tmp_dir.close(.retain) else tmp_dir.deinit();
 
     var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
     const filename = try std.fmt.bufPrint(
@@ -7430,7 +7556,6 @@ fn writeScreenFile(
 
         const sel = sel_ orelse {
             // If we have no selection we have no data so we do nothing.
-            tmp_dir.deinit();
             return;
         };
 
@@ -7480,6 +7605,9 @@ fn writeScreenFile(
             path,
         ), .unlocked),
     }
+
+    // The action accepted the path, so retain the file for its consumer.
+    retain_tmp_dir = true;
 }
 
 /// Call this to complete a clipboard request sent to apprt. This should
