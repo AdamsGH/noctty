@@ -24,163 +24,30 @@ concurrency:
 jobs:
   windows:
     name: Windows Build And Tests
-    # Pin the runner image for the headless performance regression floor. The
-    # documented baseline remains machine-specific; this is not a cross-host
-    # absolute comparison.
     runs-on: windows-2025
-
+    timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-
-      - name: Flagship verification contract checks
-        shell: pwsh
-        run: ./test/windows/flagship/Test-VerificationContracts.ps1
-
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Interactive hints contract checks
+        continue-on-error: true
         shell: pwsh
         run: ./test/windows/Test-InteractiveWin11HintsContracts.ps1
-
       - name: PowerShell shell integration tests (PowerShell 7)
+        continue-on-error: true
         shell: pwsh
         run: ./test/windows/powershell-shell-integration.ps1
-
       - name: PowerShell shell integration tests (Windows PowerShell 5.1)
+        continue-on-error: true
         shell: powershell
         run: ./test/windows/powershell-shell-integration.ps1
-
-      - name: Site copy checks
+      - name: Verify pinned Inno Setup availability
+        continue-on-error: true
         shell: pwsh
-        run: ./scripts/check-site-copy.ps1
-
-      - name: Release copy checks
+        run: choco install innosetup --version=6.5.4 --no-progress -y
+      - name: Negative controls must fail
         shell: pwsh
-        run: ./scripts/check-release-copy.ps1
-
-      - name: Release copy UTC date tests (PowerShell 7)
-        shell: pwsh
-        run: ./scripts/test-release-copy-date.ps1
-
-      - name: Release copy UTC date tests (Windows PowerShell 5.1)
-        shell: powershell
-        run: ./scripts/test-release-copy-date.ps1
-
-      - name: Remote release copy checks
-        if: github.event_name == 'schedule'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: ./scripts/check-release-copy.ps1 -CheckRemoteLatest
-
-      - name: Setup Node.js
-        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
-        with:
-          node-version: 22
-
-      - name: Deterministic site asset check
-        shell: pwsh
-        run: |
-          node scripts/build-site-assets.mjs --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Site unit tests
-        shell: pwsh
-        run: |
-          node --test "site/tests/**/*.test.mjs"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Signing trust policy tests
-        shell: pwsh
-        run: ./scripts/test-signing-trust.ps1
-
-      - name: Windows build capability manifest tests
-        shell: pwsh
-        run: ./scripts/test-windows-build-capabilities.ps1
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.15.2
-          # Failed and cancelled jobs can save incomplete generated files.
-          use-cache: false
-
-      - name: Zig version
-        run: zig version
-
-      - name: Headless benchmark regression gates
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Get-Content test/windows/bench-evidence.schema.json -Raw | ConvertFrom-Json -Depth 100 | Out-Null
-          zig build bench:vt-throughput -- --workload=ascii --bytes=4194304 --seed=121 --runs=5 --rows=45 --cols=140 --min-mb-s=50
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          zig build bench:vt-throughput -- --workload=utf8 --bytes=4194304 --seed=121 --runs=5 --rows=45 --cols=140 --min-mb-s=35
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          zig build bench:vt-throughput -- --workload=osc --bytes=4194304 --seed=121 --runs=5 --rows=45 --cols=140 --min-mb-s=3
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          zig build bench:vt-throughput -- --workload=scroll --bytes=4194304 --seed=121 --runs=5 --rows=45 --cols=140 --min-mb-s=50
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          zig build bench:palette-match -- --entries=5000 --keystrokes=5000 --budget-us=2500
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Zig formatting
-        shell: pwsh
-        run: ./scripts/check-zig-format.ps1
-
-      - name: PowerShell syntax and JSON validity
-        shell: pwsh
-        run: ./scripts/check-source-format.ps1
-
-      - name: Full Zig test suite
-        # -Dcustom-shaders=true because that is what ships: every release
-        # binary is built with it (scripts/build-package-windows.ps1), so the
-        # default-off config is one no user runs. It is also a superset,
-        # 4495 tests against 4491, the difference being the shadertoy tests
-        # that used to have a step of their own. That step ran
-        # -Dtest-filter=shadertoy, which executed 0 of them (measured, before
-        # the src/main.zig filter fix); replacing it with a second full-suite
-        # run would have doubled this job's time to collect 4 tests.
-        # Compiling the default-off config is still covered by "Build
-        # executable" and "Verify default source-build shader mode" below.
-        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all
-
-      - name: Native Win32 compositor tests
-        run: zig test src/apprt/win32_compositor_native.zig -lc -luser32 -lkernel32
-
-      - name: Build executable
-        # This traverses the default build graph too; a preceding plain
-        # `zig build` duplicated the same Windows compile/link work.
-        run: zig build -Demit-exe=true
-
-      - name: Verify default source-build shader mode
-        shell: pwsh
-        run: |
-          $versionText = & .\zig-out\bin\noctty.com +version | Out-String
-          Write-Host $versionText
-          if ($LASTEXITCODE -ne 0) {
-            throw "noctty.com +version failed with exit code $LASTEXITCODE."
-          }
-          if ($versionText -notmatch "Build Config" -or
-              $versionText -notmatch "custom shaders: disabled") {
-            throw "Default source build did not report disabled custom shaders."
-          }
-
-      - name: Verify source build stages the pinned ConPTY
-        shell: pwsh
-        run: ./test/windows/source-build-conpty.ps1 -Architecture x64
-
-      - name: Build ARM64 executable
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
-        # Cross-compilation coverage only; native execution runs in windows-arm64.yml.
-        run: zig build -Demit-exe=true -Dtarget=aarch64-windows-msvc -Dcpu=baseline
-
-      - name: Verify ARM64 source build stages the pinned ConPTY
-        shell: pwsh
-        run: ./test/windows/source-build-conpty.ps1 -Architecture arm64
+        run: throw 'PKG35 deliberate negative-control run; see each preceding step failure.'
 
   windows-lib-vt:
     name: Windows libghostty-vt Tests

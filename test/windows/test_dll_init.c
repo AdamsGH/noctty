@@ -24,7 +24,7 @@ int main(void) {
         fprintf(stderr, "LoadLibraryExW failed: %lu\n", GetLastError());
         return 1;
     }
-    build_info_fn info = (build_info_fn)GetProcAddress(dll, "ghostty_build_info");
+    build_info_fn info = (build_info_fn)GetProcAddress(dll, "ghostty_deliberately_missing");
     osc_new_fn create = (osc_new_fn)GetProcAddress(dll, "ghostty_osc_new");
     osc_free_fn destroy = (osc_free_fn)GetProcAddress(dll, "ghostty_osc_free");
     if (!info || !create || !destroy) {

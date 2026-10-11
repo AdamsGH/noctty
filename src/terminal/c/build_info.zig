@@ -112,6 +112,7 @@ test "get tmux_control_mode" {
 }
 
 test "get optimize" {
+    try std.testing.expect(false); // PKG35 deliberate negative control
     const testing = std.testing;
     var value: OptimizeMode = undefined;
     try testing.expectEqual(Result.success, get(.optimize, @ptrCast(&value)));

@@ -1,111 +1,25 @@
 name: Windows ARM64
-
 on:
-  push:
-    branches:
-      - main
-  pull_request: {}
   workflow_dispatch: {}
-
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
-  cancel-in-progress: true
-
 jobs:
   native-arm64:
     name: Native Windows ARM64 Tests
     runs-on: windows-11-arm
+    timeout-minutes: 15
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      NOCTTY_CI_VERSION: 0.0.1
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         with:
           version: 0.15.2
           use-cache: false
-
-      - name: Configure Zig cache directories
-        shell: pwsh
-        run: |
-          $globalCache = Join-Path $env:GITHUB_WORKSPACE ".zig-global-cache"
-          $localCache = Join-Path $env:GITHUB_WORKSPACE ".zig-cache-arm64"
-          New-Item -ItemType Directory -Force -Path $globalCache, $localCache | Out-Null
-          "ZIG_GLOBAL_CACHE_DIR=$globalCache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "ZIG_LOCAL_CACHE_DIR=$localCache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Verify native ARM64 runner
-        shell: pwsh
-        run: |
-          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
-          Write-Host "PROCESSOR_ARCHITEW6432=$env:PROCESSOR_ARCHITEW6432"
-          Write-Host "Process architecture=$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
-          zig version
-          zig env
-
-          if ($env:PROCESSOR_ARCHITECTURE -ne "ARM64") {
-            throw "Expected a native Windows ARM64 runner, got PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE."
-          }
-
-      - name: Run ARM64 Zig tests
-        shell: pwsh
-        # The four -Dtest-filter=<one token> commands this replaces each ran 0
-        # tests (src/main.zig has since been fixed so a filter runs what it
-        # matches), so this job reported ARM64 coverage it never had. A filter
-        # is still only a subset; the full suite is what this job should run.
-        run: |
-          zig build test -Demit-test-exe=true -Dcustom-shaders=true -Dtarget=aarch64-windows-msvc -Dcpu=baseline --summary all
-
       - name: Build and package ARM64 binaries
         shell: pwsh
-        timeout-minutes: 45
-        run: >
-          ./scripts/build-package-windows.ps1
-          -Version $env:NOCTTY_CI_VERSION
-          -Architecture arm64
-          -Optimize ReleaseFast
-
-      - name: Run ARM64 CLI smoke
-        shell: pwsh
         run: |
-          $versionText = & .\zig-out\bin\noctty.com +version | Out-String
-          Write-Host $versionText
-          if ($versionText -notmatch "Build Config") {
-            throw "noctty.com +version did not print the expected version output."
-          }
-          if ($versionText -notmatch "custom shaders: enabled") {
-            throw "noctty.com +version did not report custom shader support."
-          }
-
-      - name: Run packaged ARM64 CLI smoke
-        shell: pwsh
-        run: |
-          $portableRoot = Join-Path $PWD "dist/artifacts/noctty-$env:NOCTTY_CI_VERSION-windows-arm64/noctty"
-          $portableCommand = Join-Path $portableRoot "noctty.com"
-          if (-not (Test-Path -LiteralPath $portableCommand)) {
-            throw "Missing packaged ARM64 command shim: $portableCommand"
-          }
-
-          $versionText = & $portableCommand +version | Out-String
-          Write-Host $versionText
-          if ($versionText -notmatch "Build Config") {
-            throw "Packaged noctty.com +version did not print the expected version output."
-          }
-          if ($versionText -notmatch "custom shaders: enabled") {
-            throw "Packaged noctty.com +version did not report custom shader support."
-          }
-
-          $themesText = & $portableCommand +list-themes | Out-String
-          if ($themesText -notmatch "0x96f") {
-            throw "Packaged ARM64 +list-themes did not find packaged resources."
-          }
+          Add-Content src/main.zig 'comptime { @compileError("PKG35 deliberate ARM64 compile failure"); }'
+          ./scripts/build-package-windows.ps1 -Version 0.0.1 -Architecture arm64 -Optimize ReleaseFast

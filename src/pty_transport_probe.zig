@@ -805,6 +805,7 @@ test "Windows ConPTY transport probe reports APC and DCS survival" {
     try Probe.run();
 }
 test "Windows ConPTY input transport probe reports key encoding survival" {
+    try std.testing.expect(false); // PKG35 deliberate negative control
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
 
     const Probe = struct {

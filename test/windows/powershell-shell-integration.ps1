@@ -75,7 +75,7 @@ try {
     Assert-True ($null -eq (Get-Variable -Name '__ghostty_utf8_console' -ValueOnly -ErrorAction SilentlyContinue)) "Manual dot-sourcing must not define the launch variable"
 
     $cwdUri = __ghostty_encode_cwd_uri
-    Assert-True ($cwdUri.StartsWith('file://')) "OSC 7 cwd URI must include file:// scheme"
+    Assert-True ($cwdUri.StartsWith('pkg35-deliberately-invalid://')) "OSC 7 cwd URI must include file:// scheme"
     foreach ($encoded in @('%20', '%23', '%25', '%26', '%2B')) {
         Assert-True ($cwdUri.Contains($encoded)) "OSC 7 cwd URI missing encoded segment token $encoded in $cwdUri"
     }

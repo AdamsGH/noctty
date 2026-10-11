@@ -3,7 +3,7 @@ param(
     [switch] $Rebuild,
     [switch] $ResetState,
     [int] $TimeoutSeconds = 25,
-    [ValidateSet('Full', 'UnsafePaste')]
+    [ValidateSet('DeliberatelyInvalid', 'UnsafePaste')]
     [string] $Scenario = 'Full'
 )
 
