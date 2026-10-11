@@ -6793,6 +6793,8 @@ const dialog_test = struct {
     extern "user32" fn GetNextDlgGroupItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
     extern "gdi32" fn BitBlt(dst: HDC, x: i32, y: i32, width: i32, height: i32, src: HDC, src_x: i32, src_y: i32, rop: u32) callconv(.winapi) BOOL;
     extern "user32" fn HideCaret(hwnd: ?HWND) callconv(.winapi) BOOL;
+    extern "user32" fn WindowFromPoint(point: POINT) callconv(.winapi) ?HWND;
+    extern "user32" fn GetClassNameW(hwnd: HWND, name: [*]u16, count: c_int) callconv(.winapi) c_int;
     extern "user32" fn MapWindowPoints(from: ?HWND, to: ?HWND, points: [*]POINT, count: UINT) callconv(.winapi) c_int;
     extern "gdi32" fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFO, usage: UINT, bits: *?*anyopaque, section: ?*anyopaque, offset: u32) callconv(.winapi) HGDIOBJ;
     extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
@@ -6904,6 +6906,31 @@ const dialog_test = struct {
                 box = .{ .left = @min(box.left, x), .top = @min(box.top, y), .right = @max(box.right, x + 1), .bottom = @max(box.bottom, y + 1) };
             };
             std.debug.print("stale pixels {d} in ({d},{d})-({d},{d}) of a {d}x{d} client\n", .{ stale, box.left, box.top, box.right, box.bottom, shown.width, shown.height });
+            // Each row's runs of stale pixels, with the colours on either side.
+            var y: usize = @intCast(box.top);
+            while (y < @as(usize, @intCast(box.bottom))) : (y += 1) {
+                var x: usize = 0;
+                var runs: usize = 0;
+                while (x < shown.width and runs < 4) : (x += 1) {
+                    const index = y * shown.width + x;
+                    if (shown.pixels[index] == repainted.pixels[index]) continue;
+                    const start = x;
+                    while (x < shown.width and shown.pixels[y * shown.width + x] != repainted.pixels[y * shown.width + x]) x += 1;
+                    std.debug.print("  y={d} x={d}..{d} shown=0x{x:0>6} repainted=0x{x:0>6}\n", .{ y, start, x, shown.pixels[index] & 0xFFFFFF, repainted.pixels[index] & 0xFFFFFF });
+                    runs += 1;
+                }
+            }
+            var center: POINT = .{ .x = @divTrunc(box.left + box.right, 2), .y = @divTrunc(box.top + box.bottom, 2) };
+            _ = sys.ClientToScreen(hwnd, &center);
+            if (WindowFromPoint(center)) |under| {
+                var class_w: [64]u16 = undefined;
+                const length = GetClassNameW(under, &class_w, class_w.len);
+                std.debug.print("  window at the centre: {f} (the Settings window: {}, its child: {})\n", .{
+                    std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
+                    under == hwnd,
+                    IsChild(hwnd, under) != 0,
+                });
+            }
         }
         try std.testing.expectEqual(@as(usize, 0), stale);
     }
@@ -7504,7 +7531,6 @@ test "settings scrolling leaves the header and the action bar untouched" {
                 dialog_test.flushPaint(hwnd);
                 const after = try dialog_test.Capture.take(hwnd);
                 defer after.deinit();
-                try dialog_test.expectNothingStale(hwnd);
 
                 const width: i32 = @intCast(before.width);
                 const height: i32 = @intCast(before.height);
@@ -7515,6 +7541,7 @@ test "settings scrolling leaves the header and the action bar untouched" {
                 try std.testing.expectEqual(@as(usize, 0), before.countDifferent(after, action_bar, 0, 0));
                 // The form itself did move.
                 try std.testing.expect(before.countDifferent(after, form, 0, 0) > 0);
+                try dialog_test.expectNothingStale(hwnd);
             }
         }
     }.body);
