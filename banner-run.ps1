@@ -228,6 +228,13 @@ function Uia-Name([IntPtr]$w) {
         return "{0} '{1}' offscreen={2} focusable={3}" -f $e.Current.ControlType.ProgrammaticName, $e.Current.Name, $e.Current.IsOffscreen, $e.Current.IsKeyboardFocusable
     } catch { return "uia-error $($_.Exception.GetType().Name)" }
 }
+function Uia-HasInvoke([IntPtr]$w) {
+    try {
+        $e = [System.Windows.Automation.AutomationElement]::FromHandle($w)
+        $o = $null
+        return $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$o)
+    } catch { return $false }
+}
 function Uia-Invoke([IntPtr]$w) {
     try {
         $e = [System.Windows.Automation.AutomationElement]::FromHandle($w)
@@ -408,7 +415,7 @@ function Measure-Banner($c, [string]$Label) {
         $btn = [Hd]::Child($c.Host, $id)
         if ($btn -ne [IntPtr]::Zero -and [Hd]::IsWindowVisible($btn)) {
             $r = [Hd+Rect]::new(); [void][Hd]::GetWindowRect($btn, [ref]$r)
-            Say ("      button {0}: {1}x{2} UIA {3}" -f $id, ($r.Right-$r.Left), ($r.Bottom-$r.Top), (Uia-Name $btn))
+            Say ("      button {0}: {1}x{2} UIA {3} invoke={4}" -f $id, ($r.Right-$r.Left), ($r.Bottom-$r.Top), (Uia-Name $btn), (Uia-HasInvoke $btn))
         }
     }
 }
