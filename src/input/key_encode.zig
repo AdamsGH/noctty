@@ -122,11 +122,13 @@ pub fn encode(
 /// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, the sequence ConPTY turns back
 /// into `KEY_EVENT_RECORD`s (microsoft/terminal InputStateMachineEngine.cpp,
 /// `_GenerateWin32Key`). The fields follow the console host's own records
-/// (windowio.cpp, `HandleKeyEvent`): a key down is one record per UTF-16
-/// unit the key typed, each carrying the key's virtual key and scan code,
-/// or a single record with Uc 0 when it typed nothing (function keys,
-/// modifiers, a dead key, Ctrl+comma); a key up is one record with Uc 0,
-/// since `WM_KEYUP` carries no character. Repeats are key downs. Every
+/// (windowio.cpp, `HandleKeyEvent`): one record per UTF-16 unit the key
+/// translates to, each carrying the key's virtual key and scan code, or a
+/// single record with Uc 0 when it translates to nothing (function keys,
+/// modifiers, a dead key, Ctrl+comma). Releases get the same treatment: the
+/// console host translates key breaks too (`TranslateMessageEx` with
+/// `TM_POSTCHARBREAKS`), so its key-up record for Shift+Enter carries 13,
+/// measured against a real console window. Repeats are key downs. Every
 /// field is written, as Windows Terminal does (terminalInput.cpp,
 /// `_makeWin32Output`); the receiver's defaults are not relied on.
 fn win32InputRecord(
@@ -135,7 +137,7 @@ fn win32InputRecord(
     record: key.KeyEvent.Win32Record,
 ) std.Io.Writer.Error!void {
     const key_down: u8 = if (event.action == .release) 0 else 1;
-    const units: []const u16 = if (event.action == .release) &.{} else record.typed();
+    const units = record.typed();
     if (units.len == 0) return try writeWin32Record(writer, record, 0, key_down);
     for (units) |unit| try writeWin32Record(writer, record, unit, key_down);
 }
@@ -2174,13 +2176,16 @@ fn win32Record(vk: u16, scan_code: u16, cs: u16, units: []const u16) key.KeyEven
     return record;
 }
 
-test "win32 input mode: one record per typed unit, release carries no unit" {
+test "win32 input mode: one record per translated unit, releases included" {
     const shift_enter = win32Record(13, 28, 0x10, &.{13});
     const cases = [_]struct { event: key.KeyEvent, output: []const u8 }{
-        // Shift+Enter: the record keeps the Shift that legacy CR loses.
+        // Shift+Enter: the record keeps the Shift that legacy CR loses. The
+        // release carries the unit the apprt translated the key break to, as
+        // the console host's own key-up record does.
         .{ .event = .{ .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;1;16;1_" },
         .{ .event = .{ .action = .repeat, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;1;16;1_" },
-        .{ .event = .{ .action = .release, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;0;0;16;1_" },
+        .{ .event = .{ .action = .release, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;0;16;1_" },
+        .{ .event = .{ .action = .release, .key = .f13, .win32 = win32Record(0x7C, 100, 0, &.{}) }, .output = "\x1b[124;100;0;0;0;1_" },
         // Ctrl+[ carries the ESC Windows produced, with the real key.
         .{ .event = .{ .key = .bracket_left, .utf8 = "[", .mods = .{ .ctrl = true }, .win32 = win32Record(0xDB, 26, 0x08, &.{0x1b}) }, .output = "\x1b[219;26;27;1;8;1_" },
         // F13 is its own key, not a Shift+F1 alias; an enhanced key sets bit 8.

@@ -163,6 +163,13 @@ pub const DeferredCharState = struct {
     /// so its release is not sent either: a Kitty `report_events` client
     /// would see a release for a key it never saw pressed.
     dead_key_vk: ?UINT = null,
+    /// Under Win32 input records, the key whose press was a dead key. Its
+    /// release record carries the accent once, as Windows Terminal's does
+    /// (`_CharacterFromKeyEvent` keeps the first unit): the layout reads the
+    /// latched accent back twice at that point (measured on
+    /// US-International, `''`), and the console host's own break records
+    /// for it are two, one of them attributed to the next key.
+    dead_record_vk: ?UINT = null,
 
     pub fn expect(self: *DeferredCharState, units: usize) void {
         self.pending_units = units;
@@ -1160,7 +1167,7 @@ pub fn keyEventFromWin32Message(
     lParam: LPARAM,
     defer_plain_text: bool,
 ) ?Win32KeyMessage {
-    return keyMessage(msg, wParam, lParam, defer_plain_text, null, false);
+    return keyMessage(msg, wParam, lParam, defer_plain_text, null, false, false);
 }
 
 /// `dwControlKeyState` bits of a `KEY_EVENT_RECORD`.
@@ -1222,21 +1229,34 @@ fn controlKeyState(keyboard_state: ?*const [256]u8, lParam: LPARAM) u16 {
 }
 
 /// The `KEY_EVENT_RECORD` fields for this key message, for Win32 input
-/// mode. The console host builds one record per `WM_CHAR` a key down
+/// mode. The console host builds one record per `WM_CHAR` a key message
 /// produced, carrying the key's virtual key and scan code, and one record
-/// with no character for a key that typed nothing and for every key up
-/// (windowio.cpp, `HandleKeyEvent`). The units are what Windows typed:
-/// `TranslateMessage`'s characters when the pump translated the key (a
-/// Ctrl chord's control character, nothing for a dead key), or the layout's
-/// translation of the key against the live modifier state for a key
-/// message sent straight to the window. `wRepeatCount` is the low word of
-/// `lParam`, never below one.
+/// with no character for a key that typed nothing (windowio.cpp,
+/// `HandleKeyEvent`). Its input thread translates key breaks as well
+/// (`TranslateMessageEx` with `TM_POSTCHARBREAKS`), so a key-up record
+/// carries the character the key translates to at release: measured against
+/// a real console window, Shift+Enter's key up is `uc=13`, AltGr+7's is `{`.
+/// The units are what Windows typed: `TranslateMessage`'s characters when
+/// the pump translated the key down (a Ctrl chord's control character,
+/// nothing for a dead key), or the layout's translation of the key against
+/// the live modifier state, which is also how a release and a key message
+/// sent straight to the window are translated. `wRepeatCount` is the low
+/// word of `lParam`, never below one.
+/// How a key release is translated for its record, following what the
+/// console host's `TranslateMessageEx(TM_POSTCHARBREAKS)` produces: a
+/// `WM_KEYUP` break is translated like the key down (Shift+Enter's key up
+/// carries 13), a `WM_SYSKEYUP` gets no break (an Alt chord's key up carries
+/// 0; measured for Alt+a and Alt+ö), and the release of a latched dead key
+/// carries its accent once (see `DeferredCharState.dead_record_vk`).
+const ReleaseTranslation = enum { none, full, first_unit };
+
 fn win32KeyRecord(
     vk: UINT,
     lParam: LPARAM,
     action: input.Action,
     keyboard_state: ?*const [256]u8,
     typed: ?*const TypedChars,
+    release: ReleaseTranslation,
 ) input.KeyEvent.Win32Record {
     var record: input.KeyEvent.Win32Record = .{
         .vk = @intCast(vk & 0xFFFF),
@@ -1244,9 +1264,9 @@ fn win32KeyRecord(
         .control_key_state = controlKeyState(keyboard_state, lParam),
         .repeat_count = @max(1, @as(u16, @truncate(lParamBits(lParam) & 0xFFFF))),
     };
-    if (action == .release) return record;
-
-    if (typed) |chars| if (chars.translated()) {
+    if (action == .release and release == .none) return record;
+    // A release has no queued characters; it is translated below.
+    if (typed) |chars| if (action != .release and chars.translated()) {
         const len = @min(chars.len, record.units.len);
         @memcpy(record.units[0..len], chars.units[0..len]);
         record.units_len = @intCast(len);
@@ -1257,7 +1277,8 @@ fn win32KeyRecord(
     var utf16: [4]u16 = [_]u16{0} ** 4;
     const count = translateKeyTextToUnicode(vk, scanCodeFromLParam(lParam), state, &utf16);
     if (count <= 0) return record;
-    const len: usize = @min(@as(usize, @intCast(count)), utf16.len);
+    var len: usize = @min(@as(usize, @intCast(count)), utf16.len);
+    if (action == .release and release == .first_unit) len = 1;
     @memcpy(record.units[0..len], utf16[0..len]);
     record.units_len = @intCast(len);
     return record;
@@ -1270,6 +1291,7 @@ fn keyMessage(
     defer_plain_text: bool,
     typed: ?*const TypedChars,
     win32_records: bool,
+    latched_dead_key: bool,
 ) ?Win32KeyMessage {
     const action: input.Action = switch (msg) {
         c.WM_KEYUP, c.WM_SYSKEYUP => .release,
@@ -1308,7 +1330,10 @@ fn keyMessage(
             ),
             // Only while the terminal sends Win32 input records; the field
             // is what makes the encoder choose that form.
-            .win32 = if (win32_records) win32KeyRecord(vk, lParam, action, keyboard_state, typed) else null,
+            .win32 = if (win32_records) win32KeyRecord(vk, lParam, action, keyboard_state, typed, release: {
+                if (latched_dead_key) break :release .first_unit;
+                break :release if (msg == c.WM_SYSKEYUP) .none else .full;
+            }) else null,
         },
     };
 
@@ -1354,10 +1379,18 @@ pub fn dispatchKeyMessage(
     win32_records: bool,
     typed: *const TypedChars,
 ) void {
+    const vk: UINT = @intCast(wParam & 0xFFFF);
     // `message` lives for the rest of this function, which covers every read
     // of `event.utf8` below including the accessibility notification.
-    var message = keyMessage(msg, wParam, lParam, defer_plain_text, typed, win32_records) orelse return;
-    const vk: UINT = @intCast(wParam & 0xFFFF);
+    var message = keyMessage(msg, wParam, lParam, defer_plain_text, typed, win32_records, chars.dead_record_vk == vk) orelse return;
+    if (win32_records) {
+        // Remember a press that only latched a dead key for its release; any
+        // other press composes or cancels the accent.
+        chars.dead_record_vk = switch (message.event.action) {
+            .release => if (chars.dead_record_vk == vk) null else chars.dead_record_vk,
+            .press, .repeat => if (message.event.composing) vk else null,
+        };
+    }
     if (chars.dead_key_vk == vk) switch (message.event.action) {
         // Its press only latched a dead key and sent nothing.
         .release => {
@@ -2571,7 +2604,7 @@ test "win32 control key state mirrors the console host's record bits" {
     );
 }
 
-test "win32 key record takes the pump's characters and never a release's" {
+test "win32 key record takes the pump's characters and translates releases" {
     var state: [256]u8 = [_]u8{0} ** 256;
     state[c.VK_SHIFT] = 0x80;
     var typed: TypedChars = .{ .len = 2 };
@@ -2579,22 +2612,31 @@ test "win32 key record takes the pump's characters and never a release's" {
     typed.units[1] = '\r';
     const lParam: LPARAM = @bitCast(@as(usize, 1 | (28 << 16)));
 
-    const press = win32KeyRecord(c.VK_RETURN, lParam, .press, &state, &typed);
+    const press = win32KeyRecord(c.VK_RETURN, lParam, .press, &state, &typed, .full);
     try std.testing.expectEqual(@as(u16, 13), press.vk);
     try std.testing.expectEqual(@as(u16, 28), press.scan_code);
     try std.testing.expectEqual(ControlKeyState.shift, press.control_key_state);
     try std.testing.expectEqual(@as(u16, 1), press.repeat_count);
     try std.testing.expectEqualSlices(u16, &.{ '\'', '\r' }, press.typed());
 
-    // A dead key latched nothing to type; a release types nothing.
+    // A dead key latched nothing to type. A release ignores the queued
+    // characters and translates the key itself, as the console host's key
+    // break does; a function key translates to nothing.
     const dead: TypedChars = .{ .dead = true };
-    try std.testing.expectEqual(@as(usize, 0), win32KeyRecord(c.VK_OEM_7, lParam, .press, &state, &dead).typed().len);
-    try std.testing.expectEqual(@as(usize, 0), win32KeyRecord(c.VK_RETURN, lParam, .release, &state, &typed).typed().len);
+    try std.testing.expectEqual(@as(usize, 0), win32KeyRecord(c.VK_OEM_7, lParam, .press, &state, &dead, .full).typed().len);
+    // A system key break (Alt chord) is not translated.
+    try std.testing.expectEqual(@as(usize, 0), win32KeyRecord(c.VK_RETURN, lParam, .release, &state, null, .none).typed().len);
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualSlices(u16, &.{'\r'}, win32KeyRecord(c.VK_RETURN, lParam, .release, &state, &typed, .full).typed());
+        // The latched dead key's release keeps one unit of the layout's two.
+        try std.testing.expect(win32KeyRecord(c.VK_OEM_7, lParam, .release, &state, null, .first_unit).typed().len <= 1);
+        try std.testing.expectEqual(@as(usize, 0), win32KeyRecord(c.VK_F1 + 12, 0, .release, &state, &typed, .full).typed().len);
+    }
 
     // A repeat count of zero (a synthesized message) is reported as one.
-    try std.testing.expectEqual(@as(u16, 1), win32KeyRecord(c.VK_RETURN, 0, .release, &state, null).repeat_count);
+    try std.testing.expectEqual(@as(u16, 1), win32KeyRecord(c.VK_RETURN, 0, .release, &state, null, .full).repeat_count);
     const repeated: LPARAM = @bitCast(@as(usize, 3 | (28 << 16) | c.KF_REPEAT));
-    try std.testing.expectEqual(@as(u16, 3), win32KeyRecord(c.VK_RETURN, repeated, .repeat, &state, &typed).repeat_count);
+    try std.testing.expectEqual(@as(u16, 3), win32KeyRecord(c.VK_RETURN, repeated, .repeat, &state, &typed, .full).repeat_count);
 }
 
 // Driven through the real US and US-International layouts and the real
@@ -2603,7 +2645,8 @@ test "win32 key record takes the pump's characters and never a release's" {
 // character the key typed, with the key's own virtual key and scan code and
 // the control state Windows reported, a single record with no character for
 // a key that typed nothing (a dead key, Ctrl+comma, F13), and one release
-// record with no character. Nothing is typed after the record.
+// record carrying the key's own translation, as the console host's
+// char-break record does. Nothing is typed after the record.
 test "win32 input records on real layouts match the console host's records" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const hwnd = testingKeyWindow() orelse return error.SkipZigTest;
@@ -2620,11 +2663,11 @@ test "win32 input records on real layouts match the console host's records" {
     const left: TestingKey = .{ .vk = c.VK_LEFT, .extended = true };
     const dead: TestingKey = .{ .vk = c.VK_OEM_7 };
     const shared = [_]Case{
-        .{ .keys = &.{a}, .expect = "\x1b[65;30;97;1;0;1_\x1b[65;30;0;0;0;1_" },
+        .{ .keys = &.{a}, .expect = "\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_" },
         // Shift survives on Enter, which the legacy CR cannot carry.
-        .{ .keys = &.{shift_enter}, .expect = "\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_" },
+        .{ .keys = &.{shift_enter}, .expect = "\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_" },
         // Ctrl+[ is the ESC Windows typed, on its own key; Ctrl+comma types nothing.
-        .{ .keys = &.{ctrl_bracket}, .expect = "\x1b[219;26;27;1;8;1_\x1b[219;26;0;0;8;1_" },
+        .{ .keys = &.{ctrl_bracket}, .expect = "\x1b[219;26;27;1;8;1_\x1b[219;26;27;0;8;1_" },
         .{ .keys = &.{ctrl_comma}, .expect = "\x1b[188;51;0;1;8;1_\x1b[188;51;0;0;8;1_" },
         .{ .keys = &.{f13}, .expect = "\x1b[124;100;0;1;0;1_\x1b[124;100;0;0;0;1_" },
         .{ .keys = &.{left}, .expect = "\x1b[37;75;0;1;256;1_\x1b[37;75;0;0;256;1_" },
@@ -2635,14 +2678,16 @@ test "win32 input records on real layouts match the console host's records" {
             .klid = "00020409",
             .cases = &(shared ++ [_]Case{
                 // The dead key is a record of its own with no character, like the
-                // console host's WM_DEADCHAR record; the composed character rides
-                // on the key that completed it.
-                .{ .keys = &.{ dead, e }, .expect = "\x1b[222;40;0;1;0;1_\x1b[222;40;0;0;0;1_" ++
-                    "\x1b[69;18;233;1;0;1_\x1b[69;18;0;0;0;1_" },
+                // console host's WM_DEADCHAR record; its release carries the accent
+                // once; the composed character rides on the key that completed it.
+                // The release of the key that completed it translates to the
+                // bare letter: the dead state went into the key down.
+                .{ .keys = &.{ dead, e }, .expect = "\x1b[222;40;0;1;0;1_\x1b[222;40;39;0;0;1_" ++
+                    "\x1b[69;18;233;1;0;1_\x1b[69;18;101;0;0;1_" },
                 // An accent that cannot combine is a second record on the key
                 // that cancelled it, as the second WM_CHAR is in the console host.
-                .{ .keys = &.{ dead, enter }, .expect = "\x1b[222;40;0;1;0;1_\x1b[222;40;0;0;0;1_" ++
-                    "\x1b[13;28;39;1;0;1_\x1b[13;28;13;1;0;1_\x1b[13;28;0;0;0;1_" },
+                .{ .keys = &.{ dead, enter }, .expect = "\x1b[222;40;0;1;0;1_\x1b[222;40;39;0;0;1_" ++
+                    "\x1b[13;28;39;1;0;1_\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_" },
             }),
         },
     };
