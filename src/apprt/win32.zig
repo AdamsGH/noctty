@@ -12325,6 +12325,8 @@ const Host = struct {
     /// A banner button holds keyboard focus (tracked from `WM_SETFOCUS`
     /// and `WM_KILLFOCUS`).
     banner_focused: bool = false,
+    /// A new update notice to announce once the banner is on screen.
+    banner_announce_pending: bool = false,
     /// When the running `.info` countdown ends (`GetTickCount64`), null
     /// while none runs. See `syncBannerExpiry`.
     banner_expires_at: ?u64 = null,
@@ -16358,6 +16360,8 @@ const Host = struct {
 
         self.banner_kind = next_kind;
         try appendOwnedString(self.app.core_app.alloc, &self.banner_text, text);
+        // This announces the banner itself, below.
+        self.banner_announce_pending = false;
         // A new message gets a full countdown of its own.
         self.stopBannerExpiry();
         self.placeBanner(true);
@@ -16382,11 +16386,11 @@ const Host = struct {
     /// The app's update notice appeared, changed or went away. `announce`
     /// is true on one host only, so a reader hears a new notice once.
     fn updateNoticeChanged(self: *Host, announce: bool) void {
-        self.placeBanner(true);
         // A message set with `setBanner` takes the banner's place, and stays
-        // what the banner says and announces.
-        if (!announce or self.banner_text != null or !self.bannerShown()) return;
-        if (self.banner_uia_provider) |provider| provider.raiseLiveRegionChanged();
+        // what the banner says and announces. A notice that an overlay keeps
+        // off screen is announced when it comes on (`syncBannerChild`).
+        self.banner_announce_pending = announce and self.app.update_notice != null and self.banner_text == null;
+        self.placeBanner(true);
     }
 
     /// Whether the banner child belongs on screen: there is a message or an
@@ -16445,7 +16449,14 @@ const Host = struct {
             const actions = self.bannerActions();
             const width = chrome_layout.hostBannerWidth(self.bannerTextWidth(hwnd), actions, self.current_dpi);
             const rect = chrome_layout.hostBannerRect(area.content, area.top, width, self.current_dpi);
-            _ = applyChromeChildRect(hwnd, &self.banner_placement, rect);
+            const old_rect = self.banner_placement.rect;
+            const was_on_screen = self.banner_placement.visible and self.banner_placement.rect_known;
+            if (applyChromeChildRect(hwnd, &self.banner_placement, rect) and was_on_screen) {
+                // `MoveWindow` without repaint leaves the banner's old image
+                // on the terminal it no longer covers (a shorter message, a
+                // relayout); have everything under the old rect repaint.
+                if (self.hwnd) |parent| _ = sys.RedrawWindow(parent, &old_rect, null, c.RDW_INVALIDATE | c.RDW_ALLCHILDREN);
+            }
             const parts = chrome_layout.hostBannerParts(rect.right - rect.left, rect.bottom - rect.top, actions, self.current_dpi);
             const button_rects = [_]?RECT{ parts.primary, parts.dismiss };
             for (self.banner_buttons, &self.banner_button_placements, button_rects) |maybe_button, *placement, maybe_rect| {
@@ -16495,6 +16506,9 @@ const Host = struct {
         const shown = self.bannerShown();
         const focus = sys.GetFocus();
         const had_focus = focus != null and (focus == hwnd or self.bannerButtonOf(focus) != null);
+        // Keyboard focus must not stay on a hidden window, where keys would
+        // go nowhere visible; move it before the hide, not after.
+        if (!shown and had_focus) self.focusTerminalOrHost();
         _ = applyChildVisibility(hwnd, &self.banner_placement, shown);
         if (shown) {
             // The terminal is a sibling that can sit above the banner
@@ -16522,9 +16536,10 @@ const Host = struct {
             // A leave for a hidden button may never come; a stale hover
             // would hold the next message's countdown.
             if (self.bannerButtonOf(self.hovered_button_hwnd) != null) self.setHoveredButton(null);
-            // Keyboard focus must not stay on a hidden window: keys would go
-            // nowhere visible.
-            if (had_focus) self.focusTerminalOrHost();
+        }
+        if (shown and self.banner_announce_pending) {
+            self.banner_announce_pending = false;
+            if (self.banner_uia_provider) |provider| provider.raiseLiveRegionChanged();
         }
         self.syncBannerExpiry();
     }
@@ -17088,6 +17103,16 @@ const Host = struct {
         try std.testing.expectEqual(chrome_layout.BannerActions.update, host.bannerActions());
         try std.testing.expect(bannerTestVisible(banner));
         try std.testing.expect(bannerTestVisible(primary));
+
+        // A notice an overlay keeps off screen is announced when it comes on.
+        host.overlay_mode = .tab_title;
+        host.updateNoticeChanged(true);
+        try std.testing.expect(!bannerTestVisible(banner));
+        try std.testing.expect(host.banner_announce_pending);
+        host.overlay_mode = .none;
+        host.syncBannerChild();
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(!host.banner_announce_pending);
     }
 
     test "an info banner counts down only while it is unread; errors stay" {
