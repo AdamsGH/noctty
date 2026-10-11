@@ -546,6 +546,10 @@ pub const Parser = struct {
                     if (cap.backing == .allocating and cap.trailing().len >= cap.max_bytes) {
                         log.warn("OSC {t} is longer than {d} bytes, ignoring it", .{ self.state, cap.max_bytes });
                     }
+
+                    // The rest of the sequence is discarded, so nothing
+                    // needs what was captured.
+                    self.dropCapture();
                     self.state = .invalid;
                 },
             };
@@ -772,6 +776,22 @@ pub const Parser = struct {
     /// The returned pointer is only valid until the next call to the parser.
     /// Callers should copy out any data they wish to retain across calls.
     pub fn end(self: *Parser, terminator_ch: ?u8) ?*Command {
+        const command = self.endCommand(terminator_ch);
+
+        // A sequence that yields no command needs nothing it captured, so
+        // free that now rather than at the next OSC, which may never come:
+        // a rejected clipboard write would otherwise hold up to 8 MiB.
+        if (command == null) self.dropCapture();
+        return command;
+    }
+
+    /// Free and forget the capture, if there is one.
+    inline fn dropCapture(self: *Parser) void {
+        if (self.capture) |*cap| cap.deinit();
+        self.capture = null;
+    }
+
+    fn endCommand(self: *Parser, terminator_ch: ?u8) ?*Command {
         if (terminator_ch) |ch| switch (ch) {
             std.ascii.control_code.can,
             std.ascii.control_code.sub,
@@ -894,7 +914,8 @@ test "Parser allocating captures stop at 8 MiB" {
     const limit = Parser.MAX_ALLOCATING_BUF;
     try testing.expectEqual(@as(usize, 8 * 1024 * 1024), limit);
 
-    var p: Parser = .init(testing.allocator);
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var p: Parser = .init(counting.allocator());
     defer p.deinit();
     try testing.expectEqual(limit, p.max_allocating_bytes);
 
@@ -905,10 +926,11 @@ test "Parser allocating captures stop at 8 MiB" {
     try testing.expectEqual(@as(usize, limit), cap.trailing().len);
     try testing.expect(cap.writer.buffer.len <= limit);
 
+    // One byte more drops the sequence and frees what it held.
     p.next('a');
     try testing.expectEqual(Parser.State.invalid, p.state);
-    try testing.expectEqual(@as(usize, limit), cap.trailing().len);
-    try testing.expect(cap.writer.buffer.len <= limit);
+    try testing.expect(p.capture == null);
+    try testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
 }
 
 test "Parser allocating captures have a hard limit" {
@@ -917,7 +939,8 @@ test "Parser allocating captures have a hard limit" {
     const limit = Parser.MAX_BUF + 1;
 
     for (prefixes) |prefix| {
-        var p: Parser = .init(testing.allocator);
+        var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+        var p: Parser = .init(counting.allocator());
         defer p.deinit();
         p.max_allocating_bytes = limit;
 
@@ -930,22 +953,34 @@ test "Parser allocating captures have a hard limit" {
 
         p.next('a');
         try testing.expectEqual(Parser.State.invalid, p.state);
-        try testing.expectEqual(@as(usize, limit), cap.trailing().len);
-        try testing.expectEqual(@as(usize, limit), cap.writer.buffer.len);
+        try testing.expect(p.capture == null);
+        try testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
+
+        // The rest of the sequence, and its end, cost nothing.
+        for (0..limit) |_| p.next('a');
+        try testing.expect(p.end(null) == null);
+        try testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
     }
 }
 
 test "Parser allocating capture limit includes parser-added bytes" {
     const testing = std.testing;
-    var p: Parser = .init(testing.allocator);
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var p: Parser = .init(counting.allocator());
     defer p.deinit();
     p.max_allocating_bytes = 4;
 
     for ("52;abcd") |ch| p.next(ch);
+    {
+        const cap = &p.capture.?;
+        try testing.expectEqual(@as(usize, 4), cap.trailing().len);
+        try testing.expectEqual(@as(usize, 4), cap.writer.buffer.len);
+    }
+
+    // The terminating NUL the clipboard parser adds does not fit, so the
+    // command is rejected and its capture freed.
     try testing.expect(p.end(null) == null);
     try testing.expectEqual(Parser.State.invalid, p.state);
-
-    const cap = &p.capture.?;
-    try testing.expectEqual(@as(usize, 4), cap.trailing().len);
-    try testing.expectEqual(@as(usize, 4), cap.writer.buffer.len);
+    try testing.expect(p.capture == null);
+    try testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
 }
