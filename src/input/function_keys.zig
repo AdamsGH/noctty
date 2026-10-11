@@ -86,7 +86,7 @@ pub const keys = keys: {
     result.set(.page_up, pcStyle("\x1b[5;{}~") ++ .{Entry{ .sequence = "\x1B[5~" }});
     result.set(.page_down, pcStyle("\x1b[6;{}~") ++ .{Entry{ .sequence = "\x1B[6~" }});
 
-    // Function Keys. todo: f13-f35 but we need to add to input.Key
+    // Function keys, including the distinct xterm codes for F13-F24.
     result.set(.f1, pcStyle("\x1b[1;{}P") ++ .{Entry{ .sequence = "\x1BOP" }});
     result.set(.f2, pcStyle("\x1b[1;{}Q") ++ .{Entry{ .sequence = "\x1BOQ" }});
     result.set(.f3, pcStyle("\x1b[13;{}~") ++ .{Entry{ .sequence = "\x1BOR" }});
@@ -99,6 +99,18 @@ pub const keys = keys: {
     result.set(.f10, pcStyle("\x1b[21;{}~") ++ .{Entry{ .sequence = "\x1B[21~" }});
     result.set(.f11, pcStyle("\x1b[23;{}~") ++ .{Entry{ .sequence = "\x1B[23~" }});
     result.set(.f12, pcStyle("\x1b[24;{}~") ++ .{Entry{ .sequence = "\x1B[24~" }});
+    result.set(.f13, pcStyle("\x1b[25;{}~") ++ .{Entry{ .sequence = "\x1B[25~" }});
+    result.set(.f14, pcStyle("\x1b[26;{}~") ++ .{Entry{ .sequence = "\x1B[26~" }});
+    result.set(.f15, pcStyle("\x1b[28;{}~") ++ .{Entry{ .sequence = "\x1B[28~" }});
+    result.set(.f16, pcStyle("\x1b[29;{}~") ++ .{Entry{ .sequence = "\x1B[29~" }});
+    result.set(.f17, pcStyle("\x1b[31;{}~") ++ .{Entry{ .sequence = "\x1B[31~" }});
+    result.set(.f18, pcStyle("\x1b[32;{}~") ++ .{Entry{ .sequence = "\x1B[32~" }});
+    result.set(.f19, pcStyle("\x1b[33;{}~") ++ .{Entry{ .sequence = "\x1B[33~" }});
+    result.set(.f20, pcStyle("\x1b[34;{}~") ++ .{Entry{ .sequence = "\x1B[34~" }});
+    result.set(.f21, pcStyle("\x1b[42;{}~") ++ .{Entry{ .sequence = "\x1B[42~" }});
+    result.set(.f22, pcStyle("\x1b[43;{}~") ++ .{Entry{ .sequence = "\x1B[43~" }});
+    result.set(.f23, pcStyle("\x1b[44;{}~") ++ .{Entry{ .sequence = "\x1B[44~" }});
+    result.set(.f24, pcStyle("\x1b[45;{}~") ++ .{Entry{ .sequence = "\x1B[45~" }});
 
     // Keypad keys
     result.set(.numpad_0, kpKeys("p"));
