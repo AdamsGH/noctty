@@ -271,15 +271,19 @@ function Note-Known([int]$ProcessId) {
     $p=Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
     if($p -and $p.CreationDate) { $knownProcs[[int]$ProcessId]=[datetime]$p.CreationDate }
 }
-# herdr servers this run started, found while their parents are still alive:
-# a herdr.exe whose parent chain reaches a known process that is the same
-# incarnation (same pid AND creation time) and older than the child. Called
-# before the owned job is stopped, when that can still be checked.
+# herdr servers this run started: a herdr.exe that is itself a recorded
+# process (same pid AND creation time; the client's children were recorded
+# while it ran), or whose parent chain, while the parents are still alive,
+# reaches a known process that is the same incarnation and older than the
+# child. Called before the owned job is stopped, when that can still be
+# checked.
 function Find-OwnHerdrServers {
     $own=@{}
     $all=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'")
     foreach($proc in $all) {
         if(-not $proc.CreationDate -or [datetime]$proc.CreationDate -lt $runStart) { continue }
+        $candidateId=[int]$proc.ProcessId
+        if($knownProcs.ContainsKey($candidateId) -and $knownProcs[$candidateId] -eq [datetime]$proc.CreationDate) { $own[$candidateId]=[datetime]$proc.CreationDate; continue }
         $child=$proc; $hops=0; $mine=$false
         while(-not $mine -and $hops -lt 6) {
             $parentId=[int]$child.ParentProcessId
@@ -516,8 +520,8 @@ try {
     # (Find-OwnHerdrServers), then stop the owned job, then stop only those
     # servers, each by pid AND creation time. Never by name or by start time
     # alone: the maintainer's own herdr is out of scope.
-    $ownServers=@{}
-    try { $ownServers=Find-OwnHerdrServers } catch { Progress "own-server scan failed: $($_.Exception.Message)" }
+    $ownServers=@{}; $scanError=$null
+    try { $ownServers=Find-OwnHerdrServers } catch { $scanError=$_.Exception.Message; Progress "own-server scan failed: $scanError" }
     $cleanupError=$null; $owned=0
     try { $owned=[HerdrMouse]::StopOwnedJob($job) } catch { $cleanupError=$_ }
     $leftover=@()
@@ -529,19 +533,21 @@ try {
         $leftover+=[int]$proc.ProcessId
     }
     $results.OwnHerdrServersSeen=@($ownServers.Keys)
+    $results.OwnServerScanError=$scanError
     $results.LeftoverHerdrStopped=$leftover
     $results.OwnedProcessCount=$owned; $results.OwnedJobCleanedUp=($null -eq $cleanupError)
     $results.HerdrInstalled=$haveHerdr; $results.WezTermInstalled=$haveWezTerm
     $results | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'results.json')
 }
 # Exit code: 2 when the driver itself broke, 3 when a phase failed (a window
-# or an API that never came, an observer with no output) or the owned job
-# was not cleaned up, 4 when a modifier key was held at the real keyboard
+# or an API that never came, an observer with no output), the owned job
+# was not cleaned up or the own-server scan failed (a detached server may
+# be left running), 4 when a modifier key was held at the real keyboard
 # during a phase's clicks (INTERFERED: run again when the machine is idle).
 # CLICKS-IGNORED and CLICKS-CHANGE-FOCUS are results, and SKIPPED is a
 # program that is not installed; neither is a failure.
 if($results.Contains('Infrastructure')) { exit 2 }
 $failedPhases=@($results.Phases | Where-Object { $_.Status -eq 'FAIL' })
-if($failedPhases.Count -gt 0 -or -not $results.OwnedJobCleanedUp) { exit 3 }
+if($failedPhases.Count -gt 0 -or -not $results.OwnedJobCleanedUp -or $results.OwnServerScanError) { exit 3 }
 if(@($results.Phases | Where-Object { $_.Status -eq 'INTERFERED' }).Count -gt 0) { exit 4 }
 exit 0
