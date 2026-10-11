@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const freetype = @import("freetype");
 const Collection = @import("main.zig").Collection;
 const DeferredFace = @import("main.zig").DeferredFace;
+const CodepointRange = @import("DeferredFace_windows.zig").CodepointRange;
+const coverageContains = @import("DeferredFace_windows.zig").coverageContains;
 pub const Descriptor = @import("descriptor.zig").Descriptor;
 const Variation = @import("variation.zig").Variation;
 const dwrite = @import("discovery_windows_dwrite.zig");
@@ -22,8 +24,10 @@ pub const Discover = Windows;
 ///      catches fonts registered at arbitrary paths (e.g. by font managers)
 ///
 /// Each font file is inspected with FreeType for its family/style names.
-/// Codepoint coverage (charset) is computed lazily per face the first time
-/// a query needs it, never during the scan itself.
+/// A face's codepoint coverage is read the first time a query has to know
+/// it, never during the scan itself, and kept for as long as the record set
+/// is: each face is opened for coverage at most once per scan, so a
+/// codepoint that no font has costs binary searches after the first one.
 ///
 /// The record set can be refreshed at runtime (see `refresh`) so fonts
 /// installed while the app is running are picked up on config reload
@@ -34,16 +38,29 @@ pub const Windows = struct {
     user_dir: ?[:0]const u8,
     records: []Record,
 
-    /// Guards `records` (including the lazily-computed charsets inside
-    /// them). Discovery can be called concurrently from multiple renderer
-    /// threads via codepoint-fallback resolution while a refresh swaps
-    /// the record set.
+    /// Guards `records` (including the lazily read coverage inside them),
+    /// `generation` and `coverage_reads`. Discovery can be called
+    /// concurrently from multiple renderer threads via codepoint-fallback
+    /// resolution while a refresh swaps the record set.
     mutex: std.Thread.Mutex,
+
+    /// Serializes `refresh`, so a caller that needs the record set waits
+    /// for a scan already in flight instead of starting a second one.
+    /// Taken before `mutex`, never while holding it.
+    scan_mutex: std.Thread.Mutex = .{},
 
     /// Snapshot of the font sources at the time of the last successful
     /// scan; used by `refresh` to skip rescanning when nothing changed.
     /// Null means we have never scanned.
     state: ?ScanState,
+
+    /// Counts record-set swaps, so an iterator can tell whether the
+    /// indices it holds still name the records it copied.
+    generation: u64 = 0,
+
+    /// Faces opened to read their coverage. Each face is opened at most
+    /// once per record set; tests read this to prove it.
+    coverage_reads: usize = 0,
 
     /// DirectWrite's system font fallback, asked which installed font
     /// Windows would use for a codepoint the loaded fonts lack. Created on
@@ -74,13 +91,13 @@ pub const Windows = struct {
         italic: bool,
         color: bool,
         variable: bool,
-        has_codepoint: bool,
-        /// Sorted codepoint coverage. Computed lazily on first use under
-        /// the discovery mutex; null means not yet computed.
-        charset: ?[]const u32,
+        /// Codepoint coverage of the face's Unicode cmap. Read on first
+        /// use under the discovery mutex; null means not read yet, and
+        /// always null on the iterator's copies.
+        coverage: ?[]const CodepointRange,
 
         fn deinit(self: *Record, alloc: Allocator) void {
-            if (self.charset) |charset| alloc.free(charset);
+            if (self.coverage) |coverage| alloc.free(coverage);
             if (self.typographic_family) |name| alloc.free(name);
             if (self.typographic_style) |name| alloc.free(name);
             alloc.free(self.path);
@@ -92,7 +109,10 @@ pub const Windows = struct {
     };
 
     pub fn init() Windows {
-        const alloc = std.heap.page_allocator;
+        // Not page_allocator: that maps a 4 KiB page per allocation, and
+        // the records are thousands of short strings, so a scan of 568
+        // faces committed about 11 MB for about 0.6 MB of data.
+        const alloc = if (builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator;
         return .{
             .alloc = alloc,
             .system_dir = systemFontsDir(alloc) catch |err| dir: {
@@ -118,11 +138,29 @@ pub const Windows = struct {
 
     /// Rescan the font sources if they changed since the last scan (or if
     /// we never scanned). Cheap when nothing changed: two directory stats
-    /// and one registry query. Serialized by the caller (SharedGridSet
-    /// holds its own lock across collection creation); concurrent
+    /// and one registry query. A call made while another thread scans
+    /// waits for that scan and then finds nothing changed. Concurrent
     /// `discover` calls are safe because the record swap happens under
-    /// our mutex and iterators hold deep copies.
+    /// `mutex` and iterators hold deep copies.
     pub fn refresh(self: *Windows) void {
+        self.scan_mutex.lock();
+        defer self.scan_mutex.unlock();
+        self.refreshScanLocked();
+    }
+
+    /// `refresh` for a caller that only wants an existing record set kept
+    /// current and must never wait for a scan. It does nothing before the
+    /// first scan, which the startup prefetch runs, or `discover` when a
+    /// query needs the records, and nothing while another thread scans,
+    /// since that scan publishes a current record set anyway.
+    pub fn refreshExisting(self: *Windows) void {
+        if (!self.hasScanned()) return;
+        if (!self.scan_mutex.tryLock()) return;
+        defer self.scan_mutex.unlock();
+        self.refreshScanLocked();
+    }
+
+    fn refreshScanLocked(self: *Windows) void {
         const state = self.scanState();
         {
             self.mutex.lock();
@@ -144,6 +182,7 @@ pub const Windows = struct {
         const old = self.records;
         self.records = records;
         self.state = state;
+        self.generation +%= 1;
         self.mutex.unlock();
 
         for (old) |*record| record.deinit(self.alloc);
@@ -168,35 +207,54 @@ pub const Windows = struct {
     ) !DiscoverIterator {
         // Some consumers (e.g. the +list-fonts CLI action) use
         // init()+discover() directly and never call refresh(); make the
-        // first scan self-healing so they still see fonts. Concurrent
-        // first calls can at worst scan twice; the extra result is freed.
+        // first scan self-healing so they still see fonts. A scan already
+        // in flight (the startup prefetch) is waited for, not repeated.
         if (!self.hasScanned()) self.refresh();
 
-        const filtered = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            break :blk try self.filterRecordsLocked(alloc, desc);
-        };
-        errdefer {
-            for (filtered) |*record| record.deinit(alloc);
-            alloc.free(filtered);
-        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sources = try self.candidatesLocked(alloc, desc);
+        errdefer alloc.free(sources);
 
         // Stable so that faces the scan saw in a fixed order keep that
         // order when they score identically. The preferred face is found
         // once, by path, and then identified by its (owned, unique) path
-        // buffer, so the comparator never compares strings.
-        const Order = struct { desc: Descriptor, preferred: ?[*]const u8 };
-        const order: Order = .{ .desc = desc, .preferred = preferredPath(filtered, preferred) };
-        std.mem.sort(Record, filtered, order, struct {
-            fn lessThan(o: Order, lhs: Record, rhs: Record) bool {
-                return fallbackRank(o.desc, lhs, o.preferred) > fallbackRank(o.desc, rhs, o.preferred);
+        // buffer, so the comparator never compares strings. Ranking never
+        // reads coverage, so ranking every candidate and letting `next`
+        // drop the ones that lack the codepoint gives the order that
+        // dropping them first would.
+        const Order = struct { records: []const Record, desc: Descriptor, preferred: ?[*]const u8 };
+        const order: Order = .{
+            .records = self.records,
+            .desc = desc,
+            .preferred = preferredPath(self.records, sources, preferred),
+        };
+        std.mem.sort(u32, sources, order, struct {
+            fn lessThan(o: Order, lhs: u32, rhs: u32) bool {
+                return fallbackRank(o.desc, o.records[lhs], o.preferred) >
+                    fallbackRank(o.desc, o.records[rhs], o.preferred);
             }
         }.lessThan);
 
+        const records = try alloc.alloc(Record, sources.len);
+        var copied: usize = 0;
+        errdefer {
+            for (records[0..copied]) |*record| record.deinit(alloc);
+            alloc.free(records);
+        }
+        for (sources) |index| {
+            records[copied] = try copyRecord(alloc, self.records[index]);
+            copied += 1;
+        }
+
         return .{
             .alloc = alloc,
-            .records = filtered,
+            .disco = self,
+            .generation = self.generation,
+            .records = records,
+            .sources = sources,
+            .codepoint = desc.codepoint,
             .variations = desc.variations,
             .i = 0,
         };
@@ -252,12 +310,13 @@ pub const Windows = struct {
         }
     };
 
-    /// The path buffer of the record `preferred` names, which identifies
+    /// The path buffer of the candidate `preferred` names, which identifies
     /// that record for the rest of the sort, or null when none matches.
-    fn preferredPath(records: []const Record, preferred: ?Preferred) ?[*]const u8 {
+    /// `candidates` are indices into `records`.
+    fn preferredPath(records: []const Record, candidates: []const u32, preferred: ?Preferred) ?[*]const u8 {
         const value = preferred orelse return null;
-        for (records) |record| {
-            if (value.matches(record)) return record.path.ptr;
+        for (candidates) |index| {
+            if (value.matches(records[index])) return records[index].path.ptr;
         }
         return null;
     }
@@ -274,53 +333,82 @@ pub const Windows = struct {
 
     pub const DiscoverIterator = struct {
         alloc: Allocator,
-        /// Deep copies of the matching records (owned by `alloc`), so the
-        /// iterator stays valid even if a concurrent refresh replaces the
-        /// discovery's record set.
+        /// The discovery the records came from. `next` reads coverage
+        /// through it, so a face is opened at most once per record set.
+        disco: *Windows,
+        /// `disco.generation` when the records were copied. While it is
+        /// current, `sources[i]` is the index of the record `records[i]`
+        /// copies.
+        generation: u64,
+        /// Deep copies of the candidate records, best first (owned by
+        /// `alloc`), so the iterator stays valid even if a concurrent
+        /// refresh replaces the discovery's record set. They carry no
+        /// coverage: `next` reads it and skips the ones that lack
+        /// `codepoint`.
         records: []Record,
+        sources: []u32,
+        /// The codepoint every returned face must have, or 0 for none.
+        codepoint: u32,
         variations: []const Variation,
+        /// FreeType library for the faces `next` opens, made on first use.
+        lib: ?freetype.Library = null,
         i: usize,
 
         pub fn deinit(self: *DiscoverIterator) void {
             // Records before `i` were consumed by next(), which transferred
-            // their allocations into the returned faces.
+            // their allocations into the returned faces or freed them.
             for (self.records[self.i..]) |*record| record.deinit(self.alloc);
             self.alloc.free(self.records);
+            self.alloc.free(self.sources);
+            if (self.lib) |*lib| lib.deinit();
             self.* = undefined;
         }
 
         pub fn next(self: *DiscoverIterator) !?DeferredFace {
-            if (self.i >= self.records.len) return null;
-            const record = &self.records[self.i];
+            while (self.i < self.records.len) {
+                const record = &self.records[self.i];
 
-            // The only fallible step happens before any ownership moves,
-            // so a failure here leaks nothing and leaves the record
-            // available for a retry.
-            const variations = try self.alloc.dupe(Variation, self.variations);
+                // The fallible steps happen before any ownership moves, so
+                // a failure here leaks nothing and leaves the record
+                // available for a retry.
+                const coverage = try self.disco.candidateCoverage(
+                    self.alloc,
+                    &self.lib,
+                    self.generation,
+                    self.sources[self.i],
+                    record.*,
+                    self.codepoint,
+                ) orelse {
+                    record.deinit(self.alloc);
+                    self.i += 1;
+                    continue;
+                };
+                errdefer self.alloc.free(coverage);
+                const variations = try self.alloc.dupe(Variation, self.variations);
 
-            // Transfer the record's allocations into the face (same
-            // allocator, no second copy). The typographic subfamily has no
-            // destination field, so it is released here.
-            if (record.typographic_style) |name| self.alloc.free(name);
-            const face: DeferredFace = .{
-                .win = .{
-                    .alloc = self.alloc,
-                    .path = record.path,
-                    .face_index = record.face_index,
-                    .family_name = record.family_name,
-                    .style_name = record.style_name,
-                    .full_name = record.full_name,
-                    .typographic_family = record.typographic_family,
-                    .variations = variations,
-                    .color = record.color,
-                    // Filtered records always carry a materialized charset
-                    // (see filterRecordsLocked).
-                    .charset = record.charset.?,
-                },
-            };
-            record.* = undefined;
-            self.i += 1;
-            return face;
+                // Transfer the record's allocations into the face (same
+                // allocator, no second copy). The typographic subfamily has
+                // no destination field, so it is released here.
+                if (record.typographic_style) |name| self.alloc.free(name);
+                const face: DeferredFace = .{
+                    .win = .{
+                        .alloc = self.alloc,
+                        .path = record.path,
+                        .face_index = record.face_index,
+                        .family_name = record.family_name,
+                        .style_name = record.style_name,
+                        .full_name = record.full_name,
+                        .typographic_family = record.typographic_family,
+                        .variations = variations,
+                        .color = record.color,
+                        .coverage = coverage,
+                    },
+                };
+                record.* = undefined;
+                self.i += 1;
+                return face;
+            }
+            return null;
         }
     };
 
@@ -611,8 +699,7 @@ pub const Windows = struct {
                 containsIgnoreCase(style_name, "oblique"),
             .color = face.hasColor() or face.hasSBIX(),
             .variable = face.hasMultipleMasters(),
-            .has_codepoint = false,
-            .charset = null,
+            .coverage = null,
         };
     }
 
@@ -755,110 +842,102 @@ pub const Windows = struct {
     //-------------------------------------------------------------------
     // Matching
 
-    /// Filter records against the descriptor and return deep copies for
-    /// the iterator. Must be called with the mutex held. Charsets are
-    /// materialized (and cached on the master records) for every record
-    /// that survives the name/style filters, because both codepoint
-    /// filtering here and DeferredFace.hasCodepoint downstream need them.
-    fn filterRecordsLocked(
+    /// Indices of the records that match `desc`, in scan order. Must be
+    /// called with the mutex held. A record whose coverage is already known
+    /// to lack `desc.codepoint` is left out here; one whose coverage has
+    /// not been read stays a candidate for `next` to check, so a query
+    /// reads coverage only as far down the ranking as it has to.
+    fn candidatesLocked(
         self: *Windows,
         alloc: Allocator,
         desc: Descriptor,
-    ) ![]Record {
-        var result: std.ArrayListUnmanaged(Record) = .{};
-        errdefer {
-            for (result.items) |*record| record.deinit(alloc);
-            result.deinit(alloc);
-        }
-
-        // One FreeType library shared by every face this query has to
-        // open, created only if some face actually needs inspection.
-        var lib: ?freetype.Library = null;
-        defer if (lib) |*l| l.deinit();
-
-        for (self.records) |*record| {
-            if (!matchesDescriptor(record.*, desc)) continue;
-
-            // Codepoint filter. A cached charset answers with a binary
-            // search; otherwise probe the face with a single char-index
-            // lookup instead of enumerating its entire charset — a
-            // codepoint-only fallback query visits nearly every record.
+    ) Allocator.Error![]u32 {
+        var result: std.ArrayListUnmanaged(u32) = .{};
+        errdefer result.deinit(alloc);
+        for (self.records, 0..) |record, index| {
+            if (!matchesDescriptor(record, desc)) continue;
             if (desc.codepoint > 0) {
-                const contains = if (record.charset) |charset|
-                    charsetHasCodepoint(charset, desc.codepoint)
-                else
-                    faceHasCodepoint(&lib, record.path, record.face_index, desc.codepoint);
-                if (!contains) continue;
+                if (record.coverage) |coverage| {
+                    if (!coverageContains(coverage, desc.codepoint)) continue;
+                }
             }
-
-            // Records handed to the iterator must carry a materialized
-            // charset for DeferredFace.hasCodepoint, so compute and cache
-            // it — but only for these survivors.
-            _ = self.ensureCharsetLocked(&lib, record);
-
-            var copy = try copyRecord(alloc, record.*);
-            copy.has_codepoint = desc.codepoint > 0;
-            errdefer copy.deinit(alloc);
-            try result.append(alloc, copy);
+            try result.append(alloc, @intCast(index));
         }
-
         return try result.toOwnedSlice(alloc);
     }
 
-    /// Cheap membership probe: open the face and look up one char index
-    /// instead of enumerating the full charset. Any failure counts as
-    /// "does not contain".
-    fn faceHasCodepoint(
+    /// The coverage `next` gives the face it builds from `copy`, as a copy
+    /// owned by `alloc`, or null when the face lacks `codepoint` (0 asks for
+    /// no codepoint). While `generation` is current, the master record at
+    /// `index` answers, and its coverage is read and kept on first use.
+    /// After a refresh replaced the records, the face is read directly.
+    fn candidateCoverage(
+        self: *Windows,
+        alloc: Allocator,
         lib: *?freetype.Library,
-        path: [:0]const u8,
-        face_index: i32,
+        generation: u64,
+        index: u32,
+        copy: Record,
         codepoint: u32,
-    ) bool {
-        const l = sharedLibrary(lib) orelse return false;
-        const face = l.initFace(path, face_index) catch return false;
-        defer face.deinit();
-        face.selectCharmap(.unicode) catch return false;
-        return face.getCharIndex(codepoint) != null;
+    ) Allocator.Error!?[]const CodepointRange {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (generation == self.generation) {
+            const kept = try self.ensureCoverageLocked(lib, &self.records[index]);
+            if (codepoint > 0 and !coverageContains(kept, codepoint)) return null;
+            return try alloc.dupe(CodepointRange, kept);
+        }
+
+        const coverage = try self.readCoverageLocked(alloc, lib, copy.path, copy.face_index);
+        if (codepoint > 0 and !coverageContains(coverage, codepoint)) {
+            alloc.free(coverage);
+            return null;
+        }
+        return coverage;
     }
 
-    /// Return the record's charset, computing and caching it on first
-    /// use. Must be called with the mutex held. Extraction failures are
-    /// cached as an empty heap-owned slice so a broken font isn't
-    /// re-parsed on every query; out-of-memory skips the cache entirely
-    /// so a later query can retry.
-    fn ensureCharsetLocked(
+    /// Return the record's coverage, reading and keeping it on first use.
+    /// Must be called with the mutex held. Out-of-memory keeps nothing, so
+    /// a later query can retry.
+    fn ensureCoverageLocked(
         self: *Windows,
         lib: *?freetype.Library,
         record: *Record,
-    ) []const u32 {
-        if (record.charset) |charset| return charset;
-
-        const charset = computeCharset(self.alloc, lib, record.path, record.face_index) catch |err| switch (err) {
-            error.OutOfMemory => return &.{},
-            else => blk: {
-                log.debug("windows font discovery charset failed path={s} index={} err={}", .{
-                    record.path, record.face_index, err,
-                });
-                break :blk self.alloc.alloc(u32, 0) catch return &.{};
-            },
-        };
-        record.charset = charset;
-        return charset;
+    ) Allocator.Error![]const CodepointRange {
+        if (record.coverage) |coverage| return coverage;
+        const coverage = try self.readCoverageLocked(self.alloc, lib, record.path, record.face_index);
+        record.coverage = coverage;
+        return coverage;
     }
 
-    fn computeCharset(
+    /// Open the face and read its coverage. A face FreeType cannot read
+    /// covers nothing, so a broken font isn't re-parsed on every query.
+    /// Must be called with the mutex held, which guards the read count.
+    fn readCoverageLocked(
+        self: *Windows,
         alloc: Allocator,
         lib: *?freetype.Library,
         path: [:0]const u8,
         face_index: i32,
-    ) ![]const u32 {
-        const l = sharedLibrary(lib) orelse return error.LibraryInitFailed;
-        const face = try l.initFace(path, face_index);
+    ) Allocator.Error![]const CodepointRange {
+        // FT_Init_FreeType fails only when it cannot allocate.
+        const l = sharedLibrary(lib) orelse return error.OutOfMemory;
+        self.coverage_reads += 1;
+        const face = l.initFace(path, face_index) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.debug("windows font discovery cannot read face path={s} index={} err={}", .{
+                    path, face_index, err,
+                });
+                return try alloc.alloc(CodepointRange, 0);
+            },
+        };
         defer face.deinit();
-        return try extractCharset(alloc, face);
+        return try extractCoverage(alloc, face);
     }
 
-    /// Return the query-shared FreeType library, creating it on first use.
+    /// Return the caller's FreeType library, creating it on first use.
     fn sharedLibrary(lib: *?freetype.Library) ?freetype.Library {
         if (lib.*) |l| return l;
         const created = freetype.Library.init() catch |err| {
@@ -869,25 +948,39 @@ pub const Windows = struct {
         return created;
     }
 
-    fn extractCharset(alloc: Allocator, face: freetype.Face) ![]const u32 {
+    /// The codepoints the face's Unicode cmap maps to a glyph, as sorted
+    /// runs. Enumerating the cmap once per face is what lets every later
+    /// query, for any codepoint, skip opening the face at all.
+    fn extractCoverage(alloc: Allocator, face: freetype.Face) Allocator.Error![]const CodepointRange {
         // Select unicode charmap for enumeration; if unavailable, treat as empty
         if (freetype.c.FT_Select_Charmap(face.handle, freetype.c.FT_ENCODING_UNICODE) != 0) {
-            return try alloc.dupe(u32, &.{});
+            return try alloc.alloc(CodepointRange, 0);
         }
 
-        var codepoints: std.ArrayListUnmanaged(u32) = .{};
-        errdefer codepoints.deinit(alloc);
+        var ranges: std.ArrayListUnmanaged(CodepointRange) = .{};
+        errdefer ranges.deinit(alloc);
 
+        // FT_Get_Next_Char returns codepoints in ascending order.
         var glyph_index: u32 = undefined;
         var charcode = freetype.c.FT_Get_First_Char(face.handle, &glyph_index);
-        while (glyph_index != 0) {
-            try codepoints.append(alloc, @intCast(charcode));
-            charcode = freetype.c.FT_Get_Next_Char(face.handle, charcode, &glyph_index);
+        while (glyph_index != 0) : (charcode = freetype.c.FT_Get_Next_Char(face.handle, charcode, &glyph_index)) {
+            const cp: u32 = @intCast(charcode);
+            if (ranges.items.len > 0) {
+                const last = &ranges.items[ranges.items.len - 1];
+                if (cp == last.last + 1) {
+                    last.last = cp;
+                    continue;
+                }
+            }
+            try ranges.append(alloc, .{ .first = cp, .last = cp });
         }
 
-        return try codepoints.toOwnedSlice(alloc);
+        return try ranges.toOwnedSlice(alloc);
     }
 
+    /// Deep copy of a record's names for the iterator. The coverage is not
+    /// copied: `next` reads it from the master record, for the one face it
+    /// returns.
     fn copyRecord(alloc: Allocator, record: Record) error{OutOfMemory}!Record {
         const path = try alloc.dupeZ(u8, record.path);
         errdefer alloc.free(path);
@@ -906,8 +999,6 @@ pub const Windows = struct {
             try alloc.dupeZ(u8, name)
         else
             null;
-        errdefer if (typographic_style) |name| alloc.free(name);
-        const charset = try alloc.dupe(u32, record.charset orelse &.{});
 
         var copy = record;
         copy.path = path;
@@ -916,7 +1007,7 @@ pub const Windows = struct {
         copy.full_name = full_name;
         copy.typographic_family = typographic_family;
         copy.typographic_style = typographic_style;
-        copy.charset = charset;
+        copy.coverage = null;
         return copy;
     }
 
@@ -979,8 +1070,6 @@ pub const Windows = struct {
     fn score(desc: Descriptor, record: Record) u32 {
         var result: u32 = 0;
 
-        if (desc.codepoint > 0 and record.has_codepoint) result |= 1 << 20;
-
         if (desc.family) |family| {
             if (std.ascii.eqlIgnoreCase(record.family_name, family)) result |= 1 << 19;
             if (record.typographic_family) |typographic| {
@@ -1019,15 +1108,6 @@ pub const Windows = struct {
         if (record.color) result |= 1 << 6;
 
         return result;
-    }
-
-    fn charsetHasCodepoint(charset: []const u32, codepoint: u32) bool {
-        const result = std.sort.binarySearch(u32, charset, codepoint, struct {
-            fn order(target: u32, item: u32) std.math.Order {
-                return std.math.order(target, item);
-            }
-        }.order);
-        return result != null;
     }
 
     fn supportedFontFile(name: []const u8) bool {
@@ -1201,8 +1281,7 @@ fn testRecord() Windows.Record {
         .italic = true,
         .color = false,
         .variable = true,
-        .has_codepoint = true,
-        .charset = null,
+        .coverage = null,
     };
 }
 
@@ -1263,8 +1342,7 @@ fn nerdFontRecords() [4]Windows.Record {
         .italic = false,
         .color = false,
         .variable = false,
-        .has_codepoint = false,
-        .charset = null,
+        .coverage = null,
     };
 
     var bold = base;
@@ -1310,17 +1388,21 @@ test "windowsSystemFallbackPreferenceBreaksTies" {
 
     // DirectWrite reports its own casing and separators.
     const records = [_]Windows.Record{ first, second, third };
-    const preferred = Windows.preferredPath(&records, .{ .path = "c:/windows/fonts/CCC-UI.TTF", .face_index = 0 });
+    const all = [_]u32{ 0, 1, 2 };
+    const preferred = Windows.preferredPath(&records, &all, .{ .path = "c:/windows/fonts/CCC-UI.TTF", .face_index = 0 });
     try testing.expectEqual(@as(?[*]const u8, third.path.ptr), preferred);
     try testing.expect(Windows.fallbackRank(desc, third, preferred) > Windows.fallbackRank(desc, first, preferred));
     try testing.expectEqual(Windows.fallbackRank(desc, first, null), Windows.fallbackRank(desc, first, preferred));
     try testing.expectEqual(Windows.fallbackRank(desc, second, null), Windows.fallbackRank(desc, second, preferred));
 
     // Same file, other face of a collection: not the one Windows named.
-    try testing.expectEqual(@as(?[*]const u8, null), Windows.preferredPath(&records, .{ .path = second.path, .face_index = 0 }));
+    try testing.expectEqual(@as(?[*]const u8, null), Windows.preferredPath(&records, &all, .{ .path = second.path, .face_index = 0 }));
+
+    // A face that is not a candidate changes nothing.
+    try testing.expectEqual(@as(?[*]const u8, null), Windows.preferredPath(&records, &.{ 0, 1 }, .{ .path = third.path, .face_index = 0 }));
 
     // A face the scan never indexed changes nothing.
-    try testing.expectEqual(@as(?[*]const u8, null), Windows.preferredPath(&records, .{ .path = "C:\\elsewhere\\x.ttf", .face_index = 0 }));
+    try testing.expectEqual(@as(?[*]const u8, null), Windows.preferredPath(&records, &all, .{ .path = "C:\\elsewhere\\x.ttf", .face_index = 0 }));
 
     // The preference outranks everything `score` can express, including a
     // face that matches the requested style better.
@@ -1333,11 +1415,11 @@ test "windowsSystemFallbackPreferenceBreaksTies" {
 }
 
 test "windows system fallback puts DirectWrite's face first end to end" {
-    // Real scan, real DirectWrite, for a CJK ideograph. If the scan indexed
-    // the face Windows names, discovery returns it first; if it did not
-    // (a font outside the scanned sources), the order is exactly the plain
-    // `discover` order. Which font Windows names depends on the machine
-    // and locale, so it is not asserted.
+    // Real scan, real DirectWrite, for a CJK ideograph. The faces come
+    // back in the plain `discover` order, except that the face Windows
+    // names, if the scan indexed it and it has the codepoint, comes first.
+    // Which font Windows names depends on the machine and locale, so it is
+    // not asserted.
     if (comptime builtin.os.tag == .windows) {
         const alloc = testing.allocator;
         var disco = Windows.init();
@@ -1349,23 +1431,55 @@ test "windows system fallback puts DirectWrite's face first end to end" {
         defer mapped.deinit(alloc);
         const preferred: Windows.Preferred = .{ .path = mapped.path, .face_index = mapped.face_index };
 
-        var ranked = try disco.discoverRanked(alloc, desc, preferred);
-        defer ranked.deinit();
-
-        // No emptiness check here: when the named face was not indexed and
-        // no scanned face covers the codepoint either, an empty result is
-        // the correct one, and the plain-order comparison below accepts it.
-        if (Windows.preferredPath(ranked.records, preferred) != null) {
-            try testing.expect(dwrite.samePath(ranked.records[0].path, mapped.path));
-            try testing.expectEqual(mapped.face_index, ranked.records[0].face_index);
-        } else {
-            var plain = try disco.discover(alloc, desc);
-            defer plain.deinit();
-            try testing.expectEqual(plain.records.len, ranked.records.len);
-            for (plain.records, ranked.records) |expected, actual| {
-                try testing.expectEqualStrings(expected.path, actual.path);
-                try testing.expectEqual(expected.face_index, actual.face_index);
+        const Face = struct { path: [:0]const u8, face_index: i32 };
+        const collect = struct {
+            fn all(it: *Windows.DiscoverIterator) ![]Face {
+                var faces: std.ArrayListUnmanaged(Face) = .{};
+                errdefer {
+                    for (faces.items) |face| testing.allocator.free(face.path);
+                    faces.deinit(testing.allocator);
+                }
+                while (try it.next()) |found| {
+                    var face = found;
+                    defer face.deinit();
+                    const path = try testing.allocator.dupeZ(u8, face.win.path);
+                    errdefer testing.allocator.free(path);
+                    try faces.append(testing.allocator, .{ .path = path, .face_index = face.win.face_index });
+                }
+                return try faces.toOwnedSlice(testing.allocator);
             }
+
+            fn free(faces: []Face) void {
+                for (faces) |face| testing.allocator.free(face.path);
+                testing.allocator.free(faces);
+            }
+        };
+
+        var plain_it = try disco.discover(alloc, desc);
+        defer plain_it.deinit();
+        const plain = try collect.all(&plain_it);
+        defer collect.free(plain);
+        var ranked_it = try disco.discoverRanked(alloc, desc, preferred);
+        defer ranked_it.deinit();
+        const ranked = try collect.all(&ranked_it);
+        defer collect.free(ranked);
+
+        // The expected order: the plain one, with the face Windows named
+        // moved to the front when the plain order has it.
+        try testing.expectEqual(plain.len, ranked.len);
+        const named: ?usize = for (plain, 0..) |face, i| {
+            if (face.face_index == preferred.face_index and dwrite.samePath(face.path, preferred.path)) break i;
+        } else null;
+        var expected: std.ArrayListUnmanaged(Face) = .{};
+        defer expected.deinit(alloc);
+        if (named) |i| try expected.append(alloc, plain[i]);
+        for (plain, 0..) |face, i| {
+            if (named != null and i == named.?) continue;
+            try expected.append(alloc, face);
+        }
+        for (expected.items, ranked) |want, got| {
+            try testing.expectEqualStrings(want.path, got.path);
+            try testing.expectEqual(want.face_index, got.face_index);
         }
     } else return error.SkipZigTest;
 }
@@ -1689,12 +1803,34 @@ test "windowsSfntNamePick" {
     try testing.expect((try Windows.pickSfntName(alloc, &.{})) == null);
 }
 
-test "windowsCharsetHasCodepoint" {
-    const charset = [_]u32{ 'A', 'B', 'Z', 0x1F600 };
-    try testing.expect(Windows.charsetHasCodepoint(&charset, 'A'));
-    try testing.expect(Windows.charsetHasCodepoint(&charset, 0x1F600));
-    try testing.expect(!Windows.charsetHasCodepoint(&charset, 'C'));
-    try testing.expect(!Windows.charsetHasCodepoint(&.{}, 'A'));
+test "windows coverage runs answer exactly what the cmap does" {
+    // The runs built from FT_Get_Next_Char must agree with a direct
+    // char-index lookup for every codepoint, gaps and supplementary planes
+    // included (the Nerd Font maps plane 15 private use).
+    const embedded = @import("embedded.zig");
+    const alloc = testing.allocator;
+    var lib = try freetype.Library.init();
+    defer lib.deinit();
+    const face = try lib.initMemoryFace(embedded.test_nerd_font, 0);
+    defer face.deinit();
+
+    const coverage = try Windows.extractCoverage(alloc, face);
+    defer alloc.free(coverage);
+    try testing.expect(coverage.len > 1);
+    for (coverage[1..], coverage[0 .. coverage.len - 1]) |range, previous| {
+        try testing.expect(range.first <= range.last);
+        try testing.expect(range.first > previous.last + 1);
+    }
+
+    try face.selectCharmap(.unicode);
+    var cp: u32 = 0;
+    while (cp <= 0x10FFFF) : (cp += 1) {
+        const expected = face.getCharIndex(cp) != null;
+        if (coverageContains(coverage, cp) != expected) {
+            std.debug.print("coverage disagrees with the cmap at U+{X}\n", .{cp});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "windowsScanStateEql" {
@@ -1738,4 +1874,174 @@ test "windows discovery end to end" {
             try testing.expect(face.hasCodepoint('A', null));
         }
     } else return error.SkipZigTest;
+}
+
+const Fixture = struct { name: []const u8, data: []const u8 };
+
+/// A discovery whose record set is exactly `fixtures`, written to `dir` and
+/// scanned in this order, as if a scan of the font sources had found them.
+fn fixtureDiscovery(dir: std.fs.Dir, fixtures: []const Fixture) !Windows {
+    var disco = Windows.init();
+    errdefer disco.deinit();
+    var lib = try freetype.Library.init();
+    defer lib.deinit();
+
+    var records: std.ArrayListUnmanaged(Windows.Record) = .{};
+    errdefer {
+        for (records.items) |*record| record.deinit(disco.alloc);
+        records.deinit(disco.alloc);
+    }
+    for (fixtures) |fixture| {
+        try dir.writeFile(.{ .sub_path = fixture.name, .data = fixture.data });
+        const path = try dir.realpathAlloc(testing.allocator, fixture.name);
+        defer testing.allocator.free(path);
+        const path_z = try testing.allocator.dupeZ(u8, path);
+        defer testing.allocator.free(path_z);
+        try Windows.scanPath(disco.alloc, lib, path_z, &records);
+    }
+
+    disco.alloc.free(disco.records);
+    disco.records = try records.toOwnedSlice(disco.alloc);
+    disco.state = .{ .system_mtime = null, .user_mtime = null, .registry_write = null };
+    return disco;
+}
+
+fn fixtureFonts() [3]Fixture {
+    const embedded = @import("embedded.zig");
+    return .{
+        .{ .name = "a-inconsolata.ttf", .data = embedded.inconsolata },
+        .{ .name = "b-geist-mono.ttf", .data = embedded.geist_mono },
+        // The only fixture with Arabic.
+        .{ .name = "c-kawkab-mono.ttf", .data = embedded.arabic },
+    };
+}
+
+fn expectNoFace(disco: *Windows, codepoint: u32) !void {
+    var it = try disco.discover(testing.allocator, .{ .codepoint = codepoint, .size = 12 });
+    defer it.deinit();
+    if (try it.next()) |face| {
+        var found = face;
+        found.deinit();
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "windows discovery opens each face once for codepoints no font has" {
+    // F121: every face that had never contained a queried codepoint was
+    // reopened for each new one, so each codepoint no font has cost a
+    // FreeType open of every installed face (about 570 here).
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var disco = try fixtureDiscovery(tmp.dir, &fixtureFonts());
+    defer disco.deinit();
+    const faces = disco.records.len;
+    try testing.expectEqual(@as(usize, 3), faces);
+
+    // The first codepoint no font has reads every face once...
+    try expectNoFace(&disco, 0x10FE00);
+    try testing.expectEqual(faces, disco.coverage_reads);
+
+    // ...and after that no query opens a face: not the same codepoint again
+    // (which is what its bold, italic and emoji lookups ask), nor another
+    // codepoint no font has.
+    try expectNoFace(&disco, 0x10FE00);
+    try expectNoFace(&disco, 0x10FE01);
+    try testing.expectEqual(faces, disco.coverage_reads);
+
+    // A codepoint one face has is still found, from the coverage kept.
+    var it = try disco.discover(testing.allocator, .{ .codepoint = 0x0627, .size = 12 });
+    defer it.deinit();
+    var face = (try it.next()) orelse return error.TestUnexpectedResult;
+    defer face.deinit();
+    try testing.expect(std.mem.endsWith(u8, face.win.path, "c-kawkab-mono.ttf"));
+    try testing.expect(face.hasCodepoint(0x0627, null));
+    try testing.expect(!face.hasCodepoint(0x10FE00, null));
+    try testing.expectEqual(faces, disco.coverage_reads);
+}
+
+test "windows discovery reads faces only until one has the codepoint" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var disco = try fixtureDiscovery(tmp.dir, &fixtureFonts());
+    defer disco.deinit();
+
+    // Every fixture has 'A': the best-ranked face answers and no other
+    // face is opened.
+    var it = try disco.discover(testing.allocator, .{ .codepoint = 'A', .size = 12 });
+    defer it.deinit();
+    var first = (try it.next()) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+    try testing.expect(first.hasCodepoint('A', null));
+    try testing.expectEqual(@as(usize, 1), disco.coverage_reads);
+
+    // The others stay available, in rank order, for a caller that rejects
+    // the first one (the resolver does, on presentation).
+    var second = (try it.next()) orelse return error.TestUnexpectedResult;
+    defer second.deinit();
+    try testing.expect(!std.mem.eql(u8, first.win.path, second.win.path));
+    try testing.expectEqual(@as(usize, 2), disco.coverage_reads);
+
+    // A family query hands out coverage as well, for the faces it returns.
+    var family = try disco.discover(testing.allocator, .{ .family = "Kawkab Mono", .size = 12 });
+    defer family.deinit();
+    var kawkab = (try family.next()) orelse return error.TestUnexpectedResult;
+    defer kawkab.deinit();
+    try testing.expect(kawkab.hasCodepoint(0x0627, null));
+}
+
+test "windows discovery iterator outlives a refresh that replaces the records" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var disco = try fixtureDiscovery(tmp.dir, &fixtureFonts());
+    defer disco.deinit();
+
+    var it = try disco.discover(testing.allocator, .{ .codepoint = 0x0627, .size = 12 });
+    defer it.deinit();
+
+    // What a refresh does to an iterator's view: the record set changes
+    // under it (here the same records, reordered, so a stale index names
+    // the wrong face) and the generation moves on.
+    {
+        disco.mutex.lock();
+        defer disco.mutex.unlock();
+        std.mem.reverse(Windows.Record, disco.records);
+        disco.generation +%= 1;
+    }
+
+    // The iterator reads its own copies' faces and keeps nothing on the
+    // new records, which it cannot vouch for.
+    var face = (try it.next()) orelse return error.TestUnexpectedResult;
+    defer face.deinit();
+    try testing.expect(std.mem.endsWith(u8, face.win.path, "c-kawkab-mono.ttf"));
+    try testing.expect(face.hasCodepoint(0x0627, null));
+    for (disco.records) |record| try testing.expect(record.coverage == null);
+}
+
+test "windows refreshExisting never starts or waits for a scan" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // Before the first scan it does nothing; whoever needs the records
+    // runs that scan.
+    {
+        var disco = Windows.init();
+        defer disco.deinit();
+        disco.refreshExisting();
+        try testing.expect(disco.state == null);
+    }
+
+    // While another thread scans it returns at once instead of waiting.
+    // (Unblocked, it would find the fixture's state stale and rescan the
+    // real font sources.)
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var disco = try fixtureDiscovery(tmp.dir, &fixtureFonts());
+    defer disco.deinit();
+    disco.scan_mutex.lock();
+    disco.refreshExisting();
+    disco.scan_mutex.unlock();
+    try testing.expectEqual(@as(usize, 3), disco.records.len);
+    try testing.expectEqual(@as(u64, 0), disco.generation);
 }
