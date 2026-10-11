@@ -350,7 +350,7 @@ try {
                 $arguments=if($mode -eq 'no-session') { '--no-session' } else { '' }
                 Progress "phase $terminal herdr ${mode}: start"
                 $t=Start-Terminal $terminal $Herdr $arguments
-                Progress "phase $terminal herdr ${mode}: terminal pid $($t.Pid) window $($t.Window)" 
+                Progress "phase $terminal herdr ${mode}: terminal pid $($t.Pid) window $($t.Window)"
                 $deadline=[datetime]::UtcNow.AddSeconds(45); $api=$null
                 do { $api=Herdr-Api @('pane','list') $socket; if($api.Exit -eq 0) { break }; Start-Sleep -Milliseconds 300 } while([datetime]::UtcNow -lt $deadline)
                 $phase.ApiReady=($api.Exit -eq 0); $phase.PaneListInitial=$api.Text
@@ -388,7 +388,7 @@ try {
                     if(Test-Path -LiteralPath $lp) { Copy-Item -LiteralPath $lp -Destination (Join-Path $Run ("{0}-{1}-{2}" -f $terminal,$mode,$log)) -Force }
                 }
                 if($mode -eq 'default') { [void](Herdr-Api @('server','stop') $socket); Start-Sleep -Milliseconds 800 }
-                Progress "phase $terminal herdr ${mode}: $($phase.Status)" 
+                Progress "phase $terminal herdr ${mode}: $($phase.Status)"
             } catch { $phase.Status='FAIL'; $phase.Error=$_.Exception.Message; $phase.ErrorAt=$_.InvocationInfo.PositionMessage }
             finally {
                 if($t) { [void][HerdrMouse]::CloseHandle($t.Process.thread); [void][HerdrMouse]::CloseHandle($t.Process.process) }
