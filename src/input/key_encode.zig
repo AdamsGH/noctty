@@ -36,6 +36,10 @@ pub const Options = struct {
     /// traditional fixterms table unless they explicitly opt in.
     windows_legacy: bool = false,
 
+    /// Terminal DEC mode 9001 (Win32 input mode). ConPTY requests it at
+    /// the start of every session. See `win32InputRecords`.
+    win32_input_mode: bool = false,
+
     /// Determines whether the "option" key on macOS is treated
     /// as "alt" or not. See the Ghostty `macos_option-as-alt` config
     /// docs for a more detailed description of why this is needed.
@@ -63,10 +67,31 @@ pub const Options = struct {
             .ignore_keypad_with_numlock = t.modes.get(.ignore_keypad_with_numlock),
             .modify_other_keys_state_2 = t.flags.modify_other_keys_2,
             .kitty_flags = t.screens.active.kitty_keyboard.current(),
+            .win32_input_mode = t.modes.get(.win32_input),
 
             // These can't be known from the terminal state.
             .macos_option_as_alt = .false,
         };
+    }
+
+    /// Whether key events are sent as Win32 input records: mode 9001 is
+    /// set and no application has asked for the Kitty keyboard protocol.
+    /// Windows Terminal applies the same rule (terminalInput.cpp,
+    /// `HandleKey`: "We have to prefer the kitty keyboard protocol, because
+    /// otherwise it would never be used"): an application that reads VT
+    /// bytes through ConPTY and asked for Kitty gets the encoding it asked
+    /// for, which passes through ConPTY unchanged, while a record would be
+    /// re-encoded by conhost without the protocol. modifyOtherKeys is no
+    /// exception, as it is none in Windows Terminal: conhost does not
+    /// implement it, so its re-encoding of the record is what such an
+    /// application receives there too; and once conhost has seen a record
+    /// it holds a lone ESC, or ESC plus one byte, back until more input
+    /// arrives (stateMachine.cpp, `EncounteredWin32InputModeSequence`), so
+    /// switching back to VT bytes would delay every Escape by a keystroke.
+    /// The kitty flags are the active screen's, so a TUI that popped them
+    /// on exit restores records.
+    pub fn win32InputRecords(self: Options) bool {
+        return self.win32_input_mode and self.kitty_flags.int() == 0;
     }
 };
 
@@ -83,6 +108,9 @@ pub fn encode(
     opts: Options,
 ) std.Io.Writer.Error!void {
     //std.log.warn("KEYENCODER event={} opts={}", .{ event, opts });
+    if (event.win32) |record| if (opts.win32InputRecords()) {
+        return try win32InputRecord(writer, event, record);
+    };
     return if (opts.kitty_flags.int() != 0) try kitty(
         writer,
         event,
@@ -92,6 +120,104 @@ pub fn encode(
         event,
         opts,
     );
+}
+
+/// Encode the key event as Win32 input mode records,
+/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, the sequence ConPTY turns back
+/// into `KEY_EVENT_RECORD`s (microsoft/terminal InputStateMachineEngine.cpp,
+/// `_GenerateWin32Key`). The fields follow the console host's own records
+/// (windowio.cpp, `HandleKeyEvent`): one record per UTF-16 unit the key
+/// translates to, each carrying the key's virtual key and scan code, or a
+/// single record with Uc 0 when it translates to nothing (function keys,
+/// modifiers, a dead key, Ctrl+comma). Releases get the same treatment: the
+/// console host translates key breaks too (`TranslateMessageEx` with
+/// `TM_POSTCHARBREAKS`), so its key-up record for Shift+Enter carries 13,
+/// measured against a real console window. Repeats are key downs. Every
+/// field is written, as Windows Terminal does (terminalInput.cpp,
+/// `_makeWin32Output`); the receiver's defaults are not relied on.
+fn win32InputRecord(
+    writer: *std.Io.Writer,
+    event: key.KeyEvent,
+    record: key.KeyEvent.Win32Record,
+) std.Io.Writer.Error!void {
+    const key_down: u8 = if (event.action == .release) 0 else 1;
+    const units = record.typed();
+    if (units.len == 0) return try writeWin32Record(writer, record, 0, key_down);
+    for (units) |unit| try writeWin32Record(writer, record, unit, key_down);
+}
+
+fn writeWin32Record(
+    writer: *std.Io.Writer,
+    record: key.KeyEvent.Win32Record,
+    unit: u16,
+    key_down: u8,
+) std.Io.Writer.Error!void {
+    try writer.print("\x1b[{};{};{};{};{};{}_", .{
+        record.vk,
+        record.scan_code,
+        unit,
+        key_down,
+        record.control_key_state,
+        record.repeat_count,
+    });
+}
+
+/// The line submissions in `data` when it is a run of Win32 input records
+/// as `win32InputRecord` writes them: one per key-down record of an
+/// unmodified Enter (character CR, none of the Shift, Ctrl and Alt bits),
+/// times its repeat count. Null when `data` is anything else, so the caller
+/// counts the CR bytes of a VT encoding instead. The records are what let a
+/// line editor tell a modified Enter apart: PSReadLine adds a continuation
+/// line on Shift+Enter and a line above on Ctrl+Enter, neither of which
+/// submits, so counting them would consume the shell's input mark while the
+/// user is still editing. A cooked console read does end the line on
+/// Shift+Enter's CR record; that submission goes uncounted on purpose, since
+/// the terminal cannot tell the reader apart and the line editor is the
+/// common one. Ctrl+Enter carries 10, which neither reader runs, like a bare
+/// LF. The lock bits (Caps, Num, Scroll Lock) and ENHANCED_KEY (the numpad
+/// Enter) do not modify.
+pub fn win32RecordSubmissions(data: []const u8) ?u32 {
+    if (data.len == 0) return null;
+    const modifiers = key.KeyEvent.Win32Record.ControlKeyState.modifiers;
+    var submissions: u32 = 0;
+    var rest = data;
+    while (rest.len > 0) {
+        if (!std.mem.startsWith(u8, rest, "\x1b[")) return null;
+        const end = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
+        var fields = std.mem.splitScalar(u8, rest[2..end], ';');
+        var values: [6]u32 = undefined;
+        for (&values) |*value| {
+            const field = fields.next() orelse return null;
+            value.* = std.fmt.parseInt(u32, field, 10) catch return null;
+        }
+        if (fields.next() != null) return null;
+        const unit, const key_down, const state, const repeat = .{ values[2], values[3], values[4], values[5] };
+        if (unit == '\r' and key_down == 1 and (state & modifiers) == 0) submissions +|= repeat;
+        rest = rest[end + 1 ..];
+    }
+    return submissions;
+}
+
+test "win32 input mode: line submissions are counted from the records" {
+    // An unmodified Enter submits, once per repeat, with the lock bits and
+    // ENHANCED_KEY (numpad Enter) set or not. Shift+Enter (PSReadLine's
+    // continuation line), Ctrl+Enter (10), a release and a key that is not
+    // Enter do not.
+    try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_"));
+    try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;416;1_"));
+    try testing.expectEqual(@as(?u32, 3), win32RecordSubmissions("\x1b[13;28;13;1;0;3_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;13;1;2;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;10;1;8;1_\x1b[13;28;10;0;8;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[65;30;97;1;0;1_\x1b[16;42;0;0;0;1_"));
+    // Anything that is not a whole run of records is left to the CR count.
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions(""));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\r"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0;1_\r"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0_"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0;1;2_"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;x;1;0;1_"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0;1"));
 }
 
 /// Perform Kitty keyboard protocol encoding of the key event.
@@ -2098,6 +2224,94 @@ test "legacy: Windows console option preserves requested keyboard protocols" {
         try encode(&writer, case.event, .{ .windows_legacy = true, .kitty_flags = .{ .disambiguate = true } });
         try testing.expectEqualStrings(case.kitty, writer.buffered());
     }
+}
+
+fn win32Record(vk: u16, scan_code: u16, cs: u16, units: []const u16) key.KeyEvent.Win32Record {
+    var record: key.KeyEvent.Win32Record = .{
+        .vk = vk,
+        .scan_code = scan_code,
+        .control_key_state = cs,
+        .repeat_count = 1,
+    };
+    @memcpy(record.units[0..units.len], units);
+    record.units_len = @intCast(units.len);
+    return record;
+}
+
+test "win32 input mode: one record per translated unit, releases included" {
+    const shift_enter = win32Record(13, 28, 0x10, &.{13});
+    const cases = [_]struct { event: key.KeyEvent, output: []const u8 }{
+        // Shift+Enter: the record keeps the Shift that legacy CR loses. The
+        // release carries the unit the apprt translated the key break to, as
+        // the console host's own key-up record does.
+        .{ .event = .{ .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;1;16;1_" },
+        .{ .event = .{ .action = .repeat, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;1;16;1_" },
+        .{ .event = .{ .action = .release, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;0;16;1_" },
+        .{ .event = .{ .action = .release, .key = .f13, .win32 = win32Record(0x7C, 100, 0, &.{}) }, .output = "\x1b[124;100;0;0;0;1_" },
+        // Ctrl+[ carries the ESC Windows produced, with the real key.
+        .{ .event = .{ .key = .bracket_left, .utf8 = "[", .mods = .{ .ctrl = true }, .win32 = win32Record(0xDB, 26, 0x08, &.{0x1b}) }, .output = "\x1b[219;26;27;1;8;1_" },
+        // F13 is its own key, not a Shift+F1 alias; an enhanced key sets bit 8.
+        .{ .event = .{ .key = .f13, .win32 = win32Record(0x7C, 100, 0, &.{}) }, .output = "\x1b[124;100;0;1;0;1_" },
+        .{ .event = .{ .key = .arrow_left, .win32 = win32Record(0x25, 75, 0x100, &.{}) }, .output = "\x1b[37;75;0;1;256;1_" },
+        // Modifiers and dead keys are reported; legacy sends nothing for them.
+        .{ .event = .{ .key = .shift_left, .mods = .{ .shift = true }, .win32 = win32Record(0x10, 42, 0x10, &.{}) }, .output = "\x1b[16;42;0;1;16;1_" },
+        .{ .event = .{ .key = .quote, .composing = true, .win32 = win32Record(0xDE, 40, 0, &.{}) }, .output = "\x1b[222;40;0;1;0;1_" },
+        // A surrogate pair is two records with the same key, as two WM_CHARs are.
+        .{ .event = .{ .key = .unidentified, .utf8 = "\u{1F600}", .win32 = win32Record(0xE7, 0, 0, &.{ 0xD83D, 0xDE00 }) }, .output = "\x1b[231;0;55357;1;0;1_\x1b[231;0;56832;1;0;1_" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .win32_input_mode = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+}
+
+test "win32 input mode: repeat count and lock bits pass through" {
+    var record = win32Record(0x41, 30, 0x20 | 0x80, &.{'A'});
+    record.repeat_count = 3;
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .key_a, .utf8 = "A", .win32 = record }, .{ .win32_input_mode = true });
+    try testing.expectEqualStrings("\x1b[65;30;65;1;160;3_", writer.buffered());
+}
+
+test "win32 input mode: yields to requested protocols and to events without a record" {
+    const record = win32Record(13, 28, 0x10, &.{13});
+    const event: key.KeyEvent = .{ .key = .enter, .mods = .{ .shift = true }, .win32 = record };
+    const cases = [_]struct { opts: Options, output: []const u8 }{
+        .{ .opts = .{ .windows_legacy = true, .win32_input_mode = true, .kitty_flags = .{ .disambiguate = true } }, .output = "\x1b[13;2u" },
+        .{ .opts = .{ .windows_legacy = true, .win32_input_mode = false }, .output = if (builtin.os.tag == .windows) "\r" else "\x1b[27;2;13~" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, event, case.opts);
+        try testing.expectEqualStrings(case.output, writer.buffered());
+        try testing.expect(!case.opts.win32InputRecords());
+    }
+    try testing.expect((Options{ .win32_input_mode = true }).win32InputRecords());
+    // modifyOtherKeys is no exception (see `win32InputRecords`): the record
+    // still goes, and conhost re-encodes it for the application.
+    {
+        const opts: Options = .{ .windows_legacy = true, .win32_input_mode = true, .modify_other_keys_state_2 = true };
+        try testing.expect(opts.win32InputRecords());
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, event, opts);
+        try testing.expectEqualStrings("\x1b[13;28;13;1;16;1_", writer.buffered());
+    }
+
+    // Text with no physical key (an IME commit) is written as text; conhost
+    // synthesizes its own records for it.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .unidentified, .utf8 = "日" }, .{ .win32_input_mode = true });
+    try testing.expectEqualStrings("日", writer.buffered());
+    // Releases of such events, and of events without a record, send nothing.
+    writer = .fixed(&buf);
+    try encode(&writer, .{ .action = .release, .key = .enter }, .{ .win32_input_mode = true });
+    try testing.expectEqualStrings("", writer.buffered());
 }
 
 test "legacy: Alt UTF-8 text and codepoint fallback" {

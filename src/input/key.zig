@@ -53,6 +53,85 @@ pub const KeyEvent = struct {
     /// shift+a is "A" in UTF-8 but unshifted would provide 'a'.
     unshifted_codepoint: u21 = 0,
 
+    /// The Win32 console record for this key, set only by the Windows
+    /// apprt. While the terminal is in Win32 input mode (DEC 9001) the
+    /// encoder sends it as a `CSI Vk;Sc;Uc;Kd;Cs;Rc _` sequence instead
+    /// of a VT encoding; see `key_encode.zig`.
+    win32: ?Win32Record = null,
+
+    /// The fields of a Win32 `KEY_EVENT_RECORD` that cannot be derived
+    /// from the rest of the event: ConPTY expects the console host's own
+    /// values, not a reconstruction from key names and modifiers.
+    pub const Win32Record = struct {
+        /// `wVirtualKeyCode`: the `wParam` of the key message, as Windows
+        /// reports it (`VK_SHIFT`, not `VK_LSHIFT`; `VK_PACKET` for
+        /// injected characters).
+        vk: u16,
+
+        /// `wVirtualScanCode`: bits 16-23 of the key message's `lParam`.
+        scan_code: u16,
+
+        /// `dwControlKeyState` as the console host builds it from the
+        /// keyboard state at the time of the message: the left/right Alt
+        /// and Ctrl bits, Shift, the lock states and ENHANCED_KEY. This is
+        /// the raw state, so an AltGr chord carries LEFT_CTRL_PRESSED and
+        /// RIGHT_ALT_PRESSED like it does in conhost.
+        control_key_state: u16,
+
+        /// `wRepeatCount`: the low word of the key message's `lParam`.
+        repeat_count: u16,
+
+        /// The UTF-16 units the key typed, one record each. Empty for a
+        /// key that types nothing (function keys, modifiers, a dead key).
+        /// A release carries the key's translation at release, as the
+        /// console host's key-break record does, or nothing for a system
+        /// key break. A Ctrl chord carries the control character Windows
+        /// produced (U+0001 for Ctrl+A), not the letter.
+        units: [max_units]u16 = [_]u16{0} ** max_units,
+        units_len: u8 = 0,
+
+        /// One key press types at most a layout ligature (four units)
+        /// plus the accent of a dead key that could not combine with it.
+        pub const max_units = 8;
+
+        /// `dwControlKeyState` bits of a `KEY_EVENT_RECORD`.
+        pub const ControlKeyState = struct {
+            pub const right_alt: u16 = 0x0001;
+            pub const left_alt: u16 = 0x0002;
+            pub const right_ctrl: u16 = 0x0004;
+            pub const left_ctrl: u16 = 0x0008;
+            pub const shift: u16 = 0x0010;
+            pub const numlock_on: u16 = 0x0020;
+            pub const scrolllock_on: u16 = 0x0040;
+            pub const capslock_on: u16 = 0x0080;
+            pub const enhanced_key: u16 = 0x0100;
+
+            pub const modifiers: u16 = right_alt | left_alt | right_ctrl | left_ctrl | shift;
+        };
+
+        pub fn typed(self: *const Win32Record) []const u16 {
+            return self.units[0..self.units_len];
+        }
+
+        /// Replace the modifier bits with `mods`, keeping the lock and
+        /// ENHANCED_KEY bits. For a `key-remap`: the record reports the
+        /// modifiers a console application reads, so it has to follow the
+        /// remap like the encoded modifiers do. Super has no console bit.
+        pub fn setModifiers(self: *Win32Record, mods: Mods) void {
+            var cs = self.control_key_state & ~ControlKeyState.modifiers;
+            if (mods.shift) cs |= ControlKeyState.shift;
+            if (mods.ctrl) cs |= if (mods.sides.ctrl == .right)
+                ControlKeyState.right_ctrl
+            else
+                ControlKeyState.left_ctrl;
+            if (mods.alt) cs |= if (mods.sides.alt == .right)
+                ControlKeyState.right_alt
+            else
+                ControlKeyState.left_alt;
+            self.control_key_state = cs;
+        }
+    };
+
     /// Returns the effective modifiers for this event. The effective
     /// modifiers are the mods that should be considered for keybindings.
     pub fn effectiveMods(self: KeyEvent) Mods {
