@@ -2283,32 +2283,39 @@ pub const SettingsWindow = struct {
 
     fn pendingDiffText(self: *const SettingsWindow, buf: []u8) []const u8 {
         const transaction = &(self.transaction orelse return no_pending_changes_text);
-        var writer: std.Io.Writer = .fixed(buf);
+        // The tail of the buffer is kept for the "and more" line.
+        var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - more_changes_text.len]);
         var count: usize = 0;
+        var truncated = false;
         for (transaction.entries) |entry| {
             if (!entry.dirty) continue;
             const line_start = writer.end;
             writeSettingDiffLine(&writer, entry.field, entry.baseline, entry.draft) catch {
                 // A cut-off line may end inside a character, which would blank the page.
                 writer.end = line_start;
+                truncated = true;
                 break;
             };
             count += 1;
         }
-        if (self.original) |*original| if (self.pending) |*pending| {
-            const owned_start = writer.end;
-            count += writeOwnedSettingDiffs(
+        if (!truncated) if (self.original) |*original| if (self.pending) |*pending| {
+            const owned = writeOwnedSettingDiffs(
                 &writer,
                 original,
                 pending,
                 self.owned_dirty,
                 self.owned_conflict,
-            ) catch blk: {
-                writer.end = owned_start;
-                break :blk 0;
-            };
+            );
+            count += owned.lines;
+            truncated = owned.truncated;
         };
-        return if (count == 0) no_pending_changes_text else writer.buffered();
+        if (count == 0 and !truncated) return no_pending_changes_text;
+        if (truncated) {
+            const end = writer.end;
+            @memcpy(buf[end..][0..more_changes_text.len], more_changes_text);
+            return buf[0 .. end + more_changes_text.len];
+        }
+        return writer.buffered();
     }
 
     pub fn hasConflict(self: *const SettingsWindow, field: SettingField) bool {
@@ -6965,6 +6972,47 @@ test "settings pending changes read in the form's words" {
     try expectNoInternalSyntax(text);
 }
 
+test "settings pending changes drop a line that does not fit, not the lines before it" {
+    var current = try Config.default(std.testing.allocator);
+    current.@"font-size" = 12;
+    current.@"cursor-style" = .block;
+    var settings: SettingsWindow = .{
+        .handle = modelOnlyHandle(),
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+    const pending = &settings.pending.?;
+    pending.@"font-size" = 14;
+    settings.trackEdit(.font_size, true);
+    pending.@"cursor-style" = .underline;
+    settings.trackEdit(.cursor_style, true);
+
+    // Room for the first line and the closing one, not the second.
+    var small: [48]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Font size: 12 pt -> 14 pt\n" ++ more_changes_text,
+        settings.pendingDiffText(&small),
+    );
+
+    // The owned fields: a short font family stays when a long command cannot fit.
+    const arena = pending._arena.?.allocator();
+    pending.@"font-family" = try parseFontFamilyEditText(arena, "Cascadia Mono");
+    settings.owned_dirty[@intFromEnum(OwnedSettingField.font_family)] = true;
+    const long_command = try arena.dupeZ(u8, "pwsh.exe " ++ "-NoLogo " ** 40);
+    pending.command = .{ .shell = long_command };
+    settings.owned_dirty[@intFromEnum(OwnedSettingField.command)] = true;
+    var buf: [256]u8 = undefined;
+    const text = settings.pendingDiffText(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Font size: 12 pt -> 14 pt\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Font family: (default) -> Cascadia Mono\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Default command") == null);
+    try std.testing.expect(std.mem.endsWith(u8, text, more_changes_text));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+}
+
 test "settings diff writes every field's values without debug syntax" {
     var buf: [256]u8 = undefined;
     for (std.enums.values(SettingField)) |field| {
@@ -8469,26 +8517,49 @@ fn conflictStatusText(buf: []u8, label: []const u8) []const u8 {
         "A setting also changed on disk. Choose Keep mine or Use disk.";
 }
 
+/// Closes a diff list that did not fit; written into the buffer's reserved tail.
+const more_changes_text = "...and more changes.\n";
+
+const OwnedDiffs = struct { lines: usize, truncated: bool };
+
+/// The lines of the owned fields (font family, theme, default command) that are
+/// edited or in conflict. A line that does not fit is dropped whole, so a long
+/// default command costs only its own line, not the short ones before it.
 fn writeOwnedSettingDiffs(
     writer: *std.Io.Writer,
     original: *const Config,
     pending: *const Config,
     dirty: [owned_setting_field_count]bool,
     conflict: [owned_setting_field_count]bool,
-) !usize {
-    var count: usize = 0;
+) OwnedDiffs {
+    var result: OwnedDiffs = .{ .lines = 0, .truncated = false };
     for (std.enums.values(OwnedSettingField)) |field| {
         const index = @intFromEnum(field);
         if (!dirty[index] and !conflict[index]) continue;
-        try writer.print("{s}: ", .{field.label()});
-        try writeOwnedSettingValue(writer, original, field);
-        try writer.writeAll(" -> ");
-        try writeOwnedSettingValue(writer, pending, field);
-        if (conflict[index]) try writer.writeAll(" (conflict)");
-        try writer.writeByte('\n');
-        count += 1;
+        const line_start = writer.end;
+        writeOwnedSettingDiffLine(writer, original, pending, field, conflict[index]) catch {
+            writer.end = line_start;
+            result.truncated = true;
+            break;
+        };
+        result.lines += 1;
     }
-    return count;
+    return result;
+}
+
+fn writeOwnedSettingDiffLine(
+    writer: *std.Io.Writer,
+    original: *const Config,
+    pending: *const Config,
+    field: OwnedSettingField,
+    conflict: bool,
+) !void {
+    try writer.print("{s}: ", .{field.label()});
+    try writeOwnedSettingValue(writer, original, field);
+    try writer.writeAll(" -> ");
+    try writeOwnedSettingValue(writer, pending, field);
+    if (conflict) try writer.writeAll(" (conflict)");
+    try writer.writeByte('\n');
 }
 
 fn utf8ToW(buf: []u16, text: []const u8) [*:0]const u16 {
@@ -8726,10 +8797,9 @@ test "win32_settings: advanced diff includes arena-backed-only edits" {
     conflict[@intFromEnum(OwnedSettingField.theme)] = true;
     var buf: [1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    try std.testing.expectEqual(
-        @as(usize, 3),
-        try writeOwnedSettingDiffs(&writer, &original, &pending, dirty, conflict),
-    );
+    const owned = writeOwnedSettingDiffs(&writer, &original, &pending, dirty, conflict);
+    try std.testing.expectEqual(@as(usize, 3), owned.lines);
+    try std.testing.expect(!owned.truncated);
     const text = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "Font family: Cascadia Mono -> JetBrains Mono, Symbols Nerd Font") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Terminal theme: Old Theme -> light:Day,dark:Night (conflict)") != null);
