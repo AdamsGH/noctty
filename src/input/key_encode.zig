@@ -355,6 +355,16 @@ fn legacy(
         break :function .{ event.key, all_mods };
     };
 
+    // ConPTY accepts modified F3 as CSI 1;<modifier>R, but drops the
+    // shared table's CSI 13;<modifier>~ form (including the F15 alias).
+    if (windows_legacy and function_key == .f3) {
+        for (function_keys.modifiers, 2..) |mods, modifier| {
+            if (mods.int() == function_mods.binding().int()) {
+                return try writer.print("\x1b[1;{}R", .{modifier});
+            }
+        }
+    }
+
     // If we match a PC style function key then that is our result.
     if (pcStyleFunctionKey(
         function_key,
@@ -2161,7 +2171,7 @@ test "legacy: F13 through F24" {
 test "legacy: Windows console F13 through F24 aliases shifted function keys" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const inputs = [_]key.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
-    const outputs = [_][]const u8{ "\x1b[1;2P", "\x1b[1;2Q", "\x1b[13;2~", "\x1b[1;2S", "\x1b[15;2~", "\x1b[17;2~", "\x1b[18;2~", "\x1b[19;2~", "\x1b[20;2~", "\x1b[21;2~", "\x1b[23;2~", "\x1b[24;2~" };
+    const outputs = [_][]const u8{ "\x1b[1;2P", "\x1b[1;2Q", "\x1b[1;2R", "\x1b[1;2S", "\x1b[15;2~", "\x1b[17;2~", "\x1b[18;2~", "\x1b[19;2~", "\x1b[20;2~", "\x1b[21;2~", "\x1b[23;2~", "\x1b[24;2~" };
     for (inputs, outputs) |input, output| {
         var buf: [128]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
