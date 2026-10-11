@@ -132,6 +132,9 @@ pub const SettingsColors = struct {
     error_text: u32,
     edit_bg: u32,
     edit_text: u32,
+    /// The resting frame of a text field (Settings paints its own field
+    /// frames; see `win32_settings.paintFieldFrame`).
+    field_border: u32,
     button_bg: u32,
     button_text: u32,
     is_dark: bool,
@@ -163,6 +166,7 @@ pub fn settingsColors(
             .error_text = system.button_text,
             .edit_bg = system.window,
             .edit_text = system.window_text,
+            .field_border = system.window_text,
             .button_bg = system.button_face,
             .button_text = system.button_text,
             .is_dark = false,
@@ -184,6 +188,7 @@ pub fn settingsColors(
         .error_text = theme.error_fg,
         .edit_bg = theme.edit_bg,
         .edit_text = theme.edit_fg,
+        .field_border = theme.edit_border_unfocused,
         .button_bg = theme.button_bg,
         .button_text = theme.button_fg,
         .is_dark = theme.is_dark,
@@ -546,7 +551,10 @@ pub fn darkTheme() ThemeColors {
         .accent = rgb(116, 156, 224),
         .accent_hover = rgb(132, 172, 238),
         .chrome_accent_idle = rgb(62, 62, 62),
-        .edit_border_unfocused = rgb(72, 72, 72),
+        // The Settings field frame. The themed edit border it replaced was
+        // #646464 in both modes; this is the nearest gray that keeps 3:1
+        // against the dark pane and the field (WCAG 1.4.11).
+        .edit_border_unfocused = rgb(106, 106, 106),
 
         .button_bg = rgb(38, 38, 38),
         .button_border = rgb(58, 58, 58),
@@ -603,7 +611,8 @@ pub fn lightTheme() ThemeColors {
         .accent = rgb(0, 120, 212),
         .accent_hover = rgb(0, 99, 177),
         .chrome_accent_idle = rgb(180, 180, 180),
-        .edit_border_unfocused = rgb(160, 160, 160),
+        // The themed edit border the Settings field frame replaced.
+        .edit_border_unfocused = rgb(100, 100, 100),
 
         .button_bg = rgb(251, 251, 251),
         .button_border = rgb(209, 209, 209),
@@ -1107,8 +1116,27 @@ test "settings colors follow explicit light and dark app themes" {
     try std.testing.expectEqual(darkTheme().button_active_fg, dark.selection_text);
     try std.testing.expectEqual(darkTheme().button_focus_ring, dark.focus_ring);
     try std.testing.expectEqual(darkTheme().error_fg, dark.error_text);
+    try std.testing.expectEqual(darkTheme().edit_border_unfocused, dark.field_border);
     try std.testing.expect(light.window_bg != dark.window_bg);
     try std.testing.expect(light.edit_bg != dark.edit_bg);
+}
+
+test "settings field frames keep 3:1 against the pane and the field" {
+    const RGB = @import("../terminal/color.zig").RGB;
+    const of = struct {
+        fn rgbOf(color: u32) RGB {
+            return .{ .r = @truncate(color), .g = @truncate(color >> 8), .b = @truncate(color >> 16) };
+        }
+    }.rgbOf;
+    const system = std.mem.zeroes(SettingsSystemColors);
+    for ([_]ThemeColors{ lightTheme(), darkTheme() }) |theme| {
+        const colors = settingsColors(theme, system, false);
+        // WCAG 1.4.11: the resting frame and the focus stroke.
+        for ([_]u32{ colors.field_border, colors.accent }) |stroke| {
+            try std.testing.expect(of(stroke).contrast(of(colors.window_bg)) >= 3.0);
+            try std.testing.expect(of(stroke).contrast(of(colors.edit_bg)) >= 3.0);
+        }
+    }
 }
 
 test "settings high contrast uses only exact system color roles" {
@@ -1137,6 +1165,7 @@ test "settings high contrast uses only exact system color roles" {
     try std.testing.expectEqual(system.button_text, colors.error_text);
     try std.testing.expectEqual(system.window, colors.edit_bg);
     try std.testing.expectEqual(system.window_text, colors.edit_text);
+    try std.testing.expectEqual(system.window_text, colors.field_border);
     try std.testing.expectEqual(@as(u32, 0), settingsDwmDarkModeValue(colors));
     try std.testing.expectEqual(
         @as(u32, 1),
