@@ -216,7 +216,7 @@ fn tokenUser(bytes: []align(@alignOf(TokenUser)) const u8) *const TokenUser {
     return @ptrCast(bytes.ptr);
 }
 
-fn allocCurrentUserSidString(alloc: Allocator) ![]u8 {
+pub fn allocCurrentUserSidString(alloc: Allocator) ![]u8 {
     const token = try openProcessToken(windows.GetCurrentProcess());
     defer _ = windows.CloseHandle(token);
 
