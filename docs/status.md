@@ -162,8 +162,10 @@ Win32-validated VT protocol coverage is tracked in
 ### Renderer
 
 - Terminal content renders with OpenGL 4.3+ via WGL.
-- Window chrome uses a separate D3D11/DirectComposition + DirectWrite
-  pipeline with GDI fallback; it never touches the terminal renderer.
+- Window chrome is painted with GDI. The D3D11/DirectComposition +
+  DirectWrite shell pipeline is not started at launch (its device graph cost
+  about 156 ms to first swap and 79 driver threads for banner text alone); it
+  never touches the terminal renderer.
 - Presentation is power- and visibility-aware: focused non-saver cadence is
   unchanged, unfocused and saver pacing is capped, and minimized or
   DWM-cloaked windows stop presenting. Details and measurement fields are in
