@@ -187,23 +187,33 @@ GHOSTTY_API void ghostty_osc_next(GhosttyOscParser parser, uint8_t byte);
  * (ESC or ST). This function finalizes the parsing process and returns the 
  * parsed OSC command.
  *
- * The return value is never NULL. Invalid commands will return a command
- * with type GHOSTTY_OSC_COMMAND_INVALID.
- * 
+ * If the sequence is not a valid command, this returns NULL. You don't need
+ * to check for NULL before calling ghostty_osc_command_type(), which
+ * returns GHOSTTY_OSC_COMMAND_INVALID for it. A sequence longer than its
+ * command allows is not valid: most commands take up to 2048 bytes after
+ * the number, OSC 52 (clipboard), 66 and 5522 up to 8 MiB, and OSC 7501
+ * up to 4087.
+ *
  * The terminator parameter specifies the byte that terminated the OSC sequence
  * (typically 0x07 for BEL or 0x5C for ST after ESC). This information is
  * preserved in the parsed command so that responses can use the same terminator
  * format for better compatibility with the calling program. For commands that
  * do not require a response, this parameter is ignored and the resulting
  * command will not retain the terminator information.
- * 
+ *
+ * If the program cancelled the sequence with CAN (0x18) or SUB (0x1A),
+ * pass that byte as the terminator. The sequence is then discarded and
+ * this returns NULL, whatever command it contained, as xterm does.
+ *
  * The returned command handle is valid until the next call to any 
  * `ghostty_osc_*` function with the same parser instance with the exception
  * of command introspection functions such as `ghostty_osc_command_type`.
  * 
  * @param parser The parser handle, must not be null.
- * @param terminator The terminating byte of the OSC sequence (0x07 for BEL, 0x5C for ST)
- * @return Handle to the parsed OSC command
+ * @param terminator The byte that ended the OSC sequence: 0x07 for BEL,
+ *        0x5C for ST, or 0x18 (CAN) or 0x1A (SUB) if it was cancelled
+ * @return Handle to the parsed OSC command, or NULL if the sequence is not
+ *         a valid command or was cancelled
  * 
  * @ingroup osc
  */

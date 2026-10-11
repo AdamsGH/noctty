@@ -94,13 +94,13 @@ pub fn unset(self: *Tabstops, col: usize) void {
     const i = entry(col);
     const idx = index(col);
     if (i < prealloc_count) {
-        self.prealloc_stops[i] ^= masks[idx];
+        self.prealloc_stops[i] &= ~masks[idx];
         return;
     }
 
     const dynamic_i = i - prealloc_count;
     assert(dynamic_i < self.dynamic_stops.len);
-    self.dynamic_stops[dynamic_i] ^= masks[idx];
+    self.dynamic_stops[dynamic_i] &= ~masks[idx];
 }
 
 /// Get the value of a tabstop at a specific column. The columns are 0-indexed.

@@ -1898,8 +1898,9 @@ const ReflowCursor = struct {
             }
         }
 
-        // Clear the row from the old page and truncate it.
-        old_page.clearCells(old_row, 0, old_page.size.cols);
+        // Reset the row on the old page and truncate it. The retired
+        // storage must be left in the default state (see resetRow).
+        old_page.resetRow(old_row);
         old_page.size.rows -= 1;
 
         // If that was the last row in that page
@@ -2403,11 +2404,7 @@ fn resizeWithoutReflowGrowCols(
         const prev_page = &prev.?.data;
         const prev_size = prev_page.size.rows - prev_copied;
         const prev_rows = prev_page.rows.ptr(prev_page.memory)[prev_size..prev_page.size.rows];
-        for (prev_rows) |*row| prev_page.clearCells(
-            row,
-            0,
-            prev_page.size.cols,
-        );
+        for (prev_rows) |*row| prev_page.resetRow(row);
         prev_page.size.rows = prev_size;
     };
 
@@ -2536,10 +2533,7 @@ fn eraseTrailingRows(self: *PageList, n: usize) void {
         // Free what the rows hold and reset their flags, since a later
         // grow() hands the same memory back out.
         const rows = page.rows.ptr(page.memory);
-        for (rows[keep..page.size.rows]) |*row| {
-            page.clearCells(row, 0, page.size.cols);
-            row.* = .{ .cells = row.cells };
-        }
+        for (rows[keep..page.size.rows]) |*row| page.resetRow(row);
 
         if (keep == 0) {
             self.erasePage(node);
@@ -2595,9 +2589,12 @@ fn trimTrailingBlankRows(
             return trimmed;
         }
 
-        // No text, we can trim this row. Because it has
-        // no text we can also be sure it has no styling
-        // so we don't need to worry about memory.
+        // No text, we can trim this row. The row can still carry
+        // metadata (e.g. a blank prompt continuation line) and
+        // background-colored cells. The retired storage is re-exposed by
+        // the grow() fast path without any clearing, so it must be left
+        // in the default state.
+        row_pin.node.data.resetRow(row_pin.rowAndCell().row);
         row_pin.node.data.size.rows -= 1;
         if (row_pin.node.data.size.rows == 0) {
             self.erasePage(row_pin.node);
@@ -3090,13 +3087,11 @@ pub fn split(
         // p.x remains the same since we're copying the row as-is
     }
 
-    // Clear our rows
+    // Reset our rows. They are retired into unused page capacity,
+    // which the grow() fast path re-exposes without any clearing, so
+    // they must be left in the default state.
     for (page.rows.ptr(page.memory)[y_start..y_end]) |*row| {
-        page.clearCells(
-            row,
-            0,
-            page.size.cols,
-        );
+        page.resetRow(row);
     }
     page.size.rows -= y_end - y_start;
 
@@ -3277,7 +3272,12 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
     const last = self.pages.last.?;
     if (last.data.capacity.rows > last.data.size.rows) {
-        // Fast path: we have capacity in the last page.
+        // Fast path: we have capacity in the last page. The exposed
+        // row requires no clearing work here: rows in unused page
+        // capacity are always in the default state, either because the
+        // page memory was never used (pool buffers are zeroed) or
+        // because whatever retired the row reset it (see Page.resetRow,
+        // which leaves only the dirty bit set).
         last.data.size.rows += 1;
         last.data.assertIntegrity();
 
@@ -3714,8 +3714,10 @@ pub fn eraseRow(
         }
     }
 
-    // Clear the final row which was rotated from the top of the page.
-    node.data.clearCells(&rows[node.data.size.rows - 1], 0, node.data.size.cols);
+    // Reset the final row which was rotated from the top of the page.
+    // A full reset (not just clearing cells) so no metadata from the
+    // erased row is retained by the new blank row.
+    node.data.resetRow(&rows[node.data.size.rows - 1]);
 }
 
 /// A variant of eraseRow that shifts only a bounded number of following
@@ -3745,7 +3747,7 @@ pub fn eraseRowBounded(
     // page, then we clear the row, rotate it to the end of the boundary limit
     // and update our pins.
     if (node.data.size.rows - pn.y > limit) {
-        node.data.clearCells(&rows[pn.y], 0, node.data.size.cols);
+        node.data.resetRow(&rows[pn.y]);
         fastmem.rotateOnce(Row, rows[pn.y..][0 .. limit + 1]);
 
         // Mark the whole page as dirty.
@@ -3845,7 +3847,7 @@ pub fn eraseRowBounded(
         // The logic here is very similar to the one before the loop.
         const shifted_limit = limit - shifted;
         if (node.data.size.rows > shifted_limit) {
-            node.data.clearCells(&rows[0], 0, node.data.size.cols);
+            node.data.resetRow(&rows[0]);
             fastmem.rotateOnce(Row, rows[0 .. shifted_limit + 1]);
 
             // Mark the whole page as dirty.
@@ -3911,9 +3913,9 @@ pub fn eraseRowBounded(
         }
     }
 
-    // We reached the end of the page list before the limit, so we clear
+    // We reached the end of the page list before the limit, so we reset
     // the final row since it was rotated down from the top of this page.
-    node.data.clearCells(&rows[node.data.size.rows - 1], 0, node.data.size.cols);
+    node.data.resetRow(&rows[node.data.size.rows - 1]);
 }
 
 /// Erase all history rows, optionally up to a bottom-left bound.
@@ -4000,15 +4002,12 @@ fn eraseRows(
             dst.dirty = true;
         }
 
-        // Clear our remaining cells that we didn't shift or swapped
-        // in case we grow back into them.
+        // Reset our remaining rows that we didn't shift or swapped.
+        // These are retired into unused page capacity, which the
+        // grow() fast path re-exposes without any clearing, so they
+        // must be left in the default state.
         for (scroll_amount..chunk.node.data.size.rows) |i| {
-            const row: *Row = &rows[i];
-            chunk.node.data.clearCells(
-                row,
-                0,
-                chunk.node.data.size.cols,
-            );
+            chunk.node.data.resetRow(&rows[i]);
         }
 
         // Update any tracked pins to shift their y. If it was in the erased

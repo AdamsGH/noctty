@@ -834,6 +834,12 @@ pub fn cursorDownScroll(self: *Screen) !void {
                 self.cursor.page_row,
                 page.getCells(self.cursor.page_row),
             );
+
+            // The row is a fresh blank row now and must not retain
+            // metadata (wrap state, semantic prompt) from the
+            // discarded content.
+            self.cursor.page_row.reset();
+
             self.cursorMarkDirty();
         } else {
             // The call to `eraseRow` will move the tracked cursor pin up by one
@@ -1123,6 +1129,11 @@ fn cursorScrollAboveRotate(self: *Screen) !void {
         &cur_rows[self.cursor.page_pin.y],
         cur_page.getCells(&cur_rows[self.cursor.page_pin.y]),
     );
+
+    // The recycled storage becomes the new blank cursor row and must
+    // not retain metadata (wrap state, semantic prompt) from the row
+    // whose content was moved to the next page.
+    cur_rows[self.cursor.page_pin.y].reset();
 
     // Mark the whole page as dirty.
     //
