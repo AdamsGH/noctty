@@ -61,7 +61,7 @@ $releasePreflightStepSha256 =
 $readinessPreflightStepSha256 =
     '153aa1d2b13ac09f38ba3269bc78840e57a93c98e54b99168a5d937b8dab7989'
 $releaseWorkflowSha256 =
-    '3f9d182557fb6b841848f7c41f7fd612f630795629aa7955ba371fa358b2e36e'
+    'fb4989d35a3042271f76959f65882143c6bad446c7618baa215f34de59e9aed3'
 $readinessWorkflowSha256 =
     '7c66f756a0219af4e791bccef9824c7373050e41aa753836f6f95577a5a1edc5'
 # Full-file pins deliberately make every workflow edit a semantic-review event,

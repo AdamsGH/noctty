@@ -128,6 +128,52 @@ $libVtStep = Get-YamlStepBlock -Content $libVtJob -Name 'Run libghostty-vt and C
 if ($libVtStep -notmatch 'run: zig build test-lib-vt -Demit-lib-vt=true --summary all') {
     throw 'CI must run the separate libghostty-vt graph and report its test count.'
 }
+# Required coverage must execute and propagate failures at both YAML levels.
+# The experimental ConPTY job is intentionally excluded from this contract.
+function Test-MandatoryWorkflowCoverage {
+    param(
+        [Parameter(Mandatory)] [string] $JobText,
+        [Parameter(Mandatory)] [string[]] $StepNames
+    )
+
+    if ($JobText -match '(?m)^    [''"]?(?:if|continue-on-error)[''"]?[ \t]*:') { return $false }
+    foreach ($name in $StepNames) {
+        $step = Get-YamlStepBlock -Content $JobText -Name $name -Source 'required coverage'
+        if ($step -match '(?m)^        [''"]?(?:if|continue-on-error)[''"]?[ \t]*:') { return $false }
+    }
+    return $true
+}
+$coverageMutationCount = 0
+foreach ($coverage in @(
+        @{ Job = $windowsHostedJob; Steps = @(
+                'PowerShell shell integration tests (PowerShell 7)',
+                'PowerShell shell integration tests (Windows PowerShell 5.1)',
+                'Interactive hints contract checks'
+            ) },
+        @{ Job = $libVtJob; Steps = @('Run libghostty-vt and C API tests') }
+    )) {
+    if (-not (Test-MandatoryWorkflowCoverage -JobText $coverage.Job -StepNames $coverage.Steps)) {
+        throw 'Required shell, hints, and library coverage must be unconditional and fail closed.'
+    }
+    foreach ($setting in @(
+            'if: false', 'continue-on-error: true',
+            "'if': false", "'continue-on-error': true",
+            '"if": false', '"continue-on-error": true',
+            'if : false', 'continue-on-error : true'
+        )) {
+        $mutations = @($coverage.Job.Replace('    steps:', "    $setting`n    steps:"))
+        foreach ($name in $coverage.Steps) {
+            $mutations += $coverage.Job.Replace("      - name: $name", "      - name: $name`n        $setting")
+        }
+        foreach ($mutation in $mutations) {
+            if (Test-MandatoryWorkflowCoverage -JobText $mutation -StepNames $coverage.Steps) {
+                throw "Required coverage accepted a disabled or ignored mutation: $setting"
+            }
+            $coverageMutationCount++
+        }
+    }
+}
+Write-Host "Required workflow coverage: $coverageMutationCount/$coverageMutationCount disabling mutations rejected"
 $conptyJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows-conpty-probes' -Source $testWorkflow
 $conptyStep = Get-YamlStepBlock -Content $conptyJob -Name 'Run opt-in ConPTY transport and key input probes' -Source $testWorkflow
 if ($conptyJob -notmatch '(?m)^    continue-on-error: true\s*$' -or
@@ -150,7 +196,7 @@ $releaseTests = Get-YamlStepBlock -Content $releaseWindowsJob -Name 'Run full te
 if ($releaseTests -notmatch '-Dcustom-shaders=true --summary all') {
     throw 'Release tests must use shipped shader support and report the test count.'
 }
-if ($releaseWindowsJob -notmatch 'choco install innosetup --version=6\.5\.4 --no-progress -y') {
+if ($releaseWindowsJob -notmatch 'choco install innosetup --version=6\.7\.1 --no-progress -y') {
     throw 'The installer compiler version must remain pinned.'
 }
 Invoke-ContractTable -Contracts @(

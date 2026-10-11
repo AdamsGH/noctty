@@ -277,10 +277,10 @@ try {
         # A ReadOnly prompt cannot be wrapped. The line reader tries before
         # every line, and it must neither put an error in $Error each time
         # nor use up a wrapper id per attempt.
-        Microsoft.PowerShell.Management\Set-Item -Path 'function:prompt' -Value { 'LOCKED> ' } -Options ReadOnly -Force
+        Microsoft.PowerShell.Management\Set-Item -Path 'function:global:prompt' -Value { 'LOCKED> ' } -Options ReadOnly -Force
         try {
-            # Set-Item on the function drive changes the existing global prompt
-            # in place rather than shadowing it in script scope; make sure.
+            # CI invokes this harness from another script. Target global scope
+            # explicitly so that caller's script scope cannot shadow the fixture.
             Assert-True ((& ${function:global:prompt}) -ceq 'LOCKED> ') "The ReadOnly test prompt is not the global prompt"
             $countBefore = $Global:__ghostty_prompt_count
             $errorsBefore = $Error.Count
@@ -290,7 +290,7 @@ try {
             $lockedIds = $Global:__ghostty_prompt_count - $countBefore
             $lockedText = (Invoke-TestPrompt).Text
         } finally {
-            Microsoft.PowerShell.Management\Remove-Item -Path 'function:prompt' -Force
+            Microsoft.PowerShell.Management\Set-Item -Path 'function:global:prompt' -Value $savedPrompt -Options None -Force
         }
         Assert-True ($lockedErrors -eq 0) "Wrapping a ReadOnly prompt added $lockedErrors record(s) to `$Error"
         Assert-True ($lockedIds -eq 0) "Wrapping a ReadOnly prompt used up $lockedIds wrapper id(s)"
