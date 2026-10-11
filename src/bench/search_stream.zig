@@ -93,6 +93,7 @@ fn buildLines(
     count: usize,
 ) ![]u8 {
     const out = try alloc.alloc(u8, count * args.line_len);
+    errdefer alloc.free(out);
     for (0..count) |i| {
         const n = first + i;
         const line = out[i * args.line_len ..][0..args.line_len];
@@ -102,7 +103,14 @@ fn buildLines(
             line[0 .. args.line_len - 2],
             "{d:0>8} GET /api/items/{d} {s} status={d} bytes={d} ",
             .{ n, n % 9973, word, 200 + (n % 5) * 100, n % 65536 },
-        ) catch {};
+        ) catch {
+            // A cut line could lose the needle and measure another workload.
+            std.log.err(
+                "bench:search-stream: --line-len={d} is too short for the line text and --needle",
+                .{args.line_len},
+            );
+            return error.InvalidArgument;
+        };
         line[args.line_len - 2] = '\r';
         line[args.line_len - 1] = '\n';
     }
