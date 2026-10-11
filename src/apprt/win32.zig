@@ -3716,6 +3716,10 @@ pub const App = struct {
     quick_terminal_keyboard_diagnostic_logged: bool = false,
     update_check_running: std.atomic.Value(bool) = .init(false),
     update_notice: ?UpdateNotice = null,
+    /// The host whose banner button started the running update action, so
+    /// its feedback lands in the window the user is looking at. Set only for
+    /// the length of that synchronous call (`Host.activateBannerButton`).
+    update_action_host: ?*Host = null,
     update_auto_check_started: bool = false,
     update_startup_ready: bool = false,
     /// Most-recently-used command palette actions; newest first. Strings
@@ -6441,13 +6445,54 @@ pub const App = struct {
     /// Updater feedback in the banner. A failure is `.err`, so it stays
     /// until dismissed instead of counting down like an `.info` message.
     fn showUpdateInfo(self: *App, kind: HostBannerKind, message: []const u8) !void {
-        if (self.primarySurface()) |surface| {
-            if (surface.host) |host| {
-                try host.setBanner(kind, message);
-                return;
-            }
-        }
+        // The window whose button was pressed, else the primary one. A host
+        // with no tab (its last one detached for undo) still shows a banner.
+        // Opening the release can pump messages, so check that the pressing
+        // window is still open before using it.
+        const pressed_in: ?*Host = if (self.update_action_host) |pressed| for (self.hosts.items) |live| {
+            if (live == pressed) break pressed;
+        } else null else null;
+        const host: ?*Host = pressed_in orelse blk: {
+            if (self.primarySurface()) |surface| if (surface.host) |value| break :blk value;
+            break :blk if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        };
+        if (host) |value| return value.setBanner(kind, message);
         try showInfoMessage(.app, "noctty", message);
+    }
+
+    test "showUpdateInfo answers in the window whose banner button was pressed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var first: Host = undefined;
+        var second: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{
+                .{ .storage = &first, .id = 1, .register = true },
+                .{ .storage = &second, .id = 2, .register = true },
+            },
+        });
+        defer session.deinit();
+
+        app.update_action_host = &second;
+        try app.showUpdateInfo(.err, "Install failed.");
+        try std.testing.expectEqual(@as(?[:0]const u8, null), first.banner_text);
+        try std.testing.expectEqualStrings("Install failed.", second.banner_text.?);
+
+        // A pressing window that has since closed is not used.
+        _ = app.hosts.swapRemove(1);
+        try app.showUpdateInfo(.err, "Still failed.");
+        try std.testing.expectEqualStrings("Still failed.", first.banner_text.?);
+
+        // With no pressed window and no surface to find the primary window
+        // by, the first window answers rather than only the log.
+        app.update_action_host = null;
+        try app.showUpdateInfo(.info, "Up to date.");
+        try std.testing.expectEqualStrings("Up to date.", first.banner_text.?);
     }
 
     fn showRecoverySafeModeNotice(_: *App, _: []const u8) void {
@@ -16638,8 +16683,14 @@ const Host = struct {
         }
         if (self.app.update_notice == null) return;
         switch (button) {
-            .primary => self.app.openUpdateNotice() catch |err| {
-                log.warn("failed to open update notice err={}", .{err});
+            .primary => {
+                // Install can destroy this host; only the app is used after.
+                const app = self.app;
+                app.update_action_host = self;
+                defer app.update_action_host = null;
+                app.openUpdateNotice() catch |err| {
+                    log.warn("failed to open update notice err={}", .{err});
+                };
             },
             .dismiss => self.app.dismissUpdateNotice(),
         }
@@ -17075,6 +17126,12 @@ const Host = struct {
             bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.primary), &name_buf),
         );
         try std.testing.expectEqualStrings("Dismiss update notice", bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.dismiss), &name_buf));
+        // A staged update offers Install instead, in the label and the name.
+        app.update_notice.?.staged = true;
+        try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Install"), host.bannerButtonLabel(.primary));
+        try std.testing.expect(std.mem.startsWith(u8, bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.primary), &name_buf), "Install: "));
+        try std.testing.expectEqual(chrome_layout.BannerActions.update_staged, host.bannerActions());
+        app.update_notice.?.staged = false;
         // Updates never count down.
         try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
 
@@ -17847,9 +17904,13 @@ const Host = struct {
                 .role = .live_text,
                 .name = &bannerUiaName,
             });
-            // Real buttons, so the keyboard, UIA Invoke and voice control
-            // reach them like any other; F6 lands on the first one shown.
+        }
+        // Real buttons, so the keyboard, UIA Invoke and voice control reach
+        // them like any other; F6 lands on the first one shown. Outside the
+        // banner's own guard, so one that failed to be created is retried.
+        if (self.banner_hwnd) |banner| {
             for (&self.banner_buttons, &self.banner_button_uia_providers, 0..) |*slot, *provider, i| {
+                if (slot.* != null) continue;
                 const button = sys.CreateWindowExW(
                     0,
                     prompt_button_class,
@@ -17859,7 +17920,7 @@ const Host = struct {
                     0,
                     1,
                     1,
-                    self.banner_hwnd.?,
+                    banner,
                     @ptrFromInt(1914 + i),
                     self.app.hinstance,
                     null,
