@@ -324,4 +324,3 @@ finally {
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $RunRoot 'result.json')
 }
 if ($result.status -ne 'PASS') { exit 1 }
-
