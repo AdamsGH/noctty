@@ -282,7 +282,15 @@ const Search = struct {
     state: terminal.search.Thread,
     thread: std.Thread,
 
+    /// Set before the search thread is told to stop. The app thread joins
+    /// that thread in `deinit` and cannot drain the app mailbox meanwhile,
+    /// so once this is set the search thread sends nothing more, and a push
+    /// already waiting for room gives up (see `pushSearchMessage`).
+    stopping: std.atomic.Value(bool) = .init(false),
+
     pub fn deinit(self: *Search) void {
+        self.stopping.store(true, .release);
+
         // Notify the thread to stop
         self.state.stop.notify() catch |err| log.err(
             "error notifying search thread to stop, may stall err={}",
@@ -296,6 +304,100 @@ const Search = struct {
         self.state.deinit();
     }
 };
+
+test "Surface: ending a search does not wait for room in a full app mailbox" {
+    // The app thread joins the search thread when a search ends and cannot
+    // drain the app mailbox meanwhile, so a search thread waiting for room
+    // in it would never finish. This drives `Search.deinit`, which
+    // `endSearch`, `setSearchQuery("")` and `deinit` all end with.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+    {
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("needle\r\nneedle\r\nneedle");
+    }
+    var mutex: std.Thread.Mutex = .{};
+
+    // Only the fields that starting a search, its event callback and the
+    // app wakeup read are set; the rest is zeroed so that a new read of an
+    // unset pointer faults instead of reading garbage.
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    @memset(std.mem.asBytes(app), 0);
+    app.mailbox = .{};
+    // No windows and no UI thread: waking the app does nothing.
+    const rt_app = try alloc.create(apprt.runtime.App);
+    defer alloc.destroy(rt_app);
+    @memset(std.mem.asBytes(rt_app), 0);
+    rt_app.windows = .empty;
+    rt_app.ui_thread_id = 0;
+
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    @memset(std.mem.asBytes(surface), 0);
+    surface.alloc = alloc;
+    surface.app = app;
+    surface.rt_app = rt_app;
+    surface.renderer_state.mutex = &mutex;
+    surface.renderer_state.terminal = &t;
+    surface.visible = true;
+    surface.focused = true;
+    surface.search = null;
+    surface.search_generation = .init(0);
+    surface.search_query_options = .{};
+
+    // Fill the app mailbox but for one slot, as a stalled app thread with
+    // busy panes would. The search's first event (the total) takes it, and
+    // the next, the viewport matches with their arena, waits for room; the
+    // testing allocator then checks that dropping it freed the arena.
+    while (app.mailbox.push(.quit, .instant) > 0) {}
+    app.mailbox.pop().?.deinit(alloc);
+    defer while (app.mailbox.pop()) |message| message.deinit(alloc);
+
+    // Start a search; its first results wait for room in the mailbox.
+    try testing.expect(try surface.setSearchQuery("needle", .{}));
+    var search_waited = false;
+    var waiting = try std.time.Timer.start();
+    while (waiting.read() < 10 * std.time.ns_per_s) {
+        app.mailbox.mutex.lock();
+        search_waited = app.mailbox.not_full_waiters > 0;
+        app.mailbox.mutex.unlock();
+        if (search_waited) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    // End the search on another thread, as the app thread would.
+    const Ender = struct {
+        fn run(search: *Search, done: *std.Thread.ResetEvent) void {
+            search.deinit();
+            done.set();
+        }
+    };
+    var done: std.Thread.ResetEvent = .{};
+    const ender = std.Thread.spawn(.{}, Ender.run, .{ &surface.search.?, &done }) catch |err| {
+        while (app.mailbox.pop()) |message| message.deinit(alloc);
+        surface.search.?.deinit();
+        surface.search = null;
+        return err;
+    };
+    const ended = if (done.timedWait(10 * std.time.ns_per_s)) |_| true else |_| false;
+    if (!ended) {
+        // Make room so the search thread, and with it the join, can finish.
+        while (true) {
+            while (app.mailbox.pop()) |message| message.deinit(alloc);
+            done.timedWait(std.time.ns_per_ms) catch continue;
+            break;
+        }
+    }
+    ender.join();
+    surface.search = null;
+    try testing.expect(search_waited);
+    try testing.expect(ended);
+}
 
 /// Mouse state for the surface.
 const Mouse = struct {
@@ -2014,6 +2116,11 @@ fn searchCallback(
     // The surface is guaranteed to be valid for the lifetime of the search
     // thread.
     const search: *Search = @ptrCast(@alignCast(ud.?));
+
+    // An ending search sends nothing more (see `pushSearchMessage`), so do
+    // not copy what it would have sent.
+    if (search.stopping.load(.acquire)) return;
+
     const self = search.surface;
     const current_generation = self.search_generation.load(.acquire);
     const event_tag = std.meta.activeTag(event);
@@ -2024,7 +2131,7 @@ fn searchCallback(
     // type-then-close can stop the search thread before it drains the newest
     // query message, so tag quit with the surface's current generation.
     const accepted_generation = if (event_tag == .quit) current_generation else generation;
-    self.searchCallback_(event, accepted_generation) catch |err| {
+    self.searchCallback_(&search.stopping, event, accepted_generation) catch |err| {
         log.warn("error in search callback err={}", .{err});
     };
 }
@@ -2047,6 +2154,7 @@ fn nextSearchGeneration(self: *Surface) u64 {
 
 fn searchCallback_(
     self: *Surface,
+    stopping: *const std.atomic.Value(bool),
     event: terminal.search.Thread.Event,
     generation: u64,
 ) !void {
@@ -2061,14 +2169,11 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.surfaceMailbox().push(
-                .{ .search_viewport_matches = .{
-                    .generation = generation,
-                    .arena = arena,
-                    .matches = matches,
-                } },
-                .forever,
-            );
+            self.pushSearchMessage(stopping, .{ .search_viewport_matches = .{
+                .generation = generation,
+                .arena = arena,
+                .matches = matches,
+            } });
         },
 
         .selected_match => |selected_| {
@@ -2079,80 +2184,81 @@ fn searchCallback_(
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected_match = .{
-                        .generation = generation,
-                        .match = .{
-                            .arena = arena,
-                            .match = match,
-                        },
-                    } },
-                    .forever,
-                );
+                self.pushSearchMessage(stopping, .{ .search_selected_match = .{
+                    .generation = generation,
+                    .match = .{
+                        .arena = arena,
+                        .match = match,
+                    },
+                } });
 
                 // Send the selected index to the surface mailbox
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = .{
-                        .generation = generation,
-                        .selected = apprtSearchSelectedIndex(sel.idx),
-                    } },
-                    .forever,
-                );
+                self.pushSearchMessage(stopping, .{ .search_selected = .{
+                    .generation = generation,
+                    .selected = apprtSearchSelectedIndex(sel.idx),
+                } });
             } else {
                 // Reset our selected match
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected_match = .{
-                        .generation = generation,
-                        .match = null,
-                    } },
-                    .forever,
-                );
+                self.pushSearchMessage(stopping, .{ .search_selected_match = .{
+                    .generation = generation,
+                    .match = null,
+                } });
 
                 // Reset the selected index
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = .{
-                        .generation = generation,
-                        .selected = null,
-                    } },
-                    .forever,
-                );
+                self.pushSearchMessage(stopping, .{ .search_selected = .{
+                    .generation = generation,
+                    .selected = null,
+                } });
             }
         },
 
         .total_matches => |total| {
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = .{
-                    .generation = generation,
-                    .total = total,
-                } },
-                .forever,
-            );
+            self.pushSearchMessage(stopping, .{ .search_total = .{
+                .generation = generation,
+                .total = total,
+            } });
         },
 
         .match_rows => |rows| {
-            _ = self.surfaceMailbox().push(
-                .{ .search_match_rows = .{
-                    .generation = generation,
-                    .rows = try apprt.surface.Message.SearchRowsReq.init(
-                        self.alloc,
-                        rows,
-                    ),
-                } },
-                .forever,
-            );
+            self.pushSearchMessage(stopping, .{ .search_match_rows = .{
+                .generation = generation,
+                .rows = try apprt.surface.Message.SearchRowsReq.init(
+                    self.alloc,
+                    rows,
+                ),
+            } });
         },
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
-            _ = self.surfaceMailbox().push(
-                .{ .search_clear = .{ .generation = generation } },
-                .forever,
-            );
+            self.pushSearchMessage(stopping, .{ .search_clear = .{ .generation = generation } });
         },
 
         // Unhandled, so far.
         .complete => {},
     }
+}
+
+/// Send a search event to the app thread. This runs on the search thread.
+///
+/// The app thread joins the search thread when a search ends
+/// (`Search.deinit`) and cannot drain the app mailbox while it waits, so a
+/// full mailbox would hang both threads. Once `stopping` is set, messages
+/// are dropped, with what they own, and a push already waiting for room
+/// gives up. Nothing is lost: ending a search clears the search state
+/// itself (`syncClearSearchState`) under a newer generation, which rejects
+/// any message from the ended search, and a closing surface has left the
+/// app.
+fn pushSearchMessage(
+    self: *Surface,
+    stopping: *const std.atomic.Value(bool),
+    msg: apprt.surface.Message,
+) void {
+    if (!stopping.load(.acquire)) {
+        if (self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
+    }
+    var dropped = msg;
+    dropped.deinit();
 }
 
 /// Call this when modifiers change. This is safe to call even if modifiers
