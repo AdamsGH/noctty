@@ -684,8 +684,9 @@ pub const Event = union(enum) {
     };
 };
 
-/// Search state.
-const Search = struct {
+/// Search state. Public for `src/bench/search_stream.zig`, which drives
+/// it the way `threadMain_` does.
+pub const Search = struct {
     /// Active viewport search for the active screen.
     viewport: ViewportSearch,
 
