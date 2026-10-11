@@ -202,6 +202,10 @@ test "Tabstops: basic" {
     try testing.expect(t.get(4));
     t.unset(4);
     try testing.expect(!t.get(4));
+
+    // Unsetting a column with no tabstop should be a no-op, not a toggle.
+    t.unset(4);
+    try testing.expect(!t.get(4));
 }
 
 test "Tabstops: dynamic allocations" {
@@ -215,6 +219,10 @@ test "Tabstops: dynamic allocations" {
     // Set something that was out of range of the first
     t.set(cap + 5);
     try testing.expect(t.get(cap + 5));
+    try testing.expect(!t.get(cap + 4));
+
+    // Unsetting a column with no tabstop should be a no-op, not a toggle.
+    t.unset(cap + 4);
     try testing.expect(!t.get(cap + 4));
 
     // Prealloc still works

@@ -806,3 +806,49 @@ test {
     _ = parsers;
     _ = encoding;
 }
+
+test "Parser end with CAN or SUB cancels the command" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    // A fixed capture (OSC 2) cancelled by CAN.
+    for ("2;title") |ch| p.next(ch);
+    try testing.expect(p.end(std.ascii.control_code.can) == null);
+
+    // An allocating capture (OSC 52) cancelled by SUB.
+    p.reset();
+    for ("52;c;Zm9v") |ch| p.next(ch);
+    try testing.expect(p.end(std.ascii.control_code.sub) == null);
+
+    // The parser still works normally after a cancel.
+    p.reset();
+    for ("2;title") |ch| p.next(ch);
+    const cmd = p.end(std.ascii.control_code.bel).?.*;
+    try testing.expect(cmd == .change_window_title);
+    try testing.expectEqualStrings("title", cmd.change_window_title);
+}
+
+test "Parser allocating captures stop at 8 MiB" {
+    const testing = std.testing;
+    const prefixes = [_][]const u8{ "52;", "66;", "5522;" };
+    const limit = 8 * 1024 * 1024;
+
+    for (prefixes) |prefix| {
+        var p: Parser = .init(testing.allocator);
+        defer p.deinit();
+
+        for (prefix) |ch| p.next(ch);
+        for (0..limit) |_| p.next('a');
+
+        const cap = &p.capture.?;
+        try testing.expectEqual(@as(usize, limit), cap.trailing().len);
+        try testing.expect(cap.writer.buffer.len <= limit);
+
+        p.next('a');
+        try testing.expectEqual(Parser.State.invalid, p.state);
+        try testing.expectEqual(@as(usize, limit), cap.trailing().len);
+        try testing.expect(cap.writer.buffer.len <= limit);
+    }
+}

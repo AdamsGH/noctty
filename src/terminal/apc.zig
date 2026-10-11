@@ -186,6 +186,100 @@ test "kitty feed error deinits parser" {
     try testing.expect(h.state == .ignore);
 }
 
+/// A test allocator that records the most bytes it ever had live, and
+/// refuses to go past `ceiling` so a missing cap fails the test instead
+/// of taking the machine's memory.
+const HighWaterAllocator = struct {
+    child: Allocator,
+    ceiling: usize,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *HighWaterAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn grow(self: *HighWaterAllocator, old_len: usize, new_len: usize) bool {
+        const live = self.live - old_len + new_len;
+        if (live > self.ceiling) return false;
+        self.live = live;
+        self.peak = @max(self.peak, live);
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.grow(0, len)) return null;
+        return self.child.rawAlloc(len, a, ra) orelse {
+            self.live -= len;
+            return null;
+        };
+    }
+
+    fn resize(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        const live = self.live;
+        if (!self.grow(mem.len, new_len)) return false;
+        if (self.child.rawResize(mem, a, new_len, ra)) return true;
+        self.live = live;
+        return false;
+    }
+
+    fn remap(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        const live = self.live;
+        if (!self.grow(mem.len, new_len)) return null;
+        return self.child.rawRemap(mem, a, new_len, ra) orelse {
+            self.live = live;
+            return null;
+        };
+    }
+
+    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(mem, a, ra);
+        self.live -= mem.len;
+    }
+};
+
+test "kitty unterminated 512 MiB payload stays under the cap" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const mib = 1024 * 1024;
+    var hw: HighWaterAllocator = .{
+        .child = std.heap.page_allocator,
+        .ceiling = 256 * mib,
+    };
+    const alloc = hw.allocator();
+
+    var h: Handler = .{};
+    defer h.deinit();
+    h.start();
+    for ("Ga=t;") |c| h.feed(alloc, c);
+    for (0..65 * mib) |_| h.feed(alloc, 'A');
+    try testing.expect(h.state != .ignore);
+
+    // One byte past the cap drops the command and frees its buffer.
+    h.feed(alloc, 'A');
+    try testing.expect(h.state == .ignore);
+    try testing.expectEqual(@as(usize, 0), hw.live);
+
+    // The rest of a 512 MiB sequence costs nothing.
+    for (65 * mib + 1..512 * mib) |_| h.feed(alloc, 'A');
+    try testing.expectEqual(@as(usize, 0), hw.live);
+    try testing.expect(h.end() == null);
+
+    // The list grows by half again plus a little, and the old buffer
+    // is still live while it is copied, so the peak stays under 2.5x.
+    try testing.expect(hw.peak <= 65 * mib * 5 / 2);
+}
+
 test "valid Kitty command" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
