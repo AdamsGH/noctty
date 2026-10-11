@@ -3620,6 +3620,9 @@ pub const App = struct {
     quick_select_class_atom: ATOM = 0,
     hosts: std.ArrayListUnmanaged(*Host) = .empty,
     windows: std.ArrayListUnmanaged(*Surface) = .empty,
+    /// Checked URL and file opens waiting for the top of the message loop;
+    /// see `runDeferredOpens`.
+    deferred_opens: std.ArrayListUnmanaged([]u8) = .empty,
     /// Internal test seam so action-path tests can drive real
     /// `performAction(.new_tab, ...)` logic without requiring HWND/GL
     /// surface bring-up.
@@ -3649,6 +3652,9 @@ pub const App = struct {
         app: *App,
         source_pane: win32_shell.model.PaneId,
     ) anyerror!void = null,
+    /// Test-only stand-in for `ShellExecuteW` on a checked open target, so a
+    /// unit test never launches a real handler.
+    test_open_target: ?*const fn (app: *App, target: []const u8) anyerror!void = null,
     next_host_id: u32 = 1,
     launcher_profile_key: ?[:0]const u8 = null,
     launcher_profile_hint: ?[:0]const u8 = null,
@@ -4235,18 +4241,17 @@ pub const App = struct {
 
         var msg: MSG = undefined;
         while (true) {
+            // Opens queued while the previous message was handled run here,
+            // with no window procedure on the stack.
+            if (try self.drainDeferredOpens()) break;
+
             const result = sys.GetMessageW(&msg, null, 0, 0);
             if (result == -1) return lastError();
             if (result == 0) break;
             self.showPendingConPtyFallbackBanner();
 
             if (msg.message == c.WM_WINHOSTTY_WAKE) {
-                if (self.global_hotkeys_dirty) {
-                    self.global_hotkeys_dirty = false;
-                    self.syncGlobalHotkeys() catch |err| {
-                        log.err("failed to sync win32 global hotkeys err={}", .{err});
-                    };
-                }
+                self.syncDirtyGlobalHotkeys();
                 try self.tickCoreApp();
                 if (!self.running and self.windows.items.len == 0) break;
                 continue;
@@ -4433,13 +4438,7 @@ pub const App = struct {
             _ = sys.TranslateMessage(&msg);
             _ = sys.DispatchMessageW(&msg);
 
-            if (self.global_hotkeys_dirty) {
-                self.global_hotkeys_dirty = false;
-                self.syncGlobalHotkeys() catch |err| {
-                    log.err("failed to sync win32 global hotkeys err={}", .{err});
-                };
-            }
-
+            self.syncDirtyGlobalHotkeys();
             try self.tickCoreApp();
 
             if (!self.running and self.windows.items.len == 0) break;
@@ -4478,6 +4477,7 @@ pub const App = struct {
         cloak_event_app = null;
         self.hosts.deinit(self.core_app.alloc);
         self.windows.deinit(self.core_app.alloc);
+        self.discardDeferredOpens();
         self.global_hotkeys.deinit(self.core_app.alloc);
         if (self.launcher_profile_key) |value| self.core_app.alloc.free(value);
         if (self.launcher_profile_hint) |value| self.core_app.alloc.free(value);
@@ -4943,6 +4943,14 @@ pub const App = struct {
         self.renderer_sync_paint_spent = false;
         try self.core_app.tick(self);
         self.resolveRecoveryStartup();
+    }
+
+    fn syncDirtyGlobalHotkeys(self: *App) void {
+        if (!self.global_hotkeys_dirty) return;
+        self.global_hotkeys_dirty = false;
+        self.syncGlobalHotkeys() catch |err| {
+            log.err("failed to sync win32 global hotkeys err={}", .{err});
+        };
     }
 
     fn rendererRepaintModeThisTick(self: *App, host: ?*const Host) SurfaceRepaintRequestMode {
@@ -10040,8 +10048,60 @@ pub const App = struct {
         };
     }
 
+    /// Checks the target now, so a refused one still fails at the caller,
+    /// and leaves the open itself to `runDeferredOpens`.
     fn openUrl(self: *App, url: []const u8) !void {
-        return openWin32Target(self.core_app.alloc, self, url, dispatchOpenTarget);
+        return openWin32Target(self.core_app.alloc, self, url, deferOpenTarget);
+    }
+
+    fn deferOpenTarget(self: *App, target: []const u8) !void {
+        const alloc = self.core_app.alloc;
+        const owned = try alloc.dupe(u8, target);
+        errdefer alloc.free(owned);
+        try self.deferred_opens.append(alloc, owned);
+    }
+
+    /// Runs the queued opens, oldest first, including any queued while one
+    /// runs. Returns whether any ran. Call only from the top of the message
+    /// loop (`drainDeferredOpens`): `ShellExecuteW` dispatches window messages while it works
+    /// (measured: a URL scheme open delivered posted WM_CLOSE and WM_KEYDOWN
+    /// messages, and a cross-thread sent message, to a window on the calling
+    /// thread), and one of them can destroy the Surface or Host whose window
+    /// procedure asked for the open. Run from the loop, no such frame is left
+    /// below the open to use the freed memory.
+    fn runDeferredOpens(self: *App) bool {
+        if (self.deferred_opens.items.len == 0) return false;
+        const alloc = self.core_app.alloc;
+        while (self.deferred_opens.items.len > 0) {
+            const target = self.deferred_opens.orderedRemove(0);
+            defer alloc.free(target);
+            // Checked again just before dispatch, as when the open ran in place.
+            openWin32Target(alloc, self, target, dispatchOpenTarget) catch |err| {
+                log.warn("deferred open failed err={} len={}", .{ err, target.len });
+            };
+        }
+        return true;
+    }
+
+    /// The message loop's step for deferred opens: run them, then do what the
+    /// loop does after a dispatched message, because the messages
+    /// ShellExecuteW dispatched can include our own wake, which the window
+    /// procedures swallow. Repeats while that tick queued more opens. Returns
+    /// whether the loop should exit.
+    fn drainDeferredOpens(self: *App) !bool {
+        while (self.runDeferredOpens()) {
+            self.syncDirtyGlobalHotkeys();
+            try self.tickCoreApp();
+            if (!self.running and self.windows.items.len == 0) return true;
+        }
+        return false;
+    }
+
+    fn discardDeferredOpens(self: *App) void {
+        const alloc = self.core_app.alloc;
+        for (self.deferred_opens.items) |target| alloc.free(target);
+        self.deferred_opens.deinit(alloc);
+        self.deferred_opens = .empty;
     }
 
     fn openWin32Target(
@@ -10064,6 +10124,7 @@ pub const App = struct {
     }
 
     fn dispatchOpenTarget(self: *App, target: []const u8) !void {
+        if (self.test_open_target) |hook| return hook(self, target);
         if (builtin.mode == .Debug and
             try recordOpenUrlForTest(self.core_app.alloc, target)) return;
 
@@ -10076,6 +10137,125 @@ pub const App = struct {
 
         const result = sys.ShellExecuteW(null, shell_open, url_w.ptr, null, null, c.SW_SHOW);
         if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+    }
+
+    test "a link open runs from the message loop, not inside the caller that asked for it" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const Hook = struct {
+            // Stands in for the window procedure that handled the click.
+            var in_caller = false;
+            var opened_in_caller: ?bool = null;
+            var opened: [2][64]u8 = undefined;
+            var opened_len: [2]usize = undefined;
+            var count: usize = 0;
+
+            fn open(app_: *App, target: []const u8) anyerror!void {
+                opened_in_caller = in_caller;
+                if (count >= opened.len) return error.TestUnexpectedOpen;
+                @memcpy(opened[count][0..target.len], target);
+                opened_len[count] = target.len;
+                count += 1;
+                // ShellExecuteW dispatches messages; one of them may be
+                // another click on a link.
+                if (count == 1) _ = try app_.performAction(.app, .open_url, .{
+                    .kind = .unknown,
+                    .url = "https://example.com/second",
+                });
+            }
+        };
+        Hook.in_caller = false;
+        Hook.opened_in_caller = null;
+        Hook.count = 0;
+        app.test_open_target = &Hook.open;
+
+        // Surface.processLinks reaches the opener through this action.
+        Hook.in_caller = true;
+        try std.testing.expect(try app.performAction(.app, .open_url, .{
+            .kind = .unknown,
+            .url = "https://example.com/first",
+        }));
+        Hook.in_caller = false;
+        try std.testing.expectEqual(@as(?bool, null), Hook.opened_in_caller);
+
+        // The message loop runs it, and the open it pumped, in order.
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(?bool, false), Hook.opened_in_caller);
+        try std.testing.expectEqual(@as(usize, 2), Hook.count);
+        try std.testing.expectEqualStrings("https://example.com/first", Hook.opened[0][0..Hook.opened_len[0]]);
+        try std.testing.expectEqualStrings("https://example.com/second", Hook.opened[1][0..Hook.opened_len[1]]);
+        try std.testing.expect(!app.runDeferredOpens());
+
+        // A refused target still fails at the caller and queues nothing.
+        try std.testing.expectError(error.OpenUrlRejected, app.performAction(.app, .open_url, .{
+            .kind = .unknown,
+            .url = "search-ms:query=*.exe",
+        }));
+        try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+
+        // The queued target is checked again right before dispatch.
+        const unchecked = try std.testing.allocator.dupe(u8, "search-ms:query=*.exe");
+        app.deferred_opens.append(std.testing.allocator, unchecked) catch |err| {
+            std.testing.allocator.free(unchecked);
+            return err;
+        };
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 2), Hook.count);
+    }
+
+    test "the message loop ticks the core after the opens it ran" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+
+        const Hook = struct {
+            var opens: usize = 0;
+            var new_windows: usize = 0;
+
+            fn open(_: *App, _: []const u8) anyerror!void {
+                opens += 1;
+            }
+
+            fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, _: SurfaceInitOptions) anyerror!*Surface {
+                new_windows += 1;
+                return error.TestWindowCreateFailed;
+            }
+        };
+        Hook.opens = 0;
+        Hook.new_windows = 0;
+        app.test_open_target = &Hook.open;
+        app.test_create_window_surface = &Hook.createSurface;
+        app.running = true;
+        app.recovery_ready_resolved = true;
+
+        // Nothing queued: no tick, so the mailbox message waits.
+        try std.testing.expect(core_app.mailbox.push(.{ .new_window = .{} }, .instant) != 0);
+        try std.testing.expect(!try app.drainDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 0), Hook.new_windows);
+
+        // A wake the open swallowed would have left that message waiting too.
+        _ = try app.performAction(.app, .open_url, .{ .kind = .unknown, .url = "https://example.com/" });
+        try std.testing.expect(!try app.drainDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 1), Hook.opens);
+        try std.testing.expectEqual(@as(usize, 1), Hook.new_windows);
     }
 
     fn isAllowedWin32OpenTarget(alloc: Allocator, target: []const u8) !bool {
@@ -35155,6 +35335,7 @@ const TestSession = struct {
             app.config.deinit();
             app.hosts.deinit(self.allocator);
             app.windows.deinit(self.allocator);
+            app.discardDeferredOpens();
         }
         if (self.core_app_initialized) self.core_app.?.deinit();
         self.* = .{};

@@ -22,6 +22,7 @@ const MessageData = @import("../../datastruct/main.zig").MessageData;
 const point = @import("../point.zig");
 const FlattenedHighlight = @import("../highlight.zig").Flattened;
 const UntrackedHighlight = @import("../highlight.zig").Untracked;
+const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const Selection = @import("../Selection.zig");
 const Terminal = @import("../Terminal.zig");
@@ -152,7 +153,11 @@ pub fn deinit(self: *Thread) void {
     // Nothing can possibly access the mailbox anymore, destroy it.
     self.mailbox.destroy(self.alloc);
 
-    if (self.search) |*s| s.deinit();
+    if (self.search) |*s| {
+        self.opts.mutex.lock();
+        defer self.opts.mutex.unlock();
+        s.deinit(self.opts.terminal);
+    }
 }
 
 /// The main entrypoint for the thread.
@@ -319,10 +324,15 @@ fn drainMailbox(self: *Thread) !void {
 
 fn select(self: *Thread, sel: ScreenSearch.Select) !void {
     const s = if (self.search) |*s| s else return;
-    const screen_search = s.screens.getPtr(s.last_screen.key) orelse return;
 
     self.opts.mutex.lock();
     defer self.opts.mutex.unlock();
+
+    // A screen can be removed or replaced between refresh ticks (and the
+    // refresh timer stops while the surface is unfocused). Reconcile while
+    // holding the terminal lock before touching any ScreenSearch pins.
+    s.feed(self.alloc, self.opts.terminal);
+    const screen_search = s.screens.getPtr(s.last_screen.key) orelse return;
 
     // Make the selection. Ignore the result because we don't
     // care if the selection didn't change.
@@ -417,7 +427,11 @@ fn changeQuery(
             return;
         }
 
-        s.deinit();
+        {
+            self.opts.mutex.lock();
+            defer self.opts.mutex.unlock();
+            s.deinit(self.opts.terminal);
+        }
         self.search = null;
 
         // When the search changes then we need to emit that it stopped.
@@ -678,6 +692,11 @@ const Search = struct {
     /// The searchers for all the screens.
     screens: std.EnumMap(ScreenSet.Key, ScreenSearch),
 
+    /// ScreenSet generations captured when each searcher was initialized.
+    /// Allocators may reuse a destroyed Screen address, so pointer equality
+    /// alone cannot distinguish replacement screens from stale handles.
+    screen_generations: std.EnumMap(ScreenSet.Key, usize),
+
     /// All state related to screen switches, collected so that when
     /// we switch screens it makes everything related stale, too.
     last_screen: ScreenState,
@@ -730,6 +749,7 @@ const Search = struct {
         return .{
             .viewport = vp,
             .screens = .init(.{}),
+            .screen_generations = .init(.{}),
             .last_screen = .{ .key = .primary },
             .last_complete = false,
             .stale_viewport_matches = true,
@@ -740,12 +760,32 @@ const Search = struct {
         };
     }
 
-    pub fn deinit(self: *Search) void {
+    /// The caller must hold the terminal lock: a searcher whose screen is
+    /// still alive untracks its pins from that screen's PageList.
+    pub fn deinit(self: *Search, t: *Terminal) void {
         self.match_rows.deinit(self.viewport.window.alloc);
         self.notified_match_rows.deinit(self.viewport.window.alloc);
         self.viewport.deinit();
         var it = self.screens.iterator();
-        while (it.next()) |entry| entry.value.deinit();
+        while (it.next()) |entry| {
+            if (self.screenIsValid(&t.screens, entry.key, entry.value)) {
+                entry.value.deinit();
+            } else {
+                entry.value.deinitScreenInvalid();
+            }
+        }
+    }
+
+    fn screenIsValid(
+        self: *const Search,
+        screens: *const ScreenSet,
+        key: ScreenSet.Key,
+        search: *const ScreenSearch,
+    ) bool {
+        const generation = self.screen_generations.get(key) orelse return false;
+        if (generation != screens.generation(key)) return false;
+        const actual = screens.get(key) orelse return false;
+        return actual == search.screen;
     }
 
     /// Returns true if all searches on all screens are complete.
@@ -831,24 +871,17 @@ const Search = struct {
         // searchers for screens that no longer exist and add searchers
         // for screens that do exist but we don't have yet.
         {
-            // Remove screens we have that no longer exist or changed.
+            // Remove screens we have that no longer exist or were destroyed
+            // and rebuilt (possibly at the same address) since.
             var it = self.screens.iterator();
             while (it.next()) |entry| {
-                const remove: bool = remove: {
-                    // If the screen doesn't exist at all, remove it.
-                    const actual = t.screens.all.get(entry.key) orelse break :remove true;
-
-                    // If the screen pointer changed, remove it, the screen
-                    // was totally reinitialized.
-                    break :remove actual != entry.value.screen;
-                };
-
-                if (remove) {
+                if (!self.screenIsValid(&t.screens, entry.key, entry.value)) {
                     if (self.match_rows_screen) |key| {
                         if (key == entry.key) self.clearMatchRowsCache();
                     }
-                    entry.value.deinit();
+                    entry.value.deinitScreenInvalid();
                     _ = self.screens.remove(entry.key);
+                    _ = self.screen_generations.remove(entry.key);
                 }
             }
         }
@@ -857,7 +890,7 @@ const Search = struct {
             var it = t.screens.all.iterator();
             while (it.next()) |entry| {
                 if (self.screens.contains(entry.key)) continue;
-                self.screens.put(entry.key, ScreenSearch.initWithOptions(
+                const screen_search = ScreenSearch.initWithOptions(
                     alloc,
                     entry.value.*,
                     self.viewport.needle(),
@@ -880,7 +913,12 @@ const Search = struct {
                         );
                         continue;
                     },
-                });
+                };
+                self.screens.put(entry.key, screen_search);
+                self.screen_generations.put(
+                    entry.key,
+                    t.screens.generation(entry.key),
+                );
             }
         }
 
@@ -1289,4 +1327,133 @@ test "equivalent query replays search state" {
     try testing.expectEqual(1, ud.total);
     try testing.expectEqualSlices(u32, &.{0}, ud.rows);
     try testing.expectEqual(1, ud.viewport.len);
+}
+
+test "select after the searched screen is removed" {
+    // Upstream 73ac36fa5679: a select between refresh ticks must not reach
+    // the searcher of a screen the terminal has already destroyed.
+    const alloc = testing.allocator;
+    var mutex: std.Thread.Mutex = .{};
+    var t: Terminal = try .init(alloc, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049hneedle");
+
+    var thread: Thread = try .init(alloc, .{ .mutex = &mutex, .terminal = &t });
+    defer thread.deinit();
+
+    try thread.changeQuery("needle", .{}, 1);
+    try thread.select(.next);
+    try testing.expectEqual(ScreenSet.Key.alternate, thread.search.?.last_screen.key);
+    try testing.expect(thread.search.?.screens.getPtr(.alternate).?.selected != null);
+
+    _ = try t.switchScreen(.primary);
+    t.screens.remove(alloc, .alternate);
+
+    try thread.select(.next);
+    try testing.expectEqual(ScreenSet.Key.primary, thread.search.?.last_screen.key);
+    try testing.expect(!thread.search.?.screens.contains(.alternate));
+}
+
+/// Keeps the last freed block of one size and hands it to the next allocation
+/// of that size, as a real allocator may: a Screen destroyed by a full reset
+/// then comes back at the same address when the alternate screen is
+/// re-entered.
+const ReuseAllocator = struct {
+    backing: Allocator,
+    len: usize,
+    held: ?struct { ptr: [*]u8, alignment: std.mem.Alignment } = null,
+
+    fn allocator(self: *ReuseAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn deinit(self: *ReuseAllocator) void {
+        const held = self.held orelse return;
+        self.backing.rawFree(held.ptr[0..self.len], held.alignment, @returnAddress());
+        self.held = null;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ReuseAllocator = @ptrCast(@alignCast(ctx));
+        if (self.held) |held| if (len == self.len and held.alignment == alignment) {
+            self.held = null;
+            return held.ptr;
+        };
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ReuseAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ReuseAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ReuseAllocator = @ptrCast(@alignCast(ctx));
+        if (memory.len == self.len and self.held == null) {
+            @memset(memory, undefined);
+            self.held = .{ .ptr = memory.ptr, .alignment = alignment };
+            return;
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a full reset that re-creates the alternate screen at the same address drops its searcher" {
+    const alloc = testing.allocator;
+    var reuse: ReuseAllocator = .{ .backing = alloc, .len = @sizeOf(Screen) };
+    defer reuse.deinit();
+    const term_alloc = reuse.allocator();
+
+    var mutex: std.Thread.Mutex = .{};
+    var t: Terminal = try .init(term_alloc, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(term_alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049hneedle");
+
+    var thread: Thread = try .init(alloc, .{ .mutex = &mutex, .terminal = &t });
+    defer thread.deinit();
+
+    try thread.changeQuery("needle", .{}, 1);
+    try thread.select(.next);
+    const destroyed = t.screens.get(.alternate).?;
+    try testing.expect(thread.search.?.screens.getPtr(.alternate).?.selected != null);
+
+    // RIS destroys the alternate screen; re-entering it builds a new one.
+    stream.nextSlice("\x1bc\x1b[?1049h");
+    const rebuilt = t.screens.get(.alternate).?;
+    try testing.expectEqual(destroyed, rebuilt);
+
+    // A refresh must not keep the destroyed screen's results and tracked
+    // selection just because the new screen has the same address.
+    {
+        mutex.lock();
+        defer mutex.unlock();
+        thread.search.?.feed(alloc, &t);
+    }
+    const searcher = thread.search.?.screens.getPtr(.alternate).?;
+    try testing.expectEqual(rebuilt, searcher.screen);
+    try testing.expectEqual(
+        t.screens.generation(.alternate),
+        thread.search.?.screen_generations.get(.alternate).?,
+    );
+    try testing.expectEqual(@as(usize, 0), searcher.matchesLen());
+    try testing.expect(searcher.selected == null);
+
+    try thread.select(.next);
+    try testing.expect(thread.search.?.screens.getPtr(.alternate).?.selected == null);
 }
