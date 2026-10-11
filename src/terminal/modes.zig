@@ -292,6 +292,11 @@ const entries: []const ModeEntry = &.{
     .{ .name = "grapheme_cluster", .value = 2027 },
     .{ .name = "report_color_scheme", .value = 2031 },
     .{ .name = "in_band_size_reports", .value = 2048 },
+
+    // Win32 input mode (ConPTY). The console host asks for it at the start
+    // of every session; while it is set, key events are sent as
+    // `CSI Vk;Sc;Uc;Kd;Cs;Rc _` INPUT_RECORD sequences (key_encode.zig).
+    .{ .name = "win32_input", .value = 9001 },
 };
 
 test {
@@ -304,6 +309,8 @@ test modeFromInt {
     try testing.expect(modeFromInt(9, true) == null);
     try testing.expect(modeFromInt(9, false).? == .mouse_event_x10);
     try testing.expect(modeFromInt(14, true) == null);
+    try testing.expect(modeFromInt(9001, false).? == .win32_input);
+    try testing.expect(modeFromInt(9001, true) == null);
 }
 
 test ModeState {

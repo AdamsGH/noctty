@@ -1827,8 +1827,12 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
 
         // We also want to ensure that normal keyboard encoding is on
         // so that we can close the terminal. We close the terminal on
-        // any key press that encodes a character.
+        // any key press that encodes a character. Win32 input mode goes
+        // too: the console host that asked for it is gone, and its records
+        // would make every modifier press and key release count as the
+        // key that closes the terminal.
         t.modes.set(.disable_keyboard, false);
+        t.modes.set(.win32_input, false);
         t.screens.active.kitty_keyboard.set(.set, .disabled);
     }
 
@@ -4599,6 +4603,11 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
 
         // Release any modifiers if set
         if (pressed_key.mods.empty()) break :unfocused;
+
+        // The Win32 record belongs to the key above, not to the modifier
+        // keys synthesized below; a console host receives no release for a
+        // modifier whose key up went to another window either.
+        pressed_key.win32 = null;
 
         // This is kind of nasty comptime meta programming but all we're doing
         // here is going through all the modifiers and if they're set, releasing

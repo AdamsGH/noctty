@@ -34002,21 +34002,32 @@ pub const Surface = struct {
         if (!self.core_initialized) return;
 
         // Under Kitty `report_all` the text must ride on the physical key
-        // event so press and release keep one identity; see
-        // `win32_input.deferPlainTextToCharMessage`.
-        const kitty_report_all = kitty_report_all: {
+        // event so press and release keep one identity, and under Win32
+        // input mode the key record carries the characters it typed; see
+        // `win32_input.deferPlainTextToCharMessage`. Read at every key, as
+        // the encoder does: the mode and the Kitty flags are the terminal's
+        // live state.
+        const encode_opts = encode_opts: {
             self.core_surface.renderer_state.mutex.lock();
             defer self.core_surface.renderer_state.mutex.unlock();
-            break :kitty_report_all self.core_surface.renderer_state.terminal.screens.active.kitty_keyboard.current().report_all;
+            break :encode_opts input.key_encode.Options.fromTerminal(
+                self.core_surface.renderer_state.terminal,
+            );
         };
+        // An IME owns the keys it composes with; its result arrives as text.
+        const win32_records = encode_opts.win32InputRecords() and !self.ime_composing;
         win32_input.dispatchKeyMessage(
             KeyTarget{ .surface = self },
             &self.deferred_char,
             msg,
             wParam,
             lParam,
-            win32_input.deferPlainTextToCharMessage(kitty_report_all, self.ime_composing),
+            win32_input.deferPlainTextToCharMessage(
+                encode_opts.kitty_flags.report_all or win32_records,
+                self.ime_composing,
+            ),
             self.ime_composing,
+            win32_records,
             typed,
         );
     }

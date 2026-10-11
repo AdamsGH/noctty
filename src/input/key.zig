@@ -53,6 +53,50 @@ pub const KeyEvent = struct {
     /// shift+a is "A" in UTF-8 but unshifted would provide 'a'.
     unshifted_codepoint: u21 = 0,
 
+    /// The Win32 console record for this key, set only by the Windows
+    /// apprt. While the terminal is in Win32 input mode (DEC 9001) the
+    /// encoder sends it as a `CSI Vk;Sc;Uc;Kd;Cs;Rc _` sequence instead
+    /// of a VT encoding; see `key_encode.zig`.
+    win32: ?Win32Record = null,
+
+    /// The fields of a Win32 `KEY_EVENT_RECORD` that cannot be derived
+    /// from the rest of the event: ConPTY expects the console host's own
+    /// values, not a reconstruction from key names and modifiers.
+    pub const Win32Record = struct {
+        /// `wVirtualKeyCode`: the `wParam` of the key message, as Windows
+        /// reports it (`VK_SHIFT`, not `VK_LSHIFT`; `VK_PACKET` for
+        /// injected characters).
+        vk: u16,
+
+        /// `wVirtualScanCode`: bits 16-23 of the key message's `lParam`.
+        scan_code: u16,
+
+        /// `dwControlKeyState` as the console host builds it from the
+        /// keyboard state at the time of the message: the left/right Alt
+        /// and Ctrl bits, Shift, the lock states and ENHANCED_KEY. This is
+        /// the raw state, so an AltGr chord carries LEFT_CTRL_PRESSED and
+        /// RIGHT_ALT_PRESSED like it does in conhost.
+        control_key_state: u16,
+
+        /// `wRepeatCount`: the low word of the key message's `lParam`.
+        repeat_count: u16,
+
+        /// The UTF-16 units the key typed, one record each. Empty for a
+        /// key that types nothing (function keys, modifiers, a dead key)
+        /// and for releases. A Ctrl chord carries the control character
+        /// Windows produced (U+0001 for Ctrl+A), not the letter.
+        units: [max_units]u16 = [_]u16{0} ** max_units,
+        units_len: u8 = 0,
+
+        /// One key press types at most a layout ligature (four units)
+        /// plus the accent of a dead key that could not combine with it.
+        pub const max_units = 8;
+
+        pub fn typed(self: *const Win32Record) []const u16 {
+            return self.units[0..self.units_len];
+        }
+    };
+
     /// Returns the effective modifiers for this event. The effective
     /// modifiers are the mods that should be considered for keybindings.
     pub fn effectiveMods(self: KeyEvent) Mods {
