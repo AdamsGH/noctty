@@ -86,6 +86,18 @@ public static class HerdrMouse {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out int pid);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out Rect r);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    // Shift (1), Ctrl (2) and Alt (4) held on the machine's keyboard right now. The
+    // terminals read the live modifier state for a posted click, and a terminal
+    // treats Shift+click as a selection instead of reporting it, so a click posted
+    // while someone holds Shift at the real keyboard measures nothing.
+    public static int ModifiersDown() {
+        int m=0;
+        if((GetAsyncKeyState(0x10)&0x8000)!=0) m|=1;
+        if((GetAsyncKeyState(0x11)&0x8000)!=0) m|=2;
+        if((GetAsyncKeyState(0x12)&0x8000)!=0) m|=4;
+        return m;
+    }
     [DllImport("user32.dll",SetLastError=true)] static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
     [DllImport("user32.dll",SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint f,uint t,out IntPtr result);
     // Tell a window it is active and focused, as a click on it would, without
@@ -286,6 +298,17 @@ function Herdr-Api([string[]]$Arguments,[string]$Socket) {
         return @{Exit=$code;Text=$text}
     } finally { $env:HERDR_SOCKET_PATH=$old }
 }
+# A herdr API answer that must have succeeded and named a pane: the exit code
+# is checked and the pane id is read back, so a failed query cannot pass as
+# an answer that happens to equal another failed one.
+function Herdr-Pane([string[]]$Arguments,[string]$Socket,[string]$What) {
+    $api=Herdr-Api $Arguments $Socket
+    if($api.Exit -ne 0) { throw ("herdr {0} failed (exit {1}): {2}" -f $What,$api.Exit,$api.Text) }
+    $paneId=$null
+    try { $paneId=(ConvertFrom-Json $api.Text).result.pane.pane_id } catch { }
+    if(-not $paneId) { throw ("herdr {0} answered without a pane id: {1}" -f $What,$api.Text) }
+    return @{Text=$api.Text;PaneId=[string]$paneId}
+}
 function Wait-Window([scriptblock]$Find,[IntPtr]$Process,[int]$Seconds,[string]$What) {
     $deadline=[datetime]::UtcNow.AddSeconds($Seconds)
     do { $h=& $Find; if($h -ne [IntPtr]::Zero) { return $h }
@@ -324,10 +347,16 @@ function Start-Terminal([string]$Terminal,[string]$Program,[string]$Arguments) {
     Progress ("wezterm windows: " + [HerdrMouse]::Windows($p.pid))
     return @{Process=$p;Window=$w;Pid=$p.pid}
 }
+# Posts a click and records the modifier keys held at the real keyboard around
+# it (ModifiersDown); a phase whose clicks saw one is INTERFERED, not a result.
 function Click-Pane([IntPtr]$Window,[double]$FractionX,[double]$FractionY) {
     $r=New-Object HerdrMouse+Rect; [void][HerdrMouse]::GetClientRect($Window,[ref]$r)
     $x=[int](($r.right-$r.left)*$FractionX); $y=[int](($r.bottom-$r.top)*$FractionY)
-    [HerdrMouse]::Click($Window,$x,$y); return @($x,$y)
+    $mods=[HerdrMouse]::ModifiersDown()
+    [HerdrMouse]::Click($Window,$x,$y)
+    Start-Sleep -Milliseconds 50
+    $mods=$mods -bor [HerdrMouse]::ModifiersDown()
+    return @{X=$x;Y=$y;Modifiers=$mods}
 }
 function Read-Records([string]$Path) {
     if(-not (Test-Path -LiteralPath $Path)) { return @() }
@@ -376,21 +405,26 @@ try {
                 $paneId=$null
                 try { $paneId=((ConvertFrom-Json $api.Text).result.panes | Where-Object { $_.focused } | Select-Object -First 1).pane_id } catch { }
                 if(-not $paneId) { $paneId='w1:p1' }
-                $split=Herdr-Api @('pane','split','--pane',$paneId,'--direction','right') $socket; $phase.Split=$split.Text
+                # Every answer below is checked (exit code and a pane id); a failed
+                # split or query makes the phase FAIL instead of a result.
+                $split=Herdr-Pane @('pane','split','--pane',$paneId,'--direction','right') $socket 'pane split'; $phase.Split=$split.Text
                 Start-Sleep -Milliseconds 1200
                 $phase.PaneListAfterSplit=(Herdr-Api @('pane','list') $socket).Text
-                $phase.CurrentBefore=(Herdr-Api @('pane','current') $socket).Text
+                $before=Herdr-Pane @('pane','current') $socket 'pane current (before)'; $phase.CurrentBefore=$before.Text
                 $phase.ClickRight=Click-Pane $t.Window 0.85 0.55
                 Start-Sleep -Milliseconds 800
-                $phase.CurrentAfterRightClick=(Herdr-Api @('pane','current') $socket).Text
+                $afterRight=Herdr-Pane @('pane','current') $socket 'pane current (after the right click)'; $phase.CurrentAfterRightClick=$afterRight.Text
                 $phase.ClickLeft=Click-Pane $t.Window 0.45 0.55
                 Start-Sleep -Milliseconds 800
-                $phase.CurrentAfterLeftClick=(Herdr-Api @('pane','current') $socket).Text
+                $afterLeft=Herdr-Pane @('pane','current') $socket 'pane current (after the left click)'; $phase.CurrentAfterLeftClick=$afterLeft.Text
+                $phase.Panes=@($before.PaneId,$afterRight.PaneId,$afterLeft.PaneId)
                 if($herdrPids.Count -gt 0) { $phase.ConsoleAfter=Attach-Info $herdrPids[0] }
-                # The two post-click answers decide: clicks that move focus name two
+                # The two post-click pane ids decide: clicks that move focus name two
                 # different panes, ignored clicks the same one, whichever pane the
                 # split itself focused (CurrentBefore is kept for the record).
-                $phase.Status=$(if($phase.CurrentAfterLeftClick -ne $phase.CurrentAfterRightClick){'CLICKS-CHANGE-FOCUS'}else{'CLICKS-IGNORED'})
+                $phase.Status=$(if($afterLeft.PaneId -ne $afterRight.PaneId){'CLICKS-CHANGE-FOCUS'}else{'CLICKS-IGNORED'})
+                $phase.ModifiersDuringClicks=($phase.ClickRight.Modifiers -bor $phase.ClickLeft.Modifiers)
+                if($phase.ModifiersDuringClicks -ne 0) { $phase.Status='INTERFERED' }
                 foreach($log in @('herdr.log','herdr-client.log','herdr-server.log')) {
                     $lp=Join-Path $herdrConfigDir $log
                     if(Test-Path -LiteralPath $lp) { Copy-Item -LiteralPath $lp -Destination (Join-Path $Run ("{0}-{1}-{2}" -f $terminal,$mode,$log)) -Force }
@@ -437,8 +471,9 @@ try {
                 Start-Sleep -Milliseconds 800
                 $phase.Records=@(Read-Records $records)
                 Set-Content -LiteralPath $stop -Value '' -NoNewline
-                $phase.Status='DONE'
-            } catch { $phase.Error=$_.Exception.Message }
+                $phase.ModifiersDuringClicks=($phase.ClickRight.Modifiers -bor $phase.ClickLeft.Modifiers)
+                $phase.Status=$(if($phase.ModifiersDuringClicks -ne 0){'INTERFERED'}else{'DONE'})
+            } catch { $phase.Status='FAIL'; $phase.Error=$_.Exception.Message }
             finally { if($t) { [void][HerdrMouse]::CloseHandle($t.Process.thread); [void][HerdrMouse]::CloseHandle($t.Process.process) } }
             $results.Phases.Add($phase)
         }
@@ -478,9 +513,12 @@ try {
 }
 # Exit code: 2 when the driver itself broke, 3 when a phase failed (a window
 # or an API that never came, an observer with no output) or the owned job
-# was not cleaned up. CLICKS-IGNORED and CLICKS-CHANGE-FOCUS are results, and
-# SKIPPED is a program that is not installed; neither is a failure.
+# was not cleaned up, 4 when a modifier key was held at the real keyboard
+# during a phase's clicks (INTERFERED: run again when the machine is idle).
+# CLICKS-IGNORED and CLICKS-CHANGE-FOCUS are results, and SKIPPED is a
+# program that is not installed; neither is a failure.
 if($results.Contains('Infrastructure')) { exit 2 }
 $failedPhases=@($results.Phases | Where-Object { $_.Status -eq 'FAIL' })
 if($failedPhases.Count -gt 0 -or -not $results.OwnedJobCleanedUp) { exit 3 }
+if(@($results.Phases | Where-Object { $_.Status -eq 'INTERFERED' }).Count -gt 0) { exit 4 }
 exit 0
