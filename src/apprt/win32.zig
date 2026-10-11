@@ -29160,13 +29160,9 @@ pub const Surface = struct {
     search_bar_label_prev_procs: [2]?*const anyopaque = .{ null, null },
     search_bar_results_placement: ChildPlacement = .{},
     search_bar_results_cache: ?[:0]const u8 = null,
-    /// OLE drop target registered on the surface HWND. `null` when
-    /// the module's `ensureCustomFormats` fails or Ole32 is absent
-    /// (extremely unlikely on Win10+). Lifetime: created in
-    /// `Surface.init` after the HWND is ready, revoked + deinited
-    /// in `Surface.destroyWindow`. Storage is INLINE on Surface so
-    /// the COM v-table pointer stays stable — Surface itself is
-    /// heap-allocated via core_app.alloc and never moves.
+    /// Surface's initial reference to an independently allocated OLE
+    /// drop target. Detached and released during native-window teardown;
+    /// retained COM references keep only the target alive after that.
     drop_target: ?*win32_surface_drop_target.DropTarget = null,
     drop_target_registered: bool = false,
     /// Clipboard operation parked on `HostOverlayMode.confirm` — the
