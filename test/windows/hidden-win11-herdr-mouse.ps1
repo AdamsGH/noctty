@@ -387,7 +387,10 @@ try {
                 Start-Sleep -Milliseconds 800
                 $phase.CurrentAfterLeftClick=(Herdr-Api @('pane','current') $socket).Text
                 if($herdrPids.Count -gt 0) { $phase.ConsoleAfter=Attach-Info $herdrPids[0] }
-                $phase.Status=$(if($phase.CurrentAfterRightClick -ne $phase.CurrentBefore -and $phase.CurrentAfterLeftClick -ne $phase.CurrentAfterRightClick){'CLICKS-CHANGE-FOCUS'}else{'CLICKS-IGNORED'})
+                # The two post-click answers decide: clicks that move focus name two
+                # different panes, ignored clicks the same one, whichever pane the
+                # split itself focused (CurrentBefore is kept for the record).
+                $phase.Status=$(if($phase.CurrentAfterLeftClick -ne $phase.CurrentAfterRightClick){'CLICKS-CHANGE-FOCUS'}else{'CLICKS-IGNORED'})
                 foreach($log in @('herdr.log','herdr-client.log','herdr-server.log')) {
                     $lp=Join-Path $herdrConfigDir $log
                     if(Test-Path -LiteralPath $lp) { Copy-Item -LiteralPath $lp -Destination (Join-Path $Run ("{0}-{1}-{2}" -f $terminal,$mode,$log)) -Force }
@@ -415,9 +418,18 @@ try {
                 Progress "phase $terminal observer ${tag}: start"
                 $t=Start-Terminal $terminal $observer ('"{0}" "{1}" "{2}" {3}{4}' -f $records,$ready,$stop,$modeHex,$(if($variant.Vt){' vt-mouse'}else{''}))
                 [void]$knownPids.Add([int]$t.Pid)
-                $deadline=[datetime]::UtcNow.AddSeconds(30)
-                while(-not (Test-Path -LiteralPath $ready) -and [datetime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
-                $phase.Ready=(Get-Content -LiteralPath $ready -Raw).Trim()
+                # The observer creates the ready file before it writes the line
+                # (and before its vt-mouse request), so wait for the whole line,
+                # not for the file.
+                $deadline=[datetime]::UtcNow.AddSeconds(30); $readyText=$null
+                do {
+                    if(Test-Path -LiteralPath $ready) { try { $readyText=Get-Content -LiteralPath $ready -Raw -ErrorAction Stop } catch { $readyText=$null } }
+                    if($readyText -and $readyText.Contains("`n")) { break }
+                    if([HerdrMouse]::WaitForSingleObject($t.Process.process,0) -eq 0) { throw "Terminal exited before its observer was ready ($ready)." }
+                    Start-Sleep -Milliseconds 100
+                } while([datetime]::UtcNow -lt $deadline)
+                if(-not ($readyText -and $readyText.Contains("`n"))) { throw "Observer ready timeout: $ready" }
+                $phase.Ready=$readyText.Trim()
                 Start-Sleep -Milliseconds 800
                 $phase.ClickRight=Click-Pane $t.Window 0.85 0.55
                 Start-Sleep -Milliseconds 600
@@ -464,5 +476,11 @@ try {
     $results.HerdrInstalled=$haveHerdr; $results.WezTermInstalled=$haveWezTerm
     $results | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'results.json')
 }
+# Exit code: 2 when the driver itself broke, 3 when a phase failed (a window
+# or an API that never came, an observer with no output) or the owned job
+# was not cleaned up. CLICKS-IGNORED and CLICKS-CHANGE-FOCUS are results, and
+# SKIPPED is a program that is not installed; neither is a failure.
 if($results.Contains('Infrastructure')) { exit 2 }
+$failedPhases=@($results.Phases | Where-Object { $_.Status -eq 'FAIL' })
+if($failedPhases.Count -gt 0 -or -not $results.OwnedJobCleanedUp) { exit 3 }
 exit 0

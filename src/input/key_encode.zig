@@ -163,14 +163,22 @@ fn writeWin32Record(
 }
 
 /// The line submissions in `data` when it is a run of Win32 input records
-/// as `win32InputRecord` writes them: one per key-down record whose
-/// character is CR, times its repeat count. Null when `data` is anything
-/// else, so the caller counts the CR bytes of a VT encoding instead. A
-/// cooked console read ends the line on a CR record whatever its modifiers
-/// (Shift+Enter carries 13), and Ctrl+Enter carries 10, which it ignores as
-/// it ignores a bare LF.
+/// as `win32InputRecord` writes them: one per key-down record of an
+/// unmodified Enter (character CR, none of the Shift, Ctrl and Alt bits),
+/// times its repeat count. Null when `data` is anything else, so the caller
+/// counts the CR bytes of a VT encoding instead. The records are what let a
+/// line editor tell a modified Enter apart: PSReadLine adds a continuation
+/// line on Shift+Enter and a line above on Ctrl+Enter, neither of which
+/// submits, so counting them would consume the shell's input mark while the
+/// user is still editing. A cooked console read does end the line on
+/// Shift+Enter's CR record; that submission goes uncounted on purpose, since
+/// the terminal cannot tell the reader apart and the line editor is the
+/// common one. Ctrl+Enter carries 10, which neither reader runs, like a bare
+/// LF. The lock bits (Caps, Num, Scroll Lock) and ENHANCED_KEY (the numpad
+/// Enter) do not modify.
 pub fn win32RecordSubmissions(data: []const u8) ?u32 {
     if (data.len == 0) return null;
+    const modifiers = key.KeyEvent.Win32Record.ControlKeyState.modifiers;
     var submissions: u32 = 0;
     var rest = data;
     while (rest.len > 0) {
@@ -183,19 +191,23 @@ pub fn win32RecordSubmissions(data: []const u8) ?u32 {
             value.* = std.fmt.parseInt(u32, field, 10) catch return null;
         }
         if (fields.next() != null) return null;
-        const unit, const key_down, const repeat = .{ values[2], values[3], values[5] };
-        if (unit == '\r' and key_down == 1) submissions +|= repeat;
+        const unit, const key_down, const state, const repeat = .{ values[2], values[3], values[4], values[5] };
+        if (unit == '\r' and key_down == 1 and (state & modifiers) == 0) submissions +|= repeat;
         rest = rest[end + 1 ..];
     }
     return submissions;
 }
 
 test "win32 input mode: line submissions are counted from the records" {
-    // Enter and Shift+Enter submit, once per repeat; Ctrl+Enter (10), a
-    // release and a key that is not Enter do not.
+    // An unmodified Enter submits, once per repeat, with the lock bits and
+    // ENHANCED_KEY (numpad Enter) set or not. Shift+Enter (PSReadLine's
+    // continuation line), Ctrl+Enter (10), a release and a key that is not
+    // Enter do not.
     try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_"));
-    try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;16;1_"));
+    try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;416;1_"));
     try testing.expectEqual(@as(?u32, 3), win32RecordSubmissions("\x1b[13;28;13;1;0;3_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;13;1;2;1_"));
     try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;10;1;8;1_\x1b[13;28;10;0;8;1_"));
     try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[65;30;97;1;0;1_\x1b[16;42;0;0;0;1_"));
     // Anything that is not a whole run of records is left to the CR count.

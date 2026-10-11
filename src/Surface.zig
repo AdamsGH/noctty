@@ -1287,8 +1287,9 @@ test "queueIo frees allocated writes in readonly mode" {
 /// already recorded from the bytes; the Kitty keyboard protocol sends
 /// `CSI 13 u`, which carries no line terminator, so that one is recorded
 /// here. A Win32 input record is counted from the bytes too (`records` is
-/// true): its character says whether the console host's cooked read ends
-/// the line, which Ctrl+Enter's 10 does not. One key press must record
+/// true): only an unmodified Enter's record submits, since a line editor
+/// reading records continues the line on Shift+Enter (see
+/// `key_encode.win32RecordSubmissions`). One key press must record
 /// exactly one submission: the terminal counts a second one, made after the
 /// first has closed the prompt, as a line typed ahead for the next prompt
 /// (`SemanticCommand.consumeInput`).
@@ -1368,9 +1369,10 @@ test "Surface: submissionsInBytes counts the lines a write submits" {
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("ls -la"));
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[A"));
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[<0;10;20M"));
-    // Win32 input records: Enter and Shift+Enter submit, Ctrl+Enter (10) does not.
+    // Win32 input records: Enter submits; Shift+Enter (a PSReadLine
+    // continuation line) and Ctrl+Enter (10) keep the shell's input mark.
     try testing.expectEqual(@as(u32, 1), submissionsInBytes("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_"));
-    try testing.expectEqual(@as(u32, 1), submissionsInBytes("\x1b[13;28;13;1;16;1_"));
+    try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"));
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[13;28;10;1;8;1_"));
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[65;30;97;1;0;1_"));
 }
