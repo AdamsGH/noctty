@@ -1282,6 +1282,27 @@ test "queueIo frees allocated writes in readonly mode" {
     } }, .unlocked);
 }
 
+/// Whether a key event that wrote to the pty counts as typing for the
+/// viewport, which scrolls to the bottom and drops the selection. A press or
+/// repeat of a key other than a modifier does. A release does not, even when
+/// it writes (a Win32 input record, a Kitty release event): the key typed on
+/// its press, and text selected or a viewport scrolled while the key was
+/// held must survive letting go of it.
+fn keyWriteIsTyping(event: input.KeyEvent) bool {
+    return event.action != .release and !event.key.modifier();
+}
+
+test "Surface: a key release that writes is not typing" {
+    const testing = std.testing;
+    try testing.expect(keyWriteIsTyping(.{ .action = .press, .key = .key_a }));
+    try testing.expect(keyWriteIsTyping(.{ .action = .repeat, .key = .key_a }));
+    try testing.expect(keyWriteIsTyping(.{ .action = .press, .key = .enter }));
+    try testing.expect(!keyWriteIsTyping(.{ .action = .release, .key = .key_a }));
+    try testing.expect(!keyWriteIsTyping(.{ .action = .release, .key = .enter }));
+    try testing.expect(!keyWriteIsTyping(.{ .action = .press, .key = .shift_left }));
+    try testing.expect(!keyWriteIsTyping(.{ .action = .release, .key = .control_left }));
+}
+
 /// Whether a key press has to record its own submission. Enter submits the
 /// line whatever its encoding. The legacy encoding is a CR, which `queueIo`
 /// already recorded from the bytes; the Kitty keyboard protocol sends
@@ -3831,10 +3852,10 @@ pub fn keyCallback(
         return .ignored;
     }
 
-    // If our event is any keypress that isn't a modifier and we generated
+    // If our event is a key press that isn't a modifier and we generated
     // some data to send to the pty, then we move the viewport down to the
     // bottom. We also clear the selection for any key other then modifiers.
-    if (!event.key.modifier()) {
+    if (keyWriteIsTyping(event)) {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
