@@ -86,7 +86,9 @@ pub const Parser = struct {
         self.arena.deinit();
     }
 
-    /// Parse a complete command string.
+    /// Parse a complete command string, with a 1 MiB payload limit. This is
+    /// a convenience for tests: the APC handler feeds a parser itself, with
+    /// the protocol's own limit (`apc.Protocol.defaultMaxBytes`).
     pub fn parseString(alloc: Allocator, data: []const u8) !Command {
         var parser = init(alloc, 1024 * 1024);
         defer parser.deinit();
