@@ -1,0 +1,18 @@
+name: PKG35 Installer Pin Proof
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Verify pinned Inno Setup availability
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.1 --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installed = choco list --exact innosetup --limit-output
+          if ($LASTEXITCODE -ne 0 -or $installed -notcontains 'innosetup|6.7.1') { throw 'Exact pinned installer package was not installed.' }
+          Write-Host 'Pinned Inno Setup 6.7.1: 1/1 checks passed'
