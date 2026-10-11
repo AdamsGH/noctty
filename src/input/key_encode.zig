@@ -341,10 +341,24 @@ fn legacy(
         opts.windows_legacy and opts.kitty_flags.int() == 0 and
         !opts.modify_other_keys_state_2;
 
+    // ConPTY's console-record parser drops the distinct F13-F24 tilde
+    // codes. Its supported shifted F1-F12 forms carry these keys in legacy
+    // mode, at the cost of aliasing a physical Shift+F1-F12 chord.
+    const function_key, const function_mods = function: {
+        const value = @intFromEnum(event.key);
+        if (windows_legacy and value >= @intFromEnum(key.Key.f13) and value <= @intFromEnum(key.Key.f24)) {
+            const mapped: key.Key = @enumFromInt(value - 12);
+            var mods = all_mods;
+            mods.shift = true;
+            break :function .{ mapped, mods };
+        }
+        break :function .{ event.key, all_mods };
+    };
+
     // If we match a PC style function key then that is our result.
     if (pcStyleFunctionKey(
-        event.key,
-        all_mods,
+        function_key,
+        function_mods,
         opts.cursor_key_application,
         opts.keypad_key_application,
         opts.ignore_keypad_with_numlock,
@@ -2142,6 +2156,25 @@ test "legacy: F13 through F24" {
         const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{}u", .{kitty_code});
         try testing.expectEqualStrings(expected, writer.buffered());
     }
+}
+
+test "legacy: Windows console F13 through F24 aliases shifted function keys" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const inputs = [_]key.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
+    const outputs = [_][]const u8{ "\x1b[1;2P", "\x1b[1;2Q", "\x1b[13;2~", "\x1b[1;2S", "\x1b[15;2~", "\x1b[17;2~", "\x1b[18;2~", "\x1b[19;2~", "\x1b[20;2~", "\x1b[21;2~", "\x1b[23;2~", "\x1b[24;2~" };
+    for (inputs, outputs) |input, output| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(output, writer.buffered());
+    }
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .f13, .mods = .{ .ctrl = true } }, .{ .windows_legacy = true });
+    try testing.expectEqualStrings("\x1b[1;6P", writer.buffered());
+    writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .f24, .mods = .{ .ctrl = true, .alt = true } }, .{ .windows_legacy = true });
+    try testing.expectEqualStrings("\x1b[24;8~", writer.buffered());
 }
 
 test "legacy: ctrl+shift+minus (underscore on US)" {

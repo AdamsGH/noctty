@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
+#include <share.h>
 
 int wmain(int argc, wchar_t **argv) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
@@ -11,7 +12,8 @@ int wmain(int argc, wchar_t **argv) {
     ULONGLONG deadline = GetTickCount64() + 120000;
     if (argc != 4) return 2;
     if (!SetConsoleMode(input, 0x98) || !GetConsoleMode(input, &mode) || mode != 0x98) return 3;
-    if (_wfopen_s(&records, argv[1], L"wb") || !records) return 4;
+    records = _wfsopen(argv[1], L"wb", _SH_DENYNO);
+    if (!records) return 4;
     fprintf(records, "CodeUnit,VirtualKey,ControlState\n");
     fflush(records);
     if (_wfopen_s(&ready, argv[2], L"wb") || !ready) { fclose(records); return 5; }

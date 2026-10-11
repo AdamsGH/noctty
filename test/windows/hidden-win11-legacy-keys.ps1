@@ -50,6 +50,8 @@ public static class LegacyKeys {
     public delegate bool EnumWindow(IntPtr h,IntPtr p);
     [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr d,IntPtr m,int f,uint a,IntPtr s);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint tid);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformationW(IntPtr h,int index,StringBuilder value,int length,out int needed);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow c,IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h,EnumWindow c,IntPtr p);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h,StringBuilder s,int n);
@@ -112,6 +114,11 @@ public static class LegacyKeys {
             if(id==pid && Class(h)=="noctty.win32.host") EnumChildWindows(h,(c,q)=> { if(Class(c)=="noctty.win32") found=c; return true; },IntPtr.Zero);
             return true;
         },IntPtr.Zero); return found;
+    }
+    public static string DesktopName() {
+        var name=new StringBuilder(256); int needed;
+        if(!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),2,name,name.Capacity*2,out needed)) throw new Exception("Driver desktop identity unavailable");
+        return name.ToString();
     }
     static void Send(IntPtr h,uint m,int w,long l) {
         IntPtr result; if(SendMessageTimeoutW(h,m,new IntPtr(w),new IntPtr(l),2,2000,out result)==IntPtr.Zero) throw new Exception("Timed key/control message failed");
@@ -252,6 +259,8 @@ if(-not $Driver) {
 }
 
 # Driver: every child inherits this private desktop and sandboxed AppData.
+$driverDesktop=[LegacyKeys]::DesktopName()
+if(-not $driverDesktop.StartsWith('noctty-legacy-',[StringComparison]::Ordinal)) { throw 'Driver is not on the task private desktop.' }
 if(-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.portable'))) { throw 'Driver requires portable marker.' }
 foreach($dir in @('LOCALAPPDATA','APPDATA')) {
     $value=[Environment]::GetEnvironmentVariable($dir)
@@ -259,7 +268,12 @@ foreach($dir in @('LOCALAPPDATA','APPDATA')) {
 }
 $checks=[Collections.Generic.List[object]]::new(); $job=[LegacyKeys]::CreateOwnedJob(); $terminal=$null; $probe=$null; $usLayout=$null
 $records=Join-Path $Run 'records.csv'; $ready=Join-Path $Run 'ready.txt'; $stop=Join-Path $Run 'stop.txt'
-function Read-Records { return @(Import-Csv -LiteralPath $records | ForEach-Object { @{CodeUnit=[int]$_.CodeUnit;VirtualKey=[int]$_.VirtualKey;ControlState=[uint32]$_.ControlState} }) }
+function Read-Records {
+    $stream=[IO.FileStream]::new($records,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    $reader=[IO.StreamReader]::new($stream)
+    try { $csv=$reader.ReadToEnd() } finally { $reader.Dispose() }
+    return @($csv | ConvertFrom-Csv | ForEach-Object { @{CodeUnit=[int]$_.CodeUnit;VirtualKey=[int]$_.VirtualKey;ControlState=[uint32]$_.ControlState} })
+}
 function Capture-Key([string]$Name,[int]$VK,[int]$Character,[bool]$Ctrl,[bool]$Alt,[bool]$Shift,[int[]]$Expected,[switch]$FunctionKey,[switch]$NonAscii) {
     $offset=@(Read-Records).Count
     $unsupported=$false
@@ -267,11 +281,13 @@ function Capture-Key([string]$Name,[int]$VK,[int]$Character,[bool]$Ctrl,[bool]$A
     else { [LegacyKeys]::Key($surface,$VK,$Character,$Ctrl,$Alt,$Shift,$Synchronous.IsPresent) }
     Start-Sleep -Milliseconds 450
     $all=@(Read-Records); $actual=if($all.Count -gt $offset) { @($all[$offset..($all.Count-1)]) } else { @() }
-    $units=@($actual | ForEach-Object { $_.CodeUnit })
-    if($FunctionKey) { $pass=@($actual | Where-Object { $_.VirtualKey -eq $VK }).Count -gt 0 -and @($actual | Where-Object { $_.CodeUnit -ne 0 }).Count -eq 0 }
+    $textRecords=@($actual | Where-Object { $_.CodeUnit -ne 0 })
+    $units=@($(if($NonAscii){$textRecords}else{$actual}) | ForEach-Object { $_.CodeUnit })
+    $functionVK=$VK-12
+    if($FunctionKey) { $pass=@($actual | Where-Object { $_.VirtualKey -eq $functionVK -and ($_.ControlState -band 16) -ne 0 }).Count -gt 0 -and $textRecords.Count -eq 0 }
     else { $pass=($units -join ',') -ceq ($Expected -join ',') }
-    if($NonAscii -and -not $unsupported) { $pass=$pass -and @($actual | Where-Object { ($_.ControlState -band 3) -ne 0 }).Count -eq 1 }
-    $expectation=if($FunctionKey) { @{VirtualKey=$VK;CodeUnit=0} } else { @{CodeUnits=$Expected;AltRequired=$NonAscii.IsPresent} }
+    if($NonAscii -and -not $unsupported) { $pass=$pass -and $textRecords.Count -eq 1 -and @($textRecords | Where-Object { ($_.ControlState -band 3) -ne 0 }).Count -eq 1 }
+    $expectation=if($FunctionKey) { @{VirtualKey=$functionVK;ShiftRequired=$true;CodeUnit=0} } else { @{CodeUnits=$Expected;AltRequired=$NonAscii.IsPresent} }
     $checks.Add(@{Name=$Name;Status=$(if($unsupported){'UNSUPPORTED'}elseif($pass){'PASS'}else{'FAIL'});Expected=$expectation;Records=$actual})
 }
 try {
@@ -280,15 +296,15 @@ try {
         Set-Content -LiteralPath $config
     $exe=Join-Path $Bin 'noctty.exe'; $helper=Join-Path $Run 'legacy-key-records.exe'
     $command='"{0}" --config-file="{1}" -e "{2}" "{3}" "{4}" "{5}"' -f $exe,$config,$helper,$records,$ready,$stop
-    $terminal=[LegacyKeys]::Launch($exe,$command,$Bin,$null,$job)
-    $deadline=[datetime]::UtcNow.AddSeconds(15); $surface=[IntPtr]::Zero
+    $terminal=[LegacyKeys]::Launch($exe,$command,$Bin,"WinSta0\$driverDesktop",$job)
+    $deadline=[datetime]::UtcNow.AddSeconds(45); $surface=[IntPtr]::Zero
     do {
         $surface=[LegacyKeys]::Surface($terminal.pid)
         if($surface -ne [IntPtr]::Zero -and (Test-Path -LiteralPath $ready)) { break }
         if([LegacyKeys]::WaitForSingleObject($terminal.process,0) -eq 0) { throw 'Noctty exited before observer ready.' }
         Start-Sleep -Milliseconds 50
     } while([datetime]::UtcNow -lt $deadline)
-    if($surface -eq [IntPtr]::Zero -or -not (Test-Path -LiteralPath $ready)) { throw 'Hidden surface/observer startup timed out.' }
+    if($surface -eq [IntPtr]::Zero -or -not (Test-Path -LiteralPath $ready)) { throw "Hidden startup timed out: surfaceFound=$($surface -ne [IntPtr]::Zero), observerReady=$(Test-Path -LiteralPath $ready)." }
     $probe=(Get-Content -LiteralPath $ready -Raw).Trim().Split(',')
     if($probe.Count -ne 2 -or $probe[1] -ne '152') { throw 'Console observer input mode was not 0x98.' }
     $usLayout=[LegacyKeys]::UseLayout($surface,'00000409')
