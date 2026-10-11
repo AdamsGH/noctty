@@ -4509,7 +4509,9 @@ fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t = &self.io.terminal;
-    return .fromTerminal(t);
+    var opts: input.key_encode.Options = .fromTerminal(t);
+    opts.windows_legacy = builtin.os.tag == .windows;
+    return opts;
 }
 
 /// Sends text as-is to the terminal without triggering any keyboard

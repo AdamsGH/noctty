@@ -31,6 +31,11 @@ pub const Options = struct {
     /// Kitty keyboard protocol flags.
     kitty_flags: KittyFlags = .disabled,
 
+    /// Use ConPTY-compatible encodings when no keyboard extension is requested.
+    /// The Windows application enables this; library callers retain the
+    /// traditional fixterms table unless they explicitly opt in.
+    windows_legacy: bool = false,
+
     /// Determines whether the "option" key on macOS is treated
     /// as "alt" or not. See the Ghostty `macos_option-as-alt` config
     /// docs for a more detailed description of why this is needed.
@@ -332,10 +337,38 @@ fn legacy(
     // If we're in a dead key state then we never emit a sequence.
     if (event.composing) return;
 
+    const windows_legacy = builtin.os.tag == .windows and
+        opts.windows_legacy and opts.kitty_flags.int() == 0 and
+        !opts.modify_other_keys_state_2;
+
+    // ConPTY's console-record parser drops the distinct F13-F24 tilde
+    // codes. Its supported shifted F1-F12 forms carry these keys in legacy
+    // mode, at the cost of aliasing a physical Shift+F1-F12 chord.
+    const function_key, const function_mods = function: {
+        const value = @intFromEnum(event.key);
+        if (windows_legacy and value >= @intFromEnum(key.Key.f13) and value <= @intFromEnum(key.Key.f24)) {
+            const mapped: key.Key = @enumFromInt(value - 12);
+            var mods = all_mods;
+            mods.shift = true;
+            break :function .{ mapped, mods };
+        }
+        break :function .{ event.key, all_mods };
+    };
+
+    // ConPTY accepts modified F3 as CSI 1;<modifier>R, but drops the
+    // shared table's CSI 13;<modifier>~ form (including the F15 alias).
+    if (windows_legacy and function_key == .f3) {
+        for (function_keys.modifiers, 2..) |mods, modifier| {
+            if (mods.int() == function_mods.binding().int()) {
+                return try writer.print("\x1b[1;{}R", .{modifier});
+            }
+        }
+    }
+
     // If we match a PC style function key then that is our result.
     if (pcStyleFunctionKey(
-        event.key,
-        all_mods,
+        function_key,
+        function_mods,
         opts.cursor_key_application,
         opts.keypad_key_application,
         opts.ignore_keypad_with_numlock,
@@ -368,6 +401,26 @@ fn legacy(
             }
         }
 
+        // ConPTY cannot decode the CSI 27 modifier forms for these keys.
+        // Keep committed IME text above and negotiated keyboard modes intact.
+        if (windows_legacy) {
+            const byte: ?u8 = switch (event.key) {
+                .enter => '\r',
+                .escape => 0x1b,
+                .tab => if (all_mods.shift) null else '\t',
+                .backspace => if (all_mods.ctrl) 0x08 else 0x7f,
+                else => null,
+            };
+            if (byte) |char| {
+                if (all_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeByte(char);
+            }
+            if (event.key == .tab) {
+                if (all_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeAll("\x1b[Z");
+            }
+        }
+
         return try writer.writeAll(sequence);
     }
 
@@ -391,16 +444,35 @@ fn legacy(
         return;
     }
 
+    // Complete the Windows C0 table after the shared Ctrl mappings. Shift
+    // does not request fixterms in a console client; unsupported punctuation
+    // falls through to its text instead of an undecodable CSI sequence.
+    if (windows_legacy and all_mods.ctrl) {
+        const cp: ?u21 = if (event.utf8.len == 1)
+            event.utf8[0]
+        else if (event.utf8.len == 0)
+            event.key.codepoint()
+        else
+            null;
+        if (cp) |char| {
+            if (char >= '@' and char <= '~') {
+                if (binding_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeByte(@intCast(char & 0x1f));
+            }
+        }
+    }
+
     // If we have no UTF8 text then the only possibility is the
     // alt-prefix handling of unshifted codepoints... so we process that.
     const utf8 = event.utf8;
     if (utf8.len == 0) {
         if (try legacyAltPrefix(
+            writer,
             event,
             binding_mods,
             all_mods,
             opts,
-        )) |byte| try writer.print("\x1B{c}", .{byte});
+        )) return;
         return;
     }
 
@@ -471,7 +543,7 @@ fn legacy(
     // Let's see if we should apply fixterms to this codepoint.
     // At this stage of key processing, we only need to apply fixterms
     // to unicode codepoints if we have ctrl set.
-    if (event.mods.ctrl) csiu: {
+    if (event.mods.ctrl and !windows_legacy) csiu: {
         // Important: we want to use the original mods here, not the
         // effective mods. The fixterms spec states the shifted chars
         // should be sent uppercase but Kitty changes that behavior
@@ -517,13 +589,12 @@ fn legacy(
     // If we have alt-pressed and alt-esc-prefix is enabled, then
     // we need to prefix the utf8 sequence with an esc.
     if (try legacyAltPrefix(
+        writer,
         event,
         binding_mods,
         all_mods,
         opts,
-    )) |byte| {
-        return try writer.print("\x1B{c}", .{byte});
-    }
+    )) return;
 
     // If we are on macOS, command+keys do not encode text. It isn't
     // typical for command+keys on macOS to ever encode text. They
@@ -542,47 +613,41 @@ fn legacy(
 }
 
 fn legacyAltPrefix(
+    writer: *std.Io.Writer,
     event: key.KeyEvent,
     binding_mods: key.Mods,
     mods: key.Mods,
     opts: Options,
-) !?u8 {
+) std.Io.Writer.Error!bool {
     // This only takes effect with alt pressed
-    if (!binding_mods.alt or !opts.alt_esc_prefix) return null;
+    if (!binding_mods.alt or !opts.alt_esc_prefix) return false;
 
     // On macOS, we only handle option like alt in certain
     // circumstances. Otherwise, macOS does a unicode translation
     // and we allow that to happen.
     if (comptime builtin.os.tag == .macos) {
         switch (opts.macos_option_as_alt) {
-            .false => return null,
-            .left => if (mods.sides.alt == .right) return null,
-            .right => if (mods.sides.alt == .left) return null,
+            .false => return false,
+            .left => if (mods.sides.alt == .right) return false,
+            .right => if (mods.sides.alt == .left) return false,
             .true => {},
         }
     }
 
-    // Otherwise, we require utf8 to already have the byte represented.
-    const utf8 = event.utf8;
-    if (utf8.len == 1) {
-        if (std.math.cast(u8, utf8[0])) |byte| {
-            return byte;
-        }
-    }
-
-    // If UTF8 isn't set, we will allow unshifted codepoints through.
-    if (event.unshifted_codepoint > 0) {
-        if (std.math.cast(
-            u8,
-            event.unshifted_codepoint,
-        )) |byte| {
-            return byte;
-        }
-    }
-
-    // Else, we can't figure out the byte to alt-prefix so we
-    // exit this handling.
-    return null;
+    // Option-as-Alt on macOS uses the unshifted key when Option translated
+    // it into non-ASCII text. Single-byte text still wins (shifted punctuation).
+    const use_text = event.utf8.len > 0 and
+        (event.utf8.len == 1 or builtin.os.tag != .macos or event.unshifted_codepoint == 0);
+    var buf: [4]u8 = undefined;
+    const utf8 = if (use_text)
+        event.utf8
+    else if (event.unshifted_codepoint > 0) blk: {
+        const len = std.unicode.utf8Encode(event.unshifted_codepoint, &buf) catch return false;
+        break :blk buf[0..len];
+    } else return false;
+    try writer.writeByte(0x1b);
+    try writer.writeAll(utf8);
+    return true;
 }
 
 /// Determines whether the key should be encoded in the xterm
@@ -1948,6 +2013,180 @@ test "legacy: esc with utf8 (dead key state)" {
     try testing.expectEqualStrings("A", writer.buffered());
 }
 
+test "legacy: Windows console control table" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const cases = [_]struct { input: key.Key, text: []const u8, output: []const u8 }{
+        .{ .input = .bracket_left, .text = "[", .output = "\x1b" },
+        .{ .input = .key_i, .text = "i", .output = "\t" },
+        .{ .input = .key_m, .text = "m", .output = "\r" },
+        .{ .input = .period, .text = ".", .output = "." },
+        .{ .input = .semicolon, .text = ";", .output = ";" },
+        .{ .input = .quote, .text = "'", .output = "'" },
+        .{ .input = .backquote, .text = "`", .output = "\x00" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = case.input, .utf8 = case.text, .mods = .{ .ctrl = true } }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+}
+
+test "legacy: Windows console modified Enter and Escape" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for ([_]key.Key{ .enter, .escape }) |input| {
+        for (function_keys.modifiers) |mods| {
+            var buf: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try encode(&writer, .{ .key = input, .mods = mods }, .{ .windows_legacy = true });
+            const byte: u8 = if (input == .enter) '\r' else 0x1b;
+            const expected = [_]u8{ 0x1b, byte };
+            try testing.expectEqualStrings(if (mods.alt) &expected else expected[1..], writer.buffered());
+        }
+    }
+}
+
+test "legacy: Windows console Tab and Backspace modifiers" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for (function_keys.modifiers) |mods| {
+        var buf: [128]u8 = undefined;
+        var expected_buf: [8]u8 = undefined;
+        for ([_]key.Key{ .tab, .backspace }) |input| {
+            var writer: std.Io.Writer = .fixed(&buf);
+            var expected: std.Io.Writer = .fixed(&expected_buf);
+            if (mods.alt) try expected.writeByte(0x1b);
+            if (input == .tab) {
+                try expected.writeAll(if (mods.shift) "\x1b[Z" else "\t");
+            } else try expected.writeByte(if (mods.ctrl) 0x08 else 0x7f);
+            try encode(&writer, .{ .key = input, .mods = mods }, .{ .windows_legacy = true });
+            try testing.expectEqualStrings(expected.buffered(), writer.buffered());
+        }
+    }
+}
+
+test "legacy: Windows console shifted Ctrl and committed IME text" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const cases = [_]struct { input: key.Key, text: []const u8, output: []const u8 }{
+        .{ .input = .key_i, .text = "I", .output = "\t" },
+        .{ .input = .key_m, .text = "M", .output = "\r" },
+        .{ .input = .digit_2, .text = "@", .output = "\x00" },
+        .{ .input = .bracket_left, .text = "ő", .output = "ő" },
+        .{ .input = .enter, .text = "日", .output = "日" },
+        .{ .input = .escape, .text = "日", .output = "日" },
+        .{ .input = .backspace, .text = "日", .output = "" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = case.input, .utf8 = case.text, .mods = .{ .ctrl = true, .shift = true } }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+}
+
+test "legacy: Windows console option preserves requested keyboard protocols" {
+    const cases = [_]struct { event: key.KeyEvent, mok: []const u8, kitty: []const u8 }{
+        .{ .event = .{ .key = .bracket_left, .utf8 = "[", .unshifted_codepoint = '[', .mods = .{ .ctrl = true } }, .mok = "\x1b[27;5;91~", .kitty = "\x1b[91;5u" },
+        .{ .event = .{ .key = .enter, .mods = .{ .shift = true } }, .mok = "\x1b[27;2;13~", .kitty = "\x1b[13;2u" },
+        .{ .event = .{ .key = .escape, .mods = .{ .ctrl = true } }, .mok = "\x1b[27;5;27~", .kitty = "\x1b[27;5u" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .modify_other_keys_state_2 = true });
+        try testing.expectEqualStrings(case.mok, writer.buffered());
+        writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .kitty_flags = .{ .disambiguate = true } });
+        try testing.expectEqualStrings(case.kitty, writer.buffered());
+    }
+}
+
+test "legacy: Alt UTF-8 text and codepoint fallback" {
+    const cases = [_]struct { text: []const u8, cp: u21 }{
+        .{ .text = "ö", .cp = 0xf6 },
+        .{ .text = "ß", .cp = 0xdf },
+        .{ .text = "ж", .cp = 0x436 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |empty| {
+            var buf: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try encode(&writer, .{
+                .key = .unidentified,
+                .utf8 = if (empty) "" else case.text,
+                .unshifted_codepoint = case.cp,
+                .mods = .{ .alt = true },
+            }, .{ .alt_esc_prefix = true, .macos_option_as_alt = .true });
+            try testing.expectEqual(@as(u8, 0x1b), writer.buffered()[0]);
+            try testing.expectEqualStrings(case.text, writer.buffered()[1..]);
+        }
+    }
+}
+
+test "legacy: Alt UTF-8 shifted text and disabled prefix" {
+    for ([_]bool{ false, true }) |prefix| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{
+            .utf8 = "Ö",
+            .unshifted_codepoint = 0xf6,
+            .mods = .{ .alt = true, .shift = true },
+        }, .{ .alt_esc_prefix = prefix, .macos_option_as_alt = .true });
+        const expected = if (!prefix) "Ö" else if (builtin.os.tag == .macos) "\x1bö" else "\x1bÖ";
+        try testing.expectEqualStrings(expected, writer.buffered());
+    }
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .unshifted_codepoint = 0xd800, .mods = .{ .alt = true } }, .{ .alt_esc_prefix = true, .macos_option_as_alt = .true });
+    try testing.expectEqualStrings("", writer.buffered());
+}
+
+test "legacy: F13 through F24" {
+    const inputs = [_]key.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
+    const outputs = [_][]const u8{ "\x1b[25~", "\x1b[26~", "\x1b[28~", "\x1b[29~", "\x1b[31~", "\x1b[32~", "\x1b[33~", "\x1b[34~", "\x1b[42~", "\x1b[43~", "\x1b[44~", "\x1b[45~" };
+    for (inputs, outputs) |input, output| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{});
+        try testing.expectEqualStrings(output, writer.buffered());
+    }
+    const codes = [_]u8{ 25, 26, 28, 29, 31, 32, 33, 34, 42, 43, 44, 45 };
+    for (inputs, codes, 57376..) |input, code, kitty_code| {
+        for (function_keys.modifiers, 2..) |mods, modifier| {
+            var buf: [128]u8 = undefined;
+            var expected_buf: [32]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try encode(&writer, .{ .key = input, .mods = mods }, .{});
+            const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{};{}~", .{ code, modifier });
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+        var buf: [128]u8 = undefined;
+        var expected_buf: [32]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{ .kitty_flags = .{ .report_all = true } });
+        const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{}u", .{kitty_code});
+        try testing.expectEqualStrings(expected, writer.buffered());
+    }
+}
+
+test "legacy: Windows console F13 through F24 aliases shifted function keys" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const inputs = [_]key.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
+    const outputs = [_][]const u8{ "\x1b[1;2P", "\x1b[1;2Q", "\x1b[1;2R", "\x1b[1;2S", "\x1b[15;2~", "\x1b[17;2~", "\x1b[18;2~", "\x1b[19;2~", "\x1b[20;2~", "\x1b[21;2~", "\x1b[23;2~", "\x1b[24;2~" };
+    for (inputs, outputs) |input, output| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(output, writer.buffered());
+    }
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .f13, .mods = .{ .ctrl = true } }, .{ .windows_legacy = true });
+    try testing.expectEqualStrings("\x1b[1;6P", writer.buffered());
+    writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .f24, .mods = .{ .ctrl = true, .alt = true } }, .{ .windows_legacy = true });
+    try testing.expectEqualStrings("\x1b[24;8~", writer.buffered());
+}
+
 test "legacy: ctrl+shift+minus (underscore on US)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2042,7 +2281,7 @@ test "legacy: alt+ф" {
     }, .{
         .alt_esc_prefix = true,
     });
-    try testing.expectEqualStrings("ф", writer.buffered());
+    try testing.expectEqualStrings(if (builtin.os.tag == .macos) "ф" else "\x1bф", writer.buffered());
 }
 
 test "legacy: ctrl+c" {
