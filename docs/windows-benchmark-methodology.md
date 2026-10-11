@@ -77,6 +77,29 @@ zig build bench:vt-throughput -- --workload=scroll --bytes=4194304 --seed=121 --
 zig build bench:palette-match -- --entries=5000 --keystrokes=5000 --budget-us=2500
 ```
 
+### Scrollback search under streaming output
+
+`bench:search-stream` is a diagnostic, not a CI gate. It fills the scrollback
+with log lines that match the needle, then either drives the search thread's
+`Search` state the way the thread does (`--mode=feed`: the initial search, then
+one refresh per 32 KiB of output) or runs the real search thread while output
+streams in 4 KiB writes under the terminal lock (`--mode=thread`;
+`--rate-mib-s` paces the output, and the writer's time waiting for the lock is
+reported). Recorded 2026-10-11 for PKG-36 on the Ryzen 9 9900X, Windows build
+26300, `ReleaseFast`, with `--lines=100000` (118k matches over 358 pages, 45 x
+140, 200 MiB scrollback); medians:
+
+| Measure                                                                        | Before PKG-36 |  After |
+| ------------------------------------------------------------------------------ | ------------: | -----: |
+| Initial search (`--mode=feed --stream-mib=4 --runs=5`)                         |      3,294 ms | 265 ms |
+| One refresh, `Search.feed` plus `notify` (same run, n = 640)                   |       27.7 ms | 3.8 ms |
+| Writer's lock wait, 8 MiB at 2 MiB/s (`--mode=thread --rate-mib-s=2 --runs=3`) |      2,668 ms | 565 ms |
+
+```powershell
+zig build bench:search-stream -- --mode=feed --lines=100000 --stream-mib=4 --runs=5
+zig build bench:search-stream -- --mode=thread --lines=100000 --stream-mib=8 --rate-mib-s=2 --runs=3
+```
+
 ## Measured interactive baseline
 
 First same-machine interactive baseline, recorded 2026-08-27 from
