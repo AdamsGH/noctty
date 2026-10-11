@@ -4014,21 +4014,19 @@ pub const App = struct {
             .onClosed = &settingsOnClosedThunk,
         });
         self.link_hover_tracker = win32_link_preview.HoverTracker.init();
-        // The driver interface retains a pointer to its App-owned field, so
-        // construct it only after `self.*` has established the final address.
+        // The D3D11/DirectComposition/DirectWrite shell compositor is not
+        // started: the backend gets no driver and no capability probe, so it
+        // stays in its fallback state and the attach, resize and render
+        // helpers below are no-ops. Building its device graph here put a
+        // hardware D3D11 device on the UI thread before the first window,
+        // and kept about 80 driver threads and tens of MB alive, for
+        // explicit banner text only (PKG-33). The device-graph code stays
+        // until the D3D11 renderer decision settles whether it is reused.
         self.shell_compositor_driver = win32_compositor_native.NativeDriver.init(core_app.alloc);
-        self.shell_compositor = win32_compositor.Backend.init(
-            win32_compositor.probeNativeCapability(),
-            self.shell_compositor_driver.interface(),
-        );
+        self.shell_compositor = win32_compositor.Backend.init(.{}, null);
         self.shell_compositor_initialized = true;
         self.shell_runtime = win32_shell.runtime.Runtime.init(core_app.alloc);
         self.shell_runtime_initialized = true;
-        const compositor_status = self.shell_compositor.status();
-        log.info("shell compositor state={s} fallback={?s}", .{
-            @tagName(compositor_status.state),
-            if (compositor_status.fallback_reason) |reason| @tagName(reason) else null,
-        });
 
         // Core conditional configuration defaults to light. Synchronize it
         // with Windows before the first surface is created so conditional
@@ -8640,8 +8638,8 @@ pub const App = struct {
         // `CreateWindowEx` with a caption it did not ask for. Take it off
         // while the host is still hidden and has no tabs. This goes after the
         // compositor attach because the frame change resizes the client area,
-        // and the host's WM_SIZE resizes its compositor target, which must
-        // exist by then.
+        // and the host's WM_SIZE resizes its compositor target (when a
+        // compositor is running), which must exist by then.
         restoreRequestedHostWindowStyle(hwnd, startup_style);
 
         try self.hosts.append(self.core_app.alloc, host);
@@ -8672,6 +8670,8 @@ pub const App = struct {
     fn attachShellCompositorWindow(self: *App, hwnd: HWND) void {
         if (!self.shell_compositor_initialized) return;
         self.shell_compositor.attachWindow(@intFromPtr(hwnd)) catch |err| switch (err) {
+            // The normal state: no driver was started, so no host has a target.
+            error.FallbackOnly => return,
             error.DeviceLost => {
                 self.shell_compositor.recover() catch |recover_err| {
                     log.warn("shell compositor recovery after attach failed err={}", .{recover_err});
@@ -8807,6 +8807,38 @@ pub const App = struct {
             },
             else => log.warn("shell compositor commit unavailable err={}", .{err}),
         };
+    }
+
+    test "App.init leaves the shell compositor stopped so banners fall back to GDI" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core = try CoreApp.create(std.testing.allocator);
+        defer core.destroy();
+
+        var app: App = undefined;
+        try app.init(core, .{});
+        defer app.terminate();
+
+        // Starting the native driver builds a hardware D3D11 device on the UI
+        // thread and attaches a DirectComposition target to every host.
+        try std.testing.expect(app.shell_compositor_initialized);
+        try std.testing.expect(!app.shell_compositor_driver.isStarted());
+        try std.testing.expectEqual(win32_compositor.State.fallback, app.shell_compositor.status().state);
+
+        // A host that appears now gets no target, and the chrome painter is
+        // told nothing was drawn, so `paintChromeBanner` draws with GDI.
+        const hwnd: HWND = @ptrFromInt(0x1000);
+        app.attachShellCompositorWindow(hwnd);
+        try std.testing.expect(!app.shell_compositor.status().compositionActive());
+        try std.testing.expectEqual(@as(u32, 0), app.shell_compositor.status().active_target_count);
+        try std.testing.expect(!app.renderShellChromeText(hwnd, .{
+            .text = std.unicode.utf8ToUtf16LeStringLiteral("Nothing to undo."),
+            .left_px = 0,
+            .top_px = 0,
+            .right_px = 100,
+            .bottom_px = 24,
+            .color_ref = 0,
+        }));
     }
 
     fn findHostById(self: *App, id: u32) ?*Host {
@@ -21572,6 +21604,74 @@ const Host = struct {
         }
         _ = sys.SetTextColor(hdc, theme.text_primary);
         return true;
+    }
+
+    test "paintChromeBanner draws an explicit banner with GDI while the shell compositor is stopped" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        // `TestSession` gives the backend no driver, as `App.init` does. Mark
+        // it initialized so `renderShellChromeText` consults it, as it does
+        // there. That `App.init` really leaves it this way is pinned by
+        // "App.init leaves the shell compositor stopped ...".
+        app.shell_compositor_initialized = true;
+
+        const raw = struct {
+            extern "user32" fn GetDC(hwnd: ?*anyopaque) callconv(.winapi) HDC;
+            extern "user32" fn ReleaseDC(hwnd: ?*anyopaque, hdc: HDC) callconv(.winapi) i32;
+            extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) callconv(.winapi) HGDIOBJ;
+            extern "gdi32" fn GetPixel(hdc: HDC, x: i32, y: i32) callconv(.winapi) u32;
+        };
+        const width = 360;
+        const height = 80;
+        const banner_y = 10;
+        const screen = raw.GetDC(null) orelse return error.SkipZigTest;
+        defer _ = raw.ReleaseDC(null, screen);
+        const memory = sys.CreateCompatibleDC(screen) orelse return error.SkipZigTest;
+        defer _ = sys.DeleteDC(memory);
+        const bitmap = raw.CreateCompatibleBitmap(screen, width, height) orelse return error.SkipZigTest;
+        defer _ = sys.DeleteObject(bitmap);
+        const previous = sys.SelectObject(memory, bitmap);
+        defer _ = sys.SelectObject(memory, previous);
+
+        const rect = RECT{ .left = 0, .top = 0, .right = width, .bottom = height };
+        const black = sys.CreateSolidBrush(0) orelse return error.SkipZigTest;
+        defer _ = sys.DeleteObject(black);
+        _ = sys.FillRect(memory, &rect, black);
+        _ = sys.SetBkMode(memory, c.TRANSPARENT);
+
+        const Counter = struct {
+            fn lit(dc: HDC) usize {
+                var count: usize = 0;
+                var y: i32 = banner_y;
+                while (y < banner_y + 24) : (y += 1) {
+                    var x: i32 = 0;
+                    while (x < width) : (x += 1) {
+                        if (raw.GetPixel(dc, x, y) != 0) count += 1;
+                    }
+                }
+                return count;
+            }
+        };
+        try std.testing.expectEqual(@as(usize, 0), Counter.lit(memory));
+
+        const alloc = std.testing.allocator;
+        try host.setBanner(.info, "Nothing to undo.");
+        defer if (host.cached_banner_w) |text| alloc.free(text);
+        host.chrome_text_dirty.banner = true;
+
+        const hwnd: HWND = @ptrFromInt(0x1000);
+        try std.testing.expect(host.paintChromeBanner(hwnd, memory, alloc, rect, banner_y, false, true, &app.resolved_theme));
+        try std.testing.expect(Counter.lit(memory) > 0);
     }
 
     fn paintChromeStatusBar(
