@@ -47,8 +47,9 @@ font_discover: ?Discover = null,
 lock: std.Thread.Mutex = .{},
 
 /// Windows font metadata discovery can overlap runtime/window setup. The
-/// worker takes `lock`, so the first grid lookup either observes a complete
-/// scan or waits for it without duplicating discovery work.
+/// worker only scans; it does not take `lock`, so a grid that needs no
+/// font from the scan is built without waiting for it, and one that does
+/// waits inside discovery, which also keeps the scan from running twice.
 discovery_prefetch_thread: ?std.Thread = null,
 
 pub const InitError = Library.InitError;
@@ -96,10 +97,16 @@ pub fn startDiscoveryPrefetch(self: *SharedGridSet) void {
         !@hasDecl(Discover, "refresh")) return;
     if (self.discovery_prefetch_thread != null) return;
 
+    const disco = disco: {
+        self.lock.lock();
+        defer self.lock.unlock();
+        break :disco (self.discover() catch return) orelse return;
+    };
+
     self.discovery_prefetch_thread = std.Thread.spawn(
         .{},
         discoveryPrefetchMain,
-        .{self},
+        .{disco},
     ) catch return;
 }
 
@@ -107,12 +114,8 @@ pub fn discoveryPrefetchStarted(self: *const SharedGridSet) bool {
     return self.discovery_prefetch_thread != null;
 }
 
-fn discoveryPrefetchMain(self: *SharedGridSet) void {
-    self.lock.lock();
-    defer self.lock.unlock();
-
-    const disco = self.discover() catch return;
-    if (disco) |value| value.refresh();
+fn discoveryPrefetchMain(disco: *Discover) void {
+    disco.refresh();
 }
 
 /// Returns the number of cached grids.
@@ -226,9 +229,11 @@ fn collection(
         // Backends that support runtime rescanning (Windows) refresh their
         // font list here so that fonts installed while the app is running
         // are picked up on config reload. This is a cheap staleness check
-        // when nothing changed. Other backends (fontconfig) are unsafe to
-        // reinit and don't declare `refresh`.
-        if (comptime @hasDecl(Discover, "refresh")) disco.refresh();
+        // when nothing changed. It never waits for or starts a first scan:
+        // a grid that names no font needs nothing from it, and `discover`
+        // below waits for it when a grid does. Other backends (fontconfig)
+        // are unsafe to reinit and don't declare `refresh`.
+        if (comptime @hasDecl(Discover, "refreshExisting")) disco.refreshExisting();
 
         // A buffer we use to store the font names for logging.
         var name_buf: [256]u8 = undefined;
@@ -876,4 +881,25 @@ test SharedGridSet {
     // If I deref grid1 then we should have a count of 0
     set.deref(key1);
     try testing.expectEqual(@as(usize, 0), set.count());
+}
+
+test "SharedGridSet builds a grid that names no font without a font scan" {
+    // F123: the default config names no font, so its grid needs nothing
+    // from the system font scan and must neither wait for the startup
+    // prefetch's scan nor run one. A fallback lookup scans when it needs to.
+    if (comptime builtin.target.os.tag == .windows) {
+        const testing = std.testing;
+        const alloc = testing.allocator;
+
+        var set = try SharedGridSet.init(alloc);
+        defer set.deinit();
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var keycfg = try DerivedConfig.init(alloc, &cfg);
+        defer keycfg.deinit();
+
+        const key, _ = try set.ref(&keycfg, .{ .points = 12 });
+        defer set.deref(key);
+        try testing.expect(set.font_discover.?.state == null);
+    } else return error.SkipZigTest;
 }
