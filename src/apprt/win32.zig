@@ -46,6 +46,7 @@ const win32_link_preview = @import("win32_link_preview.zig");
 const win32_quick_terminal = @import("win32_quick_terminal.zig");
 const win32_surface_drop = @import("win32_surface_drop.zig");
 const win32_surface_drop_target = @import("win32_surface_drop_target.zig");
+const win32_ole = @import("win32_ole.zig");
 const win32_toast_activation = @import("win32_toast_activation.zig");
 const win32_tab_drag = @import("win32_tab_drag.zig");
 const win32_tab_drag_ole = @import("win32_tab_drag_ole.zig");
@@ -280,10 +281,6 @@ const DeferredUiaDisconnect = struct {
     retries: u8 = 0,
 };
 const WS_OVERLAPPEDWINDOW = c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU | c.WS_THICKFRAME | c.WS_MINIMIZEBOX | c.WS_MAXIMIZEBOX;
-/// CF_HTML: registered clipboard format name is the literal string
-/// "HTML Format". The ID is process-local — we cache it on App.
-const CF_HTML_NAME = std.unicode.utf8ToUtf16LeStringLiteral("HTML Format");
-
 fn hostCompositionRedrawFlags() UINT {
     return c.RDW_INVALIDATE | c.RDW_ERASE | c.RDW_FRAME | c.RDW_NOCHILDREN | c.RDW_UPDATENOW;
 }
@@ -3732,8 +3729,8 @@ pub const App = struct {
     /// Stable core surface id that owned focus when Settings opened. Settings
     /// itself clears terminal focus flags, so close must not guess host zero.
     settings_restore_surface_id: ?u64 = null,
-    /// Whether `CoInitializeEx` actually took responsibility for the
-    /// apartment on this thread. `CoUninitialize` only pairs with a
+    /// Whether `OleInitialize` actually took responsibility for the
+    /// apartment on this thread. `OleUninitialize` only pairs with a
     /// successful init (`S_OK` / `S_FALSE`) — `RPC_E_CHANGED_MODE`
     /// means another component already set up COM and we must not
     /// touch it on the way down.
@@ -3762,11 +3759,6 @@ pub const App = struct {
     /// Whether the current core-app tick already spent its one synchronous
     /// renderer paint. See `rendererTickRepaintMode`.
     renderer_sync_paint_spent: bool = false,
-    /// Cached CF_HTML clipboard format ID — lazy-registered on
-    /// first HTML copy. Process-local so one cache per App is
-    /// enough; re-registering on every copy is documented as
-    /// cheap by MS but still pointless work.
-    cf_html_format: UINT = 0,
     /// Hyperlink hover-dwell tracker. Reset via `dismiss()` whenever
     /// focus leaves a surface or a click arrives.
     link_hover_tracker: win32_link_preview.HoverTracker = undefined,
@@ -4048,21 +4040,21 @@ pub const App = struct {
         };
     }
 
-    /// Bring the STA apartment online for in-process COM consumers
+    /// Bring OLE and its STA apartment online for in-process COM consumers
     /// (settings path picker via `IFileOpenDialog`, WinRT toast setup,
-    /// OLE drag-drop). Safe to call multiple times —
+    /// OLE drag-drop). Pair each successful call with OleUninitialize —
     /// `S_FALSE` means "already initialised in this mode", and
     /// `RPC_E_CHANGED_MODE` means "already initialised in a different
     /// mode" and leaves STA-only consumers disabled.
     fn initComApartment(self: *App) void {
-        const hr = sys.CoInitializeEx(null, c.COINIT_APARTMENTTHREADED);
+        const hr = sys.OleInitialize(null);
         switch (hr) {
             0, 1 => self.com_initialized = true, // S_OK, S_FALSE
             c.RPC_E_CHANGED_MODE => {
                 std.log.warn("COM apartment: already MTA on this thread; STA consumers may fail", .{});
             },
             else => {
-                std.log.warn("COM apartment: CoInitializeEx failed hr=0x{x:0>8}", .{@as(u32, @bitCast(hr))});
+                std.log.warn("COM apartment: OleInitialize failed hr=0x{x:0>8}", .{@as(u32, @bitCast(hr))});
             },
         }
     }
@@ -4528,7 +4520,7 @@ pub const App = struct {
         deinitImeWindowFormsTracePath(self.core_app.alloc);
         self.config.deinit();
         if (self.com_initialized) {
-            sys.CoUninitialize();
+            sys.OleUninitialize();
             self.com_initialized = false;
         }
     }
@@ -28312,6 +28304,20 @@ fn mouseButtonStateFromMessage(msg: UINT) ?input.MouseButtonState {
     };
 }
 
+fn rightClickShowsMenu(action: configpkg.Config.RightClickAction, press_consumed: bool) bool {
+    return action == .@"context-menu" and !press_consumed;
+}
+
+test "win32 right click menu honors consumed presses and every configured action" {
+    const expect = std.testing.expect;
+    try expect(rightClickShowsMenu(.@"context-menu", false));
+    try expect(!rightClickShowsMenu(.@"context-menu", true));
+    inline for (.{ .ignore, .paste, .copy, .@"copy-or-paste" }) |action| {
+        try expect(!rightClickShowsMenu(action, false));
+        try expect(!rightClickShowsMenu(action, true));
+    }
+}
+
 fn mouseModsFromWParam(wParam: WPARAM) input.Mods {
     const bits = @as(usize, @intCast(wParam));
     var mods = currentMods();
@@ -28557,6 +28563,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSEMOVE => {
             if (surface) |v| {
+                v.armScrollbarLeaveTracking(hwnd);
                 if (v.handleScrollbarProxyMouseMove(hwnd, lParam)) return 0;
                 v.handleMouseMove(lParam, mouseModsFromWParam(wParam));
                 return 0;
@@ -28566,7 +28573,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSELEAVE => {
             if (surface) |v| {
-                v.handleScrollbarMouseLeave();
+                v.handleMouseLeave();
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -28574,16 +28581,17 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_RBUTTONUP => {
             if (surface) |v| {
-                // If terminal has mouse reporting active and Shift is not held,
-                // pass through as a mouse event. Shift+Right-Click always opens
-                // the context menu (standard terminal behavior).
-                const mods = mouseModsFromWParam(wParam);
-                if (v.core_initialized and v.core_surface.io.terminal.flags.mouse_event != .none and !mods.shift) {
-                    v.handleMouseButton(msg, wParam, lParam);
-                    return 0;
-                }
-                // Otherwise show context menu
-                _ = sys.ReleaseCapture();
+                // Balance the core's press even when the click opens a menu.
+                // Snapshot and clear before releasing capture, which can send
+                // synchronous window messages. A reporting TUI consumes the
+                // press; Shift bypasses it unless the TUI captures Shift too.
+                const show_menu = v.core_initialized and rightClickShowsMenu(
+                    v.core_surface.config.right_click_action,
+                    v.right_press_consumed,
+                );
+                v.right_press_consumed = false;
+                _ = v.handleMouseButton(msg, wParam, lParam);
+                if (!show_menu) return 0;
                 if (v.host) |h| {
                     var pt: POINT = .{
                         .x = signedLowWord(lParamBits(lParam)),
@@ -28600,15 +28608,23 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
         c.WM_LBUTTONDOWN, c.WM_LBUTTONUP => {
             if (surface) |v| {
                 if (v.handleScrollbarProxyButton(hwnd, msg, lParam)) return 0;
-                v.handleMouseButton(msg, wParam, lParam);
+                _ = v.handleMouseButton(msg, wParam, lParam);
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
-        c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_MBUTTONUP => {
+        c.WM_RBUTTONDOWN => {
             if (surface) |v| {
-                v.handleMouseButton(msg, wParam, lParam);
+                v.right_press_consumed = v.handleMouseButton(msg, wParam, lParam);
+                return 0;
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        c.WM_MBUTTONDOWN, c.WM_MBUTTONUP => {
+            if (surface) |v| {
+                _ = v.handleMouseButton(msg, wParam, lParam);
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -28631,6 +28647,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSEWHEEL, c.WM_POINTERWHEEL => {
             if (surface) |v| {
+                v.updateWheelCursorPos(hwnd, lParam);
                 v.handleMouseWheel(normalizeWheelDelta(
                     v.wheelNormalizationContext(),
                     .vertical,
@@ -28643,6 +28660,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSEHWHEEL, c.WM_POINTERHWHEEL => {
             if (surface) |v| {
+                v.updateWheelCursorPos(hwnd, lParam);
                 v.handleMouseWheel(normalizeWheelDelta(
                     v.wheelNormalizationContext(),
                     .horizontal,
@@ -29015,6 +29033,7 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale = .{ .x = 1, .y = 1 },
     size: apprt.SurfaceSize = .{ .width = 800, .height = 600 },
     cursor_pos: apprt.CursorPos = .{ .x = -1, .y = -1 },
+    right_press_consumed: bool = false,
     title: ?[:0]const u8 = null,
     title_override: ?[:0]const u8 = null,
     tab_title_override: ?[:0]const u8 = null,
@@ -29148,7 +29167,7 @@ pub const Surface = struct {
     /// in `Surface.destroyWindow`. Storage is INLINE on Surface so
     /// the COM v-table pointer stays stable — Surface itself is
     /// heap-allocated via core_app.alloc and never moves.
-    drop_target: win32_surface_drop_target.DropTarget = undefined,
+    drop_target: ?*win32_surface_drop_target.DropTarget = null,
     drop_target_registered: bool = false,
     /// Clipboard operation parked on `HostOverlayMode.confirm` — the
     /// owning `Surface` holds deep-copied payload bytes so the async
@@ -29370,11 +29389,6 @@ pub const Surface = struct {
             .memory_stage_trace = MemoryStageTrace.init(app.core_app.alloc),
             .undo_stack = win32_undo.UndoStack.init(app.core_app.alloc),
             .search_bar = win32_search_bar.SearchBar.init(app.core_app.alloc),
-            .drop_target = win32_surface_drop_target.DropTarget.init(
-                app.core_app.alloc,
-                undefined, // surface_ctx — fixed up below after the address stabilises
-                &surfaceDropPayloadCallback,
-            ),
         };
         // `destroy` never runs for a Surface whose init fails, so free here
         // what it would: the strings, among them the launch command cloned
@@ -29394,12 +29408,15 @@ pub const Surface = struct {
         else
             config.command;
         if (launch_command) |command| self.launch_command = try command.clone(app.core_app.alloc);
-        // The DropTarget's surface_ctx must be `self`, but we can't
-        // initialise it until `self.*` has been fully assigned above
-        // (taking the address of an in-progress struct literal is
-        // undefined). Patch it in now, before the HWND is created so
-        // the first COM callback has a valid context.
-        self.drop_target.surface_ctx = @ptrCast(self);
+        self.drop_target = try win32_surface_drop_target.DropTarget.create(
+            app.core_app.alloc,
+            @ptrCast(self),
+            &surfaceDropPayloadCallback,
+        );
+        errdefer {
+            self.drop_target.?.deinit();
+            self.drop_target = null;
+        }
         self.background_opacity_default = normalizedBackgroundOpacity(config.@"background-opacity");
         // First memory-stage sample. Every later stage's private-bytes delta
         // is measured against this one, so it has to be the first thing that
@@ -29428,15 +29445,14 @@ pub const Surface = struct {
         // land as typed input in the terminal. Failure is non-fatal:
         // the user loses the feature but the terminal still works.
         // Requires the STA apartment that `App.init` brought up via
-        // `CoInitializeEx`.
-        self.drop_target.register(hwnd) catch |err| {
+        // `OleInitialize`.
+        if (self.drop_target.?.register(hwnd)) {
+            self.drop_target_registered = true;
+        } else |err| {
             std.log.warn("drop target register failed hwnd={*} err={}", .{ hwnd, err });
-        };
-        self.drop_target_registered = true;
-        // `errdefer` below revokes on failure.  Explicit revoke also
-        // happens in `destroyWindow` via the same helper.
+        }
         errdefer if (self.drop_target_registered) {
-            self.drop_target.revoke(hwnd);
+            self.drop_target.?.revoke(hwnd);
             self.drop_target_registered = false;
         };
 
@@ -29692,7 +29708,7 @@ pub const Surface = struct {
         defer session.deinit();
         // With COM, a tab button gets a UIA provider, as in the app.
         app.initComApartment();
-        defer if (app.com_initialized) sys.CoUninitialize();
+        defer if (app.com_initialized) sys.OleUninitialize();
         try app.ensureWindowClass();
         defer _ = sys.UnregisterClassW(class_name, app.hinstance);
         const host_hwnd = try createTestHostWindow();
@@ -31863,7 +31879,7 @@ pub const Surface = struct {
             .hwndTrack = hwnd,
             .dwHoverTime = 0,
         };
-        _ = sys.TrackMouseEvent(&track);
+        if (sys.TrackMouseEvent(&track) == 0) return;
         self.scrollbar_leave_armed = true;
         self.scrollbar_leave_hwnd = hwnd;
     }
@@ -33845,39 +33861,15 @@ pub const Surface = struct {
 
         if (!self.core_initialized) return;
 
-        const file_count = sys.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
-        if (file_count == 0) return;
-
         const alloc = self.app.core_app.alloc;
-        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer {
-            for (paths.items) |path| alloc.free(path);
-            paths.deinit(alloc);
-        }
-
-        var i: UINT = 0;
-        while (i < file_count) : (i += 1) {
-            // Get required buffer length (not counting null terminator)
-            const wchar_len = sys.DragQueryFileW(hDrop, i, null, 0);
-            if (wchar_len == 0) continue;
-
-            // Allocate UTF-16 buffer (+1 for null)
-            const buf = alloc.alloc(u16, wchar_len + 1) catch continue;
-            defer alloc.free(buf);
-            _ = sys.DragQueryFileW(hDrop, i, buf.ptr, wchar_len + 1);
-
-            const path = std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..wchar_len]) catch continue;
-            paths.append(alloc, path) catch {
-                alloc.free(path);
-                continue;
-            };
-        }
-
-        if (paths.items.len == 0) return;
-        const payload = win32_surface_drop.formatFilePayload(alloc, paths.items, .{}) catch |err| {
+        const payload = win32_ole.extractHdrop(alloc, hDrop, .{}) catch |err| {
             log.warn("win32 drop files format failed err={}", .{err});
             return;
         };
+        if (payload.len == 0) {
+            alloc.free(payload);
+            return;
+        }
         defer alloc.free(payload);
 
         surfaceDropPayloadCallback(self, payload);
@@ -33891,11 +33883,94 @@ pub const Surface = struct {
         };
     }
 
-    fn handleMouseButton(self: *Surface, msg: UINT, wParam: WPARAM, lParam: LPARAM) void {
+    fn handleMouseLeave(self: *Surface) void {
+        self.handleScrollbarMouseLeave();
         if (!self.core_initialized) return;
+        // Captured drags keep reporting their real out-of-pane coordinates
+        // for selection auto-scroll. The scrollbar child shares tracking.
+        if (self.hwnd != null and sys.GetCapture() == self.hwnd) return;
+        self.cursor_pos = .{ .x = -1, .y = -1 };
+        self.core_surface.cursorPosCallback(self.cursor_pos, null) catch |err| {
+            log.err("win32 cursor leave callback failed err={}", .{err});
+        };
+    }
 
-        const button = mouseButtonFromMessage(msg) orelse return;
-        const state = mouseButtonStateFromMessage(msg) orelse return;
+    test "win32 pointer leave clears core link and renderer positions" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var mutex: std.Thread.Mutex = .{};
+        var surface: Surface = .{ .app = undefined, .core_initialized = true };
+        surface.core_surface.io.terminal = try terminal.Terminal.init(std.testing.allocator, .{ .cols = 10, .rows = 10 });
+        defer surface.core_surface.io.terminal.deinit(std.testing.allocator);
+        surface.core_surface.mouse = .{ .link_point = .{ .x = 4, .y = 4 } };
+        surface.core_surface.renderer_state = .{
+            .mutex = &mutex,
+            .terminal = &surface.core_surface.io.terminal,
+            .mouse = .{ .point = .{ .x = 4, .y = 4 } },
+        };
+        surface.core_surface.config.mouse_reporting = false;
+        surface.core_surface.size = .{
+            .screen = .{ .width = 100, .height = 100 },
+            .cell = .{ .width = 10, .height = 10 },
+            .padding = .{},
+        };
+        surface.core_surface.inspector = null;
+        surface.core_surface.selection_scroll_active = false;
+        surface.scrollbar_leave_armed = true;
+        surface.handleMouseLeave();
+        try std.testing.expect(!surface.scrollbar_leave_armed);
+        try std.testing.expect(surface.core_surface.mouse.link_point == null);
+        try std.testing.expect(surface.core_surface.renderer_state.mouse.point == null);
+        try std.testing.expect(surface.core_surface.io.terminal.screens.active.dirty.hyperlink_hover);
+        try std.testing.expectEqual(@as(f32, -1), surface.cursor_pos.x);
+    }
+
+    fn updateWheelCursorPos(self: *Surface, hwnd: HWND, lParam: LPARAM) void {
+        // Wheel messages carry screen coordinates, including precision
+        // pointer wheels. Updating only the cache avoids a spurious motion
+        // report or hover/selection action before the wheel report.
+        var point: POINT = .{
+            .x = signedLowWord(lParamBits(lParam)),
+            .y = signedHighWord(lParamBits(lParam)),
+        };
+        if (sys.ScreenToClient(hwnd, &point) == 0) return;
+        self.cursor_pos = .{ .x = @floatFromInt(point.x), .y = @floatFromInt(point.y) };
+    }
+
+    test "win32 wheel position uses signed screen coordinates without mouse motion" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        // An unshown stock window needs no Surface/core setup and cannot
+        // touch the clipboard. Use a negative origin to catch unsigned words.
+        const hwnd = sys.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            0,
+            -300,
+            -200,
+            500,
+            400,
+            null,
+            null,
+            sys.GetModuleHandleW(null),
+            null,
+        ) orelse return error.CreateWindowFailed;
+        defer _ = sys.DestroyWindow(hwnd);
+        var surface: Surface = .{ .app = undefined };
+        var point: POINT = .{ .x = 40, .y = 60 };
+        try std.testing.expect(sys.ClientToScreen(hwnd, &point) != 0);
+        const bits: u32 = @as(u32, @as(u16, @bitCast(@as(i16, @intCast(point.x))))) |
+            (@as(u32, @as(u16, @bitCast(@as(i16, @intCast(point.y))))) << 16);
+        surface.updateWheelCursorPos(hwnd, @intCast(bits));
+        try std.testing.expectEqual(@as(f32, 40), surface.cursor_pos.x);
+        try std.testing.expectEqual(@as(f32, 60), surface.cursor_pos.y);
+        try std.testing.expect(!surface.scrollbar_leave_armed);
+    }
+
+    fn handleMouseButton(self: *Surface, msg: UINT, wParam: WPARAM, lParam: LPARAM) bool {
+        if (!self.core_initialized) return true;
+
+        const button = mouseButtonFromMessage(msg) orelse return true;
+        const state = mouseButtonStateFromMessage(msg) orelse return true;
         const mods = mouseModsFromWParam(wParam);
 
         self.cursor_pos = cursorPosFromLParam(lParam);
@@ -33914,13 +33989,13 @@ pub const Surface = struct {
         self.core_surface.cursorPosCallback(self.cursor_pos, mods) catch |err| {
             log.err("win32 cursor pos callback failed before button err={}", .{err});
         };
-        _ = self.core_surface.mouseButtonCallback(state, button, mods) catch |err| {
+        return self.core_surface.mouseButtonCallback(state, button, mods) catch |err| {
             log.err("win32 mouse button callback failed err={} button={} state={}", .{
                 err,
                 button,
                 state,
             });
-            return;
+            return true;
         };
     }
 
@@ -34001,11 +34076,15 @@ pub const Surface = struct {
         // Revoke the drop target BEFORE destroying the HWND — Ole
         // would otherwise hold a dangling HWND reference until the
         // process exits. Idempotent on already-revoked targets.
-        if (self.drop_target_registered) {
-            if (self.hwnd) |hwnd| self.drop_target.revoke(hwnd);
-            self.drop_target_registered = false;
+        if (self.drop_target) |target| {
+            self.drop_target = null;
+            target.detach();
+            if (self.drop_target_registered) {
+                if (self.hwnd) |hwnd| target.revoke(hwnd);
+                self.drop_target_registered = false;
+            }
+            target.deinit();
         }
-        self.drop_target.deinit();
 
         self.deinitCore();
         self.noteBenchmarkMemoryStage(.core_deinit_complete, null);
@@ -34633,16 +34712,8 @@ pub const Surface = struct {
     fn writeClipboardHtml(self: *const Surface, html: []const u8, plain: ?[]const u8) !void {
         const alloc = self.app.core_app.alloc;
 
-        // Lazily register CF_HTML once per App. The ID is process-
-        // local and stable.
-        if (self.app.cf_html_format == 0) {
-            const id = sys.RegisterClipboardFormatW(CF_HTML_NAME);
-            if (id == 0) {
-                return lastError();
-            }
-            self.app.cf_html_format = id;
-        }
-        const cf_html = self.app.cf_html_format;
+        const cf_html = win32_ole.htmlFormat();
+        if (cf_html == 0) return lastError();
 
         const wrapped = try win32_clipboard_html.wrapFragment(alloc, html);
         defer alloc.free(wrapped);
@@ -34918,7 +34989,7 @@ const TestSession = struct {
                 .core_surface = uninitializedInertStorage(CoreSurface),
                 .undo_stack = win32_undo.UndoStack.init(undo_allocator),
                 .search_bar = win32_search_bar.SearchBar.init(self.allocator),
-                .drop_target = win32_surface_drop_target.DropTarget.init(
+                .drop_target = try win32_surface_drop_target.DropTarget.create(
                     self.allocator,
                     @ptrCast(surface),
                     &surfaceDropPayloadCallback,
@@ -34962,7 +35033,8 @@ const TestSession = struct {
                 }
                 if (record.undo_initialized) record.surface.undo_stack.deinit();
                 record.surface.search_bar.deinit();
-                record.surface.drop_target.deinit();
+                if (record.surface.drop_target) |target| target.deinit();
+                record.surface.drop_target = null;
             }
         }
 
