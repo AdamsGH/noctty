@@ -228,6 +228,13 @@ function Uia-Name([IntPtr]$w) {
         return "{0} '{1}' offscreen={2} focusable={3}" -f $e.Current.ControlType.ProgrammaticName, $e.Current.Name, $e.Current.IsOffscreen, $e.Current.IsKeyboardFocusable
     } catch { return "uia-error $($_.Exception.GetType().Name)" }
 }
+function Uia-Invoke([IntPtr]$w) {
+    try {
+        $e = [System.Windows.Automation.AutomationElement]::FromHandle($w)
+        $p = $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $p.Invoke(); return 'invoked'
+    } catch { return "uia-error $($_.Exception.GetType().Name)" }
+}
 function Startup-Fingerprint {
     $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
     if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
@@ -467,7 +474,9 @@ try {
                         }
                     }
                     if ($caseName -eq 'update' -and $shown) {
+                        Say ("  terminal under the notice:          {0}" -f (Swaps $c))
                         [Hd]::Key($c.Surface, 121); Start-Sleep -Milliseconds 600
+                        Say ("  terminal after the banner shrank:   {0}" -f (Swaps $c))
                         Measure-Banner $c 'message-over-notice'
                         $landed = $false
                         for ($i = 0; $i -lt 4 -and -not $landed; $i++) {
@@ -481,6 +490,11 @@ try {
                             Say ("  Escape closed the message; the notice is back: {0}; focus now {1}" -f [Hd]::IsWindowVisible([Hd]::Child($c.Host, 1914)), [Hd]::Class([Hd]::Focus($c.Host)))
                             Measure-Banner $c 'notice-again'
                         }
+                    }
+                    if ($caseName -eq 'light') {
+                        $close = [Hd]::Child($c.Host, 1915)
+                        Say ("  UIA Invoke on the close button: {0}" -f (Uia-Invoke $close)); Start-Sleep -Milliseconds 500
+                        Say ("  ... hid the banner: {0}; focus {1}" -f (-not [Hd]::IsWindowVisible([Hd]::Child($c.Host, 1913))), [Hd]::Class([Hd]::Focus($c.Host)))
                     }
                     if ($caseName -eq 'split-after-banner') {
                         Say ("  banner samples before the split: {0}" -f (Banner-Samples $c 30))

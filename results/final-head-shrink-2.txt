@@ -1,0 +1,31 @@
+SPI_GETMESSAGEDURATION = 5 s
+== after / update
+  before: topmost=Static#1913 banner visible=True
+  banner child became visible: True
+  [raised] panes=1 visible=True topmost=Static#1913 dpi=144 banner=(544,212)-(1421,260) 877x48 surface=(163,212)-(1421,941) bannerTop-surfaceTop=0
+      GDI reach over the banner rect: banner=2728/3520 terminal=0/3520
+      PrintWindow(banner, 2): ok=True 877x48 untouched=0 colours=172 dominant=#1E1E22 notDominant=26639
+      PrintWindow(host, 0) over the banner rect: ok=True 877x48 untouched=0 colours=172 dominant=#1E1E22 notDominant=26639
+      PrintWindow(host, 2) over the banner rect: ok=True 877x48 untouched=0 colours=172 dominant=#1E1E22 notDominant=26639
+      UIA: ControlType.Text 'Update available: noctty 1.3.131 is ready on GitHub Releases.' offscreen=False focusable=False
+      button 1914: 153x36 UIA ControlType.Button 'Open Release: Update available: noctty 1.3.131 is ready on GitHub Releases.' offscreen=False focusable=True
+      button 1915: 108x36 UIA ControlType.Button 'Dismiss update notice' offscreen=False focusable=True
+  terminal under the notice:          swaps=21 paintRetries=6 paintDraws=21 focusChanges=4
+  terminal after the banner shrank:   swaps=22 paintRetries=7 paintDraws=22 focusChanges=4
+  [message-over-notice] panes=1 visible=True topmost=Static#1913 dpi=144 banner=(1076,212)-(1421,260) 345x48 surface=(163,212)-(1421,941) bannerTop-surfaceTop=0
+      GDI reach over the banner rect: banner=1260/1392 terminal=0/1392
+      PrintWindow(banner, 2): ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 0) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 2) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      UIA: ControlType.Text 'Layout was not found.' offscreen=False focusable=False
+      button 1915: 42x36 UIA ControlType.Button 'Close: Layout was not found.' offscreen=False focusable=True
+  F6 landed on a banner button: True (#1915)
+  Escape closed the message; the notice is back: True; focus now noctty.win32
+  [notice-again] panes=1 visible=True topmost=Static#1913 dpi=144 banner=(544,212)-(1421,260) 877x48 surface=(163,212)-(1421,941) bannerTop-surfaceTop=0
+      GDI reach over the banner rect: banner=2728/3520 terminal=0/3520
+      PrintWindow(banner, 2): ok=True 877x48 untouched=0 colours=172 dominant=#1E1E22 notDominant=26639
+      PrintWindow(host, 0) over the banner rect: ok=True 877x48 untouched=0 colours=172 dominant=#1E1E22 notDominant=26639
+      PrintWindow(host, 2) over the banner rect: ok=True 877x48 untouched=0 colours=172 dominant=#1E1E22 notDominant=26639
+      UIA: ControlType.Text 'Update available: noctty 1.3.131 is ready on GitHub Releases.' offscreen=False focusable=False
+      button 1914: 153x36 UIA ControlType.Button 'Open Release: Update available: noctty 1.3.131 is ready on GitHub Releases.' offscreen=False focusable=True
+      button 1915: 108x36 UIA ControlType.Button 'Dismiss update notice' offscreen=False focusable=True
