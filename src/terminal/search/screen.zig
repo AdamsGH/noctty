@@ -174,10 +174,29 @@ pub const ScreenSearch = struct {
     }
 
     pub fn deinit(self: *ScreenSearch) void {
+        self.deinitInternal(true);
+    }
+
+    /// Release owned search state after the underlying Screen has already
+    /// been destroyed. Tracked pins belonged to that Screen's PageList pool
+    /// and were freed with it, so only independently owned memory is freed.
+    pub fn deinitScreenInvalid(self: *ScreenSearch) void {
+        self.deinitInternal(false);
+    }
+
+    fn deinitInternal(self: *ScreenSearch, screen_valid: bool) void {
         const alloc = self.allocator();
         self.active.deinit();
-        if (self.history) |*h| h.deinit(self.screen);
-        if (self.selected) |*m| m.deinit(self.screen);
+        if (self.history) |*h| {
+            if (screen_valid) {
+                h.deinit(self.screen);
+            } else {
+                h.searcher.deinitListInvalid();
+            }
+        }
+        if (screen_valid) {
+            if (self.selected) |*m| m.deinit(self.screen);
+        }
         for (self.active_results.items) |*hl| hl.deinit(alloc);
         self.active_results.deinit(alloc);
         for (self.history_results.items) |*hl| hl.deinit(alloc);
