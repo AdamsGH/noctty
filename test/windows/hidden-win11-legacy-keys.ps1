@@ -318,8 +318,9 @@ try {
     Capture-Key 'Ctrl+Escape' 27 27 $true $false $false @(27)
     Capture-Key 'Shift+Escape' 27 27 $false $false $true @(27)
     Capture-Key 'Alt+nonASCII' 0 -1 $false $true $false @(246) -NonAscii
-    Capture-Key 'F13' 0x7C -1 $false $false $false @() -FunctionKey
-    Capture-Key 'F24' 0x87 -1 $false $false $false @() -FunctionKey
+    foreach($number in 13..24) {
+        Capture-Key "F$number" (0x70+$number-1) -1 $false $false $false @() -FunctionKey
+    }
 } catch {
     $checks.Add(@{Name='Infrastructure';Status='FAIL';Error=$_.Exception.Message})
 } finally {
