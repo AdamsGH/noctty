@@ -282,11 +282,17 @@ function Capture-Key([string]$Name,[int]$VK,[int]$Character,[bool]$Ctrl,[bool]$A
     Start-Sleep -Milliseconds 450
     $all=@(Read-Records); $actual=if($all.Count -gt $offset) { @($all[$offset..($all.Count-1)]) } else { @() }
     $textRecords=@($actual | Where-Object { $_.CodeUnit -ne 0 })
+    $modifierKeys=@(16,17,18,160,161,162,163,164,165)
+    $unexpectedZero=@($actual | Where-Object { $_.CodeUnit -eq 0 -and $_.VirtualKey -notin $modifierKeys })
     $units=@($(if($NonAscii){$textRecords}else{$actual}) | ForEach-Object { $_.CodeUnit })
     $functionVK=$VK-12
-    if($FunctionKey) { $pass=@($actual | Where-Object { $_.VirtualKey -eq $functionVK -and ($_.ControlState -band 16) -ne 0 }).Count -gt 0 -and $textRecords.Count -eq 0 }
+    if($FunctionKey) {
+        $functionRecords=@($actual | Where-Object { $_.VirtualKey -eq $functionVK -and ($_.ControlState -band 16) -ne 0 })
+        $pass=$functionRecords.Count -eq 1 -and $textRecords.Count -eq 0 -and
+            @($unexpectedZero | Where-Object { $_.VirtualKey -ne $functionVK }).Count -eq 0
+    }
     else { $pass=($units -join ',') -ceq ($Expected -join ',') }
-    if($NonAscii -and -not $unsupported) { $pass=$pass -and $textRecords.Count -eq 1 -and @($textRecords | Where-Object { ($_.ControlState -band 3) -ne 0 }).Count -eq 1 }
+    if($NonAscii -and -not $unsupported) { $pass=$pass -and $unexpectedZero.Count -eq 0 -and $textRecords.Count -eq 1 -and @($textRecords | Where-Object { ($_.ControlState -band 3) -ne 0 }).Count -eq 1 }
     $expectation=if($FunctionKey) { @{VirtualKey=$functionVK;ShiftRequired=$true;CodeUnit=0} } else { @{CodeUnits=$Expected;AltRequired=$NonAscii.IsPresent} }
     $checks.Add(@{Name=$Name;Status=$(if($unsupported){'UNSUPPORTED'}elseif($pass){'PASS'}else{'FAIL'});Expected=$expectation;Records=$actual})
 }
