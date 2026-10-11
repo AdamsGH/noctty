@@ -253,11 +253,29 @@ function Wait-File([string] $Path) {
         Start-Sleep -Milliseconds 30
     }
 }
-function Read-Reports {
+function Get-ReportOffset {
+    if (-not (Test-Path -LiteralPath ($marker + '.bytes'))) { return 0L }
+    return (Get-Item -LiteralPath ($marker + '.bytes')).Length
+}
+function Read-Reports([long] $Offset) {
     if (-not (Test-Path -LiteralPath ($marker + '.bytes'))) { return '' }
     $stream = [IO.File]::Open($marker + '.bytes', 'Open', 'Read', 'ReadWrite')
-    try { $reader = [IO.StreamReader]::new($stream); return $reader.ReadToEnd() }
+    try {
+        [void]$stream.Seek($Offset, [IO.SeekOrigin]::Begin)
+        $reader = [IO.StreamReader]::new($stream)
+        return $reader.ReadToEnd()
+    }
     finally { $stream.Dispose() }
+}
+function Wait-Report([long] $Offset, [string] $Pattern, [string] $EventName) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $report = [regex]::Matches((Read-Reports $Offset), $Pattern) | Select-Object -Last 1
+        if ($report) { return $report }
+        if ($app.HasExited) { throw "App exited while waiting for $EventName." }
+        Start-Sleep -Milliseconds 30
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "No new $EventName report before deadline."
 }
 function Right-Click([int] $Mods) {
     [MouseInputNative]::Send($surface, 0x204, ($Mods -bor 2), [MouseInputNative]::Position(80,80))
@@ -288,30 +306,44 @@ try {
     [IO.File]::WriteAllText($marker + '.enable', 'yes')
     Wait-File ($marker + '.enabled')
     Start-Sleep -Milliseconds 250
+    $offset = Get-ReportOffset
     [MouseInputNative]::Send($surface, 0x200, 0, [MouseInputNative]::Position(100,100))
-    Start-Sleep -Milliseconds 200
-    $reports = Read-Reports
-    $result.observations += ('motion after menu: ' + $reports.Replace([string][char]27, '<ESC>'))
-    if (-not $ObserveBaseline -and ($reports -match '\[<34;' -or $reports -notmatch '\[<35;')) { throw 'Phantom right drag or missing unpressed motion.' }
+    $motionPattern = '\x1b\[<(\d+);(\d+);(\d+)M'
+    $firstMotion = Wait-Report $offset $motionPattern 'motion after menu'
+    $result.observations += ('motion after menu: ' + $firstMotion.Value.Replace([string][char]27, '<ESC>'))
+    # SGR folds Shift/Alt/Ctrl into the button field; the interactive user's
+    # modifier state may change independently of our posted hidden messages.
+    if (-not $ObserveBaseline -and ([int]$firstMotion.Groups[1].Value -band (-bnot 28)) -ne 35) { throw 'Phantom right drag.' }
     $menuShown = Right-Click 0
     if (-not $ObserveBaseline -and $menuShown) { throw 'Mouse-reporting right click opened a menu.' }
     $menuShown = Right-Click 4
     if (-not $ObserveBaseline -and $menuShown -ne ($RightClickAction -eq 'context-menu')) { throw 'Shift override menu policy failed.' }
+    $offset = Get-ReportOffset
     [MouseInputNative]::Send($surface, 0x200, 0, [MouseInputNative]::Position(180,140))
-    Start-Sleep -Milliseconds 200
-    $reports = Read-Reports
-    $lastMotion = [regex]::Matches($reports, '\x1b\[<(\d+);(\d+);(\d+)M') | Select-Object -Last 1
-    if (-not $ObserveBaseline -and $lastMotion.Groups[1].Value -ne '35') { throw 'Shift right release left a pressed button.' }
+    $lastMotion = Wait-Report $offset $motionPattern 'motion after Shift release'
+    if (-not $ObserveBaseline -and ([int]$lastMotion.Groups[1].Value -band (-bnot 28)) -ne 35) { throw 'Shift right release left a pressed button.' }
+    if ($lastMotion.Groups[2].Value -eq $firstMotion.Groups[2].Value -and $lastMotion.Groups[3].Value -eq $firstMotion.Groups[3].Value) { throw 'Motion reported the previous position.' }
     foreach ($message in @(0x20A, 0x20E)) {
-        $point = [MouseInputNative+Point]::new(); $point.x = 300; $point.y = 200
+        # Calibrate the expected cell on this DPI/font, then leave a different
+        # cached position so a wheel handler that ignores lParam still fails.
+        $x = if ($message -eq 0x20A) { 300 } else { 340 }
+        $y = if ($message -eq 0x20A) { 200 } else { 240 }
+        $offset = Get-ReportOffset
+        [MouseInputNative]::Send($surface, 0x200, 0, [MouseInputNative]::Position($x,$y))
+        $expected = Wait-Report $offset $motionPattern 'wheel position calibration'
+        $offset = Get-ReportOffset
+        [MouseInputNative]::Send($surface, 0x200, 0, [MouseInputNative]::Position(180,140))
+        $lastMotion = Wait-Report $offset $motionPattern 'motion before wheel'
+        if ($expected.Groups[2].Value -eq $lastMotion.Groups[2].Value -and $expected.Groups[3].Value -eq $lastMotion.Groups[3].Value) { throw 'Wheel calibration did not change the cell.' }
+        $point = [MouseInputNative+Point]::new(); $point.x = $x; $point.y = $y
         if (-not [MouseInputNative]::ClientToScreen($surface, [ref]$point)) { throw 'ClientToScreen failed.' }
+        $offset = Get-ReportOffset
         [MouseInputNative]::Send($surface, $message, (120 -shl 16), [MouseInputNative]::Position($point.x,$point.y))
-        Start-Sleep -Milliseconds 200
-        $reports = Read-Reports
-        $wheel = [regex]::Matches($reports, '\x1b\[<(6[4-7]);(\d+);(\d+)M') | Select-Object -Last 1
-        if (-not $wheel) { throw 'No wheel report.' }
-        $result.observations += "wheel $message at cell $($wheel.Groups[2].Value),$($wheel.Groups[3].Value)"
-        if (-not $ObserveBaseline -and $wheel.Groups[2].Value -eq $lastMotion.Groups[2].Value -and $wheel.Groups[3].Value -eq $lastMotion.Groups[3].Value) { throw 'Wheel reported stale mouse coordinates.' }
+        $button = if ($message -eq 0x20A) { 64 } else { 66 }
+        $wheel = Wait-Report $offset $motionPattern "wheel $message"
+        if (([int]$wheel.Groups[1].Value -band (-bnot 28)) -ne $button) { throw "Wheel $message reported the wrong button." }
+        $result.observations += "wheel $message button $button at cell $($wheel.Groups[2].Value),$($wheel.Groups[3].Value)"
+        if (-not $ObserveBaseline -and ($wheel.Groups[2].Value -ne $expected.Groups[2].Value -or $wheel.Groups[3].Value -ne $expected.Groups[3].Value)) { throw 'Wheel reported an unexpected position.' }
     }
     $result.status = 'PASS'
 }
