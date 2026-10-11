@@ -429,6 +429,7 @@ pub const VK_OEM_4 = 0xDB;
 pub const VK_OEM_5 = 0xDC;
 pub const VK_OEM_6 = 0xDD;
 pub const VK_OEM_7 = 0xDE;
+pub const VK_PROCESSKEY = 0xE5;
 pub const VK_OEM_102 = 0xE2;
 pub const VK_PACKET = 0xE7;
 

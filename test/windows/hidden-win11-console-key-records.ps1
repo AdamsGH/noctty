@@ -153,6 +153,8 @@ public static class KeyRecords {
     public class Stroke {
         public int Vk; public bool Ctrl,Alt,AltGr,Shift,Extended; public int Repeats=1;
         public bool DownOnly,UpOnly;
+        // Bit 25 of lParam: the key message of the left Ctrl Windows synthesizes for AltGr.
+        public bool Fake;
     }
     static void KeyState(byte[] state,Stroke k,bool down) {
         if(k.Ctrl||k.AltGr) state[0x11]=state[0xA2]=0x80;
@@ -187,7 +189,7 @@ public static class KeyRecords {
                 var state=new byte[256]; KeyState(state,k,true);
                 if(!SetKeyboardState(state)) throw new Exception("SetKeyboardState failed");
                 long scan=(long)MapVirtualKeyExW((uint)k.Vk,0,layout);
-                long l=1L | (scan<<16) | (k.Extended?1L<<24:0);
+                long l=1L | (scan<<16) | (k.Extended?1L<<24:0) | (k.Fake?1L<<25:0);
                 // Alt alone makes a system key message with the context bit; with Ctrl
                 // held (AltGr) Windows posts ordinary key messages.
                 bool sys=k.Alt && !k.Ctrl && !k.AltGr;
@@ -419,9 +421,9 @@ function Run-Keys([IntPtr]$Target,[uint32]$Thread,[string]$Path,[KeyRecords+Stro
     if($markers.Count -ne 2) { throw "Console case barrier: expected the marker's two records, found $($markers.Count)." }
     return @($actual | Where-Object { $_.VirtualKey -ne $Marker })
 }
-function Stroke([int]$Vk,[switch]$Ctrl,[switch]$Alt,[switch]$AltGr,[switch]$Shift,[switch]$Extended,[int]$Repeats=1,[switch]$DownOnly,[switch]$UpOnly) {
+function Stroke([int]$Vk,[switch]$Ctrl,[switch]$Alt,[switch]$AltGr,[switch]$Shift,[switch]$Extended,[int]$Repeats=1,[switch]$DownOnly,[switch]$UpOnly,[switch]$Fake) {
     $s=[KeyRecords+Stroke]::new(); $s.Vk=$Vk; $s.Ctrl=$Ctrl.IsPresent; $s.Alt=$Alt.IsPresent; $s.AltGr=$AltGr.IsPresent; $s.Shift=$Shift.IsPresent
-    $s.Extended=$Extended.IsPresent; $s.Repeats=$Repeats; $s.DownOnly=$DownOnly.IsPresent; $s.UpOnly=$UpOnly.IsPresent; return $s
+    $s.Extended=$Extended.IsPresent; $s.Repeats=$Repeats; $s.DownOnly=$DownOnly.IsPresent; $s.UpOnly=$UpOnly.IsPresent; $s.Fake=$Fake.IsPresent; return $s
 }
 # Posts the same strokes to noctty's surface and to the reference console
 # window, and compares every record. Expect (optional) pins fields the case
@@ -454,7 +456,8 @@ function Compare-Case([string]$Name,[KeyRecords+Stroke[]]$Strokes,[hashtable[]]$
                 foreach($f in @('KeyDown','VirtualKey','ScanCode','CodeUnit','ControlState')) {
                     # conhost zeroes the scan code of a "fake" character message (the
                     # accent a dead key flushes before Enter); noctty keeps the key's.
-                    if($f -eq 'ScanCode' -and $theirsCompared[$i][$f] -eq 0) { continue }
+                    # Only that record, in a dead-key case, is exempt.
+                    if($f -eq 'ScanCode' -and -not $CompareReleases -and $theirsCompared[$i][$f] -eq 0 -and $theirsCompared[$i]['CodeUnit'] -ne 0) { continue }
                     if($oursCompared[$i][$f] -ne $theirsCompared[$i][$f]) { $status='FAIL'; $detail+="record $i ${f}: noctty=$($oursCompared[$i][$f]) conhost=$($theirsCompared[$i][$f])" }
                 }
             }
@@ -547,7 +550,16 @@ try {
         @{Name='Dead acute then e (German)';Strokes=@((Stroke 0xDD),(Stroke 0x45));CompareReleases=$false;
             Expect=@(@{KeyDown=1;VirtualKey=0xDD;CodeUnit=0},@{KeyDown=0;VirtualKey=0xDD;CodeUnit=180},@{KeyDown=1;VirtualKey=0x45;CodeUnit=233},@{KeyDown=0;VirtualKey=0x45;CodeUnit=101});Layout='00000407'},
         @{Name='Dead acute then Enter (German)';Strokes=@((Stroke 0xDD),(Stroke 13));CompareReleases=$false;
-            Expect=@(@{KeyDown=0;VirtualKey=0xDD;CodeUnit=180},@{KeyDown=1;VirtualKey=13;CodeUnit=180},@{KeyDown=1;VirtualKey=13;CodeUnit=13},@{KeyDown=0;VirtualKey=13;CodeUnit=13});Layout='00000407'}
+            Expect=@(@{KeyDown=0;VirtualKey=0xDD;CodeUnit=180},@{KeyDown=1;VirtualKey=13;CodeUnit=180},@{KeyDown=1;VirtualKey=13;CodeUnit=13},@{KeyDown=0;VirtualKey=13;CodeUnit=13});Layout='00000407'},
+        # A Shift tap while the dead key is held leaves the accent latched: the
+        # dead key's release still carries it once, and e still composes.
+        @{Name='Dead acute, Shift tap, then e (German)';Strokes=@((Stroke 0xDD -DownOnly),(Stroke 0x10),(Stroke 0xDD -UpOnly),(Stroke 0x45));CompareReleases=$false;
+            Expect=@(@{KeyDown=1;VirtualKey=0xDD;CodeUnit=0},@{KeyDown=1;VirtualKey=0x10;CodeUnit=0;ControlState=16},@{KeyDown=0;VirtualKey=0xDD;CodeUnit=180},@{KeyDown=1;VirtualKey=0x45;CodeUnit=233});Layout='00000407'},
+        # AltGr as Windows posts it: the left Ctrl key messages carry bit 25
+        # (FAKE_KEYSTROKE) and the console host ignores them, down and up; the
+        # right Alt and the key are recorded with the raw LEFT_CTRL|RIGHT_ALT state.
+        @{Name='AltGr+q with the fake Ctrl messages (German)';Strokes=@((Stroke 0x11 -AltGr -Fake -DownOnly),(Stroke 0x12 -AltGr -Extended -DownOnly),(Stroke 0x51 -AltGr),(Stroke 0x12 -Ctrl -Extended -UpOnly),(Stroke 0x11 -Fake -UpOnly));
+            Expect=@(@{KeyDown=1;VirtualKey=0x12;CodeUnit=0;ControlState=265},@{KeyDown=1;VirtualKey=0x51;CodeUnit=64;ControlState=9},@{KeyDown=0;VirtualKey=0x12;CodeUnit=0;ControlState=264});Layout='00000407'}
     )
     foreach($number in 13..24) {
         $vk=0x70+$number-1

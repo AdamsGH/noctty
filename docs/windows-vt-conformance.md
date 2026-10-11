@@ -225,7 +225,7 @@ values describe the probe's 100x30 grid and configured colours.
 | DA2 `CSI >c`                                              | `CSI >1;10;0c`               | conhost: `CSI >0;10;1c`                                       |
 | DA3 `CSI =c`                                              | none                         | conhost: `DCS !\|00000000 ST`                                 |
 | DECRQM 2026, before and after `CSI ?2026h`                | `2`, then `1`                | `0`, then `0`: synchronized output looks unsupported          |
-| DECRQM 1004 / 9001                                        | `1` / `1`                    | `2` / `2`                                                     |
+| DECRQM 1004 / 9001                                        | `1` / `1` (9001: see below)  | `2` / `2`                                                     |
 | XTGETTCAP `TN`, `Co`, `RGB`                               | three replies                | none                                                          |
 | OSC 4 / 10 / 11 / 12 colour queries                       | noctty's palette and colours | none                                                          |
 | Private CPR `CSI ?6n`                                     | none                         | conhost: `CSI ?1;15;1R`                                       |
@@ -234,7 +234,11 @@ values describe the probe's 100x30 grid and configured colours.
 So on the in-box path a program detects conhost's capabilities rather than
 noctty's, finds no synchronized output, and waits out its own timeout for
 colour and terminfo replies. The bundled stream also carried the probe's
-output byte-for-byte, while the in-box stream re-rendered it.
+output byte-for-byte, while the in-box stream re-rendered it. The 9001 half
+of the DECRQM row was `0` (unknown mode) when the table was measured and is
+`1` by code: the mode is now tracked (`modes.zig`, pinned by the `modeFromInt`
+test) and reported through the same `requestMode` path the measured 1004
+reply took; it was not re-measured through the pty.
 
 Measurement host: Windows `10.0.26300`; in-box `System32\conhost.exe`
 FileVersion `10.0.26100.1`; bundled `conpty.dll` FileVersion
@@ -288,25 +292,38 @@ conhost's decoding of those same characters instead.
 Every ConPTY session opens by asking the terminal for Win32 input mode
 (`CSI ?9001h`, alongside `CSI ?1004h`). noctty tracks the mode and, while it is
 set, sends each key event as the `CSI Vk;Sc;Uc;Kd;Cs;Rc _` record ConPTY turns
-back into a `KEY_EVENT_RECORD`, so a console-API reader (PSReadLine, `ssh.exe`,
-crossterm) sees the key the user pressed instead of conhost's decoding of a VT
-byte. The records follow the console host's own (`windowio.cpp`
-`HandleKeyEvent`): one key-down record per UTF-16 unit the key typed, with the
-message's virtual key, scan code, repeat count and the raw control-key state
-(an AltGr chord carries LEFT_CTRL and RIGHT_ALT, as in conhost); one record
-with no character for a key that types nothing; and a key-up record that
-carries the key's translation at release, because conhost's input thread asks
-`TranslateMessageEx(TM_POSTCHARBREAKS)` for key breaks too (Shift+Enter's key
-up carries 13, an Alt chord's carries 0, a latched dead key's carries its
-accent once). The Kitty and modifyOtherKeys paths are untouched: records are
-sent only while the active screen has no Kitty flags and modifyOtherKeys is
-off, the rule Windows Terminal applies for Kitty (`terminalInput.cpp`
-`HandleKey`), so an application that asked for a keyboard protocol keeps the
-bytes it asked for and ConPTY passes them through as measured above. Text
+back into a `KEY_EVENT_RECORD`, so a console-API reader (PSReadLine, crossterm,
+a cooked `ReadConsole`) sees the key the user pressed instead of conhost's
+decoding of a VT byte. The records follow the console host's own
+(`windowio.cpp` `HandleKeyEvent`): one key-down record per UTF-16 unit the key
+typed, with the message's virtual key, scan code, repeat count and the raw
+control-key state (an AltGr chord carries LEFT_CTRL and RIGHT_ALT, as in
+conhost); one record with no character for a key that types nothing; and a
+key-up record that carries the key's translation at release, because conhost's
+input thread asks `TranslateMessageEx(TM_POSTCHARBREAKS)` for key breaks too
+(Shift+Enter's key up carries 13, an Alt chord's carries 0, a latched dead
+key's carries its accent once, also when a Shift tap came between). The key
+messages conhost ignores get no record either: the left Ctrl Windows
+synthesizes for AltGr (`lParam` bit 25, `FAKE_KEYSTROKE`) and a key the IME
+took (`VK_PROCESSKEY`). The Kitty path is untouched: records are sent only
+while the active screen has no Kitty flags, the rule Windows Terminal applies
+(`terminalInput.cpp` `HandleKey`), so an application that asked for that
+protocol keeps the bytes it asked for and ConPTY passes them through as
+measured above. modifyOtherKeys is no exception, as it is none in Windows
+Terminal: conhost does not implement it and re-encodes the record for the
+child, and once conhost has seen a record it holds a lone ESC, or ESC plus one
+byte, back until more input arrives (`stateMachine.cpp`,
+`EncounteredWin32InputModeSequence`), so a switch back to VT bytes would delay
+every Escape by a keystroke. A `key-remap` reaches the record's modifier bits
+(the virtual key and the typed character stay the physical chord's). Text
 without a physical key (IME commits, injected characters) is still written as
 text, which conhost turns into records itself; paste, focus and mouse reports
 are unchanged; a child's own `CSI ?9001l` never reaches the terminal, because
-conhost absorbs it (`adaptDispatch.cpp`, `W32IM_Win32InputMode`).
+conhost absorbs it (`adaptDispatch.cpp`, `W32IM_Win32InputMode`). The mode
+ends with the child (`childExited` clears it before the exit is shown, so a
+modifier press or a key release cannot be the key that closes the pane) and
+survives a `reset` keybinding, which the pty never sees: ConPTY asks again
+only after a RIS it parsed itself (`adaptDispatch.cpp` `HardReset`).
 
 ### Measured Win32 input mode records
 
@@ -324,16 +341,22 @@ OpenConsole `1.24.260710001`, US and German layouts:
 | Ctrl+[, Ctrl+i, Ctrl+m, Ctrl+period, Ctrl+comma    | identical (`vk` of the key, `uc` 27 / 9 / 13 / 0 / 0)    | decoded as the Escape, Tab and Enter keys; `.` and `,` typed as text without Ctrl  |
 | Alt+a, Alt+ö (German)                              | identical (`uc` 97 / 246 with LEFT_ALT, key up `uc=0`)   | Alt+ö arrives as `vk=255` with Ctrl+Alt+Shift                                      |
 | AltGr+q `@`, AltGr+7 `{` (German)                  | identical (`cs=9`, the real key)                         | decoded as Shift+2 and Shift+[                                                     |
+| AltGr+q with Windows' fake left-Ctrl messages      | identical: no record for the fake Ctrl, down or up       | not run on main                                                                    |
 | F13-F24, Left (enhanced), Shift alone, autorepeat  | identical                                                | F13-F24 arrive as Shift+F1-F12; no record for a modifier alone                     |
 | dead `´` then `e`, dead `´` then Enter (German)    | key downs identical; see the release note below          | `é` arrives as `vk=0` text, the accent likewise                                    |
+| dead `´`, Shift tap, then `e` (German)             | key downs identical; the accent still latched, sent once | not run on main                                                                    |
 | PSReadLine: `echo A`, Shift+Enter, `echo B`, Enter | `>>` continuation, one history entry for the two lines   | `echo A` runs on Shift+Enter                                                       |
 
 The one deliberate difference is a latched dead key's release: conhost's break
-translation reads the accent back twice and attributes one of the two records
-to the following key (measured, `kd=0 vk=69 sc=0 uc=180` for the `e` that had
-not been pressed yet), and it zeroes the scan code of the accent a dead key
-flushes before Enter. noctty sends the accent once on that release with the
-key's own scan code, as Windows Terminal's `_CharacterFromKeyEvent` does.
+translation reads the accent back twice and emits two release records for it
+(`kd=0 vk=221 sc=0 uc=180` then `kd=0 vk=221 sc=13 uc=180` after a Shift tap;
+without one the second is attributed to the following key, `kd=0 vk=69 sc=0
+uc=180` for the `e` that had not been pressed yet), and it zeroes the scan code
+of the accent a dead key flushes before Enter. noctty sends the accent once on
+that release with the key's own scan code, as Windows Terminal's
+`_CharacterFromKeyEvent` does. Everything else in the table is identical
+record for record; what the table does not cover (a physical non-US keyboard,
+IME composition, the in-box conhost as the pty source) is not measured.
 
 ### Behavior by sequence class
 

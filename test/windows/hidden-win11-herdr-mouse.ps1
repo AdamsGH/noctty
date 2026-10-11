@@ -345,6 +345,11 @@ try {
             if(-not $haveHerdr) { $results.Phases.Add($phase); continue }
             $socket=Join-Path $Run ("herdr-{0}-{1}.sock" -f $terminal,$mode)
             $env:HERDR_SOCKET_PATH=$socket
+            # herdr keeps its session state under LOCALAPPDATA and restores it
+            # on the next start; each phase gets a state directory of its own
+            # so a layout from the previous phase is not restored into it.
+            $env:LOCALAPPDATA=Join-Path $Run ("localappdata-herdr-{0}-{1}" -f $terminal,$mode)
+            [void](New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force)
             $t=$null
             try {
                 $arguments=if($mode -eq 'no-session') { '--no-session' } else { '' }
@@ -439,6 +444,9 @@ try {
     $leftover=@()
     $all=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'")
     foreach($proc in $all) {
+        # A pid recorded earlier may have been reused by now: only a process
+        # created after this run began can be one of its own.
+        if($proc.CreationDate -and $proc.CreationDate -lt $runStart) { continue }
         $mine=($proc.CommandLine -and $proc.CommandLine -like "*$Run*")
         $parent=$proc.ParentProcessId; $hops=0
         while(-not $mine -and $parent -gt 0 -and $hops -lt 6) {

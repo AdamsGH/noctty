@@ -1286,15 +1286,19 @@ test "queueIo frees allocated writes in readonly mode" {
 /// line whatever its encoding. The legacy encoding is a CR, which `queueIo`
 /// already recorded from the bytes; the Kitty keyboard protocol sends
 /// `CSI 13 u`, which carries no line terminator, so that one is recorded
-/// here. One key press must record exactly one submission: the terminal
-/// counts a second one, made after the first has closed the prompt, as a line
-/// typed ahead for the next prompt (`SemanticCommand.consumeInput`).
+/// here. A Win32 input record is counted from the bytes too (`records` is
+/// true): its character says whether the console host's cooked read ends
+/// the line, which Ctrl+Enter's 10 does not. One key press must record
+/// exactly one submission: the terminal counts a second one, made after the
+/// first has closed the prompt, as a line typed ahead for the next prompt
+/// (`SemanticCommand.consumeInput`).
 fn keySubmitsSeparately(
     action: input.Action,
     key: input.Key,
     bytes_submit: bool,
+    records: bool,
 ) bool {
-    if (action == .release or bytes_submit) return false;
+    if (action == .release or bytes_submit or records) return false;
     return key == .enter or key == .numpad_enter;
 }
 
@@ -1304,8 +1308,10 @@ fn keySubmitsSeparately(
 /// into a CR. A bare LF submits nothing: the console host turns it into
 /// Ctrl+Enter, which cmd and PowerShell do not run. The Kitty keyboard
 /// protocol encodes Enter as `CSI 13 u` instead, which is handled at the key
-/// level in `keyCallback`.
+/// level in `keyCallback`. A run of Win32 input records carries the CR inside
+/// the record (`key_encode.win32RecordSubmissions`).
 fn submissionsInBytes(data: []const u8) u32 {
+    if (input.key_encode.win32RecordSubmissions(data)) |records| return records;
     return @intCast(@min(std.mem.count(u8, data, "\r"), std.math.maxInt(u32)));
 }
 
@@ -1333,15 +1339,20 @@ test "Surface: an Enter key press records one submission" {
     const testing = std.testing;
 
     // Legacy Enter: the CR in the bytes already counted it.
-    try testing.expect(!keySubmitsSeparately(.press, .enter, true));
-    try testing.expect(!keySubmitsSeparately(.repeat, .numpad_enter, true));
+    try testing.expect(!keySubmitsSeparately(.press, .enter, true, false));
+    try testing.expect(!keySubmitsSeparately(.repeat, .numpad_enter, true, false));
 
     // Kitty keyboard protocol Enter, `CSI 13 u`: no terminator in the bytes.
-    try testing.expect(keySubmitsSeparately(.press, .enter, false));
-    try testing.expect(keySubmitsSeparately(.press, .numpad_enter, false));
+    try testing.expect(keySubmitsSeparately(.press, .enter, false, false));
+    try testing.expect(keySubmitsSeparately(.press, .numpad_enter, false, false));
 
-    try testing.expect(!keySubmitsSeparately(.release, .enter, false));
-    try testing.expect(!keySubmitsSeparately(.press, .key_a, false));
+    // A Win32 input record: the bytes decide (Ctrl+Enter's record carries
+    // 10 and submits nothing).
+    try testing.expect(!keySubmitsSeparately(.press, .enter, true, true));
+    try testing.expect(!keySubmitsSeparately(.press, .enter, false, true));
+
+    try testing.expect(!keySubmitsSeparately(.release, .enter, false, false));
+    try testing.expect(!keySubmitsSeparately(.press, .key_a, false, false));
 }
 
 test "Surface: submissionsInBytes counts the lines a write submits" {
@@ -1357,6 +1368,11 @@ test "Surface: submissionsInBytes counts the lines a write submits" {
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("ls -la"));
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[A"));
     try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[<0;10;20M"));
+    // Win32 input records: Enter and Shift+Enter submit, Ctrl+Enter (10) does not.
+    try testing.expectEqual(@as(u32, 1), submissionsInBytes("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_"));
+    try testing.expectEqual(@as(u32, 1), submissionsInBytes("\x1b[13;28;13;1;16;1_"));
+    try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[13;28;10;1;8;1_"));
+    try testing.expectEqual(@as(u32, 0), submissionsInBytes("\x1b[65;30;97;1;0;1_"));
 }
 
 /// Forces the surface to render. This is useful for when the surface
@@ -1757,6 +1773,20 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
     self.child_exited = true;
 
+    // From here on any key press that encodes something closes the terminal
+    // (`keyCallback`), so normal keyboard encoding has to be on whichever
+    // way the exit is shown below: with a keyboard protocol or Win32 input
+    // mode still set, a modifier press or a key release would encode and
+    // close it. The program that asked for them is gone.
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        t.modes.set(.disable_keyboard, false);
+        t.modes.set(.win32_input, false);
+        t.screens.active.kitty_keyboard.set(.set, .disabled);
+    }
+
     // Program status records that describe running work end with the
     // process, whatever happens to the surface next.
     self.programStatus(.program_ended);
@@ -1824,16 +1854,6 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
         t.printString("Process exited. Press any key to close the terminal.") catch
             break :terminal;
         t.modes.set(.cursor_visible, false);
-
-        // We also want to ensure that normal keyboard encoding is on
-        // so that we can close the terminal. We close the terminal on
-        // any key press that encodes a character. Win32 input mode goes
-        // too: the console host that asked for it is gone, and its records
-        // would make every modifier press and key release count as the
-        // key that closes the terminal.
-        t.modes.set(.disable_keyboard, false);
-        t.modes.set(.win32_input, false);
-        t.screens.active.kitty_keyboard.set(.set, .disabled);
     }
 
     // Waiting after command we stop here. The terminal is updated, our
@@ -3480,7 +3500,63 @@ fn applyKeyRemaps(
     if (event_orig.binding_mods) |binding_mods| {
         event.binding_mods = remaps.apply(binding_mods);
     }
+    // A Win32 input record reports the modifiers a console application
+    // reads, so a remap that changed them has to reach its bits too. The
+    // physical modifiers with their sides are the binding mods: the encoded
+    // mods have an AltGr pair collapsed, which the record keeps.
+    if (event.win32) |*record| {
+        if (!event.bindingMods().equal(event_orig.bindingMods())) {
+            record.setModifiers(event.bindingMods());
+        }
+    }
     return event;
+}
+
+test "key remaps reach the Win32 input record's modifier bits" {
+    const testing = std.testing;
+    const cs = input.KeyEvent.Win32Record.ControlKeyState;
+
+    var remaps: input.KeyRemapSet = .empty;
+    defer remaps.deinit(testing.allocator);
+    try remaps.parse(testing.allocator, "left_ctrl=alt");
+    remaps.finalize();
+
+    // Ctrl+A with left Ctrl held: the record now says left Alt, and keeps
+    // the lock and ENHANCED_KEY bits it had.
+    const ctrl_a = applyKeyRemaps(&remaps, .{
+        .key = .key_a,
+        .mods = .{ .ctrl = true, .sides = .{ .ctrl = .left } },
+        .unshifted_codepoint = 'a',
+        .win32 = .{
+            .vk = 'A',
+            .scan_code = 30,
+            .control_key_state = cs.left_ctrl | cs.capslock_on | cs.enhanced_key,
+            .repeat_count = 1,
+        },
+    });
+    try testing.expect(ctrl_a.mods.alt and !ctrl_a.mods.ctrl);
+    try testing.expectEqual(cs.left_alt | cs.capslock_on | cs.enhanced_key, ctrl_a.win32.?.control_key_state);
+
+    // Right Ctrl is not remapped: the record is left exactly as the apprt
+    // built it, AltGr's raw LEFT_CTRL|RIGHT_ALT pair included.
+    const alt_gr: input.Mods = .{ .ctrl = true, .alt = true, .sides = .{ .ctrl = .left, .alt = .right } };
+    const untouched = applyKeyRemaps(&remaps, .{
+        .key = .key_q,
+        .mods = .{ .ctrl = true, .sides = .{ .ctrl = .right } },
+        .win32 = .{ .vk = 'Q', .scan_code = 16, .control_key_state = cs.right_ctrl, .repeat_count = 1 },
+    });
+    try testing.expectEqual(cs.right_ctrl, untouched.win32.?.control_key_state);
+    var alt_gr_remaps: input.KeyRemapSet = .empty;
+    defer alt_gr_remaps.deinit(testing.allocator);
+    try alt_gr_remaps.parse(testing.allocator, "shift=super");
+    alt_gr_remaps.finalize();
+    const alt_gr_event = applyKeyRemaps(&alt_gr_remaps, .{
+        .key = .key_q,
+        .mods = .{},
+        .binding_mods = alt_gr,
+        .win32 = .{ .vk = 'Q', .scan_code = 16, .control_key_state = cs.left_ctrl | cs.right_alt, .repeat_count = 1 },
+    });
+    try testing.expectEqual(cs.left_ctrl | cs.right_alt, alt_gr_event.win32.?.control_key_state);
 }
 
 test "key remaps apply to binding-only modifiers" {
@@ -3737,6 +3813,7 @@ pub fn keyCallback(
         }
 
         // Read before `queueIo` takes ownership of the bytes.
+        const records = input.key_encode.win32RecordSubmissions(write_req.slice()) != null;
         const bytes_submit = submissionsInBytes(write_req.slice()) > 0;
         self.queueIo(switch (write_req) {
             .small => |v| .{ .write_small = v },
@@ -3744,7 +3821,7 @@ pub fn keyCallback(
             .alloc => |v| .{ .write_alloc = v },
         }, .unlocked);
 
-        if (keySubmitsSeparately(event.action, event.key, bytes_submit)) {
+        if (keySubmitsSeparately(event.action, event.key, bytes_submit, records)) {
             self.markInputSubmitted(.unlocked, 1);
         }
     } else {
@@ -4589,6 +4666,13 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
         // All our actions will be releases
         pressed_key.action = .release;
 
+        // No Win32 input record for these synthesized releases: a console
+        // host never sees the key up of a key whose release went to another
+        // window, and the press's record (its characters, its repeat count)
+        // would be wrong for one. A protocol that reports releases still
+        // gets them below.
+        pressed_key.win32 = null;
+
         // Release the full key first
         if (pressed_key.key != .unidentified) {
             const effect = self.keyCallback(pressed_key) catch |err| err: {
@@ -4603,11 +4687,6 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
 
         // Release any modifiers if set
         if (pressed_key.mods.empty()) break :unfocused;
-
-        // The Win32 record belongs to the key above, not to the modifier
-        // keys synthesized below; a console host receives no release for a
-        // modifier whose key up went to another window either.
-        pressed_key.win32 = null;
 
         // This is kind of nasty comptime meta programming but all we're doing
         // here is going through all the modifiers and if they're set, releasing
@@ -6474,7 +6553,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            self.renderer_state.terminal.fullReset();
+            const t = self.renderer_state.terminal;
+            // The pty does not see this reset. ConPTY asks for Win32 input
+            // mode once per session and again only after a RIS it parsed
+            // itself (adaptDispatch.cpp `HardReset`, `InjectionType::RIS`),
+            // so the mode it asked for survives a reset the user started.
+            const win32_input = t.modes.get(.win32_input);
+            t.fullReset();
+            t.modes.set(.win32_input, win32_input);
         },
 
         .start_search => {

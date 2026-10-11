@@ -44,7 +44,7 @@ int wmain(int argc, wchar_t **argv) {
         DWORD written = 0, out_mode = 0;
         GetConsoleMode(output, &out_mode);
         SetConsoleMode(output, out_mode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */);
-        WriteConsoleW(output, L"\x1b[?1003;1006h", 12, &written, NULL);
+        WriteConsoleW(output, L"\x1b[?1003;1006h", 13, &written, NULL);
     }
     fprintf(ready, "%lu,%lu,%llu,%d,%d,%d,%d,%d,%d\n", GetCurrentProcessId(), mode,
         (unsigned long long)(ULONG_PTR)GetConsoleWindow(), info.dwSize.X, info.dwSize.Y,
