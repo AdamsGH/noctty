@@ -416,6 +416,9 @@ try {
                 $arguments=if($mode -eq 'no-session') { '--no-session' } else { '' }
                 Progress "phase $terminal herdr ${mode}: start"
                 $t=Start-Terminal $terminal $Herdr $arguments
+                # Recorded at once, so a phase that stops at the API check still
+                # has a parent that vouches for the server herdr may have started.
+                Note-Known $t.Pid
                 Progress "phase $terminal herdr ${mode}: terminal pid $($t.Pid) window $($t.Window)"
                 $deadline=[datetime]::UtcNow.AddSeconds(45); $api=$null
                 do { $api=Herdr-Api @('pane','list') $socket; if($api.Exit -eq 0) { break }; Start-Sleep -Milliseconds 300 } while([datetime]::UtcNow -lt $deadline)
@@ -423,13 +426,15 @@ try {
                 if($api.Exit -ne 0) { $phase.Status='FAIL'; $phase.Error='herdr API never answered'; $results.Phases.Add($phase); continue }
                 Start-Sleep -Milliseconds 1500
                 $herdrPids=@(Child-Pids $t.Pid 'herdr.exe'); Progress "herdr client pids: $($herdrPids -join ',')"
-                Note-Known $t.Pid; foreach($hp in $herdrPids) { Note-Known $hp }
-                foreach($hp in $herdrPids) { foreach($sp in @(Child-Pids $hp 'herdr.exe')) { Note-Known $sp } }
                 if($terminal -eq 'wezterm' -and $herdrPids.Count -eq 0) {
                     # WezTerm may spawn through its own conpty host; take any herdr whose parent is a child of the GUI.
                     $kids=@(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $t.Pid } | Select-Object -ExpandProperty ProcessId)
+                    foreach($k in $kids) { Note-Known $k }
                     $herdrPids=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'" | Where-Object { $kids -contains $_.ParentProcessId } | Select-Object -ExpandProperty ProcessId)
                 }
+                # The clients and the servers they spawned, recorded after the
+                # fallback has found them, with the hosts in between.
+                foreach($hp in $herdrPids) { Note-Known $hp; foreach($sp in @(Child-Pids $hp 'herdr.exe')) { Note-Known $sp } }
                 $phase.HerdrClientPid=$herdrPids
                 if($herdrPids.Count -gt 0) { $phase.Console=Attach-Info $herdrPids[0] }
                 # The split target is the current pane's id from the API (there is no
