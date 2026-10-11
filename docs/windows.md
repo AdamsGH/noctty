@@ -970,6 +970,20 @@ re-enterable table: activating it again from a nested table does not stack a
 second copy mode, and leaving copy mode unwinds every table pushed on top of
 it.
 
+## Mouse input
+
+Right-click follows `right-click-action`. With its default `context-menu`,
+mouse-reporting applications receive the click; hold Shift to use the terminal
+menu unless the application is configured to capture Shift. `ignore`, `copy`,
+`paste`, and `copy-or-paste` perform their configured action without opening a
+menu.
+
+Wheel reports use the position carried by the wheel event. The number of
+reports per notch retains the Windows scroll-lines setting and the configured
+multiplier. If a mouse-reporting TUI scrolls too quickly, try
+`mouse-scroll-multiplier = discrete:1`; this also slows normal viewport
+scrolling.
+
 ## Quick terminal and global hotkeys
 
 The quick terminal uses the same `toggle_quick_terminal` action and

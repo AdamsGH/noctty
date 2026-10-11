@@ -4,6 +4,7 @@ const std = @import("std");
 const windows = std.os.windows;
 const win32_types = @import("../win32_types.zig");
 const c = @import("consts.zig");
+const ole = @import("../win32_ole.zig");
 
 const ATOM = win32_types.ATOM;
 const LPCWSTR = win32_types.LPCWSTR;
@@ -439,6 +440,13 @@ pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) cal
 
 pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 
+pub extern "ole32" fn OleInitialize(pvReserved: ?*anyopaque) callconv(.winapi) i32;
+pub extern "ole32" fn OleUninitialize() callconv(.winapi) void;
+pub extern "ole32" fn RegisterDragDrop(hwnd: HWND, target: *anyopaque) callconv(.winapi) i32;
+pub extern "ole32" fn RevokeDragDrop(hwnd: HWND) callconv(.winapi) i32;
+pub extern "ole32" fn DoDragDrop(data: *anyopaque, source: *anyopaque, effects: DWORD, effect: *DWORD) callconv(.winapi) i32;
+pub extern "ole32" fn ReleaseStgMedium(medium: *ole.STGMEDIUM) callconv(.winapi) void;
+
 pub extern "ntdll" fn RtlGetVersion(lpVersionInformation: *RTL_OSVERSIONINFOW) callconv(.winapi) i32;
 
 /// Atomic replace of an existing file. Used by the settings save path
@@ -596,6 +604,8 @@ pub extern "kernel32" fn GlobalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyop
 pub extern "kernel32" fn GlobalLock(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
 pub extern "kernel32" fn GlobalUnlock(hMem: ?*anyopaque) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GlobalSize(hMem: ?*anyopaque) callconv(.winapi) usize;
 
 pub extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
 
