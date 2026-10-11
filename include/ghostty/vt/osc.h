@@ -188,11 +188,11 @@ GHOSTTY_API void ghostty_osc_next(GhosttyOscParser parser, uint8_t byte);
  * parsed OSC command.
  *
  * If the sequence is not a valid command, this returns NULL. You don't need
- * to check for NULL before calling ghostty_osc_command_type(), which
- * returns GHOSTTY_OSC_COMMAND_INVALID for it. A sequence longer than its
- * command allows is not valid: most commands take up to 2048 bytes after
- * the number, OSC 52 (clipboard), 66 and 5522 up to 8 MiB, and OSC 7501
- * up to 4087.
+ * to check for NULL before calling ghostty_osc_command_type() or
+ * ghostty_osc_command_data(), which return GHOSTTY_OSC_COMMAND_INVALID and
+ * false for it. A sequence longer than its command allows is not valid:
+ * most commands take up to 2048 bytes after the number, OSC 52
+ * (clipboard), 66 and 5522 up to 8 MiB, and OSC 7501 up to 4087.
  *
  * The terminator parameter specifies the byte that terminated the OSC sequence
  * (typically 0x07 for BEL or 0x5C for ST after ESC). This information is
