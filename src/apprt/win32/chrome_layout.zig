@@ -467,14 +467,15 @@ pub const HostBannerParts = struct {
     /// Open Release or Install; null for a `.close` banner.
     primary: ?RECT,
     /// The close button, or Dismiss for the update notice.
-    dismiss: RECT,
+    dismiss: ?RECT,
 };
 
 /// Lay the banner's buttons out right-aligned and give the text what is
 /// left. Taken from the banner's own size rather than recomputed from the
 /// DPI, so paint and hit-testing agree with the rect the child really has.
-/// A banner too narrow for its buttons gives the text an empty rect rather
-/// than a negative one.
+/// A button that does not fit at its full width is left out (null) rather
+/// than squeezed to nothing, which would leave a focusable button nobody
+/// can see; the text gets what remains, never a negative width.
 pub fn hostBannerParts(width: i32, height: i32, actions: BannerActions, dpi: u32) HostBannerParts {
     const w = @max(0, width);
     const h = @max(0, height);
@@ -503,12 +504,13 @@ pub fn hostBannerParts(width: i32, height: i32, actions: BannerActions, dpi: u32
 }
 
 /// Take a button of `width` off the right of the row ending at `right.*`,
-/// and leave `right.*` one gap left of it. Never extends past the left edge.
-fn bannerButtonRect(right: *i32, width: i32, top: i32, height: i32, gap: i32) RECT {
-    const button_right = @max(0, right.*);
-    const button_left = @max(0, button_right - width);
-    right.* = button_left - gap;
-    return .{ .left = button_left, .top = top, .right = button_right, .bottom = top + height };
+/// and leave `right.*` one gap left of it; null, leaving `right.*` as it
+/// was, when the row has no room for the whole button.
+fn bannerButtonRect(right: *i32, width: i32, top: i32, height: i32, gap: i32) ?RECT {
+    if (height <= 0 or right.* < width) return null;
+    const button = RECT{ .left = right.* - width, .top = top, .right = right.*, .bottom = top + height };
+    right.* = button.left - gap;
+    return button;
 }
 
 fn scaledBy(base: i32, dpi: u32) i32 {
@@ -866,7 +868,7 @@ test "hostBannerRect sits at the right of the content area, which bounds it" {
 test "hostBannerParts puts a close button at the right and gives the text the rest" {
     const parts = hostBannerParts(800, 32, .close, 96);
     try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 3, .bottom = 32 }, parts.stripe);
-    try std.testing.expectEqual(RECT{ .left = 764, .top = 4, .right = 792, .bottom = 28 }, parts.dismiss);
+    try std.testing.expectEqual(RECT{ .left = 764, .top = 4, .right = 792, .bottom = 28 }, parts.dismiss.?);
     try std.testing.expectEqual(@as(?RECT, null), parts.primary);
     try std.testing.expectEqual(RECT{ .left = 12, .top = 0, .right = 756, .bottom = 32 }, parts.text);
 }
@@ -874,26 +876,34 @@ test "hostBannerParts puts a close button at the right and gives the text the re
 test "hostBannerParts scales the update notice and its two buttons with DPI" {
     // 150%: 24 -> 36 buttons, 8 -> 12 gaps.
     const parts = hostBannerParts(1200, 48, .update, 144);
-    try std.testing.expectEqual(RECT{ .left = 1080, .top = 6, .right = 1188, .bottom = 42 }, parts.dismiss);
+    try std.testing.expectEqual(RECT{ .left = 1080, .top = 6, .right = 1188, .bottom = 42 }, parts.dismiss.?);
     try std.testing.expectEqual(RECT{ .left = 915, .top = 6, .right = 1068, .bottom = 42 }, parts.primary.?);
     try std.testing.expectEqual(RECT{ .left = 18, .top = 0, .right = 903, .bottom = 48 }, parts.text);
 
     // 200%: Install is narrower than Open Release.
     const staged = hostBannerParts(1600, 64, .update_staged, 192);
-    try std.testing.expectEqual(RECT{ .left = 1440, .top = 8, .right = 1584, .bottom = 56 }, staged.dismiss);
+    try std.testing.expectEqual(RECT{ .left = 1440, .top = 8, .right = 1584, .bottom = 56 }, staged.dismiss.?);
     try std.testing.expectEqual(RECT{ .left = 1252, .top = 8, .right = 1424, .bottom = 56 }, staged.primary.?);
 }
 
-test "hostBannerParts never hands out negative rects" {
-    // Too narrow for the buttons: they pile up at the left edge and the
-    // text gets nothing rather than a negative width.
+test "hostBannerParts leaves out a button that does not fit and never hands out negative rects" {
+    // Room for Dismiss but not Open Release: no zero-width primary for
+    // F6 to land on; the text keeps what is left of Dismiss.
+    const tight = hostBannerParts(120, 32, .update, 96);
+    try std.testing.expectEqual(RECT{ .left = 40, .top = 4, .right = 112, .bottom = 28 }, tight.dismiss.?);
+    try std.testing.expectEqual(@as(?RECT, null), tight.primary);
+    try std.testing.expectEqual(RECT{ .left = 12, .top = 0, .right = 32, .bottom = 32 }, tight.text);
+
+    // Room for neither: no buttons, and the text gets the row.
     const narrow = hostBannerParts(60, 32, .update, 96);
-    try std.testing.expect(narrow.dismiss.left >= 0);
-    try std.testing.expect(narrow.primary.?.left >= 0 and narrow.primary.?.right >= narrow.primary.?.left);
-    try std.testing.expectEqual(narrow.text.left, narrow.text.right);
+    try std.testing.expectEqual(@as(?RECT, null), narrow.dismiss);
+    try std.testing.expectEqual(@as(?RECT, null), narrow.primary);
+    try std.testing.expectEqual(RECT{ .left = 12, .top = 0, .right = 52, .bottom = 32 }, narrow.text);
+    const sliver = hostBannerParts(5, 32, .close, 96);
+    try std.testing.expect(sliver.text.right >= sliver.text.left);
 
     // Shorter than a button: the buttons shrink to fit.
     const short = hostBannerParts(400, 20, .close, 96);
-    try std.testing.expectEqual(@as(i32, 20), short.dismiss.bottom - short.dismiss.top);
+    try std.testing.expectEqual(@as(i32, 20), short.dismiss.?.bottom - short.dismiss.?.top);
     try std.testing.expectEqual(@as(i32, 20), short.stripe.bottom);
 }

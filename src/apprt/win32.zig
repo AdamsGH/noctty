@@ -16290,6 +16290,9 @@ const Host = struct {
                 var it = tab.tree.iterator();
                 while (it.next()) |entry| entry.view.syncOcclusion();
             }
+            // An info banner nobody can see waits, and starts over when
+            // the window comes back.
+            self.syncBannerExpiry();
         }
 
         // Deliberately outside the transition branch, and deliberately here
@@ -16531,9 +16534,10 @@ const Host = struct {
     }
 
     /// Count an `.info` message down only while it is on screen and nobody
-    /// is reading it: the pointer is not over it and it does not hold
-    /// keyboard focus. Errors and the update notice stay until dismissed.
-    /// When either ends, the countdown restarts in full.
+    /// is reading it: the window is shown, not minimized and not cloaked
+    /// (`surfaces_visible`), the pointer is not over the banner and it does
+    /// not hold keyboard focus. Errors and the update notice stay until
+    /// dismissed. When any of that ends, the countdown restarts in full.
     ///
     /// The duration is the system's own notification time, Settings >
     /// Accessibility > Visual effects > "Dismiss notifications after this
@@ -16545,6 +16549,7 @@ const Host = struct {
         const run = self.banner_kind == .info and
             self.banner_text != null and
             self.banner_placement.visible and
+            self.surfaces_visible and
             !self.banner_pointer_inside and
             self.bannerButtonOf(self.hovered_button_hwnd) == null and
             !self.banner_focused;
@@ -17124,6 +17129,13 @@ const Host = struct {
         host.syncBannerExpiry();
         try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
         host.banner_focused = false;
+        host.syncBannerExpiry();
+        try std.testing.expect(host.banner_expires_at != null);
+        // Minimized, hidden or cloaked, it waits too.
+        host.surfaces_visible = false;
+        host.syncBannerExpiry();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.surfaces_visible = true;
         host.syncBannerExpiry();
         try std.testing.expect(host.banner_expires_at != null);
 
