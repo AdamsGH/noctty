@@ -1125,11 +1125,7 @@ pub const Search = struct {
         alloc: Allocator,
         screen_search: *ScreenSearch,
     ) Allocator.Error!void {
-        const rows = try screen_search.matchRows(alloc);
-        defer alloc.free(rows);
-
-        self.match_rows.clearRetainingCapacity();
-        try self.match_rows.appendSlice(alloc, rows);
+        try screen_search.collectMatchRows(alloc, &self.match_rows);
     }
 };
 
@@ -1328,6 +1324,84 @@ test "equivalent query replays search state" {
     try testing.expectEqual(1, ud.total);
     try testing.expectEqualSlices(u32, &.{0}, ud.rows);
     try testing.expectEqual(1, ud.viewport.len);
+}
+
+test "notified match rows follow streamed output while the scrollback is pruned" {
+    const alloc = testing.allocator;
+    var mutex: std.Thread.Mutex = .{};
+
+    // Room for about three pages, so the output below prunes the oldest.
+    const page_size = page_size: {
+        var probe: Terminal = try .init(alloc, .{ .cols = 20, .rows = 4 });
+        defer probe.deinit(alloc);
+        break :page_size probe.screens.active.pages.page_size;
+    };
+    var t: Terminal = try .init(alloc, .{
+        .cols = 20,
+        .rows = 4,
+        .max_scrollback = 3 * page_size,
+    });
+    defer t.deinit(alloc);
+    const list = &t.screens.active.pages;
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    const lines = [_][]const u8{ "Fizz Fizz\r\n", "noop\r\n", "x Fizz\r\n" };
+    var line: usize = 0;
+    while (list.totalPages() < 2) : (line += 1) stream.nextSlice(lines[line % lines.len]);
+
+    var ud: TestUserData = .{};
+    defer ud.deinit();
+    var thread: Thread = try .init(alloc, .{
+        .mutex = &mutex,
+        .terminal = &t,
+        .event_cb = &TestUserData.callback,
+        .event_userdata = &ud,
+    });
+    defer thread.deinit();
+    try thread.changeQuery("Fizz", .{}, 1);
+    const s = &thread.search.?;
+
+    var rounds: usize = 0;
+    while (rounds < 4 or list.page_serial_min == 0) : (rounds += 1) {
+        if (rounds > 10_000) return error.TestScrollbackNeverPruned;
+
+        // What the search thread does until the search completes.
+        while (true) {
+            s.notify(alloc, &TestUserData.callback, 1, &ud, false);
+            if (s.isComplete()) break;
+            if (s.tick() == .blocked) s.feed(alloc, &t);
+        }
+
+        // The rows `pointFromPin` gives for every match.
+        var expected: std.ArrayList(u32) = .empty;
+        defer expected.deinit(alloc);
+        const screen_search = s.screens.getPtr(.primary).?;
+        for ([_][]const FlattenedHighlight{
+            screen_search.active_results.items,
+            screen_search.history_results.items,
+        }) |results| for (results) |hl| {
+            const pt = list.pointFromPin(.screen, hl.startPin()) orelse continue;
+            try expected.append(alloc, pt.screen.y);
+        };
+        std.mem.sort(u32, expected.items, {}, std.sort.asc(u32));
+        var write: usize = 0;
+        for (expected.items) |row| {
+            if (write > 0 and expected.items[write - 1] == row) continue;
+            expected.items[write] = row;
+            write += 1;
+        }
+        try testing.expect(write > 0);
+        try testing.expectEqualSlices(u32, expected.items[0..write], ud.rows);
+
+        // More output, then a refresh as the renderer would trigger one.
+        for (0..200) |_| {
+            stream.nextSlice(lines[line % lines.len]);
+            line += 1;
+        }
+        t.flags.search_viewport_dirty = true;
+        s.feed(alloc, &t);
+    }
 }
 
 test "select after the searched screen is removed" {
