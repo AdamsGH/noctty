@@ -30,6 +30,12 @@ foreach ($path in @($portableRoot, $portableExe, $portableCommand, $portableReso
     }
 }
 
+$dllSmoke = Join-Path $stageBase 'test_dll_init.exe'
+& zig cc (Join-Path $PSScriptRoot 'test_dll_init.c') -I (Join-Path $repoRoot 'include') -lshell32 -o $dllSmoke
+if ($LASTEXITCODE -ne 0) { throw "Packaged DLL smoke compilation failed: $LASTEXITCODE" }
+& $dllSmoke (Join-Path $portableRoot 'ghostty-vt.dll')
+if ($LASTEXITCODE -ne 0) { throw "Packaged DLL smoke failed: $LASTEXITCODE" }
+
 & $shellHarness `
     -Shell cmd `
     -BinDir $portableRoot `

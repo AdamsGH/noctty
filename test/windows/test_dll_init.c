@@ -1,51 +1,53 @@
-/*
- * Minimal reproducer for the libghostty DLL CRT initialization issue.
- *
- * Before the fix (DllMain calling __vcrt_initialize / __acrt_initialize),
- * loading ghostty.dll and calling any function that touches the C runtime
- * crashed with "access violation writing 0x0000000000000024" because Zig's
- * _DllMainCRTStartup does not initialize the MSVC C runtime for DLL targets.
- *
- * This test loads the DLL and calls ghostty_info, which exercises the CRT
- * (string handling, memory). If it returns a version string without
- * crashing, the CRT is properly initialized.
- *
- * Build:  zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
- * Run:    copy ..\..\zig-out\lib\ghostty.dll . && test_dll_init.exe
- *
- * Expected output (after fix):
- *   ghostty_info: <version string>
- */
-
+/* Load the packaged libghostty-vt DLL and exercise its C allocator. */
 #include <stdio.h>
 #include <windows.h>
+#include <shellapi.h>
+#include <ghostty/vt/build_info.h>
+#include <ghostty/vt/osc.h>
 
-typedef struct {
-    int build_mode;
-    const char *version;
-    size_t version_len;
-} ghostty_info_s;
-
-typedef ghostty_info_s (*ghostty_info_fn)(void);
+typedef GhosttyResult (*build_info_fn)(GhosttyBuildInfo, void *);
+typedef GhosttyResult (*osc_new_fn)(const GhosttyAllocator *, GhosttyOscParser *);
+typedef void (*osc_free_fn)(GhosttyOscParser);
 
 int main(void) {
-    HMODULE dll = LoadLibraryA("ghostty.dll");
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv || argc != 2) {
+        fprintf(stderr, "Usage: test_dll_init.exe <absolute ghostty-vt.dll path>\n");
+        if (argv) LocalFree(argv);
+        return 1;
+    }
+    HMODULE dll = LoadLibraryExW(argv[1], NULL,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    LocalFree(argv);
     if (!dll) {
-        fprintf(stderr, "LoadLibrary failed: %lu\n", GetLastError());
+        fprintf(stderr, "LoadLibraryExW failed: %lu\n", GetLastError());
         return 1;
     }
-
-    ghostty_info_fn info_fn = (ghostty_info_fn)GetProcAddress(dll, "ghostty_info");
-    if (!info_fn) {
-        fprintf(stderr, "GetProcAddress(ghostty_info) failed: %lu\n", GetLastError());
+    build_info_fn info = (build_info_fn)GetProcAddress(dll, "ghostty_build_info");
+    osc_new_fn create = (osc_new_fn)GetProcAddress(dll, "ghostty_osc_new");
+    osc_free_fn destroy = (osc_free_fn)GetProcAddress(dll, "ghostty_osc_free");
+    if (!info || !create || !destroy) {
+        fprintf(stderr, "Missing libghostty-vt C API export\n");
+        FreeLibrary(dll);
         return 1;
     }
-
-    ghostty_info_s info = info_fn();
-    fprintf(stderr, "ghostty_info: %.*s\n", (int)info.version_len, info.version);
-
-    /* Skip FreeLibrary -- ghostty's global state cleanup and CRT
-     * teardown ordering is not yet handled. The OS reclaims everything
-     * on process exit. */
+    GhosttyString version = {0};
+    GhosttyOscParser parser = NULL;
+    if (info(GHOSTTY_BUILD_INFO_VERSION_STRING, &version) != GHOSTTY_SUCCESS ||
+        !version.ptr || version.len == 0) {
+        fprintf(stderr, "ghostty_build_info returned no version\n");
+        FreeLibrary(dll);
+        return 1;
+    }
+    if (create(NULL, &parser) != GHOSTTY_SUCCESS || !parser) {
+        fprintf(stderr, "ghostty_osc_new failed\n");
+        FreeLibrary(dll);
+        return 1;
+    }
+    destroy(parser);
+    printf("libghostty-vt DLL smoke: 3/3 checks passed (version=%.*s)\n",
+        (int)version.len, version.ptr);
+    FreeLibrary(dll);
     return 0;
 }

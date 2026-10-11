@@ -379,13 +379,11 @@ pub const ScreenSearch = struct {
                 self.screen,
                 self.needle(),
                 self.active.window.query_options,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    log.warn("error reinitializing screen search after resize err={}", .{err});
-                    self.failSearch();
-                    return;
-                },
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                log.warn("error reinitializing screen search after resize err={}", .{err});
+                self.failSearch();
+                return;
             };
 
             // Deinit/reinit
@@ -458,13 +456,11 @@ pub const ScreenSearch = struct {
         const alloc = self.allocator();
         var appended = false;
         while (true) {
-            const hl = self.active.next() catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    log.warn("error searching active area err={}", .{err});
-                    self.failSearch();
-                    return;
-                },
+            const hl = self.active.next() catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                log.warn("error searching active area err={}", .{err});
+                self.failSearch();
+                return;
             } orelse break;
 
             // `active.next()` prunes as it advances, so clone before
@@ -492,13 +488,11 @@ pub const ScreenSearch = struct {
         const alloc = self.allocator();
         var appended = false;
         while (true) {
-            const hl = history.searcher.next() catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    log.warn("error searching history err={}", .{err});
-                    self.failSearch();
-                    return;
-                },
+            const hl = history.searcher.next() catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                log.warn("error searching history err={}", .{err});
+                self.failSearch();
+                return;
             } orelse break;
 
             // Ignore selections that are found within the starting
@@ -590,13 +584,11 @@ pub const ScreenSearch = struct {
                     self.active.window.query_options,
                     list,
                     history_node,
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => {
-                        log.warn("error initializing history search err={}", .{err});
-                        self.failSearch();
-                        return;
-                    },
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    log.warn("error initializing history search err={}", .{err});
+                    self.failSearch();
+                    return;
                 };
                 errdefer search.deinit();
 
@@ -627,13 +619,11 @@ pub const ScreenSearch = struct {
                 .forward,
                 self.needle(),
                 self.active.window.query_options,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    log.warn("error initializing active-history reconciliation search err={}", .{err});
-                    self.failSearch();
-                    return;
-                },
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                log.warn("error initializing active-history reconciliation search err={}", .{err});
+                self.failSearch();
+                return;
             };
             defer window.deinit();
             while (true) {
@@ -653,13 +643,11 @@ pub const ScreenSearch = struct {
                 results.deinit(alloc);
             }
             while (true) {
-                const hl = window.next() catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => {
-                        log.warn("error refreshing history matches err={}", .{err});
-                        self.failSearch();
-                        return;
-                    },
+                const hl = window.next() catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    log.warn("error refreshing history matches err={}", .{err});
+                    self.failSearch();
+                    return;
                 } orelse break;
 
                 if (hl.chunks.items(.node)[0] == history_node) continue;
