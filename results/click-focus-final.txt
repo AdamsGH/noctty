@@ -1,0 +1,14 @@
+SPI_GETMESSAGEDURATION = 5 s
+== after3 / tab-bar-never
+  before: topmost=noctty.win32#0 banner visible=False
+  banner child became visible: True
+  [raised] panes=1 visible=True topmost=Static#1913 dpi=144 banner=(1114,235)-(1459,283) 345x48 surface=(201,235)-(1459,979) bannerTop-surfaceTop=0
+      GDI reach over the banner rect: banner=1260/1392 terminal=0/1392
+      PrintWindow(banner, 2): ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 0) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 2) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      UIA: ControlType.Text 'Layout was not found.' offscreen=False focusable=False
+      button 1915: 42x36 UIA ControlType.Button 'Close: Layout was not found.' offscreen=False focusable=True
+  terminal before the click: swaps=23 paintRetries=7 paintDraws=23 focusChanges=4
+  terminal after the click:  swaps=24 paintRetries=8 paintDraws=24 focusChanges=4
+  click on the close button hid it: True; focus now noctty.win32

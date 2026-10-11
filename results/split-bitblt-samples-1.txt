@@ -1,0 +1,20 @@
+SPI_GETMESSAGEDURATION = 5 s
+== after3 / split-after-banner
+  before: topmost=noctty.win32#0 banner visible=False
+  banner child became visible: True
+  [raised] panes=1 visible=True topmost=Static#1913 dpi=144 banner=(1190,326)-(1535,374) 345x48 surface=(277,326)-(1535,1055) bannerTop-surfaceTop=0
+      GDI reach over the banner rect: banner=1260/1392 terminal=0/1392
+      PrintWindow(banner, 2): ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 0) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 2) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      UIA: ControlType.Text 'Layout was not found.' offscreen=False focusable=False
+      button 1915: 42x36 UIA ControlType.Button 'Close: Layout was not found.' offscreen=False focusable=True
+  banner samples before the split: 82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82
+  [after-split] panes=2 visible=True topmost=Static#1913 dpi=144 banner=(1190,326)-(1535,374) 345x48 surface=(277,692)-(1535,1055) bannerTop-surfaceTop=-366
+      GDI reach over the banner rect: banner=1260/1392 terminal=0/1392
+      PrintWindow(banner, 2): ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 0) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      PrintWindow(host, 2) over the banner rect: ok=True 345x48 untouched=0 colours=82 dominant=#1E1E22 notDominant=8843
+      UIA: ControlType.Text 'Layout was not found.' offscreen=False focusable=False
+      button 1915: 42x36 UIA ControlType.Button 'Close: Layout was not found.' offscreen=False focusable=True
+  banner samples after the split:  82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82
