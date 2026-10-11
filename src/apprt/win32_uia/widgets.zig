@@ -1364,7 +1364,7 @@ pub const SettingsControlProvider = struct {
                 self.role != .text and self.role != .layout_pane,
             ),
             constants.UIA_HasKeyboardFocusPropertyId => out.* = com.VARIANT.fromBool(
-                self.role != .text and hwndHasKeyboardFocus(self.hwnd),
+                self.role != .text and self.role != .layout_pane and hwndHasKeyboardFocus(self.hwnd),
             ),
             constants.UIA_IsOffscreenPropertyId => out.* = com.VARIANT.fromBool(settingsControlIsOffscreen(
                 IsWindowVisible(self.hwnd),
@@ -7095,11 +7095,13 @@ test "SettingsControlProvider layout pane stays out of the control and content v
             lpParam: ?*anyopaque,
         ) callconv(.winapi) ?com.HWND;
         extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+        extern "user32" fn SetFocus(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
     };
+    const empty_title = std.unicode.utf8ToUtf16LeStringLiteral("");
     const hwnd = win32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
-        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        empty_title,
         0,
         0,
         0,
@@ -7111,6 +7113,24 @@ test "SettingsControlProvider layout pane stays out of the control and content v
         null,
     ) orelse return error.TestUnexpectedResult;
     defer _ = win32.DestroyWindow(hwnd);
+    // A field inside the pane has the focus; the pane must not claim it.
+    const child = win32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+        empty_title,
+        0x40000000,
+        0,
+        0,
+        80,
+        24,
+        hwnd,
+        @ptrFromInt(44),
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(child);
+    _ = win32.SetFocus(child);
+    try std.testing.expect(hwndHasKeyboardFocus(hwnd));
 
     const pane = try SettingsControlProvider.create(std.testing.allocator, hwnd, .layout_pane, null);
     defer _ = SettingsControlProvider.Release(&pane.base);
@@ -7121,6 +7141,7 @@ test "SettingsControlProvider layout pane stays out of the control and content v
         constants.UIA_IsControlElementPropertyId,
         constants.UIA_IsContentElementPropertyId,
         constants.UIA_IsKeyboardFocusablePropertyId,
+        constants.UIA_HasKeyboardFocusPropertyId,
     }) |property| {
         try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&pane.base, property, &value));
         try std.testing.expectEqual(com.VT_BOOL, value.vt);

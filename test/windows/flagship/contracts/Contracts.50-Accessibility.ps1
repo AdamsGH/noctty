@@ -1632,7 +1632,7 @@ $focusProviderPins = @(
         Description = 'SettingsSectionProvider focus-event publishing'
     },
     @{
-        Pattern = '(?s)const SettingsControlProvider = struct.*?constants\.UIA_HasKeyboardFocusPropertyId => out\.\* = com\.VARIANT\.fromBool\(\s*self\.role != \.text and hwndHasKeyboardFocus\(self\.hwnd\)'
+        Pattern = '(?s)const SettingsControlProvider = struct.*?constants\.UIA_HasKeyboardFocusPropertyId => out\.\* = com\.VARIANT\.fromBool\(\s*self\.role != \.text and self\.role != \.layout_pane and hwndHasKeyboardFocus\(self\.hwnd\)'
         Description = 'SettingsControlProvider HasKeyboardFocus property reporting'
     },
     @{

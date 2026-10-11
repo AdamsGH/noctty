@@ -6582,7 +6582,9 @@ fn ChildPlacements(comptime capacity: usize) type {
             if (BeginDeferWindowPos(@intCast(self.len))) |first| {
                 var batch: ?*anyopaque = first;
                 for (self.windows[0..self.len], self.rects[0..self.len]) |window, r| {
-                    batch = DeferWindowPos(batch.?, window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags) orelse break;
+                    // A failed call has already discarded the batch.
+                    batch = DeferWindowPos(batch.?, window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+                    if (batch == null) break;
                 }
                 if (batch) |complete| if (EndDeferWindowPos(complete) != 0) return true;
             }
@@ -6753,10 +6755,18 @@ fn layoutChildren(self: *SettingsWindow) void {
 
     // Moving children repaints them and whatever they uncovered. The frame's
     // own lines move only with the action bar or the column, which a window
-    // that keeps its size does not repaint on its own.
+    // that keeps its size does not repaint on its own: repaint where each one
+    // was and where it is now.
     const background = backgroundGeometry(self, rect);
     if (self.background_geometry) |previous| {
-        if (!std.meta.eql(previous, background)) _ = InvalidateRect(hwnd, null, 0);
+        inline for (std.meta.fields(BackgroundGeometry)) |field| {
+            const old_rect = @field(previous, field.name);
+            const new_rect = @field(background, field.name);
+            if (!std.meta.eql(old_rect, new_rect)) {
+                _ = InvalidateRect(hwnd, &old_rect, 0);
+                _ = InvalidateRect(hwnd, &new_rect, 0);
+            }
+        }
     }
     self.background_geometry = background;
 }
@@ -6915,8 +6925,14 @@ const dialog_test = struct {
     }
 
     fn onHiddenDesktop(body: *const fn () anyerror!void) !void {
+        // One desktop per test process. Two test runs at once (parallel
+        // worktrees) shared one named desktop, and the Ctrl+S test failed in a
+        // run that overlapped another one while passing on its own.
+        var name_utf8: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_utf8, "noctty-test-settings-dialog-{d}", .{windows.GetCurrentProcessId()});
+        var name_w: [64:0]u16 = undefined;
         const desktop = CreateDesktopW(
-            std.unicode.utf8ToUtf16LeStringLiteral("noctty-test-settings-dialog"),
+            utf8ToW(&name_w, name),
             null,
             null,
             0,
