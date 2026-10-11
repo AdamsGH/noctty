@@ -250,7 +250,7 @@ fn threadMain_(self: *Thread) !void {
 
         // Tick the search. This will trigger any event callbacks, lock
         // for data loading, etc.
-        switch (s.tick()) {
+        switch (s.tick(self.opts.mutex)) {
             // We're complete now when we were not before. Notify!
             .complete => {},
 
@@ -809,13 +809,13 @@ const Search = struct {
         blocked,
     };
 
-    /// Tick the search forward as much as possible without acquiring
-    /// the big lock. Returns the overall tick progress.
-    pub fn tick(self: *Search) Tick {
+    /// Scan copied data without the big lock, taking it only for failure
+    /// cleanup that releases screen-owned pins. Returns overall progress.
+    pub fn tick(self: *Search, mutex: *Mutex) Tick {
         var result: Tick = .complete;
         var it = self.screens.iterator();
         while (it.next()) |entry| {
-            if (entry.value.tick()) {
+            if (entry.value.tickWithMutex(mutex)) {
                 result = .progress;
             } else |err| switch (err) {
                 // Ignore... nothing we can do.
