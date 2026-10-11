@@ -194,6 +194,9 @@ fn runFeed(
         var sink: Sink = .{ .alloc = alloc };
         var search = try ThreadSearch.init(alloc, args.needle, .{});
         defer search.deinit(&t);
+        // Single-threaded: `tick` takes the terminal lock only to clean up
+        // after a matcher failure, and nothing else contends for it here.
+        var mutex: std.Thread.Mutex = .{};
 
         // `changeQuery`'s initial feed, then the search thread's loop until
         // the search completes.
@@ -202,7 +205,7 @@ fn runFeed(
         while (true) {
             search.notify(alloc, &Sink.callback, 1, &sink, false);
             if (search.isComplete()) break;
-            switch (search.tick()) {
+            switch (search.tick(&mutex)) {
                 .complete, .progress => {},
                 .blocked => search.feed(alloc, &t),
             }
@@ -232,7 +235,7 @@ fn runFeed(
             while (true) {
                 search.notify(alloc, &Sink.callback, 1, &sink, false);
                 if (search.isComplete()) break;
-                switch (search.tick()) {
+                switch (search.tick(&mutex)) {
                     .complete, .progress => {},
                     .blocked => search.feed(alloc, &t),
                 }

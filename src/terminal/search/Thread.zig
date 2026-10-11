@@ -1370,7 +1370,7 @@ test "notified match rows follow streamed output while the scrollback is pruned"
         while (true) {
             s.notify(alloc, &TestUserData.callback, 1, &ud, false);
             if (s.isComplete()) break;
-            if (s.tick() == .blocked) s.feed(alloc, &t);
+            if (s.tick(&mutex) == .blocked) s.feed(alloc, &t);
         }
 
         // The rows `pointFromPin` gives for every match.
