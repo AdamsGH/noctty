@@ -92,6 +92,11 @@ pub fn registerAumidDisplayName(alloc: std.mem.Allocator) void {
 }
 
 fn registerForExe(alloc: std.mem.Allocator, subkey: LPCWSTR, exe_path: []const u8, portable: bool) void {
+    // Both launch modes serialize the portable check and all writes. Global
+    // scope covers simultaneous sessions of the same HKCU user; the SID keeps
+    // unrelated users apart. Failure/timeout leaves the registration untouched.
+    const lock = RegistrationLock.acquire(alloc, subkey) catch return;
+    defer lock.release();
     var hkey: HKEY = undefined;
     const open_rc = sys.RegCreateKeyExW(
         HKEY_CURRENT_USER,
@@ -99,7 +104,7 @@ fn registerForExe(alloc: std.mem.Allocator, subkey: LPCWSTR, exe_path: []const u
         0,
         null,
         REG_OPTION_NON_VOLATILE,
-        KEY_WRITE | KEY_QUERY_VALUE,
+        KEY_WRITE | (if (portable) KEY_QUERY_VALUE else @as(REGSAM, 0)),
         null,
         &hkey,
         null,
@@ -162,6 +167,50 @@ fn registerForExe(alloc: std.mem.Allocator, subkey: LPCWSTR, exe_path: []const u
         std.log.warn("AUMID: write ShowInSettings failed rc={d}", .{show_rc});
     }
 }
+
+const RegistrationLock = struct {
+    handle: windows.HANDLE,
+
+    extern "kernel32" fn CreateMutexExW(?*const windows.SECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn ReleaseMutex(windows.HANDLE) callconv(.winapi) windows.BOOL;
+
+    fn acquire(alloc: std.mem.Allocator, subkey: LPCWSTR) !RegistrationLock {
+        const sid = try @import("win32_elevation.zig").allocCurrentUserSidString(alloc);
+        defer alloc.free(sid);
+        const name = try std.fmt.allocPrint(alloc, "Global\\noctty-aumid-{s}-{x}", .{
+            sid, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(std.mem.span(subkey))),
+        });
+        defer alloc.free(name);
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, name);
+        defer alloc.free(wide);
+        // An elevated creator's default label would prevent a normal launcher
+        // from opening the same lock. This mutex protects only HKCU metadata:
+        // grant the same user wait/release rights and explicitly label it medium.
+        const sddl = try std.fmt.allocPrint(alloc, "O:{s}D:P(A;;0x00100001;;;{s})S:(ML;;NW;;;ME)", .{ sid, sid });
+        defer alloc.free(sddl);
+        const sddl_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, sddl);
+        defer alloc.free(sddl_wide);
+        var descriptor: ?*anyopaque = null;
+        if (sys.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl_wide, 1, &descriptor, null) == 0) return error.LockUnavailable;
+        defer _ = sys.LocalFree(descriptor);
+        var attributes: windows.SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = descriptor orelse return error.LockUnavailable,
+            .bInheritHandle = 0,
+        };
+        const handle = CreateMutexExW(&attributes, wide, 0, 0x00100001) orelse return error.LockUnavailable;
+        errdefer windows.CloseHandle(handle);
+        const result = windows.kernel32.WaitForSingleObject(handle, 250);
+        // An abandoned mutex grants ownership too; re-read registry state.
+        if (result != 0 and result != 0x80) return error.LockUnavailable;
+        return .{ .handle = handle };
+    }
+
+    fn release(self: RegistrationLock) void {
+        _ = ReleaseMutex(self.handle);
+        windows.CloseHandle(self.handle);
+    }
+};
 
 /// Unknown/unreachable registrations are preserved too: never contact a
 /// network server from startup just to replace its icon with a portable one.
@@ -331,6 +380,23 @@ test "aumid portable registration preserves a working icon and repairs a broken 
     try std.testing.expectEqual(ERROR_SUCCESS, writeRegSz(key, icon_name, installed_wide));
     const display_name = std.unicode.utf8ToUtf16LeStringLiteral("DisplayName");
     try std.testing.expectEqual(ERROR_SUCCESS, writeRegSz(key, display_name, std.unicode.utf8ToUtf16LeStringLiteral("custom")));
+    // A second launcher cannot write while another registration transaction
+    // owns the mutex. Use a separate thread (mutexes are recursive per thread)
+    // and a separately opened handle, as a second process would use.
+    {
+        const held = try RegistrationLock.acquire(alloc, subkey);
+        defer held.release();
+        const Writer = struct {
+            fn run(a: std.mem.Allocator, k: LPCWSTR, exe: []const u8) void {
+                registerForExe(a, k, exe, false);
+            }
+        };
+        const writer = try std.Thread.spawn(.{}, Writer.run, .{ alloc, subkey.ptr, portable_exe });
+        writer.join();
+        const unchanged = (try readIconUri(alloc, key)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(unchanged);
+        try std.testing.expectEqualStrings(installed, unchanged);
+    }
     registerForExe(alloc, subkey, portable_exe, true);
     const preserved = (try readIconUri(alloc, key)) orelse return error.TestUnexpectedResult;
     defer alloc.free(preserved);
