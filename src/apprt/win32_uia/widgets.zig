@@ -2054,10 +2054,9 @@ pub const ChromeControlState = struct {
     selection_container: ?*const fn (*anyopaque) ?*ChromeControlProvider = null,
     toggled: ?*const fn (*anyopaque, usize) bool = null,
     range_value: ?*const fn (*anyopaque) ChromeRangeValue = null,
-    /// Overrides the role's default keyboard focusability. The host
-    /// banner opts in: it is not interactive, but the window's
-    /// focus-region cycle can land real Win32 focus on it, and
-    /// `IsKeyboardFocusable` must say so rather than contradict the
+    /// Overrides the role's default keyboard focusability, for a control
+    /// that real Win32 focus reaches although its role is not interactive
+    /// (or the reverse): `IsKeyboardFocusable` must not contradict the
     /// focus-changed event a reader just received.
     keyboard_focusable: ?bool = null,
     use_com_threading: bool = false,
@@ -6808,9 +6807,8 @@ test "ChromeControlProvider keyboard focusability follows the role unless overri
     defer _ = ChromeControlProvider.Release(&notice.base);
     defer notice.detach();
 
-    // The host banner is the same role but is a focus-region landing
-    // site, so it must not claim to be unfocusable while the cycle
-    // parks real keyboard focus on it.
+    // The same role on a focus-region landing site must not claim to be
+    // unfocusable while the cycle parks real keyboard focus on it.
     const banner = try ChromeControlProvider.create(std.testing.allocator, hwnd, .{
         .ctx = context_ptr,
         .role = .live_text,

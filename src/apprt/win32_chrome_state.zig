@@ -13,14 +13,12 @@ pub const HostOverlayMode = win32_theme.HostOverlayMode;
 pub const TextDirty = packed struct(u8) {
     overlay: bool = true,
     inspector: bool = true,
-    banner: bool = true,
     status: bool = true,
-    _padding: u4 = 0,
+    _padding: u5 = 0,
 
     pub fn markTop(self: *TextDirty) void {
         self.overlay = true;
         self.inspector = true;
-        self.banner = true;
     }
 
     pub fn markAll(self: *TextDirty) void {
@@ -153,37 +151,31 @@ test "chrome text dirty splits top and status cache invalidation" {
     var dirty: TextDirty = .{
         .overlay = false,
         .inspector = false,
-        .banner = false,
         .status = false,
     };
     dirty.markTop();
     try testing.expect(dirty.overlay);
     try testing.expect(dirty.inspector);
-    try testing.expect(dirty.banner);
     try testing.expect(!dirty.status);
 
     dirty = .{
         .overlay = false,
         .inspector = false,
-        .banner = false,
         .status = false,
     };
     dirty.status = true;
     try testing.expect(!dirty.overlay);
     try testing.expect(!dirty.inspector);
-    try testing.expect(!dirty.banner);
     try testing.expect(dirty.status);
 
     dirty = .{
         .overlay = false,
         .inspector = false,
-        .banner = false,
         .status = false,
     };
     dirty.markAll();
     try testing.expect(dirty.overlay);
     try testing.expect(dirty.inspector);
-    try testing.expect(dirty.banner);
     try testing.expect(dirty.status);
 }
 
