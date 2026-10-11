@@ -264,8 +264,36 @@ foreach($dir in @('LOCALAPPDATA','APPDATA','HOME','USERPROFILE')) {
 }
 $results=[ordered]@{Phases=[Collections.Generic.List[object]]::new()}
 $runStart=Get-Date
-# Every process this run launched or found under one it launched.
-$knownPids=[Collections.Generic.HashSet[int]]::new()
+# Every process this run launched or found under one it launched, by pid and
+# creation time: a pid alone names whatever process holds it now.
+$knownProcs=@{}
+function Note-Known([int]$ProcessId) {
+    $p=Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if($p -and $p.CreationDate) { $knownProcs[[int]$ProcessId]=[datetime]$p.CreationDate }
+}
+# herdr servers this run started, found while their parents are still alive:
+# a herdr.exe whose parent chain reaches a known process that is the same
+# incarnation (same pid AND creation time) and older than the child. Called
+# before the owned job is stopped, when that can still be checked.
+function Find-OwnHerdrServers {
+    $own=@{}
+    $all=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'")
+    foreach($proc in $all) {
+        if(-not $proc.CreationDate -or [datetime]$proc.CreationDate -lt $runStart) { continue }
+        $child=$proc; $hops=0; $mine=$false
+        while(-not $mine -and $hops -lt 6) {
+            $parentId=[int]$child.ParentProcessId
+            $parent=Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
+            if($null -eq $parent -or -not $parent.CreationDate) { break }
+            if([datetime]$parent.CreationDate -gt [datetime]$child.CreationDate) { break } # the pid was reused after the child started
+            if($knownProcs.ContainsKey($parentId) -and $knownProcs[$parentId] -eq [datetime]$parent.CreationDate) { $mine=$true; break }
+            if($parent.Name -ne 'herdr.exe') { break }
+            $child=$parent; $hops++
+        }
+        if($mine) { $own[[int]$proc.ProcessId]=[datetime]$proc.CreationDate }
+    }
+    return $own
+}
 $job=[HerdrMouse]::CreateOwnedJob()
 $observer=Join-Path $Run 'console-input-records.exe'; $attachInfo=Join-Path $Run 'console-attach-info.exe'
 $herdrConfigDir=Join-Path $env:APPDATA 'herdr'; [void](New-Item -ItemType Directory -Path $herdrConfigDir -Force)
@@ -391,8 +419,8 @@ try {
                 if($api.Exit -ne 0) { $phase.Status='FAIL'; $phase.Error='herdr API never answered'; $results.Phases.Add($phase); continue }
                 Start-Sleep -Milliseconds 1500
                 $herdrPids=@(Child-Pids $t.Pid 'herdr.exe'); Progress "herdr client pids: $($herdrPids -join ',')"
-                [void]$knownPids.Add([int]$t.Pid); foreach($hp in $herdrPids) { [void]$knownPids.Add([int]$hp) }
-                foreach($hp in $herdrPids) { foreach($sp in @(Child-Pids $hp 'herdr.exe')) { [void]$knownPids.Add([int]$sp) } }
+                Note-Known $t.Pid; foreach($hp in $herdrPids) { Note-Known $hp }
+                foreach($hp in $herdrPids) { foreach($sp in @(Child-Pids $hp 'herdr.exe')) { Note-Known $sp } }
                 if($terminal -eq 'wezterm' -and $herdrPids.Count -eq 0) {
                     # WezTerm may spawn through its own conpty host; take any herdr whose parent is a child of the GUI.
                     $kids=@(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $t.Pid } | Select-Object -ExpandProperty ProcessId)
@@ -451,7 +479,7 @@ try {
             try {
                 Progress "phase $terminal observer ${tag}: start"
                 $t=Start-Terminal $terminal $observer ('"{0}" "{1}" "{2}" {3}{4}' -f $records,$ready,$stop,$modeHex,$(if($variant.Vt){' vt-mouse'}else{''}))
-                [void]$knownPids.Add([int]$t.Pid)
+                Note-Known $t.Pid
                 # The observer creates the ready file before it writes the line
                 # (and before its vt-mouse request), so wait for the whole line,
                 # not for the file.
@@ -482,31 +510,26 @@ try {
     $results.Infrastructure=@{Status='FAIL';Error=$_.Exception.Message;Position=$_.InvocationInfo.PositionMessage}
     Progress ("infrastructure failure: " + $_.Exception.Message)
 } finally {
+    # herdr's server detaches from the client's job (its command line is just
+    # `herdr server`, nothing names this run). Identify the servers this run
+    # started while their parents are still alive to vouch for them
+    # (Find-OwnHerdrServers), then stop the owned job, then stop only those
+    # servers, each by pid AND creation time. Never by name or by start time
+    # alone: the maintainer's own herdr is out of scope.
+    $ownServers=@{}
+    try { $ownServers=Find-OwnHerdrServers } catch { Progress "own-server scan failed: $($_.Exception.Message)" }
     $cleanupError=$null; $owned=0
     try { $owned=[HerdrMouse]::StopOwnedJob($job) } catch { $cleanupError=$_ }
-    # herdr's server detaches from the client's job. Stop only a server this
-    # run started: a herdr.exe whose parent chain reaches a process this run
-    # launched (recorded in $knownPids), or whose command line names Run.
-    # Never by name or start time: the maintainer's own herdr is out of scope.
     $leftover=@()
-    $all=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'")
-    foreach($proc in $all) {
-        # A pid recorded earlier may have been reused by now: only a process
-        # created after this run began can be one of its own.
-        if($proc.CreationDate -and $proc.CreationDate -lt $runStart) { continue }
-        $mine=($proc.CommandLine -and $proc.CommandLine -like "*$Run*")
-        $parent=$proc.ParentProcessId; $hops=0
-        while(-not $mine -and $parent -gt 0 -and $hops -lt 6) {
-            if($knownPids.Contains([int]$parent)) { $mine=$true; break }
-            $pp=$all | Where-Object { $_.ProcessId -eq $parent } | Select-Object -First 1
-            if($null -eq $pp) { $pp=Get-CimInstance Win32_Process -Filter "ProcessId=$parent" -ErrorAction SilentlyContinue }
-            if($null -eq $pp) { break }
-            $parent=$pp.ParentProcessId; $hops++
-        }
-        if($mine) { $leftover+=$proc }
+    foreach($entry in $ownServers.GetEnumerator()) {
+        $proc=Get-CimInstance Win32_Process -Filter "ProcessId=$($entry.Key)" -ErrorAction SilentlyContinue
+        if($null -eq $proc -or $proc.Name -ne 'herdr.exe' -or -not $proc.CreationDate -or [datetime]$proc.CreationDate -ne $entry.Value) { continue }
+        Progress "stopping leftover herdr server pid $($proc.ProcessId) started $($proc.CreationDate)"
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        $leftover+=[int]$proc.ProcessId
     }
-    foreach($proc in $leftover) { Progress "stopping leftover herdr pid $($proc.ProcessId) started $($proc.CreationDate)"; Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue }
-    $results.LeftoverHerdrStopped=@($leftover | ForEach-Object { $_.ProcessId })
+    $results.OwnHerdrServersSeen=@($ownServers.Keys)
+    $results.LeftoverHerdrStopped=$leftover
     $results.OwnedProcessCount=$owned; $results.OwnedJobCleanedUp=($null -eq $cleanupError)
     $results.HerdrInstalled=$haveHerdr; $results.WezTermInstalled=$haveWezTerm
     $results | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'results.json')
