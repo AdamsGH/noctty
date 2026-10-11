@@ -834,6 +834,12 @@ pub fn cursorDownScroll(self: *Screen) !void {
                 self.cursor.page_row,
                 page.getCells(self.cursor.page_row),
             );
+
+            // The row is a fresh blank row now and must not retain
+            // metadata (wrap state, semantic prompt) from the
+            // discarded content.
+            self.cursor.page_row.reset();
+
             self.cursorMarkDirty();
         } else {
             // The call to `eraseRow` will move the tracked cursor pin up by one
@@ -1123,6 +1129,11 @@ fn cursorScrollAboveRotate(self: *Screen) !void {
         &cur_rows[self.cursor.page_pin.y],
         cur_page.getCells(&cur_rows[self.cursor.page_pin.y]),
     );
+
+    // The recycled storage becomes the new blank cursor row and must
+    // not retain metadata (wrap state, semantic prompt) from the row
+    // whose content was moved to the next page.
+    cur_rows[self.cursor.page_pin.y].reset();
 
     // Mark the whole page as dirty.
     //
@@ -4897,6 +4908,102 @@ test "Screen: scrolling with a single-row screen with scrollback" {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
         try testing.expectEqualStrings("1ABCD", contents);
+    }
+}
+
+test "Screen: cursorScrollAbove cross-page recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 10 });
+    defer s.deinit();
+
+    // Get the cursor page and the last page to differ so that
+    // cursorScrollAbove takes the cross-page rotate path.
+    const first_page_size = s.pages.pages.first.?.data.capacity.rows;
+    s.pages.pages.first.?.data.pauseIntegrityChecks(true);
+    for (0..first_page_size - 3) |_| try s.testWriteString("\n");
+    s.pages.pages.first.?.data.pauseIntegrityChecks(false);
+    try s.testWriteString("1A\n2B\n3C\n4D\n5E");
+    s.cursorAbsolute(0, 1);
+    try testing.expect(s.cursor.page_pin.node == s.pages.pages.first.?);
+    try testing.expect(s.pages.pages.first.?.next != null);
+
+    // The last row of the cursor page is the Row storage that gets
+    // recycled as the new blank row below the cursor after its content
+    // is moved down to the next page.
+    {
+        const rac = s.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    try s.cursorScrollAbove();
+
+    // One row scrolled into history, so the blank row is at active
+    // y=1 (just below the cursor's original row).
+    {
+        const rac = s.pages.getCell(.{ .active = .{ .y = 1 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("2B\n\n3C\n4D\n5E", contents);
+    }
+}
+
+test "Screen: cursorDownScroll no scrollback recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{} }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    s.cursorAbsolute(0, 2);
+    try s.cursorDownScroll();
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Screen: cursorDownScroll single row no scrollback resets metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 1, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD");
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{} }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    try s.cursorDownScroll();
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{} }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
     }
 }
 

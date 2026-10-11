@@ -388,6 +388,10 @@ pub const StreamHandler = struct {
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
+            // The shape a mouse tracking toggle would set.
+            .mouse_shape_reset => try self.setMouseShape(
+                if (self.terminal.flags.mouse_event != .none) .default else .text,
+            ),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
                 @branchHint(.likely);
@@ -2470,4 +2474,73 @@ test "OSC 7501 answers the query once and forwards reports, prompts and resets" 
 
     // Nothing a program reported was written back to it.
     try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
+}
+
+test "OSC 22 with an empty shape gives the pointer back" {
+    const alloc = std.testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+
+    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer termio_mailbox.deinit(alloc);
+    var renderer_mutex: std.Thread.Mutex = .{};
+    var renderer_state: renderer.State = undefined;
+    renderer_state.mutex = &renderer_mutex;
+    renderer_state.terminal = &term;
+    var rt_app: apprt.App = undefined;
+    rt_app.windows = .empty;
+    rt_app.ui_thread_id = 0;
+    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
+    const app_queue = try AppMailbox.Queue.create(alloc);
+    defer app_queue.destroy(alloc);
+    const surface_mailbox: apprt.surface.Mailbox = .{
+        .surface = undefined,
+        .app = .{
+            .rt_app = &rt_app,
+            .mailbox = app_queue,
+        },
+    };
+
+    var stream = StreamHandler.Stream.initAlloc(alloc, .{
+        .alloc = alloc,
+        .size = undefined,
+        .terminal = &term,
+        .termio_mailbox = &termio_mailbox,
+        .surface_mailbox = surface_mailbox,
+        .renderer_state = &renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .default_cursor_style = .block,
+        .default_cursor_blink = true,
+        .enquiry_response = "",
+        .osc_color_report_format = .none,
+        .clipboard_write = .allow,
+    });
+    defer stream.deinit();
+
+    const S = struct {
+        fn nextShape(queue: anytype) ?terminal.MouseShape {
+            while (queue.pop()) |message| switch (message.surface_message.message) {
+                .set_mouse_shape => |shape| return shape,
+                else => {},
+            };
+            return null;
+        }
+    };
+
+    // Without mouse tracking the pointer goes back to the text shape.
+    stream.nextSlice("\x1b]22;crosshair\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(app_queue));
+    stream.nextSlice("\x1b]22;\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .text), S.nextShape(app_queue));
+
+    // While a program tracks the mouse it goes back to the shape that
+    // turning tracking on set.
+    stream.nextSlice("\x1b[?1000h");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(app_queue));
+    stream.nextSlice("\x1b]22;crosshair\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(app_queue));
+    stream.nextSlice("\x1b]22;\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(app_queue));
+    try std.testing.expect(S.nextShape(app_queue) == null);
 }

@@ -80,7 +80,7 @@ pub fn commandData(
         inline else => |comptime_data| commandDataTyped(
             command_,
             comptime_data,
-            @ptrCast(@alignCast(out)),
+            @ptrCast(@alignCast(out orelse return false)),
         ),
     };
 }
@@ -90,7 +90,9 @@ fn commandDataTyped(
     comptime data: CommandData,
     out: *data.OutType(),
 ) bool {
-    const command = command_.?;
+    // ghostty_osc_end returns NULL for a sequence that is not a valid
+    // command, and the header says a NULL command may be passed here.
+    const command = command_ orelse return false;
     switch (data) {
         .invalid => return false,
         .change_window_title_str => switch (command.*) {
@@ -115,6 +117,41 @@ test "alloc" {
 test "command type null" {
     const testing = std.testing;
     try testing.expectEqual(.invalid, commandType(null));
+}
+
+test "command data null" {
+    const testing = std.testing;
+    var title: [*:0]const u8 = undefined;
+    try testing.expect(!commandData(null, .change_window_title_str, @ptrCast(&title)));
+    try testing.expect(!commandData(null, .change_window_title_str, null));
+    try testing.expect(!commandData(null, .invalid, null));
+}
+
+test "end returns null for an invalid or cancelled sequence" {
+    const testing = std.testing;
+    var p: Parser = undefined;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &p,
+    ));
+    defer free(p);
+
+    // Not a valid command: OSC 0 with no separator.
+    next(p, '0');
+    const invalid = end(p, 0x07);
+    try testing.expect(invalid == null);
+    try testing.expectEqual(.invalid, commandType(invalid));
+
+    // A complete title cancelled with CAN, then with SUB.
+    for ([_]u8{ 0x18, 0x1A }) |cancel| {
+        reset(p);
+        for ("0;hello") |c| next(p, c);
+        const cancelled = end(p, cancel);
+        try testing.expect(cancelled == null);
+        try testing.expectEqual(.invalid, commandType(cancelled));
+        var title: [*:0]const u8 = undefined;
+        try testing.expect(!commandData(cancelled, .change_window_title_str, @ptrCast(&title)));
+    }
 }
 
 test "change window title" {

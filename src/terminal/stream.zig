@@ -126,6 +126,7 @@ pub const Action = union(Key) {
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
     program_status: ProgramStatus,
+    mouse_shape_reset,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -224,6 +225,7 @@ pub const Action = union(Key) {
             "color_operation",
             "semantic_prompt",
             "program_status",
+            "mouse_shape_reset",
         },
     );
 
@@ -526,11 +528,17 @@ pub fn Stream(comptime H: type) type {
             while (self.parser.state == .ground and offset < input.len) {
                 const res = simd.vt.utf8DecodeUntilControlSeq(input[offset..], cp_buf);
                 for (cp_buf[0..res.decoded]) |cp| {
-                    if (cp <= 0xF) {
-                        self.execute(@intCast(cp));
-                    } else {
-                        self.print(@intCast(cp));
+                    // C0 controls execute and UTF-8-decoded C1 controls
+                    // are dropped, as xterm does; neither prints. ESC never
+                    // appears here because the decoder stops at it. A
+                    // codepoint is one of those exactly when it has no bit
+                    // set outside 0x9F (0x00-0x1F and 0x80-0x9F).
+                    if ((cp & ~@as(u32, 0x9F)) == 0) {
+                        @branchHint(.unlikely);
+                        if (cp <= 0x1F) self.execute(@intCast(cp));
+                        continue;
                     }
+                    self.print(@intCast(cp));
                 }
                 // Consume the bytes we just processed.
                 offset += res.consumed;
@@ -631,16 +639,23 @@ pub fn Stream(comptime H: type) type {
             // a chain of inline functions.
             @setEvalBranchQuota(100_000);
 
-            // C0 control
-            if (c <= 0xF) {
+            // C0 control or a C1 control decoded from UTF-8: exactly the
+            // codepoints with no bit set outside 0x9F (0x00-0x1F and
+            // 0x80-0x9F), so the printable path stays a single AND-test.
+            if ((c & ~@as(u21, 0x9F)) == 0) {
                 @branchHint(.unlikely);
+
+                // ESC
+                if (c == 0x1B) {
+                    self.parser.state = .escape;
+                    self.parser.clear();
+                    return;
+                }
+
+                // Ignore C1 that came via UTF-8 decoding, matching xterm.
+                if (c > 0x1F) return;
+
                 self.execute(@intCast(c));
-                return;
-            }
-            // ESC
-            if (c == 0x1B) {
-                self.parser.state = .escape;
-                self.parser.clear();
                 return;
             }
             self.print(@intCast(c));
@@ -780,7 +795,9 @@ pub fn Stream(comptime H: type) type {
                 .SO => self.handler.vt(.invoke_charset, .{ .bank = .GL, .charset = .G1, .locking = false }),
                 .SI => self.handler.vt(.invoke_charset, .{ .bank = .GL, .charset = .G0, .locking = false }),
 
-                else => log.warn("invalid C0 character, ignoring: 0x{x}", .{c}),
+                // DLE through US (CAN and SUB included) do nothing here, and
+                // a binary dump is full of them, so they are not logged.
+                else => if (c < 0x10) log.warn("invalid C0 character, ignoring: 0x{x}", .{c}),
             }
         }
 
@@ -2005,6 +2022,13 @@ pub fn Stream(comptime H: type) type {
                 },
 
                 .mouse_shape => |v| {
+                    // An empty name gives the pointer back (kitty documents
+                    // it, foot does the same). Unknown names are ignored.
+                    if (v.value.len == 0) {
+                        self.handler.vt(.mouse_shape_reset, {});
+                        return;
+                    }
+
                     const shape = MouseShape.fromString(v.value) orelse {
                         @branchHint(.unlikely);
                         log.warn("unknown cursor shape: {s}", .{v.value});
@@ -2455,6 +2479,140 @@ test "simd: complete incomplete utf-8" {
     try testing.expect(s.handler.c == null);
     s.nextSlice(&.{0x80});
     try testing.expectEqual(@as(u21, 0x800), s.handler.c.?);
+}
+
+/// Records every printed codepoint, for the ground state control tests.
+const PrintRecorder = struct {
+    buf: [128]u21 = undefined,
+    len: usize = 0,
+
+    pub fn vt(
+        self: *@This(),
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) void {
+        switch (action) {
+            .print => {
+                self.buf[self.len] = value.cp;
+                self.len += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+test "stream: ground state C0 controls are executed, not printed" {
+    // Every C0 control except ESC must never produce a print action
+    // in the ground state. ESC is excluded because it begins an
+    // escape sequence rather than executing.
+    for (0..0x20) |c| {
+        if (c == 0x1B) continue;
+
+        // Scalar path.
+        {
+            var s: Stream(PrintRecorder) = .init(.{});
+            s.next('A');
+            s.next(@intCast(c));
+            s.next('B');
+            try testing.expectEqual(@as(usize, 2), s.handler.len);
+            try testing.expectEqual(@as(u21, 'A'), s.handler.buf[0]);
+            try testing.expectEqual(@as(u21, 'B'), s.handler.buf[1]);
+        }
+
+        // Batched path.
+        {
+            var s: Stream(PrintRecorder) = .init(.{});
+            s.nextSlice(&.{ 'A', 'B', @intCast(c), 'C', 'D' });
+            try testing.expectEqual(@as(usize, 4), s.handler.len);
+            for ("ABCD", 0..) |expected, i| {
+                try testing.expectEqual(@as(u21, expected), s.handler.buf[i]);
+            }
+        }
+
+        // Batched path with a run long enough for the SIMD decoder to
+        // see printable bytes on either side of the control.
+        {
+            var s: Stream(PrintRecorder) = .init(.{});
+            var input: [65]u8 = @splat('A');
+            input[32] = @intCast(c);
+            s.nextSlice(&input);
+            try testing.expectEqual(@as(usize, 64), s.handler.len);
+            for (s.handler.buf[0..s.handler.len]) |cp| {
+                try testing.expectEqual(@as(u21, 'A'), cp);
+            }
+        }
+    }
+}
+
+test "stream: ground state UTF-8-decoded C1 controls are ignored" {
+    // Every C1 control that arrives as well-formed UTF-8 (a two byte
+    // 0xC2-lead sequence) must be dropped: not printed and not
+    // interpreted as a control (e.g. U+009B must not start a CSI).
+    for (0x80..0xA0) |c| {
+        const enc: [2]u8 = .{ 0xC2, @intCast(c) };
+
+        // Scalar path.
+        {
+            var s: Stream(PrintRecorder) = .init(.{});
+            s.next('A');
+            s.next(enc[0]);
+            s.next(enc[1]);
+            s.next('B');
+            try testing.expectEqual(@as(usize, 2), s.handler.len);
+            try testing.expectEqual(@as(u21, 'A'), s.handler.buf[0]);
+            try testing.expectEqual(@as(u21, 'B'), s.handler.buf[1]);
+        }
+
+        // Batched path.
+        {
+            var s: Stream(PrintRecorder) = .init(.{});
+            s.nextSlice(&.{ 'A', 'B', enc[0], enc[1], 'C', 'D' });
+            try testing.expectEqual(@as(usize, 4), s.handler.len);
+            for ("ABCD", 0..) |expected, i| {
+                try testing.expectEqual(@as(u21, expected), s.handler.buf[i]);
+            }
+        }
+
+        // Batched path with a run long enough for the SIMD decoder to
+        // see printable bytes on either side of the control.
+        {
+            var s: Stream(PrintRecorder) = .init(.{});
+            var input: [66]u8 = @splat('A');
+            input[32] = enc[0];
+            input[33] = enc[1];
+            s.nextSlice(&input);
+            try testing.expectEqual(@as(usize, 64), s.handler.len);
+            for (s.handler.buf[0..s.handler.len]) |cp| {
+                try testing.expectEqual(@as(u21, 'A'), cp);
+            }
+        }
+    }
+
+    // U+00A0 (NBSP), just past the C1 range, must still print.
+    {
+        var s: Stream(PrintRecorder) = .init(.{});
+        s.nextSlice(&.{ 0xC2, 0xA0 });
+        try testing.expectEqual(@as(usize, 1), s.handler.len);
+        try testing.expectEqual(@as(u21, 0xA0), s.handler.buf[0]);
+    }
+
+    // A codepoint whose continuation byte falls in the C1 range must
+    // still print: "Ü" is 0xC3 0x9C.
+    {
+        var s: Stream(PrintRecorder) = .init(.{});
+        s.nextSlice("Ü");
+        try testing.expectEqual(@as(usize, 1), s.handler.len);
+        try testing.expectEqual(@as(u21, 0xDC), s.handler.buf[0]);
+    }
+
+    // A raw C1 byte is ill-formed UTF-8, not a decoded C1: it must
+    // still produce a U+FFFD replacement.
+    {
+        var s: Stream(PrintRecorder) = .init(.{});
+        s.nextSlice(&.{0x9B});
+        try testing.expectEqual(@as(usize, 1), s.handler.len);
+        try testing.expectEqual(@as(u21, 0xFFFD), s.handler.buf[0]);
+    }
 }
 
 test "stream: cursor right (CUF)" {

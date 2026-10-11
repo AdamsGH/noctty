@@ -314,6 +314,17 @@ pub fn print(self: *Terminal, c: u21) !void {
     // that our screen remains in a consistent state.
     defer self.screens.active.assertIntegrity();
 
+    // The charset this character is printed with. A single shift applies to
+    // exactly one character, so it is used up here, whether the character
+    // takes a cell or attaches to the previous one: xterm clears it for a
+    // combining character and so do we.
+    const charset: charsets.Charset = charset: {
+        const state = &self.screens.active.charset;
+        const key = state.single_shift orelse state.gl;
+        state.single_shift = null;
+        break :charset state.charsets.get(key);
+    };
+
     // Our right margin depends where our cursor is now.
     const right_limit = if (self.screens.active.cursor.x > self.scrolling_region.right)
         self.cols
@@ -350,15 +361,23 @@ pub fn print(self: *Terminal, c: u21) !void {
                 break :left @intFromBool(self.screens.active.cursor.page_cell.codepoint() == 0);
             };
 
+            // A reflow can leave a cursor that waits to wrap on the spacer
+            // head of a wide character it moved to the next row. The
+            // character just printed is the one before that.
+            const head: size.CellCountInt = @intFromBool(
+                self.screens.active.cursor.x > left and
+                    self.screens.active.cursorCellLeft(left).wide == .spacer_head,
+            );
+
             // If the previous cell is a wide spacer tail, then we actually
             // want to use the cell before that because that has the actual
             // content.
-            const immediate = self.screens.active.cursorCellLeft(left);
+            const immediate = self.screens.active.cursorCellLeft(left + head);
             break :prev switch (immediate.wide) {
-                else => .{ .cell = immediate, .left = left },
+                else => .{ .cell = immediate, .left = left + head },
                 .spacer_tail => .{
-                    .cell = self.screens.active.cursorCellLeft(left + 1),
-                    .left = left + 1,
+                    .cell = self.screens.active.cursorCellLeft(left + head + 1),
+                    .left = left + head + 1,
                 },
             };
         };
@@ -367,20 +386,22 @@ pub fn print(self: *Terminal, c: u21) !void {
         // necessarily a grapheme break.
         if (prev.cell.codepoint() == 0) break :grapheme;
 
+        // The last codepoint of the cell's cluster, which is the one a
+        // variation selector applies to.
+        var previous_codepoint: u21 = prev.cell.content.codepoint;
         const grapheme_break = brk: {
             var state: uucode.grapheme.BreakState = .default;
-            var cp1: u21 = prev.cell.content.codepoint;
             if (prev.cell.hasGrapheme()) {
                 const cps = self.screens.active.cursor.page_pin.node.data.lookupGrapheme(prev.cell).?;
                 for (cps) |cp2| {
-                    // log.debug("cp1={x} cp2={x}", .{ cp1, cp2 });
-                    assert(!unicode.graphemeBreak(cp1, cp2, &state));
-                    cp1 = cp2;
+                    // log.debug("cp1={x} cp2={x}", .{ previous_codepoint, cp2 });
+                    assert(!unicode.graphemeBreak(previous_codepoint, cp2, &state));
+                    previous_codepoint = cp2;
                 }
             }
 
-            // log.debug("cp1={x} cp2={x} end", .{ cp1, c });
-            break :brk unicode.graphemeBreak(cp1, c, &state);
+            // log.debug("cp1={x} cp2={x} end", .{ previous_codepoint, c });
+            break :brk unicode.graphemeBreak(previous_codepoint, c, &state);
         };
 
         // If we can NOT break, this means that "c" is part of a grapheme
@@ -392,7 +413,7 @@ pub fn print(self: *Terminal, c: u21) !void {
             // the cell width accordingly. VS16 makes the character wide and
             // VS15 makes it narrow.
             if (c == 0xFE0F or c == 0xFE0E) {
-                const prev_props = unicode.table.get(prev.cell.content.codepoint);
+                const prev_props = unicode.table.get(previous_codepoint);
                 // Check if it is a valid variation sequence in
                 // emoji-variation-sequences.txt, and if not, ignore the char.
                 if (!prev_props.emoji_vs_base) return;
@@ -442,7 +463,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                             prev.cell.content.codepoint = 0;
 
                             try self.printWrap();
-                            self.printCell(prev_cp, .wide);
+                            self.writeCell(prev_cp, .wide);
 
                             const new_pin = self.screens.active.cursor.page_pin.*;
                             const new_rac = new_pin.rowAndCell();
@@ -479,12 +500,12 @@ pub fn print(self: *Terminal, c: u21) !void {
                             // we'll be appending graphemes to
                             prev.cell = self.screens.active.cursor.page_cell;
                         } else {
-                            self.printCell(
+                            self.writeCell(
                                 0,
                                 if (row_wrap) .spacer_head else .narrow,
                             );
                             try self.printWrap();
-                            self.printCell(prev_cp, .wide);
+                            self.writeCell(prev_cp, .wide);
 
                             // Point prev.cell to our new previous cell that
                             // we'll be appending graphemes to
@@ -508,7 +529,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                     const spacer_node = self.screens.active.cursor.page_pin.node;
                     const spacer_serial = spacer_node.serial;
 
-                    self.printCell(0, .spacer_tail);
+                    self.writeCell(0, .spacer_tail);
 
                     if (self.screens.active.cursor.page_pin.node != spacer_node or
                         self.screens.active.cursor.page_pin.node.serial != spacer_serial)
@@ -589,20 +610,32 @@ pub fn print(self: *Terminal, c: u21) !void {
         // it.
         if (self.modes.get(.grapheme_cluster)) return;
 
-        // If we're at cell zero, then this is malformed data and we don't
-        // print anything or even store this. Zero-width characters are ALWAYS
-        // attached to some other non-zero-width character at the time of
-        // writing.
-        if (self.screens.active.cursor.x == 0) {
+        // With a pending wrap, the character we're attaching to is still
+        // under the cursor. Otherwise, it's the cell to the left. Printing
+        // in the last column sets the pending wrap with wraparound off too
+        // (the next character then overwrites that cell), so this holds
+        // either way.
+        const left: size.CellCountInt = @intFromBool(!self.screens.active.cursor.pending_wrap);
+
+        // If we're at cell zero and not pending a wrap, then this is malformed
+        // data and we don't print anything or even store this. Zero-width
+        // characters are ALWAYS attached to some other non-zero-width
+        // character at the time of writing.
+        if (self.screens.active.cursor.x == 0 and left == 1) {
             log.warn("zero-width character with no prior character, ignoring", .{});
             return;
         }
 
-        // Find our previous cell
+        // Find our previous cell. As in the grapheme path above, a cursor
+        // waiting to wrap can sit on a spacer head that a reflow left.
         const prev = prev: {
-            const immediate = self.screens.active.cursorCellLeft(1);
+            const head: size.CellCountInt = @intFromBool(
+                self.screens.active.cursor.x > left and
+                    self.screens.active.cursorCellLeft(left).wide == .spacer_head,
+            );
+            const immediate = self.screens.active.cursorCellLeft(left + head);
             if (immediate.wide != .spacer_tail) break :prev immediate;
-            break :prev self.screens.active.cursorCellLeft(2);
+            break :prev self.screens.active.cursorCellLeft(left + head + 1);
         };
 
         // If our previous cell has no text, just ignore the zero-width character
@@ -644,7 +677,7 @@ pub fn print(self: *Terminal, c: u21) !void {
         1 => {
             @branchHint(.likely);
             self.screens.active.cursorMarkDirty();
-            @call(.always_inline, printCell, .{ self, c, .narrow });
+            @call(.always_inline, printCell, .{ self, c, .narrow, charset });
         },
 
         // Wide character requires a spacer. We print this by
@@ -670,22 +703,22 @@ pub fn print(self: *Terminal, c: u21) !void {
                     // a page resize during printCell then it'll fail
                     // integrity checks.
                     self.screens.active.cursor.page_row.wrap = true;
-                    self.printCell(0, .spacer_head);
+                    self.writeCell(0, .spacer_head);
                 } else {
-                    self.printCell(0, .narrow);
+                    self.writeCell(0, .narrow);
                 }
                 try self.printWrap();
             }
 
             self.screens.active.cursorMarkDirty();
-            self.printCell(c, .wide);
+            self.printCell(c, .wide, charset);
             self.screens.active.cursorRight(1);
-            self.printCell(0, .spacer_tail);
+            self.writeCell(0, .spacer_tail);
         } else {
             // This is pretty broken, terminals should never be only 1-wide.
             // We should prevent this downstream.
             self.screens.active.cursorMarkDirty();
-            self.printCell(0, .narrow);
+            self.writeCell(0, .narrow);
         },
 
         else => unreachable,
@@ -706,25 +739,17 @@ pub inline fn committedPrintCodepoint(self: *const Terminal) ?u21 {
     return self.last_printed_codepoint;
 }
 
+/// Prints the character unmapped_c into the cell under the cursor, mapped
+/// through set, the charset print chose for it. Spacers and cells that
+/// already hold a mapped character are written with writeCell instead.
 fn printCell(
     self: *Terminal,
     unmapped_c: u21,
     wide: Cell.Wide,
+    set: charsets.Charset,
 ) void {
-    defer self.screens.active.assertIntegrity();
-
-    // TODO: spacers should use a bgcolor only cell
-
     const c: u21 = c: {
         // TODO: non-utf8 handling, gr
-
-        // If we're single shifting, then we use the key exactly once.
-        const key = if (self.screens.active.charset.single_shift) |key_once| blk: {
-            self.screens.active.charset.single_shift = null;
-            break :blk key_once;
-        } else self.screens.active.charset.gl;
-
-        const set = self.screens.active.charset.charsets.get(key);
 
         // UTF-8 or ASCII is used as-is
         if (set == .utf8 or set == .ascii) {
@@ -732,15 +757,29 @@ fn printCell(
             break :c unmapped_c;
         }
 
-        // If we're outside of ASCII range this is an invalid value in
-        // this table so we just return space.
-        if (unmapped_c > std.math.maxInt(u8)) break :c ' ';
+        // The tables only cover 0x00-0xFF. Like xterm, which never remaps a
+        // character above 255 in UTF-8 mode, we print anything above as is,
+        // which also keeps it at the width it was measured with.
+        if (unmapped_c > std.math.maxInt(u8)) break :c unmapped_c;
 
         // Get our lookup table and map it
         const table = charsets.table(set);
         break :c @intCast(table[@intCast(unmapped_c)]);
     };
     if (unmapped_c != 0) self.last_printed_codepoint = c;
+
+    @call(.always_inline, writeCell, .{ self, c, wide });
+}
+
+/// Writes c into the cell under the cursor as it is, without a charset.
+fn writeCell(
+    self: *Terminal,
+    c: u21,
+    wide: Cell.Wide,
+) void {
+    defer self.screens.active.assertIntegrity();
+
+    // TODO: spacers should use a bgcolor only cell
 
     const cell = self.screens.active.cursor.page_cell;
 
@@ -1043,6 +1082,7 @@ pub fn cursorLeft(self: *Terminal, count_req: usize) void {
     if (self.screens.active.cursor.pending_wrap) {
         count -= 1;
         self.screens.active.cursor.pending_wrap = false;
+        if (count == 0) return;
     }
 
     // The margins we can move to.
@@ -2097,6 +2137,14 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                 cur_row,
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
+
+            // With a full-width scroll region the entire row is a
+            // fresh blank row: reset the metadata so nothing (wrap
+            // state, semantic prompt) is retained from the row whose
+            // storage it recycles. With left/right margins the row
+            // keeps content outside the margins so the metadata is
+            // preserved, matching the shift case above.
+            if (!left_right) cur_row.reset();
         }
 
         // Mark the row as dirty
@@ -2285,6 +2333,14 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                 cur_row,
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
+
+            // With a full-width scroll region the entire row is a
+            // fresh blank row: reset the metadata so nothing (wrap
+            // state, semantic prompt) is retained from the row whose
+            // storage it recycles. With left/right margins the row
+            // keeps content outside the margins so the metadata is
+            // preserved, matching the shift case above.
+            if (!left_right) cur_row.reset();
         }
 
         // Mark the row as dirty
@@ -2540,9 +2596,14 @@ pub fn eraseLine(
             break :left .{ 0, x + 1 };
         },
 
-        // Note that it seems like complete should reset the soft-wrap
-        // state of the line but in xterm it does not.
-        .complete => .{ 0, self.cols },
+        .complete => complete: {
+            // Xterm preserves this flag for EL2, but it also doesn't reflow
+            // rows when resizing. Since we do, the erased row must no longer
+            // continue onto the next row.
+            self.screens.active.cursorResetWrap();
+
+            break :complete .{ 0, self.cols };
+        },
 
         else => {
             log.err("unimplemented erase line mode: {}", .{mode});
@@ -3239,6 +3300,10 @@ pub fn fullReset(self: *Terminal) void {
         .right = self.cols - 1,
     };
 
+    // A program's palette changes go back to the configured palette.
+    self.colors.palette.resetAll();
+    self.flags.dirty.palette = true;
+
     // Always mark dirty so we redraw everything
     self.flags.dirty.clear = true;
 }
@@ -3376,6 +3441,68 @@ test "Terminal: zero-width character at start" {
 
     // Should not be dirty since we changed nothing.
     try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+// https://github.com/ghostty-org/ghostty/pull/12581
+test "Terminal: zero-width character attaches to pending wrap cell" {
+    var t = try init(testing.allocator, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    // Disable grapheme clustering to exercise the fallback path.
+    t.modes.set(.grapheme_cluster, false);
+
+    try t.print('x');
+    try t.print('å');
+    try t.print(0x0332); // Combining low line.
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("xå̲", str);
+}
+
+test "Terminal: zero-width character after a reflow left the cursor on a spacer head" {
+    for ([_]bool{ false, true }) |cluster| {
+        var t = try init(testing.allocator, .{ .cols = 5, .rows = 5 });
+        defer t.deinit(testing.allocator);
+        t.modes.set(.grapheme_cluster, cluster);
+
+        // A cursor waiting to wrap after "E", then a wide character on the
+        // next row. Widening by one column reflows the wide character back
+        // up but it doesn't fit, so its spacer head ends up under the
+        // restored cursor.
+        for ("ABCDE") |c| try t.print(c);
+        t.saveCursor();
+        try t.print(0x4E2D);
+        t.restoreCursor();
+        try t.resize(testing.allocator, 6, 5);
+        try testing.expect(t.screens.active.cursor.pending_wrap);
+        try testing.expectEqual(Cell.Wide.spacer_head, t.screens.active.cursor.page_cell.wide);
+
+        // The mark goes on the "E" just printed.
+        try t.print(0x0332);
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(@as(u21, 'E'), list_cell.cell.content.codepoint);
+        try testing.expect(list_cell.cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{0x0332}, list_cell.node.data.lookupGrapheme(list_cell.cell).?);
+    }
+}
+
+test "Terminal: zero-width character attaches to last column without wraparound" {
+    var t = try init(testing.allocator, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    // Without wraparound the cursor stays on the last column, on the
+    // character it just printed.
+    t.modes.set(.grapheme_cluster, false);
+    t.modes.set(.wraparound, false);
+
+    try t.print('x');
+    try t.print('å');
+    try t.print(0x0332); // Combining low line.
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("xå̲", str);
 }
 
 // https://github.com/mitchellh/ghostty/issues/1400
@@ -3782,6 +3909,43 @@ test "Terminal: invalid VS16 doesn't mark dirty" {
     t.clearDirty();
     try t.print(0xFE0F); // VS16 to make wide
     try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+// https://github.com/ghostty-org/ghostty/pull/12596
+test "Terminal: variation selectors apply to preceding codepoint" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    // Pirate flag: black flag + ZWJ + skull and crossbones + VS16.
+    try t.print(0x1F3F4);
+    try t.print(0x200D);
+    try t.print(0x2620);
+    try t.print(0xFE0F);
+
+    const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    const cell = list_cell.cell;
+    try testing.expectEqual(@as(u21, 0x1F3F4), cell.content.codepoint);
+    try testing.expect(cell.hasGrapheme());
+    try testing.expectEqualSlices(u21, &.{ 0x200D, 0x2620, 0xFE0F }, list_cell.node.data.lookupGrapheme(cell).?);
+}
+
+test "Terminal: variation selector after ZWJ is still ignored" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    t.modes.set(.grapheme_cluster, true);
+
+    // A ZWJ is not a variation sequence base, so the selector is dropped
+    // and the cell keeps its width.
+    try t.print('A');
+    try t.print(0x200D);
+    try t.print(0xFE0F);
+
+    const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expectEqual(.narrow, list_cell.cell.wide);
+    try testing.expectEqualSlices(u21, &.{0x200D}, list_cell.node.data.lookupGrapheme(list_cell.cell).?);
 }
 
 test "Terminal: print multicodepoint grapheme, mode 2027" {
@@ -4486,15 +4650,17 @@ test "Terminal: grapheme transfer across pages when the append grows the page" {
     }
 
     // On the first page's last row, at the right edge: a narrow emoji with
-    // two combining marks, then VS16 to widen it, which wraps it onto the
-    // second page.
+    // two combining marks, then a ZWJ and a second pictograph, which widens
+    // it and wraps it onto the second page. (A VS16 here would not widen
+    // it: a variation selector applies to the codepoint just before it.)
     t.setCursorPos(3, 40);
     try testing.expect(screen.cursor.page_pin.node == screen.pages.pages.first.?);
     const second_page = screen.pages.pages.last.?;
     try t.print(0x263A);
     try t.print(0x0301);
     try t.print(0x0301);
-    try t.print(0xFE0F);
+    try t.print(0x200D);
+    try t.print(0x2620);
 
     // The transfer grew (replaced) the second page.
     try testing.expect(screen.pages.pages.last.? != second_page);
@@ -4521,7 +4687,7 @@ test "Terminal: grapheme transfer across pages when the append grows the page" {
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
         try testing.expectEqualSlices(
             u21,
-            &.{ 0x0301, 0x0301, 0xFE0F },
+            &.{ 0x0301, 0x0301, 0x200D, 0x2620 },
             list_cell.node.data.lookupGrapheme(cell).?,
         );
     }
@@ -5149,10 +5315,70 @@ test "Terminal: print charset outside of ASCII" {
     {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
-        try testing.expectEqualStrings("◆ ", str);
+        try testing.expectEqualStrings("◆😀", str);
     }
 
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+test "Terminal: print wide codepoint in a charset prints it unmapped" {
+    var t = try init(testing.allocator, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    // The charset has no such codepoint, so it prints as it is, two
+    // columns wide, and the characters after it are mapped again.
+    t.configureCharset(.G0, .dec_special);
+    try t.print('`');
+    try t.print(0x1F600);
+    try t.print('a');
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?.cell;
+    try testing.expectEqual(@as(u21, 0x1F600), cell.codepoint());
+    try testing.expectEqual(.wide, cell.wide);
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("◆😀▒", str);
+    }
+}
+
+test "Terminal: print single shift is used up by a combining character" {
+    // As in xterm, the single shift applies to the combining mark, the next
+    // character printed, whether or not it clusters with the one before.
+    for ([_]bool{ false, true }) |cluster| {
+        var t = try init(testing.allocator, .{ .cols = 10, .rows = 2 });
+        defer t.deinit(testing.allocator);
+        t.modes.set(.grapheme_cluster, cluster);
+
+        t.configureCharset(.G2, .british);
+        try t.print('#');
+        t.invokeCharset(.GL, .G2, true);
+        try t.print(0x0301);
+        try testing.expectEqual(null, t.screens.active.charset.single_shift);
+        try t.print('#');
+
+        try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+        const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?.cell;
+        try testing.expectEqual(@as(u21, '#'), cell.codepoint());
+    }
+}
+
+test "Terminal: VS16 moving a character to the next line keeps it unmapped" {
+    var t = try init(testing.allocator, .{ .cols = 3, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    // The '#' is printed with ASCII in the last column. VS16 widens it after
+    // the British set (which maps '#' to '£') is selected, which moves it to
+    // the next line: it is the same character, not one to map again.
+    t.modes.set(.grapheme_cluster, true);
+    t.cursorRight(2);
+    try t.print('#');
+    t.configureCharset(.G0, .british);
+    try t.print(0xFE0F);
+
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?.cell;
+    try testing.expectEqual(@as(u21, '#'), cell.codepoint());
+    try testing.expectEqual(.wide, cell.wide);
 }
 
 test "Terminal: print invoke charset" {
@@ -5629,7 +5855,7 @@ test "Terminal: overwrite hyperlink" {
 }
 
 // Printing a wide char at the right edge with an active hyperlink causes
-// printCell to write a spacer_head before printWrap sets the row wrap
+// writeCell to write a spacer_head before printWrap sets the row wrap
 // flag. The integrity check inside setHyperlink (or increaseCapacity)
 // sees the unwrapped spacer head and panics. Found via fuzzing.
 test "Terminal: print wide char at right edge with hyperlink" {
@@ -5641,7 +5867,7 @@ test "Terminal: print wide char at right edge with hyperlink" {
     // Move cursor to the last column (1-indexed)
     t.setCursorPos(1, 10);
 
-    // Print a wide character; this will call printCell(0, .spacer_head)
+    // Print a wide character; this will call writeCell(0, .spacer_head)
     // at the right edge before calling printWrap, triggering the
     // integrity violation.
     try t.print(0x4E2D); // U+4E2D '中'
@@ -8903,6 +9129,37 @@ test "Terminal: cursorLeft reverse wrap with pending wrap state" {
     }
 }
 
+test "Terminal: cursorLeft reverse wrap with pending wrap above top margin" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.wraparound, true);
+    t.modes.set(.reverse_wrap, true);
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 2);
+    for ("AB") |c| try t.print(c);
+    t.saveCursor();
+
+    // Restore pending wrap at the left margin, above the top margin.
+    t.setLeftAndRightMargin(2, 5);
+    t.setTopAndBottomMargin(3, 5);
+    t.restoreCursor();
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    t.cursorLeft(1);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+    try testing.expectEqual(1, t.screens.active.cursor.x);
+    try testing.expectEqual(0, t.screens.active.cursor.y);
+    try t.print('X');
+
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("AX", str);
+    }
+}
+
 test "Terminal: cursorLeft reverse wrap extended with pending wrap state" {
     const alloc = testing.allocator;
     var t = try init(alloc, .{ .rows = 5, .cols = 5 });
@@ -9879,6 +10136,198 @@ test "Terminal: deleteLines zero" {
     // This should do nothing
     t.setCursorPos(1, 1);
     t.deleteLines(0);
+}
+
+test "Terminal: scroll region linefeed recycled row has default metadata" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // A soft-wrapped line across rows 0-2 so that row 1 has both wrap
+    // flags set. Mark row 1 as a prompt as well (OSC 133 A would).
+    for (0..12) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+
+    // DECSTBM rows 2-4, cursor to the region bottom, and linefeed:
+    // row 1 is discarded and its Row storage recycled as the new
+    // blank region-bottom row.
+    t.setTopAndBottomMargin(2, 4);
+    t.setCursorPos(4, 1);
+    try t.linefeed();
+
+    {
+        const rac = t.screens.active.pages.getCell(.{ .active = .{ .y = 3 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: alt screen scroll up recycled row has default metadata" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    try t.switchScreenMode(.@"1049", true);
+
+    // A soft-wrapped line across rows 0-1 and a prompt mark on row 0.
+    for (0..7) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{} },
+    ).?.row.semantic_prompt = .prompt;
+
+    // Scroll up: with no scrollback, row 0 is discarded and its Row
+    // storage recycled as the new blank bottom row.
+    try t.scrollUp(1);
+
+    {
+        const rac = t.screens.active.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: insertLines count over region blanks row metadata" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // A soft-wrapped line across rows 0-2 so that row 1 has both wrap
+    // flags set, plus a prompt mark on row 1.
+    for (0..12) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+
+    // Insert more lines than remain in the region: every row from the
+    // cursor to the region bottom is blanked in place, with no shifts.
+    t.setCursorPos(2, 1);
+    t.insertLines(10);
+
+    for (1..5) |y| {
+        const rac = t.screens.active.pages.getCell(
+            .{ .active = .{ .y = @intCast(y) } },
+        ).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: deleteLines count over region blanks row metadata" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    for (0..12) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+
+    t.setCursorPos(2, 1);
+    t.deleteLines(10);
+
+    for (1..5) |y| {
+        const rac = t.screens.active.pages.getCell(
+            .{ .active = .{ .y = @intCast(y) } },
+        ).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: deleteLines blank row does not retain semantic prompt" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Mark row 0 as a prompt row, then delete it. The blank row that
+    // appears at the region bottom reuses the deleted row's storage
+    // and must not read as a prompt (e.g. for prompt navigation).
+    try t.print('$');
+    t.screens.active.pages.getCell(
+        .{ .active = .{} },
+    ).?.row.semantic_prompt = .prompt;
+
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+
+    {
+        const rac = t.screens.active.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Screen content that must NOT enter the scrollback on a clear.
+    try t.printString("hello");
+
+    // Mark row 1 as a prompt row and then discard it with a region
+    // scroll, recycling its storage as the blank bottom row.
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+    t.setTopAndBottomMargin(2, 3);
+    t.setCursorPos(3, 1);
+    try t.linefeed();
+    t.setTopAndBottomMargin(0, 0);
+
+    // ED2: since no prompt is on screen, this must NOT take the
+    // scroll-and-clear path that pushes content into scrollback. A
+    // stale prompt flag on the recycled blank bottom row would.
+    t.eraseDisplay(.complete, false);
+
+    try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
+}
+
+test "Terminal: selectLine does not join lines across a recycled row" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 6, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // A soft-wrapped line across rows 1 and 2: row 1 gets wrap=true.
+    t.setCursorPos(2, 1);
+    try t.printString("AAAAAAA");
+
+    // Scroll a region of rows 1-3 up by one: row 1 is discarded and its
+    // Row storage recycled as the blank row 3. (A region that starts at
+    // the top row scrolls into history instead and recycles nothing.)
+    t.setTopAndBottomMargin(2, 4);
+    t.setCursorPos(4, 1);
+    try t.linefeed();
+    t.setTopAndBottomMargin(0, 0);
+
+    // Write unrelated single-line words on the recycled row and below.
+    t.setCursorPos(4, 1);
+    try t.printString("world");
+    t.setCursorPos(5, 1);
+    try t.printString("hello");
+
+    // Selecting the line "world" must not extend into "hello": these
+    // are separate hard lines. A stale wrap flag on the recycled row
+    // would join them.
+    const s = t.screens.active;
+    var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+        .x = 0,
+        .y = 3,
+    } }).? }).?;
+    defer sel.deinit(s);
+    const contents = try s.selectionString(alloc, .{
+        .sel = sel,
+        .trim = false,
+    });
+    defer alloc.free(contents);
+    try testing.expectEqualStrings("world", contents);
 }
 
 test "Terminal: default style is empty" {
@@ -11775,6 +12224,34 @@ test "Terminal: eraseLine complete preserves background sgr" {
     }
 }
 
+test "Terminal: eraseLine complete resets wrap" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    for ("ABCDE123") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(list_cell.row.wrap);
+    }
+
+    t.setCursorPos(1, 1);
+    t.eraseLine(.complete, false);
+
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(!list_cell.row.wrap);
+    }
+    try t.print('X');
+    try t.resize(alloc, 10, 5);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("X\n123", str);
+    }
+}
+
 test "Terminal: eraseLine complete protected attributes respected with iso" {
     const alloc = testing.allocator;
     var t = try init(alloc, .{ .rows = 5, .cols = 5 });
@@ -13014,6 +13491,23 @@ test "Terminal: fullReset default modes" {
     try testing.expect(t.modes.get(.grapheme_cluster));
     t.fullReset();
     try testing.expect(t.modes.get(.grapheme_cluster));
+}
+
+test "Terminal: fullReset resets the palette to the configured one" {
+    var t = try init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // A theme the configuration set, then a program's change on top.
+    var theme = t.colors.palette.original;
+    theme[1] = .{ .r = 0xAA, .g = 0, .b = 0 };
+    t.colors.palette.changeDefault(theme);
+    t.colors.palette.set(1, .{ .r = 1, .g = 2, .b = 3 });
+    t.colors.palette.set(200, .{ .r = 4, .g = 5, .b = 6 });
+
+    t.fullReset();
+    try testing.expectEqual(theme, t.colors.palette.current);
+    try testing.expectEqual(@as(usize, 0), t.colors.palette.mask.count());
+    try testing.expect(t.flags.dirty.palette);
 }
 
 test "Terminal: fullReset tracked pins" {
