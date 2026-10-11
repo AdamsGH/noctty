@@ -493,7 +493,10 @@ fn parseArgs(raw: []const []const u8) !Args {
         }
     }
     if (!std.math.isFinite(out.rate_mib_s) or out.rate_mib_s < 0) return error.InvalidArgument;
+    // Both modes report statistics over the streamed output, so it must
+    // hold at least one line.
     if (out.runs == 0 or out.match_every == 0 or out.line_len < 64 or
+        out.line_len > 1024 * 1024 or out.stream_mib == 0 or
         out.needle.len == 0 or out.rows == 0 or out.cols == 0)
     {
         return error.InvalidArgument;
