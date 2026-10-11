@@ -233,10 +233,11 @@ packaging commits are excluded rather than queued.
 
 ### Adapted between windows
 
-On 2026-10-11 the audit package PKG-23 ported these upstream memory-safety
-fixes by hand, under the amended `docs/upstream-merge-policy.md`, so the next
-window must neither pick nor defer them again. This supersedes the "Input
-encoding and Surface lifetime" row above.
+On 2026-10-11 the audit packages PKG-23 and LIFE-01 ported these upstream
+memory-safety fixes by hand, under the amended
+`docs/upstream-merge-policy.md`, so the next window must neither pick nor
+defer them again. This supersedes the "Input encoding and Surface lifetime"
+row above.
 
 | Upstream                                          | Fork adaptation                                                                                                                                                        |
 | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -246,6 +247,7 @@ encoding and Surface lifetime" row above.
 | `60f767dd84ca` left-click pin screen generations  | As upstream, with the `ScreenSet` generation counter taken from `2355550a9410` (not its C API).                                                                         |
 | `957ed21d5c62`, `2f7fbadb0b9c` discarded messages | The fork already had `Message.deinit` and the `send` failure paths; the read-only `queueIo` branch, the shutdown drain and `Mailbox.deinit` now free what they discard. |
 | `2b32b5b75cfe` retained temp directory handles    | Ported to Zig 0.15 `std.fs`. Without `TMP` the parent is the current directory opened again, never `std.fs.cwd()`.                                                     |
+| `73ac36fa5679` search state of a destroyed screen | As upstream, in the fork's search thread (query options, match-row cache); the select reconcile also covers the fork's refresh timer, which stops while unfocused.     |
 
 ## Validation gates
 
