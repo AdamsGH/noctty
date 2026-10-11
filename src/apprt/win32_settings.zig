@@ -6580,10 +6580,14 @@ fn ChildPlacements(comptime capacity: usize) type {
 
         /// A static whose text wraps to its width. Moving a window keeps
         /// what it showed, and the Static class does not ask to be drawn
-        /// again when its size changes (no `CS_HREDRAW`), so a resized
-        /// static would keep its old picture: the text wrapped for the old
-        /// width, or, after a DPI change, drawn by `WM_SETFONT` in the new
-        /// font at the old size. A resized one is drawn again whole.
+        /// again when its size changes (no `CS_HREDRAW`). A resize of the
+        /// Settings window repaints every child anyway (its class has
+        /// `CS_HREDRAW | CS_VREDRAW`), but a static can change size while the
+        /// window keeps its own: a status message that needs a row of its
+        /// own, or a DPI change on a window already at its capped minimum,
+        /// where `WM_SETFONT` has just drawn the text in the new font at the
+        /// old size. Such a static would keep its old picture, so a resized
+        /// one is drawn again whole.
         fn addText(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
             self.put(hwnd, x, y, width, height, true);
         }
@@ -6948,24 +6952,24 @@ const dialog_test = struct {
                     runs += 1;
                 }
             }
-            // The windows that cover them. A point lookup would not do: a
-            // static answers `HTTRANSPARENT`, so it reports the parent.
+            // The visible windows that cover them. A point lookup would not
+            // do: a static answers `HTTRANSPARENT`, so it reports the parent.
             const Overlapping = struct {
                 var root: HWND = undefined;
                 var area: RECT = undefined;
                 fn each(child: HWND, _: LPARAM) callconv(.winapi) BOOL {
+                    if (sys.IsWindowVisible(child) == 0) return 1;
                     const r = rectIn(root, child);
                     if (r.right <= area.left or r.left >= area.right or r.bottom <= area.top or r.top >= area.bottom) return 1;
                     var class_w: [64]u16 = undefined;
                     const length = GetClassNameW(child, &class_w, class_w.len);
-                    std.debug.print("  under them: {f} ({d},{d})-({d},{d}), a direct child: {}, visible: {}\n", .{
+                    std.debug.print("  under them: {f} ({d},{d})-({d},{d}), a direct child: {}\n", .{
                         std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
                         r.left,
                         r.top,
                         r.right,
                         r.bottom,
                         sys.GetParent(child) == root,
-                        sys.IsWindowVisible(child) != 0,
                     });
                     return 1;
                 }
@@ -7142,7 +7146,8 @@ const dialog_test = struct {
         /// fields no longer fits and the form scrolls, at the work area's
         /// corner. On a screen smaller than that size (a CI runner's is
         /// 1024x768) the minimum is the work area, so the window keeps one
-        /// size across DPI changes: see the re-wrap test.
+        /// size across DPI changes: see "settings text resized inside a
+        /// window of one size is drawn again".
         fn makeFormScrollable(self: *Fixture) !void {
             var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
             _ = windowWorkArea(self.hwnd(), &work);
@@ -7677,38 +7682,47 @@ test "settings section switches and scrolling leave the window's own paint alone
     }.body);
 }
 
-test "settings text that wraps differently after a resize or a DPI change is drawn again" {
+test "settings text resized inside a window of one size is drawn again" {
     try dialog_test.onHiddenDesktop(struct {
+        fn sized(rect: RECT) [2]i32 {
+            return .{ rect.right - rect.left, rect.bottom - rect.top };
+        }
+
         fn body() !void {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
             dialog_test.simulateDpi(hwnd, 96);
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(hwnd, &work);
 
-            // Advanced has the longest summary and a help text, and both wrap
-            // to the pane while it is narrower than a line of prose.
+            // A resize of the window repaints every child (the frame's class
+            // has CS_HREDRAW | CS_VREDRAW); these resize text inside a window
+            // that keeps its size. First a status message too long for the
+            // room beside the buttons, which gets a row of its own, and a
+            // short one that gives it back.
+            const long_status = "A status message far too long to fit beside the buttons, so it takes a row of its own and wraps onto more than one line of it.";
+            for ([_]i32{ 900, 760 }) |logical_width| {
+                _ = SetWindowPos(hwnd, null, work.left, work.top, settings.px(logical_width), settings.px(560), SWP_NOZORDER | SWP_NOACTIVATE);
+                dialog_test.flushPaint(hwnd);
+                for ([_][]const u8{ long_status, "Saved." }) |message| {
+                    const before = sized(dialog_test.rectIn(hwnd, settings.text_status.?));
+                    settings.setStatus(message);
+                    try std.testing.expect(!std.meta.eql(before, sized(dialog_test.rectIn(hwnd, settings.text_status.?))));
+                    try dialog_test.expectNothingStale(hwnd);
+                }
+            }
+
+            // Then a DPI change that leaves the window's size alone, as when
+            // the window is already as large as the screen allows (a CI
+            // runner's is 1024x768): `WM_SETFONT` draws the text in the new
+            // font before the layout gives it its new width. Advanced has
+            // the longest summary.
             const button = settings.sectionButton(.advanced).?;
             const id: usize = @intCast(GetDlgCtrlID(button));
             _ = SendMessageW(hwnd, WM_COMMAND, (@as(usize, BN_CLICKED) << 16) | id, @bitCast(@intFromPtr(button)));
             try std.testing.expectEqual(Section.advanced, settings.active_section);
-
-            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
-            _ = windowWorkArea(hwnd, &work);
-            var previous_width: ?i32 = null;
-            for ([_]i32{ 900, 720, 780, 900 }) |logical_width| {
-                _ = SetWindowPos(hwnd, null, work.left, work.top, settings.px(logical_width), settings.px(560), SWP_NOZORDER | SWP_NOACTIVATE);
-                const summary = dialog_test.rectIn(hwnd, settings.text_summary.?);
-                // The resize did narrow or widen the text.
-                if (previous_width) |width| try std.testing.expect(width != summary.right - summary.left);
-                previous_width = summary.right - summary.left;
-                try dialog_test.expectNothingStale(hwnd);
-            }
-
-            // A DPI change that leaves the window's size alone, as when the
-            // window is already as large as the screen allows (a CI runner's
-            // is 1024x768): the new fonts reach the text before the layout
-            // gives it its new width.
             _ = SetWindowPos(hwnd, null, work.left, work.top, 1100, 800, SWP_NOZORDER | SWP_NOACTIVATE);
             dialog_test.flushPaint(hwnd);
             var window: RECT = undefined;
@@ -7760,7 +7774,19 @@ test "settings field frames take the new colours when the theme changes" {
             const high_contrast = try dialog_test.Capture.take(hwnd);
             defer high_contrast.deinit();
             try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(high_contrast, field.left, middle));
-            try std.testing.expectEqual(settings.theme_adapter.colors.edit_bg, colorAt(high_contrast, field.left + settings.fieldStroke(), field.top + settings.fieldStroke()));
+
+            // A theme change also gives every control its theme again and
+            // reframes the text fields for the new font, and either of those
+            // redraws the frame on its own. The adapter's own redraw must
+            // cover the frame without them: new colours, then that redraw only.
+            settings.theme_adapter.colors.field_border = 0x0000C0;
+            settings.theme_adapter.colors.edit_bg = 0x00C000;
+            _ = sys.EnumChildWindows(hwnd, invalidateThemeChild, 0);
+            dialog_test.flushPaint(hwnd);
+            const redrawn = try dialog_test.Capture.take(hwnd);
+            defer redrawn.deinit();
+            try std.testing.expectEqual(@as(u32, 0x0000C0), colorAt(redrawn, field.left, middle));
+            try std.testing.expectEqual(@as(u32, 0x00C000), colorAt(redrawn, field.left + settings.fieldStroke(), field.top + settings.fieldStroke()));
         }
     }.body);
 }
