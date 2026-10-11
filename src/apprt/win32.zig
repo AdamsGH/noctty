@@ -3620,9 +3620,10 @@ pub const App = struct {
     quick_select_class_atom: ATOM = 0,
     hosts: std.ArrayListUnmanaged(*Host) = .empty,
     windows: std.ArrayListUnmanaged(*Surface) = .empty,
-    /// Checked URL and file opens waiting for the top of the message loop;
+    /// Owned shell requests waiting for the top of the message loop;
     /// see `runDeferredOpens`.
-    deferred_opens: std.ArrayListUnmanaged([]u8) = .empty,
+    deferred_opens: std.ArrayListUnmanaged(DeferredOpen) = .empty,
+
     /// Internal test seam so action-path tests can drive real
     /// `performAction(.new_tab, ...)` logic without requiring HWND/GL
     /// surface bring-up.
@@ -3655,6 +3656,9 @@ pub const App = struct {
     /// Test-only stand-in for `ShellExecuteW` on a checked open target, so a
     /// unit test never launches a real handler.
     test_open_target: ?*const fn (app: *App, target: []const u8) anyerror!void = null,
+    /// Stand-in for the remaining shell launchers; tests never launch OSK,
+    /// elevated windows or installers.
+    test_shell_request: ?*const fn (app: *App, request: *const DeferredOpen) anyerror!void = null,
     next_host_id: u32 = 1,
     launcher_profile_key: ?[:0]const u8 = null,
     launcher_profile_hint: ?[:0]const u8 = null,
@@ -3824,6 +3828,23 @@ pub const App = struct {
     shell_compositor_initialized: bool = false,
     shell_runtime: win32_shell.runtime.Runtime = undefined,
     shell_runtime_initialized: bool = false,
+
+    const DeferredOpen = union(enum) {
+        target: []u8,
+        on_screen_keyboard,
+        elevated_window: struct { parameters: [:0]u8, cwd: ?[]const u8 },
+
+        fn deinit(self: DeferredOpen, alloc: Allocator) void {
+            switch (self) {
+                .target => |target| alloc.free(target),
+                .elevated_window => |launch| {
+                    alloc.free(launch.parameters);
+                    if (launch.cwd) |cwd| alloc.free(cwd);
+                },
+                .on_screen_keyboard => {},
+            }
+        }
+    };
 
     pub fn init(
         self: *App,
@@ -6383,6 +6404,7 @@ pub const App = struct {
         const stage_dir_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, stage_dir);
         defer self.core_app.alloc.free(stage_dir_w);
 
+        // Only App-owned state follows this call; the click handler returns without touching Host.
         const result = sys.ShellExecuteW(
             null,
             shell_runas,
@@ -6851,7 +6873,7 @@ pub const App = struct {
                     self.startup_cwd orelse cwd,
                     command,
                 );
-                defer alloc.free(parameters);
+                errdefer alloc.free(parameters);
 
                 // `--working-directory` above carries the terminal path
                 // verbatim; ShellExecuteExW needs a Windows-local directory
@@ -6861,12 +6883,12 @@ pub const App = struct {
                     alloc,
                     cwd,
                 );
-                defer if (host_cwd) |directory| alloc.free(directory);
+                errdefer if (host_cwd) |directory| alloc.free(directory);
 
-                switch (try win32_elevation.launchElevated(alloc, parameters, host_cwd)) {
-                    .launched => {},
-                    .cancelled => log.info("win32 elevated launch cancelled by user", .{}),
-                }
+                try self.deferShellRequest(.{ .elevated_window = .{
+                    .parameters = parameters,
+                    .cwd = host_cwd,
+                } });
                 return true;
             },
 
@@ -9887,6 +9909,10 @@ pub const App = struct {
     }
 
     fn showOnScreenKeyboard(self: *App) !void {
+        try self.deferShellRequest(.on_screen_keyboard);
+    }
+
+    fn launchOnScreenKeyboard(self: *App) !void {
         const osk_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, "osk.exe");
         defer self.core_app.alloc.free(osk_w);
         const result = sys.ShellExecuteW(null, shell_open, osk_w.ptr, null, null, c.SW_SHOW);
@@ -10058,7 +10084,30 @@ pub const App = struct {
         const alloc = self.core_app.alloc;
         const owned = try alloc.dupe(u8, target);
         errdefer alloc.free(owned);
-        try self.deferred_opens.append(alloc, owned);
+        try self.deferShellRequest(.{ .target = owned });
+    }
+
+    /// Ownership transfers only after append succeeds; callers retain their
+    /// errdefer cleanup on allocation failure.
+    fn deferShellRequest(self: *App, request: DeferredOpen) !void {
+        try self.deferred_opens.append(self.core_app.alloc, request);
+    }
+
+    fn dispatchDeferredOpen(self: *App, request: *const DeferredOpen) !void {
+        // Checked again just before dispatch, as when URL opens ran in place.
+        switch (request.*) {
+            .target => |target| return openWin32Target(self.core_app.alloc, self, target, dispatchOpenTarget),
+            else => {},
+        }
+        if (self.test_shell_request) |hook| return hook(self, request);
+        switch (request.*) {
+            .target => unreachable,
+            .on_screen_keyboard => try self.launchOnScreenKeyboard(),
+            .elevated_window => |launch| switch (try win32_elevation.launchElevated(self.core_app.alloc, launch.parameters, launch.cwd)) {
+                .launched => {},
+                .cancelled => log.info("win32 elevated launch cancelled by user", .{}),
+            },
+        }
     }
 
     /// Runs the queued opens, oldest first, including any queued while one
@@ -10073,11 +10122,10 @@ pub const App = struct {
         if (self.deferred_opens.items.len == 0) return false;
         const alloc = self.core_app.alloc;
         while (self.deferred_opens.items.len > 0) {
-            const target = self.deferred_opens.orderedRemove(0);
-            defer alloc.free(target);
-            // Checked again just before dispatch, as when the open ran in place.
-            openWin32Target(alloc, self, target, dispatchOpenTarget) catch |err| {
-                log.warn("deferred open failed err={} len={}", .{ err, target.len });
+            const request = self.deferred_opens.orderedRemove(0);
+            defer request.deinit(alloc);
+            self.dispatchDeferredOpen(&request) catch |err| {
+                log.warn("deferred shell request failed kind={s} err={}", .{ @tagName(request), err });
             };
         }
         return true;
@@ -10099,7 +10147,7 @@ pub const App = struct {
 
     fn discardDeferredOpens(self: *App) void {
         const alloc = self.core_app.alloc;
-        for (self.deferred_opens.items) |target| alloc.free(target);
+        for (self.deferred_opens.items) |request| request.deinit(alloc);
         self.deferred_opens.deinit(alloc);
         self.deferred_opens = .empty;
     }
@@ -10201,12 +10249,68 @@ pub const App = struct {
 
         // The queued target is checked again right before dispatch.
         const unchecked = try std.testing.allocator.dupe(u8, "search-ms:query=*.exe");
-        app.deferred_opens.append(std.testing.allocator, unchecked) catch |err| {
+        app.deferred_opens.append(std.testing.allocator, .{ .target = unchecked }) catch |err| {
             std.testing.allocator.free(unchecked);
             return err;
         };
         try std.testing.expect(app.runDeferredOpens());
         try std.testing.expectEqual(@as(usize, 2), Hook.count);
+    }
+
+    test "deferred shell requests own payloads and run after their callers return" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const Hook = struct {
+            var in_caller = false;
+            var launched_in_caller = false;
+            var count: usize = 0;
+            var kinds: [3]std.meta.Tag(DeferredOpen) = undefined;
+            var saw_elevation_payload = false;
+            fn launch(app_: *App, request: *const DeferredOpen) anyerror!void {
+                launched_in_caller = launched_in_caller or in_caller;
+                if (count >= kinds.len) return error.TestUnexpectedLaunch;
+                kinds[count] = std.meta.activeTag(request.*);
+                count += 1;
+                if (request.* == .elevated_window) {
+                    saw_elevation_payload = request.elevated_window.parameters.len > 0;
+                    if (request.elevated_window.cwd) |cwd| try std.testing.expect(cwd.len > 0);
+                }
+                // Stand in for a message pumped by the shell launcher.
+                if (count == 1) try app_.showOnScreenKeyboard();
+            }
+        };
+        Hook.in_caller = true;
+        Hook.launched_in_caller = false;
+        Hook.count = 0;
+        Hook.saw_elevation_payload = false;
+        app.test_shell_request = &Hook.launch;
+        try std.testing.expect(try app.performAction(.app, .show_on_screen_keyboard, {}));
+        try std.testing.expect(try app.performAction(.app, .new_window_elevated, .{ .profile_key = "" }));
+        Hook.in_caller = false;
+        try std.testing.expectEqual(@as(usize, 0), Hook.count);
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expect(!Hook.launched_in_caller);
+        try std.testing.expect(Hook.saw_elevation_payload);
+        try std.testing.expectEqual(@as(usize, 3), Hook.count);
+        try std.testing.expectEqualSlices(std.meta.Tag(DeferredOpen), &.{ .on_screen_keyboard, .elevated_window, .on_screen_keyboard }, &Hook.kinds);
+        try std.testing.expect(!app.runDeferredOpens());
+
+        // Teardown owns pending payloads too; the testing allocator checks
+        // both the successful dispatch and undispatched cleanup for leaks.
+        {
+            const parameters = try std.testing.allocator.dupeZ(u8, "--test-pending");
+            errdefer std.testing.allocator.free(parameters);
+            const cwd = try std.testing.allocator.dupe(u8, "C:\\pending");
+            errdefer std.testing.allocator.free(cwd);
+            try app.deferShellRequest(.{ .elevated_window = .{ .parameters = parameters, .cwd = cwd } });
+        }
+        app.discardDeferredOpens();
+        try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
     }
 
     test "the message loop ticks the core after the opens it ran" {
