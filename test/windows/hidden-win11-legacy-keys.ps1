@@ -185,7 +185,7 @@ function Startup-Fingerprint {
 }
 function Assert-AdoptedStartup($Fingerprint) {
     if($Fingerprint.Hash -ne '7b4f9aa31731df822e3ec13f8381e76dc759455abbf8bb458f74e10bf5e2bb9c' -or
-        [datetime]::Parse($Fingerprint.Modified).ToUniversalTime() -ne [datetime]::Parse('2026-10-10T18:18:34Z').ToUniversalTime()) {
+        [datetime]::Parse($Fingerprint.Modified).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') -ne '2026-10-10T18:18:34Z') {
         throw 'Real startup state differs from the adopted baseline; stop launches.'
     }
 }
