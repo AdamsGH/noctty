@@ -417,6 +417,102 @@ pub fn overlayEditChildRectFromFrame(frame: RECT, inset_x: i32, inset_y: i32) RE
     };
 }
 
+/// What the host banner offers besides its text, which fixes its buttons.
+pub const BannerActions = enum {
+    /// A message set through `Host.setBanner`: a close button.
+    close,
+    /// The update notice: Open Release and Dismiss.
+    update,
+    /// The update notice for a verified staged update: Install and Dismiss.
+    update_staged,
+};
+
+pub const banner_height_base: i32 = 32;
+pub const banner_stripe_width_base: i32 = 3;
+pub const banner_text_left_base: i32 = 12;
+pub const banner_button_height_base: i32 = 24;
+pub const banner_button_gap_base: i32 = 8;
+pub const banner_close_width_base: i32 = 28;
+pub const banner_dismiss_width_base: i32 = 72;
+pub const banner_open_release_width_base: i32 = 102;
+pub const banner_install_width_base: i32 = 86;
+
+/// The width a banner needs for a line `text_width` pixels wide and its
+/// buttons, before the content area bounds it.
+pub fn hostBannerWidth(text_width: i32, actions: BannerActions, dpi: u32) i32 {
+    const gap = scaledBy(banner_button_gap_base, dpi);
+    const buttons = switch (actions) {
+        .close => scaledBy(banner_close_width_base, dpi),
+        .update => scaledBy(banner_open_release_width_base, dpi) + gap + scaledBy(banner_dismiss_width_base, dpi),
+        .update_staged => scaledBy(banner_install_width_base, dpi) + gap + scaledBy(banner_dismiss_width_base, dpi),
+    };
+    return scaledBy(banner_text_left_base, dpi) + @max(0, text_width) + gap + buttons + gap;
+}
+
+/// The host banner in host client coordinates: `width` wide at the right end
+/// of the content rect at `top`, never wider than the content rect nor
+/// taller than what is left of it.
+pub fn hostBannerRect(content: RECT, top: i32, width: i32, dpi: u32) RECT {
+    const height = std.math.clamp(content.bottom - top, 0, scaledBy(banner_height_base, dpi));
+    const right = @max(content.left, content.right);
+    return .{ .left = @max(content.left, right - @max(0, width)), .top = top, .right = right, .bottom = top + height };
+}
+
+/// The parts of a banner `width` by `height` pixels, in its own client
+/// coordinates.
+pub const HostBannerParts = struct {
+    /// The severity stripe along the left edge.
+    stripe: RECT,
+    text: RECT,
+    /// Open Release or Install; null for a `.close` banner.
+    primary: ?RECT,
+    /// The close button, or Dismiss for the update notice.
+    dismiss: ?RECT,
+};
+
+/// Lay the banner's buttons out right-aligned and give the text what is
+/// left. Taken from the banner's own size rather than recomputed from the
+/// DPI, so paint and hit-testing agree with the rect the child really has.
+/// A button that does not fit at its full width is left out (null) rather
+/// than squeezed to nothing, which would leave a focusable button nobody
+/// can see; the text gets what remains, never a negative width.
+pub fn hostBannerParts(width: i32, height: i32, actions: BannerActions, dpi: u32) HostBannerParts {
+    const w = @max(0, width);
+    const h = @max(0, height);
+    const button_h = @min(h, scaledBy(banner_button_height_base, dpi));
+    const button_top = @divTrunc(h - button_h, 2);
+    const gap = scaledBy(banner_button_gap_base, dpi);
+
+    var right = w - gap;
+    const dismiss_w = scaledBy(switch (actions) {
+        .close => banner_close_width_base,
+        .update, .update_staged => banner_dismiss_width_base,
+    }, dpi);
+    const dismiss = bannerButtonRect(&right, dismiss_w, button_top, button_h, gap);
+    const primary: ?RECT = switch (actions) {
+        .close => null,
+        .update => bannerButtonRect(&right, scaledBy(banner_open_release_width_base, dpi), button_top, button_h, gap),
+        .update_staged => bannerButtonRect(&right, scaledBy(banner_install_width_base, dpi), button_top, button_h, gap),
+    };
+    const text_left = @min(w, scaledBy(banner_text_left_base, dpi));
+    return .{
+        .stripe = .{ .left = 0, .top = 0, .right = @min(w, scaledBy(banner_stripe_width_base, dpi)), .bottom = h },
+        .text = .{ .left = text_left, .top = 0, .right = @max(text_left, right), .bottom = h },
+        .primary = primary,
+        .dismiss = dismiss,
+    };
+}
+
+/// Take a button of `width` off the right of the row ending at `right.*`,
+/// and leave `right.*` one gap left of it; null, leaving `right.*` as it
+/// was, when the row has no room for the whole button.
+fn bannerButtonRect(right: *i32, width: i32, top: i32, height: i32, gap: i32) ?RECT {
+    if (height <= 0 or right.* < width) return null;
+    const button = RECT{ .left = right.* - width, .top = top, .right = right.*, .bottom = top + height };
+    right.* = button.left - gap;
+    return button;
+}
+
 fn scaledBy(base: i32, dpi: u32) i32 {
     return win32_chrome_state.scaled(base, dpi);
 }
@@ -733,4 +829,81 @@ test "confirm prompt text placement refuses a collapsed band" {
         overlayPanelInterior(40, 140, 96),
     );
     try std.testing.expect(!inverted.visible());
+}
+
+test "hostBannerWidth fits the line and the buttons the parts layout uses" {
+    // 12 text inset + 200 text + 8 gap + 28 close + 8 right gap.
+    try std.testing.expectEqual(@as(i32, 256), hostBannerWidth(200, .close, 96));
+    // At that width the text gets exactly its 200 pixels.
+    const parts = hostBannerParts(hostBannerWidth(200, .close, 96), 32, .close, 96);
+    try std.testing.expectEqual(@as(i32, 200), parts.text.right - parts.text.left);
+    for ([_]BannerActions{ .update, .update_staged }) |actions| {
+        for ([_]u32{ 96, 144, 192 }) |dpi| {
+            const fitted = hostBannerParts(hostBannerWidth(300, actions, dpi), 48, actions, dpi);
+            try std.testing.expectEqual(@as(i32, 300), fitted.text.right - fitted.text.left);
+        }
+    }
+}
+
+test "hostBannerRect sits at the right of the content area, which bounds it" {
+    try std.testing.expectEqual(
+        RECT{ .left = 544, .top = 40, .right = 800, .bottom = 72 },
+        hostBannerRect(.{ .left = 0, .top = 40, .right = 800, .bottom = 600 }, 40, 256, 96),
+    );
+    // Below a docked search frame, and 150% tall.
+    try std.testing.expectEqual(
+        RECT{ .left = 700, .top = 100, .right = 1200, .bottom = 148 },
+        hostBannerRect(.{ .left = 0, .top = 60, .right = 1200, .bottom = 900 }, 100, 500, 144),
+    );
+    try std.testing.expectEqual(@as(i32, 64), hostBannerRect(.{ .left = 0, .top = 0, .right = 1600, .bottom = 1200 }, 0, 500, 192).bottom);
+    // Wider than the content area: as wide as it.
+    try std.testing.expectEqual(
+        RECT{ .left = 10, .top = 0, .right = 400, .bottom = 32 },
+        hostBannerRect(.{ .left = 10, .top = 0, .right = 400, .bottom = 300 }, 0, 9000, 96),
+    );
+    // A content area shorter than the banner bounds it.
+    try std.testing.expectEqual(@as(i32, 20), hostBannerRect(.{ .left = 0, .top = 0, .right = 400, .bottom = 20 }, 0, 100, 96).bottom);
+}
+
+test "hostBannerParts puts a close button at the right and gives the text the rest" {
+    const parts = hostBannerParts(800, 32, .close, 96);
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 3, .bottom = 32 }, parts.stripe);
+    try std.testing.expectEqual(RECT{ .left = 764, .top = 4, .right = 792, .bottom = 28 }, parts.dismiss.?);
+    try std.testing.expectEqual(@as(?RECT, null), parts.primary);
+    try std.testing.expectEqual(RECT{ .left = 12, .top = 0, .right = 756, .bottom = 32 }, parts.text);
+}
+
+test "hostBannerParts scales the update notice and its two buttons with DPI" {
+    // 150%: 24 -> 36 buttons, 8 -> 12 gaps.
+    const parts = hostBannerParts(1200, 48, .update, 144);
+    try std.testing.expectEqual(RECT{ .left = 1080, .top = 6, .right = 1188, .bottom = 42 }, parts.dismiss.?);
+    try std.testing.expectEqual(RECT{ .left = 915, .top = 6, .right = 1068, .bottom = 42 }, parts.primary.?);
+    try std.testing.expectEqual(RECT{ .left = 18, .top = 0, .right = 903, .bottom = 48 }, parts.text);
+
+    // 200%: Install is narrower than Open Release.
+    const staged = hostBannerParts(1600, 64, .update_staged, 192);
+    try std.testing.expectEqual(RECT{ .left = 1440, .top = 8, .right = 1584, .bottom = 56 }, staged.dismiss.?);
+    try std.testing.expectEqual(RECT{ .left = 1252, .top = 8, .right = 1424, .bottom = 56 }, staged.primary.?);
+}
+
+test "hostBannerParts leaves out a button that does not fit and never hands out negative rects" {
+    // Room for Dismiss but not Open Release: no zero-width primary for
+    // F6 to land on; the text keeps what is left of Dismiss.
+    const tight = hostBannerParts(120, 32, .update, 96);
+    try std.testing.expectEqual(RECT{ .left = 40, .top = 4, .right = 112, .bottom = 28 }, tight.dismiss.?);
+    try std.testing.expectEqual(@as(?RECT, null), tight.primary);
+    try std.testing.expectEqual(RECT{ .left = 12, .top = 0, .right = 32, .bottom = 32 }, tight.text);
+
+    // Room for neither: no buttons, and the text gets the row.
+    const narrow = hostBannerParts(60, 32, .update, 96);
+    try std.testing.expectEqual(@as(?RECT, null), narrow.dismiss);
+    try std.testing.expectEqual(@as(?RECT, null), narrow.primary);
+    try std.testing.expectEqual(RECT{ .left = 12, .top = 0, .right = 52, .bottom = 32 }, narrow.text);
+    const sliver = hostBannerParts(5, 32, .close, 96);
+    try std.testing.expect(sliver.text.right >= sliver.text.left);
+
+    // Shorter than a button: the buttons shrink to fit.
+    const short = hostBannerParts(400, 20, .close, 96);
+    try std.testing.expectEqual(@as(i32, 20), short.dismiss.?.bottom - short.dismiss.?.top);
+    try std.testing.expectEqual(@as(i32, 20), short.stripe.bottom);
 }

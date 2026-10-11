@@ -161,8 +161,6 @@ const ThemeSurface = enum {
     search_frame_bg,
     search_frame_border,
     search_frame_underline,
-    update_open_bg,
-    update_dismiss_bg,
     launcher_lane_bg,
     launcher_lane_border,
 };
@@ -198,14 +196,6 @@ fn themeSurface(theme: *const ThemeColors, surface: ThemeSurface) u32 {
             adjustColor(theme.overlay_border, -10, -10, -8)
         else
             adjustColor(theme.overlay_border, 10, 10, 10),
-        .update_open_bg => if (theme.is_dark)
-            adjustColor(theme.overlay_bg, 10, 10, 12)
-        else
-            adjustColor(theme.overlay_bg, -4, -4, -4),
-        .update_dismiss_bg => if (theme.is_dark)
-            adjustColor(theme.status_bg, 10, 10, 12)
-        else
-            adjustColor(theme.status_bg, -4, -4, -4),
         .launcher_lane_bg => if (theme.is_dark)
             adjustColor(theme.status_bg, 8, 8, 10)
         else
@@ -3726,6 +3716,10 @@ pub const App = struct {
     quick_terminal_keyboard_diagnostic_logged: bool = false,
     update_check_running: std.atomic.Value(bool) = .init(false),
     update_notice: ?UpdateNotice = null,
+    /// The host whose banner button started the running update action, so
+    /// its feedback lands in the window the user is looking at. Set only for
+    /// the length of that synchronous call (`Host.activateBannerButton`).
+    update_action_host: ?*Host = null,
     update_auto_check_started: bool = false,
     update_startup_ready: bool = false,
     /// Most-recently-used command palette actions; newest first. Strings
@@ -4249,7 +4243,7 @@ pub const App = struct {
         };
         if (portable_failure) |message| {
             defer self.core_app.alloc.free(message);
-            self.showUpdateInfo(message) catch |err| {
+            self.showUpdateInfo(.err, message) catch |err| {
                 log.warn("failed to surface portable update failure err={}", .{err});
             };
         }
@@ -6193,7 +6187,7 @@ pub const App = struct {
 
         const current = self.update_check_running.cmpxchgStrong(false, true, .acq_rel, .acquire);
         if (current != null) {
-            if (opts.manual) try self.showUpdateInfo("Update check already running.");
+            if (opts.manual) try self.showUpdateInfo(.info, "Update check already running.");
             return;
         }
         errdefer self.update_check_running.store(false, .release);
@@ -6246,7 +6240,7 @@ pub const App = struct {
                 log.warn("failed to surface update notice err={}", .{err});
             };
             if (completion.manual_message) |message| {
-                self.showUpdateInfo(message) catch |err| {
+                self.showUpdateInfo(.info, message) catch |err| {
                     log.warn("failed to show updater status message err={}", .{err});
                 };
             }
@@ -6254,7 +6248,7 @@ pub const App = struct {
         }
 
         if (completion.manual_message) |message| {
-            self.showUpdateInfo(message) catch |err| {
+            self.showUpdateInfo(.info, message) catch |err| {
                 log.warn("failed to show updater status message err={}", .{err});
             };
         }
@@ -6273,14 +6267,20 @@ pub const App = struct {
         }
 
         self.update_notice = try UpdateNotice.init(self.core_app.alloc, version_text, release_url, staged);
-        for (self.hosts.items) |host| host.invalidateBannerText();
+        // Announce it once: in the window the user is in, else the first.
+        const foreground = sys.GetForegroundWindow();
+        var announcer: ?*Host = if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        for (self.hosts.items) |host| {
+            if (host.hwnd != null and host.hwnd == foreground) announcer = host;
+        }
+        for (self.hosts.items) |host| host.updateNoticeChanged(host == announcer);
     }
 
     fn clearUpdateNotice(self: *App) void {
         if (self.update_notice) |*notice| {
             notice.deinit(self.core_app.alloc);
             self.update_notice = null;
-            for (self.hosts.items) |host| host.invalidateBannerText();
+            for (self.hosts.items) |host| host.updateNoticeChanged(false);
         }
     }
 
@@ -6289,7 +6289,7 @@ pub const App = struct {
         if (notice.staged) {
             if (!self.canApplyStagedUpdate()) {
                 if (isPortableModeActive(self.core_app.alloc)) {
-                    try self.showUpdateInfo(updateApplyFailureMessage(error.NoStagedPortableInstall));
+                    try self.showUpdateInfo(.err, updateApplyFailureMessage(error.NoStagedPortableInstall));
                     return;
                 }
                 if (notice.release_url) |url| {
@@ -6350,7 +6350,7 @@ pub const App = struct {
             release_feed_url,
             expected_kind,
         ) catch |err| {
-            self.showUpdateInfo(updateApplyFailureMessage(err)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return err;
@@ -6358,7 +6358,7 @@ pub const App = struct {
         defer staged.deinit(self.core_app.alloc);
 
         const install_dir = currentInstallDir(self.core_app.alloc) catch |err| {
-            self.showUpdateInfo(updateApplyFailureMessage(err)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return err;
@@ -6367,7 +6367,7 @@ pub const App = struct {
 
         if (staged.kind == .portable) {
             updatepkg.recordPortableApplyPending(self.core_app.alloc, state_path, 0) catch |err| {
-                self.showUpdateInfo(updateApplyFailureMessage(err)) catch |banner_err| {
+                self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
                     log.warn("failed to show updater apply failure err={}", .{banner_err});
                 };
                 return err;
@@ -6380,7 +6380,7 @@ pub const App = struct {
         }
 
         if (!internal_os.windows.isInstallerManagedInstallDir(install_dir)) {
-            self.showUpdateInfo(updateApplyFailureMessage(error.InvalidInstallPath)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(error.InvalidInstallPath)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return error.InvalidInstallPath;
@@ -6414,7 +6414,7 @@ pub const App = struct {
             c.SW_SHOW,
         );
         if (@intFromPtr(result) <= 32) {
-            self.showUpdateInfo(updateApplyFailureMessage(error.UpdateApplyLaunchFailed)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(error.UpdateApplyLaunchFailed)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return error.UpdateApplyLaunchFailed;
@@ -6442,14 +6442,57 @@ pub const App = struct {
             updatepkg.hasStagedWindowsInstall(self.core_app.alloc, state_path, .installer);
     }
 
-    fn showUpdateInfo(self: *App, message: []const u8) !void {
-        if (self.primarySurface()) |surface| {
-            if (surface.host) |host| {
-                try host.setBanner(.info, message);
-                return;
-            }
-        }
+    /// Updater feedback in the banner. A failure is `.err`, so it stays
+    /// until dismissed instead of counting down like an `.info` message.
+    fn showUpdateInfo(self: *App, kind: HostBannerKind, message: []const u8) !void {
+        // The window whose button was pressed, else the primary one. A host
+        // with no tab (its last one detached for undo) still shows a banner.
+        // Opening the release can pump messages, so check that the pressing
+        // window is still open before using it.
+        const pressed_in: ?*Host = if (self.update_action_host) |pressed| for (self.hosts.items) |live| {
+            if (live == pressed) break pressed;
+        } else null else null;
+        const host: ?*Host = pressed_in orelse blk: {
+            if (self.primarySurface()) |surface| if (surface.host) |value| break :blk value;
+            break :blk if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        };
+        if (host) |value| return value.setBanner(kind, message);
         try showInfoMessage(.app, "noctty", message);
+    }
+
+    test "showUpdateInfo answers in the window whose banner button was pressed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var first: Host = undefined;
+        var second: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{
+                .{ .storage = &first, .id = 1, .register = true },
+                .{ .storage = &second, .id = 2, .register = true },
+            },
+        });
+        defer session.deinit();
+
+        app.update_action_host = &second;
+        try app.showUpdateInfo(.err, "Install failed.");
+        try std.testing.expectEqual(@as(?[:0]const u8, null), first.banner_text);
+        try std.testing.expectEqualStrings("Install failed.", second.banner_text.?);
+
+        // A pressing window that has since closed is not used.
+        _ = app.hosts.swapRemove(1);
+        try app.showUpdateInfo(.err, "Still failed.");
+        try std.testing.expectEqualStrings("Still failed.", first.banner_text.?);
+
+        // With no pressed window and no surface to find the primary window
+        // by, the first window answers rather than only the log.
+        app.update_action_host = null;
+        try app.showUpdateInfo(.info, "Up to date.");
+        try std.testing.expectEqualStrings("Up to date.", first.banner_text.?);
     }
 
     fn showRecoverySafeModeNotice(_: *App, _: []const u8) void {
@@ -8855,8 +8898,9 @@ pub const App = struct {
         try std.testing.expect(!app.shell_compositor_driver.isStarted());
         try std.testing.expectEqual(win32_compositor.State.fallback, app.shell_compositor.status().state);
 
-        // A host that appears now gets no target, and the chrome painter is
-        // told nothing was drawn, so `paintChromeBanner` draws with GDI.
+        // A host that appears now gets no target, and DirectWrite chrome
+        // text reports nothing drawn. Banners do not use it any more: the
+        // banner child paints itself with GDI (`Host.paintBanner`).
         const hwnd: HWND = @ptrFromInt(0x1000);
         app.attachShellCompositorWindow(hwnd);
         try std.testing.expect(!app.shell_compositor.status().compositionActive());
@@ -8996,7 +9040,9 @@ pub const App = struct {
         const surface = self.primarySurface() orelse return;
         const host = surface.host orelse return;
         const text = ptypkg.takeConPtyFallbackBanner() orelse return;
-        host.setBanner(.info, text) catch |err| {
+        // Shown once per process and naming why output may be degraded, so
+        // it stays until dismissed.
+        host.setBanner(.err, text) catch |err| {
             log.warn("failed to show ConPTY fallback banner err={}", .{err});
         };
     }
@@ -12220,7 +12266,6 @@ const Host = struct {
     chrome_text_dirty: ChromeTextDirty = .{},
     cached_status_w: ?[:0]const u16 = null,
     cached_detail_w: ?[:0]const u16 = null,
-    cached_banner_w: ?[:0]const u16 = null,
     cached_inspector_title_w: ?[:0]const u16 = null,
     cached_inspector_hint_w: ?[:0]const u16 = null,
     cached_overlay_paint_badge_w: ?[:0]const u16 = null,
@@ -12311,8 +12356,25 @@ const Host = struct {
     banner_placement: ChildPlacement = .{},
     banner_prev_proc: ?*const anyopaque = null,
     banner_uia_provider: ?*win32_uia.ChromeControlProvider = null,
-    update_open_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-    update_dismiss_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    /// Open Release or Install (control 1914) and the close button or
+    /// Dismiss (1915): BUTTON children of the banner, indexed by
+    /// `BannerButton`.
+    banner_buttons: [2]?HWND = .{ null, null },
+    banner_button_placements: [2]ChildPlacement = .{ .{}, .{} },
+    banner_button_uia_providers: [2]?*win32_uia.ChromeControlProvider = .{ null, null },
+    /// The content area and top `layout` last gave the banner;
+    /// `placeBanner` sizes it within that.
+    banner_area: ?struct { content: RECT, top: i32 } = null,
+    /// The pointer is over the banner; `TME_LEAVE` is armed while it is.
+    banner_pointer_inside: bool = false,
+    /// A banner button holds keyboard focus (tracked from `WM_SETFOCUS`
+    /// and `WM_KILLFOCUS`).
+    banner_focused: bool = false,
+    /// A new update notice to announce once the banner is on screen.
+    banner_announce_pending: bool = false,
+    /// When the running `.info` countdown ends (`GetTickCount64`), null
+    /// while none runs. See `syncBannerExpiry`.
+    banner_expires_at: ?u64 = null,
     tab_drag_index: ?usize = null,
     tab_drag_start_x: i32 = 0,
     tab_drag_start_y: i32 = 0,
@@ -14539,7 +14601,7 @@ const Host = struct {
             log.warn("palette theme saved but masked by a later config layer theme={s}", .{theme_name});
             runUiActionOrLog(
                 "palette masked theme banner failed",
-                self.setBanner(.info, "Theme saved, but a later config layer masks it."),
+                self.setBanner(.err, "Theme saved, but a later config layer masks it."),
             );
         }
         self.layout() catch |err| {
@@ -14807,6 +14869,10 @@ const Host = struct {
             if (self.hwnd) |h| _ = sys.KillTimer(h, c.RESIZE_SETTLE_TIMER_ID);
             self.resize_settle_timer_active = false;
         }
+        if (self.banner_expires_at != null) {
+            if (self.hwnd) |h| _ = sys.KillTimer(h, c.BANNER_TIMER_ID);
+            self.banner_expires_at = null;
+        }
         self.tween_sched.deinit();
 
         self.revertPaletteThemePreview();
@@ -14858,6 +14924,7 @@ const Host = struct {
         detachChromeControlProvider(self.app, &self.new_tab_uia_provider);
         detachChromeControlProvider(self.app, &self.overflow_uia_provider);
         detachChromeControlProvider(self.app, &self.banner_uia_provider);
+        for (&self.banner_button_uia_providers) |*provider| detachChromeControlProvider(self.app, provider);
 
         detachChromeControlProvider(self.app, &self.overlay_title_uia_provider);
         detachChromeControlProvider(self.app, &self.overlay_body_uia_provider);
@@ -14901,6 +14968,7 @@ const Host = struct {
         self.chrome_button_prev_proc = null;
         destroySubclassedWindowWithPrev(&self.new_tab_hwnd, chrome_prev);
         destroySubclassedWindowWithPrev(&self.overflow_hwnd, chrome_prev);
+        for (&self.banner_buttons) |*button| destroySubclassedWindowWithPrev(button, chrome_prev);
         destroySubclassedWindow(&self.banner_hwnd, &self.banner_prev_proc);
         destroySubclassedWindow(&self.tab_container_hwnd, &self.tab_container_prev_proc);
 
@@ -16134,6 +16202,7 @@ const Host = struct {
         self.hovered_button_hwnd = child;
         if (previous) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
         if (child) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
+        if (self.bannerButtonOf(previous) != null or self.bannerButtonOf(child) != null) self.syncBannerExpiry();
 
         const previous_titlebar_role = if (previous) |h| self.titlebarActionButtonRole(h) else .none;
         if (previous_titlebar_role != .none) self.startTitlebarHoverFade(previous_titlebar_role);
@@ -16269,6 +16338,11 @@ const Host = struct {
                 while (it.next()) |entry| entry.view.syncOcclusion();
             }
         }
+        // An info banner nobody can see waits, and starts over when the
+        // window comes back. Outside the transition branch: a window first
+        // shown while the flag still holds its initial `true` makes no
+        // transition.
+        self.syncBannerExpiry();
 
         // Deliberately outside the transition branch, and deliberately here
         // rather than at the message handlers. "The window is on screen" is
@@ -16319,7 +16393,13 @@ const Host = struct {
         const next_kind: HostBannerKind = if (text == null) .none else kind;
         if (self.banner_kind == next_kind) {
             if (text) |value| {
-                if (ownedStringEquals(self.banner_text, value)) return;
+                if (ownedStringEquals(self.banner_text, value)) {
+                    // The same message again (undo pressed twice): a full
+                    // countdown again, without announcing it twice.
+                    self.stopBannerExpiry();
+                    self.syncBannerExpiry();
+                    return;
+                }
             } else if (self.banner_text == null) {
                 return;
             }
@@ -16327,15 +16407,12 @@ const Host = struct {
 
         self.banner_kind = next_kind;
         try appendOwnedString(self.app.core_app.alloc, &self.banner_text, text);
-        if (self.banner_hwnd) |banner_hwnd| {
-            _ = applyChildVisibility(
-                banner_hwnd,
-                &self.banner_placement,
-                self.banner_text != null and self.overlay_mode == .none,
-            );
-        }
+        // This announces the banner itself, below.
+        self.banner_announce_pending = false;
+        // A new message gets a full countdown of its own.
+        self.stopBannerExpiry();
+        self.placeBanner(true);
         if (self.banner_uia_provider) |provider| provider.raiseLiveRegionChanged();
-        self.invalidateBannerText();
         // While an overlay is open, banner text is rendered inside the
         // overlay feedback lane rather than the ordinary host banner lane.
         if (self.overlay_mode != .none) self.invalidateOverlayText();
@@ -16353,24 +16430,869 @@ const Host = struct {
         }
     }
 
-    fn clearUpdateActionRects(self: *Host) void {
-        self.update_open_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        self.update_dismiss_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    /// The app's update notice appeared, changed or went away. `announce`
+    /// is true on one host only, so a reader hears a new notice once.
+    fn updateNoticeChanged(self: *Host, announce: bool) void {
+        // A message set with `setBanner` takes the banner's place, and stays
+        // what the banner says and announces. A notice that an overlay keeps
+        // off screen is announced when it comes on (`syncBannerChild`).
+        self.banner_announce_pending = announce and self.app.update_notice != null and self.banner_text == null;
+        self.placeBanner(true);
     }
 
-    fn handleUpdateNoticeClick(self: *Host, point: POINT) bool {
-        if (self.app.update_notice == null) return false;
-        if (pointInRect(point, self.update_open_rect)) {
-            self.app.openUpdateNotice() catch |err| {
-                log.warn("failed to open update notice err={}", .{err});
+    /// Whether the banner child belongs on screen: there is a message or an
+    /// update notice to show, and no overlay is open (an overlay shows banner
+    /// text in its own feedback lane).
+    fn bannerShown(self: *const Host) bool {
+        if (self.overlay_mode != .none) return false;
+        return self.banner_text != null or self.app.update_notice != null;
+    }
+
+    /// The buttons the banner offers: a message set with `setBanner` takes
+    /// precedence over the update notice, and has a close button.
+    fn bannerActions(self: *const Host) chrome_layout.BannerActions {
+        if (self.banner_text == null) {
+            if (self.app.update_notice) |notice| return if (notice.staged) .update_staged else .update;
+        }
+        return .close;
+    }
+
+    fn bannerButtonOf(self: *const Host, hwnd: ?HWND) ?BannerButton {
+        const value = hwnd orelse return null;
+        for (self.banner_buttons, 0..) |button, i| {
+            if (button == value) return @enumFromInt(i);
+        }
+        return null;
+    }
+
+    /// Where F6 lands in the banner: its first button on screen.
+    fn bannerFocusHwnd(self: *const Host) ?HWND {
+        for (self.banner_buttons) |button| {
+            if (focusableHwnd(button)) |hwnd| return hwnd;
+        }
+        return null;
+    }
+
+    /// Lay the banner out over the content area at `top`, which is below
+    /// any docked search frame that starts there.
+    ///
+    /// The banner overlays the terminal's top rows rather than reserving a
+    /// row of its own: a reserved row resizes the terminal every time a
+    /// banner comes or goes, and every resize makes ConPTY and the shell
+    /// redraw (#328).
+    fn layoutBanner(self: *Host, content_rect: RECT, top: i32) void {
+        self.banner_area = .{ .content = content_rect, .top = top };
+        self.placeBanner(false);
+    }
+
+    /// Size the banner to what it shows now, at the right end of the area
+    /// `layoutBanner` last gave it, so a short message leaves the start of
+    /// the top rows (where a fresh prompt is) uncovered. Then sync it.
+    /// `repaint` is for a change of text, label or kind, which can leave the
+    /// rects as they were.
+    fn placeBanner(self: *Host, repaint: bool) void {
+        const hwnd = self.banner_hwnd orelse return;
+        if (self.banner_area) |area| {
+            const actions = self.bannerActions();
+            const width = chrome_layout.hostBannerWidth(self.bannerTextWidth(hwnd), actions, self.current_dpi);
+            const rect = chrome_layout.hostBannerRect(area.content, area.top, width, self.current_dpi);
+            const old_rect = self.banner_placement.rect;
+            const was_on_screen = self.banner_placement.visible and self.banner_placement.rect_known;
+            if (applyChromeChildRect(hwnd, &self.banner_placement, rect) and was_on_screen) {
+                // `MoveWindow` without repaint leaves the banner's old image
+                // on the terminal it no longer covers (a shorter message, a
+                // relayout); have everything under the old rect repaint.
+                if (self.hwnd) |parent| _ = sys.RedrawWindow(parent, &old_rect, null, c.RDW_INVALIDATE | c.RDW_ALLCHILDREN);
+            }
+            const parts = chrome_layout.hostBannerParts(rect.right - rect.left, rect.bottom - rect.top, actions, self.current_dpi);
+            const button_rects = [_]?RECT{ parts.primary, parts.dismiss };
+            for (self.banner_buttons, &self.banner_button_placements, button_rects) |maybe_button, *placement, maybe_rect| {
+                const button = maybe_button orelse continue;
+                if (maybe_rect) |button_rect| {
+                    _ = applyChromeChildRect(button, placement, button_rect);
+                } else if (sys.GetFocus() == button) {
+                    // A message replacing the notice takes Install away
+                    // from under the keyboard; hiding the focused button
+                    // would leave focus on the banner, where no key works.
+                    self.focusTerminalOrHost();
+                }
+                _ = applyChildVisibility(button, placement, maybe_rect != null);
+            }
+        }
+        if (repaint) {
+            _ = sys.InvalidateRect(hwnd, null, 0);
+            for (self.banner_buttons, self.banner_button_uia_providers) |button, provider| {
+                if (button) |value| _ = sys.InvalidateRect(value, null, 0);
+                // Their names carry the banner's text.
+                if (provider) |value| value.raiseNameChanged();
+            }
+        }
+        self.syncBannerChild();
+    }
+
+    /// The width of the banner's line in the chrome font, in pixels.
+    fn bannerTextWidth(self: *const Host, hwnd: HWND) i32 {
+        var buf: [512]u16 = undefined;
+        const text = self.bannerDisplayText(&buf);
+        if (text.len == 0) return 0;
+        const hdc = sys.GetDC(hwnd) orelse return 0;
+        defer _ = sys.ReleaseDC(hwnd, hdc);
+        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
+        defer if (prev_font) |pf| {
+            _ = sys.SelectObject(hdc, pf);
+        };
+        var rect = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = sys.DrawTextW(hdc, text.ptr, @intCast(text.len), &rect, c.DT_CALCRECT | c.DT_SINGLELINE | c.DT_NOPREFIX);
+        return rect.right - rect.left;
+    }
+
+    /// Show the banner child exactly while there is something to show, keep
+    /// it above the terminal, and run or stop the `.info` countdown to match.
+    fn syncBannerChild(self: *Host) void {
+        const hwnd = self.banner_hwnd orelse return;
+        const shown = self.bannerShown();
+        const focus = sys.GetFocus();
+        const had_focus = focus != null and (focus == hwnd or self.bannerButtonOf(focus) != null);
+        // Keyboard focus must not stay on a hidden window, where keys would
+        // go nowhere visible; move it before the hide, not after.
+        if (!shown and had_focus) self.focusTerminalOrHost();
+        _ = applyChildVisibility(hwnd, &self.banner_placement, shown);
+        if (shown) {
+            // The terminal is a sibling that can sit above the banner
+            // (AGENTS.md 2026-09-10: the first surface is the topmost child),
+            // and `WS_CLIPSIBLINGS` on it only spares siblings above it, so
+            // a banner below it would be painted over by the next present.
+            if (self.hwnd) |parent| {
+                if (sys.GetWindow(parent, c.GW_CHILD) != hwnd) {
+                    _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
+                }
+            }
+        } else {
+            if (self.banner_pointer_inside) {
+                // A leave armed before the hide could otherwise arrive after
+                // the next show and start a countdown under a resting pointer.
+                var track: TRACKMOUSEEVENT = .{
+                    .cbSize = @sizeOf(TRACKMOUSEEVENT),
+                    .dwFlags = c.TME_LEAVE | c.TME_CANCEL,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                _ = sys.TrackMouseEvent(&track);
+                self.banner_pointer_inside = false;
+            }
+            // A leave for a hidden button may never come; a stale hover
+            // would hold the next message's countdown.
+            if (self.bannerButtonOf(self.hovered_button_hwnd) != null) self.setHoveredButton(null);
+        }
+        if (shown and self.banner_announce_pending) {
+            self.banner_announce_pending = false;
+            if (self.banner_uia_provider) |provider| provider.raiseLiveRegionChanged();
+        }
+        self.syncBannerExpiry();
+    }
+
+    fn focusTerminalOrHost(self: *Host) void {
+        if (!self.moveFocusToRegion(.terminal)) self.refocusHostWindow();
+    }
+
+    /// Count an `.info` message down only while it is on screen and nobody
+    /// is reading it: the window is shown, not minimized and not cloaked,
+    /// the pointer is not over the banner and it does not hold keyboard
+    /// focus. Errors and the update notice stay until
+    /// dismissed. When any of that ends, the countdown restarts in full.
+    ///
+    /// The duration is the system's own notification time, Settings >
+    /// Accessibility > Visual effects > "Dismiss notifications after this
+    /// amount of time" (`SPI_GETMESSAGEDURATION`, 5 s by default), which
+    /// Windows uses for its notification pop-ups and users lengthen when
+    /// they need longer to read.
+    fn syncBannerExpiry(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        // `surfaces_visible` adds DWM cloaking, but it starts out true and is
+        // only refreshed by window messages, so the window itself is asked
+        // whether it is shown and not minimized.
+        const run = self.banner_kind == .info and
+            self.banner_text != null and
+            self.banner_placement.visible and
+            self.surfaces_visible and
+            sys.IsWindowVisible(hwnd) != 0 and
+            sys.IsIconic(hwnd) == 0 and
+            !self.banner_pointer_inside and
+            self.bannerButtonOf(self.hovered_button_hwnd) == null and
+            !self.banner_focused;
+        if (!run) return self.stopBannerExpiry();
+        if (self.banner_expires_at != null) return;
+        const duration_ms = bannerMessageDurationMs();
+        self.banner_expires_at = sys.GetTickCount64() + duration_ms;
+        _ = sys.SetTimer(hwnd, c.BANNER_TIMER_ID, duration_ms, null);
+    }
+
+    fn stopBannerExpiry(self: *Host) void {
+        if (self.banner_expires_at == null) return;
+        self.banner_expires_at = null;
+        if (self.hwnd) |hwnd| _ = sys.KillTimer(hwnd, c.BANNER_TIMER_ID);
+    }
+
+    /// `BANNER_TIMER_ID` fired. Honoured only once the current deadline has
+    /// passed: every new message, and every end of a hover or focus, writes
+    /// a new deadline, so a tick left over from an older countdown finds it
+    /// in the future and only re-arms for the rest, and a tick after the
+    /// countdown stopped finds none.
+    fn bannerExpiryTick(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        _ = sys.KillTimer(hwnd, c.BANNER_TIMER_ID);
+        const deadline = self.banner_expires_at orelse return;
+        const now = sys.GetTickCount64();
+        if (now < deadline) {
+            _ = sys.SetTimer(hwnd, c.BANNER_TIMER_ID, @intCast(@min(deadline - now, std.math.maxInt(u31))), null);
+            return;
+        }
+        self.banner_expires_at = null;
+        runUiActionOrLog("banner expiry failed", self.setBanner(.none, null));
+    }
+
+    fn bannerPointerMoved(self: *Host) void {
+        if (self.banner_pointer_inside) return;
+        const hwnd = self.banner_hwnd orelse return;
+        var track: TRACKMOUSEEVENT = .{
+            .cbSize = @sizeOf(TRACKMOUSEEVENT),
+            .dwFlags = c.TME_LEAVE,
+            .hwndTrack = hwnd,
+            .dwHoverTime = 0,
+        };
+        _ = sys.TrackMouseEvent(&track);
+        self.banner_pointer_inside = true;
+        self.syncBannerExpiry();
+    }
+
+    fn bannerPointerLeft(self: *Host) void {
+        self.banner_pointer_inside = false;
+        self.syncBannerExpiry();
+    }
+
+    /// A banner button was pressed (click, Enter or Space, or UIA Invoke).
+    /// Install applies a staged update and destroys every window, this
+    /// banner included, so callers must not touch the host after this.
+    fn activateBannerButton(self: *Host, button: BannerButton) void {
+        // UIA Invoke is posted, so it can arrive after the button went away
+        // (an overlay opened, the notice changed): a hidden button does
+        // nothing.
+        if (!self.bannerShown() or !self.banner_button_placements[@intFromEnum(button)].visible) return;
+        if (self.banner_text != null) {
+            if (button != .dismiss) return;
+            const had_focus = self.banner_focused;
+            runUiActionOrLog("banner dismiss failed", self.setBanner(.none, null));
+            // The update notice can be behind the message, on the same
+            // buttons. Without this, the Enter that closed the message is
+            // one repeat away from pressing Dismiss or Install.
+            if (had_focus and self.banner_focused) self.focusTerminalOrHost();
+            return;
+        }
+        if (self.app.update_notice == null) return;
+        switch (button) {
+            .primary => {
+                // Install can destroy this host; only the app is used after.
+                const app = self.app;
+                app.update_action_host = self;
+                defer app.update_action_host = null;
+                app.openUpdateNotice() catch |err| {
+                    log.warn("failed to open update notice err={}", .{err});
+                };
+            },
+            .dismiss => self.app.dismissUpdateNotice(),
+        }
+    }
+
+    /// Keys on a focused banner button; true when consumed. Never touch the
+    /// host after a press: see `activateBannerButton`.
+    fn handleBannerButtonKey(self: *Host, hwnd: HWND, button: BannerButton, vk: WPARAM, lParam: LPARAM) bool {
+        const repeat = (lParamBits(lParam) & (1 << 30)) != 0;
+        const key = bannerButtonKey(self.banner_text != null, vk, repeat) orelse return false;
+        switch (key) {
+            .ignore => {},
+            .press => self.activateBannerButton(button),
+            .dismiss => self.activateBannerButton(.dismiss),
+            .other_button => {
+                const other: BannerButton = if (button == .primary) .dismiss else .primary;
+                if (focusableHwnd(self.banner_buttons[@intFromEnum(other)])) |target| {
+                    if (target != hwnd) _ = sys.SetFocus(target);
+                }
+            },
+        }
+        return true;
+    }
+
+    /// The banner's line as drawn: the message with the same "Info: " or
+    /// "Error: " prefix the overlay lane shows, or the update notice.
+    /// Bounded by `buf`, so a long message is cut, never overflowed.
+    fn bannerDisplayText(self: *const Host, buf: []u16) [:0]const u16 {
+        var bytes: [1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        const text: []const u8 = if (self.banner_text) |message|
+            buildHostBannerText(fixed.allocator(), self.banner_kind, message) catch message
+        else if (self.app.update_notice) |notice|
+            notice.message_text orelse ""
+        else
+            "";
+        return buf[0..paint_text.utf8ToUtf16LeBounded(buf, text) :0];
+    }
+
+    fn bannerBackground(theme: *const ThemeColors, high_contrast: bool) u32 {
+        // High Contrast keeps the system colors as they are; the adjusted
+        // panel surface would step off them.
+        return if (high_contrast) theme.overlay_bg else themeSurface(theme, .overlay_panel_bg);
+    }
+
+    /// Paint the banner child (its buttons paint themselves). Serves
+    /// `WM_PAINT` and `WM_PRINTCLIENT`, so `PrintWindow` sees what the
+    /// screen does. The child fills its whole rect itself: the host's
+    /// `WS_CLIPCHILDREN` keeps the parent's paint out of it (AGENTS.md
+    /// 2026-09-14).
+    fn paintBanner(self: *Host, hdc: HDC, client: RECT, high_contrast: bool) void {
+        if (client.right <= client.left or client.bottom <= client.top) return;
+        const theme = &self.app.resolved_theme;
+        const parts = chrome_layout.hostBannerParts(client.right - client.left, client.bottom - client.top, self.bannerActions(), self.current_dpi);
+        fillSolidRect(hdc, client, bannerBackground(theme, high_contrast));
+        fillSolidRect(hdc, .{
+            .left = client.left,
+            .top = client.bottom - 1,
+            .right = client.right,
+            .bottom = client.bottom,
+        }, if (high_contrast) theme.overlay_border else themeSurface(theme, .overlay_panel_border));
+        const accent = if (self.banner_text != null and self.banner_kind == .err) theme.error_fg else theme.info_fg;
+        fillSolidRect(hdc, parts.stripe, accent);
+
+        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
+        defer if (prev_font) |pf| {
+            _ = sys.SelectObject(hdc, pf);
+        };
+        const prev_bk_mode = sys.SetBkMode(hdc, c.TRANSPARENT);
+        defer _ = sys.SetBkMode(hdc, prev_bk_mode);
+        const prev_color = sys.SetTextColor(hdc, accent);
+        defer _ = sys.SetTextColor(hdc, prev_color);
+
+        var buf: [512]u16 = undefined;
+        const text = self.bannerDisplayText(&buf);
+        var text_rect = parts.text;
+        _ = sys.DrawTextW(
+            hdc,
+            text.ptr,
+            @intCast(text.len),
+            &text_rect,
+            c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX | c.DT_END_ELLIPSIS,
+        );
+    }
+
+    /// `WM_DRAWITEM` for a banner button, sent to the banner, its parent.
+    fn drawBannerButton(self: *Host, draw: *const DRAWITEMSTRUCT) bool {
+        const button = self.bannerButtonOf(draw.hwndItem) orelse return false;
+        const theme = &self.app.resolved_theme;
+        const hovered = self.isHoveredButton(draw.hwndItem);
+        const pressed = (draw.itemState & c.ODS_SELECTED) != 0;
+        const focused = (draw.itemState & c.ODS_FOCUS) != 0 or sys.GetFocus() == draw.hwndItem;
+        const ring = self.chromeFocusRingVisible(focused, false);
+        const primary = button == .primary;
+        const colors = buttonColorsFromTheme(theme, false, true, hovered, pressed, false, primary);
+        fillSolidRect(draw.hDC, draw.rcItem, bannerBackground(theme, isHighContrastActive()));
+        // A message's close glyph sits bare until it is pointed at or
+        // focused, the way a tab's close button does.
+        const bare = self.banner_text != null and !hovered and !pressed and !ring;
+        if (!bare) drawRoundedRect(draw.hDC, draw.rcItem, colors.bg, colors.border, self.scaled(4));
+        if (ring) {
+            const inset = self.scaled(2);
+            drawRoundedRect(draw.hDC, .{
+                .left = draw.rcItem.left + inset,
+                .top = draw.rcItem.top + inset,
+                .right = draw.rcItem.right - inset,
+                .bottom = draw.rcItem.bottom - inset,
+            }, colors.bg, if (primary) theme.button_accept_focus_ring else theme.button_overlay_focus_ring, self.scaled(3));
+        }
+        const prev_font = if (self.chrome_font) |font| sys.SelectObject(draw.hDC, font) else null;
+        defer if (prev_font) |pf| {
+            _ = sys.SelectObject(draw.hDC, pf);
+        };
+        _ = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
+        _ = sys.SetTextColor(draw.hDC, if (bare) theme.text_secondary else colors.fg);
+        const label = self.bannerButtonLabel(button);
+        var label_rect = draw.rcItem;
+        _ = sys.DrawTextW(
+            draw.hDC,
+            label.ptr,
+            @intCast(label.len),
+            &label_rect,
+            c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
+        );
+        return true;
+    }
+
+    fn bannerButtonLabel(self: *const Host, button: BannerButton) [:0]const u16 {
+        if (self.banner_text != null) return std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
+        const staged = if (self.app.update_notice) |notice| notice.staged else false;
+        return switch (button) {
+            .primary => if (staged)
+                std.unicode.utf8ToUtf16LeStringLiteral("Install")
+            else
+                std.unicode.utf8ToUtf16LeStringLiteral("Open Release"),
+            .dismiss => std.unicode.utf8ToUtf16LeStringLiteral("Dismiss"),
+        };
+    }
+
+    /// A button's UIA name. F6 lands on a button, not on the banner's text,
+    /// so the name that is read on landing says what the button is for.
+    fn bannerButtonUiaName(ctx: *anyopaque, tag: usize, buf: []u8) []const u8 {
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        if (self.banner_text) |text| {
+            return std.fmt.bufPrint(buf, "Close: {s}", .{utf8BoundedPrefix(text, buf.len -| 7)}) catch "Close";
+        }
+        const notice = self.app.update_notice orelse return "";
+        const label = if (notice.staged) "Install" else "Open Release";
+        return switch (@as(BannerButton, @enumFromInt(tag))) {
+            .primary => if (notice.message_text) |text|
+                std.fmt.bufPrint(buf, "{s}: {s}", .{ label, utf8BoundedPrefix(text, buf.len -| label.len -| 2) }) catch label
+            else
+                label,
+            .dismiss => "Dismiss update notice",
+        };
+    }
+
+    /// A hidden top-level window standing in for the host window, with the
+    /// real chrome children `ensureChromeButtons` creates and a plain child
+    /// over the content rect standing in for the terminal pane, raised to
+    /// the top as the first surface is (AGENTS.md 2026-09-10). Nothing is
+    /// shown on the desktop.
+    const BannerTestWindow = struct {
+        parent: HWND,
+        pane: HWND,
+        content: RECT,
+
+        fn init(host: *Host) !BannerTestWindow {
+            const parent = try createTestHostWindow();
+            errdefer _ = sys.DestroyWindow(parent);
+            host.hwnd = parent;
+            errdefer host.hwnd = null;
+            // The tab-strip container is a layered child, which this
+            // manifest-less test binary cannot create (AGENTS.md
+            // 2026-10-01); a plain one takes its slot.
+            host.tab_container_hwnd = try createTestChromeChild(parent, prompt_label_class);
+            try host.ensureChromeButtons();
+            const content = RECT{ .left = 0, .top = 32, .right = 320, .bottom = 240 };
+            const pane = try createTestChromeChild(parent, prompt_label_class);
+            _ = sys.MoveWindow(pane, content.left, content.top, content.right - content.left, content.bottom - content.top, 0);
+            _ = sys.SetWindowPos(pane, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
+            return .{ .parent = parent, .pane = pane, .content = content };
+        }
+
+        /// Destroys the children with the parent; the host keeps no handle.
+        fn deinit(self: BannerTestWindow, host: *Host) void {
+            host.stopBannerExpiry();
+            host.hovered_button_hwnd = null;
+            _ = sys.DestroyWindow(self.parent);
+            host.hwnd = null;
+            host.banner_hwnd = null;
+            host.banner_prev_proc = null;
+            host.banner_buttons = .{ null, null };
+            host.tab_container_hwnd = null;
+            host.tab_container_prev_proc = null;
+            host.new_tab_hwnd = null;
+            host.overflow_hwnd = null;
+            host.chrome_button_prev_proc = null;
+        }
+    };
+
+    /// A 32-bit DIB to print a window into through `WM_PRINTCLIENT`, the path
+    /// `PrintWindow` takes, after filling it with a colour the banner never
+    /// uses, so untouched pixels show.
+    const BannerTestCanvas = struct {
+        const untouched: u32 = 0x00FF00FF;
+        const BITMAPINFOHEADER = extern struct {
+            biSize: u32 = @sizeOf(@This()),
+            biWidth: i32,
+            biHeight: i32,
+            biPlanes: u16 = 1,
+            biBitCount: u16 = 32,
+            biCompression: u32 = 0,
+            biSizeImage: u32 = 0,
+            biXPelsPerMeter: i32 = 0,
+            biYPelsPerMeter: i32 = 0,
+            biClrUsed: u32 = 0,
+            biClrImportant: u32 = 0,
+        };
+        const raw = struct {
+            extern "gdi32" fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFOHEADER, usage: u32, bits: *?[*]u32, section: ?*anyopaque, offset: u32) callconv(.winapi) HGDIOBJ;
+            extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
+        };
+
+        dc: HDC,
+        bitmap: HGDIOBJ,
+        previous: HGDIOBJ,
+        bits: [*]u32,
+        width: i32,
+        height: i32,
+
+        fn init(width: i32, height: i32) !BannerTestCanvas {
+            const dc = sys.CreateCompatibleDC(null) orelse return error.SkipZigTest;
+            errdefer _ = sys.DeleteDC(dc);
+            var bits: ?[*]u32 = null;
+            // Top-down, so row 0 is the top of the window.
+            const bitmap = raw.CreateDIBSection(dc, &.{ .biWidth = width, .biHeight = -height }, 0, &bits, null, 0) orelse return error.SkipZigTest;
+            return .{
+                .dc = dc,
+                .bitmap = bitmap,
+                .previous = sys.SelectObject(dc, bitmap),
+                .bits = bits orelse return error.SkipZigTest,
+                .width = width,
+                .height = height,
             };
-            return true;
         }
-        if (pointInRect(point, self.update_dismiss_rect)) {
-            self.app.dismissUpdateNotice();
-            return true;
+
+        fn deinit(self: BannerTestCanvas) void {
+            _ = sys.SelectObject(self.dc, self.previous);
+            _ = sys.DeleteObject(self.bitmap);
+            _ = sys.DeleteDC(self.dc);
         }
-        return false;
+
+        fn print(self: BannerTestCanvas, hwnd: HWND) void {
+            fillSolidRect(self.dc, .{ .left = 0, .top = 0, .right = self.width, .bottom = self.height }, untouched);
+            _ = sys.SendMessageW(hwnd, c.WM_PRINTCLIENT, @intFromPtr(self.dc), c.PRF_CLIENT);
+            _ = raw.GdiFlush();
+        }
+
+        /// The pixel at (x, y) as a COLORREF.
+        fn pixel(self: BannerTestCanvas, x: i32, y: i32) u32 {
+            const bgrx = self.bits[@intCast(y * self.width + x)];
+            return ((bgrx & 0xFF) << 16) | (bgrx & 0xFF00) | ((bgrx >> 16) & 0xFF);
+        }
+
+        /// Pixels in `rect` that are neither `background` nor untouched.
+        fn inked(self: BannerTestCanvas, rect: RECT, background: u32) usize {
+            var count: usize = 0;
+            var y = @max(0, rect.top);
+            while (y < @min(self.height, rect.bottom)) : (y += 1) {
+                var x = @max(0, rect.left);
+                while (x < @min(self.width, rect.right)) : (x += 1) {
+                    const value = self.pixel(x, y);
+                    if (value != background and value != untouched) count += 1;
+                }
+            }
+            return count;
+        }
+
+        fn untouchedCount(self: BannerTestCanvas) usize {
+            var count: usize = 0;
+            for (self.bits[0..@intCast(self.width * self.height)]) |value| {
+                if (value & 0xFFFFFF == 0xFF00FF) count += 1;
+            }
+            return count;
+        }
+    };
+
+    fn bannerTestVisible(hwnd: HWND) bool {
+        return (sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE) & c.WS_VISIBLE) != 0;
+    }
+
+    fn bannerTestClientRect(hwnd: HWND) !RECT {
+        var rect: RECT = undefined;
+        if (sys.GetClientRect(hwnd, &rect) == 0) return error.TestUnexpectedResult;
+        return rect;
+    }
+
+    fn bannerTestPress(host: *Host, button: BannerButton) void {
+        const banner = host.banner_hwnd.?;
+        const child = host.banner_buttons[@intFromEnum(button)].?;
+        const id: usize = 1914 + @as(usize, @intFromEnum(button));
+        _ = sys.SendMessageW(banner, c.WM_COMMAND, (c.BN_CLICKED << 16) | id, @bitCast(@intFromPtr(child)));
+    }
+
+    test "a banner shows above the terminal, at the right of its top rows, and paints itself" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        const banner = host.banner_hwnd.?;
+        const close_button = host.banner_buttons[@intFromEnum(BannerButton.dismiss)].?;
+
+        // Nothing to show: hidden, so F6 skips it.
+        host.layoutBanner(window.content, window.content.top);
+        try std.testing.expect(!bannerTestVisible(banner));
+        try std.testing.expectEqual(@as(?HWND, window.pane), sys.GetWindow(window.parent, c.GW_CHILD));
+
+        try host.setBanner(.err, "Not found.");
+        try std.testing.expect(bannerTestVisible(banner));
+        // Above the terminal, which would otherwise paint over it.
+        try std.testing.expectEqual(@as(?HWND, banner), sys.GetWindow(window.parent, c.GW_CHILD));
+        // Over the terminal's top rows, at their right end, so the start of
+        // the rows stays uncovered; the terminal keeps its size.
+        var banner_rect: RECT = undefined;
+        var pane_rect: RECT = undefined;
+        try std.testing.expect(sys.GetWindowRect(banner, &banner_rect) != 0);
+        try std.testing.expect(sys.GetWindowRect(window.pane, &pane_rect) != 0);
+        try std.testing.expectEqual(pane_rect.top, banner_rect.top);
+        try std.testing.expectEqual(pane_rect.right, banner_rect.right);
+        try std.testing.expect(banner_rect.left > pane_rect.left);
+        try std.testing.expectEqual(@as(i32, 32), banner_rect.bottom - banner_rect.top);
+        // A close button, nothing else.
+        try std.testing.expect(bannerTestVisible(close_button));
+        try std.testing.expect(!bannerTestVisible(host.banner_buttons[@intFromEnum(BannerButton.primary)].?));
+        // Opaque to the pointer, unlike the hit-transparent child it was.
+        const center_x: LPARAM = @divTrunc(banner_rect.left + banner_rect.right, 2);
+        const center_y: LPARAM = @divTrunc(banner_rect.top + banner_rect.bottom, 2);
+        try std.testing.expectEqual(@as(LRESULT, c.HTCLIENT), sys.SendMessageW(banner, c.WM_NCHITTEST, 0, (center_x & 0xFFFF) | ((center_y & 0xFFFF) << 16)));
+
+        const theme = &app.resolved_theme;
+        const background = bannerBackground(theme, isHighContrastActive());
+        for ([_]u32{ 96, 144, 192 }) |dpi| {
+            host.current_dpi = dpi;
+            host.layoutBanner(window.content, window.content.top);
+            const client = try bannerTestClientRect(banner);
+            try std.testing.expectEqual(host.scaled(chrome_layout.banner_height_base), client.bottom);
+            const parts = chrome_layout.hostBannerParts(client.right, client.bottom, .close, dpi);
+            const canvas = try BannerTestCanvas.init(client.right, client.bottom);
+            defer canvas.deinit();
+            canvas.print(banner);
+            // The banner owns every pixel of its rect.
+            try std.testing.expectEqual(@as(usize, 0), canvas.untouchedCount());
+            try std.testing.expectEqual(background, canvas.pixel(@divTrunc(client.right, 2), 0));
+            try std.testing.expectEqual(theme.error_fg, canvas.pixel(0, @divTrunc(client.bottom, 2)));
+            try std.testing.expect(canvas.inked(parts.text, background) > 0);
+            // The close button paints its glyph.
+            const close_client = try bannerTestClientRect(close_button);
+            const button_canvas = try BannerTestCanvas.init(close_client.right, close_client.bottom);
+            defer button_canvas.deinit();
+            button_canvas.print(close_button);
+            try std.testing.expectEqual(@as(usize, 0), button_canvas.untouchedCount());
+            try std.testing.expect(button_canvas.inked(close_client, background) > 0);
+        }
+
+        // High Contrast paints on the system colours themselves.
+        const saved_theme = app.resolved_theme;
+        defer app.resolved_theme = saved_theme;
+        app.resolved_theme = highContrastThemeFromSysColors();
+        const client = try bannerTestClientRect(banner);
+        const canvas = try BannerTestCanvas.init(client.right, client.bottom);
+        defer canvas.deinit();
+        host.paintBanner(canvas.dc, client, true);
+        const window_bg = sys.GetSysColor(c.COLOR_WINDOW);
+        try std.testing.expectEqual(window_bg, canvas.pixel(@divTrunc(client.right, 2), 0));
+        try std.testing.expectEqual(sys.GetSysColor(c.COLOR_WINDOWTEXT), canvas.pixel(0, @divTrunc(client.bottom, 2)));
+        try std.testing.expect(canvas.inked(chrome_layout.hostBannerParts(client.right, client.bottom, .close, host.current_dpi).text, window_bg) > 0);
+
+        // The close button dismisses the message and hides the banner.
+        bannerTestPress(&host, .dismiss);
+        try std.testing.expectEqual(@as(?[:0]const u8, null), host.banner_text);
+        try std.testing.expect(!bannerTestVisible(banner));
+    }
+
+    test "the update notice shows in the banner with its two buttons" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        const banner = host.banner_hwnd.?;
+        const primary = host.banner_buttons[@intFromEnum(BannerButton.primary)].?;
+        const dismiss = host.banner_buttons[@intFromEnum(BannerButton.dismiss)].?;
+        host.layoutBanner(window.content, window.content.top);
+
+        // Never press these here: Dismiss writes the real update state and
+        // Open Release starts a browser.
+        app.update_notice = try UpdateNotice.init(std.testing.allocator, "1.3.200", "https://example.invalid/release", false);
+        defer {
+            app.update_notice.?.deinit(std.testing.allocator);
+            app.update_notice = null;
+        }
+        host.updateNoticeChanged(true);
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(bannerTestVisible(primary));
+        try std.testing.expect(bannerTestVisible(dismiss));
+        var name_buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "Update available: noctty 1.3.200 is ready on GitHub Releases.",
+            bannerUiaName(@ptrCast(&host), 0, &name_buf),
+        );
+        try std.testing.expectEqualStrings(
+            "Open Release: Update available: noctty 1.3.200 is ready on GitHub Releases.",
+            bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.primary), &name_buf),
+        );
+        try std.testing.expectEqualStrings("Dismiss update notice", bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.dismiss), &name_buf));
+        // A staged update offers Install instead, in the label and the name.
+        app.update_notice.?.staged = true;
+        try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Install"), host.bannerButtonLabel(.primary));
+        try std.testing.expect(std.mem.startsWith(u8, bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.primary), &name_buf), "Install: "));
+        try std.testing.expectEqual(chrome_layout.BannerActions.update_staged, host.bannerActions());
+        app.update_notice.?.staged = false;
+        // Updates never count down.
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+
+        const background = bannerBackground(&app.resolved_theme, isHighContrastActive());
+        for ([_]HWND{ banner, primary, dismiss }) |hwnd| {
+            const client = try bannerTestClientRect(hwnd);
+            const canvas = try BannerTestCanvas.init(client.right, client.bottom);
+            defer canvas.deinit();
+            canvas.print(hwnd);
+            try std.testing.expect(canvas.inked(client, background) > 0);
+        }
+
+        // A message takes the banner's place while it is up, with a close
+        // button only, and closing it brings the notice back.
+        try host.setBanner(.info, "Layout saved.");
+        try std.testing.expectEqual(chrome_layout.BannerActions.close, host.bannerActions());
+        try std.testing.expect(!bannerTestVisible(primary));
+        try std.testing.expectEqualStrings("Close: Layout saved.", bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.dismiss), &name_buf));
+        // UIA Invoke is posted: one that lands while an overlay hides the
+        // banner does nothing.
+        host.overlay_mode = .tab_title;
+        bannerTestPress(&host, .dismiss);
+        try std.testing.expectEqualStrings("Layout saved.", host.banner_text.?);
+        host.overlay_mode = .none;
+        bannerTestPress(&host, .dismiss);
+        try std.testing.expectEqual(chrome_layout.BannerActions.update, host.bannerActions());
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(bannerTestVisible(primary));
+
+        // A notice an overlay keeps off screen is announced when it comes on.
+        host.overlay_mode = .tab_title;
+        host.updateNoticeChanged(true);
+        try std.testing.expect(!bannerTestVisible(banner));
+        try std.testing.expect(host.banner_announce_pending);
+        host.overlay_mode = .none;
+        host.syncBannerChild();
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(!host.banner_announce_pending);
+    }
+
+    /// Run `body` on a thread attached to a desktop of its own, where it can
+    /// show and minimize windows without touching the user's desktop
+    /// (AGENTS.md 2026-10-06; `SetThreadDesktop` needs a thread that owns
+    /// no window yet).
+    fn runOnPrivateDesktop(comptime body: anytype) !void {
+        const Desktop = struct {
+            extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+            extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+            extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+            fn run(desktop: *anyopaque, result: *anyerror!void) void {
+                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
+            }
+        };
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "noctty-banner-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+        defer std.testing.allocator.free(wide_name);
+        const desktop = Desktop.CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+        defer _ = Desktop.CloseDesktop(desktop);
+        var result: anyerror!void = {};
+        const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
+        thread.join();
+        return result;
+    }
+
+    test "an info banner counts down only while it is unread; errors stay" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(bannerCountdownTestBody);
+    }
+
+    fn bannerCountdownTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        host.layoutBanner(window.content, window.content.top);
+
+        // A window that is not shown yet: nothing counts down, whatever the
+        // cached `surfaces_visible` says.
+        try host.setBanner(.info, "Nothing to undo.");
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        host.refreshSurfaceVisibility();
+        const first = host.banner_expires_at orelse return error.TestExpectedCountdown;
+        try std.testing.expect(first >= sys.GetTickCount64() + 4000);
+        // The same message again starts it over.
+        host.banner_expires_at = 1;
+        try host.setBanner(.info, "Nothing to undo.");
+        try std.testing.expect(host.banner_expires_at.? >= first);
+
+        // Pointed at (the banner or its button) or focused, it waits; when
+        // that ends, it starts over.
+        host.bannerPointerMoved();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.bannerPointerLeft();
+        try std.testing.expect(host.banner_expires_at != null);
+        host.setHoveredButton(host.banner_buttons[@intFromEnum(BannerButton.dismiss)]);
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.setHoveredButton(null);
+        try std.testing.expect(host.banner_expires_at != null);
+        host.banner_focused = true;
+        host.syncBannerExpiry();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.banner_focused = false;
+        host.syncBannerExpiry();
+        try std.testing.expect(host.banner_expires_at != null);
+        // Minimized, hidden or cloaked, it waits too, and starts over when
+        // the window is back.
+        for ([_]i32{ c.SW_SHOWMINNOACTIVE, c.SW_HIDE }) |away| {
+            _ = sys.ShowWindow(window.parent, away);
+            host.refreshSurfaceVisibility();
+            try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+            _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+            if (sys.IsIconic(window.parent) != 0) _ = sys.ShowWindow(window.parent, c.SW_RESTORE);
+            host.refreshSurfaceVisibility();
+            try std.testing.expect(host.banner_expires_at != null);
+        }
+        host.surfaces_visible = false;
+        host.syncBannerExpiry();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.surfaces_visible = true;
+        host.syncBannerExpiry();
+        try std.testing.expect(host.banner_expires_at != null);
+
+        // A tick before the deadline (left over from an older countdown,
+        // or early) only re-arms.
+        host.bannerExpiryTick();
+        try std.testing.expectEqualStrings("Nothing to undo.", host.banner_text.?);
+        try std.testing.expect(host.banner_expires_at != null);
+        // A tick after the countdown stopped does nothing.
+        host.stopBannerExpiry();
+        host.bannerExpiryTick();
+        try std.testing.expect(host.banner_text != null);
+        // A tick at the deadline clears the message.
+        host.syncBannerExpiry();
+        host.banner_expires_at = 1;
+        host.bannerExpiryTick();
+        try std.testing.expectEqual(@as(?[:0]const u8, null), host.banner_text);
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+
+        // Errors stay until dismissed, and a later info message is not
+        // cleared by the error's (absent) countdown.
+        try host.setBanner(.err, "Layout could not be saved.");
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        try host.setBanner(.info, "Layout saved.");
+        try std.testing.expect(host.banner_expires_at != null);
     }
 
     fn setOverlayDefaultBanner(self: *Host, mode: HostOverlayMode) !void {
@@ -16702,10 +17624,10 @@ const Host = struct {
 
     fn bannerUiaName(ctx: *anyopaque, _: usize, buf: []u8) []const u8 {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        return if (self.banner_text) |text|
-            std.fmt.bufPrint(buf, "{s}", .{text}) catch "Notification"
-        else
-            "";
+        if (self.banner_text) |text| return std.fmt.bufPrint(buf, "{s}", .{text}) catch "Notification";
+        const notice = self.app.update_notice orelse return "";
+        const message = notice.message_text orelse return "";
+        return std.fmt.bufPrint(buf, "{s}", .{message}) catch "Update available";
     }
 
     /// UIA name for the confirm title. Reports the text the control was
@@ -17000,11 +17922,13 @@ const Host = struct {
         }
 
         if (self.banner_hwnd == null) {
+            // Painted by `paintBanner` from `hostBannerProc`; shown, placed
+            // and raised above the terminal by `layoutBanner`.
             self.banner_hwnd = sys.CreateWindowExW(
-                c.WS_EX_LAYERED | c.WS_EX_TRANSPARENT,
+                0,
                 prompt_label_class,
                 std.unicode.utf8ToUtf16LeStringLiteral(""),
-                c.WS_CHILD | c.SS_OWNERDRAW,
+                c.WS_CHILD | c.WS_CLIPSIBLINGS | c.WS_CLIPCHILDREN | c.SS_OWNERDRAW,
                 0,
                 0,
                 1,
@@ -17014,7 +17938,6 @@ const Host = struct {
                 self.app.hinstance,
                 null,
             ) orelse return lastError();
-            _ = sys.SetLayeredWindowAttributes(self.banner_hwnd.?, 0, 0, c.LWA_ALPHA);
             _ = sys.SetWindowLongPtrW(
                 self.banner_hwnd.?,
                 c.GWLP_USERDATA,
@@ -17030,10 +17953,37 @@ const Host = struct {
                 .ctx = @ptrCast(self),
                 .role = .live_text,
                 .name = &bannerUiaName,
-                // The focus-region cycle can land on the banner, so it is
-                // keyboard focusable even though it is not interactive.
-                .keyboard_focusable = true,
             });
+        }
+        // Real buttons, so the keyboard, UIA Invoke and voice control reach
+        // them like any other; F6 lands on the first one shown. Outside the
+        // banner's own guard, so one that failed to be created is retried.
+        if (self.banner_hwnd) |banner| {
+            for (&self.banner_buttons, &self.banner_button_uia_providers, 0..) |*slot, *provider, i| {
+                if (slot.* != null) continue;
+                const button = sys.CreateWindowExW(
+                    0,
+                    prompt_button_class,
+                    std.unicode.utf8ToUtf16LeStringLiteral(""),
+                    c.WS_CHILD | c.WS_TABSTOP | c.BS_OWNERDRAW,
+                    0,
+                    0,
+                    1,
+                    1,
+                    banner,
+                    @ptrFromInt(1914 + i),
+                    self.app.hinstance,
+                    null,
+                ) orelse return lastError();
+                slot.* = button;
+                self.subclassButton(button, &hostButtonProc, &self.chrome_button_prev_proc);
+                provider.* = self.createChromeUiaProvider(button, .{
+                    .ctx = @ptrCast(self),
+                    .role = .button,
+                    .tag = i,
+                    .name = &bannerButtonUiaName,
+                });
+            }
         }
     }
 
@@ -17189,6 +18139,9 @@ const Host = struct {
         if (restore_terminal_focus) {
             refocusActiveSurface(self);
         }
+        // `setBanner(.none, null)` above does nothing when only the update
+        // notice is up, and not every caller relayouts after this.
+        self.syncBannerChild();
     }
 
     fn invalidateOverlayTransitionPlacementCache(self: *Host) void {
@@ -17791,6 +18744,8 @@ const Host = struct {
                 surface.applySearchBarFont(font);
             }
         }
+        // The banner is sized to its line in this font.
+        self.placeBanner(true);
     }
 
     fn ensureSearchTimer(self: *Host) void {
@@ -18161,7 +19116,7 @@ const Host = struct {
             .terminal = terminal_available,
             .tab_strip = self.tabStripFocusHwnd() != null,
             .search = self.searchFocusHwnd() != null,
-            .banner = focusableHwnd(self.banner_hwnd) != null,
+            .banner = self.bannerFocusHwnd() != null,
         };
     }
 
@@ -18189,7 +19144,7 @@ const Host = struct {
             .terminal => if (self.activeSurface()) |surface| surface.hwnd else null,
             .tab_strip => self.tabStripFocusHwnd(),
             .search => self.searchFocusHwnd(),
-            .banner => focusableHwnd(self.banner_hwnd),
+            .banner => self.bannerFocusHwnd(),
         };
     }
 
@@ -18207,7 +19162,7 @@ const Host = struct {
         if (self.tabIndexForButton(child) != null) return .tab_strip;
         if (self.new_tab_hwnd) |hwnd| if (hwnd == child) return .tab_strip;
         if (self.overflow_hwnd) |hwnd| if (hwnd == child) return .tab_strip;
-        if (self.banner_hwnd) |hwnd| if (hwnd == child) return .banner;
+        if (self.bannerButtonOf(child) != null) return .banner;
         if (self.searchControlSurface(child) != null) return .search;
         return null;
     }
@@ -18312,6 +19267,7 @@ const Host = struct {
     fn chromeUiaProviderForHwnd(self: *Host, child: HWND) ?*win32_uia.ChromeControlProvider {
         if (self.new_tab_hwnd == child) return self.new_tab_uia_provider;
         if (self.overflow_hwnd == child) return self.overflow_uia_provider;
+        if (self.bannerButtonOf(child)) |button| return self.banner_button_uia_providers[@intFromEnum(button)];
         const surface = self.searchControlSurface(child) orelse return null;
         const role = surface.searchBarButtonRole(child) orelse return null;
         return surface.search_bar_button_uia_providers[@intFromEnum(role)];
@@ -19872,11 +20828,6 @@ const Host = struct {
         self.repaintStatusBar();
     }
 
-    fn invalidateBannerText(self: *Host) void {
-        self.chrome_text_dirty.banner = true;
-        self.repaintTopChrome();
-    }
-
     fn invalidateOverlayText(self: *Host) void {
         self.chrome_text_dirty.overlay = true;
         self.repaintTopChrome();
@@ -20048,7 +20999,6 @@ const Host = struct {
         self.chrome_text_dirty.markAll();
         if (self.cached_status_w) |w| alloc.free(w);
         if (self.cached_detail_w) |w| alloc.free(w);
-        if (self.cached_banner_w) |w| alloc.free(w);
         if (self.cached_inspector_title_w) |w| alloc.free(w);
         if (self.cached_inspector_hint_w) |w| alloc.free(w);
         if (self.cached_overlay_paint_badge_w) |w| alloc.free(w);
@@ -20061,7 +21011,6 @@ const Host = struct {
         }
         self.cached_status_w = null;
         self.cached_detail_w = null;
-        self.cached_banner_w = null;
         self.cached_inspector_title_w = null;
         self.cached_inspector_hint_w = null;
         self.cached_overlay_paint_badge_w = null;
@@ -20374,28 +21323,6 @@ const Host = struct {
             } else {
                 changed.* = applyChildVisibility(container_hwnd, &self.tab_container_placement, false) or changed.*;
             }
-        }
-
-        // The banner is painted text with no control of its own, so its
-        // provider lives on an invisible child. Track the painted row (same
-        // offsets `paintChrome` uses) so position and touch navigation land
-        // on the banner instead of at the window origin. Visibility stays
-        // owned by `setBanner`.
-        if (self.banner_hwnd) |banner_hwnd| {
-            const overlay_offset: i32 = if (self.overlay_mode == .none) 0 else self.scaled(host_overlay_height);
-            const inspector_offset: i32 = if (self.inspectorPanelVisible()) self.scaled(host_inspector_panel_height) else 0;
-            const banner_y: i32 = self.tabBarHeight() + overlay_offset + inspector_offset + self.scaled(2);
-            const banner_x = self.scaled(16);
-            changed.* = applyChromeChildRect(
-                banner_hwnd,
-                &self.banner_placement,
-                childRect(
-                    banner_x,
-                    banner_y,
-                    @max(1, width - banner_x),
-                    self.scaled(24),
-                ),
-            ) or changed.*;
         }
 
         // Right-side cluster: [+][▾] — new tab and dropdown chevron.
@@ -20801,8 +21728,12 @@ const Host = struct {
             .bottom = content_rect.bottom,
         };
         const search_bar_height = self.scaled(host_search_bar_height);
-        const active_tab = self.activeTab() orelse return;
+        // A host whose last tab is detached for undo still shows its banner.
+        const active_tab = self.activeTab() orelse return self.layoutBanner(content_rect, content_rect.top);
         var content_layout_changed = false;
+        // The banner goes below a docked search frame at the top of the
+        // content area rather than over the search field.
+        var banner_top = content_rect.top;
 
         // Hide non-active child GL surfaces before showing the active tab.
         // Briefly overlapping multiple WGL child windows under one host can
@@ -20827,6 +21758,7 @@ const Host = struct {
                             layoutRectToWin32(search_frame_rect),
                             true,
                         )) or content_layout_changed;
+                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
                     } else {
                         content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
                     }
@@ -20877,6 +21809,7 @@ const Host = struct {
                             layoutRectToWin32(search_frame_rect),
                             true,
                         )) or content_layout_changed;
+                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
                     } else {
                         content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
                     }
@@ -20898,6 +21831,7 @@ const Host = struct {
                 entry.view.syncContentScaleToHostDpi();
             }
         }
+        self.layoutBanner(content_rect, banner_top);
 
         if (chrome_layout_changed or content_layout_changed) {
             // Batch-invalidate after actual positioning/visibility changes.
@@ -21700,264 +22634,6 @@ const Host = struct {
         _ = sys.SetTextColor(hdc, theme.text_primary);
     }
 
-    fn paintChromeBanner(
-        self: *Host,
-        hwnd: HWND,
-        hdc: HDC,
-        alloc: Allocator,
-        client_rect: RECT,
-        banner_y: i32,
-        inspector_panel_visible: bool,
-        paint_top: bool,
-        theme: *const ThemeColors,
-    ) bool {
-        const explicit_banner_text: ?[]const u8 = if (self.overlay_mode == .none)
-            self.banner_text
-        else
-            null;
-        const paint_inspector_banner = blk: {
-            if (!paint_top) break :blk false;
-            if (self.overlay_mode != .none) break :blk false;
-            if (self.banner_text != null) break :blk false;
-            if (inspector_panel_visible) break :blk false;
-            break :blk self.activeTabHasInspector();
-        };
-        const banner_kind: HostBannerKind = if (explicit_banner_text != null)
-            self.banner_kind
-        else if (paint_inspector_banner)
-            .info
-        else
-            .none;
-        const paint_update_notice = paint_top and
-            self.overlay_mode == .none and
-            !inspector_panel_visible and
-            self.banner_text == null and
-            self.app.update_notice != null;
-        if (paint_top and self.chrome_text_dirty.banner) {
-            if (self.cached_banner_w) |old| alloc.free(old);
-            self.cached_banner_w = null;
-
-            if (paint_update_notice) {
-                if (self.app.update_notice) |notice| {
-                    if (notice.message_text) |message| {
-                        self.cached_banner_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, message) catch return false;
-                    }
-                }
-            } else if (explicit_banner_text) |value| {
-                const full = buildHostBannerText(alloc, banner_kind, value) catch return false;
-                defer alloc.free(full);
-                self.cached_banner_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, full) catch return false;
-            } else if (paint_inspector_banner) {
-                if (self.activeSurface()) |surface| {
-                    const host_status = self.app.hostTabStatus(surface);
-                    const pane_count = if (self.activeTab()) |tab| tab.leafCount() else 1;
-                    const value = buildInspectorBannerText(
-                        alloc,
-                        host_status,
-                        pane_count,
-                        if (self.activeTab()) |tab| tab.tree.zoomed != null else false,
-                    ) catch return false;
-                    defer alloc.free(value);
-                    const full = buildHostBannerText(alloc, banner_kind, value) catch return false;
-                    defer alloc.free(full);
-                    self.cached_banner_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, full) catch return false;
-                }
-            }
-            self.chrome_text_dirty.banner = false;
-        }
-        const dwrite_banner_painted = if (paint_top) blk: {
-            const text: []const u16 = if (explicit_banner_text != null)
-                if (self.cached_banner_w) |value| value else &.{}
-            else
-                &.{};
-            const color = switch (banner_kind) {
-                .none => theme.text_primary,
-                .info => theme.info_fg,
-                .err => theme.error_fg,
-            };
-            const rendered = self.app.renderShellChromeText(hwnd, .{
-                .text = text,
-                .left_px = self.scaled(16),
-                .top_px = banner_y,
-                .right_px = @max(self.scaled(16), client_rect.right - self.scaled(16)),
-                .bottom_px = banner_y + self.scaled(24),
-                .color_ref = color,
-            });
-            break :blk rendered and text.len > 0;
-        } else false;
-        if (paint_top) self.clearUpdateActionRects();
-        if (paint_top and self.overlay_mode == .none and !inspector_panel_visible and self.banner_text == null) {
-            if (self.app.update_notice) |notice| {
-                const open_label = if (notice.staged)
-                    std.unicode.utf8ToUtf16LeStringLiteral("Install")
-                else
-                    std.unicode.utf8ToUtf16LeStringLiteral("Open Release");
-                const dismiss_label = std.unicode.utf8ToUtf16LeStringLiteral("Dismiss");
-                const button_height = self.scaled(22);
-                const dismiss_width = self.scaled(72);
-                const open_width = if (notice.staged) self.scaled(86) else self.scaled(102);
-                const button_gap = self.scaled(8);
-                const dismiss_rect = RECT{
-                    .left = client_rect.right - dismiss_width - self.scaled(16),
-                    .top = banner_y - self.scaled(4),
-                    .right = client_rect.right - self.scaled(16),
-                    .bottom = banner_y - self.scaled(4) + button_height,
-                };
-                const open_rect = RECT{
-                    .left = dismiss_rect.left - open_width - button_gap,
-                    .top = dismiss_rect.top,
-                    .right = dismiss_rect.left - button_gap,
-                    .bottom = dismiss_rect.bottom,
-                };
-                self.update_open_rect = open_rect;
-                self.update_dismiss_rect = dismiss_rect;
-
-                const text_right = @max(self.scaled(120), open_rect.left - self.scaled(10));
-                var text_rect = RECT{
-                    .left = self.scaled(16),
-                    .top = banner_y - self.scaled(2),
-                    .right = text_right,
-                    .bottom = banner_y + button_height,
-                };
-
-                _ = sys.SetTextColor(hdc, theme.info_fg);
-                if (self.cached_banner_w) |banner_w| {
-                    drawTextWz(
-                        hdc,
-                        banner_w,
-                        &text_rect,
-                        c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX | c.DT_END_ELLIPSIS,
-                    );
-                }
-
-                drawRoundedRect(
-                    hdc,
-                    open_rect,
-                    themeSurface(theme, .update_open_bg),
-                    theme.info_fg,
-                    self.scaled(5),
-                );
-                drawRoundedRect(
-                    hdc,
-                    dismiss_rect,
-                    themeSurface(theme, .update_dismiss_bg),
-                    theme.chrome_border,
-                    self.scaled(5),
-                );
-
-                _ = sys.SetTextColor(hdc, theme.text_primary);
-                var open_text_rect = open_rect;
-                open_text_rect.left += self.scaled(6);
-                open_text_rect.right -= self.scaled(6);
-                var dismiss_text_rect = dismiss_rect;
-                dismiss_text_rect.left += self.scaled(6);
-                dismiss_text_rect.right -= self.scaled(6);
-                _ = sys.DrawTextW(
-                    hdc,
-                    open_label,
-                    @intCast(std.mem.sliceTo(open_label, 0).len),
-                    &open_text_rect,
-                    c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
-                );
-                _ = sys.DrawTextW(
-                    hdc,
-                    dismiss_label,
-                    @intCast(std.mem.sliceTo(dismiss_label, 0).len),
-                    &dismiss_text_rect,
-                    c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
-                );
-            } else if (paint_inspector_banner) {
-                _ = sys.SetTextColor(hdc, switch (banner_kind) {
-                    .none => theme.text_primary,
-                    .info => theme.info_fg,
-                    .err => theme.error_fg,
-                });
-                if (self.cached_banner_w) |banner_w| {
-                    textOutWz(hdc, self.scaled(16), banner_y, banner_w);
-                }
-            }
-        } else if (explicit_banner_text != null and !dwrite_banner_painted) {
-            _ = sys.SetTextColor(hdc, switch (banner_kind) {
-                .none => theme.text_primary,
-                .info => theme.info_fg,
-                .err => theme.error_fg,
-            });
-            if (self.cached_banner_w) |banner_w| {
-                textOutWz(hdc, self.scaled(16), banner_y, banner_w);
-            }
-        }
-        _ = sys.SetTextColor(hdc, theme.text_primary);
-        return true;
-    }
-
-    test "paintChromeBanner draws an explicit banner with GDI while the shell compositor is stopped" {
-        if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-        var core_app: CoreApp = undefined;
-        var app: App = undefined;
-        var host: Host = undefined;
-        var session: TestSession = .{};
-        try session.init(.{
-            .core_app = &core_app,
-            .app = &app,
-            .hosts = &.{.{ .storage = &host }},
-        });
-        defer session.deinit();
-        // `TestSession` gives the backend no driver, as `App.init` does. Mark
-        // it initialized so `renderShellChromeText` consults it, as it does
-        // there. That `App.init` really leaves it this way is pinned by
-        // "App.init leaves the shell compositor stopped ...".
-        app.shell_compositor_initialized = true;
-
-        const raw = struct {
-            extern "user32" fn GetDC(hwnd: ?*anyopaque) callconv(.winapi) HDC;
-            extern "user32" fn ReleaseDC(hwnd: ?*anyopaque, hdc: HDC) callconv(.winapi) i32;
-            extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) callconv(.winapi) HGDIOBJ;
-            extern "gdi32" fn GetPixel(hdc: HDC, x: i32, y: i32) callconv(.winapi) u32;
-        };
-        const width = 360;
-        const height = 80;
-        const banner_y = 10;
-        const screen = raw.GetDC(null) orelse return error.SkipZigTest;
-        defer _ = raw.ReleaseDC(null, screen);
-        const memory = sys.CreateCompatibleDC(screen) orelse return error.SkipZigTest;
-        defer _ = sys.DeleteDC(memory);
-        const bitmap = raw.CreateCompatibleBitmap(screen, width, height) orelse return error.SkipZigTest;
-        defer _ = sys.DeleteObject(bitmap);
-        const previous = sys.SelectObject(memory, bitmap);
-        defer _ = sys.SelectObject(memory, previous);
-
-        const rect = RECT{ .left = 0, .top = 0, .right = width, .bottom = height };
-        const black = sys.CreateSolidBrush(0) orelse return error.SkipZigTest;
-        defer _ = sys.DeleteObject(black);
-        _ = sys.FillRect(memory, &rect, black);
-        _ = sys.SetBkMode(memory, c.TRANSPARENT);
-
-        const Counter = struct {
-            fn lit(dc: HDC) usize {
-                var count: usize = 0;
-                var y: i32 = banner_y;
-                while (y < banner_y + 24) : (y += 1) {
-                    var x: i32 = 0;
-                    while (x < width) : (x += 1) {
-                        if (raw.GetPixel(dc, x, y) != 0) count += 1;
-                    }
-                }
-                return count;
-            }
-        };
-        try std.testing.expectEqual(@as(usize, 0), Counter.lit(memory));
-
-        const alloc = std.testing.allocator;
-        try host.setBanner(.info, "Nothing to undo.");
-        defer if (host.cached_banner_w) |text| alloc.free(text);
-        host.chrome_text_dirty.banner = true;
-
-        const hwnd: HWND = @ptrFromInt(0x1000);
-        try std.testing.expect(host.paintChromeBanner(hwnd, memory, alloc, rect, banner_y, false, true, &app.resolved_theme));
-        try std.testing.expect(Counter.lit(memory) > 0);
-    }
-
     fn paintChromeStatusBar(
         self: *Host,
         hdc: HDC,
@@ -22260,7 +22936,6 @@ const Host = struct {
         const paint_top = paintRectVisible(hdc, ps.rcPaint, top_rect);
         const paint_content = paintRectVisible(hdc, ps.rcPaint, content_rect);
         const paint_status = paintRectVisible(hdc, ps.rcPaint, status_rect);
-        const banner_y: i32 = bands.content_top + self.scaled(2);
 
         self.paintChromeTabBar(hdc, client_rect, tab_h, bands.overlay_top, paint_top, theme);
         if (!self.paintChromeOverlay(hdc, alloc, client_rect, tab_h, bands, paint_top, theme)) return;
@@ -22284,16 +22959,6 @@ const Host = struct {
             paint_status,
             theme,
         );
-        if (!self.paintChromeBanner(
-            hwnd,
-            hdc,
-            alloc,
-            client_rect,
-            banner_y,
-            inspector_panel_visible,
-            paint_top,
-            theme,
-        )) return;
         if (status_h <= 0) {
             self.chrome_repaint_dirty = false;
             return;
@@ -22777,6 +23442,11 @@ fn restoreTerminalUndoState(
 }
 
 const HostBannerKind = labels.HostBannerKind;
+
+/// A button of the host banner: `primary` is Open Release or Install on the
+/// update notice; `dismiss` is Dismiss there and the close button otherwise.
+const BannerButton = enum(u1) { primary, dismiss };
+
 const LaunchTargetButtonKeyAction = labels.LaunchTargetButtonKeyAction;
 const ProfileOpenTarget = labels.ProfileOpenTarget;
 
@@ -26085,8 +26755,6 @@ const buildHostBannerText = labels.buildHostBannerText;
 
 const overlayPaintCacheDirty = labels.overlayPaintCacheDirty;
 
-const buildInspectorBannerText = labels.buildInspectorBannerText;
-
 const buildInspectorPanelTitleText = labels.buildInspectorPanelTitleText;
 
 const buildInspectorPanelHintText = labels.buildInspectorPanelHintText;
@@ -26662,22 +27330,137 @@ fn tabContainerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callc
     return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+const BannerKey = enum { ignore, press, dismiss, other_button };
+
+/// What a key does on a focused banner button, or null when the button
+/// leaves it to the focus-region keys (F6, and Escape on the update notice,
+/// which goes back to the terminal: Dismiss records that version as
+/// dismissed, so it takes a deliberate press). Space is the BUTTON's own:
+/// it clicks on release. A held Enter or Escape repeats, and a repeat must
+/// not press whatever button the first press left focused.
+fn bannerButtonKey(has_message: bool, vk: WPARAM, repeat: bool) ?BannerKey {
+    return switch (vk) {
+        c.VK_RETURN => if (repeat) .ignore else .press,
+        c.VK_ESCAPE => if (!has_message) null else if (repeat) .ignore else .dismiss,
+        c.VK_TAB, c.VK_LEFT, c.VK_RIGHT => .other_button,
+        else => null,
+    };
+}
+
+test "bannerButtonKey presses once, closes a message on Escape and leaves the notice's Escape alone" {
+    try std.testing.expectEqual(@as(?BannerKey, .press), bannerButtonKey(true, c.VK_RETURN, false));
+    try std.testing.expectEqual(@as(?BannerKey, .press), bannerButtonKey(false, c.VK_RETURN, false));
+    try std.testing.expectEqual(@as(?BannerKey, .ignore), bannerButtonKey(false, c.VK_RETURN, true));
+    try std.testing.expectEqual(@as(?BannerKey, .dismiss), bannerButtonKey(true, c.VK_ESCAPE, false));
+    try std.testing.expectEqual(@as(?BannerKey, .ignore), bannerButtonKey(true, c.VK_ESCAPE, true));
+    try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(false, c.VK_ESCAPE, false));
+    for ([_]WPARAM{ c.VK_TAB, c.VK_LEFT, c.VK_RIGHT }) |vk| {
+        try std.testing.expectEqual(@as(?BannerKey, .other_button), bannerButtonKey(false, vk, false));
+    }
+    try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(true, c.VK_SPACE, false));
+    try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(true, c.VK_F6, false));
+}
+
+/// How long an `.info` banner stays up, in milliseconds: the system's
+/// notification time (`SPI_GETMESSAGEDURATION`), which Settings offers from
+/// 5 seconds to 5 minutes and defaults to 5.
+fn bannerMessageDurationMs() UINT {
+    var seconds: u32 = 0;
+    if (sys.SystemParametersInfoW(c.SPI_GETMESSAGEDURATION, 0, @ptrCast(&seconds), 0) == 0) seconds = 0;
+    return std.math.clamp(seconds, 5, 300) * std.time.ms_per_s;
+}
+
+/// Mouse on a banner button, or null for a message it leaves alone. The
+/// BUTTON class takes keyboard focus on a press. A banner button must not:
+/// every click would pull focus, and the focus reports a program asked for,
+/// off the terminal, and a press dragged off before the release would leave
+/// focus on the button. So the press, capture and click are done here.
+fn bannerButtonMouse(host: *Host, hwnd: HWND, button: BannerButton, msg: UINT, lParam: LPARAM) ?LRESULT {
+    switch (msg) {
+        c.WM_LBUTTONDOWN, c.WM_LBUTTONDBLCLK => {
+            _ = sys.SetCapture(hwnd);
+            _ = sys.SendMessageW(hwnd, c.BM_SETSTATE, 1, 0);
+            return 0;
+        },
+        c.WM_LBUTTONUP => {
+            if (sys.GetCapture() != hwnd) return 0;
+            var client: RECT = undefined;
+            const inside = sys.GetClientRect(hwnd, &client) != 0 and pointInRect(.{
+                .x = signedLowWord(lParamBits(lParam)),
+                .y = signedHighWord(lParamBits(lParam)),
+            }, client);
+            // `WM_CAPTURECHANGED` clears the pressed look.
+            _ = sys.ReleaseCapture();
+            // May destroy every window (Install): touch nothing after.
+            if (inside) host.activateBannerButton(button);
+            return 0;
+        },
+        c.WM_CAPTURECHANGED => {
+            _ = sys.SendMessageW(hwnd, c.BM_SETSTATE, 0, 0);
+            return 0;
+        },
+        else => return null,
+    }
+}
+
 fn hostBannerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     if (getHost(hwnd)) |host| {
-        if (msg == c.WM_GETOBJECT) {
-            if (host.banner_uia_provider) |provider| {
-                if (win32_uia.returnChromeControlProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
-            }
-        }
-        if (msg == c.WM_NCHITTEST) return c.HTTRANSPARENT;
-        // The banner is hit-transparent and painted by the host, so it
-        // only ever receives keys through the focus-region cycle.
-        if (msg == c.WM_SETFOCUS) {
-            if (host.banner_uia_provider) |provider| provider.raiseFocusChanged();
-        }
-        if (msg == c.WM_KEYDOWN) {
-            host.noteChromeKeyInput(wParam);
-            if (host.handleFocusRegionKey(hwnd, wParam, true)) return 0;
+        switch (msg) {
+            c.WM_GETOBJECT => {
+                if (host.banner_uia_provider) |provider| {
+                    if (win32_uia.returnChromeControlProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
+                }
+            },
+            // Opaque, so it answers for its own rect, except where the
+            // resize edges of a frameless window reach into it, as the
+            // terminal pane does.
+            c.WM_NCHITTEST => return if (host.resizesFrom(lParam)) c.HTTRANSPARENT else c.HTCLIENT,
+            c.WM_SETCURSOR => {
+                if ((lParamBits(lParam) & 0xFFFF) == c.HTCLIENT) {
+                    _ = sys.SetCursor(sys.LoadCursorW(null, c.IDC_ARROW));
+                    return 1;
+                }
+            },
+            c.WM_ERASEBKGND => return 1,
+            c.WM_PAINT => {
+                var ps: PAINTSTRUCT = undefined;
+                const hdc = sys.BeginPaint(hwnd, &ps) orelse return 0;
+                defer _ = sys.EndPaint(hwnd, &ps);
+                var client: RECT = undefined;
+                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                return 0;
+            },
+            c.WM_PRINTCLIENT => {
+                const hdc: HDC = @ptrFromInt(wParam);
+                var client: RECT = undefined;
+                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                return 0;
+            },
+            c.WM_MOUSEMOVE => {
+                host.bannerPointerMoved();
+                return 0;
+            },
+            c.WM_MOUSELEAVE => {
+                host.bannerPointerLeft();
+                return 0;
+            },
+            // The banner's buttons are its own children, so their owner
+            // draw and their clicks (and UIA Invoke, which posts the same
+            // command) come here.
+            c.WM_DRAWITEM => {
+                const draw: *const DRAWITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (host.drawBannerButton(draw)) return 1;
+            },
+            c.WM_COMMAND => {
+                const child: ?HWND = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (((wParam >> 16) & 0xFFFF) == c.BN_CLICKED) {
+                    if (host.bannerButtonOf(child)) |button| {
+                        host.activateBannerButton(button);
+                        return 0;
+                    }
+                }
+            },
+            else => {},
         }
         if (host.banner_prev_proc) |previous| return sys.CallWindowProcW(previous, hwnd, msg, wParam, lParam);
     }
@@ -26880,6 +27663,10 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         if (msg == c.WM_LBUTTONDOWN or msg == c.WM_RBUTTONDOWN or msg == c.WM_MBUTTONDOWN) {
             v.noteChromePointerInput();
         }
+        if (v.bannerButtonOf(hwnd)) |button| {
+            // May destroy every window (Install): touch nothing after.
+            if (bannerButtonMouse(v, hwnd, button, msg, lParam)) |result| return result;
+        }
         switch (v.button_tooltip.apply(buttonTooltipAction(msg, wParam), hwnd)) {
             .none => {},
             .present => v.showSearchButtonTooltip(hwnd),
@@ -26889,6 +27676,12 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // docked search controls. Overlay buttons are deliberately
         // excluded: they belong to a modal overlay, not to the window's
         // focus-region cycle.
+        if (msg == c.WM_KEYDOWN) {
+            if (v.bannerButtonOf(hwnd)) |button| {
+                // May destroy every window (Install): touch nothing after.
+                if (v.handleBannerButtonKey(hwnd, button, wParam, lParam)) return 0;
+            }
+        }
         if (msg == c.WM_KEYDOWN and !v.isOverlayButton(hwnd)) {
             // The docked search buttons already own Escape (it dismisses
             // the search), so only F6 is taken from them here.
@@ -26951,6 +27744,10 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         }
         switch (msg) {
             c.WM_SETFOCUS => {
+                if (v.bannerButtonOf(hwnd) != null) {
+                    v.banner_focused = true;
+                    v.syncBannerExpiry();
+                }
                 if (v.searchControlSurface(hwnd)) |surface| {
                     v.app.activateSurfaceNoFocus(surface);
                 }
@@ -26960,6 +27757,10 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             },
             c.WM_KILLFOCUS => {
                 v.setFocusedQuickSlot(null);
+                if (v.bannerButtonOf(hwnd) != null) {
+                    v.banner_focused = false;
+                    v.syncBannerExpiry();
+                }
             },
             c.WM_MOUSEMOVE => {
                 // The search bar's icon buttons also arm TME_HOVER, as the tab
@@ -27593,6 +28394,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             }
             if (wParam == c.RESIZE_SETTLE_TIMER_ID) {
                 if (host) |v| v.tickResizeSettleRepaint();
+                return 0;
+            }
+            if (wParam == c.BANNER_TIMER_ID) {
+                if (host) |v| v.bannerExpiryTick();
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -28242,9 +29047,6 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     .x = signedLowWord(lParamBits(lParam)),
                     .y = signedHighWord(lParamBits(lParam)),
                 };
-                if (msg == c.WM_LBUTTONUP and v.handleUpdateNoticeClick(point)) {
-                    return 0;
-                }
                 if (v.quickSlotProfileIndexAtPoint(point)) |profile_index| {
                     _ = v.setSelectedProfileIndex(profile_index) catch return 0;
                     const open_target = switch (msg) {
