@@ -339,8 +339,8 @@ pub const ScreenSearch = struct {
         SearchComplete,
     };
 
-    /// Make incremental progress on the search without accessing any
-    /// screen state (so no lock is required).
+    /// Make incremental progress. The caller protects screen-owned pins
+    /// during failure cleanup; background callers use tickWithMutex instead.
     ///
     /// This will return error.FeedRequired if the search cannot make progress
     /// without being fed more data. In this case, the caller should call
@@ -350,9 +350,16 @@ pub const ScreenSearch = struct {
     /// This is to signal to the caller that it can move to a more efficient
     /// sleep/wait state until there is more work to do (e.g. new data to feed).
     pub fn tick(self: *ScreenSearch) TickError!void {
+        return self.tickWithMutex(null);
+    }
+
+    /// Scan copied data without the terminal lock, acquiring it only when
+    /// a matcher failure must release screen-owned tracked pins. A null
+    /// mutex means the caller already protects the screen (as in searchAll).
+    pub fn tickWithMutex(self: *ScreenSearch, mutex: ?*std.Thread.Mutex) TickError!void {
         switch (self.state) {
-            .active => try self.tickActive(),
-            .history => try self.tickHistory(),
+            .active => try self.tickActive(mutex),
+            .history => try self.tickHistory(mutex, PageListSearch.next, ScreenSearch.failSearch),
             .history_feed => return error.FeedRequired,
             .complete => return error.SearchComplete,
         }
@@ -450,7 +457,7 @@ pub const ScreenSearch = struct {
         }
     }
 
-    fn tickActive(self: *ScreenSearch) Allocator.Error!void {
+    fn tickActive(self: *ScreenSearch, mutex: ?*std.Thread.Mutex) Allocator.Error!void {
         // For the active area, we consume the entire search in one go
         // because the active area is generally small.
         const alloc = self.allocator();
@@ -459,6 +466,8 @@ pub const ScreenSearch = struct {
             const hl = self.active.next() catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("error searching active area err={}", .{err});
+                if (mutex) |lock| lock.lock();
+                defer if (mutex) |lock| lock.unlock();
                 self.failSearch();
                 return;
             } orelse break;
@@ -476,7 +485,12 @@ pub const ScreenSearch = struct {
         self.state = .history;
     }
 
-    fn tickHistory(self: *ScreenSearch) Allocator.Error!void {
+    fn tickHistory(
+        self: *ScreenSearch,
+        mutex: ?*std.Thread.Mutex,
+        comptime next: anytype,
+        comptime cleanup: anytype,
+    ) Allocator.Error!void {
         const history: *HistorySearch = if (self.history) |*h| h else {
             // No history to search, we're done.
             self.state = .complete;
@@ -488,10 +502,12 @@ pub const ScreenSearch = struct {
         const alloc = self.allocator();
         var appended = false;
         while (true) {
-            const hl = history.searcher.next() catch |err| {
+            const hl = next(&history.searcher) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("error searching history err={}", .{err});
-                self.failSearch();
+                if (mutex) |lock| lock.lock();
+                defer if (mutex) |lock| lock.unlock();
+                cleanup(self);
                 return;
             } orelse break;
 
@@ -739,14 +755,14 @@ pub const ScreenSearch = struct {
         switch (self.state) {
             // If we're in the active state we run a normal tick so
             // we can move into a better state.
-            .active => try self.tickActive(),
+            .active => try self.tickActive(null),
 
             // Otherwise, just tick it and move back to whatever state
             // we were in.
             else => {
                 const old_state = self.state;
                 defer self.state = old_state;
-                try self.tickActive();
+                try self.tickActive(null);
             },
         }
 
@@ -975,6 +991,57 @@ pub const ScreenSearch = struct {
         return true;
     }
 };
+
+test "history matcher failure cleans tracked pins under the terminal mutex" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(alloc, .{
+        .cols = 10,
+        .rows = 2,
+        .max_scrollback = std.math.maxInt(usize),
+    });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("Fizz\r\n");
+    while (t.screens.active.pages.totalPages() < 3) stream.nextSlice("\r\n");
+    for (0..t.screens.active.pages.rows) |_| stream.nextSlice("\r\n");
+    stream.nextSlice("Fizz");
+    var search: ScreenSearch = try .init(alloc, t.screens.active, "Fizz");
+    defer search.deinit();
+    try search.searchAll();
+    _ = try search.select(.next);
+    try testing.expect(search.history != null and search.selected != null);
+    const revision = search.matchRowsRevision();
+
+    var mutex: std.Thread.Mutex = .{};
+    const Probe = struct {
+        var mutex_: *std.Thread.Mutex = undefined;
+        var scanning_unlocked = false;
+        var cleanup_locked = false;
+        fn next(_: *PageListSearch) error{ OutOfMemory, InjectedMatcherFailure }!?FlattenedHighlight {
+            scanning_unlocked = mutex_.tryLock();
+            if (scanning_unlocked) mutex_.unlock();
+            return error.InjectedMatcherFailure;
+        }
+        fn cleanup(search_: *ScreenSearch) void {
+            const acquired = mutex_.tryLock();
+            cleanup_locked = !acquired;
+            if (acquired) mutex_.unlock();
+            search_.failSearch();
+        }
+    };
+    Probe.mutex_ = &mutex;
+    Probe.scanning_unlocked = false;
+    Probe.cleanup_locked = false;
+    search.state = .history;
+    try search.tickHistory(&mutex, Probe.next, Probe.cleanup);
+    try testing.expect(Probe.scanning_unlocked);
+    try testing.expect(Probe.cleanup_locked);
+    try testing.expect(search.history == null and search.selected == null);
+    try testing.expectEqual(@as(usize, 0), search.matchesLen());
+    try testing.expect(search.matchRowsRevision() != revision);
+    try testing.expectEqual(ScreenSearch.State.complete, search.state);
+}
 
 test "simple search" {
     const alloc = testing.allocator;
