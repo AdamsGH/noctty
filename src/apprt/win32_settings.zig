@@ -251,6 +251,7 @@ const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOREDRAW: UINT = 0x0008;
 const SWP_NOACTIVATE: UINT = 0x0010;
 const SWP_FRAMECHANGED: UINT = 0x0020;
+const SWP_NOCOPYBITS: UINT = 0x0100;
 const SW_SCROLLCHILDREN: UINT = 0x0001;
 const SW_INVALIDATE: UINT = 0x0002;
 const SM_CXVSCROLL: c_int = 2;
@@ -6570,29 +6571,53 @@ fn ChildPlacements(comptime capacity: usize) type {
     return struct {
         windows: [capacity]HWND = undefined,
         rects: [capacity]RECT = undefined,
+        flags: [capacity]UINT = undefined,
         len: usize = 0,
 
         fn add(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
+            self.put(hwnd, x, y, width, height, false);
+        }
+
+        /// A static whose text wraps to its width. Moving a window keeps
+        /// what it showed, and the Static class does not ask to be drawn
+        /// again when its size changes (no `CS_HREDRAW`), so a resized
+        /// static would keep its old picture: the text wrapped for the old
+        /// width, or, after a DPI change, drawn by `WM_SETFONT` in the new
+        /// font at the old size. A resized one is drawn again whole.
+        fn addText(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
+            self.put(hwnd, x, y, width, height, true);
+        }
+
+        fn put(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32, wraps: bool) void {
             const window = hwnd orelse return;
             std.debug.assert(self.len < capacity);
+            const r: RECT = .{ .left = x, .top = y, .right = x + @max(0, width), .bottom = y + @max(0, height) };
+            var flags: UINT = SWP_NOZORDER | SWP_NOACTIVATE;
+            if (wraps) {
+                var current: RECT = undefined;
+                const resized = GetWindowRect(window, &current) == 0 or
+                    current.right - current.left != r.right - r.left or
+                    current.bottom - current.top != r.bottom - r.top;
+                if (resized) flags |= SWP_NOCOPYBITS;
+            }
             self.windows[self.len] = window;
-            self.rects[self.len] = .{ .left = x, .top = y, .right = x + @max(0, width), .bottom = y + @max(0, height) };
+            self.rects[self.len] = r;
+            self.flags[self.len] = flags;
             self.len += 1;
         }
 
         fn apply(self: *const @This()) bool {
             if (self.len == 0) return true;
-            const flags = SWP_NOZORDER | SWP_NOACTIVATE;
             if (BeginDeferWindowPos(@intCast(self.len))) |first| {
                 var batch: ?*anyopaque = first;
-                for (self.windows[0..self.len], self.rects[0..self.len]) |window, r| {
+                for (self.windows[0..self.len], self.rects[0..self.len], self.flags[0..self.len]) |window, r, flags| {
                     // A failed call has already discarded the batch.
                     batch = DeferWindowPos(batch.?, window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
                     if (batch == null) break;
                 }
                 if (batch) |complete| if (EndDeferWindowPos(complete) != 0) return true;
             }
-            for (self.windows[0..self.len], self.rects[0..self.len]) |window, r| {
+            for (self.windows[0..self.len], self.rects[0..self.len], self.flags[0..self.len]) |window, r, flags| {
                 _ = SetWindowPos(window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
             }
             return false;
@@ -6660,8 +6685,8 @@ fn layoutChildren(self: *SettingsWindow) void {
     const viewport_height = @max(0, viewport_bottom - viewport_top);
 
     const prose_width = @min(pane.width, self.px(settings_prose_max_width));
-    frame.add(self.text_header, pane_left, pane_top, prose_width, self.px(settings_header_title_height));
-    frame.add(self.text_summary, pane_left, pane_top + self.px(settings_header_summary_top), prose_width, self.px(settings_header_summary_height));
+    frame.addText(self.text_header, pane_left, pane_top, prose_width, self.px(settings_header_title_height));
+    frame.addText(self.text_summary, pane_left, pane_top + self.px(settings_header_summary_top), prose_width, self.px(settings_header_summary_height));
     // To the window's right edge, so its scroll bar sits at the edge of the
     // window but only beside the form.
     frame.add(self.viewport, pane_left, viewport_top, rect.right - pane_left, viewport_height);
@@ -6705,14 +6730,14 @@ fn layoutChildren(self: *SettingsWindow) void {
         const geometry = item_rects[index];
         if (item.label_index) |label_index| {
             const label = geometry.label;
-            form.add(self.field_labels[label_index], label.left, label.top - scroll_y, label.right - label.left, label.bottom - label.top);
+            form.addText(self.field_labels[label_index], label.left, label.top - scroll_y, label.right - label.left, label.bottom - label.top);
         }
         // A dropdown's height is that of its open list; its closed height is
         // set afterwards (`fitComboFields`).
         const height = if (isComboControl(self, control)) self.px(settings_combo_popup_height) else self.px(settings_control_height);
         form.add(control, geometry.control.left, geometry.control.top - scroll_y, geometry.control.right - geometry.control.left, height);
     }
-    if (help_rect) |help| form.add(self.text_help, help.left, help.top - scroll_y, help.right - help.left, help.bottom - help.top);
+    if (help_rect) |help| form.addText(self.text_help, help.left, help.top - scroll_y, help.right - help.left, help.bottom - help.top);
 
     const row_top = action_bar_top + action_bar.actions_top;
     const action_gap = self.px(settings_action_gap);
@@ -6721,9 +6746,9 @@ fn layoutChildren(self: *SettingsWindow) void {
     frame.add(self.btn_conflict_keep, pane_left + normal_actions.keep_mine_x, row_top + normal_actions.keep_mine_y, normal_actions.keep_mine_width, normal_actions.button_height);
     frame.add(self.btn_conflict_use_disk, pane_left + normal_actions.use_disk_x, row_top + normal_actions.use_disk_y, normal_actions.use_disk_width, normal_actions.button_height);
     if (action_bar.status_separate) {
-        frame.add(self.text_status, pane_left, action_bar_top + action_bar.status_top, column_width, action_bar.status_height);
+        frame.addText(self.text_status, pane_left, action_bar_top + action_bar.status_top, column_width, action_bar.status_height);
     } else {
-        frame.add(self.text_status, pane_left, row_top + self.px(6), @max(0, normal_actions.status_right), self.px(20));
+        frame.addText(self.text_status, pane_left, row_top + self.px(6), @max(0, normal_actions.status_right), self.px(20));
     }
     self.status_row_separate = action_bar.status_separate;
     self.status_row_height = action_bar.status_height;
@@ -6731,7 +6756,7 @@ fn layoutChildren(self: *SettingsWindow) void {
     const close_actions = action_bar.actions;
     const close_top = action_bar_top + action_bar.actions_top;
     const prompt_width = if (close_actions.stacked) column_width else @max(0, close_actions.first_x - action_gap);
-    frame.add(self.text_close_prompt, pane_left, action_bar_top + action_bar.prompt_top, prompt_width, action_bar.prompt_height);
+    frame.addText(self.text_close_prompt, pane_left, action_bar_top + action_bar.prompt_top, prompt_width, action_bar.prompt_height);
     frame.add(self.btn_close_save, pane_left + close_actions.first_x, close_top, close_actions.first_width, close_actions.button_height);
     frame.add(self.btn_close_discard, pane_left + close_actions.second_x, close_top + close_actions.second_y, close_actions.second_width, close_actions.button_height);
     frame.add(self.btn_close_keep_editing, pane_left + close_actions.third_x, close_top + close_actions.third_y, close_actions.third_width, close_actions.button_height);
@@ -6797,7 +6822,6 @@ const dialog_test = struct {
     extern "user32" fn GetNextDlgGroupItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
     extern "gdi32" fn BitBlt(dst: HDC, x: i32, y: i32, width: i32, height: i32, src: HDC, src_x: i32, src_y: i32, rop: u32) callconv(.winapi) BOOL;
     extern "user32" fn HideCaret(hwnd: ?HWND) callconv(.winapi) BOOL;
-    extern "user32" fn WindowFromPoint(point: POINT) callconv(.winapi) ?HWND;
     extern "user32" fn GetClassNameW(hwnd: HWND, name: [*]u16, count: c_int) callconv(.winapi) c_int;
     extern "user32" fn MapWindowPoints(from: ?HWND, to: ?HWND, points: [*]POINT, count: UINT) callconv(.winapi) c_int;
     extern "gdi32" fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFO, usage: UINT, bits: *?*anyopaque, section: ?*anyopaque, offset: u32) callconv(.winapi) HGDIOBJ;
@@ -6910,9 +6934,9 @@ const dialog_test = struct {
                 box = .{ .left = @min(box.left, x), .top = @min(box.top, y), .right = @max(box.right, x + 1), .bottom = @max(box.bottom, y + 1) };
             };
             std.debug.print("stale pixels {d} in ({d},{d})-({d},{d}) of a {d}x{d} client\n", .{ stale, box.left, box.top, box.right, box.bottom, shown.width, shown.height });
-            // Each row's runs of stale pixels, with the colours on either side.
+            // The first rows' runs of stale pixels, with both colours.
             var y: usize = @intCast(box.top);
-            while (y < @as(usize, @intCast(box.bottom))) : (y += 1) {
+            while (y < @min(@as(usize, @intCast(box.bottom)), @as(usize, @intCast(box.top)) + 16)) : (y += 1) {
                 var x: usize = 0;
                 var runs: usize = 0;
                 while (x < shown.width and runs < 4) : (x += 1) {
@@ -6924,17 +6948,31 @@ const dialog_test = struct {
                     runs += 1;
                 }
             }
-            var center: POINT = .{ .x = @divTrunc(box.left + box.right, 2), .y = @divTrunc(box.top + box.bottom, 2) };
-            _ = sys.ClientToScreen(hwnd, &center);
-            if (WindowFromPoint(center)) |under| {
-                var class_w: [64]u16 = undefined;
-                const length = GetClassNameW(under, &class_w, class_w.len);
-                std.debug.print("  window at the centre: {f} (the Settings window: {}, its child: {})\n", .{
-                    std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
-                    under == hwnd,
-                    IsChild(hwnd, under) != 0,
-                });
-            }
+            // The windows that cover them. A point lookup would not do: a
+            // static answers `HTTRANSPARENT`, so it reports the parent.
+            const Overlapping = struct {
+                var root: HWND = undefined;
+                var area: RECT = undefined;
+                fn each(child: HWND, _: LPARAM) callconv(.winapi) BOOL {
+                    const r = rectIn(root, child);
+                    if (r.right <= area.left or r.left >= area.right or r.bottom <= area.top or r.top >= area.bottom) return 1;
+                    var class_w: [64]u16 = undefined;
+                    const length = GetClassNameW(child, &class_w, class_w.len);
+                    std.debug.print("  under them: {f} ({d},{d})-({d},{d}), a direct child: {}, visible: {}\n", .{
+                        std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
+                        r.left,
+                        r.top,
+                        r.right,
+                        r.bottom,
+                        sys.GetParent(child) == root,
+                        sys.IsWindowVisible(child) != 0,
+                    });
+                    return 1;
+                }
+            };
+            Overlapping.root = hwnd;
+            Overlapping.area = box;
+            _ = sys.EnumChildWindows(hwnd, Overlapping.each, 0);
         }
         try std.testing.expectEqual(@as(usize, 0), stale);
     }
@@ -7101,10 +7139,10 @@ const dialog_test = struct {
         }
 
         /// Shrink to the minimum size, where a single column of Appearance
-        /// fields no longer fits and the form scrolls.
-        /// The window is kept inside the work area, at its corner: a CI
-        /// runner's screen is 1024x768, and the pixel tests read what the
-        /// window shows, which a part past the screen's edge may not hold.
+        /// fields no longer fits and the form scrolls, at the work area's
+        /// corner. On a screen smaller than that size (a CI runner's is
+        /// 1024x768) the minimum is the work area, so the window keeps one
+        /// size across DPI changes: see the re-wrap test.
         fn makeFormScrollable(self: *Fixture) !void {
             var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
             _ = windowWorkArea(self.hwnd(), &work);
@@ -7635,6 +7673,56 @@ test "settings section switches and scrolling leave the window's own paint alone
             try std.testing.expect(settings.content_scroll_y > 0);
             dialog_test.flushPaint(hwnd);
             try std.testing.expectEqual(paints, settings.proof_paint_count);
+        }
+    }.body);
+}
+
+test "settings text that wraps differently after a resize or a DPI change is drawn again" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            dialog_test.simulateDpi(hwnd, 96);
+
+            // Advanced has the longest summary and a help text, and both wrap
+            // to the pane while it is narrower than a line of prose.
+            const button = settings.sectionButton(.advanced).?;
+            const id: usize = @intCast(GetDlgCtrlID(button));
+            _ = SendMessageW(hwnd, WM_COMMAND, (@as(usize, BN_CLICKED) << 16) | id, @bitCast(@intFromPtr(button)));
+            try std.testing.expectEqual(Section.advanced, settings.active_section);
+
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(hwnd, &work);
+            var previous_width: ?i32 = null;
+            for ([_]i32{ 900, 720, 780, 900 }) |logical_width| {
+                _ = SetWindowPos(hwnd, null, work.left, work.top, settings.px(logical_width), settings.px(560), SWP_NOZORDER | SWP_NOACTIVATE);
+                const summary = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                // The resize did narrow or widen the text.
+                if (previous_width) |width| try std.testing.expect(width != summary.right - summary.left);
+                previous_width = summary.right - summary.left;
+                try dialog_test.expectNothingStale(hwnd);
+            }
+
+            // A DPI change that leaves the window's size alone, as when the
+            // window is already as large as the screen allows (a CI runner's
+            // is 1024x768): the new fonts reach the text before the layout
+            // gives it its new width.
+            _ = SetWindowPos(hwnd, null, work.left, work.top, 1100, 800, SWP_NOZORDER | SWP_NOACTIVATE);
+            dialog_test.flushPaint(hwnd);
+            var window: RECT = undefined;
+            _ = GetWindowRect(hwnd, &window);
+            for ([_]u32{ 144, 96 }) |dpi| {
+                const before = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                dialog_test.simulateDpi(hwnd, dpi);
+                var now: RECT = undefined;
+                _ = GetWindowRect(hwnd, &now);
+                try std.testing.expectEqual(window, now);
+                const after = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                try std.testing.expect(before.right - before.left != after.right - after.left);
+                try dialog_test.expectNothingStale(hwnd);
+            }
         }
     }.body);
 }
