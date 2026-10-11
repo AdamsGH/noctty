@@ -76,6 +76,17 @@ those changes must be adapted around fork-owned Windows behavior rather than
 overwriting it. If neither rule resolves a conflict cleanly, add the change to
 the window's deferred list with a written reason; do not force it through.
 
+The merge scope above decides which paths a window merges from upstream. It is
+not a reason to defer an upstream memory-safety fix (a use-after-free, double
+free, data race or resource leak) whose code also exists in the fork. When such
+a fix lands in a fork-owned seam or outside the merge scope, for example in
+`src/Surface.zig` or `src/os/**`, port it by hand into the fork's code, in the
+window that finds it or out of band, together with its tests where they exist.
+Record the upstream commit and what was adapted in that window's drift report,
+or, for a port made between windows, in the latest one. Defer it only for a
+written reason that is about the fix itself, such as the fixed code not
+existing in the fork.
+
 ## Recording the base
 
 At the end of a completed merge window, update
