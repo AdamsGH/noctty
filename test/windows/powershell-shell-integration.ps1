@@ -624,7 +624,7 @@ try {
         # Under Restricted PSReadLine cannot load, so do not import it just for
         # this guard. If the host loaded it, isolate it before it reads a line.
         $historyPrefix = "if (Get-Module PSReadLine) { Set-PSReadLineOption -HistorySaveStyle SaveNothing; Set-PSReadLineOption -HistorySavePath '$historyPath'; if ((Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing' -or (Get-PSReadLineOption).HistorySavePath -ne '$historyPath') { throw 'Child history isolation failed' } }; [Console]::WriteLine('HISTORY' + '-ISOLATED'); "
-        $payload = $historyPrefix + $prefix + $Preamble +
+        $payload = '[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); ' + $historyPrefix + $prefix + $Preamble +
             "function global:prompt { 'NOCTTYPROBE> ' }; " +
             "& { `$__ghostty_utf8_console = `$false; `$__ghostty_integration_path = '$childQuotedPath" +
             '''; try { if ($ExecutionContext.SessionState.LanguageMode -ne ''FullLanguage'') { Microsoft.PowerShell.Utility\Write-Warning ''noctty PowerShell integration skipped: unsupported language mode.'' -WarningAction Continue } else { $__ghostty_load_error_head = $null; if ($Error.Count) { $__ghostty_load_error_head = $Error[0] }; Microsoft.PowerShell.Core\Import-Module ([Reflection.Assembly]::Load(''Microsoft.PowerShell.Security'').Location) -ErrorAction Stop; if ((Microsoft.PowerShell.Security\Get-ExecutionPolicy -ErrorAction Stop) -eq ''AllSigned'') { . $__ghostty_integration_path } else { . ([scriptblock]::Create([IO.File]::ReadAllText($__ghostty_integration_path))) } } } catch { while ($Error.Count -gt 0 -and -not [object]::ReferenceEquals($Error[0], $__ghostty_load_error_head)) { $Error.RemoveAt(0) }; Microsoft.PowerShell.Utility\Write-Warning ''noctty PowerShell integration could not load (execution policy or script error).'' -WarningAction Continue } }' +
@@ -658,7 +658,15 @@ try {
             # harness children still need it for their unsigned script payloads.
             $info.EnvironmentVariables.Remove('PSExecutionPolicyPreference')
         }
-        $process = [System.Diagnostics.Process]::Start($info)
+        # .NET Framework has no StandardInputEncoding setting and its default
+        # writer can emit a BOM during Start. Scope its encoding to this launch.
+        $parentInputEncoding = [Console]::InputEncoding
+        try {
+            [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+            $process = [System.Diagnostics.Process]::Start($info)
+        } finally {
+            [Console]::InputEncoding = $parentInputEncoding
+        }
         try {
             $stderr = $process.StandardError.ReadToEndAsync()
             # Never queue a test line until the child confirms isolation. A
