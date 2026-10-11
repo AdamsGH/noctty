@@ -229,11 +229,11 @@ jobs:
 
       - name: Install Inno Setup
         shell: pwsh
-        run: choco install innosetup --no-progress -y
+        run: choco install innosetup --version=6.5.4 --no-progress -y
 
       - name: Run full test suite
         shell: pwsh
-        run: zig build test -Demit-test-exe=true
+        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all
 
       - name: Run native Win32 compositor tests
         shell: pwsh

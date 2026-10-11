@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:AssertionCount = 0
 
 function Assert-True {
     param(
@@ -13,6 +14,7 @@ function Assert-True {
     if (-not $Condition) {
         throw $Message
     }
+    $script:AssertionCount++
 }
 
 $script:OriginalPrompt = $function:global:prompt
@@ -22,11 +24,23 @@ $script:OriginalFeatures = $env:GHOSTTY_SHELL_FEATURES
 # until the history-handler section below imports the module itself.
 $script:PSReadLineImported = $false
 $script:OriginalAddToHistoryHandler = $null
+$script:OriginalHistoryOptions = $null
 $script:IntegrationPath = Join-Path $RepoRoot 'src\shell-integration\powershell\integration.ps1'
 $script:TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-ps-si-" + [guid]::NewGuid().ToString('n'))
 
 try {
     New-Item -ItemType Directory -Force -Path $script:TempDir | Out-Null
+    # APPDATA does not redirect PSReadLine history. Isolate an already loaded
+    # module too, so invoking this harness from an interactive host is safe.
+    if (Get-Module PSReadLine) {
+        $options = Get-PSReadLineOption
+        $script:OriginalHistoryOptions = @{
+            HistorySavePath = $options.HistorySavePath
+            HistorySaveStyle = $options.HistorySaveStyle
+        }
+        Set-PSReadLineOption -HistorySaveStyle SaveNothing
+        Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
+    }
     $specialDir = Join-Path $script:TempDir 'a b#c%d&e+f'
     New-Item -ItemType Directory -Force -Path $specialDir | Out-Null
     Push-Location $specialDir
@@ -478,6 +492,17 @@ try {
     # integration must leave it, or any handler a profile set, as it was.
     if ($null -ne (Get-Module PSReadLine -ListAvailable | Select-Object -First 1)) {
         Import-Module PSReadLine -ErrorAction Stop
+        if ($null -eq $script:OriginalHistoryOptions) {
+            $options = Get-PSReadLineOption
+            $script:OriginalHistoryOptions = @{
+                HistorySavePath = $options.HistorySavePath
+                HistorySaveStyle = $options.HistorySaveStyle
+            }
+        }
+        Set-PSReadLineOption -HistorySaveStyle SaveNothing
+        Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
+        Assert-True ((Get-PSReadLineOption).HistorySaveStyle -eq 'SaveNothing') "Parent PSReadLine history writes are not disabled"
+        Assert-True ((Get-PSReadLineOption).HistorySavePath -eq (Join-Path $script:TempDir 'parent-history.txt')) "Parent PSReadLine history is not isolated"
         $script:PSReadLineImported = $true
         $script:OriginalAddToHistoryHandler = (Get-PSReadLineOption).AddToHistoryHandler
 
@@ -559,6 +584,7 @@ try {
             [switch]$WithoutPSReadLine,
             [switch]$StandInReader,
             [string]$ExecutionPolicy = 'Bypass',
+            [switch]$ScrubExecutionPolicy,
             [string]$IntegrationPath = $script:IntegrationPath
         )
 
@@ -586,7 +612,13 @@ try {
             $quote = [string][char]$point
             $childQuotedPath = $childQuotedPath.Replace($quote, $quote + $quote)
         }
-        $payload = $prefix + $Preamble +
+        # Do this before any prompt or stdin line, including in children that
+        # subsequently unload PSReadLine. The scratch path is a second barrier.
+        $historyPath = (Join-Path $script:TempDir 'child-history.txt').Replace("'", "''")
+        # Under Restricted PSReadLine cannot load, so do not import it just for
+        # this guard. If the host loaded it, isolate it before it reads a line.
+        $historyPrefix = "if (Get-Module PSReadLine) { Set-PSReadLineOption -HistorySaveStyle SaveNothing; Set-PSReadLineOption -HistorySavePath '$historyPath'; if ((Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing' -or (Get-PSReadLineOption).HistorySavePath -ne '$historyPath') { throw 'Child history isolation failed' } }; [Console]::WriteLine('HISTORY' + '-ISOLATED'); "
+        $payload = $historyPrefix + $prefix + $Preamble +
             "function global:prompt { 'NOCTTYPROBE> ' }; " +
             "& { `$__ghostty_utf8_console = `$false; `$__ghostty_integration_path = '$childQuotedPath" +
             '''; try { if ($ExecutionContext.SessionState.LanguageMode -ne ''FullLanguage'') { Microsoft.PowerShell.Utility\Write-Warning ''noctty PowerShell integration skipped: unsupported language mode.'' -WarningAction Continue } else { $__ghostty_load_error_head = $null; if ($Error.Count) { $__ghostty_load_error_head = $Error[0] }; Microsoft.PowerShell.Core\Import-Module ([Reflection.Assembly]::Load(''Microsoft.PowerShell.Security'').Location) -ErrorAction Stop; if ((Microsoft.PowerShell.Security\Get-ExecutionPolicy -ErrorAction Stop) -eq ''AllSigned'') { . $__ghostty_integration_path } else { . ([scriptblock]::Create([IO.File]::ReadAllText($__ghostty_integration_path))) } } } catch { while ($Error.Count -gt 0 -and -not [object]::ReferenceEquals($Error[0], $__ghostty_load_error_head)) { $Error.RemoveAt(0) }; Microsoft.PowerShell.Utility\Write-Warning ''noctty PowerShell integration could not load (execution policy or script error).'' -WarningAction Continue } }' +
@@ -605,6 +637,11 @@ try {
         $info.RedirectStandardOutput = $true
         $info.RedirectStandardError = $true
         $info.WorkingDirectory = $PWD.ProviderPath
+        if ($ScrubExecutionPolicy) {
+            # Only this policy-focused child loses the parent's Bypass. Other
+            # harness children still need it for their unsigned script payloads.
+            $info.EnvironmentVariables.Remove('PSExecutionPolicyPreference')
+        }
         $process = [System.Diagnostics.Process]::Start($info)
         try {
             $stdout = $process.StandardOutput.ReadToEndAsync()
@@ -616,7 +653,9 @@ try {
                 $process.Kill()
                 throw 'Injected PowerShell child timed out'
             }
-            return $stdout.Result + $stderr.Result
+            $output = $stdout.Result + $stderr.Result
+            Assert-True ($output.Contains('HISTORY-ISOLATED')) "Child did not confirm history isolation"
+            return $output
         } finally {
             $process.Dispose()
         }
@@ -630,14 +669,19 @@ try {
     $motwPath = Join-Path $script:TempDir 'motw.ps1'
     Copy-Item -LiteralPath $script:IntegrationPath -Destination $motwPath
     Set-Content -LiteralPath $motwPath -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+    $parentPolicyPreference = $env:PSExecutionPolicyPreference
     foreach ($policyCase in @(
         @{ Policy = 'Restricted'; Path = $script:IntegrationPath },
         @{ Policy = 'RemoteSigned'; Path = $motwPath }
     )) {
-        $policyOut = Invoke-NocttyInjectedChild -ExecutionPolicy $policyCase.Policy -IntegrationPath $policyCase.Path -WithoutPSReadLine
+        $policyOut = Invoke-NocttyInjectedChild -ExecutionPolicy $policyCase.Policy -IntegrationPath $policyCase.Path -WithoutPSReadLine -ScrubExecutionPolicy `
+            -Postamble '; ("POLICY" + "CHECK=") + (Microsoft.PowerShell.Security\Get-ExecutionPolicy); '
+        Assert-True ($policyOut.Contains("POLICYCHECK=$($policyCase.Policy)")) "Policy-focused child did not use $($policyCase.Policy): $policyOut"
         Assert-True ($policyOut.Contains('HELPER-RESOLVED') -and $policyOut.Contains(']133;A;')) "Integration failed under $($policyCase.Policy): $policyOut"
+        Assert-True ($policyOut.Contains(']7;file://') -and $policyOut.Contains('NOCTTYPROBE> ')) "Policy-focused child lost its cwd or user prompt: $policyOut"
         Assert-True (-not ($policyOut -match 'PSSecurityException|UnauthorizedAccess|cannot be loaded')) "Policy load left an error wall: $policyOut"
     }
+    Assert-True ($env:PSExecutionPolicyPreference -ceq $parentPolicyPreference) "Policy-focused cases changed the parent's execution policy preference"
     $signedOut = Invoke-NocttyInjectedChild -ExecutionPolicy AllSigned -WithoutPSReadLine -Preamble '$Error.Clear(); ' `
         -Postamble '; "ERR" + "COUNT=" + $Error.Count'
     Assert-True (-not $signedOut.Contains('HELPER-RESOLVED')) "AllSigned loaded an unsigned integration script"
@@ -1008,7 +1052,7 @@ try {
         }
     }
 
-    Write-Output 'PASS powershell shell integration'
+    Write-Output "PASS powershell shell integration: $script:AssertionCount assertions passed"
 } finally {
     [Console]::SetOut($script:OriginalOut)
     Pop-Location -ErrorAction SilentlyContinue
@@ -1024,6 +1068,9 @@ try {
     Remove-Variable -Name '__noctty_test_status', '__noctty_test_next_line' -Scope Global -ErrorAction Ignore
     if ($script:PSReadLineImported) {
         Set-PSReadLineOption -AddToHistoryHandler $script:OriginalAddToHistoryHandler
+    }
+    if ($null -ne $script:OriginalHistoryOptions) {
+        Set-PSReadLineOption @script:OriginalHistoryOptions
     }
     if ($null -eq $script:OriginalFeatures) {
         Remove-Item Env:GHOSTTY_SHELL_FEATURES -ErrorAction SilentlyContinue
