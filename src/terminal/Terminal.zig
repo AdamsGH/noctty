@@ -361,15 +361,23 @@ pub fn print(self: *Terminal, c: u21) !void {
                 break :left @intFromBool(self.screens.active.cursor.page_cell.codepoint() == 0);
             };
 
+            // A reflow can leave a cursor that waits to wrap on the spacer
+            // head of a wide character it moved to the next row. The
+            // character just printed is the one before that.
+            const head: size.CellCountInt = @intFromBool(
+                self.screens.active.cursor.x > left and
+                    self.screens.active.cursorCellLeft(left).wide == .spacer_head,
+            );
+
             // If the previous cell is a wide spacer tail, then we actually
             // want to use the cell before that because that has the actual
             // content.
-            const immediate = self.screens.active.cursorCellLeft(left);
+            const immediate = self.screens.active.cursorCellLeft(left + head);
             break :prev switch (immediate.wide) {
-                else => .{ .cell = immediate, .left = left },
+                else => .{ .cell = immediate, .left = left + head },
                 .spacer_tail => .{
-                    .cell = self.screens.active.cursorCellLeft(left + 1),
-                    .left = left + 1,
+                    .cell = self.screens.active.cursorCellLeft(left + head + 1),
+                    .left = left + head + 1,
                 },
             };
         };
@@ -618,11 +626,16 @@ pub fn print(self: *Terminal, c: u21) !void {
             return;
         }
 
-        // Find our previous cell
+        // Find our previous cell. As in the grapheme path above, a cursor
+        // waiting to wrap can sit on a spacer head that a reflow left.
         const prev = prev: {
-            const immediate = self.screens.active.cursorCellLeft(left);
+            const head: size.CellCountInt = @intFromBool(
+                self.screens.active.cursor.x > left and
+                    self.screens.active.cursorCellLeft(left).wide == .spacer_head,
+            );
+            const immediate = self.screens.active.cursorCellLeft(left + head);
             if (immediate.wide != .spacer_tail) break :prev immediate;
-            break :prev self.screens.active.cursorCellLeft(left + 1);
+            break :prev self.screens.active.cursorCellLeft(left + head + 1);
         };
 
         // If our previous cell has no text, just ignore the zero-width character
@@ -3445,6 +3458,33 @@ test "Terminal: zero-width character attaches to pending wrap cell" {
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("xå̲", str);
+}
+
+test "Terminal: zero-width character after a reflow left the cursor on a spacer head" {
+    for ([_]bool{ false, true }) |cluster| {
+        var t = try init(testing.allocator, .{ .cols = 5, .rows = 5 });
+        defer t.deinit(testing.allocator);
+        t.modes.set(.grapheme_cluster, cluster);
+
+        // A cursor waiting to wrap after "E", then a wide character on the
+        // next row. Widening by one column reflows the wide character back
+        // up but it doesn't fit, so its spacer head ends up under the
+        // restored cursor.
+        for ("ABCDE") |c| try t.print(c);
+        t.saveCursor();
+        try t.print(0x4E2D);
+        t.restoreCursor();
+        try t.resize(testing.allocator, 6, 5);
+        try testing.expect(t.screens.active.cursor.pending_wrap);
+        try testing.expectEqual(Cell.Wide.spacer_head, t.screens.active.cursor.page_cell.wide);
+
+        // The mark goes on the "E" just printed.
+        try t.print(0x0332);
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(@as(u21, 'E'), list_cell.cell.content.codepoint);
+        try testing.expect(list_cell.cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{0x0332}, list_cell.node.data.lookupGrapheme(list_cell.cell).?);
+    }
 }
 
 test "Terminal: zero-width character attaches to last column without wraparound" {
