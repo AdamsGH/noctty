@@ -60,8 +60,10 @@ const HMONITOR = sys.HMONITOR;
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 const WS_MAXIMIZEBOX: u32 = 0x00010000;
 const WS_EX_APPWINDOW: u32 = 0x00040000;
-const WS_BORDER: u32 = 0x00800000;
+const WS_EX_CONTROLPARENT: u32 = 0x00010000;
 const WS_VSCROLL: u32 = 0x00200000;
+const WS_CLIPCHILDREN: u32 = 0x02000000;
+const WS_CLIPSIBLINGS: u32 = 0x04000000;
 const SW_HIDE: i32 = 0;
 const SW_SHOWNORMAL: i32 = 1;
 const SW_RESTORE: i32 = 9;
@@ -82,7 +84,13 @@ const WM_CLOSE: UINT = 0x0010;
 const WM_NCCREATE: UINT = 0x0081;
 const WM_PAINT: UINT = 0x000F;
 const WM_ERASEBKGND: UINT = 0x0014;
+const WM_PRINTCLIENT: UINT = 0x0318;
+const WM_ENABLE: UINT = 0x000A;
 const WM_NCDESTROY: UINT = 0x0082;
+const WM_NCCALCSIZE: UINT = 0x0083;
+const WM_NCHITTEST: UINT = 0x0084;
+const WM_NCPAINT: UINT = 0x0085;
+const HTCLIENT: LRESULT = 1;
 const WM_GETOBJECT: UINT = 0x003D;
 const WM_COMMAND: UINT = 0x0111;
 const WM_SIZE: UINT = 0x0005;
@@ -145,7 +153,7 @@ const WM_SETTINGS_PROOF_LIVE_FOCUS_RING: UINT = WM_APP + 0x106;
 const WM_SETTINGS_PROOF_CHILD: UINT = WM_APP + 0x107;
 const WM_SETTINGS_PROOF_SET_FOCUS: UINT = WM_APP + 0x108;
 const WM_SETTINGS_PROOF_PAINT_COUNT: UINT = WM_APP + 0x109;
-const WM_SETTINGS_PROOF_LAYOUT_REDRAW_SUCCEEDED: UINT = WM_APP + 0x10A;
+const WM_SETTINGS_PROOF_LAYOUT_BATCHED: UINT = WM_APP + 0x10A;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_TABSTOP: u32 = 0x00010000;
@@ -225,6 +233,7 @@ const CB_SETCURSEL: UINT = 0x014E;
 const CB_GETCURSEL: UINT = 0x0147;
 const CB_RESETCONTENT: UINT = 0x014B;
 const CB_SETITEMHEIGHT: UINT = 0x0153;
+const CB_GETITEMHEIGHT: UINT = 0x0154;
 const CBS_DROPDOWNLIST: u32 = 0x3;
 const CBS_HASSTRINGS: u32 = 0x200;
 const OBJID_CLIENT: u32 = @bitCast(@as(i32, -4));
@@ -236,9 +245,16 @@ const CLSCTX_INPROC_SERVER: u32 = 0x1;
 const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 const SPI_GETWORKAREA: UINT = 0x0030;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
+const SWP_NOSIZE: UINT = 0x0001;
+const SWP_NOMOVE: UINT = 0x0002;
 const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOREDRAW: UINT = 0x0008;
 const SWP_NOACTIVATE: UINT = 0x0010;
+const SWP_FRAMECHANGED: UINT = 0x0020;
+const SWP_NOCOPYBITS: UINT = 0x0100;
+const SW_SCROLLCHILDREN: UINT = 0x0001;
+const SW_INVALIDATE: UINT = 0x0002;
+const SM_CXVSCROLL: c_int = 2;
 const SB_VERT: c_int = 1;
 const SB_LINEUP: usize = 0;
 const SB_LINEDOWN: usize = 1;
@@ -254,7 +270,6 @@ const SIF_POS: u32 = 0x0004;
 const SIF_TRACKPOS: u32 = 0x0010;
 const TME_LEAVE: u32 = 0x00000002;
 const RDW_INVALIDATE: u32 = 0x0001;
-const RDW_ERASE: u32 = 0x0004;
 const RDW_ALLCHILDREN: u32 = 0x0080;
 const RDW_UPDATENOW: u32 = 0x0100;
 
@@ -1040,14 +1055,12 @@ const GetWindowTextW = sys.GetWindowTextW;
 const SendMessageW = sys.SendMessageW;
 const ShowScrollBar = sys.ShowScrollBar;
 const TrackMouseEvent = sys.TrackMouseEvent;
-const SetWindowRgn = sys.SetWindowRgn;
 const GetSysColor = sys.GetSysColor;
 const NotifyWinEvent = sys.NotifyWinEvent;
 const EnumChildWindows = sys.EnumChildWindows;
 const CreateFontW = sys.CreateFontW;
 const DeleteObject = sys.DeleteObject;
 const SelectObject = sys.SelectObject;
-const CreateRectRgn = sys.CreateRectRgn;
 const FillRect = sys.FillRect;
 const GetStockObject = sys.GetStockObject;
 const SetDCBrushColor = sys.SetDCBrushColor;
@@ -1063,6 +1076,31 @@ extern "user32" fn GetDlgCtrlID(hWnd: HWND) callconv(.winapi) c_int;
 extern "user32" fn SetScrollInfo(hWnd: HWND, nBar: c_int, lpsi: *const SCROLLINFO, redraw: BOOL) callconv(.winapi) c_int;
 extern "user32" fn GetScrollInfo(hWnd: HWND, nBar: c_int, lpsi: *SCROLLINFO) callconv(.winapi) BOOL;
 extern "user32" fn FrameRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) callconv(.winapi) i32;
+extern "user32" fn ScrollWindowEx(
+    hWnd: HWND,
+    dx: i32,
+    dy: i32,
+    prcScroll: ?*const RECT,
+    prcClip: ?*const RECT,
+    hrgnUpdate: ?HRGN,
+    prcUpdate: ?*RECT,
+    flags: UINT,
+) callconv(.winapi) c_int;
+extern "user32" fn BeginDeferWindowPos(nNumWindows: c_int) callconv(.winapi) ?*anyopaque;
+extern "user32" fn DeferWindowPos(
+    hWinPosInfo: *anyopaque,
+    hWnd: HWND,
+    hWndInsertAfter: ?HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    uFlags: UINT,
+) callconv(.winapi) ?*anyopaque;
+extern "user32" fn EndDeferWindowPos(hWinPosInfo: *anyopaque) callconv(.winapi) BOOL;
+extern "user32" fn GetSystemMetricsForDpi(nIndex: c_int, dpi: UINT) callconv(.winapi) c_int;
+extern "user32" fn GetWindowDC(hWnd: HWND) callconv(.winapi) HDC;
+extern "gdi32" fn ExcludeClipRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) c_int;
 extern "gdi32" fn EnumFontFamiliesExW(
     hdc: HDC,
     logfont: *LOGFONTW,
@@ -1105,6 +1143,9 @@ const SCROLLINFO = extern struct {
 };
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings");
+/// The child window that holds the form: it clips the fields to the band
+/// between the section header and the action bar, and owns the scroll bar.
+const viewport_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings.viewport");
 const edit_text_max_code_units: usize = 4096;
 const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 
@@ -1365,8 +1406,12 @@ fn applyNativeControlThemeToChild(hwnd: HWND, lParam: LPARAM) callconv(.winapi) 
     return 1;
 }
 
+/// The frame too: a text field's frame and the viewport's scroll bar are
+/// non-client, and their colours come from the theme as well.
 fn invalidateThemeChild(hwnd: HWND, _: LPARAM) callconv(.winapi) BOOL {
-    _ = sys.InvalidateRect(hwnd, null, 1);
+    const rdw_erase: u32 = 0x0004;
+    const rdw_frame: u32 = 0x0400;
+    _ = sys.RedrawWindow(hwnd, null, null, RDW_INVALIDATE | rdw_erase | rdw_frame);
     return 1;
 }
 
@@ -1468,6 +1513,16 @@ pub const AppHandle = struct {
 pub const SettingsWindow = struct {
     handle: AppHandle,
     hwnd: ?HWND = null,
+    /// The form's own window (`viewport_class_name`): every field, its label
+    /// and the help text are its children, so its client area is what clips
+    /// them. Window regions cannot: the stock control classes carry
+    /// `CS_PARENTDC`, which paints through the parent's clip and ignores a
+    /// window region, so scrolled fields drew over the header and the action
+    /// bar.
+    viewport: ?HWND = null,
+    /// Stays out of the UIA control view (`layout_pane`), so the fields keep
+    /// reading as children of the window.
+    viewport_uia_provider: ?*win32_uia.SettingsControlProvider = null,
     btn_open_editor: ?HWND = null,
     btn_section_appearance: ?HWND = null,
     btn_section_terminal: ?HWND = null,
@@ -1555,8 +1610,21 @@ pub const SettingsWindow = struct {
     combo_auto_update_channel: ?HWND = null,
     active_section: Section = .appearance,
     dpi: u32 = 96,
-    /// Class atom lazily registered the first time `open` runs.
+    /// Class atoms lazily registered the first time `open` runs.
     class_atom: ATOM = 0,
+    viewport_class_atom: ATOM = 0,
+    /// Line height of the field font, which the text fields centre their text
+    /// on (`fieldFrameInsets`). Measured when the fonts are built.
+    field_text_height: i32 = 0,
+    /// The field whose frame was last painted as invalid, so the frame can be
+    /// repainted when `validation_control` moves on.
+    framed_invalid_field: ?HWND = null,
+    /// Whether the last layout showed the help text (Keybindings, Advanced).
+    help_shown: bool = false,
+    /// What the frame window painted last time: when the action bar or the
+    /// column changes height or width without the window resizing, the old
+    /// separators have to be painted over.
+    background_geometry: ?BackgroundGeometry = null,
 
     /// Frozen snapshot of the config at the moment the window last
     /// opened. Independently owned via `Config.clone` so an
@@ -1602,7 +1670,8 @@ pub const SettingsWindow = struct {
     proof_redraw_succeeded: bool = false,
     proof_update_pending: bool = false,
     proof_paint_count: u32 = 0,
-    proof_layout_redraw_succeeded: bool = false,
+    /// Whether the last layout moved its windows in deferred batches.
+    proof_layout_batched: bool = false,
     /// Guard flag so the EN_CHANGE handler doesn't fire a cascade
     /// when we programmatically set the EDIT text on open.
     suppress_edit_events: bool = false,
@@ -1703,6 +1772,7 @@ pub const SettingsWindow = struct {
         self.releaseTextUiaProviders();
         self.releaseControlUiaProviders();
         self.hwnd = null;
+        self.forgetFormWindows();
         self.deleteUiFont();
         self.theme_adapter.deinit();
         self.btn_open_editor = null;
@@ -1876,6 +1946,7 @@ pub const SettingsWindow = struct {
         if (self.btn_save) |button| _ = sys.EnableWindow(button, @intFromBool(enabled));
         self.updateClosePromptActions();
         self.syncIdleStatus();
+        self.syncFieldFrames();
     }
 
     /// Say an outcome (`note`) now, whatever else the line shows, and keep
@@ -2445,6 +2516,7 @@ pub const SettingsWindow = struct {
         self.releaseTextUiaProviders();
         self.releaseControlUiaProviders();
         self.hwnd = null;
+        self.forgetFormWindows();
         self.text_header = null;
         self.text_summary = null;
         self.text_status = null;
@@ -2601,6 +2673,20 @@ pub const SettingsWindow = struct {
             );
         }
         self.control_uia_prev_procs = [_]?*const anyopaque{null} ** settings_control_count;
+        if (self.viewport_uia_provider) |provider| {
+            self.viewport_uia_provider = null;
+            provider.detach();
+            self.deferProviderDisconnect(@ptrCast(provider), settingsControlDisconnect, settingsControlRelease);
+        }
+    }
+
+    /// The viewport and the state the layout and the field frames keep about
+    /// it, for a window that is gone.
+    fn forgetFormWindows(self: *SettingsWindow) void {
+        self.viewport = null;
+        self.framed_invalid_field = null;
+        self.help_shown = false;
+        self.background_geometry = null;
     }
 
     fn deferProviderDisconnect(
@@ -2683,6 +2769,18 @@ pub const SettingsWindow = struct {
     fn initializeControlUiaProviders(self: *SettingsWindow) void {
         self.releaseControlUiaProviders();
         if (!self.canInitializeCustomUiaProviders()) return;
+        if (self.viewport) |viewport| {
+            // Answered from the viewport's own window procedure; no subclass.
+            self.viewport_uia_provider = win32_uia.SettingsControlProvider.create(
+                std.heap.page_allocator,
+                viewport,
+                .layout_pane,
+                null,
+            ) catch |err| blk: {
+                std.log.warn("settings viewport UIA provider unavailable err={}", .{err});
+                break :blk null;
+            };
+        }
         for (settings_control_specs, 0..) |spec, index| {
             const control = self.controlHwnd(index) orelse continue;
             const provider = win32_uia.SettingsControlProvider.create(
@@ -2785,35 +2883,104 @@ pub const SettingsWindow = struct {
         }
     }
 
+    /// Switch the form to `next`. The new section's fields are placed while
+    /// they are still hidden, swapped in for the old ones, and painted before
+    /// this returns, so no frame shows a field that has not drawn itself yet.
+    /// Only the form and the header text repaint; the frame window does not.
     fn setActiveSection(self: *SettingsWindow, next: Section) void {
         const changed = self.active_section != next;
         self.active_section = next;
         if (self.section_uia_group) |group| group.setSelected(@intFromEnum(next));
         self.content_scroll_y = 0;
-        self.applySectionVisibility();
         self.refreshNativeSectionText();
         layoutChildren(self);
+        self.applySectionVisibility();
+        if (self.hwnd) |hwnd| _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
         if (changed) {
             if (self.sectionProvider(next)) |provider| provider.raiseSelected();
-            if (self.hwnd) |h| _ = sys.InvalidateRect(h, null, 1);
         }
     }
 
+    /// Scroll the form to `next`. The viewport moves its pixels and its child
+    /// windows together and repaints only the strip that comes into view; the
+    /// header and the action bar are outside it and do not repaint at all.
     fn setContentScroll(self: *SettingsWindow, next: i32) void {
         const clamped = std.math.clamp(next, 0, self.content_scroll_max);
         if (clamped == self.content_scroll_y) return;
+        const delta = self.content_scroll_y - clamped;
         self.content_scroll_y = clamped;
-        layoutChildren(self);
-        if (self.hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 1);
+        const viewport = self.viewport orelse return;
+        _ = ScrollWindowEx(viewport, 0, delta, null, null, null, null, SW_SCROLLCHILDREN | SW_INVALIDATE);
+        _ = RedrawWindow(viewport, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
+        const position: SCROLLINFO = .{
+            .cbSize = @sizeOf(SCROLLINFO),
+            .fMask = SIF_POS,
+            .nMin = 0,
+            .nMax = 0,
+            .nPage = 0,
+            .nPos = clamped,
+            .nTrackPos = 0,
+        };
+        _ = SetScrollInfo(viewport, SB_VERT, &position, 1);
+        self.syncViewportClipFlags();
     }
 
     /// Height of one "page" of the form for Page Up/Down and page-scroll wheels.
     fn contentPage(self: *SettingsWindow) i32 {
-        const hwnd = self.hwnd orelse return self.px(240);
+        const viewport = self.viewport orelse return self.px(240);
         var client: RECT = undefined;
-        if (GetClientRect(hwnd, &client) == 0) return self.px(240);
-        const viewport = @max(1, settingsContentViewportBottom(self, client) - settingsContentViewportTop(self, client));
-        return @max(1, viewport - self.px(settings_control_height));
+        if (GetClientRect(viewport, &client) == 0) return self.px(240);
+        return @max(1, client.bottom - self.px(settings_control_height));
+    }
+
+    /// A `WM_VSCROLL` from the viewport's scroll bar.
+    fn scrollByBar(self: *SettingsWindow, code: usize) void {
+        const viewport = self.viewport orelse return;
+        var tracking: SCROLLINFO = .{
+            .cbSize = @sizeOf(SCROLLINFO),
+            .fMask = SIF_TRACKPOS,
+            .nMin = 0,
+            .nMax = 0,
+            .nPage = 0,
+            .nPos = 0,
+            .nTrackPos = self.content_scroll_y,
+        };
+        if (code == SB_THUMBPOSITION or code == SB_THUMBTRACK) _ = GetScrollInfo(viewport, SB_VERT, &tracking);
+        const page = self.contentPage();
+        self.setContentScroll(switch (code) {
+            SB_LINEUP => self.content_scroll_y - self.px(32),
+            SB_LINEDOWN => self.content_scroll_y + self.px(32),
+            SB_PAGEUP => self.content_scroll_y - page,
+            SB_PAGEDOWN => self.content_scroll_y + page,
+            SB_THUMBPOSITION, SB_THUMBTRACK => tracking.nTrackPos,
+            SB_TOP => 0,
+            SB_BOTTOM => self.content_scroll_max,
+            else => self.content_scroll_y,
+        });
+    }
+
+    /// Tell each field's UIA provider whether the viewport hides it entirely;
+    /// a field cut by an edge is still on screen.
+    fn syncViewportClipFlags(self: *SettingsWindow) void {
+        const viewport = self.viewport orelse return;
+        var client: RECT = undefined;
+        if (GetClientRect(viewport, &client) == 0) return;
+        var active_controls = [_]bool{false} ** settings_clipped_control_count;
+        var active_labels = [_]bool{false} ** settings_label_specs.len;
+        for (self.formItems()) |item| {
+            active_controls[item.control_index] = true;
+            if (item.label_index) |index| active_labels[index] = true;
+        }
+        for (0..settings_clipped_control_count) |index| if (self.control_uia_providers[index]) |provider| {
+            provider.setViewportFullyClipped(!active_controls[index] or
+                viewportHidesChild(viewport, self.controlHwnd(index), client.bottom));
+        };
+        if (self.text_uia_providers[4]) |provider| {
+            provider.setViewportFullyClipped(!self.help_shown or viewportHidesChild(viewport, self.text_help, client.bottom));
+        }
+        for (self.field_labels, 0..) |label, index| if (self.text_uia_providers[index + 5]) |provider| {
+            provider.setViewportFullyClipped(!active_labels[index] or viewportHidesChild(viewport, label, client.bottom));
+        };
     }
 
     /// Scroll the form by one wheel message. Notches and precision-touchpad
@@ -2964,7 +3131,7 @@ pub const SettingsWindow = struct {
         const hwnd = self.hwnd orelse return false;
         var rect: RECT = undefined;
         if (GetClientRect(hwnd, &rect) == 0) return false;
-        const bar = closePromptLayoutGeometry(self, paneBounds(self, rect).width, actionBarAvailableHeight(self, rect));
+        const bar = closePromptLayoutGeometry(self, actionColumnWidth(self, rect), actionBarAvailableHeight(self, rect));
         return bar.status_separate != self.status_row_separate or bar.status_height != self.status_row_height;
     }
 
@@ -3016,6 +3183,12 @@ pub const SettingsWindow = struct {
         if (previous_secondary) |font| _ = DeleteObject(font);
         if (previous_emphasis) |font| _ = DeleteObject(font);
         if (previous_header) |font| _ = DeleteObject(font);
+        self.field_text_height = fontLineHeight(hwnd, next);
+        // The text fields centre on the new line height and the frame scales
+        // with the DPI: ask each one for its frame again.
+        for (self.editControls()) |edit| if (edit) |control| {
+            _ = SetWindowPos(control, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        };
         self.updateComboMetrics();
     }
 
@@ -3051,13 +3224,98 @@ pub const SettingsWindow = struct {
         };
     }
 
+    fn editControls(self: *const SettingsWindow) [8]?HWND {
+        return .{
+            self.edit_scrollback,
+            self.edit_font_family,
+            self.edit_font_size,
+            self.edit_theme,
+            self.edit_bg_opacity,
+            self.edit_command,
+            self.edit_pad_x,
+            self.edit_pad_y,
+        };
+    }
+
+    fn isEditControl(self: *const SettingsWindow, hwnd: HWND) bool {
+        for (self.editControls()) |edit| if (edit == hwnd) return true;
+        return false;
+    }
+
+    /// Width of a text field's frame: the focus stroke, which the resting
+    /// 1 DIP line sits inside, so focus does not move the text.
+    fn fieldStroke(self: *const SettingsWindow) i32 {
+        return @max(1, self.px(settings_metrics.stroke_focus));
+    }
+
+    /// Paint `edit`'s frame (see `settingsEditProc`). `focused` overrides
+    /// `GetFocus` while focus is changing hands.
+    fn paintFieldFrame(self: *SettingsWindow, edit: HWND, focused: ?bool) void {
+        var window: RECT = undefined;
+        var client: RECT = undefined;
+        var client_origin: POINT = .{ .x = 0, .y = 0 };
+        if (GetWindowRect(edit, &window) == 0 or
+            GetClientRect(edit, &client) == 0 or
+            sys.ClientToScreen(edit, &client_origin) == 0) return;
+        const hdc = GetWindowDC(edit) orelse return;
+        defer _ = ReleaseDC(edit, hdc);
+        const left = client_origin.x - window.left;
+        const top = client_origin.y - window.top;
+        _ = ExcludeClipRect(hdc, left, top, left + client.right, top + client.bottom);
+
+        const colors = self.theme_adapter.colors;
+        const enabled = sys.IsWindowEnabled(edit) != 0;
+        const state = fieldFrameState(focused orelse (GetFocus() == edit), enabled and self.validation_control == edit);
+        const outer: RECT = .{ .left = 0, .top = 0, .right = window.right - window.left, .bottom = window.bottom - window.top };
+        // A disabled EDIT asks for WM_CTLCOLORSTATIC and draws on the pane colour.
+        fillSolid(hdc, outer, if (enabled) colors.edit_bg else colors.window_bg);
+        const stroke: struct { color: COLORREF, width: i32 } = switch (state) {
+            .rest => .{
+                .color = if (enabled) colors.field_border else colors.disabled_text,
+                .width = @max(1, self.px(settings_metrics.stroke_hairline)),
+            },
+            .focused => .{ .color = colors.accent, .width = self.fieldStroke() },
+            .invalid => .{ .color = colors.error_text, .width = self.fieldStroke() },
+        };
+        strokeRect(hdc, outer, stroke.color, stroke.width);
+    }
+
+    /// Repaint the frames of the field that stops being invalid and of the
+    /// one that starts (`fieldFrameState`).
+    fn syncFieldFrames(self: *SettingsWindow) void {
+        const next = self.validation_control;
+        if (next == self.framed_invalid_field) return;
+        const previous = self.framed_invalid_field;
+        self.framed_invalid_field = next;
+        for ([_]?HWND{ previous, next }) |field| if (field) |control| {
+            if (self.isEditControl(control)) self.paintFieldFrame(control, null);
+        };
+    }
+
     fn updateComboMetrics(self: *SettingsWindow) void {
-        const field_height: LPARAM = self.px(settings_control_height);
         const item_height: LPARAM = self.px(settings_combo_item_height);
         for (self.comboControls()) |combo| if (combo) |control| {
-            _ = SendMessageW(control, CB_SETITEMHEIGHT, std.math.maxInt(WPARAM), field_height);
-            _ = SendMessageW(control, CB_SETITEMHEIGHT, 0, item_height);
             win32_theme.WindowThemeAdapter.applyNativeCombo(control, self.theme_adapter.colors);
+            _ = SendMessageW(control, CB_SETITEMHEIGHT, 0, item_height);
+        };
+        self.fitComboFields();
+    }
+
+    /// Make each closed dropdown exactly as tall as a text field. A dropdown
+    /// that is resized, as every layout does (its height is that of the open
+    /// list), puts its selection field back to the font's height, so the
+    /// height set before the layout was lost: 35 px against 48 px text fields
+    /// at 150%. This runs after the layout. The height asked for is the
+    /// selection field's; the window adds a frame, which is measured.
+    fn fitComboFields(self: *SettingsWindow) void {
+        const target = self.px(settings_control_height);
+        for (self.comboControls()) |combo| if (combo) |control| {
+            var rect: RECT = undefined;
+            if (GetWindowRect(control, &rect) == 0) continue;
+            const current = SendMessageW(control, CB_GETITEMHEIGHT, std.math.maxInt(WPARAM), 0);
+            if (current <= 0) continue;
+            const next = comboSelectionHeight(rect.bottom - rect.top, @intCast(current), target);
+            if (next != current) _ = SendMessageW(control, CB_SETITEMHEIGHT, std.math.maxInt(WPARAM), next);
         };
     }
 
@@ -3143,50 +3401,49 @@ pub const SettingsWindow = struct {
             }
         }
         if (!is_form_control) return;
-        const hwnd = self.hwnd orelse return;
+        const viewport = self.viewport orelse return;
         var child_rect: RECT = undefined;
         var client_rect: RECT = undefined;
         if (sys.GetWindowRect(control, &child_rect) == 0 or
-            sys.GetClientRect(hwnd, &client_rect) == 0) return;
+            sys.GetClientRect(viewport, &client_rect) == 0) return;
         var child_origin: POINT = .{ .x = child_rect.left, .y = child_rect.top };
-        if (sys.ScreenToClient(hwnd, &child_origin) == 0) return;
+        if (sys.ScreenToClient(viewport, &child_origin) == 0) return;
         const top = child_origin.y;
         const bottom = top + child_rect.bottom - child_rect.top;
-        const viewport_top = settingsContentViewportTop(self, client_rect);
-        const viewport_bottom = settingsContentViewportBottom(self, client_rect);
-        if (top < viewport_top) {
-            self.setContentScroll(self.content_scroll_y - (viewport_top - top));
-        } else if (bottom > viewport_bottom) {
-            self.setContentScroll(self.content_scroll_y + (bottom - viewport_bottom));
+        if (top < 0) {
+            self.setContentScroll(self.content_scroll_y + top);
+        } else if (bottom > client_rect.bottom) {
+            self.setContentScroll(self.content_scroll_y + (bottom - client_rect.bottom));
         }
     }
 
+    /// Show the active section's fields and labels and hide the rest. A
+    /// window already in the wanted state is left alone, so it does not
+    /// repaint.
     fn applySectionVisibility(self: *SettingsWindow) void {
         for (std.enums.values(Section)) |section| {
             if (self.sectionButton(section)) |button| {
-                _ = sys.SendMessageW(
-                    button,
-                    BM_SETCHECK,
-                    if (section == self.active_section) BST_CHECKED else BST_UNCHECKED,
-                    0,
-                );
+                const check: usize = if (section == self.active_section) BST_CHECKED else BST_UNCHECKED;
+                if (@as(usize, @bitCast(sys.SendMessageW(button, BM_GETCHECK, 0, 0))) != check) {
+                    _ = sys.SendMessageW(button, BM_SETCHECK, check, 0);
+                }
                 const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(button, GWL_STYLE))));
                 const next_style = if (section == self.active_section) style | WS_TABSTOP else style & ~WS_TABSTOP;
                 if (next_style != style) _ = sys.SetWindowLongPtrW(button, GWL_STYLE, @intCast(next_style));
             }
         }
-        for (0..settings_clipped_control_count) |index| if (self.controlHwnd(index)) |control| {
-            _ = ShowWindow(control, SW_HIDE);
-        };
-        for (self.field_labels) |label| {
-            if (label) |control| _ = ShowWindow(control, SW_HIDE);
-        }
+        var active_controls = [_]bool{false} ** settings_clipped_control_count;
+        var active_labels = [_]bool{false} ** settings_label_specs.len;
         for (self.formItems()) |item| {
-            if (self.controlHwnd(item.control_index)) |control| _ = ShowWindow(control, SW_SHOWNORMAL);
-            if (item.label_index) |index| {
-                if (self.field_labels[index]) |label| _ = ShowWindow(label, SW_SHOWNORMAL);
-            }
+            active_controls[item.control_index] = true;
+            if (item.label_index) |index| active_labels[index] = true;
         }
+        for (0..settings_clipped_control_count) |index| if (self.controlHwnd(index)) |control| {
+            setChildShown(control, active_controls[index]);
+        };
+        for (self.field_labels, 0..) |label, index| if (label) |control| {
+            setChildShown(control, active_labels[index]);
+        };
     }
 
     /// Read the current EDIT text and write the parsed integer into
@@ -4206,9 +4463,33 @@ pub const SettingsWindow = struct {
                 return windows.unexpectedError(windows.kernel32.GetLastError());
             }
         }
+        if (self.viewport_class_atom == 0) {
+            const wc: WNDCLASSEXW = .{
+                .cbSize = @sizeOf(WNDCLASSEXW),
+                .style = 0,
+                .lpfnWndProc = &viewportProc,
+                .cbClsExtra = 0,
+                .cbWndExtra = 0,
+                .hInstance = self.handle.hinstance,
+                .hIcon = null,
+                .hCursor = sys.LoadCursorW(null, @ptrFromInt(IDC_ARROW)),
+                .hbrBackground = null,
+                .lpszMenuName = null,
+                .lpszClassName = viewport_class_name,
+                .hIconSm = null,
+            };
+            self.viewport_class_atom = sys.RegisterClassExW(&wc);
+            if (self.viewport_class_atom == 0) {
+                return windows.unexpectedError(windows.kernel32.GetLastError());
+            }
+        }
 
         const title = std.unicode.utf8ToUtf16LeStringLiteral("noctty settings");
-        const window_style = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_VSCROLL;
+        // WS_CLIPCHILDREN: painting the frame never paints over a child, so a
+        // relayout, a section switch or a theme refresh no longer blanks the
+        // form until every control has repainted. The scroll bar belongs to
+        // the viewport, not to the window.
+        const window_style = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
         const initial_outer = settingsOuterSizeForClient(960, 640, 96, window_style, WS_EX_APPWINDOW);
         const owner_hwnd = if (self.handle.ownerWindow) |get_owner| get_owner(self.handle.ctx) else null;
         const hwnd = sys.CreateWindowExW(
@@ -4277,11 +4558,6 @@ pub const SettingsWindow = struct {
         self.text_status = makeStatic(hwnd, self.handle.hinstance, "");
         self.text_close_prompt = makeStatic(hwnd, self.handle.hinstance, "Save changes before closing?");
         if (self.text_close_prompt) |text| _ = sys.ShowWindow(text, SW_HIDE);
-        self.text_help = makeStatic(hwnd, self.handle.hinstance, "");
-        for (settings_label_specs, 0..) |spec, i| {
-            self.field_labels[i] = makeStatic(hwnd, self.handle.hinstance, spec);
-        }
-        self.initializeTextUiaProviders();
 
         // Left-rail section buttons. Clicks arrive via WM_COMMAND on
         // the parent; the id maps back to a `Section` via
@@ -4295,6 +4571,40 @@ pub const SettingsWindow = struct {
         self.btn_section_advanced = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.advanced);
         self.subclassSectionButtons();
         self.initializeSectionUiaProviders();
+
+        // The form: every field, its label and the help text live in the
+        // viewport, after the rail in z-order so Tab goes rail, fields, action
+        // bar. WS_EX_CONTROLPARENT lets the dialog manager walk into it.
+        // WM_COMMAND and WM_CTLCOLOR* from the fields are forwarded here.
+        const form = sys.CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            viewport_class_name,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VSCROLL,
+            0,
+            0,
+            1,
+            1,
+            hwnd,
+            null,
+            self.handle.hinstance,
+            self,
+        ) orelse {
+            const err = windows.kernel32.GetLastError();
+            _ = sys.DestroyWindow(hwnd);
+            return windows.unexpectedError(err);
+        };
+        self.viewport = form;
+        self.text_help = makeStatic(form, self.handle.hinstance, "");
+        // The arrow keys walk a group from window to window and step into the
+        // viewport, ignoring a group style on the viewport itself: its first
+        // child has to end the rail's group, or Down from the last section
+        // would run on into the labels.
+        if (self.text_help) |help| startGroup(help);
+        for (settings_label_specs, 0..) |spec, i| {
+            self.field_labels[i] = makeStatic(form, self.handle.hinstance, spec);
+        }
+        self.initializeTextUiaProviders();
 
         // "Open in default editor" button — escape hatch for users
         // who prefer text-editing the config file directly. Lives
@@ -4310,7 +4620,7 @@ pub const SettingsWindow = struct {
             0,
             settings_field_max_width,
             32,
-            hwnd,
+            form,
             @ptrFromInt(BTN_OPEN_EDITOR),
             self.handle.hinstance,
             null,
@@ -4414,7 +4724,7 @@ pub const SettingsWindow = struct {
             0,
             settings_field_max_width,
             32,
-            hwnd,
+            form,
             @ptrFromInt(BTN_KEYBINDINGS_EDITOR),
             self.handle.hinstance,
             null,
@@ -4422,52 +4732,52 @@ pub const SettingsWindow = struct {
 
         // Scrollback limit EDIT. Lives in the Terminal section. Digit-
         // only input via ES_NUMBER; EN_CHANGE syncs into `pending`.
-        self.edit_scrollback = makeEdit(hwnd, self.handle.hinstance, EDIT_SCROLLBACK, ES_NUMBER);
+        self.edit_scrollback = makeEdit(form, self.handle.hinstance, EDIT_SCROLLBACK, ES_NUMBER);
 
         // font-family EDIT. Comma-separated fallback families.
-        self.edit_font_family = makeEdit(hwnd, self.handle.hinstance, EDIT_FONT_FAMILY, 0);
+        self.edit_font_family = makeEdit(form, self.handle.hinstance, EDIT_FONT_FAMILY, 0);
 
         // font-size EDIT. Appearance section. We accept floats via a
         // plain EDIT (not ES_NUMBER — which rejects '.') and validate
         // on EN_CHANGE.
-        self.edit_font_size = makeEdit(hwnd, self.handle.hinstance, EDIT_FONT_SIZE, 0);
+        self.edit_font_size = makeEdit(form, self.handle.hinstance, EDIT_FONT_SIZE, 0);
 
         // theme EDIT. Accepts a built-in/custom name or light/dark pair.
-        self.edit_theme = makeEdit(hwnd, self.handle.hinstance, EDIT_THEME, 0);
+        self.edit_theme = makeEdit(form, self.handle.hinstance, EDIT_THEME, 0);
 
         // background-opacity EDIT. Appearance section. 0.0..1.0.
-        self.edit_bg_opacity = makeEdit(hwnd, self.handle.hinstance, EDIT_BG_OPACITY, 0);
+        self.edit_bg_opacity = makeEdit(form, self.handle.hinstance, EDIT_BG_OPACITY, 0);
 
-        self.edit_command = makeEdit(hwnd, self.handle.hinstance, EDIT_COMMAND, 0);
+        self.edit_command = makeEdit(form, self.handle.hinstance, EDIT_COMMAND, 0);
 
-        self.edit_pad_x = makeEdit(hwnd, self.handle.hinstance, EDIT_PAD_X, 0);
+        self.edit_pad_x = makeEdit(form, self.handle.hinstance, EDIT_PAD_X, 0);
 
-        self.edit_pad_y = makeEdit(hwnd, self.handle.hinstance, EDIT_PAD_Y, 0);
+        self.edit_pad_y = makeEdit(form, self.handle.hinstance, EDIT_PAD_Y, 0);
 
         // clipboard-trim-trailing-spaces checkbox. Terminal section.
         self.chk_trim_trail = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_TRIM_TRAIL,
             std.unicode.utf8ToUtf16LeStringLiteral("Trim trailing spaces on copy"),
         );
 
         self.chk_desktop_notifications = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_DESKTOP_NOTIFICATIONS,
             std.unicode.utf8ToUtf16LeStringLiteral("Allow terminal desktop notifications"),
         );
 
         self.chk_app_notify_clipboard = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CLIPBOARD,
             std.unicode.utf8ToUtf16LeStringLiteral("Notify when clipboard copy completes"),
         );
 
         self.chk_app_notify_config = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CONFIG,
             std.unicode.utf8ToUtf16LeStringLiteral("Notify after config reload"),
@@ -4475,7 +4785,7 @@ pub const SettingsWindow = struct {
 
         // Comboboxes for enum fields.
         self.combo_confirm_close = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CONFIRM_CLOSE,
             settings_combo_popup_height,
@@ -4483,7 +4793,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_copy_on_select = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_COPY_ON_SELECT,
             settings_combo_popup_height,
@@ -4491,7 +4801,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_clipboard_read = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CLIPBOARD_READ,
             settings_combo_popup_height,
@@ -4499,7 +4809,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_clipboard_write = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CLIPBOARD_WRITE,
             settings_combo_popup_height,
@@ -4507,7 +4817,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_link_url = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_LINK_URL,
             settings_combo_popup_height,
@@ -4515,7 +4825,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_link_previews = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_LINK_PREVIEWS,
             settings_combo_popup_height,
@@ -4523,7 +4833,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_window_theme = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_WINDOW_THEME,
             settings_combo_popup_height,
@@ -4531,7 +4841,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_shell_integ = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_SHELL_INTEG,
             settings_combo_popup_height,
@@ -4539,7 +4849,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_cursor_style = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CURSOR_STYLE,
             settings_combo_popup_height,
@@ -4550,7 +4860,7 @@ pub const SettingsWindow = struct {
         // 2026-09-14), so the box is shown for what the config file may say and
         // cannot be changed here. It keeps its place and its accessible name.
         self.chk_bg_blur = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_BG_BLUR,
             std.unicode.utf8ToUtf16LeStringLiteral(background_blur_label),
@@ -4558,7 +4868,7 @@ pub const SettingsWindow = struct {
         if (self.chk_bg_blur) |chk| _ = sys.EnableWindow(chk, 0);
 
         self.combo_pad_balance = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_PAD_BALANCE,
             settings_combo_popup_height,
@@ -4566,7 +4876,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_auto_update = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_AUTO_UPDATE,
             settings_combo_popup_height,
@@ -4574,7 +4884,7 @@ pub const SettingsWindow = struct {
         );
 
         self.combo_auto_update_channel = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_AUTO_UPDATE_CHANNEL,
             settings_combo_popup_height,
@@ -4589,6 +4899,7 @@ pub const SettingsWindow = struct {
         // Before the UIA providers: they subclass the same HWNDs and call
         // down to whatever procedure is installed when they arrive.
         for (self.comboControls()) |combo| if (combo) |control| subclassCombo(control);
+        for (self.editControls()) |edit| if (edit) |control| subclassEdit(control);
         self.applyTabOrder();
         self.initializeControlUiaProviders();
 
@@ -4802,16 +5113,15 @@ fn makeEdit(
     extra_style: u32,
 ) ?HWND {
     const edit_class = std.unicode.utf8ToUtf16LeStringLiteral("EDIT");
-    // `WS_EX_CLIENTEDGE` is the classic sunken 3-D frame. It ignores the
-    // `DarkMode_Explorer` theme entirely, so on the dark pane every field
-    // wore a two-pixel near-white bevel. A themed `WS_BORDER` EDIT draws
-    // the same 1 px frame the combo boxes beside it draw, in the theme's
-    // own colour, in both modes.
+    // No border style: the field draws its own frame (`settingsEditProc`).
+    // `WS_EX_CLIENTEDGE` is the classic sunken 3-D frame and ignores the dark
+    // theme; a themed `WS_BORDER` has no focused state, and the themed EDIT
+    // drew it a second time inside the text area once the frame was ours.
     const edit = CreateWindowExW(
         0,
         edit_class,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | extra_style,
+        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | extra_style,
         0,
         0,
         settings_field_max_width,
@@ -5908,43 +6218,34 @@ fn confirmedStaAllowsCustomUiaProviders(confirmed_sta: bool) bool {
     return confirmed_sta;
 }
 
-fn viewportRegionIsFullyClipped(width: i32, clip_top: i32, clip_bottom: i32) bool {
-    return width == 0 or clip_top == clip_bottom;
+/// Whether a child spanning `top`..`bottom` (viewport client coordinates) is
+/// entirely outside a viewport `height` tall. One cut by an edge is on screen.
+fn viewportHidesSpan(top: i32, bottom: i32, height: i32) bool {
+    return height <= 0 or bottom <= top or bottom <= 0 or top >= height;
+}
+
+fn viewportHidesChild(viewport: HWND, child: ?HWND, height: i32) bool {
+    const hwnd = child orelse return true;
+    var rect: RECT = undefined;
+    if (sys.GetWindowRect(hwnd, &rect) == 0) return true;
+    var origin: POINT = .{ .x = rect.left, .y = rect.top };
+    if (sys.ScreenToClient(viewport, &origin) == 0) return true;
+    return viewportHidesSpan(origin.y, origin.y + (rect.bottom - rect.top), height);
 }
 
 test "settings viewport exposes partially clipped controls as onscreen" {
-    try std.testing.expect(viewportRegionIsFullyClipped(100, 20, 20));
-    try std.testing.expect(viewportRegionIsFullyClipped(0, 0, 10));
-    try std.testing.expect(!viewportRegionIsFullyClipped(100, 20, 21));
-    try std.testing.expect(!viewportRegionIsFullyClipped(100, 0, 40));
+    try std.testing.expect(viewportHidesSpan(-40, 0, 300));
+    try std.testing.expect(viewportHidesSpan(300, 340, 300));
+    try std.testing.expect(viewportHidesSpan(20, 20, 300));
+    try std.testing.expect(viewportHidesSpan(0, 40, 0));
+    try std.testing.expect(!viewportHidesSpan(-39, 1, 300));
+    try std.testing.expect(!viewportHidesSpan(299, 339, 300));
+    try std.testing.expect(!viewportHidesSpan(0, 40, 300));
 }
 
 test "settings custom UIA providers require confirmed STA initialization" {
     try std.testing.expect(!confirmedStaAllowsCustomUiaProviders(false));
     try std.testing.expect(confirmedStaAllowsCustomUiaProviders(true));
-}
-
-fn clipChildToViewport(parent: HWND, child: ?HWND, viewport_top: i32, viewport_bottom: i32) bool {
-    const hwnd = child orelse return true;
-    var rect: RECT = undefined;
-    if (sys.GetWindowRect(hwnd, &rect) == 0) return false;
-    var origin: POINT = .{ .x = rect.left, .y = rect.top };
-    if (sys.ScreenToClient(parent, &origin) == 0) return false;
-    const width = @max(0, rect.right - rect.left);
-    const height = @max(0, rect.bottom - rect.top);
-    const clip_top = std.math.clamp(viewport_top - origin.y, 0, height);
-    const clip_bottom = std.math.clamp(viewport_bottom - origin.y, clip_top, height);
-    if (clip_top == 0 and clip_bottom == height) {
-        _ = SetWindowRgn(hwnd, null, 0);
-        return false;
-    }
-    const fully_clipped = viewportRegionIsFullyClipped(width, clip_top, clip_bottom);
-    const region = CreateRectRgn(0, clip_top, width, clip_bottom) orelse return false;
-    if (SetWindowRgn(hwnd, region, 0) == 0) {
-        _ = DeleteObject(region);
-        return false;
-    }
-    return fully_clipped;
 }
 
 test "settings scrollbar thumb and maximum cover real extents" {
@@ -6072,8 +6373,7 @@ fn statusRowGeometry(self: *SettingsWindow, full_width: i32, inline_width: i32) 
 /// monitor work area, so a short work area at a high scale can produce a
 /// client that the scaled header plus a stacked dirty-close bar would consume
 /// entirely: a 1366x768 work area at 288 DPI gives a viewport of exactly zero
-/// height, and `clipChildToViewport` then assigns an empty region to every
-/// control and label, i.e. a blank form. The viewport is reserved first and
+/// height, i.e. a blank form. The viewport is reserved first and
 /// the action bar gives way, which it already handles because it clamps its
 /// own contents to whatever height it is given.
 fn actionBarAvailableHeight(self: *SettingsWindow, client_rect: RECT) i32 {
@@ -6184,9 +6484,61 @@ fn paneBounds(self: *const SettingsWindow, client_rect: RECT) PaneBounds {
 }
 
 fn settingsContentViewportBottom(self: *SettingsWindow, client_rect: RECT) i32 {
-    const pane = paneBounds(self, client_rect);
-    const action_bar = closePromptLayoutGeometry(self, pane.width, actionBarAvailableHeight(self, client_rect));
+    const action_bar = closePromptLayoutGeometry(self, actionColumnWidth(self, client_rect), actionBarAvailableHeight(self, client_rect));
     return @max(settingsContentViewportTop(self, client_rect), client_rect.bottom - action_bar.bar_height - self.px(settings_pane_padding));
+}
+
+/// The width the form is laid out in. The viewport runs from the pane's left
+/// edge to the window's right edge, so its scroll bar normally sits in the
+/// pane's right padding; whatever part of the bar reaches into the pane is
+/// left out, shown or not, so the fields never sit under it and never move
+/// when it appears.
+fn formPaneWidth(self: *const SettingsWindow, client_rect: RECT) i32 {
+    const pane = paneBounds(self, client_rect);
+    const scrollbar = @max(0, GetSystemMetricsForDpi(SM_CXVSCROLL, normalizedDpi(self.dpi)));
+    return @max(0, @min(pane.width, client_rect.right - pane.left - scrollbar));
+}
+
+/// How wide the laid-out form is: one lane, or two lanes and the gap.
+fn settingsFormColumnWidth(form_pane_width: i32, dpi: u32) i32 {
+    const lane = settingsFieldRects(0, form_pane_width, dpi).control;
+    const lane_width = lane.right - lane.left;
+    if (settingsColumnCount(form_pane_width, dpi) < 2) return lane_width;
+    return 2 * lane_width + scaleForDpi(settings_column_gap, dpi);
+}
+
+/// The width of the action bar and of the separators. Once the form has two
+/// lanes it is the form's own width, so Save stays at the form's right edge
+/// however wide the window gets (it drifted to the far right before). A
+/// one-lane form keeps the whole pane: the action rows need more than one
+/// lane to stand side by side.
+fn settingsActionColumnWidth(pane_width: i32, form_pane_width: i32, dpi: u32) i32 {
+    if (settingsColumnCount(form_pane_width, dpi) < 2) return pane_width;
+    return @min(pane_width, settingsFormColumnWidth(form_pane_width, dpi));
+}
+
+fn actionColumnWidth(self: *const SettingsWindow, client_rect: RECT) i32 {
+    return settingsActionColumnWidth(paneBounds(self, client_rect).width, formPaneWidth(self, client_rect), self.dpi);
+}
+
+test "settings action bar follows the form's column once it has two lanes" {
+    for ([_]u32{ 96, 144, 192, 288 }) |dpi| {
+        // One lane: the whole pane, so the close prompt's three buttons fit.
+        const narrow = scaleForDpi(500, dpi);
+        try std.testing.expectEqual(narrow, settingsActionColumnWidth(narrow, narrow, dpi));
+        // Two lanes in a wide pane: two full lanes and the gap, not the pane.
+        const wide = scaleForDpi(1600, dpi);
+        const column = settingsActionColumnWidth(wide, wide, dpi);
+        try std.testing.expectEqual(2 * scaleForDpi(settings_field_max_width, dpi) + scaleForDpi(settings_column_gap, dpi), column);
+        // Just wide enough for two lanes: the form fills the pane.
+        const tight = scaleForDpi(settings_two_column_min_width, dpi);
+        try std.testing.expect(settingsActionColumnWidth(tight, tight, dpi) <= tight);
+        try std.testing.expect(settingsActionColumnWidth(tight, tight, dpi) >= tight - 1);
+        // The right lane's controls end where the column ends.
+        var rects: [2]SettingsFieldRects = undefined;
+        settingsFormItemRects(&.{ .{ .control_index = 4, .label_index = 3 }, .{ .control_index = 5, .label_index = 4 } }, wide, dpi, &rects);
+        try std.testing.expectEqual(column, rects[1].control.right);
+    }
 }
 
 fn measureStaticTextHeight(self: *SettingsWindow, text_opt: ?HWND, width: i32) i32 {
@@ -6211,29 +6563,124 @@ fn isComboControl(self: *const SettingsWindow, hwnd: HWND) bool {
     return false;
 }
 
+/// Child windows to place at once. One `DeferWindowPos` batch moves them all
+/// before anything repaints, and Windows invalidates only what moved or was
+/// uncovered. If the batch cannot be built, each window is moved on its own.
+/// All windows in one batch must share a parent.
+fn ChildPlacements(comptime capacity: usize) type {
+    return struct {
+        windows: [capacity]HWND = undefined,
+        rects: [capacity]RECT = undefined,
+        flags: [capacity]UINT = undefined,
+        len: usize = 0,
+
+        fn add(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
+            self.put(hwnd, x, y, width, height, false);
+        }
+
+        /// A static whose text wraps to its width. Moving a window keeps
+        /// what it showed, and the Static class does not ask to be drawn
+        /// again when its size changes (no `CS_HREDRAW`). A resize of the
+        /// Settings window repaints every child anyway (its class has
+        /// `CS_HREDRAW | CS_VREDRAW`), but a static can change size while the
+        /// window keeps its own: a status message that needs a row of its
+        /// own, or a DPI change on a window already at its capped minimum,
+        /// where `WM_SETFONT` has just drawn the text in the new font at the
+        /// old size. Such a static would keep its old picture, so a resized
+        /// one is drawn again whole.
+        fn addText(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
+            self.put(hwnd, x, y, width, height, true);
+        }
+
+        fn put(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32, wraps: bool) void {
+            const window = hwnd orelse return;
+            std.debug.assert(self.len < capacity);
+            const r: RECT = .{ .left = x, .top = y, .right = x + @max(0, width), .bottom = y + @max(0, height) };
+            var flags: UINT = SWP_NOZORDER | SWP_NOACTIVATE;
+            if (wraps) {
+                var current: RECT = undefined;
+                const resized = GetWindowRect(window, &current) == 0 or
+                    current.right - current.left != r.right - r.left or
+                    current.bottom - current.top != r.bottom - r.top;
+                if (resized) flags |= SWP_NOCOPYBITS;
+            }
+            self.windows[self.len] = window;
+            self.rects[self.len] = r;
+            self.flags[self.len] = flags;
+            self.len += 1;
+        }
+
+        fn apply(self: *const @This()) bool {
+            if (self.len == 0) return true;
+            if (BeginDeferWindowPos(@intCast(self.len))) |first| {
+                var batch: ?*anyopaque = first;
+                for (self.windows[0..self.len], self.rects[0..self.len], self.flags[0..self.len]) |window, r, flags| {
+                    // A failed call has already discarded the batch.
+                    batch = DeferWindowPos(batch.?, window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+                    if (batch == null) break;
+                }
+                if (batch) |complete| if (EndDeferWindowPos(complete) != 0) return true;
+            }
+            for (self.windows[0..self.len], self.rects[0..self.len], self.flags[0..self.len]) |window, r, flags| {
+                _ = SetWindowPos(window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+            }
+            return false;
+        }
+    };
+}
+
+/// Rail buttons, header, summary, viewport, status, prompt, five action buttons.
+const settings_frame_child_count = section_count + 11;
+/// Every label and field of the largest section, and the help text.
+const settings_form_child_count = settings_max_form_items * 2 + 1;
+
+/// What the frame window paints besides its background colour.
+const BackgroundGeometry = struct {
+    rail: RECT,
+    rail_separator: RECT,
+    header_separator: RECT,
+    action_separator: RECT,
+};
+
+fn backgroundGeometry(self: *SettingsWindow, client_rect: RECT) BackgroundGeometry {
+    const separator_width = @max(1, self.px(settings_metrics.stroke_hairline));
+    const rail_right = self.px(settings_rail_width);
+    const pane = paneBounds(self, client_rect);
+    const column = actionColumnWidth(self, client_rect);
+    const rail_geometry = sectionRailGeometry(client_rect.bottom - client_rect.top, self.dpi);
+    const header_y = rail_geometry.top_pad + self.px(settings_header_separator_y);
+    const action_bar = closePromptLayoutGeometry(self, column, actionBarAvailableHeight(self, client_rect));
+    const action_y = client_rect.bottom - action_bar.bar_height;
+    return .{
+        .rail = .{ .left = client_rect.left, .top = client_rect.top, .right = rail_right, .bottom = client_rect.bottom },
+        .rail_separator = .{ .left = rail_right - separator_width, .top = client_rect.top, .right = rail_right, .bottom = client_rect.bottom },
+        .header_separator = .{ .left = pane.left, .top = header_y, .right = pane.left + column, .bottom = header_y + separator_width },
+        .action_separator = .{ .left = pane.left, .top = action_y, .right = pane.left + column, .bottom = action_y + separator_width },
+    };
+}
+
 fn layoutChildren(self: *SettingsWindow) void {
     const hwnd = self.hwnd orelse return;
     var rect: RECT = undefined;
     if (GetClientRect(hwnd, &rect) == 0) return;
-    const position_flags = SWP_NOREDRAW | SWP_NOZORDER | SWP_NOACTIVATE;
 
+    var frame: ChildPlacements(settings_frame_child_count) = .{};
     const rail_width = self.px(settings_rail_width);
     const rail_padding = self.px(settings_rail_padding_x);
     const pane_padding = self.px(settings_pane_padding);
     const rail_geometry = sectionRailGeometry(rect.bottom - rect.top, self.dpi);
     var rail_y = rail_geometry.top_pad;
     for (std.enums.values(Section)) |section| {
-        if (self.sectionButton(section)) |button| {
-            _ = SetWindowPos(button, null, rail_padding, rail_y, rail_width - 2 * rail_padding, rail_geometry.button_height, position_flags);
-        }
+        frame.add(self.sectionButton(section), rail_padding, rail_y, rail_width - 2 * rail_padding, rail_geometry.button_height);
         rail_y += rail_geometry.button_height + rail_geometry.gap;
     }
 
     const pane = paneBounds(self, rect);
     const pane_left = pane.left;
-    const pane_width = pane.width;
+    const form_width = formPaneWidth(self, rect);
+    const column_width = settingsActionColumnWidth(pane.width, form_width, self.dpi);
     const pane_top = rail_geometry.top_pad;
-    const action_bar = closePromptLayoutGeometry(self, pane_width, actionBarAvailableHeight(self, rect));
+    const action_bar = closePromptLayoutGeometry(self, column_width, actionBarAvailableHeight(self, rect));
     const action_bar_top = rect.bottom - action_bar.bar_height;
     const viewport_top = pane_top + self.px(settings_form_viewport_top);
     const viewport_bottom = @max(viewport_top, action_bar_top - pane_padding);
@@ -6241,15 +6688,19 @@ fn layoutChildren(self: *SettingsWindow) void {
     self.proof_viewport_bottom = viewport_bottom;
     const viewport_height = @max(0, viewport_bottom - viewport_top);
 
-    const prose_width = @min(pane_width, self.px(settings_prose_max_width));
-    if (self.text_header) |text| _ = SetWindowPos(text, null, pane_left, pane_top, prose_width, self.px(settings_header_title_height), position_flags);
-    if (self.text_summary) |text| _ = SetWindowPos(text, null, pane_left, pane_top + self.px(settings_header_summary_top), prose_width, self.px(settings_header_summary_height), position_flags);
+    const prose_width = @min(pane.width, self.px(settings_prose_max_width));
+    frame.addText(self.text_header, pane_left, pane_top, prose_width, self.px(settings_header_title_height));
+    frame.addText(self.text_summary, pane_left, pane_top + self.px(settings_header_summary_top), prose_width, self.px(settings_header_summary_height));
+    // To the window's right edge, so its scroll bar sits at the edge of the
+    // window but only beside the form.
+    frame.add(self.viewport, pane_left, viewport_top, rect.right - pane_left, viewport_height);
 
+    // The form, in viewport coordinates.
     const form_items = self.formItems();
     var item_rects: [settings_max_form_items]SettingsFieldRects = undefined;
     var extent_rects: [settings_max_form_items * 2 + 1]RECT = undefined;
     var extent_count: usize = 0;
-    settingsFormItemRects(form_items, pane_width, self.dpi, item_rects[0..form_items.len]);
+    settingsFormItemRects(form_items, form_width, self.dpi, item_rects[0..form_items.len]);
     for (form_items, 0..) |item, index| {
         if (self.controlHwnd(item.control_index) == null) continue;
         if (item.label_index != null) {
@@ -6263,7 +6714,7 @@ fn layoutChildren(self: *SettingsWindow) void {
     var help_rect: ?RECT = null;
     if (self.active_section == .keybindings or self.active_section == .advanced) {
         const help_top = self.px(settings_field_row_pitch);
-        const help_width = @min(pane_width, self.px(settings_prose_max_width));
+        const help_width = @min(form_width, self.px(settings_prose_max_width));
         const help_height = measureStaticTextHeight(self, self.text_help, help_width);
         if (help_height > 0) {
             help_rect = .{ .left = 0, .top = help_top, .right = help_width, .bottom = help_top + help_height };
@@ -6275,100 +6726,82 @@ fn layoutChildren(self: *SettingsWindow) void {
     const scroll_geometry = settingsScrollGeometry(content_extent, viewport_height);
     self.content_scroll_max = scroll_geometry.max_position;
     self.content_scroll_y = std.math.clamp(self.content_scroll_y, 0, self.content_scroll_max);
-    const scroll_info: SCROLLINFO = .{
-        .cbSize = @sizeOf(SCROLLINFO),
-        .fMask = SIF_RANGE | SIF_PAGE | SIF_POS,
-        .nMin = 0,
-        .nMax = scroll_geometry.nmax,
-        .nPage = scroll_geometry.page,
-        .nPos = self.content_scroll_y,
-        .nTrackPos = 0,
-    };
-    _ = SetScrollInfo(hwnd, SB_VERT, &scroll_info, 1);
-    _ = ShowScrollBar(hwnd, SB_VERT, @intFromBool(self.content_scroll_max > 0));
+    const scroll_y = self.content_scroll_y;
 
+    var form: ChildPlacements(settings_form_child_count) = .{};
     for (form_items, 0..) |item, index| {
         const control = self.controlHwnd(item.control_index) orelse continue;
         const geometry = item_rects[index];
-        if (item.label_index) |label_index| if (self.field_labels[label_index]) |label| {
-            _ = SetWindowPos(
-                label,
-                null,
-                pane_left + geometry.label.left,
-                viewport_top + geometry.label.top - self.content_scroll_y,
-                geometry.label.right - geometry.label.left,
-                geometry.label.bottom - geometry.label.top,
-                position_flags,
-            );
-        };
-        _ = SetWindowPos(
-            control,
-            null,
-            pane_left + geometry.control.left,
-            viewport_top + geometry.control.top - self.content_scroll_y,
-            geometry.control.right - geometry.control.left,
-            if (isComboControl(self, control)) self.px(settings_combo_popup_height) else self.px(settings_control_height),
-            position_flags,
-        );
+        if (item.label_index) |label_index| {
+            const label = geometry.label;
+            form.addText(self.field_labels[label_index], label.left, label.top - scroll_y, label.right - label.left, label.bottom - label.top);
+        }
+        // A dropdown's height is that of its open list; its closed height is
+        // set afterwards (`fitComboFields`).
+        const height = if (isComboControl(self, control)) self.px(settings_combo_popup_height) else self.px(settings_control_height);
+        form.add(control, geometry.control.left, geometry.control.top - scroll_y, geometry.control.right - geometry.control.left, height);
     }
-    if (help_rect) |help| if (self.text_help) |text| {
-        _ = SetWindowPos(
-            text,
-            null,
-            pane_left + help.left,
-            viewport_top + help.top - self.content_scroll_y,
-            help.right - help.left,
-            help.bottom - help.top,
-            position_flags,
-        );
-    };
-    if (self.text_help) |text| _ = ShowWindow(text, if (help_rect != null) SW_SHOWNORMAL else SW_HIDE);
+    if (help_rect) |help| form.addText(self.text_help, help.left, help.top - scroll_y, help.right - help.left, help.bottom - help.top);
 
     const row_top = action_bar_top + action_bar.actions_top;
     const action_gap = self.px(settings_action_gap);
     const normal_actions = action_bar.normal_actions;
-    if (self.btn_save) |button| _ = SetWindowPos(button, null, pane_left + normal_actions.save_x, row_top + normal_actions.save_y, normal_actions.save_width, normal_actions.button_height, position_flags);
-    if (self.btn_conflict_keep) |button| _ = SetWindowPos(button, null, pane_left + normal_actions.keep_mine_x, row_top + normal_actions.keep_mine_y, normal_actions.keep_mine_width, normal_actions.button_height, position_flags);
-    if (self.btn_conflict_use_disk) |button| _ = SetWindowPos(button, null, pane_left + normal_actions.use_disk_x, row_top + normal_actions.use_disk_y, normal_actions.use_disk_width, normal_actions.button_height, position_flags);
-    if (self.text_status) |text| {
-        if (action_bar.status_separate) {
-            _ = SetWindowPos(text, null, pane_left, action_bar_top + action_bar.status_top, pane_width, action_bar.status_height, position_flags);
-        } else {
-            _ = SetWindowPos(text, null, pane_left, row_top + self.px(6), @max(0, normal_actions.status_right), self.px(20), position_flags);
-        }
+    frame.add(self.btn_save, pane_left + normal_actions.save_x, row_top + normal_actions.save_y, normal_actions.save_width, normal_actions.button_height);
+    frame.add(self.btn_conflict_keep, pane_left + normal_actions.keep_mine_x, row_top + normal_actions.keep_mine_y, normal_actions.keep_mine_width, normal_actions.button_height);
+    frame.add(self.btn_conflict_use_disk, pane_left + normal_actions.use_disk_x, row_top + normal_actions.use_disk_y, normal_actions.use_disk_width, normal_actions.button_height);
+    if (action_bar.status_separate) {
+        frame.addText(self.text_status, pane_left, action_bar_top + action_bar.status_top, column_width, action_bar.status_height);
+    } else {
+        frame.addText(self.text_status, pane_left, row_top + self.px(6), @max(0, normal_actions.status_right), self.px(20));
     }
     self.status_row_separate = action_bar.status_separate;
     self.status_row_height = action_bar.status_height;
 
     const close_actions = action_bar.actions;
     const close_top = action_bar_top + action_bar.actions_top;
-    const prompt_width = if (close_actions.stacked) pane_width else @max(0, close_actions.first_x - action_gap);
-    if (self.text_close_prompt) |text| _ = SetWindowPos(text, null, pane_left, action_bar_top + action_bar.prompt_top, prompt_width, action_bar.prompt_height, position_flags);
-    if (self.btn_close_save) |button| _ = SetWindowPos(button, null, pane_left + close_actions.first_x, close_top, close_actions.first_width, close_actions.button_height, position_flags);
-    if (self.btn_close_discard) |button| _ = SetWindowPos(button, null, pane_left + close_actions.second_x, close_top + close_actions.second_y, close_actions.second_width, close_actions.button_height, position_flags);
-    if (self.btn_close_keep_editing) |button| _ = SetWindowPos(button, null, pane_left + close_actions.third_x, close_top + close_actions.third_y, close_actions.third_width, close_actions.button_height, position_flags);
+    const prompt_width = if (close_actions.stacked) column_width else @max(0, close_actions.first_x - action_gap);
+    frame.addText(self.text_close_prompt, pane_left, action_bar_top + action_bar.prompt_top, prompt_width, action_bar.prompt_height);
+    frame.add(self.btn_close_save, pane_left + close_actions.first_x, close_top, close_actions.first_width, close_actions.button_height);
+    frame.add(self.btn_close_discard, pane_left + close_actions.second_x, close_top + close_actions.second_y, close_actions.second_width, close_actions.button_height);
+    frame.add(self.btn_close_keep_editing, pane_left + close_actions.third_x, close_top + close_actions.third_y, close_actions.third_width, close_actions.button_height);
 
-    var active_clipped_controls = [_]bool{false} ** settings_clipped_control_count;
-    for (form_items) |item| active_clipped_controls[item.control_index] = true;
-    for (0..settings_clipped_control_count) |index| {
-        const control = self.controlHwnd(index);
-        const region_fully_clipped = clipChildToViewport(hwnd, control, viewport_top, viewport_bottom);
-        const fully_clipped = !active_clipped_controls[index] or region_fully_clipped;
-        if (self.control_uia_providers[index]) |provider| provider.setViewportFullyClipped(fully_clipped);
+    const frame_batched = frame.apply();
+    if (self.viewport) |viewport| {
+        const scroll_info: SCROLLINFO = .{
+            .cbSize = @sizeOf(SCROLLINFO),
+            .fMask = SIF_RANGE | SIF_PAGE | SIF_POS,
+            .nMin = 0,
+            .nMax = scroll_geometry.nmax,
+            .nPage = scroll_geometry.page,
+            .nPos = scroll_y,
+            .nTrackPos = 0,
+        };
+        _ = SetScrollInfo(viewport, SB_VERT, &scroll_info, 1);
+        _ = ShowScrollBar(viewport, SB_VERT, @intFromBool(self.content_scroll_max > 0));
     }
-    const help_region_fully_clipped = clipChildToViewport(hwnd, self.text_help, viewport_top, viewport_bottom);
-    const help_fully_clipped = help_rect == null or help_region_fully_clipped;
-    if (self.text_uia_providers[4]) |provider| provider.setViewportFullyClipped(help_fully_clipped);
-    var active_labels = [_]bool{false} ** settings_label_specs.len;
-    for (form_items) |item| {
-        if (item.label_index) |index| active_labels[index] = true;
+    const form_batched = form.apply();
+    self.fitComboFields();
+    self.help_shown = help_rect != null;
+    if (self.text_help) |text| setChildShown(text, self.help_shown);
+    self.proof_layout_batched = frame_batched and form_batched;
+    self.syncViewportClipFlags();
+
+    // Moving children repaints them and whatever they uncovered. The frame's
+    // own lines move only with the action bar or the column, which a window
+    // that keeps its size does not repaint on its own: repaint where each one
+    // was and where it is now.
+    const background = backgroundGeometry(self, rect);
+    if (self.background_geometry) |previous| {
+        inline for (std.meta.fields(BackgroundGeometry)) |field| {
+            const old_rect = @field(previous, field.name);
+            const new_rect = @field(background, field.name);
+            if (!std.meta.eql(old_rect, new_rect)) {
+                _ = InvalidateRect(hwnd, &old_rect, 0);
+                _ = InvalidateRect(hwnd, &new_rect, 0);
+            }
+        }
     }
-    for (self.field_labels, 0..) |label, index| {
-        const region_fully_clipped = clipChildToViewport(hwnd, label, viewport_top, viewport_bottom);
-        const fully_clipped = !active_labels[index] or region_fully_clipped;
-        if (self.text_uia_providers[index + 5]) |provider| provider.setViewportFullyClipped(fully_clipped);
-    }
-    self.proof_layout_redraw_succeeded = RedrawWindow(hwnd, null, null, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE) != 0;
+    self.background_geometry = background;
 }
 
 /// Dialog-semantics tests drive a real Settings window. They run on a desktop
@@ -6391,6 +6824,171 @@ const dialog_test = struct {
     extern "user32" fn GetKeyboardState(keys: *[256]u8) callconv(.winapi) BOOL;
     extern "user32" fn SetKeyboardState(keys: *const [256]u8) callconv(.winapi) BOOL;
     extern "user32" fn GetNextDlgGroupItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
+    extern "gdi32" fn BitBlt(dst: HDC, x: i32, y: i32, width: i32, height: i32, src: HDC, src_x: i32, src_y: i32, rop: u32) callconv(.winapi) BOOL;
+    extern "user32" fn HideCaret(hwnd: ?HWND) callconv(.winapi) BOOL;
+    extern "user32" fn GetClassNameW(hwnd: HWND, name: [*]u16, count: c_int) callconv(.winapi) c_int;
+    extern "user32" fn MapWindowPoints(from: ?HWND, to: ?HWND, points: [*]POINT, count: UINT) callconv(.winapi) c_int;
+    extern "gdi32" fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFO, usage: UINT, bits: *?*anyopaque, section: ?*anyopaque, offset: u32) callconv(.winapi) HGDIOBJ;
+    extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
+
+    const BITMAPINFO = extern struct {
+        biSize: u32 = @sizeOf(BITMAPINFO) - 4,
+        biWidth: i32,
+        biHeight: i32,
+        biPlanes: u16 = 1,
+        biBitCount: u16 = 32,
+        biCompression: u32 = 0,
+        biSizeImage: u32 = 0,
+        biXPelsPerMeter: i32 = 0,
+        biYPelsPerMeter: i32 = 0,
+        biClrUsed: u32 = 0,
+        biClrImportant: u32 = 0,
+        colors: [1]u32 = .{0},
+    };
+
+    /// The client area of `hwnd` as its surface holds it now, children
+    /// included, top row first: a BitBlt from the window DC, which shows a
+    /// missing repaint (a hidden desktop cannot be screen-captured, and
+    /// `PrintWindow` repaints everything first).
+    const Capture = struct {
+        pixels: []u32,
+        width: usize,
+        height: usize,
+
+        fn take(hwnd: HWND) !Capture {
+            var rect: RECT = undefined;
+            if (GetClientRect(hwnd, &rect) == 0 or rect.right <= 0 or rect.bottom <= 0) return error.NoClientArea;
+            const memory = sys.CreateCompatibleDC(null) orelse return error.NoDC;
+            defer _ = sys.DeleteDC(memory);
+            const info: BITMAPINFO = .{ .biWidth = rect.right, .biHeight = -rect.bottom };
+            var bits: ?*anyopaque = null;
+            const bitmap = CreateDIBSection(memory, &info, 0, &bits, null, 0) orelse return error.NoBitmap;
+            defer _ = DeleteObject(bitmap);
+            const previous = SelectObject(memory, bitmap);
+            defer _ = SelectObject(memory, previous);
+            const source_dc = GetDC(hwnd) orelse return error.NoDC;
+            defer _ = ReleaseDC(hwnd, source_dc);
+            const srccopy: u32 = 0x00CC0020;
+            if (BitBlt(memory, 0, 0, rect.right, rect.bottom, source_dc, 0, 0, srccopy) == 0) return error.BitBltFailed;
+            _ = GdiFlush();
+            const width: usize = @intCast(rect.right);
+            const height: usize = @intCast(rect.bottom);
+            const source: [*]const u32 = @ptrCast(@alignCast(bits.?));
+            return .{ .pixels = try std.testing.allocator.dupe(u32, source[0 .. width * height]), .width = width, .height = height };
+        }
+
+        fn deinit(self: Capture) void {
+            std.testing.allocator.free(self.pixels);
+        }
+
+        fn rows(self: Capture, top: i32, bottom: i32) []const u32 {
+            const first: usize = @intCast(std.math.clamp(top, 0, @as(i32, @intCast(self.height))));
+            const last: usize = @intCast(std.math.clamp(bottom, top, @as(i32, @intCast(self.height))));
+            return self.pixels[first * self.width .. last * self.width];
+        }
+
+        /// Pixels inside `rect` (client coordinates) that differ from `other`,
+        /// skipping the columns `skip_left`..`skip_right`.
+        fn countDifferent(self: Capture, other: Capture, rect: RECT, skip_left: i32, skip_right: i32) usize {
+            var count: usize = 0;
+            var y = @max(0, rect.top);
+            while (y < @min(rect.bottom, @as(i32, @intCast(self.height)))) : (y += 1) {
+                var x = @max(0, rect.left);
+                while (x < @min(rect.right, @as(i32, @intCast(self.width)))) : (x += 1) {
+                    if (x >= skip_left and x < skip_right) continue;
+                    const index = @as(usize, @intCast(y)) * self.width + @as(usize, @intCast(x));
+                    if (self.pixels[index] != other.pixels[index]) count += 1;
+                }
+            }
+            return count;
+        }
+    };
+
+    /// Lay the window out as on a monitor at `dpi`, the way `WM_DPICHANGED`
+    /// does (fonts, metrics, layout), without moving it to such a monitor.
+    fn simulateDpi(hwnd: HWND, dpi: u32) void {
+        var rect: RECT = undefined;
+        _ = GetWindowRect(hwnd, &rect);
+        _ = SendMessageW(hwnd, WM_DPICHANGED, (@as(usize, dpi) << 16) | dpi, @bitCast(@intFromPtr(&rect)));
+    }
+
+    /// Paint everything that is waiting to be painted, children included.
+    fn flushPaint(hwnd: HWND) void {
+        _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+
+    /// What the window shows now equals a full repaint of it: nothing was left
+    /// unpainted or stale by whatever ran before. The caret is hidden.
+    fn expectNothingStale(hwnd: HWND) !void {
+        _ = HideCaret(null);
+        flushPaint(hwnd);
+        const shown = try Capture.take(hwnd);
+        defer shown.deinit();
+        const rdw_frame: UINT = 0x0400;
+        _ = RedrawWindow(hwnd, null, null, RDW_INVALIDATE | rdw_frame | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        const repainted = try Capture.take(hwnd);
+        defer repainted.deinit();
+        const all: RECT = .{ .left = 0, .top = 0, .right = @intCast(shown.width), .bottom = @intCast(shown.height) };
+        const stale = shown.countDifferent(repainted, all, 0, 0);
+        if (stale != 0) {
+            var box: RECT = .{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = -1, .bottom = -1 };
+            for (shown.pixels, repainted.pixels, 0..) |a, b, index| if (a != b) {
+                const x: i32 = @intCast(index % shown.width);
+                const y: i32 = @intCast(index / shown.width);
+                box = .{ .left = @min(box.left, x), .top = @min(box.top, y), .right = @max(box.right, x + 1), .bottom = @max(box.bottom, y + 1) };
+            };
+            std.debug.print("stale pixels {d} in ({d},{d})-({d},{d}) of a {d}x{d} client\n", .{ stale, box.left, box.top, box.right, box.bottom, shown.width, shown.height });
+            // The first rows' runs of stale pixels, with both colours.
+            var y: usize = @intCast(box.top);
+            while (y < @min(@as(usize, @intCast(box.bottom)), @as(usize, @intCast(box.top)) + 16)) : (y += 1) {
+                var x: usize = 0;
+                var runs: usize = 0;
+                while (x < shown.width and runs < 4) : (x += 1) {
+                    const index = y * shown.width + x;
+                    if (shown.pixels[index] == repainted.pixels[index]) continue;
+                    const start = x;
+                    while (x < shown.width and shown.pixels[y * shown.width + x] != repainted.pixels[y * shown.width + x]) x += 1;
+                    std.debug.print("  y={d} x={d}..{d} shown=0x{x:0>6} repainted=0x{x:0>6}\n", .{ y, start, x, shown.pixels[index] & 0xFFFFFF, repainted.pixels[index] & 0xFFFFFF });
+                    runs += 1;
+                }
+            }
+            // The visible windows that cover them. A point lookup would not
+            // do: a static answers `HTTRANSPARENT`, so it reports the parent.
+            const Overlapping = struct {
+                var root: HWND = undefined;
+                var area: RECT = undefined;
+                fn each(child: HWND, _: LPARAM) callconv(.winapi) BOOL {
+                    if (sys.IsWindowVisible(child) == 0) return 1;
+                    const r = rectIn(root, child);
+                    if (r.right <= area.left or r.left >= area.right or r.bottom <= area.top or r.top >= area.bottom) return 1;
+                    var class_w: [64]u16 = undefined;
+                    const length = GetClassNameW(child, &class_w, class_w.len);
+                    std.debug.print("  under them: {f} ({d},{d})-({d},{d}), a direct child: {}\n", .{
+                        std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
+                        r.left,
+                        r.top,
+                        r.right,
+                        r.bottom,
+                        sys.GetParent(child) == root,
+                    });
+                    return 1;
+                }
+            };
+            Overlapping.root = hwnd;
+            Overlapping.area = box;
+            _ = sys.EnumChildWindows(hwnd, Overlapping.each, 0);
+        }
+        try std.testing.expectEqual(@as(usize, 0), stale);
+    }
+
+    /// `child`'s window rect in `parent`'s client coordinates.
+    fn rectIn(parent: HWND, child: HWND) RECT {
+        var rect: RECT = undefined;
+        _ = GetWindowRect(child, &rect);
+        var corners = [_]POINT{ .{ .x = rect.left, .y = rect.top }, .{ .x = rect.right, .y = rect.bottom } };
+        _ = MapWindowPoints(null, parent, &corners, 2);
+        return .{ .left = corners[0].x, .top = corners[0].y, .right = corners[1].x, .bottom = corners[1].y };
+    }
 
     const GCLP_HICON: i32 = -14;
     const GCLP_HICONSM: i32 = -34;
@@ -6410,8 +7008,14 @@ const dialog_test = struct {
     }
 
     fn onHiddenDesktop(body: *const fn () anyerror!void) !void {
+        // One desktop per test process. Two test runs at once (parallel
+        // worktrees) shared one named desktop, and the Ctrl+S test failed in a
+        // run that overlapped another one while passing on its own.
+        var name_utf8: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_utf8, "noctty-test-settings-dialog-{d}", .{windows.GetCurrentProcessId()});
+        var name_w: [64:0]u16 = undefined;
         const desktop = CreateDesktopW(
-            std.unicode.utf8ToUtf16LeStringLiteral("noctty-test-settings-dialog"),
+            utf8ToW(&name_w, name),
             null,
             null,
             0,
@@ -6471,6 +7075,7 @@ const dialog_test = struct {
         fn finish(self: *Fixture) void {
             self.settings.deinit();
             _ = sys.UnregisterClassW(class_name, self.settings.handle.hinstance);
+            _ = sys.UnregisterClassW(viewport_class_name, self.settings.handle.hinstance);
             self.config.deinit();
             std.testing.allocator.destroy(self);
         }
@@ -6538,10 +7143,17 @@ const dialog_test = struct {
         }
 
         /// Shrink to the minimum size, where a single column of Appearance
-        /// fields no longer fits and the form scrolls.
+        /// fields no longer fits and the form scrolls, at the work area's
+        /// corner. On a screen smaller than that size (a CI runner's is
+        /// 1024x768) the minimum is the work area, so the window keeps one
+        /// size across DPI changes: see "settings text resized inside a
+        /// window of one size is drawn again".
         fn makeFormScrollable(self: *Fixture) !void {
-            const swp_nomove: UINT = 0x0002;
-            _ = SetWindowPos(self.hwnd(), null, 0, 0, self.settings.px(720), self.settings.px(520), SWP_NOZORDER | SWP_NOACTIVATE | swp_nomove);
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(self.hwnd(), &work);
+            const width = @min(self.settings.px(720), work.right - work.left);
+            const height = @min(self.settings.px(520), work.bottom - work.top);
+            _ = SetWindowPos(self.hwnd(), null, work.left, work.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
             try std.testing.expect(self.settings.content_scroll_max > 0);
         }
     };
@@ -6897,6 +7509,346 @@ test "settings window carries the application icon" {
                 @as(LRESULT, @bitCast(icon)),
                 sys.SendMessageW(hwnd, dialog_test.WM_GETICON, ICON_BIG, 0),
             );
+        }
+    }.body);
+}
+
+fn windowStyle(hwnd: HWND) u32 {
+    return @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, GWL_STYLE))));
+}
+
+test "settings fields, labels and help live in a viewport that clips them" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            const viewport = sys.GetParent(settings.edit_font_size.?).?;
+            try std.testing.expect(viewport != hwnd);
+            try std.testing.expectEqual(hwnd, sys.GetParent(viewport).?);
+            try std.testing.expect(windowStyle(viewport) & WS_CLIPCHILDREN != 0);
+            // Painting the window never paints over a child, and once the
+            // form overflows the scroll bar spans the form, not the rail and
+            // the action bar.
+            try std.testing.expect(windowStyle(hwnd) & WS_CLIPCHILDREN != 0);
+            try fixture.makeFormScrollable();
+            try std.testing.expect(windowStyle(viewport) & WS_VSCROLL != 0);
+            try std.testing.expect(windowStyle(hwnd) & WS_VSCROLL == 0);
+
+            for (0..settings_clipped_control_count) |index| {
+                try std.testing.expectEqual(viewport, sys.GetParent(settings.controlHwnd(index).?).?);
+            }
+            for (settings.field_labels) |label| try std.testing.expectEqual(viewport, sys.GetParent(label.?).?);
+            try std.testing.expectEqual(viewport, sys.GetParent(settings.text_help.?).?);
+            for ([_]?HWND{
+                settings.text_header,            settings.text_summary,   settings.text_status,
+                settings.text_close_prompt,      settings.btn_save,       settings.btn_conflict_keep,
+                settings.btn_conflict_use_disk,  settings.btn_close_save, settings.btn_close_discard,
+                settings.btn_close_keep_editing,
+            }) |child| try std.testing.expectEqual(hwnd, sys.GetParent(child.?).?);
+            // The UIA subclasses find the window through the control's parent.
+            for (0..settings_control_count) |index| {
+                const parent = sys.GetParent(settings.controlHwnd(index).?).?;
+                try std.testing.expectEqual(settings, recoverOwner(parent).?);
+            }
+        }
+    }.body);
+}
+
+test "settings scrolling leaves the header and the action bar untouched" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            for ([_]u32{ 144, 96, 192, 288 }) |dpi| {
+                dialog_test.simulateDpi(hwnd, dpi);
+                try fixture.makeFormScrollable();
+                settings.setContentScroll(0);
+                dialog_test.flushPaint(hwnd);
+                const before = try dialog_test.Capture.take(hwnd);
+                defer before.deinit();
+
+                for (0..3) |_| dialog_test.Fixture.wheel(hwnd, -120);
+                try std.testing.expect(settings.content_scroll_y > 0);
+                dialog_test.flushPaint(hwnd);
+                const after = try dialog_test.Capture.take(hwnd);
+                defer after.deinit();
+
+                const width: i32 = @intCast(before.width);
+                const height: i32 = @intCast(before.height);
+                const header: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = settings.proof_viewport_top };
+                const action_bar: RECT = .{ .left = 0, .top = settings.proof_viewport_bottom, .right = width, .bottom = height };
+                const form: RECT = .{ .left = 0, .top = settings.proof_viewport_top, .right = width, .bottom = settings.proof_viewport_bottom };
+                try std.testing.expectEqual(@as(usize, 0), before.countDifferent(after, header, 0, 0));
+                try std.testing.expectEqual(@as(usize, 0), before.countDifferent(after, action_bar, 0, 0));
+                // The form itself did move.
+                try std.testing.expect(before.countDifferent(after, form, 0, 0) > 0);
+                try dialog_test.expectNothingStale(hwnd);
+            }
+        }
+    }.body);
+}
+
+test "settings scrolling puts every field where a fresh layout does" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const viewport = settings.viewport.?;
+            try fixture.makeFormScrollable();
+
+            // A jump past the whole viewport moves fields that started below
+            // its bottom edge too; then back.
+            for ([_]i32{ settings.content_scroll_max, settings.px(37), 0 }) |position| {
+                settings.setContentScroll(position);
+                var scrolled: [settings_max_form_items]RECT = undefined;
+                for (settings.formItems(), 0..) |item, index| {
+                    scrolled[index] = dialog_test.rectIn(viewport, settings.controlHwnd(item.control_index).?);
+                }
+                layoutChildren(settings);
+                for (settings.formItems(), 0..) |item, index| {
+                    try std.testing.expectEqual(scrolled[index], dialog_test.rectIn(viewport, settings.controlHwnd(item.control_index).?));
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings dropdowns are as tall as text fields and the text sits in the middle" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            for ([_]u32{ 144, 96, 192, 288 }) |dpi| {
+                dialog_test.simulateDpi(hwnd, dpi);
+                const field = settings.edit_font_size.?;
+                const edit = dialog_test.rectIn(hwnd, field);
+                for (settings.comboControls()) |combo| {
+                    const rect = dialog_test.rectIn(hwnd, combo.?);
+                    try std.testing.expectEqual(edit.bottom - edit.top, rect.bottom - rect.top);
+                }
+                // One line of text, centred: the client area is the line.
+                var client: RECT = undefined;
+                _ = GetClientRect(field, &client);
+                var origin = [_]POINT{.{ .x = 0, .y = 0 }};
+                _ = dialog_test.MapWindowPoints(field, hwnd, &origin, 1);
+                const above = origin[0].y - edit.top;
+                const below = edit.bottom - (origin[0].y + client.bottom);
+                try std.testing.expectEqual(above, below);
+                try std.testing.expect(client.bottom >= settings.field_text_height);
+                try std.testing.expect(client.bottom <= settings.field_text_height + 1);
+            }
+        }
+    }.body);
+}
+
+test "settings section switches and scrolling leave the window's own paint alone" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            try fixture.makeFormScrollable();
+
+            // Each switch repaints the form and the header text, which are
+            // children; the window itself is neither erased nor repainted.
+            for ([_]Section{ .terminal, .privacy, .keybindings, .appearance }) |section| {
+                dialog_test.flushPaint(hwnd);
+                const paints = settings.proof_paint_count;
+                const button = settings.sectionButton(section).?;
+                const id: usize = @intCast(GetDlgCtrlID(button));
+                _ = SendMessageW(hwnd, WM_COMMAND, (@as(usize, BN_CLICKED) << 16) | id, @bitCast(@intFromPtr(button)));
+                try std.testing.expectEqual(section, settings.active_section);
+                dialog_test.flushPaint(hwnd);
+                try std.testing.expectEqual(paints, settings.proof_paint_count);
+                try dialog_test.expectNothingStale(hwnd);
+            }
+            const paints = settings.proof_paint_count;
+            dialog_test.Fixture.wheel(hwnd, -120);
+            try std.testing.expect(settings.content_scroll_y > 0);
+            dialog_test.flushPaint(hwnd);
+            try std.testing.expectEqual(paints, settings.proof_paint_count);
+        }
+    }.body);
+}
+
+test "settings text resized inside a window of one size is drawn again" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn sized(rect: RECT) [2]i32 {
+            return .{ rect.right - rect.left, rect.bottom - rect.top };
+        }
+
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            dialog_test.simulateDpi(hwnd, 96);
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(hwnd, &work);
+
+            // A resize of the window repaints every child (the frame's class
+            // has CS_HREDRAW | CS_VREDRAW); these resize text inside a window
+            // that keeps its size. First a status message too long for the
+            // room beside the buttons, which gets a row of its own, and a
+            // short one that gives it back.
+            const long_status = "A status message far too long to fit beside the buttons, so it takes a row of its own and wraps onto more than one line of it.";
+            for ([_]i32{ 900, 760 }) |logical_width| {
+                _ = SetWindowPos(hwnd, null, work.left, work.top, settings.px(logical_width), settings.px(560), SWP_NOZORDER | SWP_NOACTIVATE);
+                dialog_test.flushPaint(hwnd);
+                for ([_][]const u8{ long_status, "Saved." }) |message| {
+                    const before = sized(dialog_test.rectIn(hwnd, settings.text_status.?));
+                    settings.setStatus(message);
+                    try std.testing.expect(!std.meta.eql(before, sized(dialog_test.rectIn(hwnd, settings.text_status.?))));
+                    try dialog_test.expectNothingStale(hwnd);
+                }
+            }
+
+            // Then a DPI change that leaves the window's size alone, as when
+            // the window is already as large as the screen allows (a CI
+            // runner's is 1024x768): `WM_SETFONT` draws the text in the new
+            // font before the layout gives it its new width. Advanced has
+            // the longest summary.
+            const button = settings.sectionButton(.advanced).?;
+            const id: usize = @intCast(GetDlgCtrlID(button));
+            _ = SendMessageW(hwnd, WM_COMMAND, (@as(usize, BN_CLICKED) << 16) | id, @bitCast(@intFromPtr(button)));
+            try std.testing.expectEqual(Section.advanced, settings.active_section);
+            _ = SetWindowPos(hwnd, null, work.left, work.top, 1100, 800, SWP_NOZORDER | SWP_NOACTIVATE);
+            dialog_test.flushPaint(hwnd);
+            var window: RECT = undefined;
+            _ = GetWindowRect(hwnd, &window);
+            for ([_]u32{ 144, 96 }) |dpi| {
+                const before = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                dialog_test.simulateDpi(hwnd, dpi);
+                var now: RECT = undefined;
+                _ = GetWindowRect(hwnd, &now);
+                try std.testing.expectEqual(window, now);
+                const after = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                try std.testing.expect(before.right - before.left != after.right - after.left);
+                try dialog_test.expectNothingStale(hwnd);
+            }
+        }
+    }.body);
+}
+
+test "settings field frames take the new colours when the theme changes" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn alwaysHighContrast(_: *anyopaque) bool {
+            return true;
+        }
+
+        /// The capture's pixel (0x00RRGGBB) as a COLORREF (0x00BBGGRR).
+        fn colorAt(capture: dialog_test.Capture, x: i32, y: i32) u32 {
+            const pixel = capture.pixels[@as(usize, @intCast(y)) * capture.width + @as(usize, @intCast(x))];
+            return ((pixel & 0xFF) << 16) | (pixel & 0xFF00) | ((pixel >> 16) & 0xFF);
+        }
+
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const field = dialog_test.rectIn(hwnd, settings.edit_font_family.?);
+            const middle = @divTrunc(field.top + field.bottom, 2);
+
+            dialog_test.flushPaint(hwnd);
+            const light = try dialog_test.Capture.take(hwnd);
+            defer light.deinit();
+            try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(light, field.left, middle));
+
+            // High Contrast turns on: the frame is non-client, and must follow.
+            settings.handle.highContrast = &alwaysHighContrast;
+            settings.themeChanged();
+            try std.testing.expect(settings.theme_adapter.colors.high_contrast);
+            dialog_test.flushPaint(hwnd);
+            const high_contrast = try dialog_test.Capture.take(hwnd);
+            defer high_contrast.deinit();
+            try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(high_contrast, field.left, middle));
+
+            // A theme change also gives every control its theme again and
+            // reframes the text fields for the new font, and either of those
+            // redraws the frame on its own. The adapter's own redraw must
+            // cover the frame without them: new colours, then that redraw only.
+            settings.theme_adapter.colors.field_border = 0x0000C0;
+            settings.theme_adapter.colors.edit_bg = 0x00C000;
+            _ = sys.EnumChildWindows(hwnd, invalidateThemeChild, 0);
+            dialog_test.flushPaint(hwnd);
+            const redrawn = try dialog_test.Capture.take(hwnd);
+            defer redrawn.deinit();
+            try std.testing.expectEqual(@as(u32, 0x0000C0), colorAt(redrawn, field.left, middle));
+            try std.testing.expectEqual(@as(u32, 0x00C000), colorAt(redrawn, field.left + settings.fieldStroke(), field.top + settings.fieldStroke()));
+        }
+    }.body);
+}
+
+test "settings an empty focused text field shows that it has focus" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const field = settings.edit_font_family.?;
+            var text: [8]u16 = undefined;
+            try std.testing.expectEqual(@as(c_int, 0), GetWindowTextW(field, &text, @intCast(text.len)));
+
+            for ([_]u32{ 96, 144 }) |dpi| {
+                dialog_test.simulateDpi(hwnd, dpi);
+                _ = SetFocus(settings.sectionButton(.appearance).?);
+                dialog_test.flushPaint(hwnd);
+                const unfocused = try dialog_test.Capture.take(hwnd);
+                defer unfocused.deinit();
+                _ = SetFocus(field);
+                _ = dialog_test.HideCaret(null);
+                dialog_test.flushPaint(hwnd);
+                const focused = try dialog_test.Capture.take(hwnd);
+                defer focused.deinit();
+                try std.testing.expect(unfocused.countDifferent(focused, dialog_test.rectIn(hwnd, field), 0, 0) > 0);
+                // Painted when focus arrived, not only by a later full repaint.
+                try dialog_test.expectNothingStale(hwnd);
+            }
+        }
+    }.body);
+}
+
+test "settings field frame insets centre one line inside the stroke" {
+    // 48 px box, 3 px stroke, 22 px line: 13 above, 13 below.
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 3, .y = 13 }, fieldFrameInsets(360, 48, 22, 3));
+    // An odd remainder goes below.
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 2, .y = 7 }, fieldFrameInsets(200, 32, 17, 2));
+    // A line taller than the box keeps the stroke, and never more than half.
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 2, .y = 2 }, fieldFrameInsets(200, 20, 40, 2));
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 1, .y = 1 }, fieldFrameInsets(3, 3, 0, 2));
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 0, .y = 0 }, fieldFrameInsets(-5, -5, 10, 2));
+    // Focus wins over an invalid value while the user is typing it.
+    try std.testing.expectEqual(FieldFrameState.focused, fieldFrameState(true, true));
+    try std.testing.expectEqual(FieldFrameState.invalid, fieldFrameState(false, true));
+    try std.testing.expectEqual(FieldFrameState.rest, fieldFrameState(false, false));
+    // A dropdown is asked for its field height less its own frame.
+    try std.testing.expectEqual(@as(i32, 42), comboSelectionHeight(35, 29, 48));
+    try std.testing.expectEqual(@as(i32, 1), comboSelectionHeight(80, 10, 4));
+}
+
+test "settings viewport stays out of the UIA control view" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const provider = settings.viewport_uia_provider.?;
+            try std.testing.expectEqual(settings.viewport.?, provider.hwnd);
+            try std.testing.expectEqual(win32_uia.SettingsControlProvider.Role.layout_pane, provider.role);
+            for (0..settings_control_count) |index| try std.testing.expect(settings.control_uia_providers[index] != null);
         }
     }.body);
 }
@@ -7568,6 +8520,95 @@ fn subclassCombo(combo: HWND) void {
     _ = sys.SetWindowLongPtrW(combo, GWLP_USERDATA, previous);
 }
 
+/// Subclass for the text fields, which draw their own frame (`fieldFrameInsets`,
+/// `SettingsWindow.paintFieldFrame`). The themed one-pixel border has no focused
+/// state, so an empty focused field showed nothing but its caret, and a
+/// single-line EDIT puts its text at the top of its box. The frame is the
+/// non-client area: a stroke all round and, above and below, whatever centres
+/// one line of text. Clicks there count as clicks in the field. The previous
+/// procedure lives in `GWLP_USERDATA`, as for the dropdowns.
+fn settingsEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+    const previous = sys.GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (previous == 0) return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+    const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
+    const owner = if (sys.GetParent(hwnd)) |parent| recoverOwner(parent) else null;
+    switch (msg) {
+        WM_NCCALCSIZE => if (owner) |settings| {
+            // Both forms put the proposed window rect first: a bare RECT, or
+            // `NCCALCSIZE_PARAMS.rgrc[0]`. It becomes the client rect.
+            const rect: *RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            const insets = fieldFrameInsets(
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                settings.field_text_height,
+                settings.fieldStroke(),
+            );
+            rect.left += insets.x;
+            rect.right -= insets.x;
+            rect.top += insets.y;
+            rect.bottom -= insets.y;
+            return 0;
+        },
+        WM_NCHITTEST => if (owner != null) return HTCLIENT,
+        WM_NCPAINT => if (owner) |settings| {
+            settings.paintFieldFrame(hwnd, null);
+            return 0;
+        },
+        WM_SETFOCUS, WM_KILLFOCUS, WM_ENABLE => {
+            const result = sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+            if (owner) |settings| settings.paintFieldFrame(hwnd, switch (msg) {
+                WM_SETFOCUS => true,
+                WM_KILLFOCUS => false,
+                else => null,
+            });
+            return result;
+        },
+        WM_NCDESTROY => {
+            _ = sys.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
+            _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        },
+        else => {},
+    }
+    return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+}
+
+fn subclassEdit(edit: HWND) void {
+    if (sys.GetWindowLongPtrW(edit, GWLP_USERDATA) != 0) return;
+    const previous = sys.SetWindowLongPtrW(
+        edit,
+        GWLP_WNDPROC,
+        @as(LONG_PTR, @intCast(@intFromPtr(&settingsEditProc))),
+    );
+    if (previous == 0) return;
+    _ = sys.SetWindowLongPtrW(edit, GWLP_USERDATA, previous);
+}
+
+const FieldFrameInsets = struct { x: i32, y: i32 };
+
+/// What a text field's frame takes from each side of a `width` x `height`
+/// window: the stroke all round, and above and below whatever centres a
+/// `line_height` line (an odd pixel goes below). Never more than half the box.
+fn fieldFrameInsets(width: i32, height: i32, line_height: i32, stroke: i32) FieldFrameInsets {
+    const w: i32 = @max(0, width);
+    const h: i32 = @max(0, height);
+    const centred: i32 = if (line_height > 0) @divTrunc(h - line_height, 2) else 0;
+    return .{
+        .x = @min(stroke, @divTrunc(w, 2)),
+        .y = @min(@max(stroke, centred), @divTrunc(h, 2)),
+    };
+}
+
+const FieldFrameState = enum { rest, focused, invalid };
+
+/// Focus wins: the field being typed in shows the accent even while its value
+/// does not parse, so the error colour does not flash on each keystroke. It
+/// shows once the user leaves the field (the status line says why at once).
+fn fieldFrameState(focused: bool, invalid: bool) FieldFrameState {
+    if (focused) return .focused;
+    if (invalid) return .invalid;
+    return .rest;
+}
+
 /// Lines a full wheel notch moves, per the user's mouse setting.
 fn systemWheelScrollLines() u32 {
     var lines: u32 = 3;
@@ -7598,6 +8639,15 @@ fn wheelScrollPixels(remainder: *i32, delta: i32, notch_px: i32) i32 {
 fn startGroup(control: HWND) void {
     const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
     if (style & WS_GROUP == 0) _ = sys.SetWindowLongPtrW(control, GWL_STYLE, @intCast(style | WS_GROUP));
+}
+
+/// Show or hide a child window, leaving one already in that state alone. The
+/// style bit is read rather than `IsWindowVisible`, which is false for every
+/// child until the window itself is shown.
+fn setChildShown(control: HWND, shown: bool) void {
+    const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
+    if ((style & WS_VISIBLE != 0) == shown) return;
+    _ = ShowWindow(control, if (shown) SW_SHOWNORMAL else SW_HIDE);
 }
 
 fn sendToBottom(control: HWND) void {
@@ -7858,8 +8908,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (owner) |o| return @intCast(o.proof_paint_count);
             return 0;
         },
-        WM_SETTINGS_PROOF_LAYOUT_REDRAW_SUCCEEDED => {
-            if (owner) |o| return @intFromBool(o.proof_layout_redraw_succeeded);
+        WM_SETTINGS_PROOF_LAYOUT_BATCHED => {
+            if (owner) |o| return @intFromBool(o.proof_layout_batched);
             return 0;
         },
         WM_SETTINGS_PROOF_CHILD => {
@@ -7884,6 +8934,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         WM_ERASEBKGND => return 1,
+        WM_PRINTCLIENT => {
+            if (owner) |o| if (wParam != 0) paintBackground(hwnd, o, @ptrFromInt(wParam));
+            return 0;
+        },
         WM_PAINT => {
             if (owner) |o| {
                 o.proof_paint_count +%= 1;
@@ -7944,6 +8998,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_DPICHANGED => {
             if (owner) |o| {
                 o.dpi = normalizedDpi(@intCast(wParam & 0xFFFF));
+                // Fonts first: the resize below lays out and paints at once,
+                // and must not paint the new size with the old fonts.
+                o.recreateUiFont();
                 const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
                 _ = sys.SetWindowPos(
                     hwnd,
@@ -7954,7 +9011,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                     suggested.bottom - suggested.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                o.recreateUiFont();
                 layoutChildren(o);
                 _ = sys.InvalidateRect(hwnd, null, 1);
             }
@@ -7980,7 +9036,12 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             return 0;
         },
         WM_SIZE => {
-            if (owner) |o| layoutChildren(o);
+            if (owner) |o| {
+                layoutChildren(o);
+                // Each step of a live resize is painted before the next one
+                // arrives, rather than whenever the size loop gets to it.
+                _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
+            }
             return 0;
         },
         WM_MENUCHAR => {
@@ -8019,34 +9080,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
-        WM_VSCROLL => {
-            if (owner) |o| {
-                const code = wParam & 0xFFFF;
-                const page = o.contentPage();
-                var tracking: SCROLLINFO = .{
-                    .cbSize = @sizeOf(SCROLLINFO),
-                    .fMask = SIF_TRACKPOS,
-                    .nMin = 0,
-                    .nMax = 0,
-                    .nPage = 0,
-                    .nPos = 0,
-                    .nTrackPos = o.content_scroll_y,
-                };
-                if (code == SB_THUMBPOSITION or code == SB_THUMBTRACK) _ = GetScrollInfo(hwnd, SB_VERT, &tracking);
-                const next = switch (code) {
-                    SB_LINEUP => o.content_scroll_y - o.px(32),
-                    SB_LINEDOWN => o.content_scroll_y + o.px(32),
-                    SB_PAGEUP => o.content_scroll_y - page,
-                    SB_PAGEDOWN => o.content_scroll_y + page,
-                    SB_THUMBPOSITION, SB_THUMBTRACK => tracking.nTrackPos,
-                    SB_TOP => 0,
-                    SB_BOTTOM => o.content_scroll_max,
-                    else => o.content_scroll_y,
-                };
-                o.setContentScroll(next);
-            }
-            return 0;
         },
         WM_COMMAND => {
             const id: usize = wParam & 0xFFFF;
@@ -8269,6 +9302,55 @@ fn recoverOwner(hwnd: HWND) ?*SettingsWindow {
     return @ptrFromInt(@as(usize, @intCast(raw)));
 }
 
+/// The form viewport (`SettingsWindow.viewport`). It paints only the pane
+/// colour behind the fields and owns the scroll bar; the fields' commands and
+/// colour queries go on to the Settings window, which handles them as it did
+/// when the fields were its own children. The wheel needs nothing here:
+/// `DefWindowProc` hands it to the parent.
+fn viewportProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+    if (msg == WM_NCCREATE) {
+        const cs: *const CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
+        if (cs.lpCreateParams) |ptr| _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, @intCast(@intFromPtr(ptr)));
+    }
+    const owner = recoverOwner(hwnd) orelse return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+    switch (msg) {
+        WM_ERASEBKGND => return 1,
+        WM_PRINTCLIENT => {
+            var rect: RECT = undefined;
+            if (wParam != 0 and GetClientRect(hwnd, &rect) != 0) fillSolid(@ptrFromInt(wParam), rect, owner.theme_adapter.colors.window_bg);
+            return 0;
+        },
+        WM_PAINT => {
+            var ps: PAINTSTRUCT = undefined;
+            const hdc = sys.BeginPaint(hwnd, &ps);
+            fillSolid(hdc, ps.rcPaint, owner.theme_adapter.colors.window_bg);
+            _ = sys.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        WM_COMMAND,
+        WM_CTLCOLORMSGBOX,
+        WM_CTLCOLOREDIT,
+        WM_CTLCOLORLISTBOX,
+        WM_CTLCOLORBTN,
+        WM_CTLCOLORDLG,
+        WM_CTLCOLORSTATIC,
+        => if (owner.hwnd) |settings| return sys.SendMessageW(settings, msg, wParam, lParam),
+        WM_VSCROLL => {
+            owner.scrollByBar(wParam & 0xFFFF);
+            return 0;
+        },
+        WM_GETOBJECT => if (owner.viewport_uia_provider) |provider| {
+            if (win32_uia.returnSettingsControlProvider(hwnd, wParam, lParam, provider)) |result| return result;
+        },
+        WM_NCDESTROY => {
+            if (owner.viewport_uia_provider) |provider| provider.detach();
+            _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        },
+        else => {},
+    }
+    return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 fn settingsSectionDisconnect(ctx: *anyopaque) win32_uia.HRESULT {
     return (@as(*win32_uia.SettingsSectionProvider, @ptrCast(@alignCast(ctx)))).disconnect();
 }
@@ -8300,55 +9382,63 @@ fn paint(hwnd: HWND, owner: *SettingsWindow) void {
     var ps: PAINTSTRUCT = undefined;
     const hdc = sys.BeginPaint(hwnd, &ps);
     defer _ = sys.EndPaint(hwnd, &ps);
+    paintBackground(hwnd, owner, hdc);
+}
 
+/// The frame window's own pixels: the pane colour, the rail and the three
+/// separators. Under WS_CLIPCHILDREN this never reaches a child. Also drawn
+/// into the DC a themed child hands over through DrawThemeParentBackground
+/// (WM_PRINTCLIENT), which a button's rounded corners need now that the frame
+/// no longer paints under its children.
+fn paintBackground(hwnd: HWND, owner: *SettingsWindow, hdc: HDC) void {
     var rect: RECT = undefined;
     if (sys.GetClientRect(hwnd, &rect) == 0) return;
-
     const colors = owner.theme_adapter.colors;
-    const fallback_brush = sys.GetStockObject(DC_BRUSH);
-    const window_brush = owner.theme_adapter.window_brush orelse fallback_brush;
-    if (owner.theme_adapter.window_brush == null) {
-        _ = sys.SetDCBrushColor(hdc, colors.window_bg);
-    }
-    _ = sys.FillRect(hdc, &rect, window_brush);
+    const geometry = backgroundGeometry(owner, rect);
+    var pane = rect;
+    pane.left = geometry.rail.right;
+    fillSolid(hdc, pane, colors.window_bg);
+    fillSolid(hdc, geometry.rail, colors.rail_bg);
+    fillSolid(hdc, geometry.rail_separator, colors.rail_separator);
+    fillSolid(hdc, geometry.header_separator, colors.pane_separator);
+    fillSolid(hdc, geometry.action_separator, colors.pane_separator);
+}
 
-    var rail_rect = rect;
-    rail_rect.right = owner.px(settings_rail_width);
-    const rail_brush = owner.theme_adapter.rail_brush orelse fallback_brush;
-    if (owner.theme_adapter.rail_brush == null) {
-        _ = sys.SetDCBrushColor(hdc, colors.rail_bg);
-    }
-    _ = FillRect(hdc, &rail_rect, rail_brush);
+fn fillSolid(hdc: HDC, rect: RECT, color: COLORREF) void {
+    _ = SetDCBrushColor(hdc, color);
+    _ = FillRect(hdc, &rect, GetStockObject(DC_BRUSH));
+}
 
-    const rail_separator_brush = CreateSolidBrush(colors.rail_separator) orelse return;
-    defer _ = DeleteObject(rail_separator_brush);
-    const pane_separator_brush = CreateSolidBrush(colors.pane_separator) orelse return;
-    defer _ = DeleteObject(pane_separator_brush);
-    const separator_width = @max(1, owner.px(settings_metrics.stroke_hairline));
-    const pane = paneBounds(owner, rect);
-    const rail_separator: RECT = .{
-        .left = owner.px(settings_rail_width) - separator_width,
-        .top = rect.top,
-        .right = owner.px(settings_rail_width),
-        .bottom = rect.bottom,
+/// A `width`-pixel line just inside `rect`.
+fn strokeRect(hdc: HDC, rect: RECT, color: COLORREF, width: i32) void {
+    const w = @min(width, @divTrunc(rect.right - rect.left, 2), @divTrunc(rect.bottom - rect.top, 2));
+    if (w <= 0) return;
+    const sides = [_]RECT{
+        .{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + w },
+        .{ .left = rect.left, .top = rect.bottom - w, .right = rect.right, .bottom = rect.bottom },
+        .{ .left = rect.left, .top = rect.top + w, .right = rect.left + w, .bottom = rect.bottom - w },
+        .{ .left = rect.right - w, .top = rect.top + w, .right = rect.right, .bottom = rect.bottom - w },
     };
-    _ = FillRect(hdc, &rail_separator, rail_separator_brush);
-    const rail_geometry = sectionRailGeometry(rect.bottom - rect.top, owner.dpi);
-    const header_separator: RECT = .{
-        .left = pane.left,
-        .top = rail_geometry.top_pad + owner.px(settings_header_separator_y),
-        .right = pane.right,
-        .bottom = rail_geometry.top_pad + owner.px(settings_header_separator_y) + separator_width,
-    };
-    _ = FillRect(hdc, &header_separator, pane_separator_brush);
-    const action_bar = closePromptLayoutGeometry(owner, pane.width, actionBarAvailableHeight(owner, rect));
-    const action_separator: RECT = .{
-        .left = pane.left,
-        .top = rect.bottom - action_bar.bar_height,
-        .right = pane.right,
-        .bottom = rect.bottom - action_bar.bar_height + separator_width,
-    };
-    _ = FillRect(hdc, &action_separator, pane_separator_brush);
+    for (sides) |side| fillSolid(hdc, side, color);
+}
+
+/// Line height of `font` (one line of `DrawText` is the font's full height,
+/// as an EDIT lays out its line).
+fn fontLineHeight(hwnd: HWND, font: HGDIOBJ) i32 {
+    const hdc = GetDC(hwnd) orelse return 0;
+    defer _ = ReleaseDC(hwnd, hdc);
+    const previous = SelectObject(hdc, font);
+    defer _ = SelectObject(hdc, previous);
+    const sample = std.unicode.utf8ToUtf16LeStringLiteral("Ag");
+    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = DrawTextW(hdc, sample, sample.len, &rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    return rect.bottom - rect.top;
+}
+
+/// The selection-field height to ask a dropdown for so that its window is
+/// `target` tall, given its window height now and the field height it has.
+fn comboSelectionHeight(window_height: i32, selection_height: i32, target: i32) i32 {
+    return @max(1, target - (window_height - selection_height));
 }
 
 fn readEditUtf8(edit: HWND, buf: []u8) ?[]const u8 {

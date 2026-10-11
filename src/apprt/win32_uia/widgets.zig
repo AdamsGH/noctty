@@ -1103,6 +1103,11 @@ pub const SettingsControlProvider = struct {
         combo_box,
         check_box,
         button,
+        /// A window that only clips and scrolls its children (the Settings
+        /// form viewport). It stays out of the control and content views,
+        /// so its children read as children of the window, as they did
+        /// before the viewport existed.
+        layout_pane,
     };
 
     base: com.IRawElementProviderSimple,
@@ -1324,6 +1329,7 @@ pub const SettingsControlProvider = struct {
                 .combo_box => constants.UIA_ComboBoxControlTypeId,
                 .check_box => constants.UIA_CheckBoxControlTypeId,
                 .button => constants.UIA_ButtonControlTypeId,
+                .layout_pane => constants.UIA_PaneControlTypeId,
             }),
             constants.UIA_NamePropertyId => {
                 if (self.name) |name| {
@@ -1352,11 +1358,13 @@ pub const SettingsControlProvider = struct {
             },
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
-            => out.* = com.VARIANT.fromBool(true),
+            => out.* = com.VARIANT.fromBool(self.role != .layout_pane),
             constants.UIA_IsEnabledPropertyId => out.* = com.VARIANT.fromBool(IsWindowEnabled(self.hwnd) != 0),
-            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(self.role != .text),
+            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(
+                self.role != .text and self.role != .layout_pane,
+            ),
             constants.UIA_HasKeyboardFocusPropertyId => out.* = com.VARIANT.fromBool(
-                self.role != .text and hwndHasKeyboardFocus(self.hwnd),
+                self.role != .text and self.role != .layout_pane and hwndHasKeyboardFocus(self.hwnd),
             ),
             constants.UIA_IsOffscreenPropertyId => out.* = com.VARIANT.fromBool(settingsControlIsOffscreen(
                 IsWindowVisible(self.hwnd),
@@ -7068,6 +7076,82 @@ test "SettingsControlProvider exposes ValueProvider only for edit controls" {
         SettingsControlProvider.QueryInterface(&text.base, &com.IID_IValueProvider, &value),
     );
     try std.testing.expect(value == null);
+}
+
+test "SettingsControlProvider layout pane stays out of the control and content views" {
+    const win32 = struct {
+        extern "user32" fn CreateWindowExW(
+            dwExStyle: u32,
+            lpClassName: [*:0]const u16,
+            lpWindowName: [*:0]const u16,
+            dwStyle: u32,
+            x: i32,
+            y: i32,
+            nWidth: i32,
+            nHeight: i32,
+            hWndParent: ?com.HWND,
+            hMenu: ?*anyopaque,
+            hInstance: ?*anyopaque,
+            lpParam: ?*anyopaque,
+        ) callconv(.winapi) ?com.HWND;
+        extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+        extern "user32" fn SetFocus(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
+    };
+    const empty_title = std.unicode.utf8ToUtf16LeStringLiteral("");
+    const hwnd = win32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        empty_title,
+        0,
+        0,
+        0,
+        100,
+        100,
+        null,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+    // A field inside the pane has the focus; the pane must not claim it.
+    const child = win32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+        empty_title,
+        0x40000000,
+        0,
+        0,
+        80,
+        24,
+        hwnd,
+        @ptrFromInt(44),
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(child);
+    _ = win32.SetFocus(child);
+    try std.testing.expect(hwndHasKeyboardFocus(hwnd));
+
+    const pane = try SettingsControlProvider.create(std.testing.allocator, hwnd, .layout_pane, null);
+    defer _ = SettingsControlProvider.Release(&pane.base);
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&pane.base, constants.UIA_ControlTypePropertyId, &value));
+    try std.testing.expectEqual(constants.UIA_PaneControlTypeId, value.value.i4);
+    for ([_]i32{
+        constants.UIA_IsControlElementPropertyId,
+        constants.UIA_IsContentElementPropertyId,
+        constants.UIA_IsKeyboardFocusablePropertyId,
+        constants.UIA_HasKeyboardFocusPropertyId,
+    }) |property| {
+        try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&pane.base, property, &value));
+        try std.testing.expectEqual(com.VT_BOOL, value.vt);
+        try std.testing.expectEqual(@as(i16, 0), value.value.bool_val);
+    }
+    // A field keeps reading as a control.
+    const field = try SettingsControlProvider.create(std.testing.allocator, hwnd, .edit, "Font size");
+    defer _ = SettingsControlProvider.Release(&field.base);
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&field.base, constants.UIA_IsControlElementPropertyId, &value));
+    try std.testing.expect(value.value.bool_val != 0);
 }
 
 test "SettingsControlProvider exposes InvokeProvider only for buttons" {
