@@ -80,7 +80,7 @@ pub fn commandData(
         inline else => |comptime_data| commandDataTyped(
             command_,
             comptime_data,
-            @ptrCast(@alignCast(out)),
+            @ptrCast(@alignCast(out orelse return false)),
         ),
     };
 }
@@ -123,6 +123,7 @@ test "command data null" {
     const testing = std.testing;
     var title: [*:0]const u8 = undefined;
     try testing.expect(!commandData(null, .change_window_title_str, @ptrCast(&title)));
+    try testing.expect(!commandData(null, .change_window_title_str, null));
     try testing.expect(!commandData(null, .invalid, null));
 }
 

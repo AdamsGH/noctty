@@ -244,7 +244,8 @@ GHOSTTY_API GhosttyOscCommandType ghostty_osc_command_type(GhosttyOscCommand com
  *
  * @param command The OSC command handle to query (may be NULL)
  * @param data The type of data to extract
- * @param out Pointer to store the extracted data (type depends on data parameter)
+ * @param out Pointer to store the extracted data (type depends on data
+ *        parameter); with NULL, nothing is extracted and this returns false
  * @return true if data extraction was successful, false otherwise
  * 
  * @ingroup osc
