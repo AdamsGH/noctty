@@ -1405,8 +1405,12 @@ fn applyNativeControlThemeToChild(hwnd: HWND, lParam: LPARAM) callconv(.winapi) 
     return 1;
 }
 
+/// The frame too: a text field's frame and the viewport's scroll bar are
+/// non-client, and their colours come from the theme as well.
 fn invalidateThemeChild(hwnd: HWND, _: LPARAM) callconv(.winapi) BOOL {
-    _ = sys.InvalidateRect(hwnd, null, 1);
+    const rdw_erase: u32 = 0x0004;
+    const rdw_frame: u32 = 0x0400;
+    _ = sys.RedrawWindow(hwnd, null, null, RDW_INVALIDATE | rdw_erase | rdw_frame);
     return 1;
 }
 
@@ -7631,6 +7635,44 @@ test "settings section switches and scrolling leave the window's own paint alone
             try std.testing.expect(settings.content_scroll_y > 0);
             dialog_test.flushPaint(hwnd);
             try std.testing.expectEqual(paints, settings.proof_paint_count);
+        }
+    }.body);
+}
+
+test "settings field frames take the new colours when the theme changes" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn alwaysHighContrast(_: *anyopaque) bool {
+            return true;
+        }
+
+        /// The capture's pixel (0x00RRGGBB) as a COLORREF (0x00BBGGRR).
+        fn colorAt(capture: dialog_test.Capture, x: i32, y: i32) u32 {
+            const pixel = capture.pixels[@as(usize, @intCast(y)) * capture.width + @as(usize, @intCast(x))];
+            return ((pixel & 0xFF) << 16) | (pixel & 0xFF00) | ((pixel >> 16) & 0xFF);
+        }
+
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const field = dialog_test.rectIn(hwnd, settings.edit_font_family.?);
+            const middle = @divTrunc(field.top + field.bottom, 2);
+
+            dialog_test.flushPaint(hwnd);
+            const light = try dialog_test.Capture.take(hwnd);
+            defer light.deinit();
+            try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(light, field.left, middle));
+
+            // High Contrast turns on: the frame is non-client, and must follow.
+            settings.handle.highContrast = &alwaysHighContrast;
+            settings.themeChanged();
+            try std.testing.expect(settings.theme_adapter.colors.high_contrast);
+            dialog_test.flushPaint(hwnd);
+            const high_contrast = try dialog_test.Capture.take(hwnd);
+            defer high_contrast.deinit();
+            try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(high_contrast, field.left, middle));
+            try std.testing.expectEqual(settings.theme_adapter.colors.edit_bg, colorAt(high_contrast, field.left + settings.fieldStroke(), field.top + settings.fieldStroke()));
         }
     }.body);
 }
