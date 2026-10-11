@@ -16337,10 +16337,12 @@ const Host = struct {
                 var it = tab.tree.iterator();
                 while (it.next()) |entry| entry.view.syncOcclusion();
             }
-            // An info banner nobody can see waits, and starts over when
-            // the window comes back.
-            self.syncBannerExpiry();
         }
+        // An info banner nobody can see waits, and starts over when the
+        // window comes back. Outside the transition branch: a window first
+        // shown while the flag still holds its initial `true` makes no
+        // transition.
+        self.syncBannerExpiry();
 
         // Deliberately outside the transition branch, and deliberately here
         // rather than at the message handlers. "The window is on screen" is
@@ -16594,9 +16596,9 @@ const Host = struct {
     }
 
     /// Count an `.info` message down only while it is on screen and nobody
-    /// is reading it: the window is shown, not minimized and not cloaked
-    /// (`surfaces_visible`), the pointer is not over the banner and it does
-    /// not hold keyboard focus. Errors and the update notice stay until
+    /// is reading it: the window is shown, not minimized and not cloaked,
+    /// the pointer is not over the banner and it does not hold keyboard
+    /// focus. Errors and the update notice stay until
     /// dismissed. When any of that ends, the countdown restarts in full.
     ///
     /// The duration is the system's own notification time, Settings >
@@ -16606,10 +16608,15 @@ const Host = struct {
     /// they need longer to read.
     fn syncBannerExpiry(self: *Host) void {
         const hwnd = self.hwnd orelse return;
+        // `surfaces_visible` adds DWM cloaking, but it starts out true and is
+        // only refreshed by window messages, so the window itself is asked
+        // whether it is shown and not minimized.
         const run = self.banner_kind == .info and
             self.banner_text != null and
             self.banner_placement.visible and
             self.surfaces_visible and
+            sys.IsWindowVisible(hwnd) != 0 and
+            sys.IsIconic(hwnd) == 0 and
             !self.banner_pointer_inside and
             self.bannerButtonOf(self.hovered_button_hwnd) == null and
             !self.banner_focused;
@@ -17172,9 +17179,37 @@ const Host = struct {
         try std.testing.expect(!host.banner_announce_pending);
     }
 
+    /// Run `body` on a thread attached to a desktop of its own, where it can
+    /// show and minimize windows without touching the user's desktop
+    /// (AGENTS.md 2026-10-06; `SetThreadDesktop` needs a thread that owns
+    /// no window yet).
+    fn runOnPrivateDesktop(comptime body: anytype) !void {
+        const Desktop = struct {
+            extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+            extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+            extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+            fn run(desktop: *anyopaque, result: *anyerror!void) void {
+                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
+            }
+        };
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "noctty-banner-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+        defer std.testing.allocator.free(wide_name);
+        const desktop = Desktop.CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+        defer _ = Desktop.CloseDesktop(desktop);
+        var result: anyerror!void = {};
+        const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
+        thread.join();
+        return result;
+    }
+
     test "an info banner counts down only while it is unread; errors stay" {
         if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(bannerCountdownTestBody);
+    }
 
+    fn bannerCountdownTestBody() !void {
         var core_app: CoreApp = undefined;
         var app: App = undefined;
         var host: Host = undefined;
@@ -17189,7 +17224,12 @@ const Host = struct {
         defer window.deinit(&host);
         host.layoutBanner(window.content, window.content.top);
 
+        // A window that is not shown yet: nothing counts down, whatever the
+        // cached `surfaces_visible` says.
         try host.setBanner(.info, "Nothing to undo.");
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        host.refreshSurfaceVisibility();
         const first = host.banner_expires_at orelse return error.TestExpectedCountdown;
         try std.testing.expect(first >= sys.GetTickCount64() + 4000);
         // The same message again starts it over.
@@ -17213,7 +17253,17 @@ const Host = struct {
         host.banner_focused = false;
         host.syncBannerExpiry();
         try std.testing.expect(host.banner_expires_at != null);
-        // Minimized, hidden or cloaked, it waits too.
+        // Minimized, hidden or cloaked, it waits too, and starts over when
+        // the window is back.
+        for ([_]i32{ c.SW_SHOWMINNOACTIVE, c.SW_HIDE }) |away| {
+            _ = sys.ShowWindow(window.parent, away);
+            host.refreshSurfaceVisibility();
+            try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+            _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+            if (sys.IsIconic(window.parent) != 0) _ = sys.ShowWindow(window.parent, c.SW_RESTORE);
+            host.refreshSurfaceVisibility();
+            try std.testing.expect(host.banner_expires_at != null);
+        }
         host.surfaces_visible = false;
         host.syncBannerExpiry();
         try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
