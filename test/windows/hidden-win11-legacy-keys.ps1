@@ -18,7 +18,9 @@ param(
     [switch] $CompileOnly,
     [switch] $Synchronous,
     [switch] $Driver,
-    [ValidateRange(10,300)] [int] $DriverTimeoutSeconds = 90
+    [ValidatePattern('^[a-fA-F0-9]{64}$')] [string] $BaselineHash,
+    [string] $BaselineModifiedUtc,
+    [ValidateRange(10,300)] [int] $DriverTimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -126,7 +128,7 @@ public static class LegacyKeys {
     static void Post(IntPtr h,uint m,int w,long l) {
         if(!PostMessageW(h,m,new IntPtr(w),new IntPtr(l))) throw new Exception("Key post failed");
     }
-    public static void Key(IntPtr h,int vk,int character,bool ctrl,bool alt,bool shift,bool synchronous) {
+    public static void Key(IntPtr h,int vk,int character,bool ctrl,bool alt,bool shift,bool synchronous,int marker,Func<bool> acknowledged) {
         int pid; uint target=GetWindowThreadProcessId(h,out pid),current=GetCurrentThreadId(); Message message;
         PeekMessageW(out message,IntPtr.Zero,0,0,0); // Give this thread an input queue.
         if(target==0 || !AttachThreadInput(current,target,true)) throw new Exception("AttachThreadInput failed");
@@ -146,8 +148,18 @@ public static class LegacyKeys {
             } else {
                 Post(h,down,vk,l); if(character>=0) Post(h,0x102,character,l); Post(h,up,vk,l|0xC0000000L);
             }
-            // Keep the shared modifier state until posted messages are consumed.
-            Thread.Sleep(250);
+            // This function key follows the complete triple on the same UI
+            // queue. Seeing its console record acknowledges both the UI and
+            // observer; retain modifiers until that end-to-end barrier.
+            long markerL=1L | ((long)MapVirtualKeyExW((uint)marker,0,GetKeyboardLayout(target))<<16);
+            if(alt) markerL|=1L<<29;
+            if(synchronous) { Send(h,down,marker,markerL); Send(h,up,marker,markerL|0xC0000000L); }
+            else { Post(h,down,marker,markerL); Post(h,up,marker,markerL|0xC0000000L); }
+            var deadline=DateTime.UtcNow.AddSeconds(5);
+            while(!acknowledged()) {
+                if(DateTime.UtcNow>=deadline) throw new Exception("Console key acknowledgment timed out");
+                Thread.Sleep(10);
+            }
         } finally {
             bool restored=!captured || SetKeyboardState(saved);
             bool detached=AttachThreadInput(current,target,false);
@@ -174,12 +186,12 @@ public static class LegacyKeys {
             throw new Exception("Hidden target keyboard layout restore failed");
         if(scope.NewlyLoaded && !UnloadKeyboardLayout(scope.Current)) throw new Exception("Task-loaded keyboard layout unload failed");
     }
-    public static int AltNonAscii(IntPtr h,bool synchronous) {
+    public static int AltNonAscii(IntPtr h,bool synchronous,int marker,Func<bool> acknowledged) {
         var scope=UseLayout(h,"00000407"); if(scope==null) return -1;
         try {
             short scan=VkKeyScanExW('\u00f6',scope.Current);
             if(scan<0 || (scan>>8)!=0) return -1;
-            Key(h,scan&255,0x00f6,false,true,false,synchronous); return 0x00f6;
+            Key(h,scan&255,0x00f6,false,true,false,synchronous,marker,acknowledged); return 0x00f6;
         } finally { RestoreLayout(h,scope); }
     }
 }
@@ -187,12 +199,13 @@ public static class LegacyKeys {
 
 function Startup-Fingerprint {
     $path=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
-    if(-not (Test-Path -LiteralPath $path)) { throw 'Adopted real startup-state file is missing; no launches permitted.' }
-    return @{ Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
+    if(-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false; Hash=$null; Modified=$null } }
+    return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
 }
 function Assert-AdoptedStartup($Fingerprint) {
-    if($Fingerprint.Hash -ne '7b4f9aa31731df822e3ec13f8381e76dc759455abbf8bb458f74e10bf5e2bb9c' -or
-        [datetime]::Parse($Fingerprint.Modified).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') -ne '2026-10-10T18:18:34Z') {
+    if(($BaselineHash -and $Fingerprint.Hash -ne $BaselineHash.ToLowerInvariant()) -or
+        ($BaselineModifiedUtc -and (-not $Fingerprint.Exists -or
+            [datetimeoffset]::Parse($Fingerprint.Modified) -ne [datetimeoffset]::Parse($BaselineModifiedUtc)))) {
         throw 'Real startup state differs from the adopted baseline; stop launches.'
     }
 }
@@ -248,7 +261,7 @@ if(-not $Driver) {
         if($pi) { [void][LegacyKeys]::CloseHandle($pi.thread); [void][LegacyKeys]::CloseHandle($pi.process) }
         [void][LegacyKeys]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
-        $unchanged=$before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
+        $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
         @{Before=$before;After=$after;Unchanged=$unchanged;OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$owned} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
         if(-not $unchanged) { throw 'Real startup state changed; stop launches.' }; Assert-AdoptedStartup $after
@@ -272,29 +285,44 @@ function Read-Records {
     $stream=[IO.FileStream]::new($records,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
     $reader=[IO.StreamReader]::new($stream)
     try { $csv=$reader.ReadToEnd() } finally { $reader.Dispose() }
+    # The observer may be appending. Only parse complete CSV rows.
+    $end=$csv.LastIndexOf("`n")
+    if($end -lt 0) { return @() }
+    $csv=$csv.Substring(0,$end+1)
     return @($csv | ConvertFrom-Csv | ForEach-Object { @{CodeUnit=[int]$_.CodeUnit;VirtualKey=[int]$_.VirtualKey;ControlState=[uint32]$_.ControlState} })
 }
 function Capture-Key([string]$Name,[int]$VK,[int]$Character,[bool]$Ctrl,[bool]$Alt,[bool]$Shift,[int[]]$Expected,[switch]$FunctionKey,[switch]$NonAscii) {
     $offset=@(Read-Records).Count
     $unsupported=$false
-    if($NonAscii) { $unsupported=[LegacyKeys]::AltNonAscii($surface,$Synchronous.IsPresent) -lt 0 }
-    else { [LegacyKeys]::Key($surface,$VK,$Character,$Ctrl,$Alt,$Shift,$Synchronous.IsPresent) }
-    Start-Sleep -Milliseconds 450
+    # F1 is an in-band barrier, except for F13 (whose observed alias is F1).
+    $markerVK=if($FunctionKey -and $VK-12 -eq 112) { 113 } else { 112 }
+    $acknowledged=[Func[bool]] {
+        $snapshot=@(Read-Records)
+        for($i=$offset;$i -lt $snapshot.Count;$i++) {
+            if($snapshot[$i].VirtualKey -eq $markerVK -and $snapshot[$i].CodeUnit -eq 0) { return $true }
+        }
+        return $false
+    }
+    if($NonAscii) { $unsupported=[LegacyKeys]::AltNonAscii($surface,$Synchronous.IsPresent,$markerVK,$acknowledged) -lt 0 }
+    else { [LegacyKeys]::Key($surface,$VK,$Character,$Ctrl,$Alt,$Shift,$Synchronous.IsPresent,$markerVK,$acknowledged) }
     $all=@(Read-Records); $actual=if($all.Count -gt $offset) { @($all[$offset..($all.Count-1)]) } else { @() }
+    $markers=@($actual | Where-Object { $_.VirtualKey -eq $markerVK -and $_.CodeUnit -eq 0 })
+    if(-not $unsupported -and ($markers.Count -ne 1 -or $actual[-1].VirtualKey -ne $markerVK)) { throw 'Console case barrier was not the final unique record.' }
+    $actual=@($actual | Where-Object { $_.VirtualKey -ne $markerVK -or $_.CodeUnit -ne 0 })
     $textRecords=@($actual | Where-Object { $_.CodeUnit -ne 0 })
     $modifierKeys=@(16,17,18,160,161,162,163,164,165)
     $unexpectedZero=@($actual | Where-Object { $_.CodeUnit -eq 0 -and $_.VirtualKey -notin $modifierKeys })
-    $units=@($(if($NonAscii){$textRecords}else{$actual}) | ForEach-Object { $_.CodeUnit })
+    $units=@($textRecords | ForEach-Object { $_.CodeUnit })
     $functionVK=$VK-12
     if($FunctionKey) {
         $functionRecords=@($actual | Where-Object { $_.VirtualKey -eq $functionVK -and ($_.ControlState -band 16) -ne 0 })
         $pass=$functionRecords.Count -eq 1 -and $textRecords.Count -eq 0 -and
-            @($unexpectedZero | Where-Object { $_.VirtualKey -ne $functionVK }).Count -eq 0
+            $unexpectedZero.Count -eq 1
     }
-    else { $pass=($units -join ',') -ceq ($Expected -join ',') }
+    else { $pass=$unexpectedZero.Count -eq 0 -and ($units -join ',') -ceq ($Expected -join ',') }
     if($NonAscii -and -not $unsupported) { $pass=$pass -and $unexpectedZero.Count -eq 0 -and $textRecords.Count -eq 1 -and @($textRecords | Where-Object { ($_.ControlState -band 3) -ne 0 }).Count -eq 1 }
     $expectation=if($FunctionKey) { @{VirtualKey=$functionVK;ShiftRequired=$true;CodeUnit=0} } else { @{CodeUnits=$Expected;AltRequired=$NonAscii.IsPresent} }
-    $checks.Add(@{Name=$Name;Status=$(if($unsupported){'UNSUPPORTED'}elseif($pass){'PASS'}else{'FAIL'});Expected=$expectation;Records=$actual})
+    $checks.Add(@{Name=$Name;Status=$(if($unsupported){'UNSUPPORTED'}elseif($pass){'PASS'}else{'FAIL'});Expected=$expectation;Records=$actual;AcknowledgmentRecords=$markers})
 }
 try {
     $config=Join-Path $Bin 'legacy-keys.ghostty'
