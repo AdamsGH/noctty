@@ -87,6 +87,12 @@ public static class HerdrMouse {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out Rect r);
     [DllImport("user32.dll",SetLastError=true)] static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
+    [DllImport("user32.dll",SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint f,uint t,out IntPtr result);
+    // Tell a window it is active and focused, as a click on it would, without
+    // touching the real foreground: WM_ACTIVATE(WA_ACTIVE) then WM_SETFOCUS.
+    public static void Activate(IntPtr h) {
+        IntPtr r; SendMessageTimeoutW(h,0x6,new IntPtr(1),IntPtr.Zero,2,2000,out r); SendMessageTimeoutW(h,0x7,IntPtr.Zero,IntPtr.Zero,2,2000,out r);
+    }
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
     [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr p,uint ms);
@@ -116,8 +122,12 @@ public static class HerdrMouse {
             throw new Exception("Owned job cleanup exceeded five seconds");
         } finally { CloseHandle(j); }
     }
-    public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job,uint flags) {
-        var s=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo p;
+    // show is the STARTUPINFO wShowWindow: SW_HIDE (0) for console and noctty
+    // children, SW_SHOWNOACTIVATE (4) for WezTerm, which honours the startup
+    // show state and keeps a hidden window's clicks from reaching its panes.
+    // Every window lives on the private desktop either way.
+    public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job,uint flags,short show) {
+        var s=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=show }; ProcessInfo p;
         if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,flags|0x4004,IntPtr.Zero,cwd,ref s,out p))
             throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
         if(!AssignProcessToJobObject(job,p.process)||ResumeThread(p.thread)==0xFFFFFFFF) {
@@ -133,9 +143,19 @@ public static class HerdrMouse {
             return true;
         },IntPtr.Zero); return found;
     }
+    // The visible top-level window of pid with class cls. WezTerm gives every
+    // window it creates the --class name, dialogs and helpers included, so the
+    // candidates are listed and the visible one with a real client area wins.
     public static IntPtr TopLevel(int pid,string cls) {
         IntPtr found=IntPtr.Zero;
-        EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id); if(id==pid && Class(h)==cls) found=h; return found==IntPtr.Zero; },IntPtr.Zero); return found;
+        EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id);
+            if(id==pid && Class(h)==cls && IsWindowVisible(h)) { Rect r; GetClientRect(h,out r); if(r.right-r.left>200 && r.bottom-r.top>100) found=h; }
+            return found==IntPtr.Zero; },IntPtr.Zero); return found;
+    }
+    public static string Windows(int pid) {
+        var sb=new StringBuilder();
+        EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id); if(id==pid) { Rect r; GetClientRect(h,out r); sb.AppendFormat("{0:X}:{1}:{2}:{3}x{4} ",h.ToInt64(),Class(h),IsWindowVisible(h),r.right-r.left,r.bottom-r.top); } return true; },IntPtr.Zero);
+        return sb.ToString();
     }
     public static string DesktopName() {
         var name=new StringBuilder(256); int needed;
@@ -160,7 +180,7 @@ function Compile-Helper([string]$Source,[string]$Exe,[IntPtr]$Job,[string]$Root)
     @('@echo off',('call "{0}" cl /nologo /W4 /WX /O2 /DUNICODE /D_UNICODE "{1}" /Fe:"{2}" /Fo:"{3}" > "{4}" 2>&1' -f
         (Join-Path $Root 'scripts\dev-windows.cmd'),$Source,$Exe,($Exe -replace '\.exe$','.obj'),($Exe -replace '\.exe$','.compile.log')),
         'exit /b %errorlevel%') | Set-Content -LiteralPath $compile -Encoding ascii
-    $cp=[HerdrMouse]::Launch($env:ComSpec,('"{0}" /d /c ""{1}""' -f $env:ComSpec,$compile),$Root,$null,$Job,0x08000000)
+    $cp=[HerdrMouse]::Launch($env:ComSpec,('"{0}" /d /c ""{1}""' -f $env:ComSpec,$compile),$Root,$null,$Job,0x08000000,0)
     try {
         if([HerdrMouse]::WaitForSingleObject($cp.process,90000) -ne 0) { throw "Compilation timed out: $Source" }
         [uint32]$code=0; [void][HerdrMouse]::GetExitCodeProcess($cp.process,[ref]$code)
@@ -198,7 +218,7 @@ if(-not $Driver) {
         $env:HERDR_WINDOWS_INPUT_TRACE='1'
         $pwsh=(Get-Command pwsh.exe).Source
         $command='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -Herdr "{4}" -WezTerm "{5}" -Driver' -f $pwsh,$PSCommandPath,$portable,$Run,$Herdr,$WezTerm
-        $pi=[HerdrMouse]::Launch($pwsh,$command,$Run,"WinSta0\$desktopName",$job,0x08000000)
+        $pi=[HerdrMouse]::Launch($pwsh,$command,$Run,"WinSta0\$desktopName",$job,0x08000000,0)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
         while([HerdrMouse]::WaitForSingleObject($pi.process,500) -eq 258) {
@@ -232,6 +252,8 @@ foreach($dir in @('LOCALAPPDATA','APPDATA','HOME','USERPROFILE')) {
 }
 $results=[ordered]@{Phases=[Collections.Generic.List[object]]::new()}
 $runStart=Get-Date
+# Every process this run launched or found under one it launched.
+$knownPids=[Collections.Generic.HashSet[int]]::new()
 $job=[HerdrMouse]::CreateOwnedJob()
 $observer=Join-Path $Run 'console-input-records.exe'; $attachInfo=Join-Path $Run 'console-attach-info.exe'
 $herdrConfigDir=Join-Path $env:APPDATA 'herdr'; [void](New-Item -ItemType Directory -Path $herdrConfigDir -Force)
@@ -250,13 +272,17 @@ $nocttyExe=Join-Path $Bin 'noctty.exe'
 $haveHerdr=Test-Path -LiteralPath $Herdr; $haveWezTerm=Test-Path -LiteralPath $WezTerm
 $script:apiCalls=0
 function Progress([string]$Text) { Add-Content -LiteralPath (Join-Path $Run 'progress.log') -Value ("{0} {1}" -f (Get-Date).ToString('HH:mm:ss.fff'),$Text) }
-function Herdr-Api([string[]]$Args,[string]$Socket) {
+# The parameter must not be called $Args: that name is PowerShell's automatic
+# unbound-arguments variable and binds nothing (AGENTS.md, 2026-09-14).
+function Herdr-Api([string[]]$Arguments,[string]$Socket) {
     $old=$env:HERDR_SOCKET_PATH; $env:HERDR_SOCKET_PATH=$Socket
     $script:apiCalls++; $out=Join-Path $Run ("api-{0:D3}.txt" -f $script:apiCalls)
     try {
-        $code=[HerdrMouse]::RunCapture($Herdr,('"{0}" {1}' -f $Herdr,($Args -join ' ')),$Run,$out,$job,15000)
-        $text=if(Test-Path -LiteralPath $out) { (Get-Content -LiteralPath $out -Raw).TrimEnd() } else { '' }
-        Progress ("api {0} -> {1}: {2}" -f ($Args -join ' '),$code,($text -replace '\s+',' ').Substring(0,[Math]::Min(160,($text -replace '\s+',' ').Length)))
+        $code=[HerdrMouse]::RunCapture($Herdr,('"{0}" {1}' -f $Herdr,($Arguments -join ' ')),$Run,$out,$job,15000)
+        $raw=if(Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw } else { $null }
+        $text=if($null -eq $raw) { '' } else { ([string]$raw).TrimEnd() }
+        $flat=[string]($text -replace '\s+',' ')
+        Progress ("api {0} -> {1}: {2}" -f ($Arguments -join ' '),$code,$flat.Substring(0,[Math]::Min(300,$flat.Length)))
         return @{Exit=$code;Text=$text}
     } finally { $env:HERDR_SOCKET_PATH=$old }
 }
@@ -272,7 +298,7 @@ function Child-Pids([int]$Parent,[string]$Name) {
 }
 function Attach-Info([int]$ProcessId) {
     $out=Join-Path $Run ("attach-{0}.txt" -f $ProcessId)
-    $p=[HerdrMouse]::Launch($attachInfo,('"{0}" {1} "{2}"' -f $attachInfo,$ProcessId,$out),$Run,"WinSta0\$driverDesktop",$job,0x08000000)
+    $p=[HerdrMouse]::Launch($attachInfo,('"{0}" {1} "{2}"' -f $attachInfo,$ProcessId,$out),$Run,"WinSta0\$driverDesktop",$job,0x08000000,0)
     try {
         if([HerdrMouse]::WaitForSingleObject($p.process,10000) -ne 0) { return @{Error='attach timeout'} }
         [uint32]$code=0; [void][HerdrMouse]::GetExitCodeProcess($p.process,[ref]$code)
@@ -285,14 +311,17 @@ function Attach-Info([int]$ProcessId) {
 function Start-Terminal([string]$Terminal,[string]$Program,[string]$Arguments) {
     if($Terminal -eq 'noctty') {
         $cmd='"{0}" --config-file="{1}" -e "{2}" {3}' -f $nocttyExe,$nocttyConfig,$Program,$Arguments
-        $p=[HerdrMouse]::Launch($nocttyExe,$cmd,$Bin,"WinSta0\$driverDesktop",$job,0x08000000)
+        $p=[HerdrMouse]::Launch($nocttyExe,$cmd,$Bin,"WinSta0\$driverDesktop",$job,0x08000000,0)
         $w=Wait-Window { [HerdrMouse]::Surface($p.pid) } $p.process 45 'noctty'
         return @{Process=$p;Window=$w;Pid=$p.pid}
     }
     $cls='noctty-g019-'+[guid]::NewGuid().ToString('N').Substring(0,8)
     $cmd='"{0}" --config-file "{1}" start --always-new-process --class {2} --cwd "{3}" -- "{4}" {5}' -f $WezTerm,$wezConfig,$cls,$Run,$Program,$Arguments
-    $p=[HerdrMouse]::Launch($WezTerm,$cmd,$Run,"WinSta0\$driverDesktop",$job,0x08000000)
+    $p=[HerdrMouse]::Launch($WezTerm,$cmd,$Run,"WinSta0\$driverDesktop",$job,0x08000000,4)
     $w=Wait-Window { [HerdrMouse]::TopLevel($p.pid,$cls) } $p.process 60 'WezTerm'
+    Start-Sleep -Milliseconds 1500 # first paint on the software front end
+    [HerdrMouse]::Activate($w); Start-Sleep -Milliseconds 300
+    Progress ("wezterm windows: " + [HerdrMouse]::Windows($p.pid))
     return @{Process=$p;Window=$w;Pid=$p.pid}
 }
 function Click-Pane([IntPtr]$Window,[double]$FractionX,[double]$FractionY) {
@@ -319,15 +348,17 @@ try {
             $t=$null
             try {
                 $arguments=if($mode -eq 'no-session') { '--no-session' } else { '' }
-                Progress "phase $terminal herdr $mode: start"
+                Progress "phase $terminal herdr ${mode}: start"
                 $t=Start-Terminal $terminal $Herdr $arguments
-                Progress "phase $terminal herdr $mode: terminal pid $($t.Pid) window $($t.Window)" 
+                Progress "phase $terminal herdr ${mode}: terminal pid $($t.Pid) window $($t.Window)" 
                 $deadline=[datetime]::UtcNow.AddSeconds(45); $api=$null
                 do { $api=Herdr-Api @('pane','list') $socket; if($api.Exit -eq 0) { break }; Start-Sleep -Milliseconds 300 } while([datetime]::UtcNow -lt $deadline)
                 $phase.ApiReady=($api.Exit -eq 0); $phase.PaneListInitial=$api.Text
                 if($api.Exit -ne 0) { $phase.Status='FAIL'; $phase.Error='herdr API never answered'; $results.Phases.Add($phase); continue }
                 Start-Sleep -Milliseconds 1500
-                $herdrPids=@(Child-Pids $t.Pid 'herdr.exe'); Progress "herdr client pids: $($herdrPids -join ',')" 
+                $herdrPids=@(Child-Pids $t.Pid 'herdr.exe'); Progress "herdr client pids: $($herdrPids -join ',')"
+                [void]$knownPids.Add([int]$t.Pid); foreach($hp in $herdrPids) { [void]$knownPids.Add([int]$hp) }
+                foreach($hp in $herdrPids) { foreach($sp in @(Child-Pids $hp 'herdr.exe')) { [void]$knownPids.Add([int]$sp) } }
                 if($terminal -eq 'wezterm' -and $herdrPids.Count -eq 0) {
                     # WezTerm may spawn through its own conpty host; take any herdr whose parent is a child of the GUI.
                     $kids=@(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $t.Pid } | Select-Object -ExpandProperty ProcessId)
@@ -335,7 +366,12 @@ try {
                 }
                 $phase.HerdrClientPid=$herdrPids
                 if($herdrPids.Count -gt 0) { $phase.Console=Attach-Info $herdrPids[0] }
-                $split=Herdr-Api @('pane','split','--current','--direction','right') $socket; $phase.Split=$split.Text
+                # The split target is the current pane's id from the API (there is no
+                # HERDR_PANE_ID in this driver's environment).
+                $paneId=$null
+                try { $paneId=((ConvertFrom-Json $api.Text).result.panes | Where-Object { $_.focused } | Select-Object -First 1).pane_id } catch { }
+                if(-not $paneId) { $paneId='w1:p1' }
+                $split=Herdr-Api @('pane','split','--pane',$paneId,'--direction','right') $socket; $phase.Split=$split.Text
                 Start-Sleep -Milliseconds 1200
                 $phase.PaneListAfterSplit=(Herdr-Api @('pane','list') $socket).Text
                 $phase.CurrentBefore=(Herdr-Api @('pane','current') $socket).Text
@@ -352,8 +388,8 @@ try {
                     if(Test-Path -LiteralPath $lp) { Copy-Item -LiteralPath $lp -Destination (Join-Path $Run ("{0}-{1}-{2}" -f $terminal,$mode,$log)) -Force }
                 }
                 if($mode -eq 'default') { [void](Herdr-Api @('server','stop') $socket); Start-Sleep -Milliseconds 800 }
-                Progress "phase $terminal herdr $mode: $($phase.Status)" 
-            } catch { $phase.Status='FAIL'; $phase.Error=$_.Exception.Message }
+                Progress "phase $terminal herdr ${mode}: $($phase.Status)" 
+            } catch { $phase.Status='FAIL'; $phase.Error=$_.Exception.Message; $phase.ErrorAt=$_.InvocationInfo.PositionMessage }
             finally {
                 if($t) { [void][HerdrMouse]::CloseHandle($t.Process.thread); [void][HerdrMouse]::CloseHandle($t.Process.process) }
                 # Each herdr instance ends with its terminal; the job stops leftovers at exit.
@@ -361,14 +397,19 @@ try {
             }
             $results.Phases.Add($phase)
         }
-        # Phase B: the observer in herdr's console input mode and with VT input.
-        foreach($modeHex in @('98','298')) {
-            $phase=[ordered]@{Terminal=$terminal;Program='observer';InputMode="0x$modeHex";Status='FAIL'}
-            $records=Join-Path $Run ("records-{0}-{1}.csv" -f $terminal,$modeHex); $ready=Join-Path $Run ("ready-{0}-{1}.txt" -f $terminal,$modeHex); $stop=Join-Path $Run ("stop-{0}-{1}.txt" -f $terminal,$modeHex)
+        # Phase B: the observer in herdr's console input mode and with VT input,
+        # then in herdr's mode but asking for SGR mouse itself: the positive
+        # control that tells a terminal not receiving the clicks from a console
+        # host that does not translate ENABLE_MOUSE_INPUT into a mouse request.
+        foreach($variant in @(@{Mode='98';Vt=$false},@{Mode='298';Vt=$false},@{Mode='98';Vt=$true})) {
+            $modeHex=$variant.Mode; $tag=$modeHex+$(if($variant.Vt){'-vtmouse'}else{''})
+            $phase=[ordered]@{Terminal=$terminal;Program='observer';InputMode="0x$modeHex";VtMouseRequest=$variant.Vt;Status='FAIL'}
+            $records=Join-Path $Run ("records-{0}-{1}.csv" -f $terminal,$tag); $ready=Join-Path $Run ("ready-{0}-{1}.txt" -f $terminal,$tag); $stop=Join-Path $Run ("stop-{0}-{1}.txt" -f $terminal,$tag)
             $t=$null
             try {
-                Progress "phase $terminal observer 0x$modeHex: start"
-                $t=Start-Terminal $terminal $observer ('"{0}" "{1}" "{2}" {3}' -f $records,$ready,$stop,$modeHex)
+                Progress "phase $terminal observer ${tag}: start"
+                $t=Start-Terminal $terminal $observer ('"{0}" "{1}" "{2}" {3}{4}' -f $records,$ready,$stop,$modeHex,$(if($variant.Vt){' vt-mouse'}else{''}))
+                [void]$knownPids.Add([int]$t.Pid)
                 $deadline=[datetime]::UtcNow.AddSeconds(30)
                 while(-not (Test-Path -LiteralPath $ready) -and [datetime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
                 $phase.Ready=(Get-Content -LiteralPath $ready -Raw).Trim()
@@ -391,15 +432,25 @@ try {
 } finally {
     $cleanupError=$null; $owned=0
     try { $owned=[HerdrMouse]::StopOwnedJob($job) } catch { $cleanupError=$_ }
-    # herdr's server detaches from the client's job. Stop any server this run
-    # started (its socket path is inside Run) by exact identity.
-    $leftover=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Run*" -or ($_.CreationDate -gt $runStart -and $_.ExecutablePath -eq $Herdr) })
-    foreach($proc in $leftover) {
-        $isMine=$false
-        try { $isMine=(Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ProcessId)").CommandLine -like "*$Run*" } catch { }
-        if(-not $isMine) { $isMine=$proc.CreationDate -gt $runStart -and $proc.ExecutablePath -eq $Herdr }
-        if($isMine) { Progress "stopping leftover herdr pid $($proc.ProcessId) started $($proc.CreationDate)"; Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue }
+    # herdr's server detaches from the client's job. Stop only a server this
+    # run started: a herdr.exe whose parent chain reaches a process this run
+    # launched (recorded in $knownPids), or whose command line names Run.
+    # Never by name or start time: the maintainer's own herdr is out of scope.
+    $leftover=@()
+    $all=@(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'")
+    foreach($proc in $all) {
+        $mine=($proc.CommandLine -and $proc.CommandLine -like "*$Run*")
+        $parent=$proc.ParentProcessId; $hops=0
+        while(-not $mine -and $parent -gt 0 -and $hops -lt 6) {
+            if($knownPids.Contains([int]$parent)) { $mine=$true; break }
+            $pp=$all | Where-Object { $_.ProcessId -eq $parent } | Select-Object -First 1
+            if($null -eq $pp) { $pp=Get-CimInstance Win32_Process -Filter "ProcessId=$parent" -ErrorAction SilentlyContinue }
+            if($null -eq $pp) { break }
+            $parent=$pp.ParentProcessId; $hops++
+        }
+        if($mine) { $leftover+=$proc }
     }
+    foreach($proc in $leftover) { Progress "stopping leftover herdr pid $($proc.ProcessId) started $($proc.CreationDate)"; Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue }
     $results.LeftoverHerdrStopped=@($leftover | ForEach-Object { $_.ProcessId })
     $results.OwnedProcessCount=$owned; $results.OwnedJobCleanedUp=($null -eq $cleanupError)
     $results.HerdrInstalled=$haveHerdr; $results.WezTermInstalled=$haveWezTerm

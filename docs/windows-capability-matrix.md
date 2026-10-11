@@ -231,9 +231,35 @@ non-US keyboard has not been used.
 Kitty and modifyOtherKeys encodings survive the pseudo console byte for byte
 on the two sources measured here — the in-box conhost of Windows
 `10.0.26200.0` and the bundled OpenConsole `1.24.260710001`; older in-box
-conhosts are unmeasured. noctty does not implement Win32 input mode
-(`CSI ?9001h`), which ConPTY requests at the start of every session. See the
-[key encoding differential](windows-vt-conformance.md#measured-master-to-child-key-encoding-differential).
+conhosts are unmeasured. noctty implements Win32 input mode (`CSI ?9001h`),
+which ConPTY requests at the start of every session: while it is set and no
+application has asked for Kitty or modifyOtherKeys, every key event goes to
+ConPTY as a `KEY_EVENT_RECORD` with the real virtual key, scan code,
+character, control-key state and repeat count, so console-API readers such as
+PSReadLine see Shift+Enter, Ctrl+Enter, Ctrl+punctuation, AltGr chords and
+F13-F24 as Windows reports them (Shift+Enter adds a PSReadLine continuation
+line instead of running the line). Measured against a real console window on
+the same keys in
+[windows-vt-conformance.md](windows-vt-conformance.md#measured-win32-input-mode-records);
+the ordering of records is the terminal's, so Windows Terminal and noctty
+differ from conhost only in a latched dead key's release, where conhost emits
+the accent twice. An application that reads VT bytes and asked for Kitty or
+modifyOtherKeys keeps those bytes; conhost re-encodes records for other
+VT-input children itself, as it does under Windows Terminal.
+
+Mouse input for console-API children goes the other way: a child that sets
+`ENABLE_MOUSE_INPUT` makes the bundled ConPTY ask noctty for SGR mouse
+reporting (`CSI ?1003;1006h`, `VtIo::Writer::WriteSGR1006`) and decode
+noctty's reports into `MOUSE_EVENT` records, which a `ReadConsoleInputW`
+reader receives (measured, `test/windows/hidden-win11-herdr-mouse.ps1`). herdr
+0.8.2 in its default client/server mode reads those and its pane focus follows
+clicks under noctty exactly as under WezTerm. Its `--no-session` (monolithic)
+mode ignores clicks under both terminals: it leaves the console in mode 0x98
+(crossterm's `EnableMouseCapture` on Windows sets the console mode and emits no
+`CSI ?1000h`) and reads stdin as bytes, which a console never fills from
+`MOUSE_EVENT` records. That is the audit's G019 observation and it is herdr's,
+not noctty's; the same observer under WezTerm 20240203's own ConPTY receives
+no mouse records at all, even when it asks for them itself.
 
 `key-remap` changes modifier state before focused or in-app keybind matching
 and terminal encoding; it does not change physical key identity. `global:`
