@@ -114,6 +114,8 @@ pub const Action = union(Key) {
     active_status_display: ansi.StatusDisplay,
     decaln,
     window_title: WindowTitle,
+    /// ConPTY's client ShowWindow notification (XTWINOPS 1/2).
+    window_visibility: bool,
     report_pwd: ReportPwd,
     show_desktop_notification: ShowDesktopNotification,
     progress_report: osc.Command.ProgressReport,
@@ -213,6 +215,7 @@ pub const Action = union(Key) {
             "active_status_display",
             "decaln",
             "window_title",
+            "window_visibility",
             "report_pwd",
             "show_desktop_notification",
             "progress_report",
@@ -1785,6 +1788,12 @@ pub fn Stream(comptime H: type) type {
                     0 => {
                         if (input.params.len > 0) {
                             switch (input.params[0]) {
+                                1, 2 => if (input.params.len == 1) {
+                                    self.handler.vt(.window_visibility, input.params[0] == 1);
+                                } else log.warn(
+                                    "ignoring window visibility with extra parameters: {f}",
+                                    .{input},
+                                ),
                                 14 => if (input.params.len == 1) {
                                     // report the text area size in pixels
                                     self.handler.vt(.size_report, .csi_14_t);
@@ -3084,6 +3093,30 @@ test "stream: XTSHIFTESCAPE" {
     // Invalid and ignored by the handler
     s.nextSlice("\x1B[1 s");
     try testing.expect(s.handler.escape.? == true);
+}
+
+test "stream: ConPTY window visibility requests" {
+    const H = struct {
+        requests: usize = 0,
+        visible: bool = false,
+
+        pub fn vt(self: *@This(), comptime action: anytype, value: anytype) void {
+            if (comptime std.mem.eql(u8, @tagName(action), "window_visibility")) {
+                self.requests += 1;
+                self.visible = value;
+            }
+        }
+    };
+    var s: Stream(H) = .init(.{});
+    s.nextSlice("\x1b[1t");
+    try testing.expectEqual(@as(usize, 1), s.handler.requests);
+    try testing.expect(s.handler.visible);
+    s.nextSlice("\x1b[2t");
+    try testing.expectEqual(@as(usize, 2), s.handler.requests);
+    try testing.expect(!s.handler.visible);
+    // Neither malformed XTWINOPS nor private variants are visibility requests.
+    s.nextSlice("\x1b[1;2t\x1b[2;0t\x1b[?1t\x1b[>2t\x1b[0t");
+    try testing.expectEqual(@as(usize, 2), s.handler.requests);
 }
 
 test "stream: change window title with invalid utf-8" {

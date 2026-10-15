@@ -691,7 +691,7 @@ const WindowsConPty = struct {
 
 /// Windows PTY creation and management.
 const WindowsPty = struct {
-    pub const Error = OpenError || GetSizeError || SetSizeError;
+    pub const Error = OpenError || GetSizeError || SetSizeError || SetAdoptedVisibilityError;
 
     pub const Fd = windows.HANDLE;
 
@@ -951,6 +951,30 @@ const WindowsPty = struct {
         }
     }
 
+    pub const SetAdoptedVisibilityError = error{VisibilityFailed};
+
+    /// Keep OpenConsole's pseudo HWND in sync with its hosting window. This
+    /// is the reverse of OpenConsole's CSI 1/2 t notifications, not pane or
+    /// renderer occlusion. Only adopted sessions expose their signal pipe.
+    pub fn setAdoptedVisibility(self: *Pty, visible: bool) SetAdoptedVisibilityError!void {
+        switch (self.control) {
+            .pseudo_console => {},
+            .handoff => |*handoff| {
+                handoff.signal_write_mutex.lock();
+                defer handoff.signal_write_mutex.unlock();
+                const signal = handoff.signal orelse return error.VisibilityFailed;
+                // PtySignal::ShowHideWindow (u16), then a u16 boolean.
+                const packet = [_]u8{ 1, 0, @intFromBool(visible), 0 };
+                var written: windows.DWORD = 0;
+                if (windows.kernel32.WriteFile(signal, &packet, packet.len, &written, null) == 0 or
+                    written != packet.len)
+                {
+                    return error.VisibilityFailed;
+                }
+            },
+        }
+    }
+
     /// Close a pipe handle that a caller may already have taken from this
     /// process.
     ///
@@ -1119,6 +1143,134 @@ test "handoff resize writes one exact signal packet" {
     try std.testing.expect(windows.kernel32.ReadFile(signal_read, &packet, packet.len, &read, null) != 0);
     try std.testing.expectEqual(@as(windows.DWORD, packet.len), read);
     try std.testing.expectEqualSlices(u8, &.{ 0x08, 0x00, 0x50, 0x00, 0x18, 0x00 }, &packet);
+}
+
+test "handoff visibility writes exact boolean packets and fails after signal close" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var signal_read: windows.HANDLE = undefined;
+    var signal_write: windows.HANDLE = undefined;
+    try std.testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+    defer _ = windows.CloseHandle(signal_read);
+
+    var pty: WindowsPty = .{
+        .out_pipe = undefined,
+        .in_pipe = undefined,
+        .out_pipe_pty = null,
+        .in_pipe_pty = null,
+        .control = .{ .handoff = .{
+            .signal = signal_write,
+            .server_process = windows.INVALID_HANDLE_VALUE,
+            .reference = windows.INVALID_HANDLE_VALUE,
+        } },
+        .size = .{},
+    };
+    defer pty.closeAdoptedSignal();
+
+    try pty.setAdoptedVisibility(true);
+    try pty.setAdoptedVisibility(false);
+    var packet: [8]u8 = undefined;
+    var read: windows.DWORD = 0;
+    try std.testing.expect(windows.kernel32.ReadFile(signal_read, &packet, packet.len, &read, null) != 0);
+    try std.testing.expectEqual(@as(windows.DWORD, packet.len), read);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 1, 0, 1, 0, 0, 0 }, &packet);
+
+    pty.closeAdoptedSignal();
+    try std.testing.expectError(error.VisibilityFailed, pty.setAdoptedVisibility(true));
+    try std.testing.expectError(error.VisibilityFailed, pty.setAdoptedVisibility(false));
+
+    // A regular HPCON must never be interpreted as a handoff signal pipe.
+    pty.control = .{ .pseudo_console = .{ .handle = undefined, .conpty = undefined } };
+    try pty.setAdoptedVisibility(true);
+    try pty.setAdoptedVisibility(false);
+}
+
+test "handoff visibility reports a broken signal receiver" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var signal_read: windows.HANDLE = undefined;
+    var signal_write: windows.HANDLE = undefined;
+    try std.testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+    _ = windows.CloseHandle(signal_read);
+    defer _ = windows.CloseHandle(signal_write);
+
+    var pty: WindowsPty = .{
+        .out_pipe = undefined,
+        .in_pipe = undefined,
+        .out_pipe_pty = null,
+        .in_pipe_pty = null,
+        .control = .{ .handoff = .{
+            .signal = signal_write,
+            .server_process = windows.INVALID_HANDLE_VALUE,
+            .reference = windows.INVALID_HANDLE_VALUE,
+        } },
+        .size = .{},
+    };
+    try std.testing.expectError(error.VisibilityFailed, pty.setAdoptedVisibility(true));
+}
+
+test "handoff visibility resize and close share the signal lock" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const Operation = enum { visibility, resize, close };
+    const Worker = struct {
+        pty: *WindowsPty,
+        operation: Operation,
+        entered: std.Thread.ResetEvent = .{},
+        done: std.Thread.ResetEvent = .{},
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.entered.set();
+            switch (self.operation) {
+                .visibility => self.pty.setAdoptedVisibility(true) catch |err| {
+                    self.failure = err;
+                },
+                .resize => self.pty.setSize(.{ .ws_col = 80, .ws_row = 24 }) catch |err| {
+                    self.failure = err;
+                },
+                .close => self.pty.closeAdoptedSignal(),
+            }
+            self.done.set();
+        }
+    };
+
+    inline for (.{ Operation.visibility, Operation.resize, Operation.close }) |operation| {
+        var signal_read: windows.HANDLE = undefined;
+        var signal_write: windows.HANDLE = undefined;
+        try std.testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+        defer _ = windows.CloseHandle(signal_read);
+        var pty: WindowsPty = .{
+            .out_pipe = undefined,
+            .in_pipe = undefined,
+            .out_pipe_pty = null,
+            .in_pipe_pty = null,
+            .control = .{ .handoff = .{
+                .signal = signal_write,
+                .server_process = windows.INVALID_HANDLE_VALUE,
+                .reference = windows.INVALID_HANDLE_VALUE,
+            } },
+            .size = .{},
+        };
+        defer pty.closeAdoptedSignal();
+        var worker: Worker = .{ .pty = &pty, .operation = operation };
+        var thread: ?std.Thread = null;
+        defer if (thread) |value| value.join();
+        {
+            pty.control.handoff.signal_write_mutex.lock();
+            defer pty.control.handoff.signal_write_mutex.unlock();
+            thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+            try worker.entered.timedWait(5 * std.time.ns_per_s);
+            try std.testing.expectError(error.Timeout, worker.done.timedWait(20 * std.time.ns_per_ms));
+            var available: windows.DWORD = 0;
+            try std.testing.expect(windows.exp.kernel32.PeekNamedPipe(signal_read, null, 0, null, &available, null) != 0);
+            try std.testing.expectEqual(@as(windows.DWORD, 0), available);
+        }
+        thread.?.join();
+        thread = null;
+        try std.testing.expect(worker.failure == null);
+        try std.testing.expect(worker.done.isSet());
+    }
 }
 
 test "Windows ConPTY resolver selects inbox and default auto backends" {

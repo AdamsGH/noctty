@@ -408,6 +408,14 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     exec.read_thread.join();
 }
 
+/// Called on the IO thread with the hosting window's visibility, including
+/// minimize/restore. Ordinary spawned sessions do not use handoff signals.
+pub fn ptyVisibility(self: *Exec, visible: bool) !void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (self.subprocess.adopted_client_process == null) return;
+    if (self.subprocess.pty) |*pty| try pty.setAdoptedVisibility(visible);
+}
+
 pub fn focusGained(
     self: *Exec,
     td: *termio.Termio.ThreadData,
@@ -1213,7 +1221,7 @@ const Subprocess = struct {
         write: Pty.Fd,
     } {
         if (comptime builtin.os.tag == .windows) if (self.adopted_client_process != null) {
-            const pty = &(self.pty orelse return error.ProcessNotStarted);
+            const pty = if (self.pty) |*value| value else return error.ProcessNotStarted;
             std.debug.assert(pty.isAdopted());
             return .{ .read = pty.out_pipe, .write = pty.in_pipe };
         };

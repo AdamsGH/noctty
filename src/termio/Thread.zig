@@ -447,6 +447,11 @@ fn drainMailbox(
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),
+            .pty_visibility => |v| io.ptyVisibility(v) catch |err| {
+                // The adopted host can close its signal pipe during teardown.
+                // Keep draining input and shutdown messages in that case.
+                log.warn("handoff visibility signal failed err={}", .{err});
+            },
             .write_small => |v| try io.queueWrite(
                 data,
                 v.data[0..v.len],
@@ -486,7 +491,7 @@ fn drainMailbox(
 /// unchanged frame per keystroke on the UI thread.
 fn messageNeedsRedraw(message: termio.Message) bool {
     return switch (message) {
-        .write_small, .write_stable, .write_alloc => false,
+        .write_small, .write_stable, .write_alloc, .pty_visibility => false,
         else => true,
     };
 }
@@ -495,6 +500,8 @@ test "termio pty writes do not ask the renderer for a frame" {
     const testing = std.testing;
     var empty: [0]u8 = .{};
     try testing.expect(!messageNeedsRedraw(.{ .write_small = .{} }));
+    try testing.expect(!messageNeedsRedraw(.{ .pty_visibility = true }));
+    try testing.expect(!messageNeedsRedraw(.{ .pty_visibility = false }));
     try testing.expect(!messageNeedsRedraw(.{ .write_stable = "\x1b[65;30;97;0;0;1_" }));
     try testing.expect(!messageNeedsRedraw(.{ .write_alloc = .{
         .alloc = testing.allocator,

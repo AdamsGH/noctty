@@ -984,6 +984,14 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     try self.renderer_wakeup.notify();
 }
 
+/// Synchronize the adopted console's pseudo HWND with its hosting window.
+/// This is independent of per-tab renderer visibility and focus events.
+pub fn ptyVisibility(self: *Termio, visible: bool) !void {
+    switch (self.backend) {
+        .exec => |*exec| try exec.ptyVisibility(visible),
+    }
+}
+
 /// Called when focus is gained or lost (when focus events are enabled)
 pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.lock();

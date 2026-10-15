@@ -279,6 +279,9 @@ pub const Message = union(enum) {
     /// of any length
     set_title: [256]u8,
 
+    /// A ConPTY client asked to show or minimize its owning window.
+    window_visibility: bool,
+
     /// Report the window title back to the terminal
     report_title: ReportTitleStyle,
 

@@ -271,6 +271,8 @@ pub const Handler = struct {
             .request_mode_unknown => self.requestModeUnknown(value.mode, value.ansi),
             .size_report => self.reportSize(value),
             .window_title => self.windowTitle(value.title),
+            // Host-window policy belongs to the app runtime.
+            .window_visibility => {},
             .xtversion => self.reportXtversion(),
             .program_status => self.programStatus(value),
 

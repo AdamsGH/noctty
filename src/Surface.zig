@@ -1586,6 +1586,12 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
     switch (msg) {
         .change_config => |config| try self.updateConfig(config),
 
+        .window_visibility => |visible| {
+            if (comptime @hasDecl(apprt.Surface, "requestWindowVisibility")) {
+                self.rt_surface.requestWindowVisibility(visible);
+            }
+        },
+
         .set_title => |*v| {
             // We ignore the message in case the title was set via config.
             if (self.config.title != null) {
@@ -4912,6 +4918,11 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     }
 
     try self.queueRender();
+}
+
+/// Host visibility, independent of the active tab or renderer occlusion.
+pub fn ptyVisibilityCallback(self: *Surface, visible: bool) void {
+    self.queueIo(.{ .pty_visibility = visible }, .unlocked);
 }
 
 pub fn focusCallback(self: *Surface, focused: bool) !void {

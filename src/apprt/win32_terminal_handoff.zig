@@ -441,6 +441,17 @@ pub const Server = struct {
         return self.pending.insert(self.alloc, session);
     }
 
+    /// Publish an accepted handoff to the UI; success transfers ownership.
+    fn offerSession(self: *Server, session: *PendingSession) bool {
+        // OpenConsole starts with a hidden pseudo HWND. Prime it before the
+        // client can run after EstablishPtyHandoff returns, even when a modal
+        // UI loop defers adoption; otherwise its first SW_HIDE is swallowed.
+        if (session.adopted) |*adopted| adopted.pty.setAdoptedVisibility(true) catch |err| {
+            log.warn("initial handoff visibility signal failed err={}", .{err});
+        };
+        return self.queue_session(self.queue_ctx, session);
+    }
+
     /// Claims the session an identifier stands for, or null when the
     /// identifier is not one we issued and still owe.
     pub fn takePending(self: *Server, id: PendingId) ?*PendingSession {
@@ -696,7 +707,7 @@ const TerminalHandoff = struct {
         // adopted session can become a window.
         pending.adopted.?.pty.releaseHandoffPipeCopies();
 
-        if (!self.server.queue_session(self.server.queue_ctx, pending)) {
+        if (!self.server.offerSession(pending)) {
             // This call fails, so nothing is marshaled and the two released
             // ends are still ours to close.
             _ = windows.CloseHandle(handles.input);
@@ -1861,6 +1872,43 @@ test "handoff startup info and vtable ABI" {
     try std.testing.expectEqual(@as(usize, 8), @alignOf(TERMINAL_STARTUP_INFO));
     try std.testing.expectEqual(@as(usize, 4 * @sizeOf(*anyopaque)), @sizeOf(ITerminalHandoff3Vtbl));
     try std.testing.expectEqual(@as(usize, 3 * @sizeOf(*anyopaque)), @offsetOf(ITerminalHandoff3Vtbl, "EstablishPtyHandoff"));
+}
+
+test "handoff is visible before the UI can defer adopting it" {
+    const State = struct {
+        signal_read: HANDLE,
+        primed_at_offer: bool = false,
+        fn offer(raw: *anyopaque, _: *PendingSession) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var available: DWORD = 0;
+            self.primed_at_offer = @import("../os/main.zig").windows.exp.kernel32.PeekNamedPipe(self.signal_read, null, 0, null, &available, null) != 0 and available == 4;
+            // Deliberately leave the UI idle; no Surface or IO thread starts.
+            return true;
+        }
+    };
+    var signal_read: HANDLE = undefined;
+    var signal_write: HANDLE = undefined;
+    try std.testing.expect(@import("../os/main.zig").windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+    defer _ = windows.CloseHandle(signal_read);
+    const current = windows.GetCurrentProcess();
+    var pending: PendingSession = .{
+        .alloc = std.testing.allocator,
+        .adopted = .{
+            .pty = try ptypkg.Pty.openAdopted(.{}, signal_write, try duplicateLocalHandle(current), try duplicateLocalHandle(current)),
+            .client_process = try duplicateLocalHandle(current),
+        },
+        .title = try std.testing.allocator.dupe(u8, "deferred handoff"),
+    };
+    defer pending.deinit();
+    var state: State = .{ .signal_read = signal_read };
+    var server = Server.init(std.testing.allocator, &state, &State.offer);
+    try std.testing.expect(server.offerSession(&pending));
+    try std.testing.expect(state.primed_at_offer);
+    var packet: [4]u8 = undefined;
+    var read: DWORD = 0;
+    try std.testing.expect(windows.kernel32.ReadFile(signal_read, &packet, packet.len, &read, null) != 0);
+    try std.testing.expectEqual(@as(DWORD, packet.len), read);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 1, 0 }, &packet);
 }
 
 test "handoff QueryInterface AddRef Release and legacy rejection" {
