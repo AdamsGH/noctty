@@ -3187,30 +3187,65 @@ const RecoveryLedgerLock = struct {
     }
 };
 
-/// Read and parse the ledger at `path`. Missing, unreadable and invalid
-/// ledgers all read as empty; `context` names the caller in the log line.
+const RecoveryLedgerRead = union(enum) {
+    /// Missing or invalid: reads as empty history.
+    empty,
+    /// Written by a newer build, or larger than any history this build writes
+    /// (16 attempts are under 2 KiB). It is valid, only not understood here,
+    /// and replacing it would reset that build's crash history: callers read
+    /// it as empty and write nothing. Waiting does not change that.
+    left_alone,
+    /// It exists and could not be read just now (a scanner holds it, the
+    /// allocator failed). It may be a newer build's, so nothing replaces it;
+    /// unlike `left_alone` it may be readable a moment later, and the ready
+    /// marker retries.
+    unreadable,
+    record: std.json.Parsed(win32_recovery.StartupAttemptRecord),
+
+    fn deinit(self: *RecoveryLedgerRead) void {
+        if (self.* == .record) self.record.deinit();
+    }
+};
+
+/// Read and parse the ledger at `path`; `context` names the caller in the log
+/// line.
 fn readRecoveryLedgerAlloc(
     alloc: Allocator,
     path: []const u8,
     context: []const u8,
-) ?std.json.Parsed(win32_recovery.StartupAttemptRecord) {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
-        switch (err) {
-            error.FileNotFound => {},
-            else => log.warn("win32 recovery: {s} open failed err={}", .{ context, err }),
-        }
-        return null;
+) RecoveryLedgerRead {
+    // A ledger that exists but cannot be read now (a scanner holds it, the
+    // allocator failed) may be a newer build's: reading it as empty would
+    // replace it.
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .empty,
+        else => {
+            log.warn("win32 recovery: {s} open failed err={}; leaving it untouched", .{ context, err });
+            return .unreadable;
+        },
     };
     defer file.close();
     const raw = file.readToEndAlloc(alloc, 64 * 1024) catch |err| {
-        log.warn("win32 recovery: {s} read failed err={}", .{ context, err });
-        return null;
+        if (err == error.FileTooBig) {
+            log.warn("win32 recovery: {s} history is larger than this build writes; leaving it untouched", .{context});
+            return .left_alone;
+        }
+        log.warn("win32 recovery: {s} read failed err={}; leaving it untouched", .{ context, err });
+        return .unreadable;
     };
     defer alloc.free(raw);
-    return win32_recovery.parseAlloc(alloc, raw) catch |err| {
+    return .{ .record = win32_recovery.parseAlloc(alloc, raw) catch |err| {
+        if (err == error.NewerSchema) {
+            log.warn("win32 recovery: {s} history was written by a newer noctty; leaving it untouched", .{context});
+            return .left_alone;
+        }
+        if (err == error.OutOfMemory) {
+            log.warn("win32 recovery: {s} history could not be parsed; leaving it untouched", .{context});
+            return .unreadable;
+        }
         log.warn("win32 recovery: {s} ignored invalid history err={}", .{ context, err });
-        return null;
-    };
+        return .empty;
+    } };
 }
 
 fn recoverySafeModeNotice(decision: win32_recovery.Decision) ?[]const u8 {
@@ -3798,9 +3833,13 @@ fn beginRecoveryStartupAtPath(
     }
 
     var record: win32_recovery.StartupAttemptRecord = .{};
-    var parsed_record = readRecoveryLedgerAlloc(alloc, path, "startup history");
-    defer if (parsed_record) |*parsed| parsed.deinit();
-    if (parsed_record) |*parsed| record = parsed.value;
+    var ledger = readRecoveryLedgerAlloc(alloc, path, "startup history");
+    defer ledger.deinit();
+    // A history that is not this build's to replace, or could not be read
+    // now, is neither counted nor replaced: this launch goes unrecorded, as it
+    // does when the lock is unavailable.
+    if (ledger == .left_alone or ledger == .unreadable) return result;
+    if (ledger == .record) record = ledger.record.value;
 
     var retained_paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -4291,6 +4330,11 @@ pub const App = struct {
     /// loaded it, so writing their own windows (or none) over it destroys the
     /// user's workspace.
     session_owner: ?SessionOwnerLock = null,
+    /// The saved session is not this build's to replace: a newer build wrote
+    /// it, or it is larger than any session this build writes. This process
+    /// neither restores it nor takes ownership, so it never saves over it or
+    /// deletes it.
+    session_state_left_alone: bool = false,
     /// Set once WM_ENDSESSION(TRUE) has saved for a sign-out, shutdown or
     /// reboot. That snapshot is final: shells the logoff kills afterwards
     /// close their panes, and the saves those closes would run must not
@@ -4820,7 +4864,7 @@ pub const App = struct {
             errdefer if (owner_lock) |lock| lock.release();
             const restored = if (owner_lock != null) try self.restoreSessionState() else false;
             if (!restored) try self.createWindow(default_title);
-            self.session_owner = owner_lock;
+            self.adoptSessionOwner(owner_lock);
             if (!restored and self.startup_profile_picker) {
                 if (self.primarySurface()) |surface| {
                     if (surface.host) |host| _ = host.toggleProfileOverlay();
@@ -5173,6 +5217,16 @@ pub const App = struct {
         };
     }
 
+    /// Ownership is for a session this process may replace. One it left alone
+    /// stays free, so the build that wrote it can still restore it.
+    fn adoptSessionOwner(self: *App, lock: ?SessionOwnerLock) void {
+        if (self.session_state_left_alone) {
+            if (lock) |held| held.release();
+            return;
+        }
+        self.session_owner = lock;
+    }
+
     fn releaseSessionOwnership(self: *App) void {
         if (self.session_owner) |lock| lock.release();
         self.session_owner = null;
@@ -5288,7 +5342,10 @@ pub const App = struct {
         if (!self.sessionRestoreEligible()) return null;
         const path = self.sessionStatePath() orelse return null;
         defer self.core_app.alloc.free(path);
+        return self.loadSessionStateAt(path);
+    }
 
+    fn loadSessionStateAt(self: *App, path: []const u8) !?std.json.Parsed(win32_session_state.SessionState) {
         return switch (win32_session_persistence.loadAlloc(
             self.core_app.alloc,
             path,
@@ -5296,10 +5353,22 @@ pub const App = struct {
         )) {
             .missing => null,
             .oversized => oversized: {
-                log.warn("win32 session restore: state exceeds size limit; leaving file untouched", .{});
+                log.warn("win32 session restore: state exceeds size limit; leaving file untouched and not saving over it", .{});
+                self.session_state_left_alone = true;
                 break :oversized null;
             },
-            .transient => |err| return err,
+            .transient => |err| {
+                // Unreadable now is not unwanted: a scanner may hold a newer
+                // build's file for a moment, and the next checkpoint would
+                // replace what this run never saw.
+                self.session_state_left_alone = true;
+                return err;
+            },
+            .newer_schema => newer: {
+                log.warn("win32 session restore: state was written by a newer noctty; leaving file untouched and not saving over it", .{});
+                self.session_state_left_alone = true;
+                break :newer null;
+            },
             .corrupt => |err| corrupt: {
                 self.quarantineInvalidSessionState(path, err);
                 break :corrupt null;
@@ -5345,6 +5414,11 @@ pub const App = struct {
             .transient => |err| {
                 log.warn("named layout launch read failed name={s} path={s} err={}", .{ name, path, err });
                 if (banner_host) |host| host.setBanner(.err, "Layout could not be read.") catch {};
+                return false;
+            },
+            .newer_schema => {
+                log.warn("named layout launch file was written by a newer noctty name={s} path={s}", .{ name, path });
+                if (banner_host) |host| host.setBanner(.err, "Layout was saved by a newer noctty.") catch {};
                 return false;
             },
             .corrupt => |err| {
@@ -5767,6 +5841,12 @@ pub const App = struct {
         };
         defer lock.release();
 
+        // A newer build may have written its own history since this launch
+        // recorded its attempt: that file is not ours to replace.
+        var ledger = readRecoveryLedgerAlloc(self.core_app.alloc, path, "window-created marker");
+        defer ledger.deinit();
+        if (ledger == .left_alone or ledger == .unreadable) return;
+
         var persisted: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined;
         @memcpy(persisted[0..current.len], current);
         persisted[current.len - 1].phase = .window_created;
@@ -5804,9 +5884,15 @@ pub const App = struct {
         defer lock.release();
 
         var disk_record: win32_recovery.StartupAttemptRecord = .{};
-        var parsed_record = readRecoveryLedgerAlloc(self.core_app.alloc, path, "ready merge");
-        defer if (parsed_record) |*parsed| parsed.deinit();
-        if (parsed_record) |*parsed| disk_record = parsed.value;
+        var ledger = readRecoveryLedgerAlloc(self.core_app.alloc, path, "ready merge");
+        defer ledger.deinit();
+        // Deterministic, so not an error that spends the caller's retries.
+        if (ledger == .left_alone) return;
+        // A transient failure is what that retry budget is for: dropping the
+        // marker would leave this launch unresolved on disk, which the next
+        // launch counts as a failed start.
+        if (ledger == .unreadable) return error.RecoveryLedgerUnreadable;
+        if (ledger == .record) disk_record = ledger.record.value;
 
         var merged_attempts: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined;
         const merged = win32_recovery.mergeMarkReady(
@@ -6113,16 +6199,45 @@ pub const App = struct {
         window: win32_session_state.Window,
     ) !void {
         const hwnd = host.hwnd orelse return;
-        if (try sessionStateWindowRect(window)) |rect| {
-            if (sys.SetWindowPos(
-                hwnd,
-                null,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-            ) == 0) return lastError();
+        if (try sessionStateWindowRect(window)) |saved| {
+            // The saved rect is where the window was, not where there is room
+            // for it now: its monitor may be gone.
+            const works = WorkAreas.collect();
+            const dpi_before = sys.GetDpiForWindow(hwnd);
+            var target = restoredRectOnScreen(saved, works.slice(), restore_grab);
+            // The rect is in the pixels of the monitor it was saved on, and is
+            // where the window goes: a crossing from the monitor the host was
+            // created on must not swap in the DPI suggestion's rescaled size.
+            host.restore_placing = true;
+            defer host.restore_placing = false;
+            for (0..3) |attempt| {
+                if (sys.SetWindowPos(
+                    hwnd,
+                    null,
+                    target.left,
+                    target.top,
+                    target.right - target.left,
+                    target.bottom - target.top,
+                    c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+                ) == 0) return lastError();
+                // Windows caps what it is given (a left edge to 16 bits, a
+                // width to the largest window), so whether the title bar can
+                // be reached is judged on the rect the window ended up with.
+                var actual: RECT = undefined;
+                if (sys.GetWindowRect(hwnd, &actual) == 0) return lastError();
+                const moved = restoredRectOnScreen(actual, works.slice(), restore_grab);
+                if (!rectEqual(moved, actual)) {
+                    if (attempt == 2) {
+                        log.warn("win32 session restore: window stayed off every monitor", .{});
+                        break;
+                    }
+                    target = moved;
+                    continue;
+                }
+                // The layout that follows a DPI change can resize it once
+                // more: apply the same rect again once.
+                if (sys.GetDpiForWindow(hwnd) == dpi_before or rectEqual(actual, target)) break;
+            }
         }
         if ((window.state orelse .normal) == .maximized) {
             _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
@@ -6241,14 +6356,14 @@ pub const App = struct {
         };
         // Geometry is restore state, not layout shape.
         if (scope == .layout) return window;
-        if (sessionWindowRect(host)) |rect| {
-            window.x = rect.left;
-            window.y = rect.top;
-            window.width = rect.right - rect.left;
-            window.height = rect.bottom - rect.top;
-        }
-        if (host.hwnd) |hwnd| {
-            window.state = if (sys.IsZoomed(hwnd) != 0) .maximized else .normal;
+        if (sessionWindowPlacement(host)) |placed| {
+            if (placed.rect) |rect| {
+                window.x = rect.left;
+                window.y = rect.top;
+                window.width = rect.right - rect.left;
+                window.height = rect.bottom - rect.top;
+            }
+            window.state = if (placed.maximized) .maximized else .normal;
         }
         return window;
     }
@@ -6496,29 +6611,48 @@ pub const App = struct {
         };
     }
 
-    fn sessionWindowRect(host: *Host) ?RECT {
+    const SessionWindowPlacement = struct {
+        /// The window's normal rect in screen coordinates.
+        rect: ?RECT,
+        /// It is, or restores to, maximized.
+        maximized: bool,
+    };
+
+    fn sessionWindowPlacement(host: *Host) ?SessionWindowPlacement {
+        return sessionWindowPlacementOn(host, null);
+    }
+
+    /// `monitor` stands in for the window's monitor, so a test can give it
+    /// the taskbar this machine lacks.
+    fn sessionWindowPlacementOn(host: *Host, monitor: ?MONITORINFO) ?SessionWindowPlacement {
         const hwnd = host.hwnd orelse return null;
+        var maximized = sys.IsZoomed(hwnd) != 0;
         var rect: RECT = undefined;
-        if (sys.IsZoomed(hwnd) != 0 or sys.IsIconic(hwnd) != 0) {
-            var placement: WINDOWPLACEMENT = .{
-                .length = @sizeOf(WINDOWPLACEMENT),
-                .flags = 0,
-                .showCmd = 0,
-                .ptMinPosition = .{ .x = 0, .y = 0 },
-                .ptMaxPosition = .{ .x = 0, .y = 0 },
-                .rcNormalPosition = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-            };
+        if (maximized or sys.IsIconic(hwnd) != 0) {
+            var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            placement.length = @sizeOf(WINDOWPLACEMENT);
             if (sys.GetWindowPlacement(hwnd, &placement) != 0) {
+                maximized = restoresMaximized(hwnd, &placement);
+                // Workspace coordinates, offset from the screen's by a taskbar
+                // on the top or left. Every other state saves screen
+                // coordinates, and restore applies them as such.
                 rect = placement.rcNormalPosition;
+                if (monitor) |info| {
+                    rect = workspaceRectToScreen(rect, info);
+                } else if (sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST)) |nearest| {
+                    var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+                    info.cbSize = @sizeOf(MONITORINFO);
+                    if (sys.GetMonitorInfoW(nearest, &info) != 0) rect = workspaceRectToScreen(rect, info);
+                }
             } else if (sys.GetWindowRect(hwnd, &rect) == 0) {
-                return null;
+                return .{ .rect = null, .maximized = maximized };
             }
         } else if (sys.GetWindowRect(hwnd, &rect) == 0) {
-            return null;
+            return .{ .rect = null, .maximized = maximized };
         }
 
-        if (rect.right <= rect.left or rect.bottom <= rect.top) return null;
-        return rect;
+        if (rect.right <= rect.left or rect.bottom <= rect.top) return .{ .rect = null, .maximized = maximized };
+        return .{ .rect = rect, .maximized = maximized };
     }
 
     /// Push an action string onto the palette MRU list, dedup'd by
@@ -14303,6 +14437,8 @@ const Host = struct {
     quick_terminal_animation: ?QuickTerminalAnimation = null,
     /// Programmatic QT rectangles are already in target-monitor pixels.
     quick_terminal_placing: bool = false,
+    /// A restored window's saved rect is being applied; same reason.
+    restore_placing: bool = false,
     tween_timer_active: bool = false,
     search_timer_active: bool = false,
     scrollbar_timer_active: bool = false,
@@ -28208,6 +28344,13 @@ test "win32 DPI suggestions preserve a quick terminal tween but resize ordinary 
     _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, param);
     try std.testing.expect(sys.GetWindowRect(hwnd, &actual) != 0);
     try std.testing.expectEqualDeep(ordinary, actual);
+    // So does a restored window's saved rect while it is being applied.
+    try std.testing.expect(sys.SetWindowPos(hwnd, null, before.left, before.top, before.right - before.left, before.bottom - before.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+    host.restore_placing = true;
+    _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, param);
+    try std.testing.expect(sys.GetWindowRect(hwnd, &actual) != 0);
+    try std.testing.expectEqualDeep(before, actual);
+    host.restore_placing = false;
     try std.testing.expect(!host.quick_terminal_placing);
     try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
 }
@@ -28628,12 +28771,8 @@ fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?H
     // taskbar once the source is minimized.
     if (fullscreen) return .{ .rect = info.rcMonitor, .maximize = null, .copied = true };
 
-    // A window minimized from maximized restores to maximized. The flag
-    // alone says nothing about a window that was restored since: Windows
-    // keeps it set on a normal window.
     const iconic = sys.IsIconic(source) != 0;
-    const zoomed = sys.IsZoomed(source) != 0 or (iconic and (placement.flags & c.WPF_RESTORETOMAXIMIZED) != 0);
-    if (zoomed) {
+    if (restoresMaximized(source, &placement)) {
         // It is maximized again, never minimized with it.
         placement.showCmd = c.SW_MAXIMIZE;
         return .{
@@ -28795,6 +28934,78 @@ fn allMonitorsInfo() ?win32_quick_terminal.MonitorInfo {
     if (search.failed) return null;
     if (!search.found) return null;
     return search.info;
+}
+
+/// Whether the window is, or when restored becomes, maximized. A window
+/// minimized from maximized restores to maximized. The flag alone says
+/// nothing about a window that was restored since: Windows keeps it set on a
+/// normal window.
+fn restoresMaximized(hwnd: HWND, placement: *const WINDOWPLACEMENT) bool {
+    return sys.IsZoomed(hwnd) != 0 or
+        (sys.IsIconic(hwnd) != 0 and (placement.flags & c.WPF_RESTORETOMAXIMIZED) != 0);
+}
+
+/// The work areas of the monitors there are now, in screen coordinates.
+const WorkAreas = struct {
+    rects: [16]RECT = undefined,
+    count: usize = 0,
+
+    fn collect() WorkAreas {
+        var areas: WorkAreas = .{};
+        _ = sys.EnumDisplayMonitors(null, null, enumProc, @as(LPARAM, @bitCast(@intFromPtr(&areas))));
+        return areas;
+    }
+
+    fn slice(self: *const WorkAreas) []const RECT {
+        return self.rects[0..self.count];
+    }
+
+    fn enumProc(monitor: sys.HMONITOR, _: HDC, _: *RECT, data: LPARAM) callconv(.winapi) BOOL {
+        const areas: *WorkAreas = @ptrFromInt(@as(usize, @bitCast(data)));
+        if (areas.count == areas.rects.len) return 0;
+        var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+        info.cbSize = @sizeOf(MONITORINFO);
+        if (sys.GetMonitorInfoW(monitor, &info) == 0) return 1;
+        areas.rects[areas.count] = info.rcWork;
+        areas.count += 1;
+        return 1;
+    }
+};
+
+/// How much of a restored window's title bar must be on a monitor for the
+/// user to be able to grab it: this wide and half as tall, in physical
+/// pixels. The saved rect is in the pixels of a monitor this process may not
+/// have seen yet, and the host being placed is on another, so no DPI is
+/// right to scale by; a caption at 100%, still a target at 300%.
+const restore_grab: i32 = 48;
+
+/// Where a window saved at `rect` (screen coordinates) goes now that the
+/// monitors' work areas are `works`. One whose title bar can still be grabbed
+/// stays exactly where it was, whatever its other edges do: a snapped window
+/// overhangs its monitor by its invisible frame. One that cannot (its monitor
+/// was unplugged, or the layout changed) moves to the nearest work area, its
+/// size capped to it.
+fn restoredRectOnScreen(rect: RECT, works: []const RECT, grab: i32) RECT {
+    if (works.len == 0) return rect;
+    // The rect comes from a file on disk: any i32 is possible, so differences
+    // of coordinates are taken in 64 bits.
+    const grab_width = @min(grab, rect.right - rect.left);
+    var nearest = works[0];
+    var nearest_gap: i64 = std.math.maxInt(i64);
+    for (works) |work| {
+        const visible_width = @as(i64, @min(rect.right, work.right)) - @max(rect.left, work.left);
+        const visible_height = @as(i64, @min(rect.top, work.bottom - grab) + grab) - @max(rect.top, work.top);
+        if (visible_width >= grab_width and visible_height >= @divTrunc(grab, 2)) return rect;
+
+        const gap_x: i64 = @max(0, @max(@as(i64, work.left) - rect.right, @as(i64, rect.left) - work.right));
+        const gap_y: i64 = @max(0, @max(@as(i64, work.top) - rect.bottom, @as(i64, rect.top) - work.bottom));
+        const gap = gap_x + gap_y;
+        if (gap < nearest_gap) {
+            nearest = work;
+            nearest_gap = gap;
+        }
+    }
+    return fitRectInWork(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, nearest);
 }
 
 // Keep helper modules reachable from the exe's module graph. Zig prunes
@@ -33233,7 +33444,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 // QT placement/tween frames own their physical-pixel rect.
                 // Keep scale and layout updates even when the OS's resized
                 // suggestion would override that rect on a DPI crossing.
-                if (!v.quick_terminal_placing and v.quick_terminal_animation == null) {
+                if (!v.quick_terminal_placing and !v.restore_placing and v.quick_terminal_animation == null) {
                     const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
                     _ = sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
                 }
@@ -51134,6 +51345,74 @@ test "win32 recovery startup leaves another instance's in-flight write temp alon
     try std.testing.expectEqualStrings(in_flight_json, survivor);
 }
 
+test "win32 recovery startup keeps a newer build's history and counts one with an added field" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
+    defer std.testing.allocator.free(target);
+
+    // Three unfinished launches, each with a field this build has never heard of.
+    const added_field =
+        \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"build":"9"},{"started_at_unix_ms":200,"build":"9"},{"started_at_unix_ms":300,"build":"9"}]}
+    ;
+    try win32_session_persistence.writeFileInPlace(target, added_field);
+    const counted = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.safe_mode, counted.decision);
+    try std.testing.expectEqual(@as(usize, 4), counted.count);
+
+    // A newer schema is read as empty and left byte for byte as it was.
+    const newer =
+        \\{"schema_version":2,"attempts":[{"started_at_unix_ms":100,"phase":"init","where":"x"}],"hist":{}}
+    ;
+    try win32_session_persistence.writeFileInPlace(target, newer);
+    const skipped = beginRecoveryStartupAtPath(std.testing.allocator, target, 500, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.normal, skipped.decision);
+    try std.testing.expectEqual(@as(usize, 0), skipped.count);
+    const after = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(newer, after);
+
+    // Nor is one larger than this build ever writes, whatever it says.
+    {
+        const file = try tmp.dir.createFile("startup-attempts.json", .{});
+        defer file.close();
+        try file.writeAll("{\"schema_version\":3,\"pad\":\"");
+        const chunk = [_]u8{'x'} ** 4096;
+        for (0..17) |_| try file.writeAll(&chunk);
+        try file.writeAll("\"}");
+    }
+    const big_before = try tmp.dir.statFile("startup-attempts.json");
+    const big = beginRecoveryStartupAtPath(std.testing.allocator, target, 600, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(@as(usize, 0), big.count);
+    const big_after = try tmp.dir.statFile("startup-attempts.json");
+    try std.testing.expectEqual(big_before.size, big_after.size);
+
+    // Nor is one that exists but cannot be read: a scanner holds it, and it may
+    // be a newer build's.
+    {
+        const file = try tmp.dir.createFile("startup-attempts.json", .{});
+        defer file.close();
+        try file.writeAll(newer);
+    }
+    {
+        const held = try tmp.dir.openFile("startup-attempts.json", .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close();
+        const blocked = beginRecoveryStartupAtPath(std.testing.allocator, target, 700, recovery_ledger_lock_wait_ms);
+        try std.testing.expectEqual(@as(usize, 0), blocked.count);
+    }
+    const unblocked = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
+    defer std.testing.allocator.free(unblocked);
+    try std.testing.expectEqualStrings(newer, unblocked);
+
+    var names = tmp.dir.iterate();
+    while (try names.next()) |entry| {
+        try std.testing.expect(std.mem.eql(u8, entry.name, "startup-attempts.json") or
+            std.mem.endsWith(u8, entry.name, ".lock"));
+    }
+}
+
 test "win32 recovery ledger lock excludes a second holder until released" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -51581,6 +51860,77 @@ test "win32 session state is saved only by the process that owns it" {
     try std.testing.expect(app.sessionStateEnabled());
 }
 
+test "win32 a session a newer build wrote, or one too large to be ours, is left alone and never owned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(state_path);
+
+    var core_app: CoreApp = undefined;
+    core_app.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.session_owner = null;
+    app.session_state_left_alone = false;
+
+    // A field a later build added within this version loads.
+    const added = "{\"schema_version\":1,\"added_later\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = added });
+    var loaded = (try app.loadSessionStateAt(state_path)).?;
+    loaded.deinit();
+    try std.testing.expect(!app.session_state_left_alone);
+
+    // A newer schema is neither restored, quarantined nor owned.
+    const newer = "{\"schema_version\":2,\"windows\":[{\"layout_v2\":true}]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = newer });
+    try std.testing.expect((try app.loadSessionStateAt(state_path)) == null);
+    try std.testing.expect(app.session_state_left_alone);
+    const lock = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    app.adoptSessionOwner(lock);
+    try std.testing.expect(app.session_owner == null);
+    const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 1024);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings(newer, kept);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json.corrupt", .{}));
+    // The lock was given back, so the build that wrote the file can take it.
+    const next = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    next.release();
+
+    // A file that cannot be read now is not replaced either: it may be a
+    // newer build's, held for a moment.
+    app.session_state_left_alone = false;
+    try tmp.dir.makeDir("session-state.d");
+    const unreadable = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.d" });
+    defer std.testing.allocator.free(unreadable);
+    try std.testing.expect(std.meta.isError(app.loadSessionStateAt(unreadable)));
+    try std.testing.expect(app.session_state_left_alone);
+
+    // So is a file larger than this build ever writes.
+    app.session_state_left_alone = false;
+    {
+        var file = try tmp.dir.createFile("session-state.json", .{});
+        defer file.close();
+        const chunk = [_]u8{' '} ** 4096;
+        var remaining: usize = win32_session_persistence.default_max_state_bytes + 1;
+        while (remaining > 0) {
+            const count = @min(remaining, chunk.len);
+            try file.writeAll(chunk[0..count]);
+            remaining -= count;
+        }
+    }
+    try std.testing.expect((try app.loadSessionStateAt(state_path)) == null);
+    try std.testing.expect(app.session_state_left_alone);
+
+    // Otherwise the process owns what it restored.
+    app.session_state_left_alone = false;
+    const mine = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    app.adoptSessionOwner(mine);
+    try std.testing.expect(app.session_owner != null);
+    app.releaseSessionOwnership();
+}
+
 test "win32 sign-out latches the session snapshot and a Restart Manager close does not" {
     var app: App = undefined;
     app.session_state_excluded_for_elevation = false;
@@ -51690,6 +52040,213 @@ test "win32 session state window rect requires complete geometry" {
     try std.testing.expectEqual(@as(i32, 20), rect.top);
     try std.testing.expectEqual(@as(i32, 310), rect.right);
     try std.testing.expectEqual(@as(i32, 220), rect.bottom);
+}
+
+test "win32 a saved window rect on a monitor that is gone moves to the nearest work area" {
+    const grab = restore_grab;
+    // A laptop's screen with a second monitor to its left, taskbar at the bottom.
+    const left: RECT = .{ .left = -1920, .top = 0, .right = 0, .bottom = 1040 };
+    const main_work: RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
+    const works = [_]RECT{ main_work, left };
+    const wide: RECT = .{ .left = 100, .top = 100, .right = 900, .bottom = 700 };
+
+    // Where there is a monitor, the rect is kept as saved.
+    try std.testing.expectEqualDeep(wide, restoredRectOnScreen(wide, &works, grab));
+    const straddling: RECT = .{ .left = -400, .top = 50, .right = 400, .bottom = 650 };
+    try std.testing.expectEqualDeep(straddling, restoredRectOnScreen(straddling, &works, grab));
+    // A snapped window overhangs its monitor by its invisible frame.
+    const snapped: RECT = .{ .left = -7, .top = 0, .right = 967, .bottom = 1047 };
+    try std.testing.expectEqualDeep(snapped, restoredRectOnScreen(snapped, &works, grab));
+    // The caption on a monitor and the body hanging off the bottom stays too.
+    const hanging: RECT = .{ .left = 100, .top = 900, .right = 900, .bottom = 1500 };
+    try std.testing.expectEqualDeep(hanging, restoredRectOnScreen(hanging, &works, grab));
+
+    // Saved on a monitor to the right that was unplugged.
+    const unplugged: RECT = .{ .left = 2100, .top = 200, .right = 2900, .bottom = 800 };
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 1120, .top = 200, .right = 1920, .bottom = 800 },
+        restoredRectOnScreen(unplugged, &works, grab),
+    );
+    // Below every monitor, and above them.
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 100, .top = 440, .right = 900, .bottom = 1040 },
+        restoredRectOnScreen(.{ .left = 100, .top = 3000, .right = 900, .bottom = 3600 }, &works, grab),
+    );
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 100, .top = 0, .right = 900, .bottom = 600 },
+        restoredRectOnScreen(.{ .left = 100, .top = -900, .right = 900, .bottom = -300 }, &works, grab),
+    );
+    // Only a sliver of the title bar on a monitor is not enough to grab.
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 1120, .top = 100, .right = 1920, .bottom = 700 },
+        restoredRectOnScreen(.{ .left = 1900, .top = 100, .right = 2700, .bottom = 700 }, &works, grab),
+    );
+    // The nearest is the monitor to the left when that is where it was.
+    try std.testing.expectEqualDeep(
+        RECT{ .left = -1920, .top = 100, .right = -1120, .bottom = 700 },
+        restoredRectOnScreen(.{ .left = -4000, .top = 100, .right = -3200, .bottom = 700 }, &works, grab),
+    );
+    // Larger than the monitor it lands on: capped to it.
+    try std.testing.expectEqualDeep(
+        left,
+        restoredRectOnScreen(.{ .left = -9000, .top = -50, .right = -4000, .bottom = 3000 }, &works, grab),
+    );
+    // No monitor list, no opinion.
+    try std.testing.expectEqualDeep(unplugged, restoredRectOnScreen(unplugged, &.{}, grab));
+
+    // The file can say anything an i32 holds, and a window cannot be that far
+    // away: no differences of these overflow.
+    const min: i32 = std.math.minInt(i32);
+    const max: i32 = std.math.maxInt(i32);
+    try std.testing.expectEqualDeep(
+        RECT{ .left = -1920, .top = 100, .right = -1120, .bottom = 700 },
+        restoredRectOnScreen(.{ .left = min, .top = 100, .right = min + 800, .bottom = 700 }, &works, grab),
+    );
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 1120, .top = 440, .right = 1920, .bottom = 1040 },
+        restoredRectOnScreen(.{ .left = max - 800, .top = max - 600, .right = max, .bottom = max }, &works, grab),
+    );
+    try std.testing.expectEqualDeep(
+        main_work,
+        restoredRectOnScreen(.{ .left = min, .top = min, .right = -1, .bottom = -1 }, &.{main_work}, grab),
+    );
+}
+
+test "win32 session placement saves the normal rect in screen coordinates for every window state" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            const surface = try placementTestSurface(&app, 120, 140);
+            defer _ = sys.DestroyWindow(surface.hwnd.?);
+            const hwnd = surface.hwnd.?;
+            var host: Host = .{ .app = &app, .id = 1, .hwnd = hwnd };
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            var normal: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(hwnd, &normal) != 0);
+
+            var placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(!placed.maximized);
+
+            // Maximized, the rect is still the one to un-maximize to.
+            _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+            placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(placed.maximized);
+
+            // With a taskbar on the left, Windows reports that normal rect
+            // relative to the work area, which starts 48 px in: the file
+            // gets screen coordinates.
+            const left_taskbar: MONITORINFO = .{
+                .cbSize = @sizeOf(MONITORINFO),
+                .rcMonitor = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 },
+                .rcWork = .{ .left = 48, .top = 0, .right = 1920, .bottom = 1080 },
+                .dwFlags = 0,
+            };
+            placed = App.sessionWindowPlacementOn(&host, left_taskbar).?;
+            try std.testing.expectEqual(normal.left + 48, placed.rect.?.left);
+            try std.testing.expectEqual(normal.top, placed.rect.?.top);
+            try std.testing.expectEqual(normal.right - normal.left, placed.rect.?.right - placed.rect.?.left);
+
+            // Minimized from maximized, it comes back maximized, which is
+            // what the session has to say. `IsZoomed` alone said normal.
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(hwnd) != 0);
+            placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(placed.maximized);
+
+            // Minimized from a normal window, it comes back normal, even
+            // though Windows left the restore-to-maximized flag on it.
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expect(sys.IsZoomed(hwnd) == 0 and sys.IsIconic(hwnd) == 0);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(!placed.maximized);
+        }
+    }.body);
+}
+
+test "win32 session restore keeps a window on a monitor and brings one back from a missing monitor" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            const surface = try placementTestSurface(&app, 120, 140);
+            defer _ = sys.DestroyWindow(surface.hwnd.?);
+            const hwnd = surface.hwnd.?;
+            var host: Host = .{ .app = &app, .id = 1, .hwnd = hwnd };
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            const works = WorkAreas.collect();
+            try std.testing.expect(works.count > 0);
+            const work = works.slice()[0];
+
+            // On screen: exactly where it was saved.
+            var window: win32_session_state.Window = .{
+                .x = work.left + 40,
+                .y = work.top + 50,
+                .width = 640,
+                .height = 480,
+                .state = .normal,
+                .selected_tab = 0,
+                .tabs = &.{},
+            };
+            try App.applyRestoredWindowPlacement(&host, window);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+            try std.testing.expectEqualDeep(RECT{ .left = work.left + 40, .top = work.top + 50, .right = work.left + 680, .bottom = work.top + 530 }, rect);
+
+            // Saved where no monitor is: on one, at the size it had.
+            window.x = 30_000;
+            window.y = 30_000;
+            try App.applyRestoredWindowPlacement(&host, window);
+            try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+            try std.testing.expect(insideAWorkArea(rect, works.slice()));
+            try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
+            try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
+
+            // Windows caps what it is given: a left edge to 16 bits, a width to
+            // the largest window. This rect spans every monitor as saved, and
+            // is off all of them once Windows is done with it.
+            window.state = .normal;
+            window.x = -2_000_000_000;
+            window.y = work.top + 50;
+            window.width = 2_100_000_000;
+            window.height = 480;
+            try App.applyRestoredWindowPlacement(&host, window);
+            try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+            try std.testing.expect(rectEqual(restoredRectOnScreen(rect, works.slice(), restore_grab), rect));
+            try std.testing.expect(rect.right - rect.left <= work.right - work.left);
+
+            // The rect a maximized window comes back to is on a monitor too.
+            window.x = -30_000;
+            window.y = -30_000;
+            window.state = .maximized;
+            try App.applyRestoredWindowPlacement(&host, window);
+            try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+            const normal = App.sessionWindowPlacement(&host).?.rect.?;
+            try std.testing.expect(insideAWorkArea(normal, works.slice()));
+        }
+
+        fn insideAWorkArea(rect: RECT, works: []const RECT) bool {
+            for (works) |work| {
+                if (rect.left >= work.left and rect.top >= work.top and
+                    rect.right <= work.right and rect.bottom <= work.bottom) return true;
+            }
+            return false;
+        }
+    }.body);
 }
 
 test "win32 session state file write replaces through temp file" {

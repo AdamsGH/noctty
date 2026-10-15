@@ -832,9 +832,29 @@ If the session-state file is unreadable, noctty moves it aside to a sibling
 with a `.corrupt` suffix, logs the failure, and starts with a fresh window.
 When an earlier quarantine file already exists, a numeric suffix is added
 (`.corrupt.1`, `.corrupt.2`, and so on) so nothing is overwritten. If the
-move fails, the original file is left untouched. Older builds parse the
-schema strictly, so downgrading while a saved state contains `scrollback`
-can quarantine that file as `.corrupt`.
+move fails, the original file is left untouched.
+
+A field this build does not know is skipped, so a file from a build that added
+one within the same schema version still restores, whether it sits on a window,
+a tab, a pane or beside a node's `pane` or `split`; a window `state` name it
+does not know restores as a normal window. A new kind of node or a new `axis`
+name is not additive and needs a new `schema_version`. A file with a newer
+`schema_version` is not unreadable, only not understood: noctty leaves it
+exactly as it is, starts with a fresh window, and does not save a session over
+it for the rest of that run. The startup history (`startup-attempts.json`) is
+read the same way, and `integration.ps1` is not replaced by a build whose copy
+declares an older `noctty-integration-revision`. Builds that predate this
+still parse strictly, so downgrading to one while a saved state contains
+`scrollback` can quarantine that file as `.corrupt`.
+
+A restored window comes back at the rect it was saved with, in screen
+coordinates, and as maximized if it was or was minimized from maximized. If
+the title bar would no longer be reachable on any monitor (a monitor was
+unplugged or the layout changed, or Windows capped an extreme size or position),
+the window moves to the nearest monitor's
+work area, its size capped to it. A window with a caption's worth of title bar
+(48 px wide) on some monitor stays where it was, even if the rest
+of it hangs off the screen.
 
 A snapshot that merely exceeds the limits above (too many lines, a line over
 16 KiB, or the shared budget) is dropped on load and the window's layout still
