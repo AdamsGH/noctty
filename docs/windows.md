@@ -556,9 +556,13 @@ verified on a machine with a battery; see the
 [status caveats](status.md#known-caveats).
 
 - `unfocused-render-fps` caps presentation for visible, unfocused surfaces.
-  Default `30`. Values below `1` are treated as `1`; values above `125` have
-  no additional effect, because the renderer never presents more often than
-  every 8 ms.
+  Default `30`. Values below `1` are treated as `1`; from `125` up an
+  unfocused surface is capped no more than a focused one (saver pacing
+  still caps both). The cap holds on average. Frames the renderer's own
+  timers bring (a deferred update, a custom-shader animation) wait for the
+  system timer tick, 15.6 ms by default, so one can land up to a tick late
+  and the next comes that much sooner, and such frames never come faster
+  than one a tick (64 fps).
 - `power-saver-rendering` accepts `auto`, `on`, or `off`. Default `auto`,
   which follows Windows Battery Saver or Energy Saver; `on` forces saver
   pacing and `off` disables it. `auto` does not key off battery power alone:

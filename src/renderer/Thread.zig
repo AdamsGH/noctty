@@ -105,14 +105,16 @@ render_h: xev.Timer,
 render_c: xev.Completion = .{},
 render_reset_c: xev.Completion = .{},
 render_followup_pending: bool = false,
-/// Absolute Win32 tick when the active render follow-up should fire.
+/// Absolute `pacingClockMs` time when the active render follow-up should fire.
 render_timer_due_ms: u64 = 0,
-last_present_request_ms: u64 = 0,
+present_pacer: PresentPacer = .{},
 /// Set when pacing deferred a frame update (`renderOnce` found the present
 /// slot taken) and cleared when one runs. The animation draw timer checks it:
 /// a draw-only tick that takes the slot would otherwise present stale frame
 /// data and push the deferred update out again, every interval (#297).
 frame_update_deferred: bool = false,
+/// Which passes present a frame synchronized output holds.
+held_frame: HeldFrame = .{},
 
 /// The timer used for draw calls. Draw calls don't update from the
 /// terminal state so they're much cheaper. They're used for animation
@@ -121,12 +123,14 @@ draw_h: xev.Timer,
 draw_c: xev.Completion = .{},
 draw_reset_c: xev.Completion = .{},
 draw_active: bool = false,
-/// Absolute Win32 tick when the active draw timer should fire. This lets a
-/// focus or power-policy change shorten an already-queued slow interval.
+/// Absolute `pacingClockMs` time when the active draw timer should fire.
+/// This lets a focus or power-policy change shorten an already-queued slow
+/// interval.
 draw_timer_due_ms: u64 = 0,
 
 /// This async is used to force a draw immediately. This does not
-/// coalesce like the wakeup does.
+/// coalesce like the wakeup does. Only a display link notifies it, so it
+/// never fires on Win32.
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
@@ -405,7 +409,7 @@ fn syncDrawTimer(self: *Thread) void {
     if (self.draw_c.state() == .active) {
         if (apprt.runtime != apprt.win32) return;
 
-        const now_ms = win32_power.tickCountMs();
+        const now_ms = win32_power.pacingClockMs();
         if (!timerNeedsEarlierDeadline(now_ms, self.draw_timer_due_ms, delay_ms)) return;
         self.draw_h.reset(
             &self.loop,
@@ -430,7 +434,7 @@ fn syncDrawTimer(self: *Thread) void {
         drawCallback,
     );
     if (apprt.runtime == apprt.win32) {
-        self.draw_timer_due_ms = win32_power.tickCountMs() +| delay_ms;
+        self.draw_timer_due_ms = win32_power.pacingClockMs() +| delay_ms;
     }
 }
 
@@ -504,7 +508,7 @@ fn drainMailbox(self: *Thread) !bool {
                 // `renderOnce`, which does `updateFrame` + `drawFrame` right
                 // after this, so the first visible frame is both fresh and
                 // immediate.
-                if (v) self.last_present_request_ms = 0;
+                if (v) self.present_pacer = .{};
 
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
@@ -655,9 +659,7 @@ fn minimumPresentIntervalMs(self: *const Thread) ?u64 {
 }
 
 fn presentWaitMs(self: *const Thread, interval_ms: u64) u64 {
-    if (interval_ms <= DRAW_INTERVAL or self.last_present_request_ms == 0) return 0;
-    const elapsed_ms = win32_power.tickCountMs() -| self.last_present_request_ms;
-    return interval_ms -| elapsed_ms;
+    return self.present_pacer.waitMs(win32_power.pacingClockMs(), interval_ms);
 }
 
 fn nextPresentTimerDelayMs(self: *const Thread) ?u64 {
@@ -667,20 +669,123 @@ fn nextPresentTimerDelayMs(self: *const Thread) ?u64 {
 }
 
 fn notePresentRequest(self: *Thread, interval_ms: u64) void {
-    if (interval_ms <= DRAW_INTERVAL) {
-        self.last_present_request_ms = 0;
-        return;
+    self.present_pacer.take(win32_power.pacingClockMs(), interval_ms);
+}
+
+/// When a throttled surface may present again. It takes the clock as an
+/// argument so the tests can drive it.
+const PresentPacer = struct {
+    /// Start of the present slot taken last, or 0 when the next present
+    /// need not wait.
+    slot_ms: u64 = 0,
+
+    /// How long a present must still wait. Intervals at or below
+    /// `DRAW_INTERVAL` are not paced.
+    fn waitMs(self: PresentPacer, now_ms: u64, interval_ms: u64) u64 {
+        if (interval_ms <= DRAW_INTERVAL or self.slot_ms == 0) return 0;
+        return interval_ms -| (now_ms -| self.slot_ms);
     }
-    self.last_present_request_ms = win32_power.tickCountMs();
+
+    /// Take the slot for a present requested at `now_ms`. The timer that
+    /// wakes a throttled surface expires on a system tick (15.6 ms), so a
+    /// present can land most of a tick after its slot opened. Starting the
+    /// slot when it opened rather than when the present came keeps the
+    /// configured rate; without it every interval grew to the next tick, 34
+    /// to 47 ms. A present later than that (output that came late, idle)
+    /// starts a new cadence, so no catch-up burst follows it.
+    fn take(self: *PresentPacer, now_ms: u64, interval_ms: u64) void {
+        if (interval_ms <= DRAW_INTERVAL) {
+            self.slot_ms = 0;
+            return;
+        }
+        const late_ms = if (self.slot_ms == 0) 0 else now_ms -| (self.slot_ms +| interval_ms);
+        const credit = late_ms <= timer_tick_ms and late_ms < interval_ms;
+        self.slot_ms = if (credit) now_ms - late_ms else now_ms;
+    }
+
+    /// The default system timer tick, 15.625 ms, rounded up.
+    const timer_tick_ms = 16;
+};
+
+test "present pacer paces only throttled intervals" {
+    const testing = std.testing;
+
+    var pacer: PresentPacer = .{};
+    try testing.expectEqual(@as(u64, 0), pacer.waitMs(1000, 34));
+    pacer.take(1000, 34);
+    try testing.expectEqual(@as(u64, 24), pacer.waitMs(1010, 34));
+    try testing.expectEqual(@as(u64, 0), pacer.waitMs(1034, 34));
+
+    // A focused surface is not paced, and its presents leave no slot behind.
+    try testing.expectEqual(@as(u64, 0), pacer.waitMs(1010, DRAW_INTERVAL));
+    pacer.take(1010, DRAW_INTERVAL);
+    try testing.expectEqual(@as(u64, 0), pacer.waitMs(1011, 34));
+}
+
+test "present pacer keeps its rate when wakes land on the system tick" {
+    const testing = std.testing;
+
+    // Timer-driven presents (a deferred follow-up, a paced shader
+    // animation): xev's IOCP timer wakes on the first 15.625 ms system tick
+    // at or after its deadline, so each present lands up to a tick late.
+    const tick = struct {
+        fn atOrAfter(ms: u64) u64 {
+            const k = (ms * 1000 + 15624) / 15625;
+            return k * 15625 / 1000;
+        }
+    };
+
+    // 60, 50, 30 (the default and the saver's 34 ms), 20 and 15 fps.
+    for ([_]u64{ 17, 20, 34, 50, 67 }) |interval_ms| {
+        var pacer: PresentPacer = .{};
+        const start_ms: u64 = 1000;
+        var now_ms = start_ms;
+        pacer.take(now_ms, interval_ms);
+        var previous_ms = now_ms;
+        const presents = 300;
+        for (0..presents) |_| {
+            while (pacer.waitMs(now_ms, interval_ms) > 0) {
+                now_ms = tick.atOrAfter(now_ms + pacer.waitMs(now_ms, interval_ms));
+            }
+            pacer.take(now_ms, interval_ms);
+            // Credit for a late present never brings two in one tick.
+            try testing.expect(now_ms - previous_ms >= 15);
+            previous_ms = now_ms;
+        }
+
+        // The configured interval on average, not the next tick after it
+        // (34 ms measured from each present would be 46.875 ms, 17 ms 31.25).
+        const average_ms = (now_ms - start_ms) / presents;
+        try testing.expect(average_ms >= interval_ms - 1 and average_ms <= interval_ms);
+    }
+}
+
+test "present pacer credits only a timer tick of lateness" {
+    const testing = std.testing;
+
+    var pacer: PresentPacer = .{};
+    pacer.take(1000, 34);
+    // 10 ms late, as a tick-bound timer is: the next slot opens 34 ms
+    // after this one should have.
+    pacer.take(1044, 34);
+    try testing.expectEqual(@as(u64, 24), pacer.waitMs(1044, 34));
+    // More than a tick late (output came late): a full interval from now,
+    // so the next present cannot follow this one almost at once.
+    pacer.take(1088, 34);
+    try testing.expectEqual(@as(u64, 34), pacer.waitMs(1088, 34));
+    pacer.take(5000, 1000);
+    pacer.take(6999, 1000);
+    try testing.expectEqual(@as(u64, 1000), pacer.waitMs(6999, 1000));
 }
 
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
-    self.drawFrameWithReservation(now, false);
+    _ = self.drawFrameWithReservation(now, false);
 }
 
-fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) void {
+/// Returns whether a paint was queued (or, off the app thread, drawn).
+fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) bool {
     // A caller-held reservation must be released on every path that does not
     // hand it to a paint. Leaking one leaves renderer_repaint_requested set
     // forever, after which every later repaint coalesces into a request that
@@ -693,26 +798,25 @@ fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) vo
         }
     };
 
-    const interval_ms = self.minimumPresentIntervalMs() orelse return;
+    const interval_ms = self.minimumPresentIntervalMs() orelse return false;
 
-    // `now` is the forced, vsync-bypassing path (`drawNowCallback`): a
-    // resize, a damage event, something the user is looking at right this
-    // moment. Dropping it would leave visible artifacts on screen for up to a
-    // full interval — a whole second at `unfocused-render-fps = 1` — so
-    // pacing does not apply. Forced draws are event-driven, not timer-driven,
-    // so this cannot become a busy loop.
-    if (!now and self.presentWaitMs(interval_ms) > 0) return;
+    // `now` is upstream's forced path (`drawNowCallback`), which pacing does
+    // not apply to. Only a display link notifies `draw_now`, and the Win32
+    // renderer has none (`DisplayLink` is void), so on Win32 every draw is
+    // paced here, including the ones the apprt asks for with a wake when a
+    // WM_PAINT finds no frame reserved.
+    if (!now and self.presentWaitMs(interval_ms) > 0) return false;
 
     // If the renderer is managing a vsync on its own, we only draw
-    // when we're forced to via `now`.
-    if (!now and self.renderer.hasVsync()) return;
+    // when we're forced to via `now`. Never true on Win32 (`hasVsync`).
+    if (!now and self.renderer.hasVsync()) return false;
 
     if (must_draw_from_app_thread) {
         if (comptime @hasDecl(apprt.Surface, "noteRendererDrawRequest")) {
             self.surface.noteRendererDrawRequest();
         }
         if (comptime @hasDecl(apprt.Surface, "beginRendererRepaintRequest")) {
-            if (!repaint_reserved and !self.surface.beginRendererRepaintRequest()) return;
+            if (!repaint_reserved and !self.surface.beginRendererRepaintRequest()) return false;
         }
 
         // From here the reservation belongs to the queued paint: either the
@@ -726,17 +830,20 @@ fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) vo
             if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
                 self.surface.cancelRendererRepaintRequest();
             }
-        } else {
-            self.notePresentRequest(interval_ms);
+            return false;
         }
+        self.notePresentRequest(interval_ms);
+        return true;
     } else {
-        // Nothing will complete a reservation on this path, so the deferred
-        // cancel above releases it once the synchronous draw returns.
+        // Not taken on Win32, which draws from the app thread. Nothing will
+        // complete a reservation on this path, so the deferred cancel above
+        // releases it once the synchronous draw returns.
         self.renderer.drawFrame(false) catch |err| {
             log.warn("error drawing err={}", .{err});
-            return;
+            return false;
         };
         self.notePresentRequest(interval_ms);
+        return true;
     }
 }
 
@@ -746,7 +853,7 @@ fn scheduleRenderFollowup(self: *Thread) void {
     if (self.render_followup_pending) {
         if (apprt.runtime != apprt.win32) return;
 
-        const now_ms = win32_power.tickCountMs();
+        const now_ms = win32_power.pacingClockMs();
         if (!timerNeedsEarlierDeadline(now_ms, self.render_timer_due_ms, delay_ms)) return;
         self.render_h.reset(
             &self.loop,
@@ -771,7 +878,7 @@ fn scheduleRenderFollowup(self: *Thread) void {
         renderCallback,
     );
     if (apprt.runtime == apprt.win32) {
-        self.render_timer_due_ms = win32_power.tickCountMs() +| delay_ms;
+        self.render_timer_due_ms = win32_power.pacingClockMs() +| delay_ms;
     }
 }
 
@@ -810,17 +917,27 @@ fn renderFollowupWindowActive(self: *const Thread) bool {
 fn shouldContinueRenderFollowup(self: *Thread) bool {
     if (apprt.runtime != apprt.win32 or !self.flags.visible) return false;
 
-    // A frame update pacing put off is still owed, dirt or not (a scroll to
-    // the bottom, a blink). The custom-shader draw timer carries it while it
-    // runs (#297); without it only this follow-up will.
-    if (self.frame_update_deferred and !self.draw_active) return true;
+    if (followupOwesFrameUpdate(self.frame_update_deferred, self.draw_active)) return true;
 
     self.state.mutex.lock();
     defer self.state.mutex.unlock();
     return terminal_render_dirty.needsFrame(self.state.terminal, self.state.drawn_undirtied);
 }
 
-fn renderOnce(self: *Thread, from_wakeup: bool) bool {
+/// What runs a render pass.
+const RenderPass = union(enum) {
+    /// A wake, with the sources it was asked for.
+    wake: u32,
+    /// The render follow-up timer.
+    followup,
+    /// The custom-shader draw timer, carrying a deferred frame update.
+    animation,
+};
+
+fn renderOnce(self: *Thread, pass: RenderPass) bool {
+    const from_wakeup = pass == .wake;
+    self.held_frame.noteWake(pass);
+
     // Drain mailbox work first so message-driven state changes are reflected
     // in the same frame as terminal output wakes.
     _ = self.drainMailbox() catch |err| {
@@ -874,8 +991,24 @@ fn renderOnce(self: *Thread, from_wakeup: bool) bool {
         self.armCursorTimerIfDead(cursorBlinkInterval());
     }
 
-    // Draw.
-    self.drawFrameWithReservation(false, repaint_reserved);
+    // Synchronized output held the frame, so a present would show the same
+    // pixels again, once per follow-up until it ends. termio's 1 s reset
+    // always wakes the renderer, an ESU only when it brings dirt, so the
+    // update stays owed and the follow-up polls for a clean ESU.
+    const held = if (frame_update) |update| update.synchronized_output else false;
+    if (held) self.frame_update_deferred = true;
+    if (held and !self.held_frame.presents(pass, self.draw_active)) {
+        if (repaint_reserved) {
+            if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
+                self.surface.cancelRendererRepaintRequest();
+            }
+        }
+        return true;
+    }
+
+    // Draw. An owed repaint stays owed when no paint could be queued (a
+    // full app mailbox), so a later pass presents the held frame.
+    if (self.drawFrameWithReservation(false, repaint_reserved)) self.held_frame.notePresent();
 
     // On Win32, xev async wakes can coalesce while a render pass is still
     // in flight. If terminal dirtiness reappeared during the pass, keep a
@@ -898,14 +1031,13 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    // Take the accumulated reasons on every wake, so a later wake is never
+    // blamed on an earlier notify.
+    const wake_sources = t.state.takeWakeSources();
     if (comptime @hasDecl(apprt.Surface, "noteRendererWakeupCallback")) {
-        // Take the accumulated reasons even when the apprt does not trace
-        // them, so a later wake is never blamed on an earlier notify.
-        t.surface.noteRendererWakeupCallback(t.state.takeWakeSources());
-    } else {
-        _ = t.state.takeWakeSources();
+        t.surface.noteRendererWakeupCallback(wake_sources);
     }
-    if (t.renderOnce(true)) {
+    if (t.renderOnce(.{ .wake = wake_sources })) {
         t.scheduleRenderFollowup();
     }
 
@@ -954,7 +1086,7 @@ fn drawCallback(
     // instead: both paths share one present slot per interval, and a
     // draw-only tick would keep the slot while presenting stale frame data.
     if (t.frame_update_deferred) {
-        if (t.renderOnce(false)) t.scheduleRenderFollowup();
+        if (t.renderOnce(.animation)) t.scheduleRenderFollowup();
     } else {
         t.drawFrame(false);
     }
@@ -967,7 +1099,7 @@ fn drawCallback(
         if (t.nextPresentTimerDelayMs()) |delay_ms| {
             t.draw_h.run(&t.loop, &t.draw_c, delay_ms, Thread, t, drawCallback);
             if (apprt.runtime == apprt.win32) {
-                t.draw_timer_due_ms = win32_power.tickCountMs() +| delay_ms;
+                t.draw_timer_due_ms = win32_power.pacingClockMs() +| delay_ms;
             }
         } else {
             t.draw_active = false;
@@ -1020,7 +1152,7 @@ fn renderCallback(
         t.renderFollowupWindowActive(),
         t.state.wakePending(),
     )) {
-        .render => if (t.renderOnce(false)) t.scheduleRenderFollowup(),
+        .render => if (t.renderOnce(.followup)) t.scheduleRenderFollowup(),
         .poll => t.scheduleRenderFollowup(),
         .stop => {},
     }
@@ -1039,6 +1171,113 @@ fn renderFollowupDecision(dirty: bool, window_active: bool, wake_pending: bool) 
     if (dirty and !wake_pending) return .render;
     if (dirty or window_active) return .poll;
     return .stop;
+}
+
+/// A frame update pacing put off is still owed, dirt or not (a search
+/// highlight, a config change, a scroll to the bottom, a blink). The
+/// custom-shader draw timer carries it while it runs (#297); without it
+/// only the follow-up will.
+fn followupOwesFrameUpdate(deferred: bool, draw_active: bool) bool {
+    return deferred and !draw_active;
+}
+
+/// Which render passes present a frame synchronized output holds: the
+/// custom-shader draw timer's, which animates over it, and any pass while
+/// the apprt is owed pixels.
+const HeldFrame = struct {
+    /// The apprt woke the renderer because a window needs its pixels drawn
+    /// (`wakeNeedsPixels`) and no present was queued since. A WM_PAINT that
+    /// finds no frame reserved draws nothing itself, so without this an
+    /// exposed or newly shown pane stays blank until the hold ends. It
+    /// outlives a pass pacing puts off, so the follow-up that runs the
+    /// deferred update presents for it.
+    repaint_owed: bool = false,
+
+    fn noteWake(self: *HeldFrame, pass: RenderPass) void {
+        switch (pass) {
+            .wake => |sources| if (wakeNeedsPixels(sources)) {
+                self.repaint_owed = true;
+            },
+            .followup, .animation => {},
+        }
+    }
+
+    fn presents(self: HeldFrame, pass: RenderPass, draw_active: bool) bool {
+        return self.repaint_owed or (pass == .animation and draw_active);
+    }
+
+    fn notePresent(self: *HeldFrame) void {
+        self.repaint_owed = false;
+    }
+};
+
+/// Wakes from the apprt for a window that needs its pixels drawn again
+/// (exposed, newly shown, resized, recovering): a frame synchronized output
+/// holds is presented anyway for these.
+fn wakeNeedsPixels(wake_sources: u32) bool {
+    const Source = rendererpkg.State.WakeSource;
+    const pixels = Source.apprt_paint_retry.bit() |
+        Source.apprt_first_show.bit() |
+        Source.apprt_resize_settle.bit() |
+        Source.apprt_health_recovery.bit();
+    return wake_sources & pixels != 0;
+}
+
+test "render follow-up carries a deferred update unless the shader timer does" {
+    const testing = std.testing;
+
+    // A throttled surface whose only change is renderer-side: nothing is
+    // dirty, so only the owed update keeps the follow-up rendering.
+    try testing.expect(followupOwesFrameUpdate(true, false));
+    try testing.expectEqual(RenderFollowupDecision.render, renderFollowupDecision(followupOwesFrameUpdate(true, false), false, false));
+    // The draw timer runs renderOnce for it; the follow-up would re-defer
+    // at every slot the timer took.
+    try testing.expect(!followupOwesFrameUpdate(true, true));
+    try testing.expect(!followupOwesFrameUpdate(false, false));
+}
+
+test "a frame synchronized output holds is presented only for animation and owed repaints" {
+    const testing = std.testing;
+    const Source = rendererpkg.State.WakeSource;
+
+    var held: HeldFrame = .{};
+    // Output, a blink or the follow-up: the held frame is not presented.
+    held.noteWake(.{ .wake = Source.io_output.bit() | Source.cursor_blink.bit() });
+    try testing.expect(!held.presents(.{ .wake = Source.io_output.bit() }, false));
+    try testing.expect(!held.presents(.followup, false));
+    // The shader draw timer's pass animates over it, but not once the
+    // timer has stopped (focus left a `custom-shader-animation = true` pane).
+    try testing.expect(held.presents(.animation, true));
+    try testing.expect(!held.presents(.animation, false));
+    // A follow-up while the draw timer runs does not present it twice.
+    try testing.expect(!held.presents(.followup, true));
+
+    // An expose: its wake's pass is put off by pacing, so the repaint stays
+    // owed and the follow-up that runs next presents the held frame.
+    held.noteWake(.{ .wake = Source.apprt_paint_retry.bit() });
+    try testing.expect(held.presents(.followup, false));
+    held.noteWake(.followup);
+    try testing.expect(held.presents(.followup, false));
+    held.notePresent();
+    try testing.expect(!held.presents(.followup, false));
+}
+
+test "only apprt repaint wakes present a frame synchronized output holds" {
+    const testing = std.testing;
+    const Source = rendererpkg.State.WakeSource;
+
+    try testing.expect(!wakeNeedsPixels(0));
+    try testing.expect(!wakeNeedsPixels(Source.io_output.bit() | Source.mailbox.bit()));
+    try testing.expect(!wakeNeedsPixels(Source.cursor_blink.bit() | Source.core_surface.bit()));
+    // A paint completing behind a newer frame is the renderer's own retry,
+    // and a paint request folded into a pending one forces that paint,
+    // whose WM_PAINT asks again (`apprt_paint_retry`) if it has no frame.
+    try testing.expect(!wakeNeedsPixels(Source.apprt_repaint_retry.bit()));
+    try testing.expect(!wakeNeedsPixels(Source.apprt_paint_pending.bit()));
+    try testing.expect(wakeNeedsPixels(Source.apprt_paint_retry.bit()));
+    try testing.expect(wakeNeedsPixels(Source.io_output.bit() | Source.apprt_first_show.bit()));
+    try testing.expect(wakeNeedsPixels(Source.apprt_resize_settle.bit()));
+    try testing.expect(wakeNeedsPixels(Source.apprt_health_recovery.bit()));
 }
 
 fn cursorTimerCallback(
