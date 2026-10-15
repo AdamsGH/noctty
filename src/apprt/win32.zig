@@ -3005,10 +3005,51 @@ const UpdateCheckCompletion = struct {
     }
 };
 
+/// A profile discovery that ran off the UI thread (`App.startProfileDiscovery`).
+const ProfileDiscoveryCompletion = struct {
+    /// Owns everything the discovery allocated, and for the detached worker
+    /// the completion itself; its child is the page allocator there, so the
+    /// worker borrows nothing from the App.
+    arena: std.heap.ArenaAllocator,
+    result: anyerror!windows_shell.ProfileDiscovery = error.NotStarted,
+    /// `App.profiles_generation` when the discovery started.
+    generation: u64,
+
+    /// Frees the arena, and with it a completion that lives in it.
+    fn deinit(self: *ProfileDiscoveryCompletion) void {
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
+test "an undelivered profile discovery frees what it found" {
+    for ([_]bool{ true, false }) |found| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        const completion = try arena.allocator().create(ProfileDiscoveryCompletion);
+        completion.* = .{ .arena = arena, .result = error.WslListTimeout, .generation = 0 };
+        const alloc = completion.arena.allocator();
+        if (found) {
+            const profiles = try alloc.alloc(windows_shell.Profile, 1);
+            const argv = try alloc.alloc([:0]const u8, 1);
+            argv[0] = try alloc.dupeZ(u8, "pwsh.exe");
+            profiles[0] = .{
+                .kind = .pwsh,
+                .key = try alloc.dupe(u8, "pwsh"),
+                .label = try alloc.dupe(u8, "PowerShell"),
+                .command = .{ .direct = argv },
+            };
+            completion.result = .{ .profiles = profiles, .complete = true };
+        }
+        var payload: AppDeliveryPayload = .{ .profiles = completion };
+        payload.deinit();
+    }
+}
+
 const AppDeliveryPayload = union(enum) {
     update: *UpdateCheckCompletion,
     toast: win32_toast_activation.ActivationTarget,
     uia_disconnect: *DeferredUiaDisconnect,
+    profiles: *ProfileDiscoveryCompletion,
 
     pub fn deinit(self: *AppDeliveryPayload) void {
         switch (self.*) {
@@ -3017,6 +3058,7 @@ const AppDeliveryPayload = union(enum) {
                 completion.deinit();
                 alloc.destroy(completion);
             },
+            .profiles => |completion| completion.deinit(),
             .toast => {},
             .uia_disconnect => |pending| {
                 pending.release(pending.ctx);
@@ -4199,6 +4241,15 @@ pub const App = struct {
     /// Published before any producer starts; retained until producers stop.
     /// Detached update workers hold their own reference, without borrowing App.
     delivery: ?*AppDelivery = null,
+    /// Bumped whenever a Host's profiles are replaced or dropped, so a
+    /// discovery that finishes off the UI thread can tell it went stale.
+    profiles_generation: u64 = 0,
+    /// A discovery result from `startProfileDiscovery`, waiting for the top
+    /// of the outer pump.
+    pending_profile_discovery: ?*ProfileDiscoveryCompletion = null,
+    /// When the running discovery started (GetTickCount64), so one that never
+    /// finishes does not block every later attempt.
+    profile_discovery_started_ms: u64 = 0,
     message_hwnd: ?HWND = null,
     core_ticking: bool = false,
     quit_timer_id: ?UINT_PTR = null,
@@ -4689,6 +4740,8 @@ pub const App = struct {
             self.stopProgramStatusNotifyTimer();
             self.stopUpdateRecheckTimer();
             @atomicStore(DWORD, &self.ui_thread_id, 0, .release);
+            if (self.pending_profile_discovery) |pending| pending.deinit();
+            self.pending_profile_discovery = null;
             self.closeMessageWindow();
             self.running = false;
         }
@@ -4832,6 +4885,7 @@ pub const App = struct {
             // with no window procedure on the stack.
             if (try self.drainDeferredOpens()) break;
             self.drainPendingHandoffs();
+            self.applyPendingProfileDiscovery();
 
             const result = sys.GetMessageW(&msg, null, 0, 0);
             if (result == -1) return lastError();
@@ -4874,17 +4928,10 @@ pub const App = struct {
                             jump_list.startupProfileDiscoveryPending())
                         {
                             const host = self.hosts.items[0];
-                            if (host.profiles == null or !host.profiles_complete) {
-                                _ = host.reloadProfiles() catch |err| {
-                                    log.warn("jump list deferred profile discovery failed err={}", .{err});
-                                    jump_list.retryStartupProfileDiscovery();
-                                    continue;
-                                };
-                            }
                             if (host.profiles != null and host.profiles_complete) {
                                 jump_list.completeStartupProfileDiscovery();
                             } else {
-                                jump_list.retryStartupProfileDiscovery();
+                                self.startProfileDiscovery();
                             }
                         }
                         continue;
@@ -5535,6 +5582,7 @@ pub const App = struct {
             } else payload.deinit();
         }
         delivery.update_running.store(false, .release);
+        delivery.profiles_running.store(false, .release);
         delivery.toast_pending.store(false, .release);
         if (self.message_hwnd) |hwnd| {
             setWindowData(hwnd, null);
@@ -6977,6 +7025,94 @@ pub const App = struct {
         thread.detach();
     }
 
+    /// Run the jump list's deferred startup profile discovery off the UI
+    /// thread. Discovery starts `wsl.exe --status` and `wsl.exe -l -q` and
+    /// waits for each (up to 1.5 s apiece), which held the UI thread about
+    /// 90 ms half a second after start-up here. Like the update check, the
+    /// worker is detached and borrows nothing from the App, so quitting never
+    /// waits for it; its result arrives as WM_WINHOSTTY_PROFILES.
+    fn startProfileDiscovery(self: *App) void {
+        const delivery = self.delivery orelse return self.discoverStartupProfilesNow();
+        const now_ms = sys.GetTickCount64();
+        if (delivery.profiles_running.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            // Running, or its result is still queued. A worker can hang for
+            // good: a shell spawned at the same moment can inherit the write
+            // end of `wsl.exe -l -q`'s stdout pipe, and its drain then never
+            // ends. Give up on it then; the generation keeps a late result
+            // from doing harm.
+            if (now_ms -| self.profile_discovery_started_ms < profile_discovery_abandon_ms) return;
+            log.warn("profile discovery worker unfinished after {d} ms; starting another", .{profile_discovery_abandon_ms});
+        }
+        self.profile_discovery_started_ms = now_ms;
+        delivery.retain();
+        const thread = std.Thread.spawn(.{}, profileDiscoveryThreadMain, .{
+            delivery,
+            self.config.@"ssh-config-hosts",
+            self.profiles_generation,
+        }) catch |err| {
+            delivery.release();
+            delivery.profiles_running.store(false, .release);
+            log.warn("profile discovery thread unavailable; discovering on the UI thread err={}", .{err});
+            return self.discoverStartupProfilesNow();
+        };
+        thread.detach();
+    }
+
+    fn applyPendingProfileDiscovery(self: *App) void {
+        const pending = self.pending_profile_discovery orelse return;
+        self.pending_profile_discovery = null;
+        defer pending.deinit();
+        if (self.delivery) |delivery| delivery.profiles_running.store(false, .release);
+        self.handleProfileDiscovery(pending);
+    }
+
+    fn handleProfileDiscovery(self: *App, completion: *const ProfileDiscoveryCompletion) void {
+        const jump_list = if (self.jump_list) |*value| value else return;
+        // With no host, `scheduleIfStartupPending` re-arms when one appears.
+        if (self.hosts.items.len == 0) return;
+        const host = self.hosts.items[0];
+        switch (profileDiscoveryVerdict(
+            completion.generation,
+            self.profiles_generation,
+            host.profiles != null and host.profiles_complete,
+        )) {
+            .already_complete => return jump_list.completeStartupProfileDiscovery(),
+            .stale => return jump_list.retryStartupProfileDiscovery(),
+            .apply => {},
+        }
+        const discovery = completion.result catch |err| {
+            log.warn("jump list deferred profile discovery failed err={}", .{err});
+            jump_list.retryStartupProfileDiscovery();
+            return;
+        };
+        const profiles = windows_shell.cloneProfiles(self.core_app.alloc, discovery.profiles) catch |err| {
+            log.warn("jump list deferred profile discovery failed err={}", .{err});
+            jump_list.retryStartupProfileDiscovery();
+            return;
+        };
+        _ = host.applyProfileDiscovery(.{ .profiles = profiles, .complete = discovery.complete }) catch |err| {
+            log.warn("jump list deferred profile discovery failed err={}", .{err});
+            jump_list.retryStartupProfileDiscovery();
+            return;
+        };
+        if (host.profiles_complete) {
+            jump_list.completeStartupProfileDiscovery();
+        } else {
+            jump_list.retryStartupProfileDiscovery();
+        }
+    }
+
+    /// The synchronous path, for when no thread can run it.
+    fn discoverStartupProfilesNow(self: *App) void {
+        var completion: ProfileDiscoveryCompletion = .{
+            .arena = .init(self.core_app.alloc),
+            .generation = self.profiles_generation,
+        };
+        defer completion.deinit();
+        completion.result = windows_shell.discoverProfiles(completion.arena.allocator(), self.config.@"ssh-config-hosts");
+        self.handleProfileDiscovery(&completion);
+    }
+
     fn handleUpdateCheckCompletion(self: *App, completion: *UpdateCheckCompletion) void {
         if (self.delivery) |delivery| delivery.update_running.store(false, .release);
 
@@ -7823,6 +7959,9 @@ pub const App = struct {
                         if (background_blur_newly_requested) logBackgroundBlurUnsupported();
                         self.config_revision +%= 1;
                         if (self.config_revision == 0) self.config_revision = 1;
+                        // Also with no Host open: a discovery still running
+                        // used the old setting.
+                        if (ssh_config_hosts_changed) self.profiles_generation +%= 1;
                         var jump_list_profiles_pending = ssh_config_hosts_changed and self.jump_list != null;
                         if (jump_list_profiles_pending) self.jump_list.?.updateProfiles(&.{});
                         for (self.hosts.items) |host| {
@@ -12654,6 +12793,52 @@ fn automationHostFocused(
 ) bool {
     const hwnd = host_hwnd orelse return surface_focused_fallback;
     return foreground_hwnd == hwnd;
+}
+
+/// `App.startProfileDiscovery`'s detached worker. It holds a reference on
+/// the delivery channel and allocates from the page allocator, so it may
+/// outlive the App; a result nobody takes is freed by the channel.
+fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, generation: u64) void {
+    defer delivery.release();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    const completion = arena.allocator().create(ProfileDiscoveryCompletion) catch {
+        arena.deinit();
+        log.warn("profile discovery result unavailable err=OutOfMemory", .{});
+        delivery.profiles_running.store(false, .release);
+        return;
+    };
+    completion.* = .{ .arena = arena, .generation = generation };
+    completion.result = windows_shell.discoverProfiles(completion.arena.allocator(), include_ssh_hosts);
+    var payload: AppDeliveryPayload = .{ .profiles = completion };
+    if (!delivery.post(c.WM_WINHOSTTY_PROFILES, payload)) {
+        payload.deinit();
+        delivery.profiles_running.store(false, .release);
+    }
+}
+
+/// Longer than a discovery can take when it works (two 1.5 s wsl.exe
+/// timeouts and the SSH config read budget).
+const profile_discovery_abandon_ms: u64 = 10 * std.time.ms_per_s;
+
+const ProfileDiscoveryVerdict = enum { apply, already_complete, stale };
+
+/// What to do with a discovery that finished off the UI thread. Profiles a
+/// Host already has completely win (a picker or palette discovered them
+/// meanwhile). Otherwise any replacement or drop since the start (a config
+/// reload with other `ssh-config-hosts`) makes the result stale, and a new
+/// discovery runs with the current settings.
+fn profileDiscoveryVerdict(started: u64, current: u64, host_complete: bool) ProfileDiscoveryVerdict {
+    if (host_complete) return .already_complete;
+    if (started != current) return .stale;
+    return .apply;
+}
+
+test "a profile discovery that finished off the UI thread applies only while current" {
+    const testing = std.testing;
+    try testing.expectEqual(ProfileDiscoveryVerdict.apply, profileDiscoveryVerdict(3, 3, false));
+    try testing.expectEqual(ProfileDiscoveryVerdict.stale, profileDiscoveryVerdict(3, 4, false));
+    try testing.expectEqual(ProfileDiscoveryVerdict.already_complete, profileDiscoveryVerdict(3, 3, true));
+    try testing.expectEqual(ProfileDiscoveryVerdict.already_complete, profileDiscoveryVerdict(3, 4, true));
 }
 
 fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
@@ -17903,11 +18088,16 @@ const Host = struct {
     }
 
     fn reloadProfiles(self: *Host) !bool {
-        const replacing = self.profiles != null;
-        const discovery = try windows_shell.discoverProfiles(
+        return try self.applyProfileDiscovery(try windows_shell.discoverProfiles(
             self.app.core_app.alloc,
             self.app.config.@"ssh-config-hosts",
-        );
+        ));
+    }
+
+    /// Takes ownership of `discovery`'s profiles, also on error.
+    fn applyProfileDiscovery(self: *Host, discovery: windows_shell.ProfileDiscovery) !bool {
+        const replacing = self.profiles != null;
+        self.app.profiles_generation +%= 1;
         const next_profiles = discovery.profiles;
         if (self.profiles) |profiles| windows_shell.deinitProfiles(self.app.core_app.alloc, profiles);
         self.profiles = next_profiles;
@@ -17942,6 +18132,7 @@ const Host = struct {
     }
 
     fn invalidateProfiles(self: *Host) void {
+        self.app.profiles_generation +%= 1;
         if (self.profiles) |profiles| {
             windows_shell.deinitProfiles(self.app.core_app.alloc, profiles);
             self.profiles = null;
@@ -31015,12 +31206,19 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
             app.tickCoreAppModal();
             return 0;
         },
-        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT => {
+        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT, c.WM_WINHOSTTY_PROFILES => {
             var payload = delivery.take(message, @bitCast(lparam)) orelse return 0;
             switch (payload) {
                 .update => |completion| {
                     defer payload.deinit();
                     app.handleUpdateCheckCompletion(completion);
+                },
+                .profiles => |completion| {
+                    // Applied at the top of the outer pump: this can run
+                    // inside a modal loop, with a menu built from the
+                    // profiles being replaced still open.
+                    if (app.pending_profile_discovery) |pending| pending.deinit();
+                    app.pending_profile_discovery = completion;
                 },
                 .toast => |activation| {
                     defer delivery.toast_pending.store(false, .release);
