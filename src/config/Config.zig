@@ -3425,6 +3425,12 @@ _arena: ?ArenaAllocator = null,
 /// supplied by a config layer. The executable stays available to runtime callers.
 _command_defaulted: bool = false,
 
+/// The last config file that was skipped whole because it is UTF-16 text that
+/// does not decode (see `loadReader`); everything it set is missing from this
+/// load. Lives in the arena of this load; `clone` and `loadTheme` (which
+/// rebuilds the config by replay) copy it, `changeConditionalState` does not.
+_undecodable_file: ?[:0]const u8 = null,
+
 /// List of diagnostics that were generated during the loading of
 /// the configuration.
 _diagnostics: cli.DiagnosticList = .{},
@@ -3569,11 +3575,82 @@ fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []c
             reader.toss(bom.len);
         }
     }
-    var line_iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
+
+    // Windows PowerShell 5.1 writes UTF-16 with a byte order mark for `>` and
+    // Out-File. Read as bytes that is NUL-separated noise which sets nothing
+    // and says nothing, so decode it first.
+    var decoded: ?[]u8 = null;
+    defer if (decoded) |text| alloc.free(text);
+    var decoded_reader: std.Io.Reader = undefined;
+    var source = reader;
+    if (utf16ByteOrder(reader)) |order| {
+        reader.toss(2);
+        decoded = self.decodeUtf16(alloc, reader, order, path) catch |err| switch (err) {
+            error.InvalidUtf16 => return,
+            else => |e| return e,
+        };
+        log.warn("{s}: UTF-16 text, read as such; save it as UTF-8 so the Settings window can edit it", .{path});
+        decoded_reader = .fixed(decoded.?);
+        source = &decoded_reader;
+    }
+
+    var line_iter: cli.args.LineIterator = .{ .r = source, .filepath = path };
     var iter: ConfigFileIterator = .{ .inner = &line_iter };
     try self.loadIter(alloc, &iter);
 
     try self.expandPaths(std.fs.path.dirname(path).?);
+}
+
+/// The byte order of the UTF-16 text `reader` starts with, if its first two
+/// bytes are a byte order mark. Consumes nothing.
+fn utf16ByteOrder(reader: *std.Io.Reader) ?std.builtin.Endian {
+    const str = reader.peek(2) catch return null;
+    if (std.mem.eql(u8, str, "\xff\xfe")) return .little;
+    if (std.mem.eql(u8, str, "\xfe\xff")) return .big;
+    return null;
+}
+
+/// Read the rest of `reader` as UTF-16 and return it as UTF-8. A file that is
+/// not valid UTF-16 (or is absurdly large) is skipped with a diagnostic; an
+/// error here would otherwise end the whole configuration load. A trailing odd
+/// byte, as a truncated write leaves, is dropped.
+fn decodeUtf16(
+    self: *Config,
+    alloc: Allocator,
+    reader: *std.Io.Reader,
+    order: std.builtin.Endian,
+    path: []const u8,
+) ![]u8 {
+    const bytes = reader.allocRemaining(alloc, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+        error.StreamTooLong => return self.invalidUtf16(path, "is too large"),
+        else => |e| return e,
+    };
+    defer alloc.free(bytes);
+    const units = try alloc.alloc(u16, bytes.len / 2);
+    defer alloc.free(units);
+    for (units, 0..) |*unit, i| {
+        unit.* = std.mem.nativeToLittle(u16, std.mem.readInt(u16, bytes[i * 2 ..][0..2], order));
+    }
+    return std.unicode.utf16LeToUtf8Alloc(alloc, units) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => self.invalidUtf16(path, "is not valid UTF-16"),
+    };
+}
+
+fn invalidUtf16(self: *Config, path: []const u8, reason: []const u8) error{ OutOfMemory, InvalidUtf16 } {
+    const arena_alloc = self._arena.?.allocator();
+    self._undecodable_file = arena_alloc.dupeZ(u8, path) catch return error.OutOfMemory;
+    const diag: cli.Diagnostic = .{
+        .message = std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "config file {s} {s}; not reading it. Save it as UTF-8",
+            .{ path, reason },
+            0,
+        ) catch return error.OutOfMemory,
+    };
+    self._diagnostics.append(arena_alloc, diag) catch return error.OutOfMemory;
+    self._replay_steps.append(arena_alloc, .{ .diagnostic = diag }) catch return error.OutOfMemory;
+    return error.InvalidUtf16;
 }
 
 /// Remove the `--launch-layout` steps at or after `from` in the replay log,
@@ -3805,6 +3882,124 @@ test "handle bom in config files" {
             cfg.@"abnormal-command-exit-runtime",
         );
     }
+}
+
+/// `text` as the bytes of a UTF-16 file, byte order mark first.
+fn testUtf16Bytes(alloc: Allocator, text: []const u8, order: std.builtin.Endian) ![]u8 {
+    const units = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
+    defer alloc.free(units);
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, if (order == .little) "\xff\xfe" else "\xfe\xff");
+    for (units) |unit| {
+        var pair: [2]u8 = undefined;
+        std.mem.writeInt(u16, &pair, std.mem.littleToNative(u16, unit), order);
+        try out.appendSlice(alloc, &pair);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "UTF-16 config files are read as the text they hold" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // What Windows PowerShell 5.1 writes for `'...' > config`: UTF-16LE with
+    // a byte order mark and CRLF. The comment holds a character outside the
+    // basic plane, which takes a surrogate pair.
+    const text = "font-size = 14\r\n# caf\u{e9} \u{1f680}\r\ncursor-style = bar\r\n";
+    for ([_]std.builtin.Endian{ .little, .big }) |order| {
+        const data = try testUtf16Bytes(alloc, text, order);
+        defer alloc.free(data);
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try cfg.finalize();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 14), cfg.@"font-size");
+        try testing.expect(cfg.@"cursor-style" == .bar);
+    }
+
+    // A truncated write leaves half a code unit: the last byte is dropped.
+    {
+        const whole = try testUtf16Bytes(alloc, "font-size = 15\n", .little);
+        defer alloc.free(whole);
+        const data = try std.mem.concat(alloc, u8, &.{ whole, "\x0a" });
+        defer alloc.free(data);
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 15), cfg.@"font-size");
+    }
+
+    // A lone surrogate is not text. The file is skipped with a diagnostic that
+    // names it, and loading goes on: an error here would end the whole load,
+    // since an included file is read the same way.
+    {
+        const data = "\xff\xfe\x00\xd8f\x00o\x00";
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try testing.expectEqual(@as(usize, 1), cfg._diagnostics.list.items.len);
+        try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "config.ghostty") != null);
+        try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "UTF-16") != null);
+        try testing.expectEqual(@as(f32, 12), cfg.@"font-size");
+        // Callers that must not act on a partial load can tell which file it was.
+        try testing.expectEqualStrings("/home/ghostty/.config/ghostty/config.ghostty", cfg._undecodable_file.?);
+    }
+}
+
+test "the record of a skipped UTF-16 file survives the theme replay and a clone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "bad16.conf", .data = "\xff\xfe\x00\xd8f\x00o\x00" });
+    try tmp.dir.writeFile(.{ .sub_path = "x.theme", .data = "cursor-style = underline\n" });
+    const bad_path = try tmp.dir.realpathAlloc(alloc, "bad16.conf");
+    defer alloc.free(bad_path);
+    const theme_path = try tmp.dir.realpathAlloc(alloc, "x.theme");
+    defer alloc.free(theme_path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, bad_path);
+    const text = try std.fmt.allocPrint(alloc, "theme = {s}\n", .{theme_path});
+    defer alloc.free(text);
+    var reader: std.Io.Reader = .fixed(text);
+    try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+    try testing.expect(cfg._undecodable_file != null);
+
+    // finalize loads the theme by rebuilding the config from its replay steps.
+    try cfg.finalize();
+    try testing.expect(cfg.@"cursor-style" == .underline);
+    try testing.expectEqualStrings(bad_path, cfg._undecodable_file.?);
+
+    var copy = try cfg.clone(alloc);
+    defer copy.deinit();
+    try testing.expectEqualStrings(bad_path, copy._undecodable_file.?);
+}
+
+test "a UTF-16 config file on disk is read through loadFile" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testUtf16Bytes(alloc, "font-size = 16\r\n", .little);
+    defer alloc.free(data);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = data });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, path);
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
@@ -4527,6 +4722,12 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     var slice_it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &slice_it);
 
+    // The replay re-applies values, not the loader's record of a file it
+    // skipped; carry that over before the old arena goes.
+    if (self._undecodable_file) |skipped| {
+        new_config._undecodable_file = try new_config._arena.?.allocator().dupeZ(u8, skipped);
+    }
+
     // Success, swap our new config in and free the old.
     self.deinit();
     self.* = new_config;
@@ -4996,6 +5197,7 @@ pub fn clone(
     // Copy our diagnostics
     result._diagnostics = try self._diagnostics.clone(alloc_arena);
     result._command_defaulted = self._command_defaulted;
+    if (self._undecodable_file) |skipped| result._undecodable_file = try alloc_arena.dupeZ(u8, skipped);
 
     // Preserve our replay steps. We copy them exactly to also preserve
     // the exact conditionals required for some steps.

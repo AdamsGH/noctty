@@ -550,6 +550,16 @@ const StatusNote = enum {
     saved,
     saved_overridden,
     save_failed,
+    /// The config file is UTF-16 or UTF-32 text that a save cannot patch.
+    unsupported_encoding,
+    /// The config path is a link whose target is missing.
+    dangling_link,
+    /// The config file holds NUL bytes without a byte order mark.
+    binary_config,
+    /// A config file, or a file it includes, will not open. Names it.
+    file_unopenable,
+    /// The in-place rewrite stopped part way. Names the complete copy.
+    write_incomplete,
     close_failed,
     resolve_first,
     conflict_not_resolved,
@@ -565,12 +575,37 @@ const StatusNote = enum {
             .saved => "Settings saved.",
             .saved_overridden => "Saved, but a later config file or command-line option overrides some of these values, so they will not take effect.",
             .save_failed => "Save failed. Your edits are kept. Check that the config file can be written and is not open in another program, then try again.",
+            .unsupported_encoding => "Nothing was saved: the config file is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .dangling_link => "Nothing was saved: the config file is a link to a file that does not exist. Fix or remove the link, then save again. Your edits are kept.",
+            .binary_config => "Nothing was saved: the config file contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .file_unopenable => "Nothing was saved: a config file cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.",
+            .write_incomplete => "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in a temporary file beside it. Copy that over the config file, then save again. Your edits are kept.",
             .close_failed => "Could not close the settings window; your edits are kept.",
             .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
             .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
             .disk_value_not_adopted => "Could not take the value from disk; your edit is kept.",
             .previews_live => "Previewing now. Save to keep it.",
             .applies_on_save => "Applies when you save.",
+        };
+    }
+
+    /// Whether the sentence can name the file it is about (`textWithDetail`).
+    fn takesDetail(self: StatusNote) bool {
+        return switch (self) {
+            .file_unopenable, .write_incomplete, .unsupported_encoding, .binary_config => true,
+            else => false,
+        };
+    }
+
+    /// `text` with the file named: what `detail` holds is a path, or a short
+    /// phrase ending in one. Owned.
+    fn textWithDetail(self: StatusNote, alloc: std.mem.Allocator, detail: []const u8) std.mem.Allocator.Error![]u8 {
+        return switch (self) {
+            .unsupported_encoding => std.fmt.allocPrint(alloc, "Nothing was saved: {s} is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
+            .binary_config => std.fmt.allocPrint(alloc, "Nothing was saved: {s} contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
+            .file_unopenable => std.fmt.allocPrint(alloc, "Nothing was saved: {s} cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.", .{detail}),
+            .write_incomplete => std.fmt.allocPrint(alloc, "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in {s}. Copy that over the config file, then save again. Your edits are kept.", .{detail}),
+            else => alloc.dupe(u8, self.text()),
         };
     }
 };
@@ -1149,8 +1184,13 @@ const viewport_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32
 const edit_text_max_code_units: usize = 4096;
 const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 
+/// `scrollback-limit` is a byte budget per terminal, and 0 turns scrollback off
+/// (Config.zig, Screen.zig); there is no "unlimited". Only new terminals read it.
+/// The accessible name stays the prefix, "Scrollback limit".
+const scrollback_label = "Scrollback limit (bytes; 0 = off; new terminals only)";
+
 const settings_label_specs = [_][]const u8{
-    "Scrollback limit (rows, 0 = unlimited)",
+    scrollback_label,
     "Close confirmation",
     "Copy on select",
     "Font family fallbacks (comma-separated)",
@@ -1295,11 +1335,29 @@ fn labelIndexIsCheckbox(index: usize) bool {
 /// edits.
 pub const SaveError = error{
     PathResolveFailed,
+    /// The config path is a link to a file that does not exist. Writing would
+    /// replace the link, so nothing is written.
+    DanglingLink,
     TempCreateFailed,
     SerializeFailed,
     ReplaceFailed,
     ReloadFailed,
     OutOfMemory,
+    /// The config file is UTF-16 or UTF-32 text. Patching it with UTF-8 lines
+    /// would leave a file that mixes encodings, so nothing is written.
+    UnsupportedEncoding,
+    /// The config file holds NUL bytes but no byte order mark: a binary file,
+    /// or UTF-16 or UTF-32 text without one.
+    BinaryConfig,
+    /// A config file, or a file it includes, exists but will not open. The
+    /// load would skip it and apply the rest, so nothing is saved.
+    FileUnopenable,
+    /// The in-place rewrite of a hard-linked file stopped after its first
+    /// byte: the file may hold new bytes followed by old ones.
+    IncompleteWrite,
+    /// The palette's theme pick found the theme changed in the config file.
+    /// There is no conflict prompt there, so the pick is refused.
+    DiskChanged,
     /// Write + reload both succeeded, but at least one GUI-edited
     /// field is masked by a later layer (included `config-file`,
     /// subsequent `--config-file`, `--config-default-files=false`
@@ -1315,6 +1373,37 @@ pub const SaveReloadOutcome = union(enum) {
     completed_masked,
     failed: SaveError,
 };
+
+/// The file a failed save is about, when the status line should name it: an
+/// include that will not open, or the complete copy of a half-written config.
+/// Owned by whoever runs the save (`AppHandle.failureDetail` lends it).
+pub const FailureDetail = struct {
+    text: ?[]u8 = null,
+
+    pub fn set(self: *FailureDetail, alloc: std.mem.Allocator, text: []const u8) void {
+        self.clear(alloc);
+        self.text = alloc.dupe(u8, text) catch null;
+    }
+
+    pub fn clear(self: *FailureDetail, alloc: std.mem.Allocator) void {
+        if (self.text) |text| alloc.free(text);
+        self.text = null;
+    }
+};
+
+/// What the status line says about a save that wrote nothing (or, for
+/// `IncompleteWrite`, too little). Most failures share one hint (the file
+/// cannot be written); the ones the user can act on are named.
+fn saveFailureNote(err: SaveError) StatusNote {
+    return switch (err) {
+        error.UnsupportedEncoding => .unsupported_encoding,
+        error.BinaryConfig => .binary_config,
+        error.DanglingLink => .dangling_link,
+        error.FileUnopenable => .file_unopenable,
+        error.IncompleteWrite => .write_incomplete,
+        else => .save_failed,
+    };
+}
 
 pub fn saveReloadOutcome(result: SaveError!void) SaveReloadOutcome {
     result catch |err| return switch (err) {
@@ -1474,6 +1563,18 @@ pub const AppHandle = struct {
     /// Optional conflict notification. The UI model retains the draft until
     /// `resolveConflict` is called with keep-mine or use-disk.
     notifyConflict: ?*const fn (ctx: *anyopaque, field: SettingField) void = null,
+    /// Optional. Asked before a save writes anything: the file may have been
+    /// edited since this window last read it, with no reload to say so. When
+    /// it finds an edit to a setting that is also being edited here, it applies
+    /// the file as a reload does, so `externalConfigChanged` flags what
+    /// overlaps and the save stops at the conflict. A save that wrote over such
+    /// an edit would lose it without a word. An error means the file could not
+    /// be checked, and nothing is saved.
+    reconcileDisk: ?*const fn (ctx: *anyopaque, pending: *const Config, original: *const Config) SaveError!void = null,
+    /// Optional. The file a save that just failed was about, for the errors
+    /// whose status sentence names one (`StatusNote.takesDetail`). Borrowed
+    /// until the next save.
+    failureDetail: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     /// Optional asynchronous two-phase persistence hook. The receiver must
     /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
     /// When absent, `saveAndReload` remains the synchronous compatibility path.
@@ -1553,6 +1654,9 @@ pub const SettingsWindow = struct {
     text_summary: ?HWND = null,
     text_status: ?HWND = null,
     status_note: StatusNote = .none,
+    /// The sentence for `status_note` when it names a file (`takesDetail`).
+    /// Owned; only meaningful while `status_note` takes a detail.
+    note_text: ?[]u8 = null,
     /// The status text measured for `status_measure_width` / `status_measure_dpi`:
     /// how wide it is on one line, and how tall it is wrapped to that width.
     /// `-1` means it has to be measured again.
@@ -1772,6 +1876,7 @@ pub const SettingsWindow = struct {
     }
 
     pub fn deinit(self: *SettingsWindow) void {
+        self.freeNoteText();
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) _ = sys.DestroyWindow(h);
         }
@@ -1962,8 +2067,31 @@ pub const SettingsWindow = struct {
     /// even while a conflict or a validation error holds the line, as the
     /// ad-hoc messages it replaces did.
     fn setNote(self: *SettingsWindow, note: StatusNote) void {
+        self.freeNoteText();
         self.status_note = note;
         self.setStatus(note.text());
+    }
+
+    /// `setNote` for a failed save: when the sentence names a file, the app
+    /// says which.
+    fn setSaveFailureNote(self: *SettingsWindow, err: SaveError) void {
+        const note = saveFailureNote(err);
+        self.setNote(note);
+        if (!note.takesDetail()) return;
+        const lend = self.handle.failureDetail orelse return;
+        const detail = lend(self.handle.ctx) orelse return;
+        self.note_text = note.textWithDetail(self.handle.alloc, detail) catch return;
+        self.setStatus(self.noteText());
+    }
+
+    fn freeNoteText(self: *SettingsWindow) void {
+        if (self.note_text) |text| self.handle.alloc.free(text);
+        self.note_text = null;
+    }
+
+    fn noteText(self: *const SettingsWindow) []const u8 {
+        if (self.note_text) |text| if (self.status_note.takesDetail()) return text;
+        return self.status_note.text();
     }
 
     /// What the status line says when no validation error or conflict holds it.
@@ -1973,15 +2101,20 @@ pub const SettingsWindow = struct {
             .saved, .saved_overridden => return self.status_note.text(),
             // These are about edits that are still there to be saved.
             .save_failed,
+            .unsupported_encoding,
+            .binary_config,
+            .dangling_link,
+            .file_unopenable,
+            .write_incomplete,
             .close_failed,
             .resolve_first,
             .conflict_not_resolved,
             .disk_value_not_adopted,
-            => if (self.hasPendingChanges()) return self.status_note.text(),
+            => if (self.hasPendingChanges()) return self.noteText(),
             .none, .previews_live, .applies_on_save => {},
         }
         if (!self.hasPendingChanges()) return nothing_to_save_text;
-        const text = self.status_note.text();
+        const text = self.noteText();
         return if (text.len != 0) text else unsaved_changes_text;
     }
 
@@ -4072,6 +4205,17 @@ pub const SettingsWindow = struct {
             self.ensureControlVisible(control);
             return;
         }
+        // The check may merge a changed file into this window, so it runs on
+        // the window's own configs, and nothing below uses a copy made before
+        // it. A conflict it finds is shown the way one that was already open is.
+        if (self.conflictCount() == 0) if (self.handle.reconcileDisk) |reconcile| {
+            if (self.pending) |*draft| if (self.original) |*baseline| reconcile(self.handle.ctx, draft, baseline) catch |err| {
+                std.log.warn("settings: could not check the config file before saving err={}; draft preserved", .{err});
+                self.setSaveFailureNote(err);
+                self.updateSaveEnabled();
+                return;
+            };
+        };
         if (self.conflictCount() != 0) {
             self.surfaceNextValidation(false);
             return;
@@ -4126,7 +4270,7 @@ pub const SettingsWindow = struct {
                 // is fixed, or close the window to discard.
                 if (apply_id) |id| if (!self.failApply(id)) return;
                 std.log.warn("settings: save failed err={}; draft preserved", .{err});
-                self.setNote(.save_failed);
+                self.setSaveFailureNote(err);
                 self.updateSaveEnabled();
             },
         }
@@ -5715,6 +5859,163 @@ test "settings opacity preview is floored while the draft keeps the typed value"
     }
 }
 
+test "settings save checks the file for edits first, and a conflict stops it" {
+    const Capture = struct {
+        saved: u32 = 0,
+        asked: u32 = 0,
+        /// What the file now holds for the font size; null means it still
+        /// holds what this session started from.
+        disk_font_size: ?f32 = null,
+        /// The file cannot be checked.
+        fail: bool = false,
+        settings: *SettingsWindow = undefined,
+        fn save(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.saved += 1;
+            // Keep the draft, as a failed write does, so the test need not
+            // fake a config reload.
+            return error.SerializeFailed;
+        }
+        fn reconcile(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.asked += 1;
+            if (self.fail) return error.ReloadFailed;
+            const size = self.disk_font_size orelse return;
+            // What the app does on finding a changed file: apply it as a reload.
+            var disk = Config.default(std.testing.allocator) catch return error.OutOfMemory;
+            defer disk.deinit();
+            disk.@"font-size" = size;
+            self.settings.externalConfigChanged(&disk, 100);
+        }
+    };
+    const edit = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Unexpected;
+    defer _ = sys.DestroyWindow(edit);
+    const current = try Config.default(std.testing.allocator);
+    var capture: Capture = .{};
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &capture, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = Capture.save, .notifySuccess = undefined, .onClosed = undefined, .reconcileDisk = Capture.reconcile },
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+        .edit_font_size = edit,
+    };
+    capture.settings = &settings;
+    settings.initTransaction();
+    defer settings.clearPending();
+
+    // The draft: font size 14, from a session that started at the default 12.
+    _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("14"));
+    settings.syncFontSizeFromEdit();
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // The file is as the session left it: the save goes ahead.
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 1), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+
+    // The file now says 16 for the setting being edited: nothing is written,
+    // the conflict is shown, and the draft is kept for Keep mine / Use disk.
+    capture.disk_font_size = 16;
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 2), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+    try std.testing.expect(settings.hasConflict(.font_size));
+    try std.testing.expectEqual(@as(usize, 1), settings.conflictCount());
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // While a conflict is open the save does not even read the file again.
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 2), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+
+    // Keep mine adopts the file's value as the baseline; the next save
+    // writes the draft.
+    capture.disk_font_size = null;
+    settings.resolveConflict(.font_size, .keep_mine);
+    try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 3), capture.asked);
+    try std.testing.expectEqual(@as(u32, 2), capture.saved);
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // A file that cannot be checked is not written over blind: nothing is
+    // saved, the draft stays and the status says the save failed.
+    capture.fail = true;
+    settings.status_note = .none;
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 4), capture.asked);
+    try std.testing.expectEqual(@as(u32, 2), capture.saved);
+    try std.testing.expectEqual(StatusNote.save_failed, settings.status_note);
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+}
+
+test "settings status line names an unusable encoding and a dangling link, and any other failed save generically" {
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.SerializeFailed));
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.ReplaceFailed));
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.PathResolveFailed));
+    try std.testing.expectEqual(StatusNote.unsupported_encoding, saveFailureNote(error.UnsupportedEncoding));
+    try std.testing.expectEqual(StatusNote.dangling_link, saveFailureNote(error.DanglingLink));
+    try std.testing.expectEqual(StatusNote.binary_config, saveFailureNote(error.BinaryConfig));
+    try std.testing.expectEqual(StatusNote.file_unopenable, saveFailureNote(error.FileUnopenable));
+    try std.testing.expectEqual(StatusNote.write_incomplete, saveFailureNote(error.IncompleteWrite));
+    // The causes are told apart in words: a mark says UTF-16, NUL bytes say
+    // binary or unmarked UTF-16/32, and the others do not claim an encoding.
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.unsupported_encoding.text(), "UTF-16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.binary_config.text(), "NUL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.file_unopenable.text(), "UTF") == null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.write_incomplete.text(), "incomplete") != null);
+    // Each note tells the person what to do, in words.
+    const encoding = StatusNote.unsupported_encoding.text();
+    try std.testing.expect(std.mem.indexOf(u8, encoding, "UTF-8") != null);
+    try expectNoInternalSyntax(encoding);
+    const link = StatusNote.dangling_link.text();
+    try std.testing.expect(std.mem.indexOf(u8, link, "link") != null);
+    try expectNoInternalSyntax(link);
+}
+
+test "settings status line names the file a failed save is about" {
+    const Lender = struct {
+        text: ?[]const u8,
+        fn lend(ctx: *anyopaque) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.text;
+        }
+    };
+    var lender: Lender = .{ .text = "the included file C:\\dotfiles\\inc.conf" };
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &lender, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = undefined, .notifySuccess = undefined, .onClosed = undefined, .failureDetail = Lender.lend },
+    };
+    defer settings.freeNoteText();
+
+    // An include that will not open is named, with the way out.
+    settings.setSaveFailureNote(error.FileUnopenable);
+    try std.testing.expectEqual(StatusNote.file_unopenable, settings.status_note);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the included file C:\\dotfiles\\inc.conf cannot be opened") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "Nothing was saved") != null);
+
+    // A half-written config says it may be incomplete and where the whole text is.
+    lender.text = "C:\\dotfiles\\config.ghostty.tmp-1-2";
+    settings.setSaveFailureNote(error.IncompleteWrite);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "may now be incomplete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "kept in C:\\dotfiles\\config.ghostty.tmp-1-2") != null);
+
+    // The encoding sentences name the file too, so an include is not blamed on
+    // the config file.
+    lender.text = "the file C:\\dotfiles\\inc.conf";
+    settings.setSaveFailureNote(error.UnsupportedEncoding);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the file C:\\dotfiles\\inc.conf is not readable as UTF-8 text") != null);
+    settings.setSaveFailureNote(error.BinaryConfig);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the file C:\\dotfiles\\inc.conf contains NUL bytes") != null);
+
+    // Nothing lent, or an error with no file to name: the plain sentence.
+    lender.text = null;
+    settings.setSaveFailureNote(error.FileUnopenable);
+    try std.testing.expectEqualStrings(StatusNote.file_unopenable.text(), settings.noteText());
+    lender.text = "C:\\ignored";
+    settings.setSaveFailureNote(error.SerializeFailed);
+    try std.testing.expectEqualStrings(StatusNote.save_failed.text(), settings.noteText());
+}
+
 fn stubChromeBg(_: *anyopaque) COLORREF {
     return 0x202020;
 }
@@ -6862,6 +7163,23 @@ const dialog_test = struct {
     extern "user32" fn GetNextDlgTabItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
     extern "user32" fn GetKeyboardState(keys: *[256]u8) callconv(.winapi) BOOL;
     extern "user32" fn SetKeyboardState(keys: *const [256]u8) callconv(.winapi) BOOL;
+
+    /// Make exactly these modifiers the ones the calling thread sees held, and
+    /// no other key. The whole 256-entry table is replaced, then read back
+    /// through `GetKeyState`, which is what the code under test reads: a
+    /// table the system refreshed from the real keyboard in between fails here
+    /// with the key that leaked, not later in an unrelated assertion.
+    fn holdKeys(held: struct { ctrl: bool = false, alt: bool = false, shift: bool = false }) !void {
+        var keys: [256]u8 = @splat(0);
+        const down: u8 = 0x80;
+        if (held.ctrl) keys[VK_CONTROL] = down;
+        if (held.alt) keys[VK_MENU] = down;
+        if (held.shift) keys[VK_SHIFT] = down;
+        try std.testing.expect(SetKeyboardState(&keys) != 0);
+        try std.testing.expectEqual(held.ctrl, win32_input.keyPressed(VK_CONTROL));
+        try std.testing.expectEqual(held.alt, win32_input.keyPressed(VK_MENU));
+        try std.testing.expectEqual(held.shift, win32_input.keyPressed(VK_SHIFT));
+    }
     extern "user32" fn GetNextDlgGroupItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
     extern "gdi32" fn BitBlt(dst: HDC, x: i32, y: i32, width: i32, height: i32, src: HDC, src_x: i32, src_y: i32, rop: u32) callconv(.winapi) BOOL;
     extern "user32" fn HideCaret(hwnd: ?HWND) callconv(.winapi) BOOL;
@@ -7310,18 +7628,29 @@ test "settings Ctrl+S reaches Save through the accelerator hook" {
             settings.syncCursorStyleFromCombo();
             _ = sys.SetFocus(settings.edit_font_size.?);
 
+            // The thread's key table starts as a copy of what the real keyboard
+            // holds, so a test that sets only Ctrl in it inherits any Shift,
+            // Alt or Ctrl the person running the suite has down (failed 2 of 6
+            // runs on a reviewer's machine). Own every key the shortcut reads.
+            var original: [256]u8 = undefined;
+            try std.testing.expect(dialog_test.GetKeyboardState(&original) != 0);
+            defer _ = dialog_test.SetKeyboardState(&original);
+
             // Without Ctrl the key is not ours.
             const focus = sys.GetFocus().?;
+            try dialog_test.holdKeys(.{});
             try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
 
-            // With the thread's Ctrl key down it is consumed and saves.
-            var keys: [256]u8 = undefined;
-            try std.testing.expect(dialog_test.GetKeyboardState(&keys) != 0);
-            const original = keys;
-            defer _ = dialog_test.SetKeyboardState(&original);
-            keys[VK_CONTROL] = 0x80;
-            try std.testing.expect(dialog_test.SetKeyboardState(&keys) != 0);
+            // Ctrl with Shift or Alt is a different chord.
+            try dialog_test.holdKeys(.{ .ctrl = true, .shift = true });
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try dialog_test.holdKeys(.{ .ctrl = true, .alt = true });
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+
+            // With only the thread's Ctrl key down it is consumed and saves.
+            try dialog_test.holdKeys(.{ .ctrl = true });
             try std.testing.expect(settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
             try std.testing.expectEqual(@as(u32, 1), fixture.saved);
         }
@@ -8050,6 +8379,54 @@ test "settings diff writes every field's values without debug syntax" {
         try std.testing.expect(line[line.len - 1] == '\n');
         try expectNoInternalSyntax(line);
     }
+}
+
+test "settings scrollback label states the unit, that 0 turns scrollback off, and who it applies to" {
+    // `scrollback-limit` is bytes per terminal, 0 disables scrollback and
+    // there is no unlimited setting (Config.zig, Screen.zig); a change reaches
+    // terminals created afterwards. The old label said "rows, 0 = unlimited".
+    comptime std.debug.assert(@FieldType(Config, "scrollback-limit") == usize);
+    try std.testing.expectEqualStrings(scrollback_label, settings_label_specs[0]);
+    for ([_][]const u8{ "bytes", "0 = off", "new terminals" }) |fact| {
+        try std.testing.expect(std.mem.indexOf(u8, scrollback_label, fact) != null);
+    }
+    for ([_][]const u8{ "rows", "unlimited" }) |claim| {
+        try std.testing.expect(std.mem.indexOf(u8, scrollback_label, claim) == null);
+    }
+    // The accessible name stays the visible label's first words (the UIA
+    // harness finds the field by it).
+    try std.testing.expect(std.mem.startsWith(u8, scrollback_label, settings_control_specs[0].name));
+    try std.testing.expect(std.mem.startsWith(u8, scrollback_label, SettingField.scrollback_limit.label()));
+}
+
+test "settings labels fit on one line in the narrowest two-column lane" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            for ([_]u32{ 96, 144, 192 }) |dpi| {
+                dialog_test.simulateDpi(fixture.hwnd(), dpi);
+                const lane = @divTrunc(scaleForDpi(settings_two_column_min_width, dpi) - scaleForDpi(settings_column_gap, dpi), 2);
+                for (settings.field_labels, settings_label_specs) |maybe_label, spec| {
+                    const label = maybe_label.?;
+                    const hdc = GetDC(label) orelse return error.NoDC;
+                    defer _ = ReleaseDC(label, hdc);
+                    const raw_font: usize = @bitCast(SendMessageW(label, WM_GETFONT, 0, 0));
+                    const previous = SelectObject(hdc, @ptrFromInt(raw_font));
+                    defer _ = SelectObject(hdc, previous);
+                    var text_w: [256:0]u16 = undefined;
+                    const length = std.unicode.utf8ToUtf16Le(&text_w, spec) catch return error.LabelTooLong;
+                    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    _ = DrawTextW(hdc, &text_w, @intCast(length), &rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                    if (rect.right - rect.left > lane) {
+                        std.debug.print("label \"{s}\" is {d}px wide in a {d}px lane at {d} dpi\n", .{ spec, rect.right - rect.left, lane, dpi });
+                        return error.LabelWiderThanLane;
+                    }
+                }
+            }
+        }
+    }.body);
 }
 
 test "settings fields carry a label, a config key and palette words" {
