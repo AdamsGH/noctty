@@ -3146,21 +3146,31 @@ fn settingsDiskEditConflict(
     return false;
 }
 
-/// `Config.load` takes a default config file it cannot open (held without read
-/// sharing, access denied, an offline share) for an absent one and loads the
-/// defaults. Judged as an edit and applied, that would drop the user's own
-/// settings from every terminal, so a target that exists but will not open
-/// stops the check, and the save with it. A file that is missing is a first
-/// save, and there is nothing on disk to conflict with.
-fn settingsTargetOpenable(path: []const u8) win32_settings.SaveError!void {
+/// `Config.load` takes a config file it cannot open (held without read
+/// sharing, access denied, an offline share) for an absent one, or for one that
+/// set nothing, and loads the rest. Judged as an edit and applied, that would
+/// drop the user's own settings from every terminal, so a file that exists but
+/// will not open stops the check, and the save with it. A file that is missing
+/// is a first save (or an include the loader reports itself), and there is
+/// nothing on disk to conflict with; a directory is not read by the loader
+/// either.
+fn settingsFileOpenable(path: []const u8) win32_settings.SaveError!void {
     const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound, error.IsDir => return,
         else => {
             log.warn("settings save: could not open the config file to check it for edits path={s} err={}", .{ path, err });
             return error.ReloadFailed;
         },
     };
     file.close();
+}
+
+/// `settingsFileOpenable` for every file the loaded config pulled in: the
+/// list holds the nested ones too, as absolute paths.
+fn settingsIncludesOpenable(disk: *const configpkg.Config) win32_settings.SaveError!void {
+    for (disk.@"config-file".value.items) |entry| switch (entry) {
+        .optional, .required => |path| if (path.len > 0) try settingsFileOpenable(path),
+    };
 }
 
 fn settingsDiskValueDiffers(
@@ -11107,13 +11117,14 @@ pub const App = struct {
         if (user_edited.count() == 0) return;
         const target_path = try self.settingsTargetPath(self.core_app.alloc);
         defer self.core_app.alloc.free(target_path);
-        try settingsTargetOpenable(target_path);
+        try settingsFileOpenable(target_path);
         var disk = self.loadConfigAtStartupCwd() catch |err| {
             log.warn("settings save: could not read the config file to check it for edits err={}", .{err});
             return error.ReloadFailed;
         };
         defer disk.deinit();
         if (!settingsDiskEditConflict(original, pending, &disk, self.core_app.config_conditional_state, user_edited)) return;
+        try settingsIncludesOpenable(&disk);
         log.info("settings save: the config file changed on disk under an edited setting; offering the choice", .{});
         self.core_app.updateConfig(self, &disk) catch |err| {
             log.warn("settings save: applying the changed config file failed err={}", .{err});
@@ -26777,11 +26788,11 @@ test "win32 settings disk check stops at a config file it cannot open, not at a 
     defer std.testing.allocator.free(missing_path);
 
     // A first save: nothing on disk to conflict with.
-    try settingsTargetOpenable(missing_path);
+    try settingsFileOpenable(missing_path);
 
     // The file exists and reads.
     try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 14\n" });
-    try settingsTargetOpenable(missing_path);
+    try settingsFileOpenable(missing_path);
 
     // Another program holds it with no sharing (std's `.lock` is a byte-range
     // lock on Windows and does not stop an open): the load would call it
@@ -26798,7 +26809,24 @@ test "win32 settings disk check stops at a config file it cannot open, not at a 
     );
     if (held == std.os.windows.INVALID_HANDLE_VALUE) return error.CouldNotHoldFile;
     defer std.os.windows.CloseHandle(held);
-    try std.testing.expectError(error.ReloadFailed, settingsTargetOpenable(missing_path));
+    try std.testing.expectError(error.ReloadFailed, settingsFileOpenable(missing_path));
+
+    // The same holds for a file the config includes: the load would skip it
+    // and leave out everything it set. A missing include and a directory are
+    // the loader's to report, and do not stop the check.
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    const arena = config._arena.?.allocator();
+    try tmp.dir.makeDir("dir");
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ missing, "dir" });
+    defer std.testing.allocator.free(dir_path);
+    const gone_path = try std.fs.path.join(std.testing.allocator, &.{ missing, "gone.conf" });
+    defer std.testing.allocator.free(gone_path);
+    try config.@"config-file".parseCLI(arena, dir_path);
+    try config.@"config-file".parseCLI(arena, gone_path);
+    try settingsIncludesOpenable(&config);
+    try config.@"config-file".parseCLI(arena, missing_path);
+    try std.testing.expectError(error.ReloadFailed, settingsIncludesOpenable(&config));
 }
 
 test "win32 settings save target stops at the child command boundary" {

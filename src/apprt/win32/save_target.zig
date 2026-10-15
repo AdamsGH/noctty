@@ -120,9 +120,11 @@ fn finalPath(alloc: Allocator, handle: windows.HANDLE) error{ OutOfMemory, Unres
 /// The final-path API answers in the `\\?\` namespace; every other path in the
 /// program is `C:\...` or `\\server\share\...`. Names that are neither (a
 /// volume with no drive letter) stay as they are, which the file APIs accept.
-/// So does a name too long for the plain form: the replace calls take the path
-/// as written, and without a long-path manifest only the extended form lets
-/// them past MAX_PATH. Edits `name` in place.
+/// So does a name that only the extended form reaches: one too long for the
+/// plain form (the replace calls take the path as written, and without a
+/// long-path manifest only the extended form lets them past MAX_PATH), or one
+/// that Win32 name normalization would turn into another file. Edits `name` in
+/// place.
 fn plain(name: []u8) []u8 {
     const unc = "\\\\?\\UNC\\";
     const extended = "\\\\?\\";
@@ -130,6 +132,7 @@ fn plain(name: []u8) []u8 {
     const max_plain = 230;
     if (name.len - @min(name.len, extended.len) > max_plain) return name;
     if (std.mem.startsWith(u8, name, unc)) {
+        if (!survivesNormalization(name[unc.len..])) return name;
         // \\?\UNC\server\share is \\server\share: the "C\" of the prefix
         // becomes the second separator.
         name[unc.len - 2] = '\\';
@@ -139,9 +142,36 @@ fn plain(name: []u8) []u8 {
         std.ascii.isAlphabetic(name[extended.len]) and
         name[extended.len + 1] == ':' and name[extended.len + 2] == '\\')
     {
+        if (!survivesNormalization(name[extended.len + 3 ..])) return name;
         return name[extended.len..];
     }
     return name;
+}
+
+/// Whether `path` (the part after the root) names the same file without the
+/// extended prefix. Normalization drops trailing dots and spaces from a
+/// component, so `config.` would reach `config`, and reads CON, NUL, COM1 and
+/// the like as devices, so a file called that is reachable only through the
+/// prefix.
+fn survivesNormalization(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, path, '\\');
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        if (part[part.len - 1] == '.' or part[part.len - 1] == ' ') return false;
+        if (isDeviceName(part)) return false;
+    }
+    return true;
+}
+
+fn isDeviceName(component: []const u8) bool {
+    // A device name is the stem before the first dot, whatever follows, and
+    // trailing spaces do not count.
+    const stem = std.mem.trimRight(u8, component[0 .. std.mem.indexOfScalar(u8, component, '.') orelse component.len], " ");
+    for ([_][]const u8{ "CON", "PRN", "AUX", "NUL" }) |device| {
+        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
+    }
+    return stem.len == 4 and stem[3] >= '1' and stem[3] <= '9' and
+        (std.ascii.startsWithIgnoreCase(stem, "COM") or std.ascii.startsWithIgnoreCase(stem, "LPT"));
 }
 
 /// Make the file at `target` hold exactly `bytes`.
@@ -455,6 +485,29 @@ test "save target rewrites a hidden hard-linked file in place" {
     try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
 }
 
+test "save target keeps the extended form for a name with a trailing dot and writes that file" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    // `config.` and `config` are two files; only the extended form reaches the
+    // first. A link to it resolves to this name, and the plain spelling would
+    // be the other file.
+    const dotted = try std.fmt.allocPrint(testing.allocator, "\\\\?\\{s}\\config.", .{scratch.root});
+    defer testing.allocator.free(dotted);
+    try std.fs.cwd().writeFile(.{ .sub_path = dotted, .data = "old\n" });
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config", .data = "sibling\n" });
+
+    const target = try resolve(testing.allocator, dotted);
+    defer target.deinit(testing.allocator);
+    try testing.expectEqualStrings(dotted, target.path);
+    try write(testing.allocator, target, "new\n");
+
+    const written = try std.fs.cwd().readFileAlloc(testing.allocator, dotted, 1024);
+    defer testing.allocator.free(written);
+    try testing.expectEqualStrings("new\n", written);
+    try scratch.expectContent("config", "sibling\n");
+    try scratch.expectNames(&.{ "config", "config." });
+}
+
 test "save target of a name in a missing directory is the name itself" {
     var scratch = try Scratch.init();
     defer scratch.deinit();
@@ -473,6 +526,18 @@ test "final path names lose the extended-length prefix and keep other shapes" {
         .{ .name = "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\a.conf", .plain = "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\a.conf" },
         .{ .name = "C:\\already\\plain.conf", .plain = "C:\\already\\plain.conf" },
         .{ .name = "\\\\?\\C:", .plain = "\\\\?\\C:" },
+        // Names Win32 normalization would change keep the extended form.
+        .{ .name = "\\\\?\\C:\\dotfiles\\config.", .plain = "\\\\?\\C:\\dotfiles\\config." },
+        .{ .name = "\\\\?\\C:\\dotfiles\\config ", .plain = "\\\\?\\C:\\dotfiles\\config " },
+        .{ .name = "\\\\?\\C:\\dotfiles.\\config", .plain = "\\\\?\\C:\\dotfiles.\\config" },
+        .{ .name = "\\\\?\\C:\\dotfiles\\nul", .plain = "\\\\?\\C:\\dotfiles\\nul" },
+        .{ .name = "\\\\?\\C:\\dotfiles\\Aux.conf", .plain = "\\\\?\\C:\\dotfiles\\Aux.conf" },
+        .{ .name = "\\\\?\\C:\\dotfiles\\com1", .plain = "\\\\?\\C:\\dotfiles\\com1" },
+        .{ .name = "\\\\?\\UNC\\server\\share\\config.", .plain = "\\\\?\\UNC\\server\\share\\config." },
+        // Near misses are ordinary names.
+        .{ .name = "\\\\?\\C:\\dotfiles\\.config\\com0.conf", .plain = "C:\\dotfiles\\.config\\com0.conf" },
+        .{ .name = "\\\\?\\C:\\dotfiles\\console\\auxiliary.conf", .plain = "C:\\dotfiles\\console\\auxiliary.conf" },
+        .{ .name = "\\\\?\\C:\\dotfiles\\com10", .plain = "C:\\dotfiles\\com10" },
         // Too long for MAX_PATH once plain: the extended form stays.
         .{ .name = "\\\\?\\C:\\" ++ "d" ** 240 ++ "\\config.ghostty", .plain = "\\\\?\\C:\\" ++ "d" ** 240 ++ "\\config.ghostty" },
         .{ .name = "\\\\?\\UNC\\server\\share\\" ++ "d" ** 240, .plain = "\\\\?\\UNC\\server\\share\\" ++ "d" ** 240 },
