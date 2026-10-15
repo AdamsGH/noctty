@@ -305,15 +305,15 @@ pub fn tabClosedMessage(set: *const input.Binding.Set, has_modifier_remaps: bool
 
     switch (trigger.key) {
         .unicode => |cp| {
-            // The layout decides which physical key produces this letter.
-            // Physical and translated-text bindings precede the unshifted
-            // codepoint in getEvent, so do not promise a shadowed chord.
+            // Win32 keyFromVirtualKey maps VK_A..VK_Z directly to key_a..key_z.
+            // That physical binding and translated-text bindings precede the
+            // unshifted letter in getEvent; unrelated keys cannot shadow it.
             if (cp < 'a' or cp > 'z') return fallback;
             var overrides = set.bindings.iterator();
             while (overrides.next()) |entry| {
                 if (!entry.key_ptr.mods.binding().equal(trigger.mods.binding())) continue;
                 switch (entry.key_ptr.key) {
-                    .physical => |key| if (key.printable()) return fallback,
+                    .physical => |key| if (key == input.Key.fromASCII(@intCast(cp)).?) return fallback,
                     .unicode => |other| if (other == std.ascii.toUpper(@intCast(cp)) or
                         (trigger.mods.ctrl and other == (cp & 0x1f))) return fallback,
                     .catch_all => {},
