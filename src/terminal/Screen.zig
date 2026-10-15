@@ -2782,6 +2782,11 @@ pub fn selectionString(
     return text;
 }
 
+/// Whether `cell` ends a line selected in semantic state `state`.
+inline fn semanticBoundary(cell: Cell, state: Cell.SemanticContent) bool {
+    return cell.hasText() and cell.semantic_content != state;
+}
+
 pub const SelectLine = struct {
     /// The pin of some part of the line to select.
     pin: Pin,
@@ -2808,9 +2813,26 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     // only happen within the same prompt state. For example, if you triple
     // click output, but the shell uses spaces to soft-wrap to the prompt
     // then the selection will stop prior to the prompt. See issue #1329.
+    //
+    // Cells that never held text (the gaps a tab or a cursor move leaves)
+    // carry the state the cursor had, not the program's, so they neither
+    // define the state nor end the line; a shell that sends no preexec mark,
+    // such as cmd, otherwise ends the line at the first gap. A click on such
+    // a cell takes the state of the nearest text on its row.
     const semantic_prompt_state: ?Cell.SemanticContent = state: {
         if (!opts.semantic_prompt_boundary) break :state null;
         const rac = opts.pin.rowAndCell();
+        if (rac.cell.hasText()) break :state rac.cell.semantic_content;
+
+        const cells = opts.pin.node.data.getCells(rac.row);
+        var x: usize = opts.pin.x;
+        while (x > 0) {
+            x -= 1;
+            if (cells[x].hasText()) break :state cells[x].semantic_content;
+        }
+        for (cells[opts.pin.x + 1 ..]) |cell| {
+            if (cell.hasText()) break :state cell.semantic_content;
+        }
         break :state rac.cell.semantic_content;
     };
 
@@ -2826,7 +2848,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
             // Scan backwards from clicked position to find where our content starts
             for (0..opts.pin.x + 1) |i| {
                 const x_rev = opts.pin.x - i;
-                if (cells[x_rev].semantic_content != v) {
+                if (semanticBoundary(cells[x_rev], v)) {
                     var copy = it_prev;
                     copy.x = @intCast(x_rev + 1);
                     break :start_pin copy;
@@ -2854,7 +2876,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
                 for (0..cells.len) |x| {
                     const x_rev = cells.len - 1 - x;
                     const cell = cells[x_rev];
-                    if (cell.semantic_content != v) break :start_pin it_prev;
+                    if (semanticBoundary(cell, v)) break :start_pin it_prev;
                     it_prev = p;
                     it_prev.x = @intCast(x_rev);
                 }
@@ -2889,7 +2911,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
                 // col doesn't match then we end at the end of the prior
                 // row. But if this is the first row, we can't go back,
                 // so we scan forward to find where our content ends.
-                if (start_offset == 0 and cells[0].semantic_content != v) {
+                if (start_offset == 0 and semanticBoundary(cells[0], v)) {
                     var prev = p.up(1).?;
                     prev.x = p.node.data.size.cols - 1;
                     break :end_pin prev;
@@ -2897,7 +2919,7 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
 
                 // For every other case, we end at the prior cell.
                 for (start_offset.., cells[start_offset..]) |x, cell| {
-                    if (cell.semantic_content != v) {
+                    if (semanticBoundary(cell, v)) {
                         var copy = p;
                         copy.x = @intCast(x - 1);
                         break :end_pin copy;
@@ -9245,6 +9267,118 @@ test "Screen: selectLine semantic prompt to input boundary" {
         try testing.expectEqual(point.Point{ .active = .{
             .x = 8,
             .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine semantic state ignores cells that never held text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // cmd.exe sends no preexec mark, so what it prints stays in the input
+    // state while the cells a tab or a cursor move skips keep the default
+    // output state. Row 0 is "T1", a three cell gap and "tab".
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("T1");
+    s.cursorAbsolute(5, 0);
+    try s.testWriteString("tab");
+
+    // The line is selected whole from text on either side of the gap, and
+    // from the gap itself.
+    for ([_]size.CellCountInt{ 0, 1, 3, 5, 7 }) |x| {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = x,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 7,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine still ends at a real boundary beyond a gap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Output "out", a two cell gap, then a prompt "$>": the gap does not
+    // hide the boundary between the output and the prompt.
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("out");
+    s.cursorAbsolute(5, 0);
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$>");
+
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 1,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 2,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 6,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 5,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 6,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine across a soft-wrap with a gap on the first row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // "ab", a two cell gap and "cd" fill row 0; "ef" wraps onto row 1.
+    var s = try init(alloc, .{ .cols = 6, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("ab");
+    s.cursorAbsolute(4, 0);
+    try s.testWriteString("cdef");
+
+    for ([_]struct { x: size.CellCountInt, y: size.CellCountInt }{
+        .{ .x = 1, .y = 1 },
+        .{ .x = 0, .y = 0 },
+        .{ .x = 3, .y = 0 },
+    }) |at| {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = at.x,
+            .y = at.y,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 1,
+            .y = 1,
         } }, s.pages.pointFromPin(.active, sel.end()).?);
     }
 }
