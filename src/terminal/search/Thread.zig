@@ -437,12 +437,13 @@ fn changeQuery(
     // one event that clears the previous results, not by a second one after
     // it (which a consumer would show as "no matches" first).
     var invalid = false;
+    var out_of_memory = false;
     var next: ?Search = null;
     if (needle.len > 0) {
         if (Search.init(self.alloc, needle, query_options)) |search| {
             next = search;
         } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => out_of_memory = true,
             else => {
                 log.warn("error initializing search query err={}", .{err});
                 invalid = true;
@@ -463,6 +464,10 @@ fn changeQuery(
         cleared_previous = true;
     }
     if (cleared_previous or invalid) self.notifySearchCleared(invalid);
+
+    // The previous search is gone even when the new one could not be set up:
+    // its results would otherwise be published for the new query.
+    if (out_of_memory) return error.OutOfMemory;
 
     // No needle means stop the search, and an invalid one starts none.
     self.search = next orelse return;
@@ -1368,6 +1373,41 @@ test "a query that matches nothing is not reported as invalid" {
     try thread.changeQuery("world", .{ .regex = true }, 5);
     try testing.expect(thread.search != null);
     try testing.expect(!ud.invalid);
+}
+
+test "a query that runs out of memory still stops the previous search" {
+    // The new query already owns the event generation, so the previous
+    // search must not keep publishing results under it.
+    const alloc = testing.allocator;
+    var mutex: std.Thread.Mutex = .{};
+    var t: Terminal = try .init(alloc, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("Hello, world");
+
+    var ud: TestUserData = .{};
+    defer ud.deinit();
+    var thread: Thread = try .init(alloc, .{
+        .mutex = &mutex,
+        .terminal = &t,
+        .event_cb = &TestUserData.callback,
+        .event_userdata = &ud,
+    });
+    defer thread.deinit();
+
+    try thread.changeQuery("world", .{}, 1);
+    try testing.expect(thread.search != null);
+
+    var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    thread.alloc = failing.allocator();
+    defer thread.alloc = alloc;
+    try testing.expectError(error.OutOfMemory, thread.changeQuery("hello", .{}, 2));
+
+    try testing.expect(thread.search == null);
+    try testing.expect(!ud.invalid);
+    try testing.expectEqual(1, ud.total_events);
 }
 
 test "equivalent query replays search state" {

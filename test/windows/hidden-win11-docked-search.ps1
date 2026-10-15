@@ -309,7 +309,9 @@ function Launch-Case([string]$Name) {
     $fill=Join-Path $dir 'fill.cmd'
     @('@echo off','for /L %%i in (1,1,60) do echo needlex %%i','ping -n 3600 127.0.0.1 >nul') | Set-Content -LiteralPath $fill -Encoding ascii
     $config=Join-Path $dir 'search.ghostty'
-    @("command = cmd.exe /d /c $fill",'shell-integration = none','single-instance = false','window-save-state = never','confirm-close-surface = false',
+    # The batch file is found through the working directory, so the run path
+    # may hold spaces without any quoting for cmd.exe.
+    @("working-directory = $dir",'command = cmd.exe /d /c fill.cmd','shell-integration = none','single-instance = false','window-save-state = never','confirm-close-surface = false',
       'copy-on-select = false','clipboard-read = deny','clipboard-write = deny',
       'keybind = f4=start_search') | Set-Content -LiteralPath $config
     $exe=Join-Path $dir 'noctty.exe'
