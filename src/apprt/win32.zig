@@ -27394,11 +27394,9 @@ fn settingsReconcileDiskThunk(
 /// reports both as unknown, and argv does not change, so every reload would
 /// raise them again.
 ///
-/// Not a diagnostic of a file's line: that is a mistake in the file. The
-/// conditional state rebuilds a config through an iterator that has no place
-/// to give, so a rebuilt config's diagnostics come without one, and the
-/// command-line ones cannot be told apart by it. `safe_mode` is whether this
-/// process was started with `--safe-mode`.
+/// Not a diagnostic of a file's line: that is a mistake in the file. Filter
+/// by key and launch state even for callers that provide no location.
+/// `safe_mode` is whether this process was started with `--safe-mode`.
 fn isLaunchArgumentDiagnostic(diag: cli_diagnostics.Diagnostic, safe_mode: bool) bool {
     if (diag.location == .file) return false;
     if (safe_mode and std.mem.eql(u8, diag.key, "safe-mode")) return true;
@@ -29012,15 +29010,22 @@ test "win32 config problems leave out the arguments that start the process" {
     try std.testing.expect(isLaunchArgumentDiagnostic(safe_mode_complaint, true));
     try std.testing.expect(!isLaunchArgumentDiagnostic(safe_mode_complaint, false));
 
-    // A conditional theme rebuilds the config through an iterator with no
-    // place to give: the complaints come back without one, and still go.
+    // Conditional replay preserves the CLI locations and still filters
+    // launch arguments without hiding the user's mistakes.
     var rebuilt = (try config.changeConditionalState(.{ .theme = .dark })).?;
     defer rebuilt.deinit();
     var rebuilt_kept: usize = 0;
+    var rebuilt_cli: usize = 0;
     for (rebuilt._diagnostics.items()) |diag| {
-        try std.testing.expect(diag.location != .cli);
+        if (diag.location == .cli) rebuilt_cli += 1;
+        for (config._diagnostics.items()) |original| {
+            if (std.mem.eql(u8, original.key, diag.key)) {
+                try std.testing.expectEqualDeep(original.location, diag.location);
+            }
+        }
         if (!isLaunchArgumentDiagnostic(diag, true)) rebuilt_kept += 1;
     }
+    try std.testing.expectEqual(@as(usize, 4), rebuilt_cli);
     try std.testing.expectEqual(@as(usize, 3), rebuilt_kept);
 
     // A file's own line with the same text is a mistake in that file.
