@@ -3053,6 +3053,7 @@ const AppDeliveryPayload = union(enum) {
     toast: win32_toast_activation.ActivationTarget,
     uia_disconnect: *DeferredUiaDisconnect,
     profiles: *ProfileDiscoveryCompletion,
+    jump_list: *win32_jump_list.RebuildJob,
 
     pub fn deinit(self: *AppDeliveryPayload) void {
         switch (self.*) {
@@ -3062,6 +3063,7 @@ const AppDeliveryPayload = union(enum) {
                 alloc.destroy(completion);
             },
             .profiles => |completion| completion.deinit(),
+            .jump_list => |job| job.deinit(),
             .toast => {},
             .uia_disconnect => |pending| {
                 pending.release(pending.ctx);
@@ -4296,6 +4298,10 @@ pub const App = struct {
     /// another attempt: nothing else re-arms the jump list's timer when a
     /// worker hangs or cannot deliver.
     profile_discovery_watchdog_id: ?UINT_PTR = null,
+    /// The host inside `Host.requestProfiles`. With no worker the discovery
+    /// runs synchronously within that call, and the host re-checks its list
+    /// itself instead of being called back from inside its own chrome sync.
+    profiles_requesting_host: ?*Host = null,
     /// Numbers each worker, so a late result from an abandoned one leaves the
     /// running state and watchdog of the attempt that replaced it alone.
     profile_discovery_attempt: u64 = 0,
@@ -5025,7 +5031,7 @@ pub const App = struct {
                     if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
                         self.stopProfileDiscoveryWatchdog();
                         const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
-                        if (pending and self.hosts.items.len > 0) self.startProfileDiscovery();
+                        if ((pending or self.anyHostRequestedProfiles()) and self.hosts.items.len > 0) self.startProfileDiscovery();
                         continue;
                     }
                 }
@@ -5166,7 +5172,27 @@ pub const App = struct {
 
     fn initializeJumpList(self: *App) void {
         const jump_list = if (self.jump_list) |*value| value else return;
+        if (self.delivery != null) jump_list.runner = .{ .ctx = self, .start = startJumpListRebuild };
         jump_list.startup();
+    }
+
+    /// The jump list's Shell commit, on a detached worker with an STA of
+    /// its own. Like the profile discovery worker it borrows nothing from
+    /// the App, so quitting never waits for it; the job comes back as
+    /// WM_WINHOSTTY_JUMP_LIST.
+    fn startJumpListRebuild(ctx: *anyopaque, job: *win32_jump_list.RebuildJob) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const delivery = self.delivery orelse return false;
+        delivery.retain();
+        // Windows' default stack: Zig's 16 MiB default is committed, not
+        // just reserved, and a wedged commit keeps its thread.
+        const thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, jumpListRebuildThreadMain, .{ delivery, job }) catch |err| {
+            delivery.release();
+            log.warn("jump list rebuild thread unavailable err={}", .{err});
+            return false;
+        };
+        thread.detach();
+        return true;
     }
 
     /// Resolve `%LOCALAPPDATA%\noctty\palette-mru.txt`. Caller frees
@@ -5670,9 +5696,16 @@ pub const App = struct {
         delivery.close();
         while (delivery.pop()) |value| {
             var payload = value;
-            if (payload == .uia_disconnect) {
-                processDeferredUiaDisconnect(null, payload.uia_disconnect);
-            } else payload.deinit();
+            switch (payload) {
+                .uia_disconnect => |pending| processDeferredUiaDisconnect(null, pending),
+                .jump_list => |job| {
+                    // The Shell already reset its removed list for this
+                    // commit; record the removals before the state is saved.
+                    if (self.jump_list) |*jump_list| jump_list.completeRebuild(job);
+                    payload.deinit();
+                },
+                else => payload.deinit(),
+            }
         }
         delivery.update_running.store(false, .release);
         delivery.profiles_running.store(false, .release);
@@ -7234,40 +7267,67 @@ pub const App = struct {
         self.handleProfileDiscovery(pending);
     }
 
+    /// A discovery's list goes to every host that asked for one (the
+    /// picker, the palette) and, for the jump list, to the first host while
+    /// its startup discovery is pending and that host has no complete list.
     fn handleProfileDiscovery(self: *App, completion: *const ProfileDiscoveryCompletion) void {
-        const jump_list = if (self.jump_list) |*value| value else return;
         // With no host, `scheduleIfStartupPending` re-arms when one appears.
         if (self.hosts.items.len == 0) return;
-        const host = self.hosts.items[0];
-        switch (profileDiscoveryVerdict(
-            completion.generation,
-            self.profiles_generation,
-            host.profiles != null and host.profiles_complete,
-        )) {
-            .already_complete => return jump_list.completeStartupProfileDiscovery(),
-            .stale => return jump_list.retryStartupProfileDiscovery(),
-            .apply => {},
+        const primary = self.hosts.items[0];
+        const jump_list: ?*win32_jump_list.JumpList = if (self.jump_list) |*value|
+            if (value.startupProfileDiscoveryPending()) value else null
+        else
+            null;
+        defer if (jump_list) |list| {
+            if (primary.profiles != null and primary.profiles_complete) {
+                list.completeStartupProfileDiscovery();
+            } else {
+                list.retryStartupProfileDiscovery();
+            }
+        };
+        const primary_wants = jump_list != null and !(primary.profiles != null and primary.profiles_complete);
+
+        if (completion.generation != self.profiles_generation) {
+            // A list was applied or dropped since this one started. The
+            // jump list re-arms its timer; a host that asked starts over.
+            if (self.anyHostRequestedProfiles()) self.startProfileDiscovery();
+            return;
         }
         const discovery = completion.result catch |err| {
-            log.warn("jump list deferred profile discovery failed err={}", .{err});
-            jump_list.retryStartupProfileDiscovery();
+            log.warn("deferred profile discovery failed err={}", .{err});
+            for (self.hosts.items) |host| {
+                if (!host.profiles_requested) continue;
+                host.profiles_requested = false;
+                if (host != self.profiles_requesting_host) host.profilesArrived(host.profiles != null);
+            }
             return;
         };
-        const profiles = windows_shell.cloneProfiles(self.core_app.alloc, discovery.profiles) catch |err| {
-            log.warn("jump list deferred profile discovery failed err={}", .{err});
-            jump_list.retryStartupProfileDiscovery();
-            return;
-        };
-        _ = host.applyProfileDiscovery(.{ .profiles = profiles, .complete = discovery.complete }) catch |err| {
-            log.warn("jump list deferred profile discovery failed err={}", .{err});
-            jump_list.retryStartupProfileDiscovery();
-            return;
-        };
-        if (host.profiles_complete) {
-            jump_list.completeStartupProfileDiscovery();
-        } else {
-            jump_list.retryStartupProfileDiscovery();
+        for (self.hosts.items) |host| {
+            if (!host.profiles_requested and !(host == primary and primary_wants)) continue;
+            host.profiles_requested = false;
+            const had_profiles = host.profiles != null;
+            // An incomplete list (a probe timed out, the SSH config was
+            // busy) does not replace a complete one.
+            if (!discovery.complete and host.profiles_complete) {
+                if (host != self.profiles_requesting_host) host.profilesArrived(had_profiles);
+                continue;
+            }
+            const profiles = windows_shell.cloneProfiles(self.core_app.alloc, discovery.profiles) catch |err| {
+                log.warn("deferred profile discovery failed err={}", .{err});
+                continue;
+            };
+            _ = host.applyProfileDiscovery(.{ .profiles = profiles, .complete = discovery.complete }) catch |err| {
+                log.warn("deferred profile discovery failed err={}", .{err});
+            };
+            if (host != self.profiles_requesting_host) host.profilesArrived(had_profiles);
         }
+    }
+
+    fn anyHostRequestedProfiles(self: *const App) bool {
+        for (self.hosts.items) |host| {
+            if (host.profiles_requested) return true;
+        }
+        return false;
     }
 
     /// The synchronous path, for when no thread can run it.
@@ -8125,20 +8185,18 @@ pub const App = struct {
                         // Also with no Host open: a discovery still running
                         // used the old setting.
                         if (ssh_config_hosts_changed) self.profiles_generation +%= 1;
-                        var jump_list_profiles_pending = ssh_config_hosts_changed and self.jump_list != null;
+                        const jump_list_profiles_pending = ssh_config_hosts_changed and self.jump_list != null;
                         if (jump_list_profiles_pending) self.jump_list.?.updateProfiles(&.{});
+                        // Drop every list before asking for a new one: each drop
+                        // bumps the generation, which would make a discovery
+                        // started in between stale.
+                        if (ssh_config_hosts_changed) {
+                            for (self.hosts.items) |host| host.invalidateProfiles();
+                        }
                         for (self.hosts.items) |host| {
-                            if (ssh_config_hosts_changed) {
-                                host.invalidateProfiles();
-                                if (host.overlay_mode == .profile or jump_list_profiles_pending) {
-                                    _ = host.reloadProfiles() catch |err| blk: {
-                                        log.warn("SSH profile reload after config change failed err={}", .{err});
-                                        break :blk false;
-                                    };
-                                    if (host.profiles != null and host.profiles_complete) {
-                                        jump_list_profiles_pending = false;
-                                    }
-                                }
+                            if (ssh_config_hosts_changed and host.overlay_mode == .profile) {
+                                host.requestProfiles();
+                                host.refreshProfileChrome();
                             }
                             if (host.overlay_mode == .command_palette) host.rebuildPaletteList();
                         }
@@ -9161,7 +9219,7 @@ pub const App = struct {
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
-        try child.spawn();
+        try internal_os.windows.spawnChildHoldingInheritLock(&child);
         return true;
     }
 
@@ -9904,9 +9962,9 @@ pub const App = struct {
         }
 
         for (self.hosts.items) |host| {
-            if (host.profiles != null) {
-                _ = host.reloadProfiles() catch false;
-            }
+            // The pins reordered the list in place; a fresh one from the
+            // discovery worker restores discovery order.
+            if (host.profiles != null) host.requestProfiles();
             host.refreshProfileChrome();
         }
     }
@@ -13040,29 +13098,140 @@ fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, g
     }
 }
 
+fn jumpListRebuildThreadMain(delivery: *AppDelivery, job: *win32_jump_list.RebuildJob) void {
+    defer delivery.release();
+    job.runInOwnApartment();
+    var payload: AppDeliveryPayload = .{ .jump_list = job };
+    if (!delivery.post(c.WM_WINHOSTTY_JUMP_LIST, payload)) payload.deinit();
+}
+
 /// Longer than a discovery can take when it works (two 1.5 s wsl.exe
 /// timeouts and the SSH config read budget).
 const profile_discovery_abandon_ms: u64 = 10 * std.time.ms_per_s;
 
-const ProfileDiscoveryVerdict = enum { apply, already_complete, stale };
-
-/// What to do with a discovery that finished off the UI thread. Profiles a
-/// Host already has completely win (a picker or palette discovered them
-/// meanwhile). Otherwise any replacement or drop since the start (a config
-/// reload with other `ssh-config-hosts`) makes the result stale, and a new
-/// discovery runs with the current settings.
-fn profileDiscoveryVerdict(started: u64, current: u64, host_complete: bool) ProfileDiscoveryVerdict {
-    if (host_complete) return .already_complete;
-    if (started != current) return .stale;
-    return .apply;
+fn testProfileList(alloc: Allocator, keys: []const []const u8) ![]windows_shell.Profile {
+    var source: [4]windows_shell.Profile = undefined;
+    for (keys, 0..) |key, index| source[index] = .{
+        .kind = .pwsh,
+        .key = key,
+        .label = key,
+        .command = .{ .direct = &.{"pwsh.exe"} },
+    };
+    return try windows_shell.cloneProfiles(alloc, source[0..keys.len]);
 }
 
-test "a profile discovery that finished off the UI thread applies only while current" {
-    const testing = std.testing;
-    try testing.expectEqual(ProfileDiscoveryVerdict.apply, profileDiscoveryVerdict(3, 3, false));
-    try testing.expectEqual(ProfileDiscoveryVerdict.stale, profileDiscoveryVerdict(3, 4, false));
-    try testing.expectEqual(ProfileDiscoveryVerdict.already_complete, profileDiscoveryVerdict(3, 3, true));
-    try testing.expectEqual(ProfileDiscoveryVerdict.already_complete, profileDiscoveryVerdict(3, 4, true));
+fn testFreeHostProfiles(app: *App, hosts: []const *Host) void {
+    const alloc = app.core_app.alloc;
+    for (hosts) |host| {
+        if (host.profiles) |profiles| windows_shell.deinitProfiles(alloc, profiles);
+        host.profiles = null;
+        appendOwnedString(alloc, &host.selected_profile_key, null) catch unreachable;
+    }
+    appendOwnedString(alloc, &app.launcher_profile_key, null) catch unreachable;
+}
+
+test "win32 a window without profiles borrows another window's complete list" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var second: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &first, .register = true, .id = 1 },
+            .{ .storage = &second, .register = true, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    defer testFreeHostProfiles(&app, &.{ &first, &second });
+
+    first.profiles = try testProfileList(app.core_app.alloc, &.{ "pwsh", "cmd" });
+    first.profiles_complete = true;
+    const generation = app.profiles_generation;
+
+    // No discovery: the list is copied, and the generation is left alone so
+    // a discovery in flight still applies.
+    try std.testing.expect(second.profilesForChrome());
+    try std.testing.expect(!second.profiles_requested);
+    try std.testing.expectEqual(generation, app.profiles_generation);
+    try std.testing.expectEqual(@as(usize, 2), second.profiles.?.len);
+    try std.testing.expectEqualStrings("cmd", second.profiles.?[1].key);
+    try std.testing.expect(second.profiles.?[0].key.ptr != first.profiles.?[0].key.ptr);
+}
+
+test "win32 a finished discovery reaches only the windows that asked for it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var second: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &first, .register = true, .id = 1 },
+            .{ .storage = &second, .register = true, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    defer testFreeHostProfiles(&app, &.{ &first, &second });
+
+    second.profiles = try testProfileList(app.core_app.alloc, &.{"old"});
+    second.profiles_complete = true;
+    first.profiles_requested = true;
+
+    var completion: ProfileDiscoveryCompletion = .{
+        .arena = .init(std.testing.allocator),
+        .generation = app.profiles_generation,
+    };
+    defer completion.deinit();
+    completion.result = .{
+        .profiles = try testProfileList(completion.arena.allocator(), &.{ "pwsh", "cmd" }),
+        .complete = true,
+    };
+    app.handleProfileDiscovery(&completion);
+
+    try std.testing.expect(!first.profiles_requested);
+    try std.testing.expectEqual(@as(usize, 2), first.profiles.?.len);
+    try std.testing.expect(first.profiles_complete);
+    try std.testing.expectEqual(@as(usize, 1), second.profiles.?.len);
+    try std.testing.expectEqualStrings("old", second.profiles.?[0].key);
+
+    // An incomplete list does not replace a complete one.
+    second.profiles_requested = true;
+    var partial: ProfileDiscoveryCompletion = .{
+        .arena = .init(std.testing.allocator),
+        .generation = app.profiles_generation,
+    };
+    defer partial.deinit();
+    partial.result = .{
+        .profiles = try testProfileList(partial.arena.allocator(), &.{"partial"}),
+        .complete = false,
+    };
+    app.handleProfileDiscovery(&partial);
+    try std.testing.expect(!second.profiles_requested);
+    try std.testing.expectEqualStrings("old", second.profiles.?[0].key);
+
+    // A result that started before a list was applied is dropped.
+    first.profiles_requested = false;
+    second.profiles_requested = false;
+    var stale: ProfileDiscoveryCompletion = .{
+        .arena = .init(std.testing.allocator),
+        .generation = app.profiles_generation -% 1,
+    };
+    defer stale.deinit();
+    stale.result = .{
+        .profiles = try testProfileList(stale.arena.allocator(), &.{"stale"}),
+        .complete = true,
+    };
+    app.handleProfileDiscovery(&stale);
+    try std.testing.expectEqualStrings("pwsh", first.profiles.?[0].key);
 }
 
 fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
@@ -14228,6 +14397,9 @@ const Host = struct {
     overlay_completion_result_id: ?PaletteStableId = null,
     profiles: ?[]windows_shell.Profile = null,
     profiles_complete: bool = false,
+    /// The picker or the palette asked the discovery worker for a list;
+    /// its result is applied here even when a list is already loaded.
+    profiles_requested: bool = false,
     selected_profile: usize = 0,
     selected_profile_key: ?[:0]const u8 = null,
     chrome_brush: HBRUSH = null,
@@ -15901,10 +16073,7 @@ const Host = struct {
             }
         }
 
-        const profiles_ready = self.ensureProfiles() catch |err| blk: {
-            logUiActionError("palette profile load failed", err);
-            break :blk false;
-        };
+        const profiles_ready = self.profilesForChrome();
         if (profiles_ready) {
             for (self.profiles.?) |profile| {
                 _ = self.appendPaletteDescriptor(.{
@@ -18322,8 +18491,14 @@ const Host = struct {
 
     /// Takes ownership of `discovery`'s profiles, also on error.
     fn applyProfileDiscovery(self: *Host, discovery: windows_shell.ProfileDiscovery) !bool {
-        const replacing = self.profiles != null;
+        // A discovery still running started from an older list.
         self.app.profiles_generation +%= 1;
+        return try self.applyProfiles(discovery);
+    }
+
+    /// Takes ownership of `discovery`'s profiles, also on error.
+    fn applyProfiles(self: *Host, discovery: windows_shell.ProfileDiscovery) !bool {
+        const replacing = self.profiles != null;
         const next_profiles = discovery.profiles;
         if (self.profiles) |profiles| windows_shell.deinitProfiles(self.app.core_app.alloc, profiles);
         self.profiles = next_profiles;
@@ -18384,12 +18559,82 @@ const Host = struct {
         _ = try self.setSelectedProfileIndex(self.selected_profile);
     }
 
+    /// For actions that need a list now (open a profile by key or index,
+    /// pin a quick slot). Borrows another window's list, complete or not,
+    /// and discovers on this thread only when no window has one.
     fn ensureProfiles(self: *Host) !bool {
-        if (self.profiles == null) return try self.reloadProfiles();
+        if (self.profiles == null and
+            !self.adoptProfilesFromAnotherHost(true) and
+            !self.adoptProfilesFromAnotherHost(false))
+        {
+            return try self.reloadProfiles();
+        }
         const profiles = self.profiles.?;
         if (profiles.len == 0) return false;
         if (self.selected_profile >= profiles.len) self.selected_profile = 0;
         return true;
+    }
+
+    /// The picker's and the palette's way to a list: never discovers on
+    /// the UI thread. With none loaded it borrows another window's, else
+    /// asks the discovery worker and answers false until that list lands.
+    fn profilesForChrome(self: *Host) bool {
+        if (self.profiles == null and !self.adoptProfilesFromAnotherHost(true)) {
+            self.requestProfiles();
+            // With no worker to run it, the discovery ran on this thread.
+            if (self.profiles == null) return false;
+        }
+        const profiles = self.profiles.?;
+        if (profiles.len == 0) return false;
+        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
+        return true;
+    }
+
+    fn requestProfiles(self: *Host) void {
+        self.profiles_requested = true;
+        const previous = self.app.profiles_requesting_host;
+        self.app.profiles_requesting_host = self;
+        defer self.app.profiles_requesting_host = previous;
+        self.app.startProfileDiscovery();
+    }
+
+    /// Copy a list another window already has (`complete_only`: only a
+    /// complete one). The copy is no newer than a discovery in flight, so it
+    /// leaves the generation alone.
+    fn adoptProfilesFromAnotherHost(self: *Host, complete_only: bool) bool {
+        for (self.app.hosts.items) |other| {
+            if (other == self or (complete_only and !other.profiles_complete)) continue;
+            const source = other.profiles orelse continue;
+            const copy = windows_shell.cloneProfiles(self.app.core_app.alloc, source) catch return false;
+            _ = self.applyProfiles(.{ .profiles = copy, .complete = other.profiles_complete }) catch |err| {
+                log.warn("profile list copy failed err={}", .{err});
+            };
+            return self.profiles != null;
+        }
+        return false;
+    }
+
+    /// A list this host asked the discovery worker for arrived, or the
+    /// discovery failed. `had_profiles`: a list was already showing.
+    fn profilesArrived(self: *Host, had_profiles: bool) void {
+        switch (self.overlay_mode) {
+            .profile => {
+                const profiles = self.profiles orelse &.{};
+                if (profiles.len == 0) {
+                    self.hideOverlay();
+                    runUiActionOrLog("profile overlay dismiss layout failed", self.layout());
+                    runUiActionOrLog(
+                        "profile availability banner failed",
+                        self.setBanner(.err, "No supported Windows profiles detected."),
+                    );
+                    return;
+                }
+                self.refreshProfileChrome();
+            },
+            // Not after a failure: the palette would ask again at once.
+            .command_palette => if (!had_profiles and self.profiles != null) self.rebuildPaletteList(),
+            else => {},
+        }
     }
 
     fn selectedProfileIndex(self: *Host) ?usize {
@@ -18458,19 +18703,19 @@ const Host = struct {
     }
 
     fn toggleProfileOverlay(self: *Host) bool {
-        if (!(self.reloadProfiles() catch false)) {
-            runUiActionOrLog(
-                "profile availability banner failed",
-                self.setBanner(.err, "No supported Windows profiles detected."),
-            );
-            return false;
-        }
         if (self.overlay_mode == .profile) {
             self.hideOverlay();
             runUiActionOrLog("profile overlay dismiss layout failed", self.layout());
             self.forceHostCompositionPaint();
             return true;
         }
+        // Each opening refreshes the list, so a shell installed meanwhile
+        // shows up, but on the discovery worker: until it answers the
+        // picker shows the list it has, or says it is detecting one.
+        // One request either way: a list borrowed from another window is
+        // refreshed too, and with no worker it is one synchronous discovery.
+        if (self.profiles == null) _ = self.adoptProfilesFromAnotherHost(true);
+        self.requestProfiles();
         const initial = self.overlayInitialText(.profile);
         defer if (initial) |value| self.app.core_app.alloc.free(value);
         self.hideOverlay();
@@ -18480,7 +18725,7 @@ const Host = struct {
 
     fn stepProfileSelection(self: *Host, reverse: bool) !bool {
         if (self.overlay_mode != .profile) return false;
-        if (!(try self.ensureProfiles())) return false;
+        if (!self.profilesForChrome()) return false;
         const profiles = self.profiles.?;
         const edit_hwnd = self.overlay_edit_hwnd orelse return false;
         const text = std.mem.trim(u8, try overlayEditText(self), " \t\r\n");
@@ -18541,7 +18786,8 @@ const Host = struct {
     }
 
     fn submitProfileOverlay(self: *Host, open_target: ProfileOpenTarget) !bool {
-        if (!(try self.ensureProfiles())) {
+        if (!self.profilesForChrome()) {
+            if (self.profiles_requested) return false;
             try self.setBanner(.err, "No supported Windows profiles detected.");
             return false;
         }
@@ -20942,7 +21188,7 @@ const Host = struct {
                 host_overlay_command_palette_label_utf8,
             ),
             .profile => {
-                if (!(try self.ensureProfiles())) {
+                if (!self.profilesForChrome()) {
                     return try syncWindowTextUtf8Cached(
                         alloc,
                         label_hwnd,
@@ -21203,6 +21449,14 @@ const Host = struct {
             );
         }
         if (self.overlay_mode == .profile) {
+            if (self.profiles == null and self.profiles_requested) {
+                return try syncWindowTextUtf8Cached(
+                    alloc,
+                    hint_hwnd,
+                    &self.cached_overlay_hint,
+                    "Detecting Windows profiles...",
+                );
+            }
             const hint = try buildProfileHintText(
                 alloc,
                 self.profiles,
@@ -21601,8 +21855,9 @@ const Host = struct {
         const hwnd = self.hwnd orelse return;
         const button = self.overflow_hwnd orelse return;
 
-        // Ensure profiles are loaded before building the menu
-        runUiActionOrLog("overflow profile load failed", self.ensureProfiles());
+        // The menu lists what is loaded; with nothing yet, the discovery
+        // worker fills it for the next opening.
+        _ = self.profilesForChrome();
 
         // Position menu below the dropdown chevron button
         var rect: RECT = undefined;
@@ -31519,7 +31774,12 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
             app.tickCoreAppModal();
             return 0;
         },
-        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT, c.WM_WINHOSTTY_PROFILES => {
+        c.WM_WINHOSTTY_UPDATE,
+        c.WM_WINHOSTTY_TOAST_ACTIVATION,
+        c.WM_WINHOSTTY_UIA_DISCONNECT,
+        c.WM_WINHOSTTY_PROFILES,
+        c.WM_WINHOSTTY_JUMP_LIST,
+        => {
             var payload = delivery.take(message, @bitCast(lparam)) orelse return 0;
             switch (payload) {
                 .update => |completion| {
@@ -31532,6 +31792,10 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
                     // profiles being replaced still open.
                     if (app.pending_profile_discovery) |pending| pending.deinit();
                     app.pending_profile_discovery = completion;
+                },
+                .jump_list => |job| {
+                    defer payload.deinit();
+                    if (app.jump_list) |*jump_list| jump_list.completeRebuild(job);
                 },
                 .toast => |activation| {
                     defer delivery.toast_pending.store(false, .release);
@@ -33078,10 +33342,7 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
                 }
             }
             if (v.overlay_mode == .profile) {
-                const profiles_ready = v.ensureProfiles() catch |err| blk: {
-                    logUiActionError("profile keyboard load failed", err);
-                    break :blk false;
-                };
+                const profiles_ready = v.profilesForChrome();
                 if (profiles_ready) {
                     if (clearQuickSlotPinsRequested(wParam, keyPressed(c.VK_MENU), keyPressed(c.VK_SHIFT))) {
                         if (v.clearQuickSlotPins()) return 0;
