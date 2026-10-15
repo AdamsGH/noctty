@@ -169,7 +169,7 @@ pub fn raiseCurrentStringPropertyChanged(
     provider: *com.IRawElementProviderSimple,
     property_id: i32,
 ) void {
-    if (!clientsAreListening()) return;
+    if (!builtin.is_test and !clientsAreListening()) return;
 
     var new_value = com.VARIANT.empty();
     const query_hr = provider.vtbl.GetPropertyValue(provider, property_id, &new_value);
@@ -247,6 +247,12 @@ pub fn raiseStructureChanged(
     logIfFailed("UIA_StructureChangedEventId", hr);
 }
 
+/// Under test, how many property changes were asked for on this thread. Like
+/// the structure changes above they are counted and not raised: a UIA client
+/// that happens to be attached to the machine holds the provider until it has
+/// read the event, which outlives a test that frees it.
+pub threadlocal var testing_property_changes: usize = 0;
+
 /// VARIANTs are shallow; caller owns any BSTR storage.
 pub fn raisePropertyChanged(
     provider: *com.IRawElementProviderSimple,
@@ -254,6 +260,10 @@ pub fn raisePropertyChanged(
     old_value: com.VARIANT,
     new_value: com.VARIANT,
 ) void {
+    if (builtin.is_test) {
+        testing_property_changes += 1;
+        return;
+    }
     if (!clientsAreListening()) return;
     const hr = com.UiaRaiseAutomationPropertyChangedEvent(
         provider,

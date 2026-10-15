@@ -5456,19 +5456,22 @@ try {
                 @{ Name = 'Window padding Y'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Window padding balance'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Background blur'; Type = [System.Windows.Automation.ControlType]::CheckBox },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Terminal = @(
                 @{ Name = 'Scrollback limit'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Close confirmation'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Copy on select'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Clipboard trimming'; Type = [System.Windows.Automation.ControlType]::CheckBox },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Shell = @(
                 @{ Name = 'Default command'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Shell integration'; Type = [System.Windows.Automation.ControlType]::ComboBox },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Privacy = @(
                 @{ Name = 'OSC 52 clipboard read requests'; Type = [System.Windows.Automation.ControlType]::ComboBox },
@@ -5478,20 +5481,24 @@ try {
                 @{ Name = 'Terminal notifications'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Clipboard-copy notification'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Config-reload notification'; Type = [System.Windows.Automation.ControlType]::CheckBox },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Updates = @(
                 @{ Name = 'Auto-update mode'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Auto-update channel'; Type = [System.Windows.Automation.ControlType]::ComboBox },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Keybindings = @(
                 @{ Name = 'Keybind configuration'; Type = [System.Windows.Automation.ControlType]::Button },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Advanced = @(
                 @{ Name = 'Full config editor'; Type = [System.Windows.Automation.ControlType]::Button },
-                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button }
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
         }
         Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description "Settings cycle $settingsCycle section UIA tree" -Condition {

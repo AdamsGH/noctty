@@ -1100,6 +1100,10 @@ pub const settings_section_count = 7;
 pub const SettingsControlProvider = struct {
     pub const Role = enum {
         text,
+        /// Text that a reader speaks when it changes, such as the status line
+        /// and the close prompt: a non-live element is spoken only if
+        /// something focuses it.
+        live_text,
         edit,
         combo_box,
         check_box,
@@ -1125,6 +1129,9 @@ pub const SettingsControlProvider = struct {
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
     viewport_fully_clipped: std.atomic.Value(bool),
+    /// The field holds a value Settings will not accept
+    /// (`UIA_IsDataValidForFormPropertyId`).
+    data_invalid: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     const vtbl: com.IRawElementProviderSimpleVtbl = .{
         .QueryInterface = QueryInterface,
@@ -1199,6 +1206,29 @@ pub const SettingsControlProvider = struct {
     pub fn raiseFocusChanged(self: *SettingsControlProvider) void {
         if (!self.available()) return;
         events.raiseFocusChanged(&self.base);
+    }
+
+    /// Announce new text in a `live_text` element. Call it once the element is
+    /// on screen: a reader drops a live region that reports `IsOffscreen`.
+    pub fn raiseLiveRegionChanged(self: *SettingsControlProvider) void {
+        if (!self.available() or self.role != .live_text) return;
+        events.raiseNameChanged(&self.base);
+        events.raiseLiveRegionChanged(&self.base);
+    }
+
+    /// Mark the field as holding a value Settings will not accept, or clear it.
+    pub fn setDataInvalid(self: *SettingsControlProvider, invalid: bool) void {
+        if (self.data_invalid.swap(invalid, .acq_rel) == invalid or !self.available()) return;
+        events.raisePropertyChanged(
+            &self.base,
+            constants.UIA_IsDataValidForFormPropertyId,
+            com.VARIANT.fromBool(invalid),
+            com.VARIANT.fromBool(!invalid),
+        );
+    }
+
+    fn isText(self: *const SettingsControlProvider) bool {
+        return self.role == .text or self.role == .live_text;
     }
 
     pub fn disconnect(self: *SettingsControlProvider) com.HRESULT {
@@ -1314,7 +1344,7 @@ pub const SettingsControlProvider = struct {
         const self = fromBase(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role == .text) return com.S_OK;
+        if (self.isText()) return com.S_OK;
         if (self.role == .edit and pattern_id == constants.UIA_ValuePatternId) {
             out.* = @ptrCast(&self.value_iface);
             _ = AddRef(&self.base);
@@ -1342,7 +1372,7 @@ pub const SettingsControlProvider = struct {
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         switch (property) {
             constants.UIA_ControlTypePropertyId => out.* = com.VARIANT.fromI4(switch (self.role) {
-                .text => constants.UIA_TextControlTypeId,
+                .text, .live_text => constants.UIA_TextControlTypeId,
                 .edit => constants.UIA_EditControlTypeId,
                 .combo_box => constants.UIA_ComboBoxControlTypeId,
                 .check_box => constants.UIA_CheckBoxControlTypeId,
@@ -1383,15 +1413,23 @@ pub const SettingsControlProvider = struct {
             => out.* = com.VARIANT.fromBool(self.role != .layout_pane),
             constants.UIA_IsEnabledPropertyId => out.* = com.VARIANT.fromBool(IsWindowEnabled(self.hwnd) != 0),
             constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(
-                self.role != .text and self.role != .layout_pane,
+                !self.isText() and self.role != .layout_pane,
             ),
             constants.UIA_HasKeyboardFocusPropertyId => out.* = com.VARIANT.fromBool(
-                self.role != .text and self.role != .layout_pane and hwndHasKeyboardFocus(self.hwnd),
+                !self.isText() and self.role != .layout_pane and hwndHasKeyboardFocus(self.hwnd),
             ),
             constants.UIA_IsOffscreenPropertyId => out.* = com.VARIANT.fromBool(settingsControlIsOffscreen(
                 IsWindowVisible(self.hwnd),
                 self.viewport_fully_clipped.load(.acquire),
             )),
+            constants.UIA_LiveSettingPropertyId => if (self.role == .live_text) {
+                out.* = com.VARIANT.fromI4(constants.LiveSetting_Polite);
+            },
+            // Only an invalid value is reported: a field with nothing wrong
+            // says nothing, as it did before.
+            constants.UIA_IsDataValidForFormPropertyId => if (self.data_invalid.load(.acquire)) {
+                out.* = com.VARIANT.fromBool(false);
+            },
             else => {},
         }
         return com.S_OK;
@@ -1764,6 +1802,23 @@ pub fn returnSettingsSectionGroupProvider(
     return com.UiaReturnRawElementProvider(hwnd, wParam, lParam, &provider.base);
 }
 
+/// What a Settings section holds that the user should know about without
+/// opening it, in the order of urgency. Reported as the rail button's
+/// `ItemStatus`, so the cue is not the dot on the button alone.
+pub const SettingsSectionMarker = enum(u8) {
+    none,
+    unsaved,
+    invalid,
+
+    pub fn itemStatus(self: SettingsSectionMarker) []const u8 {
+        return switch (self) {
+            .none => "",
+            .unsaved => "Has unsaved changes",
+            .invalid => "Has an invalid value",
+        };
+    }
+};
+
 /// Explicit provider for the settings window's native section radio buttons.
 /// The system UIA bridge reports these push-like BUTTON HWNDs as generic Panes,
 /// so Narrator otherwise loses both their radio role and selection semantics.
@@ -1778,6 +1833,7 @@ pub const SettingsSectionProvider = struct {
     container: *SettingsSectionGroupProvider,
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
+    marker: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SettingsSectionMarker.none)),
 
     const simple_vtbl: com.IRawElementProviderSimpleVtbl = .{
         .QueryInterface = QueryInterface,
@@ -1842,6 +1898,17 @@ pub const SettingsSectionProvider = struct {
     pub fn raiseSelected(self: *SettingsSectionProvider) void {
         if (!self.available()) return;
         events.raiseSelectionItemSelected(&self.base);
+    }
+
+    pub fn markerState(self: *const SettingsSectionProvider) SettingsSectionMarker {
+        return @enumFromInt(self.marker.load(.acquire));
+    }
+
+    /// Say what the section holds; a change is announced as a new `ItemStatus`.
+    pub fn setMarker(self: *SettingsSectionProvider, marker: SettingsSectionMarker) void {
+        if (self.marker.swap(@intFromEnum(marker), .acq_rel) == @intFromEnum(marker)) return;
+        if (!self.available()) return;
+        events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ItemStatusPropertyId);
     }
 
     pub fn raiseFocusChanged(self: *SettingsSectionProvider) void {
@@ -1938,6 +2005,10 @@ pub const SettingsSectionProvider = struct {
             constants.UIA_ControlTypePropertyId => out.* = com.VARIANT.fromI4(constants.UIA_RadioButtonControlTypeId),
             constants.UIA_NamePropertyId => {
                 const bstr = allocBstrFromUtf8(self.alloc, self.name) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
+            },
+            constants.UIA_ItemStatusPropertyId => {
+                const bstr = allocBstrFromUtf8(self.alloc, self.markerState().itemStatus()) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
             constants.UIA_FrameworkIdPropertyId => {
@@ -8050,6 +8121,134 @@ test "SettingsSectionProvider retains its selection container without a cycle" {
     try std.testing.expectEqual(@as(u32, 0), SettingsSectionProvider.Release(&section.base));
     try std.testing.expectEqual(@as(u32, 1), group.refcount.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), SettingsSectionGroupProvider.Release(&group.base));
+}
+
+const settings_provider_windows = struct {
+    extern "user32" fn CreateWindowExW(
+        dwExStyle: u32,
+        lpClassName: [*:0]const u16,
+        lpWindowName: [*:0]const u16,
+        dwStyle: u32,
+        x: i32,
+        y: i32,
+        nWidth: i32,
+        nHeight: i32,
+        hWndParent: ?com.HWND,
+        hMenu: ?*anyopaque,
+        hInstance: ?*anyopaque,
+        lpParam: ?*anyopaque,
+    ) callconv(.winapi) ?com.HWND;
+    extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+
+    fn create(comptime class: []const u8) !com.HWND {
+        return CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral(class),
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            0,
+            0,
+            0,
+            100,
+            100,
+            null,
+            null,
+            null,
+            null,
+        ) orelse error.TestUnexpectedResult;
+    }
+};
+
+fn expectBstrProperty(p: *com.IRawElementProviderSimple, property: i32, expected: []const u8) !void {
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, p.vtbl.GetPropertyValue(p, property, &value));
+    defer _ = com.VariantClear(&value);
+    try std.testing.expectEqual(@as(u16, com.VT_BSTR), value.vt);
+    var expected_w: [64]u16 = undefined;
+    const length = try std.unicode.utf8ToUtf16Le(&expected_w, expected);
+    const bstr = value.value.bstr.?;
+    try std.testing.expectEqualSlices(u16, expected_w[0..length], bstr[0..com.SysStringLen(bstr)]);
+}
+
+test "SettingsControlProvider live text is a Text element a reader speaks when it changes" {
+    const hwnd = try settings_provider_windows.create("STATIC");
+    defer _ = settings_provider_windows.DestroyWindow(hwnd);
+    const live = try SettingsControlProvider.create(std.testing.allocator, hwnd, .live_text, null);
+    defer _ = SettingsControlProvider.Release(&live.base);
+    const plain = try SettingsControlProvider.create(std.testing.allocator, hwnd, .text, null);
+    defer _ = SettingsControlProvider.Release(&plain.base);
+
+    for ([_]*SettingsControlProvider{ live, plain }) |provider| {
+        var value = com.VARIANT.empty();
+        try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&provider.base, constants.UIA_ControlTypePropertyId, &value));
+        try std.testing.expectEqual(constants.UIA_TextControlTypeId, value.value.i4);
+        // Neither takes keyboard focus nor offers a pattern.
+        try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&provider.base, constants.UIA_IsKeyboardFocusablePropertyId, &value));
+        try std.testing.expectEqual(@as(i16, com.VARIANT_FALSE), value.value.bool_val);
+        var pattern: ?*com.IUnknown = null;
+        try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPatternProvider(&provider.base, constants.UIA_ValuePatternId, &pattern));
+        try std.testing.expect(pattern == null);
+    }
+
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&live.base, constants.UIA_LiveSettingPropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_I4), value.vt);
+    try std.testing.expectEqual(constants.LiveSetting_Polite, value.value.i4);
+    // Ordinary text is not a live region.
+    value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&plain.base, constants.UIA_LiveSettingPropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
+}
+
+test "SettingsControlProvider reports a field whose value Settings will not accept" {
+    const hwnd = try settings_provider_windows.create("EDIT");
+    defer _ = settings_provider_windows.DestroyWindow(hwnd);
+    const edit = try SettingsControlProvider.create(std.testing.allocator, hwnd, .edit, "Font size");
+    defer _ = SettingsControlProvider.Release(&edit.base);
+
+    var value = com.VARIANT.empty();
+    // Nothing is said of a field with nothing wrong.
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
+
+    edit.setDataInvalid(true);
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_BOOL), value.vt);
+    try std.testing.expectEqual(@as(i16, com.VARIANT_FALSE), value.value.bool_val);
+
+    edit.setDataInvalid(false);
+    value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
+}
+
+test "SettingsSectionProvider reports what its section holds as ItemStatus" {
+    const hwnd = try settings_provider_windows.create("BUTTON");
+    defer _ = settings_provider_windows.DestroyWindow(hwnd);
+    const group = try SettingsSectionGroupProvider.create(std.testing.allocator, hwnd);
+    const section = try SettingsSectionProvider.create(std.testing.allocator, hwnd, "Appearance", 0, group);
+    group.setSection(0, section);
+    defer {
+        group.detach();
+        section.detach();
+        _ = SettingsSectionProvider.Release(&section.base);
+        _ = SettingsSectionGroupProvider.Release(&group.base);
+    }
+
+    events.testing_property_changes = 0;
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "");
+    section.setMarker(.unsaved);
+    // A new status is announced once; the same one again is not.
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    section.setMarker(.unsaved);
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "Has unsaved changes");
+    section.setMarker(.invalid);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "Has an invalid value");
+    try std.testing.expectEqual(SettingsSectionMarker.invalid, section.markerState());
+    // The name a harness finds the rail button by does not change.
+    try expectBstrProperty(&section.base, constants.UIA_NamePropertyId, "Appearance");
+    section.setMarker(.none);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "");
 }
 
 fn testTerminalState(data: *TestTerminalStateData) TerminalState {

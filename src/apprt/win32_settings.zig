@@ -73,6 +73,8 @@ const DT_CALCRECT: u32 = 0x0400;
 const DT_NOPREFIX: u32 = 0x0800;
 const DT_SINGLELINE: u32 = 0x0020;
 const DT_VCENTER: u32 = 0x0004;
+const DT_CENTER: u32 = 0x0001;
+const NULL_PEN: i32 = 8;
 const GWLP_USERDATA: i32 = -21;
 const GWLP_WNDPROC: i32 = -4;
 const GWL_STYLE: i32 = -16;
@@ -104,6 +106,11 @@ const WM_MOUSELEAVE: UINT = 0x02A3;
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_ACTIVATE: UINT = 0x0006;
+const WM_TIMER: UINT = 0x0113;
+/// The one timer of the Settings window: the quiet period before the error of
+/// a half-typed field is shown (`SettingsWindow.armValidationTimer`).
+const validation_timer_id: usize = 1;
+const validation_quiet_ms: UINT = 400;
 const WM_SETICON: UINT = 0x0080;
 /// `WM_ACTIVATE` low word: the window is being deactivated.
 const WA_INACTIVE: usize = 0;
@@ -179,6 +186,7 @@ const BTN_CONFLICT_KEEP: usize = 303;
 const BTN_CONFLICT_USE_DISK: usize = 304;
 const BTN_CLOSE_SAVE: usize = 305;
 const BTN_CLOSE_DISCARD: usize = 306;
+const BTN_DISCARD_CHANGES: usize = 307;
 // IsDialogMessageW maps Escape to the conventional cancel command ID
 // (IDCANCEL), including when focus is inside an EDIT or COMBO child. The
 // close prompt's "Keep editing" button owns that ID.
@@ -500,6 +508,13 @@ const OwnedSettingField = enum {
     theme,
     command,
 
+    fn section(self: OwnedSettingField) Section {
+        return switch (self) {
+            .font_family, .theme => .appearance,
+            .command => .shell,
+        };
+    }
+
     fn label(self: OwnedSettingField) []const u8 {
         return switch (self) {
             .font_family => "Font family",
@@ -532,6 +547,13 @@ const RawScalarField = enum {
     background_opacity,
     window_padding_x,
     window_padding_y,
+
+    fn section(self: RawScalarField) Section {
+        return switch (self) {
+            .scrollback_limit => .terminal,
+            .font_size, .background_opacity, .window_padding_x, .window_padding_y => .appearance,
+        };
+    }
 };
 
 const raw_scalar_field_count = std.enums.values(RawScalarField).len;
@@ -562,6 +584,9 @@ const StatusNote = enum {
     /// The in-place rewrite stopped part way. Names the complete copy.
     write_incomplete,
     close_failed,
+    /// "Discard changes" threw the draft away.
+    discarded,
+    discard_failed,
     resolve_first,
     conflict_not_resolved,
     disk_value_not_adopted,
@@ -582,6 +607,8 @@ const StatusNote = enum {
             .file_unopenable => "Nothing was saved: a config file cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.",
             .write_incomplete => "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in a temporary file beside it. Copy that over the config file, then save again. Your edits are kept.",
             .close_failed => "Could not close the settings window; your edits are kept.",
+            .discarded => "Changes discarded.",
+            .discard_failed => "Could not discard the changes; they are kept.",
             .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
             .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
             .disk_value_not_adopted => "Could not take the value from disk; your edit is kept.",
@@ -1176,6 +1203,10 @@ const SCROLLINFO = extern struct {
 };
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings");
+const window_title = std.unicode.utf8ToUtf16LeStringLiteral("noctty settings");
+/// The title while there are edits to save, so the taskbar and Alt+Tab say so
+/// before the close prompt does. In words: a reader speaks the title.
+const window_title_unsaved = std.unicode.utf8ToUtf16LeStringLiteral("noctty settings (unsaved changes)");
 /// The child window that holds the form: it clips the fields to the band
 /// between the section header and the action bar, and owns the scroll bar.
 const viewport_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings.viewport");
@@ -1214,6 +1245,9 @@ const settings_label_specs = [_][]const u8{
 };
 
 const settings_text_count = 5 + settings_label_specs.len;
+/// Positions in `SettingsWindow.textHwnd`.
+const text_status_index = 2;
+const text_close_prompt_index = 3;
 const background_blur_label = "Background blur (not supported on Windows)";
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
 const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
@@ -1250,11 +1284,14 @@ const settings_control_specs = [_]struct { role: SettingsControlRole, name: []co
     .{ .role = .button, .name = "Save and close" },
     .{ .role = .button, .name = "Discard changes" },
     .{ .role = .button, .name = "Keep editing" },
+    // The same words as the close prompt's button, which is hidden whenever
+    // this one shows (and the other way round).
+    .{ .role = .button, .name = "Discard changes" },
 };
 const settings_control_count = settings_control_specs.len;
-// Save, conflict resolution, and dirty-close actions remain fixed in the
-// action bar; only the leading content controls are clipped to the viewport.
-const settings_header_control_count = 6;
+// Save, conflict resolution, discard and dirty-close actions remain fixed in
+// the action bar; only the leading content controls are clipped to the viewport.
+const settings_header_control_count = 7;
 const settings_clipped_control_count = settings_control_count - settings_header_control_count;
 
 const FormItem = struct {
@@ -1656,6 +1693,8 @@ pub const SettingsWindow = struct {
     section_uia_group: ?*win32_uia.SettingsSectionGroupProvider = null,
     section_uia_providers: [section_count]?*win32_uia.SettingsSectionProvider = [_]?*win32_uia.SettingsSectionProvider{null} ** section_count,
     btn_save: ?HWND = null,
+    /// Throws the draft away and shows what is saved, without closing.
+    btn_discard_changes: ?HWND = null,
     btn_keybindings_editor: ?HWND = null,
     btn_conflict_keep: ?HWND = null,
     btn_conflict_use_disk: ?HWND = null,
@@ -1780,7 +1819,17 @@ pub const SettingsWindow = struct {
     raw_scalar_dirty: [raw_scalar_field_count]bool = [_]bool{false} ** raw_scalar_field_count,
     /// Borrowed static validation messages for each unparsed scalar field.
     raw_scalar_error: [raw_scalar_field_count]?[]const u8 = [_]?[]const u8{null} ** raw_scalar_field_count,
+    /// Whether the message in `raw_scalar_error` is on screen yet. Text that
+    /// does not parse is wrong for as long as it is half typed ("1" on the way
+    /// to "16"), so the message waits for `validation_quiet_ms` without a key,
+    /// for the field to lose focus, or for a save. Until then the field only
+    /// keeps Save off (`raw_scalar_dirty`).
+    raw_scalar_shown: [raw_scalar_field_count]bool = [_]bool{false} ** raw_scalar_field_count,
     active_raw_validation: ?RawScalarField = null,
+    /// What each rail button and the title were last drawn to say
+    /// (`syncMarkers`), so only a change repaints.
+    section_markers: [section_count]win32_uia.SettingsSectionMarker = [_]win32_uia.SettingsSectionMarker{.none} ** section_count,
+    title_marked: bool = false,
     active_conflict_field: ?SettingField = null,
     active_owned_conflict_field: ?OwnedSettingField = null,
     content_scroll_y: i32 = 0,
@@ -1910,6 +1959,7 @@ pub const SettingsWindow = struct {
         self.focus_before_deactivate = null;
         self.text_uia_prev_proc = null;
         self.btn_save = null;
+        self.btn_discard_changes = null;
         self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
         self.btn_conflict_use_disk = null;
@@ -1967,6 +2017,8 @@ pub const SettingsWindow = struct {
         self.owned_conflict = [_]bool{false} ** owned_setting_field_count;
         self.raw_scalar_dirty = [_]bool{false} ** raw_scalar_field_count;
         self.raw_scalar_error = [_]?[]const u8{null} ** raw_scalar_field_count;
+        self.raw_scalar_shown = [_]bool{false} ** raw_scalar_field_count;
+        self.killValidationTimer();
         self.active_raw_validation = null;
         self.active_conflict_field = null;
         self.active_owned_conflict_field = null;
@@ -2056,9 +2108,16 @@ pub const SettingsWindow = struct {
             self.conflictCount() == 0 and
             self.hasPendingChanges();
         if (self.btn_save) |button| _ = sys.EnableWindow(button, @intFromBool(enabled));
+        if (self.btn_discard_changes) |button| {
+            const discardable = self.hasPendingChanges();
+            // Disabling the focused button would strand the keyboard on it.
+            if (!discardable and GetFocus() == button) self.focusAfterConflictResolution();
+            _ = sys.EnableWindow(button, @intFromBool(discardable));
+        }
         self.updateClosePromptActions();
         self.syncIdleStatus();
         self.syncFieldFrames();
+        self.syncMarkers();
     }
 
     /// Say an outcome (`note`) now, whatever else the line shows, and keep
@@ -2097,7 +2156,7 @@ pub const SettingsWindow = struct {
     fn idleStatusText(self: *const SettingsWindow) []const u8 {
         switch (self.status_note) {
             // A save's result stays up whatever the draft looks like now.
-            .saved => return self.status_note.text(),
+            .saved, .discarded => return self.status_note.text(),
             .saved_overridden => return self.noteText(),
             // These are about edits that are still there to be saved.
             .save_failed,
@@ -2107,6 +2166,7 @@ pub const SettingsWindow = struct {
             .file_unopenable,
             .write_incomplete,
             .close_failed,
+            .discard_failed,
             .resolve_first,
             .conflict_not_resolved,
             .disk_value_not_adopted,
@@ -2138,6 +2198,8 @@ pub const SettingsWindow = struct {
         const index = @intFromEnum(field);
         self.raw_scalar_dirty[index] = false;
         self.raw_scalar_error[index] = null;
+        self.raw_scalar_shown[index] = false;
+        if (!self.hasRawScalarEdits()) self.killValidationTimer();
         if (self.active_raw_validation == field) {
             self.active_raw_validation = null;
             // The remaining errors go to the status line. Moving the user to
@@ -2166,27 +2228,76 @@ pub const SettingsWindow = struct {
         if (self.validation_control == control) self.surfaceNextValidation(false);
     }
 
+    /// Record that `field`'s text does not parse. The message is shown at once
+    /// when the field already shows an error (so it stays true to what is
+    /// typed), otherwise after the quiet period; Save is off either way.
     fn setRawScalarValidationError(
         self: *SettingsWindow,
         field: RawScalarField,
         control: HWND,
         message: []const u8,
     ) void {
-        self.raw_scalar_error[@intFromEnum(field)] = message;
-        self.active_raw_validation = field;
-        self.validation_control = control;
-        self.setStatus(message);
+        const index = @intFromEnum(field);
+        self.raw_scalar_error[index] = message;
+        if (self.raw_scalar_shown[index]) {
+            self.active_raw_validation = field;
+            self.validation_control = control;
+            self.setErrorStatus(message);
+        } else {
+            self.armValidationTimer();
+        }
         self.updateSaveEnabled();
+    }
+
+    fn armValidationTimer(self: *SettingsWindow) void {
+        const hwnd = self.hwnd orelse return;
+        // The same id restarts the countdown, so it is a quiet period.
+        _ = sys.SetTimer(hwnd, validation_timer_id, validation_quiet_ms, null);
+    }
+
+    fn killValidationTimer(self: *SettingsWindow) void {
+        const hwnd = self.hwnd orelse return;
+        _ = sys.KillTimer(hwnd, validation_timer_id);
+    }
+
+    /// Show the errors of the fields that have not shown theirs yet: all of
+    /// them (`only` null), or the one that lost focus.
+    fn showRawScalarErrors(self: *SettingsWindow, only: ?RawScalarField) void {
+        var changed = false;
+        for (std.enums.values(RawScalarField)) |field| {
+            const index = @intFromEnum(field);
+            if (only != null and only.? != field) continue;
+            if (self.raw_scalar_error[index] == null or self.raw_scalar_shown[index]) continue;
+            self.raw_scalar_shown[index] = true;
+            self.active_raw_validation = field;
+            changed = true;
+        }
+        if (changed) self.surfaceNextValidation(false);
+    }
+
+    /// `validation_quiet_ms` passed without a key in an invalid field.
+    fn validationQuietElapsed(self: *SettingsWindow) void {
+        self.killValidationTimer();
+        self.showRawScalarErrors(null);
     }
 
     fn nextRawScalarValidation(self: *const SettingsWindow) ?RawScalarField {
         if (self.active_raw_validation) |field| {
-            if (self.raw_scalar_error[@intFromEnum(field)] != null) return field;
+            const index = @intFromEnum(field);
+            if (self.raw_scalar_error[index] != null and self.raw_scalar_shown[index]) return field;
         }
         for (std.enums.values(RawScalarField)) |field| {
-            if (self.raw_scalar_error[@intFromEnum(field)] != null) return field;
+            const index = @intFromEnum(field);
+            if (self.raw_scalar_error[index] != null and self.raw_scalar_shown[index]) return field;
         }
         return null;
+    }
+
+    /// `message` as the status line's error: the word comes first so the line
+    /// is not an error by its colour alone.
+    fn setErrorStatus(self: *SettingsWindow, message: []const u8) void {
+        var buf: [256]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&buf, "Error: {s}", .{message}) catch message);
     }
 
     fn nextStatus(self: *const SettingsWindow) SettingsStatus {
@@ -2197,14 +2308,92 @@ pub const SettingsWindow = struct {
         return .none;
     }
 
-    fn rawScalarDestination(self: *const SettingsWindow, field: RawScalarField) struct { section: Section, hwnd: ?HWND } {
+    fn rawScalarEdit(self: *const SettingsWindow, field: RawScalarField) ?HWND {
         return switch (field) {
-            .scrollback_limit => .{ .section = .terminal, .hwnd = self.edit_scrollback },
-            .font_size => .{ .section = .appearance, .hwnd = self.edit_font_size },
-            .background_opacity => .{ .section = .appearance, .hwnd = self.edit_bg_opacity },
-            .window_padding_x => .{ .section = .appearance, .hwnd = self.edit_pad_x },
-            .window_padding_y => .{ .section = .appearance, .hwnd = self.edit_pad_y },
+            .scrollback_limit => self.edit_scrollback,
+            .font_size => self.edit_font_size,
+            .background_opacity => self.edit_bg_opacity,
+            .window_padding_x => self.edit_pad_x,
+            .window_padding_y => self.edit_pad_y,
         };
+    }
+
+    fn rawScalarDestination(self: *const SettingsWindow, field: RawScalarField) struct { section: Section, hwnd: ?HWND } {
+        return .{ .section = field.section(), .hwnd = self.rawScalarEdit(field) };
+    }
+
+    fn ownedEdit(self: *const SettingsWindow, field: OwnedSettingField) ?HWND {
+        return switch (field) {
+            .font_family => self.edit_font_family,
+            .theme => self.edit_theme,
+            .command => self.edit_command,
+        };
+    }
+
+    /// What each section holds that its rail button should say. An invalid
+    /// value is the more urgent, so it wins over unsaved changes.
+    fn sectionMarkers(self: *const SettingsWindow) [section_count]win32_uia.SettingsSectionMarker {
+        const Marker = win32_uia.SettingsSectionMarker;
+        var markers = [_]Marker{.none} ** section_count;
+        const Mark = struct {
+            fn at(all: *[section_count]Marker, section: Section, marker: Marker) void {
+                const slot = &all[@intFromEnum(section)];
+                if (@intFromEnum(marker) > @intFromEnum(slot.*)) slot.* = marker;
+            }
+        };
+        if (self.transaction) |transaction| for (transaction.entries) |entry| {
+            if (entry.dirty or entry.conflict) Mark.at(&markers, self.settingDestination(entry.field).section, .unsaved);
+        };
+        for (std.enums.values(RawScalarField)) |field| {
+            const index = @intFromEnum(field);
+            if (self.raw_scalar_dirty[index]) Mark.at(&markers, field.section(), .unsaved);
+            if (self.raw_scalar_error[index] != null and self.raw_scalar_shown[index]) Mark.at(&markers, field.section(), .invalid);
+        }
+        for (std.enums.values(OwnedSettingField)) |field| {
+            const index = @intFromEnum(field);
+            if (self.owned_text_changed[index] or self.owned_dirty[index] or self.owned_conflict[index]) {
+                Mark.at(&markers, field.section(), .unsaved);
+            }
+            if (self.owned_validation_control != null and self.owned_validation_control == self.ownedEdit(field)) {
+                Mark.at(&markers, field.section(), .invalid);
+            }
+        }
+        return markers;
+    }
+
+    /// Whether `field`'s control is showing an error now.
+    fn fieldIsInvalid(self: *const SettingsWindow, control: HWND) bool {
+        for (std.enums.values(RawScalarField)) |field| {
+            const index = @intFromEnum(field);
+            if (self.rawScalarEdit(field) == control) return self.raw_scalar_error[index] != null and self.raw_scalar_shown[index];
+        }
+        return self.owned_validation_control == control;
+    }
+
+    /// Bring everything that says "there is something here" up to date: a dot
+    /// or a mark on the rail buttons, the title, and the same facts for UIA.
+    /// Cheap and idempotent; it runs with every change of state.
+    fn syncMarkers(self: *SettingsWindow) void {
+        const markers = self.sectionMarkers();
+        for (std.enums.values(Section)) |section| {
+            const index = @intFromEnum(section);
+            if (markers[index] == self.section_markers[index]) continue;
+            self.section_markers[index] = markers[index];
+            if (self.sectionProvider(section)) |provider| provider.setMarker(markers[index]);
+            if (self.sectionButton(section)) |button| _ = InvalidateRect(button, null, 0);
+        }
+        const marked = self.hasPendingChanges();
+        if (marked != self.title_marked) {
+            self.title_marked = marked;
+            if (self.hwnd) |hwnd| {
+                _ = sys.SetWindowTextW(hwnd, if (marked) window_title_unsaved else window_title);
+            }
+        }
+        for (0..settings_clipped_control_count) |index| {
+            const provider = self.control_uia_providers[index] orelse continue;
+            const control = self.controlHwnd(index) orelse continue;
+            provider.setDataInvalid(self.fieldIsInvalid(control));
+        }
     }
 
     fn surfaceNextValidation(self: *SettingsWindow, focus: bool) void {
@@ -2216,7 +2405,7 @@ pub const SettingsWindow = struct {
                 const destination = self.rawScalarDestination(field);
                 self.active_raw_validation = field;
                 self.validation_control = destination.hwnd;
-                self.setStatus(self.raw_scalar_error[@intFromEnum(field)].?);
+                self.setErrorStatus(self.raw_scalar_error[@intFromEnum(field)].?);
                 if (focus) if (destination.hwnd) |control| {
                     self.setActiveSection(destination.section);
                     self.ensureControlVisible(control);
@@ -2226,7 +2415,7 @@ pub const SettingsWindow = struct {
             .owned_validation => |control| {
                 self.active_raw_validation = null;
                 self.validation_control = control;
-                self.setStatus(self.owned_validation_message orelse "A settings value is invalid.");
+                self.setErrorStatus(self.owned_validation_message orelse "A settings value is invalid.");
                 if (focus) {
                     if (self.controlIndex(control)) |index| {
                         if (self.controlSection(index)) |section| self.setActiveSection(section);
@@ -2511,6 +2700,13 @@ pub const SettingsWindow = struct {
         if (self.btn_conflict_keep) |button| _ = ShowWindow(button, show);
         if (self.btn_conflict_use_disk) |button| _ = ShowWindow(button, show);
         if (show == SW_HIDE and conflict_button_focused) self.focusAfterConflictResolution();
+        // Discard takes the conflict buttons' place the rest of the time.
+        const discard_hidden = show != SW_HIDE or self.close_prompt_visible;
+        if (self.btn_discard_changes) |button| {
+            const was_focused = focused == button;
+            _ = ShowWindow(button, if (discard_hidden) SW_HIDE else SW_SHOWNORMAL);
+            if (discard_hidden and was_focused) self.focusAfterConflictResolution();
+        }
         return visibility_changed;
     }
 
@@ -2600,6 +2796,7 @@ pub const SettingsWindow = struct {
         self.focus_input_mode = .pointer;
         self.focus_before_deactivate = null;
         self.btn_save = null;
+        self.btn_discard_changes = null;
         self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
         self.btn_conflict_use_disk = null;
@@ -2675,11 +2872,25 @@ pub const SettingsWindow = struct {
         return switch (index) {
             0 => self.text_header,
             1 => self.text_summary,
-            2 => self.text_status,
-            3 => self.text_close_prompt,
+            text_status_index => self.text_status,
+            text_close_prompt_index => self.text_close_prompt,
             4 => self.text_help,
             else => if (index - 5 < self.field_labels.len) self.field_labels[index - 5] else null,
         };
+    }
+
+    /// Announce new text in the status line or the close prompt, the two
+    /// elements Narrator would otherwise never speak: the keyboard focus is
+    /// elsewhere when they change. Without the custom providers the legacy
+    /// name-change event is all a client has.
+    fn announceText(self: *SettingsWindow, index: usize) void {
+        const text = self.textHwnd(index) orelse return;
+        if (self.text_uia_providers[index]) |provider| {
+            // A reader drops a live region that is offscreen.
+            if (sys.IsWindowVisible(text) != 0) provider.raiseLiveRegionChanged();
+            return;
+        }
+        sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, text, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
     }
 
     fn textIndex(self: *const SettingsWindow, hwnd: HWND) ?usize {
@@ -2697,7 +2908,11 @@ pub const SettingsWindow = struct {
         if (!self.canInitializeCustomUiaProviders()) return;
         for (0..settings_text_count) |index| {
             const text = self.textHwnd(index) orelse continue;
-            const provider = win32_uia.SettingsControlProvider.create(std.heap.page_allocator, text, .text, null) catch |err| {
+            const role: SettingsControlRole = switch (index) {
+                text_status_index, text_close_prompt_index => .live_text,
+                else => .text,
+            };
+            const provider = win32_uia.SettingsControlProvider.create(std.heap.page_allocator, text, role, null) catch |err| {
                 std.log.warn("settings text UIA provider unavailable index={} err={}", .{ index, err });
                 continue;
             };
@@ -2804,6 +3019,7 @@ pub const SettingsWindow = struct {
             30 => self.btn_close_save,
             31 => self.btn_close_discard,
             32 => self.btn_close_keep_editing,
+            33 => self.btn_discard_changes,
             else => null,
         };
     }
@@ -3148,11 +3364,13 @@ pub const SettingsWindow = struct {
             sendToBottom(control);
             if (index == 0) startGroup(control);
         };
-        // Conflict choices sit left of Save; the close prompt replaces them all.
+        // Conflict choices and Discard sit left of Save (never together); the
+        // close prompt replaces them all.
         var first_action = true;
         for ([_]?HWND{
             self.btn_conflict_keep,
             self.btn_conflict_use_disk,
+            self.btn_discard_changes,
             self.btn_save,
             self.btn_close_save,
             self.btn_close_discard,
@@ -3216,7 +3434,7 @@ pub const SettingsWindow = struct {
         const status = self.text_status orelse return;
         if (!setWindowTextUtf8IfChanged(status, text)) return;
         self.status_measure_width = -1;
-        sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, status, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
+        if (self.statusAnnounces()) self.announceText(text_status_index);
         // A message too long for the room beside the buttons gets a row of its
         // own, and a shorter one gives it back. The form loses or gains that much
         // height, so the field being typed in is kept in view.
@@ -3224,6 +3442,20 @@ pub const SettingsWindow = struct {
             layoutChildren(self);
             if (GetFocus()) |focused| self.ensureControlVisible(focused);
         }
+    }
+
+    /// Whether the line now says something a screen reader should speak: an
+    /// error, a conflict or the outcome of a save. The hint of what an edit
+    /// does ("Applies when you save.") and the idle line change with nearly
+    /// every edit and are read on request.
+    fn statusAnnounces(self: *const SettingsWindow) bool {
+        return switch (self.nextStatus()) {
+            .none => switch (self.status_note) {
+                .none, .previews_live, .applies_on_save => false,
+                else => true,
+            },
+            else => true,
+        };
     }
 
     fn statusRowChanged(self: *SettingsWindow) bool {
@@ -4158,6 +4390,9 @@ pub const SettingsWindow = struct {
         for (std.enums.values(OwnedSettingField)) |field| {
             if (self.owned_text_changed[@intFromEnum(field)]) self.syncOwnedControl(field);
         }
+        // A close prompt's "Save and close" gets here with a field still inside
+        // its quiet period.
+        self.showRawScalarErrors(null);
         if (self.validation_control) |control| {
             _ = sys.SetFocus(control);
             self.ensureControlVisible(control);
@@ -4240,9 +4475,7 @@ pub const SettingsWindow = struct {
     fn syncClosePromptText(self: *SettingsWindow, announce: bool) void {
         const text = self.text_close_prompt orelse return;
         setWindowTextUtf8(text, closePromptText(self.quit_after_close));
-        if (announce) {
-            sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, text, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
-        }
+        if (announce) self.announceText(text_close_prompt_index);
     }
 
     fn showClosePrompt(self: *SettingsWindow) void {
@@ -4255,6 +4488,7 @@ pub const SettingsWindow = struct {
         if (self.text_status) |text| _ = sys.ShowWindow(text, SW_HIDE);
         if (self.btn_conflict_keep) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.btn_conflict_use_disk) |button| _ = sys.ShowWindow(button, SW_HIDE);
+        if (self.btn_discard_changes) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.btn_save) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.text_close_prompt) |text| _ = sys.ShowWindow(text, SW_SHOWNORMAL);
         if (self.btn_close_save) |button| _ = sys.ShowWindow(button, SW_SHOWNORMAL);
@@ -4347,6 +4581,22 @@ pub const SettingsWindow = struct {
         if (!self.close_prompt_visible or self.close_posted) return;
         self.close_after_save = false;
         self.postCloseNow();
+    }
+
+    /// "Discard changes": throw the draft away and show what is saved, with
+    /// the window still open. It is the re-read a reopened window does after a
+    /// discarded close (`adoptCurrentConfig`), and `clearPending` rolls back
+    /// every live preview on the way.
+    fn discardChanges(self: *SettingsWindow) void {
+        if (self.close_prompt_visible or self.close_posted or !self.hasPendingChanges()) return;
+        self.freeNoteText();
+        self.adoptCurrentConfig() catch |err| {
+            std.log.warn("settings: discarding the draft failed err={}", .{err});
+            self.setNote(.discard_failed);
+            return;
+        };
+        self.refreshAllControls();
+        self.setNote(.discarded);
     }
 
     fn postCloseNow(self: *SettingsWindow) void {
@@ -4475,10 +4725,9 @@ pub const SettingsWindow = struct {
         self.initTransaction();
     }
 
-    /// Open settings at the exact native control that owns `field`.
-    pub fn openField(self: *SettingsWindow, field: SettingField) !void {
-        try self.open();
-        const destination: struct { section: Section, hwnd: ?HWND } = switch (field) {
+    /// The section and the native control that own `field`.
+    fn settingDestination(self: *const SettingsWindow, field: SettingField) struct { section: Section, hwnd: ?HWND } {
+        return switch (field) {
             .font_size => .{ .section = .appearance, .hwnd = self.edit_font_size },
             .background_opacity => .{ .section = .appearance, .hwnd = self.edit_bg_opacity },
             .window_padding_x => .{ .section = .appearance, .hwnd = self.edit_pad_x },
@@ -4502,6 +4751,12 @@ pub const SettingsWindow = struct {
             .auto_update => .{ .section = .updates, .hwnd = self.combo_auto_update },
             .auto_update_channel => .{ .section = .updates, .hwnd = self.combo_auto_update_channel },
         };
+    }
+
+    /// Open settings at the exact native control that owns `field`.
+    pub fn openField(self: *SettingsWindow, field: SettingField) !void {
+        try self.open();
+        const destination = self.settingDestination(field);
         self.setActiveSection(destination.section);
         if (destination.hwnd) |control| {
             self.ensureControlVisible(control);
@@ -4601,7 +4856,7 @@ pub const SettingsWindow = struct {
             }
         }
 
-        const title = std.unicode.utf8ToUtf16LeStringLiteral("noctty settings");
+        const title = window_title;
         // WS_CLIPCHILDREN: painting the frame never paints over a child, so a
         // relayout, a section switch or a theme refresh no longer blanks the
         // form until every control has repainted. The scroll bar belongs to
@@ -4757,6 +5012,20 @@ pub const SettingsWindow = struct {
             32,
             hwnd,
             @ptrFromInt(BTN_SAVE),
+            self.handle.hinstance,
+            null,
+        );
+        self.btn_discard_changes = sys.CreateWindowExW(
+            0,
+            btn_class,
+            std.unicode.utf8ToUtf16LeStringLiteral("Discard changes"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0,
+            0,
+            128,
+            32,
+            hwnd,
+            @ptrFromInt(BTN_DISCARD_CHANGES),
             self.handle.hinstance,
             null,
         );
@@ -5445,6 +5714,10 @@ fn closeActionRowGeometry(available_width: i32, available_height: i32, dpi: u32)
 
 const NormalActionRowGeometry = struct {
     status_right: i32,
+    /// "Discard changes" beside Save. Zero wide while a conflict owns the row
+    /// (its choices are the way out), or when the pane has no room for it.
+    discard_x: i32 = 0,
+    discard_width: i32 = 0,
     keep_mine_x: i32,
     keep_mine_y: i32,
     keep_mine_width: i32,
@@ -5468,8 +5741,12 @@ fn normalActionRowGeometry(pane_width: i32, available_height: i32, conflict: boo
     if (!conflict) {
         const save_width = @min(preferred_save_width, width);
         const save_x = width - save_width;
+        const discard_width = std.math.clamp(save_x - gap, 0, scaleForDpi(128, dpi));
+        const discard_x = if (discard_width > 0) save_x - gap - discard_width else 0;
         return .{
-            .status_right = @max(0, save_x - gap),
+            .discard_x = discard_x,
+            .discard_width = discard_width,
+            .status_right = @max(0, (if (discard_width > 0) discard_x else save_x) - gap),
             .keep_mine_x = 0,
             .keep_mine_y = 0,
             .keep_mine_width = 0,
@@ -6063,7 +6340,13 @@ test "settings status priority survives validation and conflict mutations" {
     settings.edit_font_size = raw_control;
 
     settings.setRawScalarValidationError(.font_size, raw_control, "Font size is required.");
+    // Inside its quiet period the raw error is not a status yet.
     settings.setValidationError(owned_control, "Terminal theme is invalid.");
+    try std.testing.expectEqual(
+        SettingsStatus{ .owned_validation = owned_control },
+        settings.nextStatus(),
+    );
+    settings.showRawScalarErrors(null);
     settings.active_conflict_field = .background_opacity;
     try std.testing.expectEqual(
         SettingsStatus{ .raw_validation = .font_size },
@@ -6145,6 +6428,7 @@ test "settings fixing one of two invalid scalars surfaces the other" {
     settings.setRawScalarValidationError(.font_size, font_size_control, "Font size is required.");
     settings.markRawScalarEdit(.background_opacity);
     settings.setRawScalarValidationError(.background_opacity, opacity_control, "Background opacity is required.");
+    settings.showRawScalarErrors(null);
     try std.testing.expectEqual(RawScalarField.background_opacity, settings.active_raw_validation.?);
     try std.testing.expectEqual(opacity_control, settings.validation_control.?);
 
@@ -6158,6 +6442,361 @@ test "settings fixing one of two invalid scalars surfaces the other" {
         settings.raw_scalar_error[@intFromEnum(RawScalarField.font_size)].?,
     );
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.background_opacity)] == null);
+}
+
+/// Type `text` into `edit` as a person would: the field's own EN_CHANGE reaches
+/// the Settings window, which parses it.
+fn typeInto(edit: HWND, text: []const u8) void {
+    var wide: [64]u16 = undefined;
+    _ = sys.SetWindowTextW(edit, utf8ToW(&wide, text));
+}
+
+test "settings a half-typed number raises no error until the field has been quiet" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const edit = settings.edit_font_size.?;
+            var buf: [256]u8 = undefined;
+
+            // "1" is the first key of "16": no message after it ...
+            typeInto(edit, "1");
+            try std.testing.expect(!std.mem.startsWith(u8, try statusTextOf(settings, &buf), "Error"));
+            try std.testing.expectEqual(SettingsStatus.none, settings.nextStatus());
+            try std.testing.expect(settings.validation_control == null);
+            // ... though Save is off and the half-typed text counts as unsaved.
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+            try std.testing.expect(settings.hasRawScalarEdits());
+            try std.testing.expect(settings.hasPendingChanges());
+
+            // ... and none after the "6" either: 16 is a size.
+            typeInto(edit, "16");
+            try std.testing.expect(!std.mem.startsWith(u8, try statusTextOf(settings, &buf), "Error"));
+            try std.testing.expectEqual(SettingsStatus.none, settings.nextStatus());
+            try std.testing.expect(!settings.hasRawScalarEdits());
+            try std.testing.expectEqual(@as(f32, 16), settings.pending.?.@"font-size");
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+
+            // Stopping on a number that is not a size says so once the quiet
+            // period is over, with the word first and the field framed.
+            typeInto(edit, "1");
+            try std.testing.expectEqual(SettingsStatus.none, settings.nextStatus());
+            settings.validationQuietElapsed();
+            try std.testing.expectEqualStrings(
+                "Error: Font size must be from 6 through 72 points.",
+                try statusTextOf(settings, &buf),
+            );
+            try std.testing.expectEqual(edit, settings.validation_control.?);
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+
+            // A field that shows its error keeps it true to the text.
+            typeInto(edit, "1x");
+            try std.testing.expectEqualStrings(
+                "Error: Font size must be a number from 6 through 72.",
+                try statusTextOf(settings, &buf),
+            );
+
+            // Fixing it takes the message back at once.
+            typeInto(edit, "12");
+            try std.testing.expectEqual(SettingsStatus.none, settings.nextStatus());
+            try std.testing.expect(settings.validation_control == null);
+            try std.testing.expect(!std.mem.startsWith(u8, try statusTextOf(settings, &buf), "Error"));
+        }
+    }.body);
+}
+
+test "settings the quiet period is a real timer and leaving the field ends it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const edit = settings.edit_font_size.?;
+            var buf: [256]u8 = undefined;
+
+            typeInto(edit, "1");
+            const started = sys.GetTickCount64();
+            var elapsed: u64 = 0;
+            while (elapsed < 3000) : (elapsed = sys.GetTickCount64() - started) {
+                var msg: sys.MSG = undefined;
+                while (sys.PeekMessageW(&msg, null, 0, 0, 1) != 0) {
+                    _ = sys.TranslateMessage(&msg);
+                    _ = sys.DispatchMessageW(&msg);
+                }
+                if (std.mem.startsWith(u8, try statusTextOf(settings, &buf), "Error: ")) break;
+                std.Thread.sleep(5 * std.time.ns_per_ms);
+            }
+            // The message came from the timer, not from the key, and not late.
+            try std.testing.expect(elapsed >= validation_quiet_ms - 100);
+            try std.testing.expect(elapsed < 3000);
+            try std.testing.expectEqual(edit, settings.validation_control.?);
+
+            // Another key restarts the countdown: no message for a fresh error.
+            typeInto(edit, "12");
+            typeInto(edit, "1");
+            try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.font_size)] != null);
+            try std.testing.expect(!settings.raw_scalar_shown[@intFromEnum(RawScalarField.font_size)]);
+
+            // Focus leaving the field shows it without waiting.
+            _ = sys.SendMessageW(hwnd, WM_COMMAND, (@as(usize, EN_KILLFOCUS) << 16) | EDIT_FONT_SIZE, @bitCast(@intFromPtr(edit)));
+            try std.testing.expect(settings.raw_scalar_shown[@intFromEnum(RawScalarField.font_size)]);
+            try std.testing.expectEqualStrings(
+                "Error: Font size must be from 6 through 72 points.",
+                try statusTextOf(settings, &buf),
+            );
+        }
+    }.body);
+}
+
+test "settings Save shows an error still inside its quiet period instead of saving past it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buf: [256]u8 = undefined;
+
+            typeInto(settings.edit_font_size.?, "1");
+            try std.testing.expectEqual(SettingsStatus.none, settings.nextStatus());
+            // The close prompt's "Save and close" calls save() directly.
+            settings.save();
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+            try std.testing.expectEqual(settings.edit_font_size.?, settings.validation_control.?);
+            try std.testing.expect(std.mem.startsWith(u8, try statusTextOf(settings, &buf), "Error: "));
+        }
+    }.body);
+}
+
+test "settings an invalid field marks its rail section, the title and UIA" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const Marker = win32_uia.SettingsSectionMarker;
+
+            for (std.enums.values(Section)) |section| {
+                try std.testing.expectEqual(Marker.none, settings.sectionProvider(section).?.markerState());
+            }
+            try std.testing.expectEqualStrings("noctty settings", try titleOf(hwnd));
+
+            // An unsaved edit marks its own section and the title, not the others.
+            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncConfirmCloseFromCombo();
+            try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.terminal).?.markerState());
+            try std.testing.expectEqual(Marker.none, settings.sectionProvider(.appearance).?.markerState());
+            try std.testing.expectEqualStrings("noctty settings (unsaved changes)", try titleOf(hwnd));
+
+            // A half-typed number marks Appearance as unsaved, and as invalid
+            // once its error is shown. The field says so too.
+            typeInto(settings.edit_font_size.?, "1");
+            try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.appearance).?.markerState());
+            const field = settings.control_uia_providers[settings.controlIndex(settings.edit_font_size.?).?].?;
+            try std.testing.expect(!field.data_invalid.load(.acquire));
+            settings.validationQuietElapsed();
+            try std.testing.expectEqual(Marker.invalid, settings.sectionProvider(.appearance).?.markerState());
+            try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.terminal).?.markerState());
+            try std.testing.expect(field.data_invalid.load(.acquire));
+
+            // Correcting it clears the error but leaves nothing unsaved only
+            // when the value is back to what is saved.
+            typeInto(settings.edit_font_size.?, "16");
+            try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.appearance).?.markerState());
+            try std.testing.expect(!field.data_invalid.load(.acquire));
+            typeInto(settings.edit_font_size.?, "12");
+            try std.testing.expectEqual(Marker.none, settings.sectionProvider(.appearance).?.markerState());
+
+            // The mark follows the section's own state through a discard.
+            settings.discardChanges();
+            try std.testing.expectEqual(Marker.none, settings.sectionProvider(.terminal).?.markerState());
+            try std.testing.expectEqualStrings("noctty settings", try titleOf(hwnd));
+        }
+    }.body);
+}
+
+test "settings an invalid value in a field that is not a number marks its section" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const Marker = win32_uia.SettingsSectionMarker;
+
+            // The theme is parsed when the field is left; half a light/dark
+            // pair is not a theme.
+            typeInto(settings.edit_theme.?, "light:solo");
+            try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.appearance).?.markerState());
+            settings.syncThemeFromEdit();
+            try std.testing.expectEqual(Marker.invalid, settings.sectionProvider(.appearance).?.markerState());
+            var buf: [256]u8 = undefined;
+            try std.testing.expectEqualStrings(
+                "Error: Terminal theme must be a valid name, path, or light/dark pair.",
+                try statusTextOf(settings, &buf),
+            );
+            try std.testing.expect(settings.control_uia_providers[settings.controlIndex(settings.edit_theme.?).?].?.data_invalid.load(.acquire));
+        }
+    }.body);
+}
+
+fn titleOf(hwnd: HWND) ![]const u8 {
+    const Storage = struct {
+        var utf8: [128]u8 = undefined;
+    };
+    var wide: [128]u16 = undefined;
+    const n = sys.GetWindowTextW(hwnd, &wide, @intCast(wide.len));
+    const len = try std.unicode.utf16LeToUtf8(&Storage.utf8, wide[0..@intCast(n)]);
+    return Storage.utf8[0..len];
+}
+
+test "settings status and close prompt are live regions" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const Role = win32_uia.SettingsControlProvider.Role;
+
+            try std.testing.expectEqual(Role.live_text, settings.text_uia_providers[text_status_index].?.role);
+            try std.testing.expectEqual(Role.live_text, settings.text_uia_providers[text_close_prompt_index].?.role);
+            // Everything else read aloud on request stays ordinary text.
+            for (0..settings_text_count) |index| {
+                if (index == text_status_index or index == text_close_prompt_index) continue;
+                const provider = settings.text_uia_providers[index] orelse continue;
+                try std.testing.expectEqual(Role.text, provider.role);
+            }
+
+            // What is announced: errors and outcomes, not the hint that the
+            // next edit applies on save.
+            try std.testing.expect(!settings.statusAnnounces());
+            settings.status_note = .applies_on_save;
+            try std.testing.expect(!settings.statusAnnounces());
+            settings.status_note = .saved;
+            try std.testing.expect(settings.statusAnnounces());
+            settings.status_note = .save_failed;
+            try std.testing.expect(settings.statusAnnounces());
+            settings.status_note = .none;
+            settings.active_conflict_field = .font_size;
+            try std.testing.expect(settings.statusAnnounces());
+        }
+    }.body);
+}
+
+test "settings Discard changes throws the draft away and keeps the window" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const discard = settings.btn_discard_changes.?;
+            var buf: [256]u8 = undefined;
+
+            // Beside Save, and idle with Save while nothing is edited.
+            try std.testing.expect(sys.IsWindowVisible(discard) != 0);
+            try std.testing.expect(sys.IsWindowEnabled(discard) == 0);
+            const discard_rect = dialog_test.rectIn(fixture.hwnd(), discard);
+            const save_rect = dialog_test.rectIn(fixture.hwnd(), settings.btn_save.?);
+            try std.testing.expect(discard_rect.right <= save_rect.left);
+            try std.testing.expectEqual(discard_rect.top, save_rect.top);
+
+            // Edits across sections, one of them half typed.
+            const original_cursor = settings.original.?.@"cursor-style";
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            typeInto(settings.edit_font_size.?, "1");
+            try std.testing.expect(sys.IsWindowEnabled(discard) != 0);
+
+            _ = sys.SetFocus(discard);
+            _ = sys.SendMessageW(discard, BM_CLICK, 0, 0);
+
+            // Everything is back to what is saved, the window is open, and the
+            // button that was pressed is no longer where the keyboard sits.
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expectEqual(original_cursor, settings.pending.?.@"cursor-style");
+            try std.testing.expectEqual(
+                @as(LRESULT, @intCast(comboIndexFromCursorStyle(original_cursor))),
+                sys.SendMessageW(settings.combo_cursor_style.?, CB_GETCURSEL, 0, 0),
+            );
+            var edit_text: [16]u8 = undefined;
+            try std.testing.expectEqualStrings("12", readEditUtf8(settings.edit_font_size.?, &edit_text).?);
+            try std.testing.expect(sys.IsWindowEnabled(discard) == 0);
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+            try std.testing.expect(sys.GetFocus().? != discard);
+            try std.testing.expect(sys.IsWindow(fixture.hwnd()) != 0);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+            try std.testing.expectEqualStrings("Changes discarded.", try statusTextOf(settings, &buf));
+            try std.testing.expectEqualStrings("noctty settings", try titleOf(fixture.hwnd()));
+
+            // The next edit replaces the note, as any outcome is replaced.
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
+        }
+    }.body);
+}
+
+test "settings Discard changes gives way to the conflict choices and to the close prompt" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const discard = settings.btn_discard_changes.?;
+
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            try std.testing.expect(sys.IsWindowVisible(discard) != 0);
+
+            // The close prompt hides it with Save and brings it back with Save.
+            settings.showClosePrompt();
+            try std.testing.expect(sys.IsWindowVisible(discard) == 0);
+            settings.cancelClosePrompt();
+            try std.testing.expect(sys.IsWindowVisible(discard) != 0);
+
+            // A disk change to the same setting is a conflict: Keep mine and
+            // Use disk take the row, and Discard does not share it.
+            var reloaded = try Config.default(std.testing.allocator);
+            defer reloaded.deinit();
+            for (std.enums.values(@TypeOf(reloaded.@"cursor-style"))) |style| {
+                if (style == settings.original.?.@"cursor-style" or style == settings.pending.?.@"cursor-style") continue;
+                reloaded.@"cursor-style" = style;
+                break;
+            }
+            settings.externalConfigChanged(&reloaded, 100);
+            _ = settings.syncConflictControls();
+            try std.testing.expect(settings.active_conflict_field != null);
+            try std.testing.expect(sys.IsWindowVisible(settings.btn_conflict_keep.?) != 0);
+            try std.testing.expect(sys.IsWindowVisible(discard) == 0);
+        }
+    }.body);
+}
+
+test "settings Discard changes sits beside Save and never over the status or the edge" {
+    for ([_]u32{ 96, 120, 144, 168, 192, 288 }) |dpi| {
+        const height = scaleForDpi(settings_control_height, dpi);
+        const wide = scaleForDpi(560, dpi);
+        const bar = normalActionRowGeometry(wide, height, false, dpi);
+        try std.testing.expect(bar.discard_width > 0);
+        try std.testing.expectEqual(bar.save_x, bar.discard_x + bar.discard_width + scaleForDpi(settings_action_gap, dpi));
+        try std.testing.expectEqual(bar.discard_x - scaleForDpi(settings_action_gap, dpi), bar.status_right);
+        try std.testing.expect(bar.discard_x >= 0);
+
+        // A conflict owns the row.
+        const conflict = normalActionRowGeometry(wide, height, true, dpi);
+        try std.testing.expectEqual(@as(i32, 0), conflict.discard_width);
+
+        // However narrow the pane, nothing lands left of its edge.
+        for ([_]i32{ 0, 1, scaleForDpi(80, dpi), scaleForDpi(120, dpi), scaleForDpi(220, dpi) }) |narrow| {
+            const squeezed = normalActionRowGeometry(narrow, height, false, dpi);
+            try std.testing.expect(squeezed.discard_x >= 0);
+            try std.testing.expect(squeezed.discard_width >= 0);
+            try std.testing.expect(squeezed.discard_x + squeezed.discard_width <= squeezed.save_x or squeezed.discard_width == 0);
+            try std.testing.expect(squeezed.status_right >= 0);
+        }
+    }
 }
 
 test "settings minimum track size caps to target monitor work area" {
@@ -6864,8 +7503,8 @@ fn ChildPlacements(comptime capacity: usize) type {
     };
 }
 
-/// Rail buttons, header, summary, viewport, status, prompt, five action buttons.
-const settings_frame_child_count = section_count + 11;
+/// Rail buttons, header, summary, viewport, status, prompt, seven action buttons.
+const settings_frame_child_count = section_count + 12;
 /// Every label and field of the largest section, and the help text.
 const settings_form_child_count = settings_max_form_items * 2 + 1;
 
@@ -6982,6 +7621,7 @@ fn layoutChildren(self: *SettingsWindow) void {
     const action_gap = self.px(settings_action_gap);
     const normal_actions = action_bar.normal_actions;
     frame.add(self.btn_save, pane_left + normal_actions.save_x, row_top + normal_actions.save_y, normal_actions.save_width, normal_actions.button_height);
+    frame.add(self.btn_discard_changes, pane_left + normal_actions.discard_x, row_top + normal_actions.save_y, normal_actions.discard_width, normal_actions.button_height);
     frame.add(self.btn_conflict_keep, pane_left + normal_actions.keep_mine_x, row_top + normal_actions.keep_mine_y, normal_actions.keep_mine_width, normal_actions.button_height);
     frame.add(self.btn_conflict_use_disk, pane_left + normal_actions.use_disk_x, row_top + normal_actions.use_disk_y, normal_actions.use_disk_width, normal_actions.button_height);
     if (action_bar.status_separate) {
@@ -7689,16 +8329,19 @@ test "settings Tab visits the fields in form order and Save last" {
                     current = dialog_test.GetNextDlgTabItem(hwnd, current, 0) orelse break;
                     if (current == first) break;
                 }
-                // Every field in form order, then Save, then the rail wraps.
-                try std.testing.expectEqual(field_count + 2, count);
+                // Every field in form order, then Discard changes and Save (the
+                // order they are laid out in), then the rail wraps.
+                try std.testing.expectEqual(field_count + 3, count);
                 for (fields[0..field_count], 0..) |control, index| {
                     try std.testing.expectEqual(control, visited[index]);
                 }
-                try std.testing.expectEqual(settings.btn_save.?, visited[field_count]);
-                try std.testing.expectEqual(settings.sectionButton(section).?, visited[field_count + 1]);
+                try std.testing.expectEqual(settings.btn_discard_changes.?, visited[field_count]);
+                try std.testing.expectEqual(settings.btn_save.?, visited[field_count + 1]);
+                try std.testing.expectEqual(settings.sectionButton(section).?, visited[field_count + 2]);
 
-                // Shift+Tab walks it back: Save, the fields in reverse, the rail.
-                var back = settings.btn_save.?;
+                // Shift+Tab walks it back: Save, Discard, the fields in reverse, the rail.
+                try std.testing.expectEqual(settings.btn_discard_changes.?, dialog_test.GetNextDlgTabItem(hwnd, settings.btn_save.?, 1).?);
+                var back = settings.btn_discard_changes.?;
                 var index = field_count;
                 while (index > 0) {
                     index -= 1;
@@ -7782,6 +8425,7 @@ test "settings correcting one invalid field does not move to another section" {
     settings.active_section = .appearance;
     settings.markRawScalarEdit(.font_size);
     settings.setRawScalarValidationError(.font_size, settings.edit_font_size.?, "Font size is required.");
+    settings.showRawScalarErrors(null);
 
     // Typing a valid size leaves the user in Appearance; the other error stays
     // in the status line for them to find.
@@ -9201,6 +9845,11 @@ fn paintSettingsSectionButton(hwnd: HWND, settings: *SettingsWindow) void {
     );
     if (label_len > 0) _ = DrawTextW(hdc, &label, label_len, &text_rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
+    if (settings.sectionForButton(hwnd)) |section| {
+        const marker = settings.section_markers[@intFromEnum(section)];
+        if (marker != .none) drawSectionMarker(hdc, settings, rect, marker, fill_color, selected);
+    }
+
     if (focused) {
         const ring_color = if (colors.high_contrast and selected) colors.selection_text else colors.focus_ring;
         const ring = CreateSolidBrush(ring_color) orelse return;
@@ -9220,6 +9869,49 @@ fn paintSettingsSectionButton(hwnd: HWND, settings: *SettingsWindow) void {
             focus_rect.bottom -= 1;
         }
     }
+}
+
+/// The mark at the right end of a rail button (`SettingsWindow.syncMarkers`).
+/// A small dot means unsaved changes; an invalid value is a larger disc with
+/// an exclamation mark. They differ in shape and size, not only in colour, and
+/// High Contrast draws both in a text colour.
+fn drawSectionMarker(
+    hdc: HDC,
+    settings: *SettingsWindow,
+    rect: RECT,
+    marker: win32_uia.SettingsSectionMarker,
+    background: COLORREF,
+    selected: bool,
+) void {
+    const colors = settings.theme_adapter.colors;
+    const invalid = marker == .invalid;
+    const diameter = settings.px(if (invalid) settings_metrics.space_6 else settings_metrics.space_3);
+    const right = rect.right - settings.px(settings_metrics.space_4);
+    const top = rect.top + @divTrunc(rect.bottom - rect.top - diameter, 2);
+    const fill = if (invalid)
+        colors.error_text
+    else if (colors.high_contrast)
+        (if (selected) colors.selection_text else colors.text)
+    else
+        colors.accent;
+    const brush = CreateSolidBrush(fill) orelse return;
+    defer _ = DeleteObject(brush);
+    const previous_brush = SelectObject(hdc, brush);
+    const previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    defer {
+        if (previous_pen) |value| _ = SelectObject(hdc, value);
+        if (previous_brush) |value| _ = SelectObject(hdc, value);
+    }
+    // The null pen leaves the right and bottom edges out of the ellipse.
+    _ = sys.Ellipse(hdc, right - diameter, top, right + 1, top + diameter + 1);
+    if (!invalid) return;
+    var glyph: RECT = .{ .left = right - diameter, .top = top, .right = right, .bottom = top + diameter };
+    const previous_font = if (settings.emphasis_font) |font| SelectObject(hdc, font) else null;
+    defer {
+        if (previous_font) |value| _ = SelectObject(hdc, value);
+    }
+    _ = SetTextColor(hdc, background);
+    _ = DrawTextW(hdc, std.unicode.utf8ToUtf16LeStringLiteral("!"), 1, &glyph, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
 }
 
 fn settingsSectionButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
@@ -9538,6 +10230,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 if (owner) |o| o.saveIfAllowed();
                 return 0;
             }
+            if (clickedButton(id, notify, BTN_DISCARD_CHANGES)) {
+                if (owner) |o| o.discardChanges();
+                return 0;
+            }
             if (clickedButton(id, notify, BTN_CLOSE_SAVE)) {
                 if (owner) |o| o.saveAndClose();
                 return 0;
@@ -9570,6 +10266,12 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 if (owner) |o| o.syncScrollbackFromEdit();
                 return 0;
             }
+            // A field the user leaves says what is wrong with it without
+            // waiting out the quiet period.
+            if (notify == EN_KILLFOCUS) if (rawScalarForEditId(id)) |field| {
+                if (owner) |o| o.showRawScalarErrors(field);
+                return 0;
+            };
             // These parse into pending._arena; record raw dirtiness immediately
             // so closing a focused edit cannot silently discard text, then
             // defer allocation to EN_KILLFOCUS/Save.
@@ -9703,6 +10405,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (owner) |o| o.requestClose(hwnd);
             return 0;
         },
+        WM_TIMER => {
+            if (wParam != validation_timer_id) return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (owner) |o| o.validationQuietElapsed();
+            return 0;
+        },
         WM_SETTINGS_CLOSE_NOW => {
             if (owner) |o| {
                 if (o.close_posted) o.closeNow(hwnd);
@@ -9723,6 +10430,18 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         },
         else => return sys.DefWindowProcW(hwnd, msg, wParam, lParam),
     }
+}
+
+/// The raw scalar field behind a text field's control id.
+fn rawScalarForEditId(id: usize) ?RawScalarField {
+    return switch (id) {
+        EDIT_SCROLLBACK => .scrollback_limit,
+        EDIT_FONT_SIZE => .font_size,
+        EDIT_BG_OPACITY => .background_opacity,
+        EDIT_PAD_X => .window_padding_x,
+        EDIT_PAD_Y => .window_padding_y,
+        else => null,
+    };
 }
 
 fn recoverOwner(hwnd: HWND) ?*SettingsWindow {

@@ -46,6 +46,7 @@ pub const UIA_HasKeyboardFocusPropertyId: i32 = 30008;
 pub const UIA_IsEnabledPropertyId: i32 = 30010;
 pub const UIA_HelpTextPropertyId: i32 = 30013;
 pub const UIA_ItemStatusPropertyId: i32 = 30026;
+pub const UIA_IsDataValidForFormPropertyId: i32 = 30103;
 pub const UIA_FrameworkIdPropertyId: i32 = 30024;
 pub const UIA_ValueValuePropertyId: i32 = 30045;
 pub const UIA_ValueIsReadOnlyPropertyId: i32 = 30046;
