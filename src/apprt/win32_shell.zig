@@ -242,6 +242,53 @@ test "win32 shell last active tab becomes retained inactive window and restores"
     try std.testing.expect(state.tab(tab_id).?.focused_pane.eql(pane_id));
 }
 
+test "win32 shell restoring a tab that closed behind the front one leaves the front alone" {
+    const allocator = std.testing.allocator;
+    var state = model.ShellState.init(allocator);
+    defer state.deinit();
+
+    var result = try reducer.apply(&state, .create_window);
+    result.deinit(allocator);
+    const window_id = state.windows.items[0].id;
+    const behind = state.tabs.items[0].id;
+    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result.deinit(allocator);
+    const front = state.window(window_id).?.active_tab.?;
+    result = try reducer.apply(&state, .{ .detach_tab = behind });
+    result.deinit(allocator);
+    try std.testing.expect(state.window(window_id).?.active_tab.?.eql(front));
+
+    result = try reducer.apply(&state, .{ .restore_tab = .{ .tab = behind, .index = 0, .activate = false } });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
+    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[0]));
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
+    try state.validate();
+    const window = state.window(window_id).?;
+    try std.testing.expect(window.tabs.items[0].eql(behind));
+    try std.testing.expect(window.tabs.items[1].eql(front));
+    try std.testing.expect(window.active_tab.?.eql(front));
+}
+
+test "win32 shell restoring into a window with no tab in front activates the tab whatever is asked" {
+    const allocator = std.testing.allocator;
+    var state = model.ShellState.init(allocator);
+    defer state.deinit();
+
+    var result = try reducer.apply(&state, .create_window);
+    result.deinit(allocator);
+    const window_id = state.windows.items[0].id;
+    const tab_id = state.tabs.items[0].id;
+    result = try reducer.apply(&state, .{ .detach_tab = tab_id });
+    result.deinit(allocator);
+
+    result = try reducer.apply(&state, .{ .restore_tab = .{ .tab = tab_id, .index = 0, .activate = false } });
+    defer result.deinit(allocator);
+    try state.validate();
+    try std.testing.expect(state.window(window_id).?.active_tab.?.eql(tab_id));
+    try std.testing.expect(state.focused_window.?.eql(window_id));
+}
+
 test "win32 shell discarding detached tab releases complete subtree and retained window" {
     const allocator = std.testing.allocator;
     var state = model.ShellState.init(allocator);
