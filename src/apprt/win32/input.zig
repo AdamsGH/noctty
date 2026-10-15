@@ -642,10 +642,10 @@ fn keyFromVirtualKey(vk: UINT, lParam: LPARAM) input.Key {
         c.VK_OEM_5 => .backslash,
         c.VK_OEM_6 => .bracket_right,
         c.VK_OEM_7 => .quote,
-        // The extra key beside left Shift on ISO keyboards, which a Japanese
-        // keyboard's Ro key (scan code 0x73, `IntlRo`) shares a virtual key
-        // with, and the Brazilian ABNT2 key beside right Shift.
-        c.VK_OEM_102 => if (scanCodeFromLParam(lParam) == 0x73) .intl_ro else .intl_backslash,
+        // The `<>|` key beside left Shift on ISO keyboards, and the Brazilian
+        // ABNT2 key beside right Shift. `hotkeyPhysicalVirtualKey` names them
+        // the same way, so a global hotkey and a key event agree on the key.
+        c.VK_OEM_102 => .intl_backslash,
         c.VK_ABNT_C1 => .intl_ro,
         c.VK_0...c.VK_9 => input.Key.fromASCII(@as(u8, @intCast('0' + (vk - c.VK_0)))) orelse .unidentified,
         c.VK_A...c.VK_Z => input.Key.fromASCII(@as(u8, @intCast('a' + (vk - c.VK_A)))) orelse .unidentified,
@@ -1604,13 +1604,10 @@ test "win32 keyFromVirtualKey maps core keys" {
 }
 
 test "win32 keyFromVirtualKey identifies the ISO and ABNT keys" {
-    // The `<>|` key every European ISO keyboard has beside left Shift (scan
-    // code 0x56) and the extra ABNT2 key beside right Shift. A Japanese
-    // keyboard's Ro key reports VK_OEM_102 too, with scan code 0x73.
-    try std.testing.expectEqual(input.Key.intl_backslash, keyFromVirtualKey(c.VK_OEM_102, 0x56 << 16));
+    // The `<>|` key every European ISO keyboard has beside left Shift and the
+    // extra ABNT2 key beside right Shift.
     try std.testing.expectEqual(input.Key.intl_backslash, keyFromVirtualKey(c.VK_OEM_102, 0));
-    try std.testing.expectEqual(input.Key.intl_ro, keyFromVirtualKey(c.VK_OEM_102, 0x73 << 16));
-    try std.testing.expectEqual(input.Key.intl_ro, keyFromVirtualKey(c.VK_ABNT_C1, 0x73 << 16));
+    try std.testing.expectEqual(input.Key.intl_ro, keyFromVirtualKey(c.VK_ABNT_C1, 0));
 }
 
 test "win32 global hotkeys can name the ISO and ABNT keys" {
