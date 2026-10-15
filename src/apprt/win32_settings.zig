@@ -2021,7 +2021,7 @@ pub const SettingsWindow = struct {
 
     /// Put every live preview back to the saved value. The preview writes the
     /// draft into the app's config, which is what `currentConfig` hands out, so
-    /// anything that reads it as "what is saved" has to run this first.
+    /// that is not "what is saved" while previews are on: use `self.current`.
     fn rollbackPreviews(self: *SettingsWindow) void {
         const transaction = &(self.transaction orelse return);
         var effects: [setting_field_count]SettingsTransaction.Effect = undefined;
@@ -4600,8 +4600,9 @@ pub const SettingsWindow = struct {
         _ = self.syncConflictControls();
         self.updateSaveEnabled();
         layoutChildren(self);
-        // An error that came up while the prompt hid the line was not spoken.
-        if (self.nextStatus() != .none) self.announceText(text_status_index);
+        // What came up while the prompt hid the line (an error, or the failure
+        // of a Save and close) was not spoken.
+        if (self.statusAnnounces()) self.announceText(text_status_index);
 
         if (prior_focus) |control| {
             const belongs_to_settings = if (self.hwnd) |settings_hwnd|
@@ -4643,18 +4644,19 @@ pub const SettingsWindow = struct {
     }
 
     /// "Discard changes": throw the draft away and show what is saved, with
-    /// the window still open. It is the re-read a reopened window does after a
-    /// discarded close (`adoptCurrentConfig`), and `clearPending` rolls back
-    /// every live preview on the way.
+    /// the window still open: `adoptConfig` from this window's own snapshot of
+    /// the saved config, which rolls every live preview back on the way.
     fn discardChanges(self: *SettingsWindow) void {
         // Not while the button is hidden: UIA can invoke it there.
         const button = self.btn_discard_changes orelse return;
         if (sys.IsWindowVisible(button) == 0 or self.close_posted or !self.hasPendingChanges()) return;
+        const saved = &(self.current orelse return);
         self.freeNoteText();
-        // The saved config is read next, and the previews have written the
-        // draft over it.
-        self.rollbackPreviews();
-        self.adoptCurrentConfig() catch |err| {
+        // From this window's own snapshot of what is saved, not from
+        // `currentConfig`: the live previews have written the draft into that
+        // one. The copies come first, then the previews are rolled back
+        // (`clearPending`), so a failure to copy leaves the draft whole.
+        self.adoptConfig(saved) catch |err| {
             std.log.warn("settings: discarding the draft failed err={}", .{err});
             self.setNote(.discard_failed);
             return;
@@ -4772,7 +4774,14 @@ pub const SettingsWindow = struct {
     }
 
     fn adoptCurrentConfig(self: *SettingsWindow) !void {
-        const current = self.handle.currentConfig(self.handle.ctx);
+        return self.adoptConfig(self.handle.currentConfig(self.handle.ctx));
+    }
+
+    /// Start the draft over from `current`. Nothing is touched until every copy
+    /// is made, so a failure leaves the draft, its tracking and its previews as
+    /// they were. `current` may be this window's own snapshot, which is freed
+    /// only after the copies exist.
+    fn adoptConfig(self: *SettingsWindow, current: *const Config) !void {
         var original = try current.clone(self.handle.alloc);
         errdefer original.deinit();
         var current_snapshot = try current.clone(self.handle.alloc);
@@ -6795,6 +6804,92 @@ test "settings status and close prompt are live regions" {
             try std.testing.expectEqual(@as(usize, 4), events.testing_live_regions);
         }
     }.body);
+}
+
+test "settings a failed Save and close is spoken when the prompt goes away" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const events = win32_uia.events;
+
+            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncConfirmCloseFromCombo();
+            settings.showClosePrompt();
+            // The status line is hidden behind the prompt: nothing to speak yet.
+            events.testing_live_regions = 0;
+            settings.setNote(.save_failed);
+            try std.testing.expectEqual(@as(usize, 0), events.testing_live_regions);
+            // Keep editing brings it back, and the reason Settings stayed open is read.
+            settings.cancelClosePrompt();
+            try std.testing.expectEqual(@as(usize, 1), events.testing_live_regions);
+        }
+    }.body);
+}
+
+test "settings a Discard that cannot copy the saved config leaves the draft and its preview alone" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buf: [256]u8 = undefined;
+            fixture.live_previews = true;
+            typeInto(settings.edit_font_size.?, "16");
+            try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
+
+            const real = settings.handle.alloc;
+            var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+            settings.handle.alloc = failing.allocator();
+            settings.discardChanges();
+            settings.handle.alloc = real;
+
+            // Still a draft that asks before closing, still previewed.
+            try std.testing.expect(settings.hasPendingChanges());
+            try std.testing.expectEqual(@as(f32, 16), settings.pending.?.@"font-size");
+            try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
+            try std.testing.expectEqualStrings("Could not discard the changes; they are kept.", try statusTextOf(settings, &buf));
+
+            // And the next try, with memory, does it.
+            settings.discardChanges();
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expectEqual(@as(f32, 12), fixture.config.@"font-size");
+        }
+    }.body);
+}
+
+test "settings discarding the draft keeps it whole when copying the saved config fails" {
+    const saved = try Config.default(std.testing.allocator);
+    var settings: SettingsWindow = .{
+        .handle = modelOnlyHandle(),
+        .current = saved,
+        .original = try saved.clone(std.testing.allocator),
+        .pending = try saved.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+    settings.pending.?.@"font-size" = 16;
+    settings.trackEdit(.font_size, true);
+    try std.testing.expect(settings.hasPendingChanges());
+
+    // Every allocation in turn fails once: the draft and its tracking survive,
+    // and the one run with nothing failing starts the draft over.
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        settings.handle.alloc = failing.allocator();
+        settings.adoptConfig(&settings.current.?) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(settings.hasPendingChanges());
+            try std.testing.expectEqual(@as(f32, 16), settings.pending.?.@"font-size");
+            continue;
+        };
+        try std.testing.expect(!settings.hasPendingChanges());
+        try std.testing.expectEqual(@as(f32, 12), settings.pending.?.@"font-size");
+        break;
+    } else return error.TestUnexpectedResult;
+    settings.handle.alloc = std.testing.allocator;
 }
 
 test "settings offers accent-follow-system as a checkbox that previews the theme" {
