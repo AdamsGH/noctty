@@ -230,7 +230,7 @@ pub const StreamHandler = struct {
         switch (action) {
             .print => {
                 @branchHint(.likely);
-                const captured = self.terminal.status_display == .main;
+                const captured = self.capturesSemanticOutput();
                 self.terminal.print(value.cp) catch |err| {
                     if (captured) self.semantic_output.omitRemainder();
                     return err;
@@ -245,7 +245,7 @@ pub const StreamHandler = struct {
             .bell => self.bell(),
             .backspace => self.terminal.backspace(),
             .horizontal_tab => {
-                const captured = self.terminal.status_display == .main;
+                const captured = self.capturesSemanticOutput();
                 const committed = self.horizontalTab(value);
                 if (captured) {
                     for (0..committed) |_| self.semantic_output.recordTab();
@@ -254,7 +254,7 @@ pub const StreamHandler = struct {
             .horizontal_tab_back => self.horizontalTabBack(value),
             .linefeed => {
                 @branchHint(.likely);
-                const captured = self.terminal.status_display == .main;
+                const captured = self.capturesSemanticOutput();
                 self.linefeed() catch |err| {
                     if (captured) self.semantic_output.omitRemainder();
                     return err;
@@ -263,7 +263,7 @@ pub const StreamHandler = struct {
             },
             .carriage_return => {
                 @branchHint(.likely);
-                const captured = self.terminal.status_display == .main;
+                const captured = self.capturesSemanticOutput();
                 self.terminal.carriageReturn();
                 if (captured) self.semantic_output.recordCarriageReturn();
             },
@@ -651,8 +651,19 @@ pub const StreamHandler = struct {
         try self.terminal.index();
     }
 
+    /// Whether printed text goes to the spoken-output capture: the main display
+    /// of the primary screen only. A full-screen program on the alternate
+    /// screen repaints by cursor addressing, which the print stream cannot
+    /// carry, so its changed cells would be read out in write order without
+    /// their positions. The text pattern's change and caret events do not
+    /// come from this capture and keep firing for that screen.
+    inline fn capturesSemanticOutput(self: *const StreamHandler) bool {
+        return self.terminal.status_display == .main and
+            self.terminal.screens.active_key == .primary;
+    }
+
     inline fn printRepeat(self: *StreamHandler, count_req: usize) !void {
-        if (self.terminal.status_display != .main) {
+        if (!self.capturesSemanticOutput()) {
             try self.terminal.printRepeat(count_req);
             return;
         }
@@ -1874,6 +1885,38 @@ test "semantic output capture follows real stream handler parser" {
     stream.nextSlice("\xcc\x81");
     const combining_noop = stream.handler.semantic_output.finish();
     try std.testing.expectEqual(@as(usize, 0), combining_noop.len);
+
+    // The alternate screen is a cursor-addressed display. What a program
+    // prints there is a stream of changed cells, not text to speak, so capture
+    // stops at the switch and resumes after it, also inside one batch, for
+    // each of the three modes that select the alternate screen.
+    inline for (.{ "47", "1047", "1049" }) |mode| {
+        stream.handler.semantic_output.begin(true);
+        stream.nextSlice(
+            "main\x1b[?" ++ mode ++ "h" ++
+                "\x1b[1;1H12:00:01\x1b[2;1H12:00:02\r\n\tX\x1b[3b" ++
+                "\x1b[?" ++ mode ++ "lback",
+        );
+        const alternate = stream.handler.semantic_output.finish();
+        try std.testing.expectEqualStrings("mainback", alternate.slice());
+        try std.testing.expect(!alternate.omitted_after);
+        try std.testing.expect(term.screens.active_key == .primary);
+    }
+
+    // A batch that ends inside the alternate screen, and the next one that
+    // starts there, record nothing until the program leaves it.
+    stream.handler.semantic_output.begin(true);
+    stream.nextSlice("before\x1b[?1049hinside");
+    const entered = stream.handler.semantic_output.finish();
+    try std.testing.expectEqualStrings("before", entered.slice());
+    stream.handler.semantic_output.begin(true);
+    stream.nextSlice("\x1b[1;1Hstill inside\r\n");
+    const still_alternate = stream.handler.semantic_output.finish();
+    try std.testing.expectEqual(@as(usize, 0), still_alternate.len);
+    stream.handler.semantic_output.begin(true);
+    stream.nextSlice("\x1b[?1049lafter");
+    const left = stream.handler.semantic_output.finish();
+    try std.testing.expectEqualStrings("after", left.slice());
 }
 
 fn expectIssue149Write(mailbox: *termio.Mailbox, expected: []const u8) !void {
