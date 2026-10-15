@@ -37,8 +37,15 @@ public static class AppDeliverySmoke {
         public short show,reservedBytes;
         public IntPtr reservedPointer,input,output,error;
     }
-    [StructLayout(LayoutKind.Sequential)] public struct ProcessInfo {
+    [StructLayout(LayoutKind.Sequential)] struct NativeProcessInfo {
         public IntPtr process,thread; public int pid,tid;
+    }
+    public sealed class ProcessInfo {
+        public IntPtr process,thread; public int pid,tid;
+        public long created; public string executable,stdoutPath,stderrPath;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes {
+        public int length; public IntPtr descriptor; public int inherit;
     }
     [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
         public long processTime,jobTime; public uint flags;
@@ -70,7 +77,8 @@ public static class AppDeliverySmoke {
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid,ref GuiInfo info);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint msg,IntPtr w,IntPtr l);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
-    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out NativeProcessInfo pi);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFileW(string path,uint access,uint share,ref SecurityAttributes sa,uint disposition,uint flags,IntPtr template);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
     [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job,int type,ref JobLimits limits,uint size);
     [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
@@ -154,24 +162,51 @@ public static class AppDeliverySmoke {
         }
         return result.Append('\\',slashes*2).Append('"').ToString();
     }
-    public static ProcessInfo Launch(string app,string[] args,string cwd,string desktop,IntPtr job) {
+    static IntPtr CaptureFile(string path,bool input) {
+        var sa=new SecurityAttributes { length=Marshal.SizeOf<SecurityAttributes>(),inherit=1 };
+        var handle=CreateFileW(path,input?0x80000000u:0x40000000u,7,ref sa,input?3u:1u,0x80,IntPtr.Zero);
+        if(handle==new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return handle;
+    }
+    public static ProcessInfo Launch(string app,string[] args,string cwd,string desktop,IntPtr job,string stdoutPath,string stderrPath) {
         var command=new StringBuilder(Quote(app)); foreach(var arg in args) command.Append(' ').Append(Quote(arg));
-        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
+        var input=IntPtr.Zero; var output=IntPtr.Zero; var error=IntPtr.Zero;
+        var native=new NativeProcessInfo(); bool createdProcess=false;
         // CREATE_NO_WINDOW | CREATE_SUSPENDED: assign job before child code runs.
-        // Driver children inherit its job; they never request breakaway.
-        if(!CreateProcessW(app,command,IntPtr.Zero,IntPtr.Zero,false,0x08000004,IntPtr.Zero,cwd,ref si,out pi)) throw new Win32Exception(Marshal.GetLastWin32Error());
-        if((job!=IntPtr.Zero && !AssignProcessToJobObject(job,pi.process)) || ResumeThread(pi.thread)==0xFFFFFFFF) {
-            TerminateProcess(pi.process,1); CloseHandle(pi.thread); CloseHandle(pi.process);
-            throw new Exception("Assign/resume owned process failed");
+        // Driver children inherit its job; they never request breakaway. Verify
+        // executable + PID + creation time while suspended, before a fast CLI
+        // can exit and QueryFullProcessImageName becomes unavailable.
+        try {
+            input=CaptureFile("NUL",true); output=CaptureFile(stdoutPath,false); error=CaptureFile(stderrPath,false);
+            var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=0x101,show=0,input=input,output=output,error=error };
+            if(!CreateProcessW(app,command,IntPtr.Zero,IntPtr.Zero,true,0x08000004,IntPtr.Zero,cwd,ref si,out native)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            createdProcess=true;
+            var path=new StringBuilder(32768); uint size=(uint)path.Capacity;
+            long created,exited,kernel,user;
+            if(GetProcessId(native.process)!=(uint)native.pid || !QueryFullProcessImageNameW(native.process,0,path,ref size) ||
+                !String.Equals(System.IO.Path.GetFullPath(path.ToString()),System.IO.Path.GetFullPath(app),StringComparison.OrdinalIgnoreCase) ||
+                !GetProcessTimes(native.process,out created,out exited,out kernel,out user)) throw new Exception("Suspended process identity check failed");
+            var pi=new ProcessInfo { process=native.process,thread=native.thread,pid=native.pid,tid=native.tid,
+                created=created,executable=System.IO.Path.GetFullPath(app),stdoutPath=stdoutPath,stderrPath=stderrPath };
+            if((job!=IntPtr.Zero && !AssignProcessToJobObject(job,pi.process)) || ResumeThread(pi.thread)==0xFFFFFFFF) throw new Exception("Assign/resume owned process failed");
+            return pi;
+        } catch {
+            if(createdProcess) { TerminateProcess(native.process,1); CloseHandle(native.thread); CloseHandle(native.process); }
+            throw;
+        } finally {
+            if(input!=IntPtr.Zero) CloseHandle(input);
+            if(output!=IntPtr.Zero) CloseHandle(output);
+            if(error!=IntPtr.Zero) CloseHandle(error);
         }
-        return pi;
     }
     public static string Verify(ProcessInfo pi,string executable) {
-        var path=new StringBuilder(32768); uint size=(uint)path.Capacity;
         long created,exited,kernel,user;
-        if(GetProcessId(pi.process)!=(uint)pi.pid || !QueryFullProcessImageNameW(pi.process,0,path,ref size) ||
-            !String.Equals(System.IO.Path.GetFullPath(path.ToString()),System.IO.Path.GetFullPath(executable),StringComparison.OrdinalIgnoreCase) ||
-            !GetProcessTimes(pi.process,out created,out exited,out kernel,out user)) throw new Exception("Exact owned process identity check failed");
+        // The retained native process handle cannot identify a reused PID.
+        // Path was verified before resume; creation time remains queryable
+        // after exit, unlike image-name lookup on some Windows builds.
+        if(GetProcessId(pi.process)!=(uint)pi.pid ||
+            !String.Equals(pi.executable,System.IO.Path.GetFullPath(executable),StringComparison.OrdinalIgnoreCase) ||
+            !GetProcessTimes(pi.process,out created,out exited,out kernel,out user) || created!=pi.created) throw new Exception("Exact owned process identity check failed");
         return DateTime.FromFileTimeUtc(created).ToString("o");
     }
     public static void CloseProcess(ProcessInfo pi) { CloseHandle(pi.thread); CloseHandle(pi.process); }
@@ -181,6 +216,37 @@ function Startup-Fingerprint {
     $path=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
     if(-not(Test-Path -LiteralPath $path)){return @{Exists=$false}}
     return @{Exists=$true;Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o')}
+}
+function Capture-Summary([string]$Path){
+    $stream=$null;$reader=$null
+    try {
+        $stream=[IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $bytes=$stream.Length
+        $reader=[IO.StreamReader]::new($stream)
+        $buffer=[char[]]::new(65536);$count=$reader.ReadBlock($buffer,0,$buffer.Length)
+        $text=[string]::new($buffer,0,$count)
+        $categories=[Collections.Generic.List[string]]::new()
+        foreach($rule in @(
+            @('Panic','(?i)panic|unhandled exception'),
+            @('Configuration','(?i)invalid config|configuration error|unknown.*config|config.*(?:error|diagnostic)'),
+            @('Initialization','(?i)app init(?:ialization)?.*fail|error initializing|failed to.*init|error starting IO thread'),
+            @('MissingFile','(?i)FileNotFound|file not found|path not found'),
+            @('AccessDenied','(?i)AccessDenied|PermissionDenied|access is denied'),
+            @('Renderer','(?i)(?:renderer|OpenGL|WGL|EGL).*fail'),
+            @('Invariant','(?i)invariant failed')
+        )){if($text -match $rule[1]){$categories.Add($rule[0])}}
+        # Emit only fixed categories and identifier-shaped error names; never
+        # emit a matching line, child command line, environment, or bulk log.
+        $errors=@([regex]::Matches($text,'\berror\.[A-Za-z][A-Za-z0-9_]*\b')|ForEach-Object Value|Select-Object -Unique -First 12)
+        return @{Bytes=$bytes;ScannedCharacters=$count;Truncated=($bytes -gt 65536);Categories=@($categories);ErrorNames=$errors}
+    } catch {return @{Readable=$false;Categories=@('CaptureUnavailable')}}
+    finally{if($reader){$reader.Dispose()}elseif($stream){$stream.Dispose()}}
+}
+function Process-Observation($Info){
+    $wait=[AppDeliverySmoke]::WaitForSingleObject($Info.process,0)
+    [uint32]$code=0
+    $available=[AppDeliverySmoke]::GetExitCodeProcess($Info.process,[ref]$code)
+    return @{Pid=$Info.pid;Exited=($wait -eq 0);WaitResult=$wait;ExitCodeAvailable=$available;ExitCode=if($available){$code}else{$null};Stdout=(Capture-Summary $Info.stdoutPath);Stderr=(Capture-Summary $Info.stderrPath)}
 }
 if(-not $Driver) {
     $Bin=(Resolve-Path -LiteralPath $Bin).Path
@@ -207,10 +273,10 @@ if(-not $Driver) {
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata';$env:APPDATA=Join-Path $Run 'appdata'
         $driverExe=(Get-Command pwsh.exe -CommandType Application).Source
         $driverArgs=@('-NoLogo','-NoProfile','-NonInteractive','-File',$PSCommandPath,'-Bin',$portableBin,'-Run',$Run,'-Driver','-DesktopName',$desktopName)
-        $driverInfo=[AppDeliverySmoke]::Launch($driverExe,$driverArgs,$Run,"WinSta0\$desktopName",$job)
+        $driverInfo=[AppDeliverySmoke]::Launch($driverExe,$driverArgs,$Run,"WinSta0\$desktopName",$job,(Join-Path $Run 'driver.stdout.log'),(Join-Path $Run 'driver.stderr.log'))
         $started=[AppDeliverySmoke]::Verify($driverInfo,$driverExe)
         @{Pid=$driverInfo.pid;StartTimeUtc=$started;Executable='pwsh.exe';Desktop=$desktopName} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Run 'driver-identity.json')
-        Write-Host "Hidden App delivery driver PID=$($driverInfo.pid); evidence=$Run"
+        Write-Host "Focused App delivery driver PID=$($driverInfo.pid). Results: $Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
         while([AppDeliverySmoke]::WaitForSingleObject($driverInfo.process,1000) -eq 258){
             if([datetime]::UtcNow -ge $deadline){throw 'Hidden driver timed out; its owned job will be cleaned up.'}
@@ -220,19 +286,21 @@ if(-not $Driver) {
         $code=$exitCode
     } finally {
         $env:LOCALAPPDATA=$oldLocal;$env:APPDATA=$oldRoaming
-        $cleanupError=$null;$ownedProcesses=0
-        try { if($driverInfo){[void][AppDeliverySmoke]::Verify($driverInfo,$driverExe)} } catch {$cleanupError=$_}
+        $cleanupError=$null;$identityError=$null;$ownedProcesses=0
+        try { if($driverInfo){[void][AppDeliverySmoke]::Verify($driverInfo,$driverExe)} } catch {$identityError=$_}
+        $driverObservation=if($driverInfo){Process-Observation $driverInfo}else{$null}
         if($job -ne [IntPtr]::Zero){try{$ownedProcesses=[AppDeliverySmoke]::StopOwnedJob($job)}catch{$cleanupError=$_}}
         if($driverInfo){[AppDeliverySmoke]::CloseProcess($driverInfo)}
         [void][AppDeliverySmoke]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{Before=$before;After=$after;Unchanged=$unchanged;OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$ownedProcesses} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        @{Before=$before;After=$after;Unchanged=$unchanged;DriverIdentityVerified=($null -eq $identityError);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$ownedProcesses;Driver=$driverObservation} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
         if(-not $unchanged){throw 'Real startup state changed; stop launches.'}
         if($cleanupError){throw $cleanupError}
+        if($identityError){throw $identityError}
     }
     if($code -ne 0){throw "Hidden App delivery smoke failed with exit $code; inspect app-delivery-results.json."}
-    Write-Host 'Hidden App delivery smoke: PASS'
+    Write-Host "Focused App delivery smoke: PASS. Results: $(Join-Path $Run 'app-delivery-results.json')"
     exit
 }
 
@@ -254,7 +322,8 @@ function Wait-Until([scriptblock]$Condition,[int]$Seconds=15){
     return $false
 }
 function Launch-Owned([string[]]$Arguments){
-    $info=[AppDeliverySmoke]::Launch($exe,$Arguments,$Bin,$null,[IntPtr]::Zero)
+    $number=$owned.Count+1
+    $info=[AppDeliverySmoke]::Launch($exe,$Arguments,$Bin,"WinSta0\$DesktopName",[IntPtr]::Zero,(Join-Path $Run "process-$number.stdout.log"),(Join-Path $Run "process-$number.stderr.log"))
     $started=[AppDeliverySmoke]::Verify($info,$exe)
     $owned.Add(@{Info=$info;Pid=$info.pid;StartTimeUtc=$started;Executable='noctty.exe'})
     return $info
@@ -266,7 +335,7 @@ try {
     $batch=Join-Path $Run 'title-driver.cmd'
     @('@echo off','title PKG19-before',':wait',"if exist `"$gate`" goto deliver",'ping.exe -n 2 127.0.0.1 >nul','goto wait',':deliver','ping.exe -n 2 127.0.0.1 >nul','title PKG19-during-menu',':hold','ping.exe -n 30 127.0.0.1 >nul','goto hold') | Set-Content -LiteralPath $batch -Encoding ascii
     $config=Join-Path $Bin 'app-delivery.ghostty'
-    @("command = cmd.exe /d /q /k `"$batch`"",'shell-integration = none','single-instance = true','initial-window = false','window-save-state = never','confirm-close-surface = false','auto-update = off',"class = $instanceClass") | Set-Content -LiteralPath $config -Encoding utf8
+    @("command = cmd.exe /d /q /k `"$batch`"",'shell-integration = none','single-instance = true','initial-window = false','quit-after-last-window-closed-delay = 5s','window-save-state = never','confirm-close-surface = false','auto-update = off',"class = $instanceClass") | Set-Content -LiteralPath $config -Encoding utf8
     $runtime=Launch-Owned @('--config-default-files=false',"--config-file=$config","--class=$instanceClass")
     $ready=Wait-Until {[AppDeliverySmoke]::AppWindow($runtime.pid) -ne [IntPtr]::Zero}
     Assert-Check 'headless App message-only HWND exists' $ready $ready
@@ -321,7 +390,7 @@ try {
     $identities=@()
     foreach($record in $owned){
         try{[void][AppDeliverySmoke]::Verify($record.Info,$exe)}catch{$checks.Add(@{Name='Exact owned process identity';Passed=$false;Pid=$record.Pid})}
-        $identities+=@{Pid=$record.Pid;StartTimeUtc=$record.StartTimeUtc;Executable=$record.Executable}
+        $identities+=@{Pid=$record.Pid;StartTimeUtc=$record.StartTimeUtc;Executable=$record.Executable;Observation=(Process-Observation $record.Info)}
         [AppDeliverySmoke]::CloseProcess($record.Info)
     }
     @{Checks=$checks;Samples=$samples;Processes=$identities;Limit='Headless forwarding, native caption menu and console title delivery only; renderer appearance, real input, updater networking, toast activation and UIA are covered separately.'} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'app-delivery-results.json')
