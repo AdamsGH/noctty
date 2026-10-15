@@ -12700,11 +12700,12 @@ pub const App = struct {
         if (!plan.notify) return;
 
         const seconds = @as(f64, @floatFromInt(finished.duration.duration)) / @as(f64, std.time.ns_per_s);
+        var code_buf: [apprt.action.CommandFinished.exit_code_text_max]u8 = undefined;
         const body = if (finished.exit_code) |code|
             try std.fmt.allocPrint(
                 self.core_app.alloc,
-                "Command finished with exit code {d} | Runtime: {d:.2}s",
-                .{ code, seconds },
+                "Command finished with exit code {s} | Runtime: {d:.2}s",
+                .{ apprt.action.CommandFinished.exitCodeText(&code_buf, code), seconds },
             )
         else
             try std.fmt.allocPrint(

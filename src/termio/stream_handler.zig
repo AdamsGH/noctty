@@ -1197,13 +1197,10 @@ pub const StreamHandler = struct {
             },
 
             .end_command => {
-                // The specification seems to not specify the type but
-                // other terminals accept 32-bits, but exit codes are really
-                // bytes, so we just do our best here.
-                const code: u8 = code: {
-                    const raw: i32 = cmd.readOption(.exit_code) orelse 0;
-                    break :code std.math.cast(u8, raw) orelse 1;
-                };
+                // The specification does not give the type; other terminals
+                // accept 32 bits and so does a Windows exit code, which can
+                // be an NTSTATUS or an installer code far outside 0-255.
+                const code: i32 = cmd.readOption(.exit_code) orelse 0;
 
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
@@ -2636,6 +2633,31 @@ test "ConPTY window visibility reaches the surface mailbox in order" {
     fixture.stream.nextSlice("\x1b[2t\x1b[1t");
     try std.testing.expectEqual(false, (try fixture.expectSurfaceMessage()).window_visibility);
     try std.testing.expectEqual(true, (try fixture.expectSurfaceMessage()).window_visibility);
+    try std.testing.expect(fixture.nextSurfaceMessage() == null);
+}
+
+test "OSC 133 D carries the whole 32-bit exit code to the surface" {
+    var fixture: TestStream = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit(std.testing.allocator);
+
+    // A code past a byte (msiexec's 1603), an NTSTATUS crash and the extremes
+    // arrive as sent. D with no code is a success.
+    const cases = [_]struct { []const u8, i64 }{
+        .{ "\x1b]133;D;1603\x07", 1603 },
+        .{ "\x1b]133;D;256\x07", 256 },
+        .{ "\x1b]133;D;-1073741819\x07", -1073741819 },
+        .{ "\x1b]133;D;-1\x07", -1 },
+        .{ "\x1b]133;D;2147483647\x07", 2147483647 },
+        .{ "\x1b]133;D;127\x07", 127 },
+        .{ "\x1b]133;D;0\x07", 0 },
+        .{ "\x1b]133;D\x07", 0 },
+    };
+    for (cases) |case| {
+        fixture.stream.nextSlice(case[0]);
+        const message = try fixture.expectSurfaceMessage();
+        try std.testing.expectEqual(case[1], @as(i64, message.stop_command.?));
+    }
     try std.testing.expect(fixture.nextSurfaceMessage() == null);
 }
 

@@ -1059,22 +1059,80 @@ pub const CloseTabMode = enum(c_int) {
 };
 
 pub const CommandFinished = struct {
-    exit_code: ?u8,
+    exit_code: ?i32,
     duration: configpkg.Config.Duration,
 
     /// sync with ghostty_action_command_finished_s in ghostty.h
     pub const C = extern struct {
-        exit_code: i16,
+        /// Only meaningful when `has_exit_code` is set. A 32-bit Windows
+        /// exit code can be any value, -1 included, so none of them can
+        /// stand for "no exit code".
+        exit_code: i32,
+        has_exit_code: bool,
         duration: u64,
     };
 
     pub fn cval(self: CommandFinished) C {
         return .{
-            .exit_code = self.exit_code orelse -1,
+            .exit_code = self.exit_code orelse 0,
+            .has_exit_code = self.exit_code != null,
             .duration = self.duration.duration,
         };
     }
+
+    /// The longest `exitCodeText` result.
+    pub const exit_code_text_max = "-2147483648".len;
+
+    /// Text for an exit code in a notification. A Windows exit code is 32
+    /// bits: an NTSTATUS crash (0xC0000005 is -1073741819 as the signed
+    /// value PowerShell reports) or an HRESULT reads as hex, while a
+    /// program's own code, including the small negative numbers scripts
+    /// pass to `exit`, reads as a decimal number.
+    pub fn exitCodeText(buf: *[exit_code_text_max]u8, code: i32) []const u8 {
+        const bits: u32 = @bitCast(code);
+        return if (code < 0 and bits < 0xFFFF0000)
+            std.fmt.bufPrint(buf, "0x{X:0>8}", .{bits}) catch unreachable
+        else
+            std.fmt.bufPrint(buf, "{d}", .{code}) catch unreachable;
+    }
 };
+
+test "CommandFinished exit codes keep all 32 bits through the C mirror" {
+    const testing = std.testing;
+    const duration: configpkg.Config.Duration = .{ .duration = 5 };
+
+    for ([_]i32{ 0, 1, 1603, 255, 256, -1, std.math.maxInt(i32), std.math.minInt(i32), -1073741819 }) |code| {
+        const c = (CommandFinished{ .exit_code = code, .duration = duration }).cval();
+        try testing.expect(c.has_exit_code);
+        try testing.expectEqual(code, c.exit_code);
+        try testing.expectEqual(@as(u64, 5), c.duration);
+    }
+
+    // No exit code is its own state, not a number that could be a real code.
+    const none = (CommandFinished{ .exit_code = null, .duration = duration }).cval();
+    try testing.expect(!none.has_exit_code);
+}
+
+test "CommandFinished.exitCodeText" {
+    const testing = std.testing;
+    var buf: [CommandFinished.exit_code_text_max]u8 = undefined;
+
+    // Success and ordinary codes stay decimal, including ones past a byte.
+    try testing.expectEqualStrings("0", CommandFinished.exitCodeText(&buf, 0));
+    try testing.expectEqualStrings("5", CommandFinished.exitCodeText(&buf, 5));
+    try testing.expectEqualStrings("1603", CommandFinished.exitCodeText(&buf, 1603));
+    try testing.expectEqualStrings("2147483647", CommandFinished.exitCodeText(&buf, std.math.maxInt(i32)));
+
+    // `exit -1` and its neighbours are what a script means, not a status.
+    try testing.expectEqualStrings("-1", CommandFinished.exitCodeText(&buf, -1));
+    try testing.expectEqualStrings("-2", CommandFinished.exitCodeText(&buf, -2));
+
+    // NTSTATUS and HRESULT values read as the hex they are documented in.
+    try testing.expectEqualStrings("0xC0000005", CommandFinished.exitCodeText(&buf, -1073741819));
+    try testing.expectEqualStrings("0xC0000135", CommandFinished.exitCodeText(&buf, -1073741515));
+    try testing.expectEqualStrings("0x80070005", CommandFinished.exitCodeText(&buf, -2147024891));
+    try testing.expectEqualStrings("0x80000000", CommandFinished.exitCodeText(&buf, std.math.minInt(i32)));
+}
 
 pub const StartSearch = struct {
     needle: [:0]const u8,
