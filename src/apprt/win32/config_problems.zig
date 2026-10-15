@@ -85,7 +85,7 @@ pub const Problems = struct {
     pub fn addMissingFont(self: *Problems, alloc: Allocator, family: []const u8) Allocator.Error!void {
         const text = try std.fmt.allocPrint(
             alloc,
-            "font-family: \"{s}\" was not found, so noctty uses its built-in font",
+            "font-family: \"{s}\" was not found; other configured or built-in fonts are used",
             .{family},
         );
         errdefer alloc.free(text);
@@ -294,7 +294,7 @@ test "config problems: the list names the problem first and its file and line af
             "1. font-szie: unknown field (C:\\Users\\a\\config.ghostty:3)\n" ++
             "2. theme \"Nope\" not found, tried path \"C:\\t\\Nope\"\n" ++
             "3. stray: invalid field (command line argument 2)\n" ++
-            "4. font-family: \"Cascadia Nope\" was not found, so noctty uses its built-in font\n",
+            "4. font-family: \"Cascadia Nope\" was not found; other configured or built-in fonts are used\n",
         problems.listText(&buf),
     );
 }

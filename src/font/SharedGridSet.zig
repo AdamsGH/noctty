@@ -199,8 +199,8 @@ pub fn ref(
 }
 
 /// The families the grid for `key` was configured with that no installed font
-/// matched, so it shows the built-in font instead. The names are borrowed from
-/// the set and stay valid while `key` is referenced.
+/// matched. Other configured or built-in families provide fallbacks. Names are
+/// borrowed from the set and stay valid while `key` is referenced.
 pub fn missingFamilies(self: *SharedGridSet, key: Key) []const [:0]const u8 {
     self.lock.lock();
     defer self.lock.unlock();
@@ -208,29 +208,66 @@ pub fn missingFamilies(self: *SharedGridSet, key: Key) []const [:0]const u8 {
     return entry.missing.reportable();
 }
 
+/// Check explicit font families without needing an open terminal or a grid.
+/// The result owns its names; the caller must deinit it with `alloc`.
+/// A config with no named fonts does not initialize or wait for discovery.
+pub fn configuredMissingFamilies(
+    self: *SharedGridSet,
+    alloc: Allocator,
+    config: *const Config,
+) !MissingFamilies {
+    self.lock.lock();
+    defer self.lock.unlock();
+
+    var missing: MissingFamilies = .{};
+    errdefer missing.deinit(alloc);
+    if (comptime Discover == void) return missing;
+
+    var refreshed = false;
+    inline for (.{ "font-family", "font-family-bold", "font-family-italic", "font-family-bold-italic" }) |key| {
+        for (@field(config, key).list.items) |family| {
+            if (std.ascii.eqlIgnoreCase(family, MissingFamilies.embedded_family)) continue;
+            const disco = try self.discover() orelse return missing;
+            if (!refreshed) {
+                if (comptime @hasDecl(Discover, "refreshExisting")) disco.refreshExisting();
+                refreshed = true;
+            }
+            if (!try familyExists(disco, alloc, family)) try missing.note(alloc, family);
+        }
+    }
+    return missing;
+}
+
+/// A failed styled lookup does not imply the family is absent. Discover
+/// without style, size or variation constraints before reporting a miss.
+fn familyExists(disco: *Discover, alloc: Allocator, family: [:0]const u8) !bool {
+    if (std.ascii.eqlIgnoreCase(family, MissingFamilies.embedded_family)) return true;
+    var it = try disco.discover(alloc, .{ .family = family });
+    defer it.deinit();
+    if (try it.next()) |value| {
+        var face = value;
+        face.deinit();
+        return true;
+    }
+    return false;
+}
+
 /// Font families a configuration asked for and discovery found nothing for.
 pub const MissingFamilies = struct {
     names: std.ArrayListUnmanaged([:0]const u8) = .empty,
-    /// Some family of the regular style matched an installed font.
-    regular_matched: bool = false,
 
     pub fn deinit(self: *MissingFamilies, alloc: Allocator) void {
         for (self.names.items) |name| alloc.free(name);
         self.names.deinit(alloc);
     }
 
-    /// Note that no face matched `family` for `style`. Only the regular style
-    /// counts: the bold and italic lookups ask for the same family, so a
-    /// miss there repeats the regular one or is only a missing style, which
-    /// `completeStyles` makes up. Each family is kept once, and the built-in
-    /// font's own name is no miss, since the built-in font is what it asks for.
+    /// Note that no installed face belongs to `family`, regardless of style.
+    /// Keep each family once across all configured styles and fallbacks.
     pub fn note(
         self: *MissingFamilies,
         alloc: Allocator,
-        style: Style,
         family: []const u8,
     ) Allocator.Error!void {
-        if (style != .regular) return;
         if (std.ascii.eqlIgnoreCase(family, embedded_family)) return;
         for (self.names.items) |seen| {
             if (std.ascii.eqlIgnoreCase(seen, family)) return;
@@ -240,17 +277,9 @@ pub const MissingFamilies = struct {
         try self.names.append(alloc, owned);
     }
 
-    /// Note that a face was found for `style`.
-    pub fn matched(self: *MissingFamilies, style: Style) void {
-        if (style == .regular) self.regular_matched = true;
-    }
-
-    /// The families to tell the user about: the ones named when none of the
-    /// regular style's families matched, since the built-in font is only what
-    /// is shown then. A list whose later entries are fallbacks for the first
-    /// that matched has nothing to report.
+    /// Each missing configured family is a problem even if a fallback works.
     pub fn reportable(self: *const MissingFamilies) []const [:0]const u8 {
-        return if (self.regular_matched) &.{} else self.names.items;
+        return self.names.items;
     }
 
     /// The family name of `font.embedded.variable`.
@@ -321,7 +350,6 @@ fn collection(
                             // No size adjustment for primary fonts.
                             .size_adjustment = .none,
                         });
-                        missing.matched(style);
 
                         continue;
                     }
@@ -358,11 +386,13 @@ fn collection(
                     }
                 }
 
-                log.warn("font-family {s} not found: {s}", .{
+                log.warn("font {s} face not found: {s}", .{
                     field.name,
                     desc.family.?,
                 });
-                try missing.note(self.alloc, style, desc.family.?);
+                if (!try familyExists(disco, self.alloc, desc.family.?)) {
+                    try missing.note(self.alloc, desc.family.?);
+                }
             }
         }
     }
@@ -973,31 +1003,116 @@ test "SharedGridSet builds a grid that names no font without a font scan" {
     } else return error.SkipZigTest;
 }
 
-test "MissingFamilies keeps each regular-style miss once and skips the built-in font" {
+test "MissingFamilies keeps each configured miss once across styles and skips the built-in font" {
     const testing = std.testing;
     var missing: MissingFamilies = .{};
     defer missing.deinit(testing.allocator);
 
-    try missing.note(testing.allocator, .regular, "Pkg22 Mono");
-    try missing.note(testing.allocator, .regular, "pkg22 mono");
-    try missing.note(testing.allocator, .regular, "Second Mono");
-    // The bold, italic and bold italic lookups ask for the same family.
-    try missing.note(testing.allocator, .bold, "Pkg22 Mono");
-    try missing.note(testing.allocator, .italic, "Only In Italic");
-    try missing.note(testing.allocator, .bold_italic, "Only In Bold Italic");
+    try missing.note(testing.allocator, "Pkg22 Mono");
+    try missing.note(testing.allocator, "pkg22 mono");
+    try missing.note(testing.allocator, "Second Mono");
+    // A repeated family across styles is still one problem.
+    try missing.note(testing.allocator, "Pkg22 Mono");
+    try missing.note(testing.allocator, "Only In Italic");
+    try missing.note(testing.allocator, "Only In Bold Italic");
     // The built-in font is what this family asks for.
-    try missing.note(testing.allocator, .regular, "jetbrains mono");
+    try missing.note(testing.allocator, "jetbrains mono");
 
-    try testing.expectEqual(@as(usize, 2), missing.reportable().len);
+    try testing.expectEqual(@as(usize, 4), missing.reportable().len);
     try testing.expectEqualStrings("Pkg22 Mono", missing.reportable()[0]);
     try testing.expectEqualStrings("Second Mono", missing.reportable()[1]);
+    try testing.expectEqualStrings("Only In Italic", missing.reportable()[2]);
+    try testing.expectEqualStrings("Only In Bold Italic", missing.reportable()[3]);
+}
 
-    // A family of the regular style matched (`font-family = A`, then a
-    // fallback `font-family = B`): the built-in font is not what is shown.
-    missing.matched(.bold);
-    try testing.expectEqual(@as(usize, 2), missing.reportable().len);
-    missing.matched(.regular);
-    try testing.expectEqual(@as(usize, 0), missing.reportable().len);
+test "SharedGridSet reports missing fallback and styled families with a present regular family" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set = try SharedGridSet.init(alloc);
+    defer set.deinit();
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    const arena = cfg._arena.?.allocator();
+    try cfg.@"font-family".parseCLI(arena, "Consolas");
+    try cfg.@"font-family".parseCLI(arena, "Small05 Missing Fallback");
+    try cfg.@"font-family-bold".parseCLI(arena, "Consolas");
+    try cfg.@"font-family-bold".parseCLI(arena, "Small05 Missing Bold");
+    try cfg.@"font-family-italic".parseCLI(arena, "Consolas");
+    try cfg.@"font-family-italic".parseCLI(arena, "Small05 Missing Italic");
+    try cfg.@"font-family-bold-italic".parseCLI(arena, "Consolas");
+    try cfg.@"font-family-bold-italic".parseCLI(arena, "Small05 Missing Bold Italic");
+    // The same missing name configured under another style is listed once.
+    try cfg.@"font-family-bold-italic".parseCLI(arena, "small05 missing bold");
+    var configured = try set.configuredMissingFamilies(alloc, &cfg);
+    defer configured.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), set.count());
+    try testing.expectEqual(@as(usize, 4), configured.reportable().len);
+    try testing.expectEqualStrings("Small05 Missing Fallback", configured.reportable()[0]);
+    try testing.expectEqualStrings("Small05 Missing Bold", configured.reportable()[1]);
+    try testing.expectEqualStrings("Small05 Missing Italic", configured.reportable()[2]);
+    try testing.expectEqualStrings("Small05 Missing Bold Italic", configured.reportable()[3]);
+    var keycfg = try DerivedConfig.init(alloc, &cfg);
+    defer keycfg.deinit();
+    const key, _ = try set.ref(&keycfg, .{ .points = 12 });
+    defer set.deref(key);
+    const missing = set.missingFamilies(key);
+    try testing.expectEqual(@as(usize, 4), missing.len);
+    try testing.expectEqualStrings("Small05 Missing Fallback", missing[0]);
+    try testing.expectEqualStrings("Small05 Missing Bold", missing[1]);
+    try testing.expectEqualStrings("Small05 Missing Italic", missing[2]);
+    try testing.expectEqualStrings("Small05 Missing Bold Italic", missing[3]);
+    const key2, _ = try set.ref(&keycfg, .{ .points = 12 });
+    defer set.deref(key2);
+    try testing.expectEqual(@as(usize, 4), set.missingFamilies(key2).len);
+}
+
+test "SharedGridSet does not call an installed family missing when its requested style is absent" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set = try SharedGridSet.init(alloc);
+    defer set.deinit();
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    const arena = cfg._arena.?.allocator();
+    try cfg.@"font-family".parseCLI(arena, "Consolas");
+    try cfg.@"font-style".parseCLI(arena, "Small05 Nonexistent Style");
+    // Family-only checking must also accept a styled family's missing style.
+    try cfg.@"font-family-bold".parseCLI(arena, "Consolas");
+    try cfg.@"font-style-bold".parseCLI(arena, "Small05 Nonexistent Bold Style");
+    var configured = try set.configuredMissingFamilies(alloc, &cfg);
+    defer configured.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), configured.reportable().len);
+    var keycfg = try DerivedConfig.init(alloc, &cfg);
+    defer keycfg.deinit();
+    const key, _ = try set.ref(&keycfg, .{ .points = 12 });
+    defer set.deref(key);
+    try testing.expectEqual(@as(usize, 0), set.missingFamilies(key).len);
+}
+
+test "SharedGridSet checks unnamed and built-in families without a scan or a grid" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set = try SharedGridSet.init(alloc);
+    defer set.deinit();
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var unnamed = try set.configuredMissingFamilies(alloc, &cfg);
+    defer unnamed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), unnamed.reportable().len);
+    try testing.expect(set.font_discover == null);
+
+    const arena = cfg._arena.?.allocator();
+    inline for (.{ "font-family", "font-family-bold", "font-family-italic", "font-family-bold-italic" }) |key| {
+        try @field(cfg, key).parseCLI(arena, "jetbrains mono");
+    }
+    var embedded = try set.configuredMissingFamilies(alloc, &cfg);
+    defer embedded.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), embedded.reportable().len);
+    try testing.expect(set.font_discover == null);
+    try testing.expectEqual(@as(usize, 0), set.count());
 }
 
 test "SharedGridSet reports a configured family that no installed font matches" {

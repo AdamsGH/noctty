@@ -102,7 +102,12 @@ docs, including the keybind grammar.
 When the config has a mistake (an unknown key, a value that does not parse, an
 include that is missing, a theme or font that is not installed), noctty shows
 an error banner with the number of problems and the first one, and the banner
-stays until you close it. **Config problems** in the command palette opens
+stays until you close it in each window. Windows opened later receive the same
+load's problems, including when `initial-window = false`. If another error is
+already showing, close that error to see the config problems next. Missing
+families are checked across the regular, bold, italic and bold-italic lists,
+including fallback entries, and listed once per config load, however many tabs
+you open. **Config problems** in the command palette opens
 Settings > Advanced, which lists the problems with their file and line where
 noctty knows them, and shows the file Settings saves to. When the list does not
 fit, or a line is cut short, `noctty +validate-config` prints the problems in
