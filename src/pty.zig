@@ -595,6 +595,24 @@ const WindowsConPty = struct {
 
         const flags = windows.exp.LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
             windows.exp.LOAD_LIBRARY_SEARCH_SYSTEM32;
+        // A conpty.dll that is not a valid image makes the loader raise a
+        // system-error dialog ("Bad Image") from inside LoadLibraryExW and wait
+        // for someone to click it, unless the thread asks for failure codes
+        // instead. Measured with a stale file: the test thread sat in
+        // NtRaiseHardError at 0 CPU for 13 minutes whenever the process was
+        // started with the default error mode (cmd.exe -> zig build). The
+        // fallback to the in-box console host is the answer to a bad file, not
+        // a dialog.
+        const loader_errors = struct {
+            extern "kernel32" fn SetThreadErrorMode(new_mode: u32, old_mode: ?*u32) callconv(.winapi) i32;
+        };
+        const sem_failcriticalerrors: u32 = 0x0001;
+        const sem_noopenfileerrorbox: u32 = 0x8000;
+        var previous_mode: u32 = 0;
+        const suppressed = loader_errors.SetThreadErrorMode(sem_failcriticalerrors | sem_noopenfileerrorbox, &previous_mode) != 0;
+        defer if (suppressed) {
+            _ = loader_errors.SetThreadErrorMode(previous_mode, null);
+        };
         const module = windows.kernel32.LoadLibraryExW(
             path_w.ptr,
             null,
