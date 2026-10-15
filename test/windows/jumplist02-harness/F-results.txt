@@ -1,0 +1,36 @@
+F-cd         mjl-colour-focused-cd-r1     flush_med= 48.0 flush_max=109.9 iters>30=17 gap_after400= 160.3 gap_all= 160.3 probe_max= 277.3 ttff=312
+F-cd         mjl-colour-focused-cd-r2     flush_med= 45.3 flush_max= 62.5 iters>30=16 gap_after400=  65.2 gap_all= 150.8 probe_max= 244.0 ttff=281
+F-cd         mjl-colour-focused-cd-r3     flush_med= 46.5 flush_max= 53.0 iters>30=16 gap_after400=  53.6 gap_all= 162.8 probe_max= 286.4 ttff=329
+F-cd         mjl-colour-focused-cd-r4     flush_med= 47.9 flush_max= 54.7 iters>30=16 gap_after400=  55.5 gap_all= 153.2 probe_max= 149.4 ttff=203
+F-cd         mjl4-colour-focused-cd-r1    flush_med=  8.8 flush_max= 13.9 iters>30= 0 gap_after400=  16.1 gap_all= 156.9 probe_max= 226.3 ttff=282
+F-cd         mjl4-colour-focused-cd-r2    flush_med=  9.1 flush_max= 11.6 iters>30= 0 gap_after400=  18.6 gap_all= 157.1 probe_max= 262.0 ttff=328
+F-cd         mjl4-colour-focused-cd-r3    flush_med=  9.4 flush_max= 13.6 iters>30= 0 gap_after400=  17.6 gap_all= 136.7 probe_max= 336.9 ttff=407
+F-cd         mjl4-colour-focused-cd-r4    flush_med=  9.4 flush_max= 12.2 iters>30= 0 gap_after400=  17.6 gap_all= 155.9 probe_max= 174.0 ttff=235
+mjl    n=4 median: flush 47.2 (max 109.9), iters>30 16, gap_after400 60.4 (max 160.3), gap_all 156.7 (max 162.8), probe 260.7 (max 286.4), ttff 296
+mjl4   n=4 median: flush 9.2 (max 13.9), iters>30 0, gap_after400 17.6 (max 18.6), gap_all 156.4 (max 157.1), probe 244.2 (max 336.9), ttff 305
+F-type       mjl-colour-focused-type-r1   flush_med= 30.2 flush_max= 60.4 iters>30= 2 gap_after400= 163.0 gap_all= 163.0 probe_max= 160.3 ttff=187
+F-type       mjl-colour-focused-type-r2   flush_med= 34.1 flush_max= 68.1 iters>30= 2 gap_after400= 168.4 gap_all= 168.4 probe_max= 164.5 ttff=188
+F-type       mjl-colour-focused-type-r3   flush_med= 37.7 flush_max= 75.3 iters>30= 2 gap_after400= 176.0 gap_all= 176.0 probe_max= 370.4 ttff=406
+F-type       mjl-colour-focused-type-r4   flush_med= 29.6 flush_max= 59.2 iters>30= 2 gap_after400= 163.1 gap_all= 163.1 probe_max= 156.0 ttff=203
+F-type       mjl4-colour-focused-type-r1  flush_med=  0.0 flush_max=  0.1 iters>30= 1 gap_after400= 170.5 gap_all= 170.5 probe_max= 167.7 ttff=203
+F-type       mjl4-colour-focused-type-r2  flush_med=  0.0 flush_max=  0.1 iters>30= 1 gap_after400= 245.4 gap_all= 245.4 probe_max= 241.6 ttff=172
+F-type       mjl4-colour-focused-type-r3  flush_med=  0.0 flush_max=  0.1 iters>30= 1 gap_after400= 183.0 gap_all= 183.0 probe_max= 248.9 ttff=297
+F-type       mjl4-colour-focused-type-r4  flush_med=  0.0 flush_max=  0.1 iters>30= 1 gap_after400= 161.2 gap_all= 161.2 probe_max= 158.9 ttff=188
+mjl    n=4 median: flush 32.1 (max 75.3), iters>30 2, gap_after400 165.8 (max 176.0), gap_all 165.8 (max 176.0), probe 162.4 (max 370.4), ttff 196
+mjl4   n=4 median: flush 0.0 (max 0.1), iters>30 1, gap_after400 176.8 (max 245.4), gap_all 176.8 (max 245.4), probe 204.7 (max 248.9), ttff 196
+F-palette    mjl-colour-focused-type-r1   wm_command_max= 288.2 pre_first_swap=[] iter_max= 288.2 ttff=297 worker_discoveries=0 picker_span=0.0 palette_rebuild_max=264.0 gap_first_1s=247.4 ui_discoveries=1 ui_discovery_ms=[104]
+F-palette    mjl-colour-focused-type-r2   wm_command_max= 283.6 pre_first_swap=[] iter_max= 283.6 ttff=297 worker_discoveries=0 picker_span=0.0 palette_rebuild_max=257.6 gap_first_1s=248.3 ui_discoveries=1 ui_discovery_ms=[102]
+F-palette    mjl-colour-focused-type-r3   wm_command_max= 292.2 pre_first_swap=[] iter_max= 292.2 ttff=297 worker_discoveries=0 picker_span=0.0 palette_rebuild_max=266.6 gap_first_1s=249.1 ui_discoveries=1 ui_discovery_ms=[90]
+F-palette    mjl4-colour-focused-type-r1  wm_command_max= 163.3 pre_first_swap=[] iter_max= 163.3 ttff=203 worker_discoveries=1 picker_span=0.0 palette_rebuild_max=150.7 gap_first_1s=146.8 ui_discoveries=0 ui_discovery_ms=[]
+F-palette    mjl4-colour-focused-type-r2  wm_command_max= 183.6 pre_first_swap=[] iter_max= 183.6 ttff=265 worker_discoveries=1 picker_span=0.0 palette_rebuild_max=157.4 gap_first_1s=152.3 ui_discoveries=0 ui_discovery_ms=[]
+F-palette    mjl4-colour-focused-type-r3  wm_command_max= 177.7 pre_first_swap=[] iter_max= 177.7 ttff=281 worker_discoveries=1 picker_span=0.0 palette_rebuild_max=154.9 gap_first_1s=156.1 ui_discoveries=0 ui_discovery_ms=[]
+mjl    n=3 median wm_command 288.2 (max 292.2), pre-first-swap iter 0.0 (max 0.0), iter_max 288.2, ttff 297 (max 297), picker 0.0 (max 0.0), palette rebuild max 264.0 (max 266.6), gap first 1 s 248.3 (max 249.1)
+mjl4   n=3 median wm_command 177.7 (max 183.6), pre-first-swap iter 0.0 (max 0.0), iter_max 177.7, ttff 265 (max 281), picker 0.0 (max 0.0), palette rebuild max 154.9 (max 157.4), gap first 1 s 152.3 (max 156.1)
+F-picker     mjl-colour-focused-type-r1   wm_command_max=   0.0 pre_first_swap=[] iter_max=  36.9 ttff=187 worker_discoveries=0 picker_span=135.5 palette_rebuild_max=0.0 gap_first_1s=129.4 ui_discoveries=1 ui_discovery_ms=[90]
+F-picker     mjl-colour-focused-type-r2   wm_command_max=   0.0 pre_first_swap=[] iter_max=  45.0 ttff=234 worker_discoveries=0 picker_span=144.0 palette_rebuild_max=0.0 gap_first_1s=132.6 ui_discoveries=1 ui_discovery_ms=[99]
+F-picker     mjl-colour-focused-type-r3   wm_command_max=   0.0 pre_first_swap=[] iter_max=  35.2 ttff=219 worker_discoveries=0 picker_span=139.5 palette_rebuild_max=0.0 gap_first_1s=128.6 ui_discoveries=1 ui_discovery_ms=[94]
+F-picker     mjl4-colour-focused-type-r1  wm_command_max=   0.0 pre_first_swap=[] iter_max= 104.7 ttff=172 worker_discoveries=1 picker_span=130.4 palette_rebuild_max=0.0 gap_first_1s=124.8 ui_discoveries=0 ui_discovery_ms=[]
+F-picker     mjl4-colour-focused-type-r2  wm_command_max=   0.0 pre_first_swap=[] iter_max= 179.3 ttff=172 worker_discoveries=1 picker_span=121.3 palette_rebuild_max=0.0 gap_first_1s=180.2 ui_discoveries=0 ui_discovery_ms=[]
+F-picker     mjl4-colour-focused-type-r3  wm_command_max=   0.0 pre_first_swap=[] iter_max= 117.8 ttff=313 worker_discoveries=1 picker_span=144.6 palette_rebuild_max=0.0 gap_first_1s=136.8 ui_discoveries=0 ui_discovery_ms=[]
+mjl    n=3 median wm_command 0.0 (max 0.0), pre-first-swap iter 0.0 (max 0.0), iter_max 36.9, ttff 219 (max 234), picker 139.5 (max 144.0), palette rebuild max 0.0 (max 0.0), gap first 1 s 129.4 (max 132.6)
+mjl4   n=3 median wm_command 0.0 (max 0.0), pre-first-swap iter 0.0 (max 0.0), iter_max 117.8, ttff 172 (max 313), picker 130.4 (max 144.6), palette rebuild max 0.0 (max 0.0), gap first 1 s 136.8 (max 180.2)
