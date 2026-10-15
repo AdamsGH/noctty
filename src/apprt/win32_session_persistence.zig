@@ -392,6 +392,44 @@ test "win32 session persistence quarantine preserves existing collision" {
     try std.testing.expectEqualStrings("previous corrupt state", previous);
 }
 
+test "win32 session persistence quarantine keeps a bounded number of copies" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const slots = [_][]const u8{
+        "session-state.json.corrupt",
+        "session-state.json.corrupt.1",
+        "session-state.json.corrupt.2",
+        "session-state.json.corrupt.3",
+        "session-state.json.corrupt.4",
+    };
+    const day_ns: i128 = std.time.ns_per_day;
+    for (slots, 0..) |name, i| {
+        var file = try tmp.dir.createFile(name, .{});
+        defer file.close();
+        try file.writeAll(name);
+        // `.corrupt.2` holds the oldest copy.
+        const age: i128 = if (i == 2) 30 else 10 - @as(i128, @intCast(i));
+        const when = std.time.nanoTimestamp() - age * day_ns;
+        try file.updateTimes(when, when);
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "newest corrupt state" });
+
+    const source = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
+    defer std.testing.allocator.free(source);
+    const destination = try quarantineCorruptFileAlloc(std.testing.allocator, source);
+    defer std.testing.allocator.free(destination);
+
+    // The oldest copy makes room; the directory does not grow.
+    try std.testing.expect(std.mem.endsWith(u8, destination, ".corrupt.2"));
+    const replaced = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json.corrupt.2", 64);
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings("newest corrupt state", replaced);
+    var count: usize = 0;
+    var names = tmp.dir.iterate();
+    while (try names.next()) |_| count += 1;
+    try std.testing.expectEqual(slots.len, count);
+}
+
 test "win32 session persistence atomic write removes temp after replace failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

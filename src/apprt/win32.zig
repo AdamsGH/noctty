@@ -51867,6 +51867,48 @@ test "win32 recovery startup keeps a newer build's history and counts one with a
     }
 }
 
+test "win32 recovery sets the session aside after failures that all began restoring it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
+    defer std.testing.allocator.free(target);
+
+    // Three launches in a row died after they began restoring the session:
+    // safe mode alone would only reset the streak for the next three.
+    try win32_session_persistence.writeFileInPlace(target,
+        \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200,"session_restore_at_unix_ms":210},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
+    );
+    const restoring = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.quarantine_session, restoring.decision);
+
+    // One of the three died before any restore began, so the session is not
+    // what keeps failing: safe mode only.
+    try win32_session_persistence.writeFileInPlace(target,
+        \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
+    );
+    const mixed = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.safe_mode, mixed.decision);
+}
+
+test "win32 recovery startup records which build wrote the attempt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
+    defer std.testing.allocator.free(target);
+
+    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, 100, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(@as(usize, 1), startup.count);
+    const written = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
+    defer std.testing.allocator.free(written);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "\"version\":\"{s}\"", .{build_config.version_string});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, written, expected) != null);
+}
+
 test "win32 recovery ledger lock excludes a second holder until released" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
