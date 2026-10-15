@@ -3,6 +3,7 @@
 //! console half remains a compatible Windows Terminal OpenConsole process.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const windows = std.os.windows;
 const ptypkg = @import("../pty.zig");
 const com = @import("win32_uia/com.zig");
@@ -59,23 +60,32 @@ const proxy_inproc_server_key_utf8 = proxy_class_key_utf8 ++ "\\InprocServer32";
 const saved_state_key_utf8 = class_key_utf8 ++ "\\noctty.default-terminal";
 const startup_key_utf8 = "Console\\%%Startup";
 const InterfaceProxyRegistration = struct {
+    /// `Interface\{IID}`, the parent of `key_utf8`.
+    iid_key_utf8: []const u8,
     key_utf8: []const u8,
     saved_key_utf8: []const u8,
+
+    fn forIid(comptime iid_text: []const u8) InterfaceProxyRegistration {
+        const iid_key = "Software\\Classes\\Interface\\" ++ iid_text;
+        return .{
+            .iid_key_utf8 = iid_key,
+            .key_utf8 = iid_key ++ "\\ProxyStubClsid32",
+            .saved_key_utf8 = saved_state_key_utf8 ++ "\\Interface\\" ++ iid_text,
+        };
+    }
 };
 const interface_proxy_registrations = [_]InterfaceProxyRegistration{
-    .{
-        .key_utf8 = "Software\\Classes\\Interface\\" ++ iid_terminal_handoff1_text ++ "\\ProxyStubClsid32",
-        .saved_key_utf8 = saved_state_key_utf8 ++ "\\Interface\\" ++ iid_terminal_handoff1_text,
-    },
-    .{
-        .key_utf8 = "Software\\Classes\\Interface\\" ++ iid_terminal_handoff2_text ++ "\\ProxyStubClsid32",
-        .saved_key_utf8 = saved_state_key_utf8 ++ "\\Interface\\" ++ iid_terminal_handoff2_text,
-    },
-    .{
-        .key_utf8 = "Software\\Classes\\Interface\\" ++ iid_terminal_handoff3_text ++ "\\ProxyStubClsid32",
-        .saved_key_utf8 = saved_state_key_utf8 ++ "\\Interface\\" ++ iid_terminal_handoff3_text,
-    },
+    .forIid(iid_terminal_handoff1_text),
+    .forIid(iid_terminal_handoff2_text),
+    .forIid(iid_terminal_handoff3_text),
 };
+/// Saved beside `Present`: which of an interface's keys registration had to
+/// create, as a mask of the two below. Unregister removes only those, and
+/// only once they are empty. State written before this was recorded has no
+/// such value and keeps every key, as it always did.
+const created_keys_name = "KeysCreated";
+const created_proxy_key: DWORD = 1;
+const created_iid_key: DWORD = 2;
 const delegation_console_name = "DelegationConsole";
 const delegation_terminal_name = "DelegationTerminal";
 const inbox_console_sentinel = "{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}";
@@ -128,6 +138,21 @@ extern "advapi32" fn RegSetValueExW(
 ) callconv(.winapi) LSTATUS;
 extern "advapi32" fn RegDeleteValueW(hKey: HKEY, lpValueName: LPCWSTR) callconv(.winapi) LSTATUS;
 extern "advapi32" fn RegDeleteTreeW(hKey: HKEY, lpSubKey: [*:0]const u16) callconv(.winapi) LSTATUS;
+extern "advapi32" fn RegDeleteKeyW(hKey: HKEY, lpSubKey: [*:0]const u16) callconv(.winapi) LSTATUS;
+extern "advapi32" fn RegQueryInfoKeyW(
+    hKey: HKEY,
+    lpClass: ?[*:0]u16,
+    lpcchClass: ?*DWORD,
+    lpReserved: ?*DWORD,
+    lpcSubKeys: ?*DWORD,
+    lpcbMaxSubKeyLen: ?*DWORD,
+    lpcbMaxClassLen: ?*DWORD,
+    lpcValues: ?*DWORD,
+    lpcbMaxValueNameLen: ?*DWORD,
+    lpcbMaxValueLen: ?*DWORD,
+    lpcbSecurityDescriptor: ?*DWORD,
+    lpftLastWriteTime: ?*anyopaque,
+) callconv(.winapi) LSTATUS;
 extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) LSTATUS;
 
 extern "advapi32" fn OpenProcessToken(
@@ -221,10 +246,19 @@ comptime {
         @compileError("ITerminalHandoff3 vtable order mismatch");
 }
 
+/// `STARTUPINFO.dwFlags` bit that makes `wShowWindow` meaningful. Without it
+/// `wShowWindow` is whatever the client left there.
+pub const STARTF_USESHOWWINDOW: DWORD = 0x1;
+
 pub const PendingSession = struct {
     alloc: Allocator,
     adopted: ?ptypkg.AdoptedSession,
     title: []u8,
+    /// The client's `STARTUPINFO.dwFlags` and `wShowWindow`, copied by value:
+    /// the `TERMINAL_STARTUP_INFO` they came from is owned by COM and gone
+    /// when the call returns.
+    startup_flags: DWORD = 0,
+    show_window: u16 = 0,
 
     pub fn takeAdopted(self: *PendingSession) ptypkg.AdoptedSession {
         const result = self.adopted.?;
@@ -641,6 +675,8 @@ const TerminalHandoff = struct {
             .alloc = self.server.alloc,
             .adopted = .{ .pty = pty, .client_process = client_copy },
             .title = title,
+            .startup_flags = if (startup_info) |info| info.dwFlags else 0,
+            .show_window = if (startup_info) |info| info.wShowWindow else 0,
         };
         title_owned = false;
         pty_owned = false;
@@ -706,7 +742,13 @@ fn cloneStartupTitle(alloc: Allocator, startup_info: ?*const TERMINAL_STARTUP_IN
     const title = bstr orelse return alloc.dupe(u8, "noctty");
     const len: usize = com.SysStringLen(title);
     if (len == 0) return alloc.dupe(u8, "noctty");
-    return std.unicode.utf16LeToUtf8Alloc(alloc, title[0..len]);
+    return startupTitleAlloc(alloc, title[0..len]);
+}
+
+/// The client names the title, so it may hold an unpaired surrogate. That is
+/// no reason to refuse the handoff: each one becomes U+FFFD.
+fn startupTitleAlloc(alloc: Allocator, units: []const u16) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(alloc, "{f}", .{std.unicode.fmtUtf16Le(units)});
 }
 
 const TOKEN_QUERY: DWORD = 0x0008;
@@ -960,6 +1002,8 @@ const RawRegistryValue = struct {
 
 const SavedRegistryValue = struct {
     value: ?RawRegistryValue,
+    /// An interface's saved `KeysCreated` mask; zero for everything else.
+    created_keys: DWORD = 0,
 
     fn deinit(self: SavedRegistryValue, alloc: Allocator) void {
         if (self.value) |value| value.deinit(alloc);
@@ -1029,6 +1073,7 @@ const RegistrationRefreshSnapshot = struct {
             try self.captureValue(alloc, registration.saved_key_utf8, "Present", true);
             try self.captureValue(alloc, registration.saved_key_utf8, "Type", true);
             try self.captureValue(alloc, registration.saved_key_utf8, "Data", true);
+            try self.captureValue(alloc, registration.saved_key_utf8, created_keys_name, true);
         }
         return self;
     }
@@ -1423,7 +1468,7 @@ pub fn unregisterDefaultTerminal(alloc: Allocator) (Allocator.Error || Registrat
         const current = try queryValueAlloc(alloc, registration.key_utf8, null);
         defer if (current) |value| value.deinit(alloc);
         if (try interfaceProxyIsOursAlloc(alloc, current)) {
-            interface_restores[index] = loadSavedRegistryValue(alloc, registration.saved_key_utf8) catch |err| switch (err) {
+            interface_restores[index] = loadSavedInterfaceProxy(alloc, registration.saved_key_utf8) catch |err| switch (err) {
                 error.MissingRestoreState => return error.MissingProxyRestoreState,
                 else => return err,
             };
@@ -1485,6 +1530,12 @@ fn savePreviousInterfaceProxy(alloc: Allocator, registration: InterfaceProxyRegi
         saved.deinit(alloc);
         return;
     }
+    // Writing the value creates the keys around it, and unregister can only
+    // tell afterwards which of them were not there before.
+    var created: DWORD = 0;
+    if (!try queryKeyExists(alloc, registration.key_utf8)) created |= created_proxy_key;
+    if (!try queryKeyExists(alloc, registration.iid_key_utf8)) created |= created_iid_key;
+    try writeRegistryDword(alloc, registration.saved_key_utf8, created_keys_name, created);
     try saveRegistryValue(alloc, registration.saved_key_utf8, current);
 }
 
@@ -1517,6 +1568,16 @@ fn loadSavedRegistryValue(alloc: Allocator, saved_key: []const u8) (Allocator.Er
     errdefer data_raw.deinit(alloc);
     const value_type = try registryDword(type_raw);
     return .{ .value = .{ .value_type = value_type, .data = data_raw.data } };
+}
+
+fn loadSavedInterfaceProxy(alloc: Allocator, saved_key: []const u8) (Allocator.Error || RegistrationError)!SavedRegistryValue {
+    var saved = try loadSavedRegistryValue(alloc, saved_key);
+    errdefer saved.deinit(alloc);
+    const raw = (try queryValueAlloc(alloc, saved_key, created_keys_name)) orelse return saved;
+    defer raw.deinit(alloc);
+    // Only cleanup depends on this, so an unreadable mask keeps the keys.
+    saved.created_keys = registryDword(raw) catch 0;
+    return saved;
 }
 
 fn restoreSavedRegistryValue(
@@ -1562,13 +1623,24 @@ fn restoreInterfaceProxyIfOwned(
     const current = try queryValueAlloc(alloc, registration.key_utf8, null);
     defer if (current) |value| value.deinit(alloc);
     if (!try interfaceProxyIsOursAlloc(alloc, current)) return false;
-    try restoreSavedRegistryValue(
-        alloc,
-        registration.key_utf8,
-        null,
-        saved orelse return error.MissingProxyRestoreState,
-    );
+    const restore = saved orelse return error.MissingProxyRestoreState;
+    try restoreSavedRegistryValue(alloc, registration.key_utf8, null, restore);
+    if (restore.value == null) removeCreatedInterfaceKeys(alloc, registration, restore.created_keys);
     return true;
+}
+
+/// Deleting the value leaves the keys registration created around it. Take
+/// them away if they are empty, innermost first. This is cleanup, not part of
+/// the restore, so a failure is logged and the unregistration goes on.
+fn removeCreatedInterfaceKeys(alloc: Allocator, registration: InterfaceProxyRegistration, created: DWORD) void {
+    if (created & created_proxy_key != 0) {
+        deleteRegistryKeyIfEmpty(alloc, registration.key_utf8) catch |err|
+            log.warn("default-terminal proxy key cleanup failed err={}", .{err});
+    }
+    if (created & created_iid_key != 0) {
+        deleteRegistryKeyIfEmpty(alloc, registration.iid_key_utf8) catch |err|
+            log.warn("default-terminal interface key cleanup failed err={}", .{err});
+    }
 }
 
 fn shouldRestoreInterfaceProxyText(current: ?[]const u8) bool {
@@ -1612,7 +1684,7 @@ fn registrySzToUtf8Alloc(alloc: Allocator, value: RawRegistryValue) (Allocator.E
 }
 
 fn queryValueAlloc(alloc: Allocator, key_utf8: []const u8, name_utf8: ?[]const u8) (Allocator.Error || RegistrationError)!?RawRegistryValue {
-    const key_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, key_utf8);
+    const key_w = try registryKeyW(alloc, key_utf8);
     defer alloc.free(key_w);
     var key: HKEY = undefined;
     const open_rc = RegOpenKeyExW(HKEY_CURRENT_USER, key_w.ptr, 0, KEY_READ, &key);
@@ -1666,7 +1738,7 @@ fn writeRegistryBytes(
     value_type: DWORD,
     data: []const u8,
 ) (Allocator.Error || RegistrationError)!void {
-    const key_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, key_utf8);
+    const key_w = try registryKeyW(alloc, key_utf8);
     defer alloc.free(key_w);
     const name_w = if (name_utf8) |name| try std.unicode.utf8ToUtf16LeAllocZ(alloc, name) else null;
     defer if (name_w) |name| alloc.free(name);
@@ -1697,7 +1769,7 @@ fn writeRegistryBytes(
 }
 
 fn deleteRegistryValue(alloc: Allocator, key_utf8: []const u8, name_utf8: ?[]const u8) (Allocator.Error || RegistrationError)!void {
-    const key_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, key_utf8);
+    const key_w = try registryKeyW(alloc, key_utf8);
     defer alloc.free(key_w);
     const name_w = if (name_utf8) |name| try std.unicode.utf8ToUtf16LeAllocZ(alloc, name) else null;
     defer if (name_w) |name| alloc.free(name);
@@ -1713,7 +1785,7 @@ fn deleteRegistryValue(alloc: Allocator, key_utf8: []const u8, name_utf8: ?[]con
 fn deleteRegistryTree(alloc: Allocator, key_utf8: []const u8) (Allocator.Error || RegistrationError)!bool {
     const existing = try queryKeyExists(alloc, key_utf8);
     if (!existing) return false;
-    const key_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, key_utf8);
+    const key_w = try registryKeyW(alloc, key_utf8);
     defer alloc.free(key_w);
     const rc = RegDeleteTreeW(HKEY_CURRENT_USER, key_w.ptr);
     if (rc != ERROR_SUCCESS and rc != ERROR_FILE_NOT_FOUND and rc != ERROR_PATH_NOT_FOUND)
@@ -1721,8 +1793,47 @@ fn deleteRegistryTree(alloc: Allocator, key_utf8: []const u8) (Allocator.Error |
     return rc == ERROR_SUCCESS;
 }
 
+/// Delete a key only if it holds no values and no subkeys. Not atomic: a
+/// value another process adds between the check and the delete goes with
+/// the key, which is why this runs only for keys registration created.
+fn deleteRegistryKeyIfEmpty(alloc: Allocator, key_utf8: []const u8) (Allocator.Error || RegistrationError)!void {
+    const key_w = try registryKeyW(alloc, key_utf8);
+    defer alloc.free(key_w);
+    var key: HKEY = undefined;
+    const open_rc = RegOpenKeyExW(HKEY_CURRENT_USER, key_w.ptr, 0, KEY_READ, &key);
+    if (open_rc == ERROR_FILE_NOT_FOUND or open_rc == ERROR_PATH_NOT_FOUND) return;
+    if (open_rc != ERROR_SUCCESS) return registryFailure("RegOpenKeyExW(empty check)", open_rc);
+    var subkeys: DWORD = 0;
+    var values: DWORD = 0;
+    const info_rc = RegQueryInfoKeyW(key, null, null, null, &subkeys, null, null, &values, null, null, null, null);
+    _ = RegCloseKey(key);
+    if (info_rc != ERROR_SUCCESS) return registryFailure("RegQueryInfoKeyW", info_rc);
+    if (subkeys != 0 or values != 0) return;
+    const rc = RegDeleteKeyW(HKEY_CURRENT_USER, key_w.ptr);
+    if (rc != ERROR_SUCCESS and rc != ERROR_FILE_NOT_FOUND and rc != ERROR_PATH_NOT_FOUND)
+        return registryFailure("RegDeleteKeyW", rc);
+}
+
+/// Test seam: a scratch subtree of HKCU that every key path resolves under,
+/// so a test can run a whole registration without touching the machine's
+/// classes or its default terminal. A test build refuses to touch the
+/// registry while it is empty; a production build never sets it.
+var test_registry_prefix: []const u8 = "";
+
+fn registryKeyW(alloc: Allocator, key_utf8: []const u8) (Allocator.Error || RegistrationError)![:0]u16 {
+    // A test that forgot `ScratchHive` would otherwise read and write the
+    // machine's classes and its default terminal.
+    if (builtin.is_test and test_registry_prefix.len == 0) @panic("registry test without a scratch hive");
+    if (builtin.is_test) {
+        const joined = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ test_registry_prefix, key_utf8 });
+        defer alloc.free(joined);
+        return std.unicode.utf8ToUtf16LeAllocZ(alloc, joined);
+    }
+    return std.unicode.utf8ToUtf16LeAllocZ(alloc, key_utf8);
+}
+
 fn queryKeyExists(alloc: Allocator, key_utf8: []const u8) (Allocator.Error || RegistrationError)!bool {
-    const key_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, key_utf8);
+    const key_w = try registryKeyW(alloc, key_utf8);
     defer alloc.free(key_w);
     var key: HKEY = undefined;
     const rc = RegOpenKeyExW(HKEY_CURRENT_USER, key_w.ptr, 0, KEY_READ, &key);
@@ -2206,4 +2317,202 @@ test "handoff console classification rejects braced values with wrong dash shape
         ConsoleHalf.compatible,
         classifyConsoleHalf("{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}"),
     );
+}
+
+test "handoff startup title keeps a title with an unpaired surrogate" {
+    const alloc = std.testing.allocator;
+    const plain = try startupTitleAlloc(alloc, std.unicode.utf8ToUtf16LeStringLiteral("C:\\Windows\\system32\\cmd.exe"));
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", plain);
+
+    // A lone high surrogate, then a lone low one, each between ordinary text.
+    const lone = [_]u16{ 'a', 0xD800, 'b', 0xDC00, 'c' };
+    const lossy = try startupTitleAlloc(alloc, &lone);
+    defer alloc.free(lossy);
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}c", lossy);
+}
+
+/// A scratch subtree of HKCU that the registration code resolves every key
+/// under, so a test never reads or writes the machine's classes or its
+/// default terminal. `deinit` deletes that subtree and nothing else.
+const ScratchHive = struct {
+    alloc: Allocator,
+    prefix: []u8,
+
+    const name_start = "Software\\noctty-test-";
+
+    fn init(alloc: Allocator) !ScratchHive {
+        const prefix = try std.fmt.allocPrint(alloc, name_start ++ "handoff-{d}-{d}", .{
+            windows.GetCurrentProcessId(),
+            std.time.milliTimestamp(),
+        });
+        test_registry_prefix = prefix;
+        return .{ .alloc = alloc, .prefix = prefix };
+    }
+
+    fn deinit(self: *ScratchHive) void {
+        test_registry_prefix = "";
+        defer self.alloc.free(self.prefix);
+        std.debug.assert(std.mem.startsWith(u8, self.prefix, name_start));
+        const prefix_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, self.prefix) catch return;
+        defer self.alloc.free(prefix_w);
+        const rc = RegDeleteTreeW(HKEY_CURRENT_USER, prefix_w.ptr);
+        if (rc != ERROR_SUCCESS and rc != ERROR_FILE_NOT_FOUND) {
+            std.debug.print("scratch registry key {s} was not deleted rc={d}\n", .{ self.prefix, rc });
+        }
+    }
+
+    /// The scratch copy of a machine that has Windows Terminal as its
+    /// default terminal.
+    fn seedWindowsTerminalDefault(self: *ScratchHive) !void {
+        try writeRegistrySz(self.alloc, startup_key_utf8, delegation_console_name, "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}");
+        try writeRegistrySz(self.alloc, startup_key_utf8, delegation_terminal_name, wt_terminal_text);
+    }
+
+    fn expectTerminal(self: *ScratchHive, expected: []const u8) !void {
+        const raw = (try queryValueAlloc(self.alloc, startup_key_utf8, delegation_terminal_name)).?;
+        defer raw.deinit(self.alloc);
+        try std.testing.expect(try registryValueEqualsGuidAlloc(self.alloc, raw, expected));
+    }
+
+    fn expectKey(self: *ScratchHive, key: []const u8, exists: bool) !void {
+        try std.testing.expectEqual(exists, try queryKeyExists(self.alloc, key));
+    }
+};
+
+const wt_terminal_text = "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}";
+
+/// A directory holding the proxy DLL registration insists on finding beside
+/// `noctty.exe`. The DLL is an empty file: nothing loads it.
+const ScratchInstall = struct {
+    tmp: std.testing.TmpDir,
+    exe_path: []u8,
+
+    fn init(alloc: Allocator) !ScratchInstall {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        (try tmp.dir.createFile(proxy_filename, .{})).close();
+        const dir = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(dir);
+        return .{ .tmp = tmp, .exe_path = try std.fs.path.join(alloc, &.{ dir, "noctty.exe" }) };
+    }
+
+    fn deinit(self: *ScratchInstall, alloc: Allocator) void {
+        alloc.free(self.exe_path);
+        self.tmp.cleanup();
+    }
+};
+
+test "handoff unregistration removes the interface keys registration created" {
+    const alloc = std.testing.allocator;
+    var hive = try ScratchHive.init(alloc);
+    defer hive.deinit();
+    var install = try ScratchInstall.init(alloc);
+    defer install.deinit(alloc);
+    try hive.seedWindowsTerminalDefault();
+
+    const registered = try registerDefaultTerminal(alloc, install.exe_path);
+    try std.testing.expect(registered.selection_changed);
+    // A refresh keeps what the first registration recorded.
+    const refreshed = try registerDefaultTerminal(alloc, install.exe_path);
+    try std.testing.expect(!refreshed.selection_changed);
+    try hive.expectTerminal(clsid_text);
+    for (interface_proxy_registrations) |registration| {
+        const raw = (try queryValueAlloc(alloc, registration.key_utf8, null)).?;
+        defer raw.deinit(alloc);
+        try std.testing.expect(try registryValueEqualsGuidAlloc(alloc, raw, proxy_clsid_text));
+    }
+
+    const result = try unregisterDefaultTerminal(alloc);
+    try std.testing.expect(result.selection_restored);
+    try std.testing.expect(result.class_removed);
+    try hive.expectTerminal(wt_terminal_text);
+    for (interface_proxy_registrations) |registration| {
+        try hive.expectKey(registration.key_utf8, false);
+        try hive.expectKey(registration.iid_key_utf8, false);
+    }
+    try hive.expectKey(class_key_utf8, false);
+    try hive.expectKey(proxy_class_key_utf8, false);
+}
+
+test "handoff unregistration keeps the interface keys that were already there" {
+    const alloc = std.testing.allocator;
+    var hive = try ScratchHive.init(alloc);
+    defer hive.deinit();
+    var install = try ScratchInstall.init(alloc);
+    defer install.deinit(alloc);
+    try hive.seedWindowsTerminalDefault();
+
+    const foreign = "{3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F}";
+    const first = interface_proxy_registrations[0];
+    const second = interface_proxy_registrations[1];
+    const third = interface_proxy_registrations[2];
+    // First: the interface key exists with a value of its own, the proxy key
+    // does not. Second: the proxy key holds another proxy. Third: the proxy
+    // key exists with nothing in it.
+    try writeRegistrySz(alloc, first.iid_key_utf8, null, "ITerminalHandoff");
+    try writeRegistrySz(alloc, second.key_utf8, null, foreign);
+    try writeRegistrySz(alloc, third.key_utf8, "Scratch", "x");
+    try deleteRegistryValue(alloc, third.key_utf8, "Scratch");
+
+    _ = try registerDefaultTerminal(alloc, install.exe_path);
+    _ = try unregisterDefaultTerminal(alloc);
+
+    try hive.expectKey(first.key_utf8, false);
+    try hive.expectKey(first.iid_key_utf8, true);
+    const name = (try queryValueAlloc(alloc, first.iid_key_utf8, null)).?;
+    defer name.deinit(alloc);
+    try std.testing.expect(try registryValueEqualsGuidAlloc(alloc, name, "ITerminalHandoff"));
+
+    const restored = (try queryValueAlloc(alloc, second.key_utf8, null)).?;
+    defer restored.deinit(alloc);
+    try std.testing.expect(try registryValueEqualsGuidAlloc(alloc, restored, foreign));
+
+    try hive.expectKey(third.key_utf8, true);
+    try std.testing.expect((try queryValueAlloc(alloc, third.key_utf8, null)) == null);
+}
+
+test "handoff unregistration leaves a created interface key somebody filled since" {
+    const alloc = std.testing.allocator;
+    var hive = try ScratchHive.init(alloc);
+    defer hive.deinit();
+    var install = try ScratchInstall.init(alloc);
+    defer install.deinit(alloc);
+    try hive.seedWindowsTerminalDefault();
+    _ = try registerDefaultTerminal(alloc, install.exe_path);
+
+    const first = interface_proxy_registrations[0];
+    const second = interface_proxy_registrations[1];
+    try writeRegistrySz(alloc, first.key_utf8, "Other", "kept");
+    try writeRegistrySz(alloc, comptime second.iid_key_utf8 ++ "\\TypeLib", null, "{00000000-0000-0000-0000-000000000001}");
+
+    _ = try unregisterDefaultTerminal(alloc);
+
+    // The default value is ours to remove, the rest is not.
+    try std.testing.expect((try queryValueAlloc(alloc, first.key_utf8, null)) == null);
+    const other = (try queryValueAlloc(alloc, first.key_utf8, "Other")).?;
+    defer other.deinit(alloc);
+    try hive.expectKey(first.iid_key_utf8, true);
+    try hive.expectKey(second.key_utf8, false);
+    try hive.expectKey(second.iid_key_utf8, true);
+}
+
+test "handoff unregistration of state saved before key creation was recorded keeps the keys" {
+    const alloc = std.testing.allocator;
+    var hive = try ScratchHive.init(alloc);
+    defer hive.deinit();
+    var install = try ScratchInstall.init(alloc);
+    defer install.deinit(alloc);
+    try hive.seedWindowsTerminalDefault();
+    _ = try registerDefaultTerminal(alloc, install.exe_path);
+    for (interface_proxy_registrations) |registration| {
+        try deleteRegistryValue(alloc, registration.saved_key_utf8, created_keys_name);
+    }
+
+    const result = try unregisterDefaultTerminal(alloc);
+    try std.testing.expect(result.selection_restored);
+    for (interface_proxy_registrations) |registration| {
+        try std.testing.expect((try queryValueAlloc(alloc, registration.key_utf8, null)) == null);
+        try hive.expectKey(registration.key_utf8, true);
+    }
 }
