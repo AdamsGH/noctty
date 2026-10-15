@@ -3673,7 +3673,7 @@ pub fn dropLaunchLayoutReplaySteps(self: *Config, from: usize) ?[]const u8 {
     while (i > from) {
         i -= 1;
         const arg: []const u8 = switch (self._replay_steps.items[i]) {
-            .arg => |value| value,
+            .arg => |value| value.value,
             .conditional_arg => |value| value.arg,
             else => continue,
         };
@@ -3717,7 +3717,7 @@ test "launch-layout is ignored in configuration files" {
         // `loadIter`, which does not pass through `loadReader`.
         for (cfg._replay_steps.items) |step| {
             const arg: []const u8 = switch (step) {
-                .arg => |value| value,
+                .arg => |value| value.value,
                 .conditional_arg => |value| value.arg,
                 else => continue,
             };
@@ -3787,7 +3787,7 @@ test "launch-layout is ignored in configuration files" {
 
         for (cfg._replay_steps.items) |step| {
             const arg: []const u8 = switch (step) {
-                .arg => |value| value,
+                .arg => |value| value.value,
                 .conditional_arg => |value| value.arg,
                 else => continue,
             };
@@ -3806,14 +3806,14 @@ test "launch-layout does not survive in the replay log once consumed" {
 
     // What `loadCliArgs` leaves behind for `noctty --launch-layout=<name>`.
     try cfg._replay_steps.append(arena_alloc, .{
-        .arg = try arena_alloc.dupeZ(u8, "--launch-layout=Project Alpha"),
+        .arg = .{ .value = try arena_alloc.dupeZ(u8, "--launch-layout=Project Alpha") },
     });
-    try cfg._replay_steps.append(arena_alloc, .@"-e");
+    try cfg._replay_steps.append(arena_alloc, .{ .@"-e" = .none });
     try cfg._replay_steps.append(arena_alloc, .{
-        .arg = try arena_alloc.dupeZ(u8, "tool.exe"),
+        .arg = .{ .value = try arena_alloc.dupeZ(u8, "tool.exe") },
     });
     try cfg._replay_steps.append(arena_alloc, .{
-        .arg = try arena_alloc.dupeZ(u8, "--launch-layout=child-option"),
+        .arg = .{ .value = try arena_alloc.dupeZ(u8, "--launch-layout=child-option") },
     });
     cfg.@"launch-layout" = "Project Alpha";
 
@@ -4352,7 +4352,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
             // First, we add an artificial "-e" so that if we
             // replay the inputs to rebuild the config (i.e. if
             // a theme is set) then we will get the same behavior.
-            try self._replay_steps.append(arena_alloc, .@"-e");
+            try self._replay_steps.append(arena_alloc, .{ .@"-e" = .none });
 
             // Next, take all remaining args and use that to build up
             // a command to execute.
@@ -4361,7 +4361,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
             for (args) |arg_raw| {
                 const arg = std.mem.sliceTo(arg_raw, 0);
                 const copy = try arena_alloc.dupeZ(u8, arg);
-                try self._replay_steps.append(arena_alloc, .{ .arg = copy });
+                try self._replay_steps.append(arena_alloc, .{ .arg = .{ .value = copy } });
                 try builder.append(arena_alloc, copy);
             }
 
@@ -4697,7 +4697,8 @@ fn loadTheme(self: *Config, theme: Theme) !void {
                 };
                 item.* = .{ .conditional_arg = .{
                     .conditions = conds,
-                    .arg = v,
+                    .arg = v.value,
+                    .location = v.location,
                 } };
             },
 
@@ -4713,6 +4714,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
                 item.* = .{ .conditional_arg = .{
                     .conditions = conds,
                     .arg = v.arg,
+                    .location = v.location,
                 } };
             },
         }
@@ -4969,7 +4971,7 @@ pub fn parseManuallyHook(
         // Add the special -e marker. This prevents:
         // (1) config-file from adding args to the end (see #2908)
         // (2) dark/light theme from making this conditional
-        try self._replay_steps.append(alloc, .@"-e");
+        try self._replay_steps.append(alloc, .{ .@"-e" = try cli.Location.fromIter(iter, alloc) });
 
         // Build up the command. We don't clean this up because we take
         // ownership in our allocator.
@@ -4978,7 +4980,10 @@ pub fn parseManuallyHook(
 
         while (iter.next()) |param| {
             const copy = try alloc.dupeZ(u8, param);
-            try self._replay_steps.append(alloc, .{ .arg = copy });
+            try self._replay_steps.append(alloc, .{ .arg = .{
+                .value = copy,
+                .location = try cli.Location.fromIter(iter, alloc),
+            } });
             try command.append(alloc, copy);
         }
 
@@ -5013,7 +5018,10 @@ pub fn parseManuallyHook(
     // Keep track of our input args for replay
     try self._replay_steps.append(
         alloc,
-        .{ .arg = try alloc.dupeZ(u8, arg) },
+        .{ .arg = .{
+            .value = try alloc.dupeZ(u8, arg),
+            .location = try cli.Location.fromIter(iter, alloc),
+        } },
     );
 
     // If we didn't find a special case, continue parsing normally
@@ -5349,7 +5357,10 @@ fn probableCliEnvironment() bool {
 const Replay = struct {
     const Step = union(enum) {
         /// An argument to parse as if it came from the CLI or file.
-        arg: [:0]const u8,
+        arg: struct {
+            value: [:0]const u8,
+            location: cli.Location = .none,
+        },
 
         /// A base path to expand relative paths against.
         expand: []const u8,
@@ -5360,6 +5371,7 @@ const Replay = struct {
         conditional_arg: struct {
             conditions: []const Conditional,
             arg: []const u8,
+            location: cli.Location = .none,
         },
 
         /// A diagnostic to be added to the new configuration when
@@ -5380,16 +5392,19 @@ const Replay = struct {
         ///
         /// Note: when "-e" is used, ONLY this is present and
         /// not an additional "arg" with "-e" value.
-        @"-e",
+        @"-e": cli.Location,
 
         fn clone(
             self: Step,
             alloc: Allocator,
         ) Allocator.Error!Step {
             return switch (self) {
-                .@"-e" => self,
+                .@"-e" => |v| .{ .@"-e" = try v.clone(alloc) },
                 .diagnostic => |v| .{ .diagnostic = try v.clone(alloc) },
-                .arg => |v| .{ .arg = try alloc.dupeZ(u8, v) },
+                .arg => |v| .{ .arg = .{
+                    .value = try alloc.dupeZ(u8, v.value),
+                    .location = try v.location.clone(alloc),
+                } },
                 .expand => |v| .{ .expand = try alloc.dupe(u8, v) },
                 .conditional_arg => |v| conditional: {
                     var conds = try alloc.alloc(Conditional, v.conditions.len);
@@ -5397,6 +5412,7 @@ const Replay = struct {
                     break :conditional .{ .conditional_arg = .{
                         .conditions = conds,
                         .arg = try alloc.dupe(u8, v.arg),
+                        .location = try v.location.clone(alloc),
                     } };
                 },
             };
@@ -5409,6 +5425,12 @@ const Replay = struct {
         config: *Config,
         slice: []const Replay.Step,
         idx: usize = 0,
+        current_location: cli.Location = .none,
+
+        pub fn location(self: *const Self, alloc: Allocator) Allocator.Error!?cli.Location {
+            // The replay source may be freed as soon as this load completes.
+            return try self.current_location.clone(alloc);
+        }
 
         pub fn next(self: *Self) ?[]const u8 {
             while (true) {
@@ -5446,11 +5468,18 @@ const Replay = struct {
                             }
                         }
 
+                        self.current_location = v.location;
                         return v.arg;
                     },
 
-                    .arg => |arg| return arg,
-                    .@"-e" => return "-e",
+                    .arg => |arg| {
+                        self.current_location = arg.location;
+                        return arg.value;
+                    },
+                    .@"-e" => |place| {
+                        self.current_location = place;
+                        return "-e";
+                    },
                 }
             }
         }
@@ -5463,6 +5492,58 @@ const Replay = struct {
         return .{ .slice = slice, .config = dst };
     }
 };
+
+test "conditional replay clones locations and handles allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: Allocator) !void {
+            const testing = std.testing;
+            var arena = ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var path = "owned-config.ghostty".*;
+            const place: cli.Location = .{ .file = .{ .path = &path, .line = 7 } };
+            const steps: []const Replay.Step = &.{
+                .{ .arg = .{ .value = "--font-szie=14", .location = place } },
+                .{ .conditional_arg = .{
+                    .arg = "--skipped=true",
+                    .location = .{ .cli = 99 },
+                    .conditions = &.{.{ .key = .theme, .op = .eq, .value = "dark" }},
+                } },
+                .{ .conditional_arg = .{
+                    .arg = "--font-size=invalid",
+                    .location = place,
+                    .conditions = &.{.{ .key = .theme, .op = .eq, .value = "light" }},
+                } },
+                .{ .arg = .{ .value = "--unknown-cli", .location = .{ .cli = 3 } } },
+                .{ .arg = .{ .value = "--unknown-source" } },
+                .{ .@"-e" = place },
+            };
+            const cloned = try arena.allocator().alloc(Replay.Step, steps.len);
+            for (steps, cloned) |step, *dst| dst.* = try step.clone(arena.allocator());
+            @memset(&path, 'x');
+
+            var cfg = try Config.default(alloc);
+            defer cfg.deinit();
+            var it = Replay.iterator(cloned, &cfg);
+            const expected = [_]cli.Location{
+                .{ .file = .{ .path = "owned-config.ghostty", .line = 7 } },
+                .{ .file = .{ .path = "owned-config.ghostty", .line = 7 } },
+                .{ .cli = 3 },
+                .none,
+                .{ .file = .{ .path = "owned-config.ghostty", .line = 7 } },
+            };
+            for (expected) |want| {
+                try testing.expect(it.next() != null);
+                const got = (try it.location(alloc)).?;
+                defer if (got == .file) alloc.free(got.file.path);
+                try testing.expectEqualDeep(want, got);
+                if (got == .file) {
+                    try testing.expect(got.file.path.ptr != it.current_location.file.path.ptr);
+                }
+            }
+            try testing.expect(it.next() == null);
+        }
+    }.run, .{});
+}
 
 /// Valid values for confirm-close-surface
 /// c_int because it needs to be extern compatible
@@ -11483,6 +11564,98 @@ test "changeConditionalState ignores irrelevant changes" {
         try testing.expect(try cfg.changeConditionalState(
             .{ .theme = .dark },
         ) == null);
+    }
+}
+
+test "conditional replay preserves diagnostic locations" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var reader: std.Io.Reader = .fixed(
+        "# a comment still counts as a line\n" ++
+            "theme = light:missing-theme02-light,dark:missing-theme02-dark\n" ++
+            "font-szie = 14\n" ++
+            "font-size = invalid\n",
+    );
+    const path = "C:/theme02/config.ghostty";
+    try cfg.loadReader(alloc, &reader, path);
+    try cfg.finalize();
+
+    var dark = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark.deinit();
+    for ([_]*const Config{ &cfg, &dark }) |config| {
+        var found: usize = 0;
+        for (config._diagnostics.list.items) |diag| {
+            const line: usize = if (std.mem.eql(u8, diag.key, "font-szie")) 3 else if (std.mem.eql(u8, diag.key, "font-size")) 4 else continue;
+            try testing.expectEqual(cli.Location.Key.file, std.meta.activeTag(diag.location));
+            try testing.expectEqualStrings(path, diag.location.file.path);
+            try testing.expectEqual(line, diag.location.file.line);
+            found += 1;
+        }
+        try testing.expectEqual(@as(usize, 2), found);
+    }
+}
+
+test "conditional replay preserves CLI diagnostic locations" {
+    const testing = std.testing;
+    for ([_][]const u8{ "--font-szie=14", "-e" }) |arg| {
+        var cfg = try Config.default(testing.allocator);
+        defer cfg.deinit();
+        var it: cli.args.ArgsIterator(cli.args.SliceIterator) = .{
+            .iterator = .{ .slice = &.{arg} },
+        };
+        try cfg.loadIter(testing.allocator, &it);
+        cfg._conditional_set.insert(.theme);
+        var replayed = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+        defer replayed.deinit();
+        try testing.expectEqual(@as(usize, 1), replayed._diagnostics.list.items.len);
+        try testing.expectEqualDeep(cli.Location{ .cli = 1 }, replayed._diagnostics.list.items[0].location);
+    }
+}
+
+test "conditional replay retains theme locations after source config is freed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    try td.dir.writeFile(.{ .sub_path = "light", .data = "# light\nfont-szie = 14\n" });
+    try td.dir.writeFile(.{ .sub_path = "dark", .data = "# dark\n# second comment\nfont-szie = 15\n" });
+    var light_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dark_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const light_path = try td.dir.realpath("light", &light_buf);
+    const dark_path = try td.dir.realpath("dark", &dark_buf);
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\nfont-size = invalid\n", .{ light_path, dark_path });
+    defer alloc.free(text);
+    var source_path = "C:/theme02/config.ghostty".*;
+    var cfg = cloned: {
+        var source = try Config.default(alloc);
+        defer source.deinit();
+        var reader: std.Io.Reader = .fixed(text);
+        try source.loadReader(alloc, &reader, &source_path);
+        try source.finalize();
+        break :cloned try source.clone(alloc);
+    };
+    defer cfg.deinit();
+    @memset(&source_path, 'x');
+
+    var dark = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark.deinit();
+    var light = (try dark.changeConditionalState(.{ .theme = .light })).?;
+    defer light.deinit();
+    for ([_]*const Config{ &cfg, &dark, &light }, 0..) |config, i| {
+        try testing.expectEqual(@as(usize, 2), config._diagnostics.list.items.len);
+        for (config._diagnostics.list.items) |diag| {
+            try testing.expectEqual(cli.Location.Key.file, std.meta.activeTag(diag.location));
+            if (std.mem.eql(u8, diag.key, "font-szie")) {
+                try testing.expectEqualStrings(if (i == 1) dark_path else light_path, diag.location.file.path);
+                try testing.expectEqual(@as(usize, if (i == 1) 3 else 2), diag.location.file.line);
+            } else {
+                try testing.expectEqualStrings("font-size", diag.key);
+                try testing.expectEqualStrings("C:/theme02/config.ghostty", diag.location.file.path);
+                try testing.expectEqual(@as(usize, 2), diag.location.file.line);
+            }
+        }
     }
 }
 
