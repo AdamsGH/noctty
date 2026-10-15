@@ -113,11 +113,8 @@ present_pacer: PresentPacer = .{},
 /// a draw-only tick that takes the slot would otherwise present stale frame
 /// data and push the deferred update out again, every interval (#297).
 frame_update_deferred: bool = false,
-/// Set when the apprt woke the renderer because a window needs its pixels
-/// drawn (`wakeNeedsPixels`) and cleared when a pass queues a present. A
-/// frame synchronized output holds is presented for it, also when pacing
-/// put that wake's pass off.
-apprt_repaint_owed: bool = false,
+/// Which passes present a frame synchronized output holds.
+held_frame: HeldFrame = .{},
 
 /// The timer used for draw calls. Draw calls don't update from the
 /// terminal state so they're much cheaper. They're used for animation
@@ -936,12 +933,7 @@ const RenderPass = union(enum) {
 
 fn renderOnce(self: *Thread, pass: RenderPass) bool {
     const from_wakeup = pass == .wake;
-    switch (pass) {
-        .wake => |sources| if (wakeNeedsPixels(sources)) {
-            self.apprt_repaint_owed = true;
-        },
-        else => {},
-    }
+    self.held_frame.noteWake(pass);
 
     // Drain mailbox work first so message-driven state changes are reflected
     // in the same frame as terminal output wakes.
@@ -999,13 +991,10 @@ fn renderOnce(self: *Thread, pass: RenderPass) bool {
     // Synchronized output held the frame, so a present would show the same
     // pixels again, once per follow-up until it ends. termio's 1 s reset
     // always wakes the renderer, an ESU only when it brings dirt, so the
-    // update stays owed and the follow-up polls for a clean ESU. The shader
-    // draw timer's pass still animates over the held frame, and a window
-    // the apprt must repaint (exposed, newly shown) still gets it.
+    // update stays owed and the follow-up polls for a clean ESU.
     const held = if (frame_update) |update| update.synchronized_output else false;
     if (held) self.frame_update_deferred = true;
-    const animating = pass == .animation and self.draw_active;
-    if (held and !animating and !self.apprt_repaint_owed) {
+    if (held and !self.held_frame.presents(pass, self.draw_active)) {
         if (repaint_reserved) {
             if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
                 self.surface.cancelRendererRepaintRequest();
@@ -1015,7 +1004,7 @@ fn renderOnce(self: *Thread, pass: RenderPass) bool {
     }
 
     // Draw.
-    self.apprt_repaint_owed = false;
+    self.held_frame.notePresent();
     self.drawFrameWithReservation(false, repaint_reserved);
 
     // On Win32, xev async wakes can coalesce while a render pass is still
@@ -1189,6 +1178,36 @@ fn followupOwesFrameUpdate(deferred: bool, draw_active: bool) bool {
     return deferred and !draw_active;
 }
 
+/// Which render passes present a frame synchronized output holds: the
+/// custom-shader draw timer's, which animates over it, and any pass while
+/// the apprt is owed pixels.
+const HeldFrame = struct {
+    /// The apprt woke the renderer because a window needs its pixels drawn
+    /// (`wakeNeedsPixels`) and no present was queued since. A WM_PAINT that
+    /// finds no frame reserved draws nothing itself, so without this an
+    /// exposed or newly shown pane stays blank until the hold ends. It
+    /// outlives a pass pacing puts off, so the follow-up that runs the
+    /// deferred update presents for it.
+    repaint_owed: bool = false,
+
+    fn noteWake(self: *HeldFrame, pass: RenderPass) void {
+        switch (pass) {
+            .wake => |sources| if (wakeNeedsPixels(sources)) {
+                self.repaint_owed = true;
+            },
+            .followup, .animation => {},
+        }
+    }
+
+    fn presents(self: HeldFrame, pass: RenderPass, draw_active: bool) bool {
+        return self.repaint_owed or (pass == .animation and draw_active);
+    }
+
+    fn notePresent(self: *HeldFrame) void {
+        self.repaint_owed = false;
+    }
+};
+
 /// Wakes from the apprt for a window that needs its pixels drawn again
 /// (exposed, newly shown, resized, recovering): a frame synchronized output
 /// holds is presented anyway for these.
@@ -1212,6 +1231,32 @@ test "render follow-up carries a deferred update unless the shader timer does" {
     // at every slot the timer took.
     try testing.expect(!followupOwesFrameUpdate(true, true));
     try testing.expect(!followupOwesFrameUpdate(false, false));
+}
+
+test "a frame synchronized output holds is presented only for animation and owed repaints" {
+    const testing = std.testing;
+    const Source = rendererpkg.State.WakeSource;
+
+    var held: HeldFrame = .{};
+    // Output, a blink or the follow-up: the held frame is not presented.
+    held.noteWake(.{ .wake = Source.io_output.bit() | Source.cursor_blink.bit() });
+    try testing.expect(!held.presents(.{ .wake = Source.io_output.bit() }, false));
+    try testing.expect(!held.presents(.followup, false));
+    // The shader draw timer's pass animates over it, but not once the
+    // timer has stopped (focus left a `custom-shader-animation = true` pane).
+    try testing.expect(held.presents(.animation, true));
+    try testing.expect(!held.presents(.animation, false));
+    // A follow-up while the draw timer runs does not present it twice.
+    try testing.expect(!held.presents(.followup, true));
+
+    // An expose: its wake's pass is put off by pacing, so the repaint stays
+    // owed and the follow-up that runs next presents the held frame.
+    held.noteWake(.{ .wake = Source.apprt_paint_retry.bit() });
+    try testing.expect(held.presents(.followup, false));
+    held.noteWake(.followup);
+    try testing.expect(held.presents(.followup, false));
+    held.notePresent();
+    try testing.expect(!held.presents(.followup, false));
 }
 
 test "only apprt repaint wakes present a frame synchronized output holds" {
