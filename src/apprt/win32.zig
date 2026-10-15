@@ -3164,8 +3164,20 @@ fn settingsFileOpenable(
     what: []const u8,
     path: []const u8,
 ) win32_settings.SaveError!void {
+    _ = try settingsFileProbe(alloc, detail, what, path);
+}
+
+/// `settingsFileOpenable`, saying whether something is there: false for a
+/// missing file, true for one that opens and for a directory.
+fn settingsFileProbe(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    what: []const u8,
+    path: []const u8,
+) win32_settings.SaveError!bool {
     const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.IsDir => return,
+        error.FileNotFound => return false,
+        error.IsDir => return true,
         else => {
             log.warn("settings save: could not open {s} to check it for edits path={s} err={}", .{ what, path, err });
             if (detail) |d| {
@@ -3177,6 +3189,7 @@ fn settingsFileOpenable(
         },
     };
     file.close();
+    return true;
 }
 
 /// `settingsFileOpenable` for every file the loaded config pulled in: the
@@ -3213,11 +3226,27 @@ fn settingsThemeOpenable(
         if (!std.mem.eql(u8, name, std.fs.path.basename(name))) continue;
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
+        var dirs: std.ArrayListUnmanaged([]const u8) = .{};
         var it: themepkg.LocationIterator = .{ .arena_alloc = arena.allocator() };
         while (it.next() catch return error.OutOfMemory) |location| {
-            const path = std.fs.path.join(arena.allocator(), &.{ location.dir, name }) catch return error.OutOfMemory;
-            try settingsFileOpenable(alloc, detail, "the theme file", path);
+            dirs.append(arena.allocator(), location.dir) catch return error.OutOfMemory;
         }
+        try settingsThemeNameOpenable(alloc, detail, name, dirs.items);
+    }
+}
+
+/// The loader uses the first directory that has `name` and never looks at the
+/// rest, so a later copy that is locked does not matter.
+fn settingsThemeNameOpenable(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    name: []const u8,
+    dirs: []const []const u8,
+) win32_settings.SaveError!void {
+    for (dirs) |dir| {
+        const path = std.fs.path.join(alloc, &.{ dir, name }) catch return error.OutOfMemory;
+        defer alloc.free(path);
+        if (try settingsFileProbe(alloc, detail, "the theme file", path)) return;
     }
 }
 
@@ -27020,6 +27049,49 @@ test "win32 settings disk check stops at a config file it cannot open, not at a 
     const expected_skipped = try std.fmt.allocPrint(alloc, "the file {s}", .{bad_path});
     defer alloc.free(expected_skipped);
     try std.testing.expectEqualStrings(expected_skipped, detail.text.?);
+}
+
+test "win32 settings disk check looks only at the theme copy the loader would use" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("user");
+    try tmp.dir.makeDir("bundled");
+    try tmp.dir.makeDir("empty");
+    try tmp.dir.writeFile(.{ .sub_path = "user/Mine", .data = "cursor-style = bar\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "bundled/Mine", .data = "cursor-style = block\n" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const user = try std.fs.path.join(alloc, &.{ root, "user" });
+    defer alloc.free(user);
+    const bundled = try std.fs.path.join(alloc, &.{ root, "bundled" });
+    defer alloc.free(bundled);
+    const empty = try std.fs.path.join(alloc, &.{ root, "empty" });
+    defer alloc.free(empty);
+    const user_copy = try std.fs.path.join(alloc, &.{ user, "Mine" });
+    defer alloc.free(user_copy);
+    const bundled_copy = try std.fs.path.join(alloc, &.{ bundled, "Mine" });
+    defer alloc.free(bundled_copy);
+
+    try settingsThemeNameOpenable(alloc, null, "Mine", &.{ user, bundled });
+
+    // Hold the bundled copy with no sharing. The user copy wins the search, so
+    // the load never opens it: no refusal.
+    const wide = try std.os.windows.sliceToPrefixedFileW(null, bundled_copy);
+    const held = std.os.windows.kernel32.CreateFileW(wide.span().ptr, std.os.windows.GENERIC_READ, 0, null, std.os.windows.OPEN_EXISTING, 0, null);
+    if (held == std.os.windows.INVALID_HANDLE_VALUE) return error.CouldNotHoldFile;
+    defer std.os.windows.CloseHandle(held);
+    try settingsThemeNameOpenable(alloc, null, "Mine", &.{ user, bundled });
+    // Where the locked copy is the first one that exists, it is the one the
+    // load needs; a directory without the name is passed over.
+    var detail: win32_settings.FailureDetail = .{};
+    defer detail.clear(alloc);
+    try std.testing.expectError(error.FileUnopenable, settingsThemeNameOpenable(alloc, &detail, "Mine", &.{ empty, bundled, user }));
+    const expected = try std.fmt.allocPrint(alloc, "the theme file {s}", .{bundled_copy});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, detail.text.?);
+    // A name that is nowhere is the loader's to report.
+    try settingsThemeNameOpenable(alloc, null, "Nowhere", &.{ empty, user, bundled });
 }
 
 test "win32 palette theme save failures say what the person can do about them" {
