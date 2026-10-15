@@ -202,8 +202,16 @@ pub const RootProvider = struct {
     /// toggle, a minimize, or a hide would otherwise keep children that
     /// `Navigate` no longer returns.
     pub fn raiseCaptionStructureChanged(self: *RootProvider) void {
-        if (self.detached.load(.acquire)) return;
         if (self.caption == null) return;
+        self.raiseChildrenInvalidated();
+    }
+
+    /// Tell listening clients that the window's children changed in a way
+    /// they cannot tell from the element alone, such as a tab leaving the
+    /// strip: the tab buttons are the window's child windows, not providers
+    /// of this root.
+    pub fn raiseChildrenInvalidated(self: *RootProvider) void {
+        if (self.detached.load(.acquire)) return;
         events.raiseStructureChanged(&self.base, .children_invalidated, null);
     }
 
