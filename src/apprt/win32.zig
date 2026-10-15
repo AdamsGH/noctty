@@ -3191,6 +3191,36 @@ fn settingsIncludesOpenable(
     };
 }
 
+/// The theme files the loaded config selects, by the loader's own search
+/// (`themepkg.open`: an absolute path, or the name in each theme directory),
+/// held to the same rule as an include. A theme that is not there is the
+/// loader's to report, and the running config lacks it too; one that is there
+/// and will not open is skipped by the load, and the settings it supplies
+/// come back as defaults. Both the light and the dark name are checked, since
+/// which one the load used depends on the system state.
+fn settingsThemeOpenable(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    disk: *const configpkg.Config,
+) win32_settings.SaveError!void {
+    const theme = disk.theme orelse return;
+    for ([_][]const u8{ theme.light, theme.dark }) |name| {
+        if (std.fs.path.isAbsolute(name)) {
+            try settingsFileOpenable(alloc, detail, "the theme file", name);
+            continue;
+        }
+        // A name with a separator is rejected by the loader without a look.
+        if (!std.mem.eql(u8, name, std.fs.path.basename(name))) continue;
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        var it: themepkg.LocationIterator = .{ .arena_alloc = arena.allocator() };
+        while (it.next() catch return error.OutOfMemory) |location| {
+            const path = std.fs.path.join(arena.allocator(), &.{ location.dir, name }) catch return error.OutOfMemory;
+            try settingsFileOpenable(alloc, detail, "the theme file", path);
+        }
+    }
+}
+
 /// Whether the loaded `disk` config holds an edit that conflicts with the
 /// draft, or an error when it is not the whole config: the save's own reload
 /// would apply the same partial load, so a locked include stops the save
@@ -3205,6 +3235,7 @@ fn settingsDiskVerdict(
     user_edited: SettingsEditedKeySet,
 ) win32_settings.SaveError!bool {
     try settingsIncludesOpenable(alloc, detail, disk);
+    try settingsThemeOpenable(alloc, detail, disk);
     // A UTF-16 file that does not decode is skipped whole, with a diagnostic
     // and everything it set missing: as incomplete as one that will not open.
     if (disk._undecodable_file) |path| {
@@ -26961,6 +26992,20 @@ test "win32 settings disk check stops at a config file it cannot open, not at a 
     const state: configpkg.ConditionalState = .{};
     try std.testing.expectError(error.FileUnopenable, settingsDiskVerdict(alloc, null, &same, &same, &config, state, edited));
     try std.testing.expect(!try settingsDiskVerdict(alloc, null, &same, &same, &same, state, edited));
+
+    // And the theme file the config selects: a theme that will not open is
+    // skipped by the load, and what it sets comes back as defaults. A theme
+    // that is not there at all is the loader's to report.
+    var themed = try configpkg.Config.default(alloc);
+    defer themed.deinit();
+    themed.theme = .{ .light = missing_path, .dark = missing_path };
+    detail.clear(alloc);
+    try std.testing.expectError(error.FileUnopenable, settingsDiskVerdict(alloc, &detail, &same, &same, &themed, state, edited));
+    const expected_theme = try std.fmt.allocPrint(alloc, "the theme file {s}", .{missing_path});
+    defer alloc.free(expected_theme);
+    try std.testing.expectEqualStrings(expected_theme, detail.text.?);
+    themed.theme = .{ .light = gone_path, .dark = "no-such-theme-for-pkg21" };
+    try std.testing.expect(!try settingsDiskVerdict(alloc, null, &same, &same, &themed, state, edited));
 
     // So is a UTF-16 file that does not decode (a lone surrogate): the load
     // skips it whole, and the defaults it leaves must not pass for an edit.
