@@ -139,7 +139,7 @@ With OSC 133 shell integration active, the command palette also offers:
 
 - `jump_to_prompt:-1` / `jump_to_prompt:1` (`Ctrl+Shift+PageUp` /
   `Ctrl+Shift+PageDown`): previous / next prompt.
-- `copy_last_command_output` (`Ctrl+Shift+Y`): copy the last completed
+- `copy_last_command_output` (no default keybind): copy the last completed
   command's output. Needs OSC 133;C and OSC 133;D boundaries.
 - `insert_last_command` (no default keybind): put the last recoverable
   single-line command back on the prompt without submitting it. Needs OSC
@@ -616,9 +616,10 @@ is not dropped: ConPTY hands the child the same bytes noctty wrote. Older
 in-box conhosts, including Windows 10 build 19045, were not measured. See the
 [key encoding differential](windows-vt-conformance.md#measured-master-to-child-key-encoding-differential).
 
-`F6` and `Shift+F6` run `cycle_focus_region` and move keyboard focus
-between the terminal pane, the tab strip, the docked search query, and the
-host banner, skipping whatever is not on screen. `Esc` returns to the
+`Ctrl+F6` and `Ctrl+Shift+F6` run `cycle_focus_region` and move keyboard
+focus between the terminal pane, the tab strip, the docked search query, and
+the host banner, skipping whatever is not on screen. A bare `F6` is left to
+the program in the pane (htop, Midnight Commander). `Esc` returns to the
 terminal. In the tab strip, Left/Right/Home/End move between tabs,
 Enter or Space activates one, `Delete` closes one, `F2` renames, and Ctrl
 with an arrow or Home/End moves the tab. These chrome keys are fixed:
