@@ -791,14 +791,17 @@ pub const StreamHandler = struct {
 
             .alt_screen_legacy => {
                 try self.terminal.switchScreenMode(.@"47", enabled);
+                self.semantic_output.noteScreenSwitch();
             },
 
             .alt_screen => {
                 try self.terminal.switchScreenMode(.@"1047", enabled);
+                self.semantic_output.noteScreenSwitch();
             },
 
             .alt_screen_save_cursor_clear_enter => {
                 try self.terminal.switchScreenMode(.@"1049", enabled);
+                self.semantic_output.noteScreenSwitch();
             },
 
             // Mode 1048 is xterm's conditional save cursor depending
@@ -1917,6 +1920,81 @@ test "semantic output capture follows real stream handler parser" {
     stream.nextSlice("\x1b[?1049lafter");
     const left = stream.handler.semantic_output.finish();
     try std.testing.expectEqualStrings("after", left.slice());
+}
+
+test "semantic output capture asks the consumer to forget typed input on a screen switch" {
+    var term = try terminal.Terminal.init(std.testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(std.testing.allocator);
+
+    var termio_mailbox = try termio.Mailbox.initSPSC(std.testing.allocator);
+    defer termio_mailbox.deinit(std.testing.allocator);
+    var renderer_mutex: std.Thread.Mutex = .{};
+    var renderer_state: renderer.State = undefined;
+    renderer_state.mutex = &renderer_mutex;
+    renderer_state.terminal = &term;
+    var rt_app: apprt.App = undefined;
+    rt_app.windows = .empty;
+    rt_app.ui_thread_id = 0;
+    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
+    const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
+    defer app_queue.destroy(std.testing.allocator);
+    const surface_mailbox: apprt.surface.Mailbox = .{
+        .surface = undefined,
+        .app = .{
+            .rt_app = &rt_app,
+            .mailbox = app_queue,
+        },
+    };
+
+    var stream = StreamHandler.Stream.initAlloc(std.testing.allocator, .{
+        .alloc = std.testing.allocator,
+        .size = undefined,
+        .terminal = &term,
+        .termio_mailbox = &termio_mailbox,
+        .surface_mailbox = surface_mailbox,
+        .renderer_state = &renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .default_cursor_style = .block,
+        .default_cursor_blink = true,
+        .enquiry_response = "",
+        .osc_color_report_format = .none,
+        .clipboard_write = .allow,
+    });
+    defer stream.deinit();
+
+    // Typed input that the print stream was still waiting to see echoed is
+    // stale once the screen changes: a full-screen program's own redraws no
+    // longer reach the stream to mismatch it, and a primary-screen line that
+    // starts with the same characters would be taken for the echo. Entering
+    // and leaving each alternate-screen mode tells the consumer to forget it,
+    // and a batch that switches nothing leaves it alone.
+    inline for (.{ "47", "1047", "1049" }) |mode| {
+        stream.handler.semantic_output.begin(true);
+        stream.nextSlice("ls\x1b[?" ++ mode ++ "h");
+        const enter = stream.handler.semantic_output.finish();
+        try std.testing.expect(enter.reset_before);
+        try std.testing.expectEqualStrings("ls", enter.slice());
+
+        stream.handler.semantic_output.begin(true);
+        stream.nextSlice("\x1b[2J\x1b[1;1Hredraw");
+        const redraw = stream.handler.semantic_output.finish();
+        try std.testing.expect(!redraw.reset_before);
+
+        stream.handler.semantic_output.begin(true);
+        stream.nextSlice("\x1b[?" ++ mode ++ "lls foo");
+        const leave = stream.handler.semantic_output.finish();
+        try std.testing.expect(leave.reset_before);
+        try std.testing.expectEqualStrings("ls foo", leave.slice());
+    }
+    stream.handler.semantic_output.begin(true);
+    stream.nextSlice("\x1b[?25h\x1b[?2004hplain\x1b[?25l");
+    const other_modes = stream.handler.semantic_output.finish();
+    try std.testing.expect(!other_modes.reset_before);
+    try std.testing.expectEqualStrings("plain", other_modes.slice());
 }
 
 fn expectIssue149Write(mailbox: *termio.Mailbox, expected: []const u8) !void {

@@ -1364,6 +1364,31 @@ test "terminal focus loss cancels speech and echo backlog" {
     try std.testing.expectEqual(@as(usize, 0), session.recent_input_len);
 }
 
+test "a continuity reset forgets typed input that was still waiting for its echo" {
+    var ctx: u8 = 0;
+    const session = try TerminalAccessibilitySession.create(
+        std.testing.allocator,
+        TestOps.ops(&ctx),
+        0,
+        0,
+    );
+    defer session.deinit();
+
+    // Typed characters are dropped from the output that starts with them...
+    session.noteInput("ls");
+    const echo = session.stripRecentInputEcho("ls foo", sys.GetTickCount64());
+    try std.testing.expectEqualStrings("", echo.held_prefix);
+    try std.testing.expectEqualStrings("foo", echo.output);
+
+    // ...unless the screen changed first (the stream handler resets the
+    // consumer then), when such a line is real output and is spoken whole.
+    session.noteInput("ls");
+    session.resetSemanticOutputContinuity();
+    const fresh = session.stripRecentInputEcho("ls foo", sys.GetTickCount64());
+    try std.testing.expectEqualStrings("", fresh.held_prefix);
+    try std.testing.expectEqualStrings("ls foo", fresh.output);
+}
+
 test "terminal name cache refreshes without an event listener" {
     var ctx: MutableTestOps.Context = .{
         .focused = true,

@@ -65,6 +65,14 @@ pub const SemanticOutputCapture = struct {
         self.reset_before = true;
     }
 
+    /// The program switched between the main and the alternate screen. What
+    /// the consumer still holds from before (typed input waiting to be seen
+    /// echoed) can no longer be told apart from output of the other screen,
+    /// so it is dropped before this batch; the bytes captured so far stay.
+    pub fn noteScreenSwitch(self: *SemanticOutputCapture) void {
+        if (self.active) self.reset_before = true;
+    }
+
     pub fn finish(self: *SemanticOutputCapture) Batch {
         var result: Batch = .{
             .bytes = undefined,
@@ -141,6 +149,25 @@ test "semantic output full reset discards prior bytes and omission" {
     try std.testing.expectEqualStrings("B", batch.slice());
     try std.testing.expect(!batch.omitted_after);
     try std.testing.expect(batch.reset_before);
+}
+
+test "semantic output screen switch resets continuity and keeps the captured bytes" {
+    var capture: SemanticOutputCapture = .{};
+    capture.begin(true);
+    capture.recordPrint('A');
+    capture.noteScreenSwitch();
+    capture.recordPrint('B');
+    const batch = capture.finish();
+    try std.testing.expectEqualStrings("AB", batch.slice());
+    try std.testing.expect(batch.reset_before);
+    try std.testing.expect(!batch.omitted_after);
+
+    // The flag belongs to one batch, and an uninterested one records nothing.
+    capture.begin(true);
+    try std.testing.expect(!capture.finish().reset_before);
+    capture.begin(false);
+    capture.noteScreenSwitch();
+    try std.testing.expect(!capture.finish().reset_before);
 }
 
 test "semantic output capture retains codepoint-aligned prefix before omission" {
