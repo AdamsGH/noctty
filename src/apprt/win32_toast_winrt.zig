@@ -352,6 +352,12 @@ fn iidEqual(a: *const GUID, b: *const GUID) bool {
 /// copy it before returning if the data must be retained.
 pub const ActivationCallback = *const fn (ctx: *anyopaque, launch: []const u8) void;
 
+/// Agile activation handlers can outlive the notifier and its UI owner.
+pub const ActivationContextLifetime = struct {
+    retain: *const fn (*anyopaque) void,
+    release: *const fn (*anyopaque) void,
+};
+
 const ToastActivatedHandlerInterface = extern struct {
     vtbl: *const ToastActivatedHandlerVtbl,
 
@@ -377,6 +383,7 @@ const ToastActivationHandler = struct {
     launch: []u8,
     callback: ActivationCallback,
     ctx: *anyopaque,
+    context_lifetime: ?ActivationContextLifetime,
 
     const alloc = std.heap.page_allocator;
 
@@ -387,7 +394,7 @@ const ToastActivationHandler = struct {
         .Invoke = Invoke,
     };
 
-    fn create(launch: []const u8, callback: ActivationCallback, ctx: *anyopaque) Allocator.Error!*ToastActivationHandler {
+    fn create(launch: []const u8, callback: ActivationCallback, ctx: *anyopaque, lifetime: ?ActivationContextLifetime) Allocator.Error!*ToastActivationHandler {
         const launch_copy = try alloc.dupe(u8, launch);
         errdefer alloc.free(launch_copy);
 
@@ -398,7 +405,9 @@ const ToastActivationHandler = struct {
             .launch = launch_copy,
             .callback = callback,
             .ctx = ctx,
+            .context_lifetime = lifetime,
         };
+        if (lifetime) |owned| owned.retain(ctx);
         return self;
     }
 
@@ -434,6 +443,7 @@ const ToastActivationHandler = struct {
         const self = fromBase(base);
         const prev = self.refcount.fetchSub(1, .acq_rel);
         if (prev == 1) {
+            if (self.context_lifetime) |owned| owned.release(self.ctx);
             alloc.free(self.launch);
             alloc.destroy(self);
             return 0;
@@ -462,6 +472,7 @@ pub const WinrtToast = struct {
     ro_initialized: bool,
     activation_callback: ?ActivationCallback = null,
     activation_ctx: ?*anyopaque = null,
+    activation_context_lifetime: ?ActivationContextLifetime = null,
 
     pub fn init(alloc: Allocator, aumid: []const u16) InitError!WinrtToast {
         const fns = try loadCombase();
@@ -503,13 +514,17 @@ pub const WinrtToast = struct {
         };
     }
 
-    pub fn setActivationCallback(self: *WinrtToast, ctx: *anyopaque, callback: ActivationCallback) void {
+    pub fn setActivationCallback(self: *WinrtToast, ctx: *anyopaque, callback: ActivationCallback, lifetime: ActivationContextLifetime) void {
+        lifetime.retain(ctx);
+        if (self.activation_context_lifetime) |old| old.release(self.activation_ctx.?);
         self.activation_ctx = ctx;
         self.activation_callback = callback;
+        self.activation_context_lifetime = lifetime;
     }
 
     pub fn deinit(self: *WinrtToast) void {
         _ = self.notifier.release();
+        if (self.activation_context_lifetime) |owned| owned.release(self.activation_ctx.?);
         _ = self.fns.delete_string(self.aumid_hs);
         if (self.ro_initialized) self.fns.ro_uninit();
         self.* = undefined;
@@ -598,7 +613,7 @@ pub const WinrtToast = struct {
             }
             const callback = self.activation_callback.?;
             const ctx = self.activation_ctx.?;
-            const handler = ToastActivationHandler.create(value, callback, ctx) catch return ShowError.OutOfMemory;
+            const handler = ToastActivationHandler.create(value, callback, ctx, self.activation_context_lifetime) catch return ShowError.OutOfMemory;
             var token: i64 = 0;
             const add_hr = notification.vtbl.add_Activated(notification.asRaw(), &handler.base, &token);
             _ = handler.base.vtbl.Release(&handler.base);
@@ -699,6 +714,7 @@ test "WinrtToast activation handler supports QI and invokes launch callback" {
         "wgh://activate?surface=7&action=focus",
         State.callback,
         &state,
+        null,
     );
 
     var out: ?*anyopaque = null;
@@ -718,6 +734,44 @@ test "WinrtToast activation handler supports QI and invokes launch callback" {
     try std.testing.expectEqual(S_OK, handler.base.vtbl.Invoke(&handler.base, @ptrFromInt(1), null));
     try std.testing.expect(state.called);
     try std.testing.expectEqual(@as(u32, 0), handler.base.vtbl.Release(&handler.base));
+}
+
+test "WinrtToast agile activation retains context beyond its UI owner" {
+    const State = struct {
+        refs: usize = 1,
+        observer: *Observer,
+        const Observer = struct { called: bool = false, destroyed: bool = false };
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+            if (self.refs != 0) return;
+            self.observer.destroyed = true;
+            std.testing.allocator.destroy(self);
+        }
+        fn callback(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs > 0);
+            self.observer.called = true;
+        }
+    };
+    var observer: State.Observer = .{};
+    const state = try std.testing.allocator.create(State);
+    state.* = .{ .observer = &observer };
+    const handler = try ToastActivationHandler.create("activation", State.callback, state, .{
+        .retain = State.retain,
+        .release = State.release,
+    });
+    State.release(state); // The UI owner is gone, but WinRT still has its handler.
+    try std.testing.expect(!observer.destroyed);
+    try std.testing.expectEqual(S_OK, handler.base.vtbl.Invoke(&handler.base, @ptrFromInt(1), null));
+    try std.testing.expect(observer.called);
+    _ = handler.base.vtbl.Release(&handler.base);
+    try std.testing.expect(observer.destroyed);
 }
 
 test "WinrtToast HRESULT classification - negative codes are failure" {

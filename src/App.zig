@@ -49,6 +49,12 @@ focused_surface: ?*Surface = null,
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: Mailbox.Queue,
 
+/// Messages that cannot run while a native modal loop has runtime frames
+/// on the stack. These retain ownership until the next ordinary tick.
+modal_mailbox: ModalMailbox = .{},
+outer_tick_active: bool = false,
+modal_tick_active: bool = false,
+
 /// The set of font GroupCache instances shared by surfaces with the
 /// same font configuration.
 font_grid_set: font.SharedGridSet,
@@ -104,6 +110,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *App) void {
+    self.modal_mailbox.deinit(self.alloc);
     while (self.mailbox.pop()) |message| message.deinit(self.alloc);
 
     // Clean up all our surfaces
@@ -139,8 +146,27 @@ test "App create overlaps Windows font discovery with runtime startup" {
 /// events. This should be called by the application runtime on every loop
 /// tick.
 pub fn tick(self: *App, rt_app: *apprt.App) !void {
+    if (self.outer_tick_active or self.modal_tick_active) return;
+    self.outer_tick_active = true;
+    defer self.outer_tick_active = false;
+
     // Drain our mailbox
-    try self.drainMailbox(rt_app);
+    try self.drainMailbox(rt_app, .outer);
+}
+
+/// Keep producer mailboxes moving inside menus and native move/size loops.
+/// A modal loop entered by an ordinary handler may drain safe work, but a
+/// handler cannot recursively drain the mailbox underneath itself.
+pub fn tickModal(self: *App, rt_app: *apprt.App) !void {
+    if (self.modal_tick_active) return;
+    self.modal_tick_active = true;
+    defer self.modal_tick_active = false;
+    self.modal_mailbox.beginModalBatch();
+    try self.drainMailbox(rt_app, .modal);
+    // A producer can refill slots as quickly as we pop them. Yield to the
+    // native pump after one batch, then wake again for still-queued work.
+    // Deferred work alone must not keep posting wakes inside the modal loop.
+    if (self.modal_mailbox.needsModalWake(&self.mailbox)) rt_app.wakeup();
 }
 
 /// Update the configuration associated with the app. This can only be
@@ -408,8 +434,8 @@ pub fn needsConfirmQuit(self: *const App) bool {
 }
 
 /// Drain the mailbox.
-fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
-    while (self.mailbox.pop()) |message| {
+fn drainMailbox(self: *App, rt_app: *apprt.App, mode: MailboxTickMode) !void {
+    while (try self.modal_mailbox.next(self.alloc, &self.mailbox, mode)) |message| {
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
                 // these tend to be way too verbose for normal debugging
@@ -474,6 +500,321 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
         // and close every window over, say, one that could not be created.
         handled catch |err| log.warn("mailbox message={t} failed err={}", .{ message, err });
     }
+}
+
+const MailboxTickMode = enum { outer, modal };
+
+/// The UI thread is the only consumer. A modal tick can overtake unsafe
+/// work, but unsafe messages retain their original FIFO order, including
+/// messages arriving during an ordinary handler's nested native loop.
+const ModalMailbox = struct {
+    const modal_batch_limit = 64;
+
+    deferred: std.ArrayList(Message) = .empty,
+    read: usize = 0,
+    modal_remaining: usize = modal_batch_limit,
+    // If growing the FIFO fails after a pop, keep its owned payload here.
+    // Further modal draining applies backpressure until storage is available
+    // or the outer loop resumes; it never executes or drops unsafe work.
+    overflow: ?Message = null,
+
+    fn beginModalBatch(self: *ModalMailbox) void {
+        self.modal_remaining = modal_batch_limit;
+    }
+
+    fn needsModalWake(self: *const ModalMailbox, mailbox: *Mailbox.Queue) bool {
+        if (self.modal_remaining != 0) return false;
+        mailbox.mutex.lock();
+        defer mailbox.mutex.unlock();
+        return mailbox.len != 0;
+    }
+
+    fn deinit(self: *ModalMailbox, alloc: Allocator) void {
+        for (self.deferred.items[self.read..]) |message| message.deinit(alloc);
+        self.deferred.deinit(alloc);
+        if (self.overflow) |message| message.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn next(
+        self: *ModalMailbox,
+        alloc: Allocator,
+        mailbox: *Mailbox.Queue,
+        mode: MailboxTickMode,
+    ) Allocator.Error!?Message {
+        switch (mode) {
+            .outer => {
+                if (self.read < self.deferred.items.len) {
+                    const message = self.deferred.items[self.read];
+                    self.read += 1;
+                    if (self.read == self.deferred.items.len) {
+                        self.deferred.clearRetainingCapacity();
+                        self.read = 0;
+                    }
+                    return message;
+                }
+                if (self.overflow) |message| {
+                    self.overflow = null;
+                    return message;
+                }
+                return mailbox.pop();
+            },
+            .modal => {
+                if (self.overflow) |message| {
+                    try self.deferred.append(alloc, message);
+                    self.overflow = null;
+                }
+                while (self.modal_remaining != 0) {
+                    const message = mailbox.pop() orelse return null;
+                    self.modal_remaining -= 1;
+                    if (messageSafeDuringModal(message)) return message;
+                    self.deferred.append(alloc, message) catch |err| {
+                        self.overflow = message;
+                        return err;
+                    };
+                }
+                return null;
+            },
+        }
+    }
+};
+
+fn messageSafeDuringModal(message: Message) bool {
+    return switch (message) {
+        .redraw_surface => true,
+        .open_config,
+        .new_window,
+        .automation_window_list,
+        .automation_action,
+        .automation_command,
+        .close,
+        .quit,
+        => false,
+        .surface_message => |payload| switch (payload.message) {
+            // Lifetime changes, native dialogs, terminal locks, and blocking
+            // sends to other worker mailboxes belong in the outer loop.
+            .close,
+            .child_exited,
+            .change_config,
+            .clipboard_read,
+            .clipboard_write,
+            .report_title,
+            .password_input,
+            .selection_scroll_tick,
+            .present_surface,
+            .search_viewport_matches,
+            .search_selected_match,
+            .search_clear,
+            => false,
+            .set_title,
+            .set_mouse_shape,
+            .desktop_notification,
+            .renderer_health,
+            .color_change,
+            .pwd_change,
+            .ring_bell,
+            .progress_report,
+            .program_status,
+            .start_command,
+            .stop_command,
+            .scrollbar,
+            .search_total,
+            .search_selected,
+            .search_match_rows,
+            => true,
+        },
+    };
+}
+
+test "modal mailbox drains past unsafe messages in a full producer queue" {
+    var queue: Mailbox.Queue = .{};
+    var pending: ModalMailbox = .{};
+    defer pending.deinit(std.testing.allocator);
+
+    for (0..63) |i| {
+        const surface: *Surface = @ptrFromInt((i + 1) * @alignOf(Surface));
+        try std.testing.expect(queue.push(.{ .close = surface }, .instant) != 0);
+    }
+    const surface: *Surface = @ptrFromInt(@alignOf(Surface));
+    try std.testing.expect(queue.push(.{ .surface_message = .{
+        .surface = surface,
+        .message = .ring_bell,
+    } }, .instant) != 0);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), queue.push(.quit, .instant));
+
+    const safe = (try pending.next(std.testing.allocator, &queue, .modal)).?;
+    try std.testing.expect(safe.surface_message.message == .ring_bell);
+    // Space is available before the native loop returns, even though the
+    // first 63 messages all require the outer loop.
+    try std.testing.expect(queue.push(.quit, .instant) != 0);
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .modal) == null);
+
+    for (0..63) |i| {
+        const expected: *Surface = @ptrFromInt((i + 1) * @alignOf(Surface));
+        const message = (try pending.next(std.testing.allocator, &queue, .outer)).?;
+        try std.testing.expectEqual(expected, message.close);
+    }
+    try std.testing.expect((try pending.next(std.testing.allocator, &queue, .outer)).? == .quit);
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .outer) == null);
+}
+
+test "modal mailbox bounds continuously refilled safe messages and requests followup" {
+    var queue: Mailbox.Queue = .{};
+    var pending: ModalMailbox = .{};
+    defer pending.deinit(std.testing.allocator);
+    const surface: *Surface = @ptrFromInt(@alignOf(Surface));
+    const message: Message = .{ .surface_message = .{
+        .surface = surface,
+        .message = .ring_bell,
+    } };
+    try std.testing.expect(queue.push(message, .instant) != 0);
+
+    for (0..3) |_| {
+        pending.beginModalBatch();
+        for (0..ModalMailbox.modal_batch_limit) |_| {
+            try std.testing.expect((try pending.next(std.testing.allocator, &queue, .modal)).?.surface_message.message == .ring_bell);
+            // The producer replaces each consumed message before the next
+            // pop. Empty-queue draining would never yield in this scenario.
+            try std.testing.expect(queue.push(message, .instant) != 0);
+        }
+        try std.testing.expect(try pending.next(std.testing.allocator, &queue, .modal) == null);
+        try std.testing.expect(pending.needsModalWake(&queue));
+        try std.testing.expectEqual(@as(Mailbox.Queue.Size, 1), queue.len);
+    }
+    _ = queue.pop();
+    try std.testing.expect(!pending.needsModalWake(&queue));
+}
+
+test "modal mailbox budget counts deferred messages without replay wakes" {
+    var queue: Mailbox.Queue = .{};
+    var pending: ModalMailbox = .{};
+    defer pending.deinit(std.testing.allocator);
+    for (0..ModalMailbox.modal_batch_limit) |_| {
+        try std.testing.expect(queue.push(.quit, .instant) != 0);
+    }
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .modal) == null);
+    try std.testing.expectEqual(@as(usize, 0), pending.modal_remaining);
+    try std.testing.expectEqual(@as(usize, ModalMailbox.modal_batch_limit), pending.deferred.items.len);
+    try std.testing.expect(!pending.needsModalWake(&queue));
+
+    // A newer producer message requires a follow-up, but draining it into
+    // the deferred FIFO must end the wake chain until the outer loop runs.
+    try std.testing.expect(queue.push(.quit, .instant) != 0);
+    try std.testing.expect(pending.needsModalWake(&queue));
+    pending.beginModalBatch();
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .modal) == null);
+    try std.testing.expect(!pending.needsModalWake(&queue));
+    try std.testing.expectEqual(@as(usize, ModalMailbox.modal_batch_limit + 1), pending.deferred.items.len);
+}
+
+test "modal mailbox retains unsafe FIFO order under an active outer handler" {
+    var queue: Mailbox.Queue = .{};
+    var pending: ModalMailbox = .{};
+    defer pending.deinit(std.testing.allocator);
+    const surfaces = [_]*Surface{
+        @ptrFromInt(@alignOf(Surface)),
+        @ptrFromInt(2 * @alignOf(Surface)),
+        @ptrFromInt(3 * @alignOf(Surface)),
+        @ptrFromInt(4 * @alignOf(Surface)),
+    };
+    for (surfaces[0..2]) |surface| {
+        try std.testing.expect(queue.push(.{ .close = surface }, .instant) != 0);
+    }
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .modal) == null);
+    const active = (try pending.next(std.testing.allocator, &queue, .outer)).?;
+    try std.testing.expectEqual(surfaces[0], active.close);
+
+    // The first outer handler enters a native loop while the second
+    // deferred message is still pending. Newly arriving unsafe work goes
+    // after that second message, even if a safe message overtakes it.
+    try std.testing.expect(queue.push(.{ .close = surfaces[2] }, .instant) != 0);
+    try std.testing.expect(queue.push(.{ .surface_message = .{
+        .surface = surfaces[0],
+        .message = .ring_bell,
+    } }, .instant) != 0);
+    try std.testing.expect(queue.push(.{ .close = surfaces[3] }, .instant) != 0);
+    pending.beginModalBatch();
+    try std.testing.expect((try pending.next(std.testing.allocator, &queue, .modal)).?.surface_message.message == .ring_bell);
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .modal) == null);
+    for (surfaces[1..]) |surface| {
+        try std.testing.expectEqual(surface, (try pending.next(std.testing.allocator, &queue, .outer)).?.close);
+    }
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .outer) == null);
+}
+
+test "modal mailbox retains owned automation on allocation failure" {
+    const request = try Message.AutomationWindowListRequest.create(
+        std.testing.allocator,
+        std.math.maxInt(u64),
+        automationTestNow,
+    );
+    defer request.release();
+    request.retain(); // Consumer ownership transferred into the queue.
+    var queue: Mailbox.Queue = .{};
+    var pending: ModalMailbox = .{};
+    defer pending.deinit(std.testing.allocator);
+    try std.testing.expect(queue.push(.{ .automation_window_list = request }, .instant) != 0);
+    const surface: *Surface = @ptrFromInt(@alignOf(Surface));
+    try std.testing.expect(queue.push(.{ .surface_message = .{
+        .surface = surface,
+        .message = .ring_bell,
+    } }, .instant) != 0);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, pending.next(failing.allocator(), &queue, .modal));
+    try std.testing.expectEqual(@as(usize, 2), request.refs.load(.acquire));
+    try std.testing.expect(pending.overflow != null);
+    try std.testing.expectError(error.OutOfMemory, pending.next(failing.allocator(), &queue, .modal));
+
+    // A later modal wake can recover, drain the safe work, and retain the
+    // earlier owned request without changing its position in the FIFO.
+    try std.testing.expect((try pending.next(std.testing.allocator, &queue, .modal)).?.surface_message.message == .ring_bell);
+    const owned = (try pending.next(std.testing.allocator, &queue, .outer)).?;
+    try std.testing.expectEqual(request, owned.automation_window_list);
+    owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), request.refs.load(.acquire));
+}
+
+test "modal tick drains safely under an outer tick and rejects recursive modal draining" {
+    var app = testAutomationApp();
+    defer app.modal_mailbox.deinit(app.alloc);
+    const rt_app: *apprt.App = @ptrFromInt(@alignOf(apprt.App));
+    const surface: *Surface = @ptrFromInt(@alignOf(Surface));
+    try std.testing.expect(app.mailbox.push(.quit, .instant) != 0);
+    const payload = try apprt.surface.Message.WriteReq.init(app.alloc, &([_]u8{'x'} ** 300));
+    try std.testing.expect(app.mailbox.push(.{ .surface_message = .{
+        .surface = surface,
+        .message = .{ .pwd_change = payload },
+    } }, .instant) != 0);
+
+    app.modal_tick_active = true;
+    try app.tickModal(rt_app);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.len);
+    app.modal_tick_active = false;
+    app.outer_tick_active = true;
+    try app.tickModal(rt_app);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), app.mailbox.len);
+    try std.testing.expectEqual(@as(usize, 1), app.modal_mailbox.deferred.items.len);
+    try std.testing.expect(app.modal_mailbox.deferred.items[0] == .quit);
+    // The nonexistent surface's owned pwd payload was freed by the actual
+    // dispatch path. The testing allocator checks this on test completion.
+}
+
+test "modal mailbox teardown releases deferred and overflow ownership" {
+    var queue: Mailbox.Queue = .{};
+    var pending: ModalMailbox = .{};
+    const first = try Message.AutomationWindowListRequest.create(std.testing.allocator, 0, automationTestNow);
+    defer first.release();
+    first.retain();
+    const second = try Message.AutomationWindowListRequest.create(std.testing.allocator, 0, automationTestNow);
+    defer second.release();
+    second.retain();
+    try pending.deferred.append(std.testing.allocator, .{ .automation_window_list = first });
+    pending.overflow = .{ .automation_window_list = second };
+    pending.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), first.refs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), second.refs.load(.acquire));
+    try std.testing.expect(try pending.next(std.testing.allocator, &queue, .outer) == null);
 }
 
 pub fn closeSurface(self: *App, surface: *Surface) void {

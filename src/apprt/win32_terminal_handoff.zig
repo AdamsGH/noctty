@@ -319,6 +319,15 @@ pub const PendingQueue = struct {
         return self.entries.items.len == 0;
     }
 
+    /// Recovery path for a queued session whose notification was lost.
+    /// Removing its capability also makes a delayed notification harmless.
+    pub fn takeOldest(self: *PendingQueue) ?*PendingSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.entries.items.len == 0) return null;
+        return self.entries.orderedRemove(0).session;
+    }
+
     /// Destroys every session that never reached the UI thread.
     pub fn drain(self: *PendingQueue, alloc: Allocator) void {
         self.mutex.lock();
@@ -1932,6 +1941,21 @@ test "handoff pending queue resolves only identifiers it issued" {
     try std.testing.expect(server.takePending(id) == null);
     session.deinit();
     alloc.destroy(session);
+}
+
+test "handoff pending backstop claims oldest and rejects delayed notifications" {
+    var queue: PendingQueue = .{};
+    defer queue.drain(std.testing.allocator);
+    var first: PendingSession = undefined;
+    var second: PendingSession = undefined;
+    const first_id = try queue.insert(std.testing.allocator, &first);
+    const second_id = try queue.insert(std.testing.allocator, &second);
+    try std.testing.expectEqual(&first, queue.takeOldest().?);
+    try std.testing.expect(queue.take(first_id) == null);
+    try std.testing.expectEqual(&second, queue.takeOldest().?);
+    try std.testing.expect(queue.take(second_id) == null);
+    try std.testing.expect(queue.takeOldest() == null);
+    try std.testing.expect(queue.isEmpty());
 }
 
 test "handoff server stays alive for objects that never called LockServer" {
