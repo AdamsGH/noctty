@@ -274,6 +274,9 @@ pub const Message = union(enum) {
     pub const SearchTotal = struct {
         generation: u64,
         total: ?usize,
+        /// The query does not compile, so `total` is zero for a reason
+        /// other than "nothing matched".
+        invalid: bool = false,
     };
     pub const SearchSelected = struct {
         generation: u64,
