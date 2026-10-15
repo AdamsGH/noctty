@@ -1,0 +1,122 @@
+##### PKG-37 final: main 7171995da (mbase) vs ce0dcfc2f (mfinal); mfix = first draft 12b710eee; all + LAT-02 measurement-only trace patch
+\7b4f9aa31731df8 70 2026-10-10 14:18:34.349797800 -0400 startup-attempts.json
+\1749a02c318cad0 244523 2026-10-14 23:39:23.795868100 -0400 ConsoleHost_history.txt
+\7b4f9aa31731df8 70 2026-10-10 14:18:34.349797800 -0400 startup-attempts.json
+\1749a02c318cad0 244523 2026-10-14 23:39:23.795868100 -0400 ConsoleHost_history.txt
+##### G-v60: emulated 60 Hz, ssh-like reader, 2 runs x 240 keys
+== display (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v60  mbase    480     9.24    16.83    17.56    22.92
+d0-ssh-steady-primary-bundled-v60  mfinal   480     9.01    16.39    20.61    53.58
+d20-ssh-steady-primary-bundled-v60 mbase    480    29.19    36.80    37.20    38.19
+d20-ssh-steady-primary-bundled-v60 mfinal   480    28.92    36.68    37.03    37.36
+d55-ssh-burst-line-primary-bundled-v60 mbase    476    64.85    72.18    78.86    84.27  missing=4
+d55-ssh-burst-line-primary-bundled-v60 mfinal   476    64.85    71.90    76.22    84.87  missing=4
+== swap (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v60  mbase    480     0.69     1.90     2.75     6.43
+d0-ssh-steady-primary-bundled-v60  mfinal   480     0.66     1.37     8.48    38.89
+d20-ssh-steady-primary-bundled-v60 mbase    480    20.68    21.61    22.47    23.02
+d20-ssh-steady-primary-bundled-v60 mfinal   480    20.67    21.42    21.85    22.40
+d55-ssh-burst-line-primary-bundled-v60 mbase    476    55.70    56.96    65.88    81.86  missing=4
+d55-ssh-burst-line-primary-bundled-v60 mfinal   476    55.68    56.91    67.18    79.26  missing=4
+scenario                               build            keys          swaps  content_swaps         frames          wakes w:core_surface    w:io_output w:apprt_repain w:cursor_blink      w:mailbox run_swap_buffe
+d0-ssh-steady-primary-bundled-v60      mbase             480            487            480            487            487              0            480              0              9              0            530
+d0-ssh-steady-primary-bundled-v60      mfinal            480            487            480            487            487              0            480              0              9              0            529
+d20-ssh-steady-primary-bundled-v60     mbase             480            483            480            483            483              0            480              0              5              0            526
+d20-ssh-steady-primary-bundled-v60     mfinal            480            483            480            483            483              0            480              0              4              0            525
+d55-ssh-burst-line-primary-bundled-v60 mbase             480            548            480            548            549              0            480              1             77              0            592
+d55-ssh-burst-line-primary-bundled-v60 mfinal            480            551            480            551            552              0            480              1             77              0            594
+##### G-cursor: arrow keys, emulated 60 Hz
+== pty_output (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318     0.24     0.55     1.16     1.50
+d0-vt-cursor-primary-bundled-v60       mfinal   318     0.25     0.66     1.11     2.58
+d30-vt-cursor-primary-bundled-v60      mbase    318    30.23    31.52    46.43   142.79
+d30-vt-cursor-primary-bundled-v60      mfinal   318    30.21    30.79    31.90    37.23
+== frame_update (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318     0.29     0.87    86.25   113.38
+d0-vt-cursor-primary-bundled-v60       mfinal   318     0.29     1.17    86.69   111.24
+d30-vt-cursor-primary-bundled-v60      mbase    318    30.28    40.21   135.26   149.32
+d30-vt-cursor-primary-bundled-v60      mfinal   318    30.25    30.88   121.20   135.25
+== swap (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318     0.65    23.81    86.72   113.77
+d0-vt-cursor-primary-bundled-v60       mfinal   318     0.65    21.41    87.41   111.54
+d30-vt-cursor-primary-bundled-v60      mbase    318    30.66    60.18   139.67   215.84
+d30-vt-cursor-primary-bundled-v60      mfinal   318    30.59    51.78   121.50   135.59
+== display (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318    11.37    32.70    97.96   127.36
+d0-vt-cursor-primary-bundled-v60       mfinal   318    11.78    31.00    97.80   120.15
+d30-vt-cursor-primary-bundled-v60      mbase    318    42.34    63.82   151.85   228.86
+d30-vt-cursor-primary-bundled-v60      mfinal   318    40.33    61.56   122.06   148.58
+##### G-saver: power-saver-rendering=on, emulated 60 Hz
+== display (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-burst-primary-bundled-v60   mbase    400    27.77    53.90    61.23    70.31
+d0-ssh-burst-primary-bundled-v60   mfinal   400    11.75    33.90    46.52    51.58
+d0-ssh-steady-primary-bundled-v60  mbase    400     9.16    16.52    17.76    47.46
+d0-ssh-steady-primary-bundled-v60  mfinal   400     9.56    17.11    50.81   133.47
+d0-vt-cursor-primary-bundled-v60   mbase     80    10.57    16.93    17.06    48.29  missing=320
+d0-vt-cursor-primary-bundled-v60   mfinal    80     8.73    17.23    17.40    46.07  missing=320
+scenario                               build            keys          swaps  content_swaps         frames          wakes w:core_surface    w:io_output w:apprt_repain w:cursor_blink      w:mailbox run_swap_buffe
+d0-ssh-burst-primary-bundled-v60       mbase             400            391            335            391            456              0            400              0             61              0            422
+d0-ssh-burst-primary-bundled-v60       mfinal            400            450            393            450            457              0            400              0             61              0            486
+d0-ssh-steady-primary-bundled-v60      mbase             400            405            400            405            405              0            400              0              8              0            437
+d0-ssh-steady-primary-bundled-v60      mfinal            400            407            400            407            407              0            400              0              8              0            442
+d0-vt-cursor-primary-bundled-v60       mbase             400            467            456            467            470              0            464              0              7              0            499
+d0-vt-cursor-primary-bundled-v60       mfinal            400            468            460            468            471              0            465              0              7              0            504
+##### G-v0: hidden desktop, real SwapBuffers
+== swap (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v0   mbase    480     0.79     2.49     3.51    10.60
+d0-ssh-steady-primary-bundled-v0   mfinal   480     0.67     1.52     2.26     5.21
+d30-ssh-burst-line-primary-bundled-v0 mbase    478    30.87    32.90    34.28    39.04  missing=2
+d30-ssh-burst-line-primary-bundled-v0 mfinal   477    30.72    31.82    33.18    35.73  missing=3
+##### G-flood: #310 case
+mbase-r1     n=1302 resize-second max=152.2 ms  after 2.5 s: n=1095 p50=0.8 p99=4.1 max=6.8  over100ms=2 total=11.2s
+mfinal-r1    n=1315 resize-second max=204.7 ms  after 2.5 s: n=1097 p50=0.9 p99=4.5 max=5.4  over100ms=3 total=11.4s
+mfinal-r2    n=1330 resize-second max=160.1 ms  after 2.5 s: n=1109 p50=0.9 p99=3.8 max=6.4  over100ms=3 total=11.4s
+mbase-r2     n=1324 resize-second max=158.2 ms  after 2.5 s: n=1108 p50=0.8 p99=4.5 max=31.7  over100ms=2 total=11.3s
+mbase-r3     n=1270 resize-second max=240.7 ms  after 2.5 s: n=1085 p50=0.9 p99=4.5 max=8.2  over100ms=3 total=11.4s
+mfinal-r3    n=1336 resize-second max=142.1 ms  after 2.5 s: n=1106 p50=0.9 p99=4.3 max=5.6  over100ms=2 total=11.3s
+flood done: C:\Users\amant\.t3\worktrees\winghostty\_scratch-pkg37\runs\G-flood
+##### G-anim: 60 fps synchronized-output TUI, 10 s (v0, v60)
+G-anim-v0.log:mbase-f60-v0-r1              frames=600 frames_in_output=600 frames_shown=600 presents=635 content_presents=601 presents_per_s=63.0
+G-anim-v0.log:mfinal-f60-v0-r1             frames=600 frames_in_output=600 frames_shown=600 presents=648 content_presents=601 presents_per_s=64.3
+G-anim-v0.log:mfinal-f60-v0-r2             frames=600 frames_in_output=600 frames_shown=556 presents=818 content_presents=557 presents_per_s=81.1
+G-anim-v0.log:mbase-f60-v0-r2              frames=600 frames_in_output=600 frames_shown=600 presents=656 content_presents=601 presents_per_s=65.1
+G-anim-v60.log:mbase-f60-v60-r1             frames=600 frames_in_output=600 frames_shown=588 presents=602 content_presents=589 presents_per_s=59.7
+G-anim-v60.log:mfinal-f60-v60-r1            frames=600 frames_in_output=600 frames_shown=579 presents=601 content_presents=579 presents_per_s=59.6
+G-anim-v60.log:mfinal-f60-v60-r2            frames=600 frames_in_output=600 frames_shown=571 presents=602 content_presents=571 presents_per_s=59.7
+G-anim-v60.log:mbase-f60-v60-r2             frames=600 frames_in_output=600 frames_shown=570 presents=602 content_presents=571 presents_per_s=59.7
+##### G-anim-saver-v60: same TUI under power-saver-rendering=on
+mbase-anim-v60-r1            frames=600 frames_in_output=600 frames_shown=214 presents=214 content_presents=214 presents_per_s=21.2
+mfinal-anim-v60-r1           frames=600 frames_in_output=600 frames_shown=295 presents=295 content_presents=295 presents_per_s=29.3
+mfinal-anim-v60-r2           frames=600 frames_in_output=600 frames_shown=295 presents=295 content_presents=295 presents_per_s=29.3
+mbase-anim-v60-r2            frames=600 frames_in_output=600 frames_shown=213 presents=214 content_presents=214 presents_per_s=21.2
+mbase-anim-v60-r1            n=212 mean=47.05 min=33.02 p10=40.25 p50=47.22 p90=50.23 max=62.60
+mbase-anim-v60-r2            n=211 mean=47.03 min=32.64 p10=37.97 p50=47.69 p90=50.36 max=61.88
+mfinal-anim-v60-r1           n=293 mean=34.01 min=27.69 p10=30.53 p50=33.25 p90=41.95 max=48.62
+mfinal-anim-v60-r2           n=293 mean=34.01 min=29.67 p10=30.56 p50=33.18 p90=40.70 max=48.98
+##### G-held-v60: synchronized output held 200 ms across 4 writes, 10 cycles
+mbase-held-v60-r1            cycles=10 cycles_shown=10 presents_in_hold=128 presents_total=145
+mfinal-held-v60-r1           cycles=10 cycles_shown=10 presents_in_hold=0 presents_total=10
+mfinal-held-v60-r2           cycles=10 cycles_shown=10 presents_in_hold=0 presents_total=10
+mbase-held-v60-r2            cycles=10 cycles_shown=10 presents_in_hold=127 presents_total=146
+##### G-held-expose: same, child invalidated every 50 ms (an expose)
+mbase-held-v0-r1             cycles=10 cycles_shown=10 presents_in_hold=139 presents_total=165
+mfix-held-v0-r1              cycles=10 cycles_shown=10 presents_in_hold=0 presents_total=24
+mfinal-held-v0-r1            cycles=10 cycles_shown=10 presents_in_hold=32 presents_total=57
+mfinal-held-v0-r2            cycles=10 cycles_shown=10 presents_in_hold=33 presents_total=59
+mfix-held-v0-r2              cycles=10 cycles_shown=10 presents_in_hold=0 presents_total=25
+mbase-held-v0-r2             cycles=10 cycles_shown=10 presents_in_hold=141 presents_total=169
+##### G-held-expose-saver: same under power-saver-rendering=on
+mbase-held-v0-r1             cycles=10 cycles_shown=10 presents_in_hold=45 presents_total=63
+mfix-held-v0-r1              cycles=10 cycles_shown=10 presents_in_hold=0 presents_total=29
+mfinal-held-v0-r1            cycles=10 cycles_shown=10 presents_in_hold=32 presents_total=57
+mfinal-held-v0-r2            cycles=10 cycles_shown=10 presents_in_hold=32 presents_total=58
+mfix-held-v0-r2              cycles=10 cycles_shown=10 presents_in_hold=0 presents_total=24
+mbase-held-v0-r2             cycles=10 cycles_shown=10 presents_in_hold=44 presents_total=64
