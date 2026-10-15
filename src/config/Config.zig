@@ -3420,7 +3420,8 @@ _command_defaulted: bool = false,
 
 /// The last config file that was skipped whole because it is UTF-16 text that
 /// does not decode (see `loadReader`); everything it set is missing from this
-/// load. Lives in the arena of this load and is not carried by `clone`.
+/// load. Lives in the arena of this load; `clone` and `loadTheme` (which
+/// rebuilds the config by replay) copy it, `changeConditionalState` does not.
 _undecodable_file: ?[:0]const u8 = null,
 
 /// List of diagnostics that were generated during the loading of
@@ -3941,6 +3942,38 @@ test "UTF-16 config files are read as the text they hold" {
         // Callers that must not act on a partial load can tell which file it was.
         try testing.expectEqualStrings("/home/ghostty/.config/ghostty/config.ghostty", cfg._undecodable_file.?);
     }
+}
+
+test "the record of a skipped UTF-16 file survives the theme replay and a clone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "bad16.conf", .data = "\xff\xfe\x00\xd8f\x00o\x00" });
+    try tmp.dir.writeFile(.{ .sub_path = "x.theme", .data = "cursor-style = underline\n" });
+    const bad_path = try tmp.dir.realpathAlloc(alloc, "bad16.conf");
+    defer alloc.free(bad_path);
+    const theme_path = try tmp.dir.realpathAlloc(alloc, "x.theme");
+    defer alloc.free(theme_path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, bad_path);
+    const text = try std.fmt.allocPrint(alloc, "theme = {s}\n", .{theme_path});
+    defer alloc.free(text);
+    var reader: std.Io.Reader = .fixed(text);
+    try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+    try testing.expect(cfg._undecodable_file != null);
+
+    // finalize loads the theme by rebuilding the config from its replay steps.
+    try cfg.finalize();
+    try testing.expect(cfg.@"cursor-style" == .underline);
+    try testing.expectEqualStrings(bad_path, cfg._undecodable_file.?);
+
+    var copy = try cfg.clone(alloc);
+    defer copy.deinit();
+    try testing.expectEqualStrings(bad_path, copy._undecodable_file.?);
 }
 
 test "a UTF-16 config file on disk is read through loadFile" {
@@ -4682,6 +4715,12 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     var slice_it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &slice_it);
 
+    // The replay re-applies values, not the loader's record of a file it
+    // skipped; carry that over before the old arena goes.
+    if (self._undecodable_file) |skipped| {
+        new_config._undecodable_file = try new_config._arena.?.allocator().dupeZ(u8, skipped);
+    }
+
     // Success, swap our new config in and free the old.
     self.deinit();
     self.* = new_config;
@@ -5151,6 +5190,7 @@ pub fn clone(
     // Copy our diagnostics
     result._diagnostics = try self._diagnostics.clone(alloc_arena);
     result._command_defaulted = self._command_defaulted;
+    if (self._undecodable_file) |skipped| result._undecodable_file = try alloc_arena.dupeZ(u8, skipped);
 
     // Preserve our replay steps. We copy them exactly to also preserve
     // the exact conditionals required for some steps.
