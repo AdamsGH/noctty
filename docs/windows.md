@@ -202,6 +202,30 @@ Unix-like shells such as Git Bash. WSL sessions manage their own
 integration inside the distribution. PowerShell integration emits OSC 7
 working-directory updates and OSC 133 prompt markers.
 
+noctty does not inject anything into `wsl.exe` profiles, so a WSL shell reports
+no working directory until its startup file does, so a new tab or split from
+it starts in the profile's own directory (the home folder for the built-in WSL
+profiles, which launch with `--cd ~`), not where you were. To report the
+directory, add the recipe Windows Terminal documents to `~/.bashrc` or
+`~/.zshrc` in the distribution:
+
+```bash
+# bash
+PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND; }'printf "\e]9;9;%s\e\\" "$(wslpath -w "$PWD")"'
+
+# zsh
+keep_current_path() { printf "\e]9;9;%s\e\\" "$(wslpath -w "$PWD")" }
+precmd_functions+=(keep_current_path)
+```
+
+`wslpath -w` prints `\\wsl.localhost\<distro>\home\me`, which noctty takes as
+that distribution's `/home/me` (see the
+[capability matrix](windows-capability-matrix.md#shell-integration)). The
+parser accepts it (it has a unit test for exactly this form), but the snippet
+was not run end to end through `wsl.exe` for this page. It reports the
+directory only; OSC 133 prompt and command marks still need a shell
+integration of their own.
+
 For `cmd.exe`, noctty wraps the inherited `PROMPT` (or cmd's `$P$G` default)
 so the shell emits OSC 133 A/B prompt marks and an OSC 9;9 working-directory
 report; a `PROMPT` set through `env = PROMPT=...` is applied afterward and
@@ -430,6 +454,17 @@ choice made after noctty was registered. Registration state written by an
 earlier build did not record which keys it created, so unregistering it
 leaves those keys in place, as before; registering again does not add the
 record while noctty's mapping is still in place.
+
+A handoff never reaches the noctty you already have open. Windows activates
+noctty through COM by starting `noctty.exe -Embedding`, and only that process
+registers the handoff class object; a normally started noctty does not. Each
+handoff is therefore served by a separate noctty process (a later handoff
+reuses it while it is running, and it exits once it has no windows and no
+pending handoff), and it opens its own top-level window for the adopted
+console, not a tab in your existing one. That process neither forwards to
+nor serves single-instance IPC, so `+list-windows` and `+perform-action`
+cannot see its windows, and it has no jump list or global hotkeys. It also
+restores no session and opens no initial window of its own.
 
 An adopted console starts with the title and show state its client asked for.
 The window title is the startup title (usually the program's path) until the
@@ -825,8 +860,11 @@ Single-instance IPC is scoped by integrity level. A normal launch and
 `+new-window` forward only to an existing noctty at the caller's integrity
 level. From an elevated shell, `+new-window` therefore opens in the elevated
 group (and starts an elevated noctty when that group is absent). A
-default-terminal handoff from an elevated console lands in that same
-`.elevated` group. The automation surface is scoped identically:
+default-terminal handoff does not use this forwarding at all (see
+[Default terminal](#default-terminal)), so it never joins an integrity group.
+It has not been run from an elevated console, and whether COM would serve
+such a console from a per-user registration is not established. The
+automation surface is scoped identically:
 `+list-windows` sees only its integrity group and `+perform-action` can target
 only windows in that group. The same commands from a non-elevated shell see
 only the non-elevated group; neither direction silently forwards or automates
@@ -1445,6 +1483,35 @@ come. See the
 [query differential](windows-vt-conformance.md#measured-query-ownership-differential)
 and the
 [transport catalog](windows-vt-conformance.md#conpty-transport-generations-and-mangling-catalog).
+
+### Inline graphics: replies, Sixel and memory
+
+- **Kitty graphics replies reach the child as input.** A command that carries
+  an image id or number (`i=` or `I=`) is answered on the child's input with
+  `ESC _ G ... ESC \` unless `q=1` (suppress success replies) or `q=2`
+  (suppress all replies) is set (`graphics_exec.zig`, `StreamHandler.apcEnd`).
+  noctty has no ConPTY-specific suppression. The 2026-10-10 audit measured the
+  bundled ConPTY handing a native console program (`[Console]::ReadKey` in
+  pwsh, and `cmd`) a lone `\` for such a reply, while the same reply arrived
+  intact through WSL's raw pty; this was not re-measured for this page. A tool
+  run directly under ConPTY that does not parse APC replies should send
+  `q=2`.
+- **Sixel is passed through but not rendered.** The bundled ConPTY delivers a
+  Sixel DCS payload byte-for-byte (see the
+  [transport catalog](windows-vt-conformance.md#conpty-transport-generations-and-mangling-catalog)),
+  but the terminal has no Sixel decoder: `src/terminal/dcs.zig` handles only
+  tmux, XTGETTCAP and DECRQSS, and the primary device-attributes reply does not
+  advertise Sixel (feature 4). Kitty graphics is the one inline image protocol
+  that draws.
+- **`image-storage-limit` bounds the terminal's decoded copy only.** The limit
+  (320 MB per screen by default; the primary and alternate screens each have
+  one) is checked against the image bytes the terminal stores
+  (`kitty/graphics_storage.zig`). The renderer's own copies, pending upload
+  data and GPU textures, are not counted against it (`src/renderer` never
+  reads it), so the process can hold a multiple of the limit while images are
+  on screen. The audit measured about 750 MB of growth from 12 zlib-compressed
+  3000x3000 images sent in a 0.56 MB file. Memory fell after `cls`, and
+  `image-storage-limit = 0` disables the image protocols.
 
 ### GPU floor and OpenGL driver issues
 

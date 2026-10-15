@@ -18,7 +18,7 @@ Use the standard Zig workflow from the repository root:
 | --------------------------------------------------- | ---------------------------------------------- |
 | `zig build`                                         | Build the Win32 app and bundled resources      |
 | `zig build -Demit-exe=true`                         | Force-install `zig-out/bin/noctty.exe`         |
-| `zig build test -Demit-test-exe=true --summary all` | Run the full test suite (about 4,500 tests)    |
+| `zig build test -Demit-test-exe=true --summary all` | Run the full test suite (about 5,300 tests)    |
 | `zig build test -Dtest-filter=<name> --summary all` | Run matching tests while iterating (see below) |
 | `zig build -Demit-lib-vt`                           | Build the retained `libghostty-vt` library     |
 

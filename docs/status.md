@@ -3,7 +3,7 @@
 What works in noctty, what is experimental, and what is out of scope. When
 this page disagrees with a commit message, trust this page.
 
-Last updated: 2026-09-02, against current fork HEAD.
+Last updated: 2026-10-15, against fork `main` at `e6dae0919`.
 
 For a row-by-row mapping against official Ghostty docs, including the
 implementation detail this page leaves out, see
@@ -25,6 +25,13 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
   "OpenCL, OpenGL, and Vulkan Compatibility Pack", because Qualcomm ships
   no desktop OpenGL driver; see
   [windows.md](windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack).
+- Windows 10 is a supported floor, not a tested target. CI runs on Windows
+  Server 2025 (`windows-2025`, `windows-latest`) and Windows 11 ARM64
+  (`windows-11-arm`), and the one interactive job is a self-hosted Windows 11
+  machine that runs only on request. No job and no harness run on Windows 10,
+  so chrome, input and startup changes are unmeasured there unless a page says
+  otherwise (for example [windows.md](windows.md#windows-tabs-and-splits) on
+  the frameless undecorated window).
 - No macOS, Linux, or cross-platform app runtime ships from this repo.
   `libghostty-vt` stays buildable for non-Windows targets as a library.
 - WSL sessions work from the profile picker. Making WSL the default shell
@@ -40,7 +47,9 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
 - Bracketed paste, mouse tracking, OSC 8 hyperlinks, OSC 10 / 11 / 52 (all
   OSC 52 selectors target the single native Windows clipboard).
 - Bidi, combining marks, grapheme cluster rendering.
-- Kitty graphics protocol and inline image display.
+- Kitty graphics protocol and inline image display. Sixel is passed through
+  by the bundled ConPTY but not decoded or drawn; see
+  [inline graphics](windows.md#inline-graphics-replies-sixel-and-memory).
 - Kitty keyboard protocol with press, repeat, and release events, Caps Lock
   and Num Lock state, and left/right modifier identity.
 - Shell integration for bash, zsh, fish, elvish, nushell, PowerShell, and
@@ -161,7 +170,10 @@ Win32-validated VT protocol coverage is tracked in
 
 ### Renderer
 
-- Terminal content renders with OpenGL 4.3+ via WGL.
+- Terminal content renders with OpenGL 4.3+ via WGL by default. An opt-in
+  Direct3D 11 beta (`renderer = d3d11`) adds hardware and WARP text rendering
+  and hands images, custom shaders and background images to OpenGL; see
+  [D3D11 renderer beta](windows.md#d3d11-renderer-beta).
 - Window chrome is painted with GDI. The D3D11/DirectComposition +
   DirectWrite shell pipeline is not started at launch (its device graph cost
   about 156 ms to first swap and 79 driver threads for banner text alone); it
@@ -214,13 +226,18 @@ per-user registration and exact selection restore, using Windows Terminal
 application is adopted into a visible noctty window, verified live on
 Windows 11 26200. Still missing: noctty cannot appear in the Windows Settings
 picker without package identity, and it implements no `IConsoleHandoff`, so
-Windows Terminal must stay selected as the console half. Details in
+Windows Terminal must stay selected as the console half. A handoff is served
+by a separate `-Embedding` noctty process that opens its own window and has
+no single-instance IPC, jump list or global hotkeys; it never reaches the
+noctty you already have open, and elevated consoles were not verified. Details in
 [windows.md](windows.md#default-terminal).
 
 ### Windows UI Automation (accessibility)
 
 Covered: tabs expose TabItem with selection state; the new-tab and overflow
-buttons have real names instead of their painted glyphs; the docked-search
+buttons have real names instead of their painted glyphs; the integrated
+title bar's minimize, maximize/restore and close buttons are named, invokable
+Button elements (since 1.3.131); the docked-search
 toggles expose Toggle state; the search result count and host banners are
 live regions; the terminal scrollbar exposes RangeValue; and the command
 palette and settings sections expose list and selection semantics. Terminal
@@ -231,10 +248,14 @@ that bounded snapshot, and real selections. In deeper scrollback the
 viewport remains available, but the off-window live caret is reported at
 the document end.
 
-Not yet covered: custom-painted caption buttons, the profile picker and
-tab-overview overlay rows, context menus, toasts, and quick-terminal chrome.
-There is no keyboard focus-region cycle, so chrome cannot be reached from the
-terminal without a mouse.
+Not yet covered: the profile picker and tab-overview overlay rows, context
+menus, toasts, the tab drag preview, and quick-terminal chrome. `Ctrl+F6` and
+`Ctrl+Shift+F6` (`cycle_focus_region`; a bare `F6` goes to the application)
+move focus between the terminal, the tab strip, the docked search query and
+the host banner, and `Escape` returns to the terminal. The cycle does not
+reach the individual search buttons, the caption buttons (deliberately: they
+are exposed through UIA but not keyboard-focusable), the profile picker, the
+tab-overview rows or context menus.
 
 No screen reader has been measured against a release yet. NVDA was measured
 against a pre-release branch build, with mixed results: terminal text,
@@ -271,9 +292,10 @@ lands incrementally.
 - GitHub Issues are for reproducible bugs. For questions, feature
   discussion, and feedback, use
   [Discussions](https://github.com/amanthanvi/noctty/discussions).
-- OpenGL 4.3 through WGL is a hard floor with no software fallback renderer.
-  Below it, noctty shows a startup diagnostic with the detected version and
-  does not start; see [windows.md](windows.md#gpu-floor-and-opengl-driver-issues).
+- OpenGL 4.3 through WGL is a hard floor for the default renderer, with no
+  automatic software fallback. Below it, noctty shows a startup diagnostic
+  with the detected version and does not start (the opt-in D3D11 beta can use
+  WARP, but needs OpenGL 4.3 for images and shaders); see [windows.md](windows.md#gpu-floor-and-opengl-driver-issues).
   On ARM64 that OpenGL comes from Microsoft's GLon12 mapping layer in the
   Compatibility Pack, not from a GPU vendor driver.
 - No supported Linux application packaging. Upstream's Flatpak and Snap
@@ -281,10 +303,15 @@ lands incrementally.
 - A few generated artifacts still reference upstream: the `libghostty-vt`
   pkg-config `URL` field, the vim syntax-file headers, and a link in the
   generated bash completions point at `ghostty-org/ghostty`.
+- Some upstream config keys are accepted and do nothing on Windows
+  (`focus-follows-mouse`, `window-inherit-font-size`, `bell-features`, the
+  GTK and X11 keys, and others); the list is in the
+  [capability matrix](windows-capability-matrix.md#settings-accepted-without-effect).
 - Crash capture is local-only, and some hard-abort paths may still
   terminate before Windows can produce a dump.
 - Power- and visibility-aware render pacing has not been exercised on a
-  machine with a battery, and the DWM cloak/uncloak WinEvent path has not
+  machine with a battery (forced saver pacing, `power-saver-rendering = on`,
+  has been measured, #297), and the DWM cloak/uncloak WinEvent path has not
   been observed across a real virtual-desktop switch. Both are argued from
   the documented Win32 contracts and covered by unit tests over the pure
   policy and event-filter functions only.
@@ -303,10 +330,9 @@ No formal roadmap. Likely next areas:
 - Narrator and JAWS results for the
   [screen-reader matrix](accessibility-matrix.md), NVDA at 100/200/300%
   scaling and with High Contrast on, the fixes for the NVDA failures
-  already recorded there, and UI Automation for caption buttons, overlay
-  rows, and menus.
-- A keyboard focus-region cycle so window chrome is reachable without a
-  mouse.
+  already recorded there, and UI Automation for overlay rows and menus.
+- Keyboard reach for the chrome the focus-region cycle still skips (the
+  search buttons, overlay rows and menus).
 - Continuing the `src/apprt/win32.zig` extraction.
 - Broader local crash metadata and report packaging.
 - ARB-context OpenGL migration paired with atlas rebuild.
