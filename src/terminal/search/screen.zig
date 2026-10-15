@@ -292,12 +292,44 @@ pub const ScreenSearch = struct {
     ) Allocator.Error![]u32 {
         var rows: std.ArrayList(u32) = .empty;
         errdefer rows.deinit(alloc);
+        try self.collectMatchRows(alloc, &rows);
+        return try rows.toOwnedSlice(alloc);
+    }
 
-        try self.appendMatchRows(alloc, &rows, self.active_results.items);
-        try self.appendMatchRows(alloc, &rows, self.history_results.items);
-        if (rows.items.len == 0) return try rows.toOwnedSlice(alloc);
+    /// Replaces the contents of `rows` with `matchRows`, or leaves them
+    /// unchanged on error. Callers must hold the screen lock.
+    pub fn collectMatchRows(
+        self: *ScreenSearch,
+        alloc: Allocator,
+        rows: *std.ArrayList(u32),
+    ) Allocator.Error!void {
+        if (self.matchesLen() == 0) {
+            rows.clearRetainingCapacity();
+            return;
+        }
+        try rows.ensureTotalCapacity(alloc, self.matchesLen());
+        var node_rows: NodeRows = try .init(alloc, &self.screen.pages);
+        defer node_rows.deinit(alloc);
 
-        std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+        // History is newest first and the active results are oldest first,
+        // so this order is usually sorted already.
+        rows.clearRetainingCapacity();
+        var i = self.history_results.items.len;
+        while (i > 0) {
+            i -= 1;
+            const start = self.history_results.items[i].startPin();
+            const row = node_rows.screenRow(start) orelse continue;
+            rows.appendAssumeCapacity(row);
+        }
+        for (self.active_results.items) |hl| {
+            const row = node_rows.screenRow(hl.startPin()) orelse continue;
+            rows.appendAssumeCapacity(row);
+        }
+        if (rows.items.len == 0) return;
+
+        if (!std.sort.isSorted(u32, rows.items, {}, std.sort.asc(u32))) {
+            std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+        }
 
         var write: usize = 1;
         for (rows.items[1..]) |row| {
@@ -306,20 +338,46 @@ pub const ScreenSearch = struct {
             write += 1;
         }
         rows.shrinkRetainingCapacity(write);
-        return try rows.toOwnedSlice(alloc);
     }
 
-    fn appendMatchRows(
-        self: *ScreenSearch,
-        alloc: Allocator,
-        rows: *std.ArrayList(u32),
-        matches_: []const FlattenedHighlight,
-    ) Allocator.Error!void {
-        for (matches_) |hl| {
-            const pt = self.screen.pages.pointFromPin(.screen, hl.startPin()) orelse continue;
-            try rows.append(alloc, pt.screen.y);
+    /// Screen rows of pins, as `PageList.pointFromPin(.screen, pin)` gives
+    /// them, for many pins at once. `pointFromPin` walks the page list from
+    /// the top for every pin; this walks it once and records the screen row
+    /// of every node's first row. A pin whose node is not in the list (its
+    /// page was destroyed) has no row, as with `pointFromPin`.
+    const NodeRows = struct {
+        first_rows: std.AutoHashMapUnmanaged(*const PageList.List.Node, u32),
+
+        /// Matches come in runs on the same node, so most lookups repeat
+        /// the previous one.
+        last_node: ?*const PageList.List.Node = null,
+        last_first_row: ?u32 = null,
+
+        fn init(alloc: Allocator, pages: *const PageList) Allocator.Error!NodeRows {
+            var first_rows: std.AutoHashMapUnmanaged(*const PageList.List.Node, u32) = .empty;
+            errdefer first_rows.deinit(alloc);
+            var row: u32 = 0;
+            var it = pages.pages.first;
+            while (it) |node| : (it = node.next) {
+                try first_rows.putNoClobber(alloc, node, row);
+                row += node.data.size.rows;
+            }
+            return .{ .first_rows = first_rows };
         }
-    }
+
+        fn deinit(self: *NodeRows, alloc: Allocator) void {
+            self.first_rows.deinit(alloc);
+        }
+
+        fn screenRow(self: *NodeRows, pin: Pin) ?u32 {
+            if (self.last_node != pin.node) {
+                self.last_node = pin.node;
+                self.last_first_row = self.first_rows.get(pin.node);
+            }
+            const first_row = self.last_first_row orelse return null;
+            return first_row + pin.y;
+        }
+    };
 
     /// Search the full screen state. This will block until the search
     /// is complete. For performance, it is recommended to use `tick` and
@@ -1795,4 +1853,99 @@ test "matchRows returns ascending unique screen rows" {
     defer alloc.free(rows);
 
     try testing.expectEqualSlices(u32, &.{ 0, 2 }, rows);
+}
+
+/// `matchRows` as it was computed before it walked the page list once:
+/// `pointFromPin` for every match, then sorted and deduplicated.
+fn testMatchRowsByPointFromPin(search: *ScreenSearch, alloc: Allocator) ![]u32 {
+    var rows: std.ArrayList(u32) = .empty;
+    errdefer rows.deinit(alloc);
+    const pages = &search.screen.pages;
+    for ([_][]const FlattenedHighlight{
+        search.active_results.items,
+        search.history_results.items,
+    }) |results| for (results) |hl| {
+        const pt = pages.pointFromPin(.screen, hl.startPin()) orelse continue;
+        try rows.append(alloc, pt.screen.y);
+    };
+    std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+    var write: usize = 0;
+    for (rows.items) |row| {
+        if (write > 0 and rows.items[write - 1] == row) continue;
+        rows.items[write] = row;
+        write += 1;
+    }
+    rows.shrinkRetainingCapacity(write);
+    return try rows.toOwnedSlice(alloc);
+}
+
+fn testExpectPointFromPinRows(search: *ScreenSearch) !void {
+    const alloc = testing.allocator;
+    const expected = try testMatchRowsByPointFromPin(search, alloc);
+    defer alloc.free(expected);
+    const rows = try search.matchRows(alloc);
+    defer alloc.free(rows);
+    try testing.expectEqualSlices(u32, expected, rows);
+}
+
+test "matchRows gives the rows pointFromPin gives, across pages, pruning and clearing" {
+    const alloc = testing.allocator;
+
+    // Room for about three pages, so more output prunes the oldest page.
+    const page_size = page_size: {
+        var probe: Terminal = try .init(alloc, .{ .cols = 20, .rows = 4 });
+        defer probe.deinit(alloc);
+        break :page_size probe.screens.active.pages.page_size;
+    };
+    var t: Terminal = try .init(alloc, .{
+        .cols = 20,
+        .rows = 4,
+        .max_scrollback = 3 * page_size,
+    });
+    defer t.deinit(alloc);
+    const list: *PageList = &t.screens.active.pages;
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Rows with two matches, one match and none.
+    const lines = [_][]const u8{ "Fizz Fizz\r\n", "noop\r\n", "x Fizz\r\n" };
+    var line: usize = 0;
+    while (list.totalPages() < 3) : (line += 1) s.nextSlice(lines[line % lines.len]);
+    s.nextSlice("Fizz");
+
+    var search: ScreenSearch = try .init(alloc, t.screens.active, "Fizz");
+    defer search.deinit();
+    try search.searchAll();
+    try testing.expect(search.history_results.items.len > 0);
+    try testing.expect(search.active_results.items.len > 0);
+    try testExpectPointFromPinRows(&search);
+
+    // Prune the oldest pages without telling the search. A pruned page is
+    // reused as the newest one, so its old matches map near the bottom.
+    while (list.page_serial_min == 0) : (line += 1) {
+        if (line > 1_000_000) return error.TestScrollbackNeverPruned;
+        s.nextSlice(lines[line % lines.len]);
+    }
+    const oldest = search.history_results.items[search.history_results.items.len - 1];
+    try testing.expect(oldest.chunks.items(.serial)[0] < list.page_serial_min);
+    try testExpectPointFromPinRows(&search);
+
+    // Once the search has caught up.
+    try search.reloadActive();
+    try search.feed();
+    try testExpectPointFromPinRows(&search);
+
+    // Clear the scrollback without telling the search: the history pages
+    // are destroyed, so the history results name nodes no longer in the
+    // list, which have no row. (Their rows within those pages can coincide
+    // with remaining rows, so check them one by one.)
+    t.eraseDisplay(.scrollback, false);
+    var node_rows: ScreenSearch.NodeRows = try .init(alloc, list);
+    defer node_rows.deinit(alloc);
+    for (search.history_results.items) |hl| {
+        try testing.expect(list.pointFromPin(.screen, hl.startPin()) == null);
+        try testing.expect(node_rows.screenRow(hl.startPin()) == null);
+    }
+    try testExpectPointFromPinRows(&search);
 }
