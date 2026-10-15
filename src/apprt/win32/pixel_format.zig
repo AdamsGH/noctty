@@ -336,6 +336,29 @@ pub fn validatePixelFormatSetTransition(before: i32, selected: i32, after: i32) 
     if (selected <= 0 or after != selected) return error.PixelFormatSetVerificationFailed;
 }
 
+pub const PixelFormatPlan = enum { choose_and_set, reuse };
+
+/// A window takes a pixel format once: Windows refuses a second
+/// `SetPixelFormat`. One this window set on an earlier attempt that failed
+/// afterwards (no context, or one that could not be made current) is reused,
+/// so OpenGL can still be tried again there; any other format already on the
+/// window is refused, as before.
+pub fn planPixelFormat(before: i32, owned_index: ?u32) error{PixelFormatAlreadySet}!PixelFormatPlan {
+    if (before == 0) return .choose_and_set;
+    if (owned_index) |index| {
+        if (@as(i64, before) == @as(i64, index)) return .reuse;
+    }
+    return error.PixelFormatAlreadySet;
+}
+
+test "win32 a window's own pixel format is reused, any other one refused" {
+    try std.testing.expectEqual(PixelFormatPlan.choose_and_set, try planPixelFormat(0, null));
+    try std.testing.expectEqual(PixelFormatPlan.choose_and_set, try planPixelFormat(0, 7));
+    try std.testing.expectEqual(PixelFormatPlan.reuse, try planPixelFormat(7, 7));
+    try std.testing.expectError(error.PixelFormatAlreadySet, planPixelFormat(7, null));
+    try std.testing.expectError(error.PixelFormatAlreadySet, planPixelFormat(7, 8));
+}
+
 fn isWglPixelFormatHardError(err: anyerror) bool {
     return switch (err) {
         error.WglBootstrapRestoreCurrentFailed,

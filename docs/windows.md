@@ -13,7 +13,8 @@ protocol coverage validated on the Win32 runtime, see
   `kernel32` import, so an earlier build refuses to start the process rather
   than degrading.
 - Native Win32 application runtime.
-- OpenGL 4.3 or newer through WGL.
+- OpenGL 4.3 or newer through WGL for the default renderer; the opt-in D3D11
+  beta needs feature level 11.0 and can use WARP software rendering.
 - `libghostty-vt` stays portable as a library. This repository does not
   ship macOS, Linux, GTK, Wayland, or X11 app runtimes.
 
@@ -31,6 +32,78 @@ Inno Setup. Without that option, a development build uses the base version
 from `VERSION` or `build.zig.zon` for the numeric fields and retains the
 `-dev` suffix and build metadata in its version strings. Packaging requires
 the staged executable's version string and numeric fields to match `-Version`.
+
+## D3D11 renderer beta
+
+OpenGL remains the default. A normal Windows build includes both renderers.
+To opt in, add this to your config and open a new window, tab, or split:
+
+```ini
+renderer = d3d11
+```
+
+D3D11 first tries hardware, then Microsoft's WARP software renderer if a
+capable hardware device cannot be created. An unavailable D3D11 runtime or
+failed software initialization falls back to OpenGL. Selection and fallback
+reasons appear in the host banner; the inspector shows the active backend and
+`+version` reports whether the build includes the beta.
+`renderer = d3d11-warp` selects WARP explicitly for driver diagnostics;
+`renderer = opengl` restores the default for newly created surfaces. Changing
+the backend preference does not interrupt an existing terminal session.
+
+Custom shaders, background images, Kitty graphics, and generated image
+overlays use OpenGL in this beta. Configured shaders/images select OpenGL at
+startup; enabling them on reload or receiving terminal image content switches
+that surface to OpenGL while preserving its terminal and search state. The
+surface stays on OpenGL for its lifetime after fallback. GLSL support still
+depends on a build with custom shader support, as it does for the default
+renderer. OpenGL fallback needs a working OpenGL 4.3 driver. If it cannot start,
+a healthy D3D11 surface continues drawing text, ignores unsupported images and
+effects, and shows a notice. A later config reload can retry the feature.
+Unavailable devices retry fallback at five-second intervals instead of spinning.
+
+Device removal/reset triggers resource reconstruction and re-uploads retained
+atlas/buffer data. Recovery permits one hardware retry per sixty-second window,
+then WARP; a later loss after that window can re-probe hardware. Failed WARP
+reconstruction falls back to OpenGL. Hardware resource or presentation errors
+also get a bounded WARP attempt. Presentation follows the existing Win32 UI
+thread paint and power-saver policy. Occluded frames keep their render target
+and probe presentation at most four times per second while visible; hidden
+tabs and minimized windows suspend the renderer's draw timer.
+
+Known limits: WARP can consume substantially more CPU under heavy output.
+Its blend quantization can differ from hardware/OpenGL at glyph edges by up
+to four channel levels in the default corrected-linear mode. D3D11 does not
+add per-pixel translucency or custom HLSL effects. Its flip-model swap chain is
+composed through DirectComposition beneath the terminal HWND's children, with
+the existing host/sibling clipping. Framebuffer alpha remains ignored; the host
+still owns whole-window opacity. Overlay ordering, opacity, and visible OpenGL
+handoff require the maintainer desktop check below. GPU loss injection in
+the automated harness tests the recovery path, rather than a physical GPU
+reset. Hidden-desktop readback proves rendered pixels, and does not prove DWM
+composition, scanout, unoccluded frame latency, monitor hotplug, or RDP behavior.
+
+Developers can build with `-Dd3d11=false` to omit the beta backend. GPU parity
+and recovery tests require `-Drenderer-test-tools=true`; those readback and
+fault-injection controls are absent from normal builds. Run
+`test/windows/renderer/Invoke-RendererParity.ps1` against the resulting
+executable; it copies a portable run, redirects app data, and uses a hidden
+desktop. On ARM64/hosts without a suitable OpenGL driver, `-WarpOnly` runs the
+software-rendering lifecycle smoke, including failed GL image/effect fallback,
+without claiming cross-backend parity.
+
+For a visible check on your own desktop, build a normal ReleaseFast binary and run:
+
+```powershell
+pwsh -NoProfile -File test/windows/renderer/Invoke-VisibleD3D11Check.ps1 -Binary .\zig-out\bin\noctty.exe
+```
+
+The script stages a separate portable copy, redirects app data, records pass/fail
+for the palette, paste confirmation, scrollbar, quick-select, opacity 0.8, and a
+Kitty-triggered OpenGL handoff. Screenshots are optional and capture displayed
+pixels. `-PrepareOnly` validates staging without launching a window. It changes
+only the staged config and never sets the clipboard or takes foreground.
+An automated readback alone is not a passing visible-desktop check.
 
 ## Install modes
 
@@ -1367,14 +1440,18 @@ and the
 
 ### GPU floor and OpenGL driver issues
 
-noctty needs OpenGL 4.3 or newer through WGL and has no software, DirectX,
-or ANGLE fallback renderer, so it cannot start when the active OpenGL
-implementation is below that floor. That is common in RDP sessions that fall
+The default OpenGL backend needs OpenGL 4.3 or newer through WGL and does not
+automatically switch to another renderer when the active implementation is
+below that floor. The opt-in D3D11 beta can draw supported text with feature
+level 11.0 hardware or WARP, without OpenGL. Full rendering of unsupported
+images and effects requires a working OpenGL fallback; otherwise healthy D3D11
+continues drawing text with those features degraded. The OpenGL floor is a
+common issue in RDP sessions that fall
 back to software GL (often `GDI Generic` at OpenGL 1.1), VMs without 3D
 acceleration or a guest GPU driver, and older integrated GPUs whose driver
 stops before 4.3.
 
-Below the floor, noctty stops before showing its window and the startup
+With the OpenGL backend below the floor, noctty stops before showing its window and the startup
 dialog lists the required and detected OpenGL versions plus the renderer and
 vendor strings the driver reports. The dialog also prints an `Architecture:`
 line naming the process and native machine, so a bug report separates a
@@ -1389,9 +1466,10 @@ Win32 or Zig error. On x64, try in order:
 4. On a hybrid-GPU system, force `noctty.exe` to the discrete or integrated
    GPU in Windows Graphics settings.
 
-Steps 3 and 4 do not apply on ARM64, where there is no GPU vendor driver to
+Steps 3 and 4 do not apply on an ARM64 PC whose GPU vendor ships no desktop
+OpenGL driver (any Snapdragon PC), where there is no vendor driver to
 reinstall. Use
-[Windows on ARM needs the Compatibility Pack](#windows-on-arm-needs-the-compatibility-pack)
+[Windows on ARM without a vendor OpenGL driver needs the Compatibility Pack](#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)
 instead.
 
 If startup fails with `LoadLibrary failed with error 126` or the startup
@@ -1401,7 +1479,7 @@ dependencies. This shows up most often on AMD+NVIDIA hybrid-GPU laptops
 while WGL loads the AMD OpenGL ICD from DriverStore; use the driver order in
 step 3 before retrying.
 
-#### Windows on ARM needs the Compatibility Pack
+#### Windows on ARM without a vendor OpenGL driver needs the Compatibility Pack
 
 Qualcomm Snapdragon PCs ship no desktop OpenGL driver. No Qualcomm
 implementation has ever appeared in the Khronos OpenGL conformant-products
@@ -1430,10 +1508,12 @@ GL_RENDERER : D3D12 (Qualcomm(R) Adreno(TM) X1-85 GPU)
 The Mesa version is whatever the installed pack ships; only the `D3D12 (...)`
 renderer prefix and a version at or above 4.3 matter.
 
-This is required today: noctty still renders through OpenGL 4.3 over WGL and
-has no DirectX, ANGLE, or software fallback renderer of its own. On ARM64
-that OpenGL comes from a Microsoft mapping layer rather than a GPU vendor's
-driver, but noctty neither knows nor cares which supplied it.
+On a Snapdragon PC, or any ARM64 PC whose GPU vendor ships no desktop
+OpenGL driver, the Compatibility Pack is required for noctty's default OpenGL
+4.3 backend; an ARM64 PC with its vendor's own OpenGL driver does not need it.
+The opt-in D3D11 beta provides a separate hardware/WARP text-rendering path.
+With the pack, OpenGL comes from a Microsoft mapping layer rather than a GPU
+vendor's driver, but noctty neither knows nor cares which supplied it.
 
 There is no AMD or NVIDIA driver to reinstall on ARM64 and no second GPU to
 select in Windows Graphics settings, so noctty's startup dialog leads with

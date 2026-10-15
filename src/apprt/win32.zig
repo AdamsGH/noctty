@@ -11794,7 +11794,10 @@ pub const App = struct {
         return try client_size_fn(ctx, live_hwnd);
     }
 
-    fn createGLContext(self: *App, hwnd: HWND) !struct {
+    /// `owned_format` is the window's record of the pixel format it set:
+    /// filled in as soon as `SetPixelFormat` succeeds, so a later attempt on
+    /// the same window reuses it after a context that failed to be created.
+    fn createGLContext(self: *App, hwnd: HWND, owned_format: *?pixel_format.WglPixelFormatProvenance) !struct {
         hdc: HDC,
         hglrc: HGLRC,
         // Returned rather than logged-and-dropped so the caller can hand
@@ -11811,35 +11814,45 @@ pub const App = struct {
         errdefer _ = sys.ReleaseDC(hwnd, hdc);
 
         const format_before = sys.GetPixelFormat(hdc);
-        if (format_before != 0) {
-            recordOpenGLStartupError(.set_pixel_format, error.PixelFormatAlreadySet);
-            return error.PixelFormatAlreadySet;
-        }
-
-        var selection = try pixel_format.chooseRealPixelFormat(self.hinstance, hwnd, hdc);
-        log.debug(
-            "selected WGL pixel format index={} source={s} srgb_capable={} depth_bits={} stencil_bits={}",
-            .{
-                selection.provenance.index,
-                @tagName(selection.provenance.selection_source),
-                selection.provenance.srgb_capable,
-                selection.provenance.depth_bits,
-                selection.provenance.stencil_bits,
-            },
-        );
-
-        if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0) {
-            const err = windows.kernel32.GetLastError();
-            recordOpenGLStartupWin32Failure(.set_pixel_format, err);
-            return windows.unexpectedError(err);
-        }
-        pixel_format.validatePixelFormatSetTransition(
+        const plan = pixel_format.planPixelFormat(
             format_before,
-            selection.pixel_format,
-            sys.GetPixelFormat(hdc),
+            if (owned_format.*) |owned| owned.index else null,
         ) catch |err| {
             recordOpenGLStartupError(.set_pixel_format, err);
             return err;
+        };
+        const provenance = switch (plan) {
+            .reuse => owned_format.*.?,
+            .choose_and_set => set: {
+                var selection = try pixel_format.chooseRealPixelFormat(self.hinstance, hwnd, hdc);
+                log.debug(
+                    "selected WGL pixel format index={} source={s} srgb_capable={} depth_bits={} stencil_bits={}",
+                    .{
+                        selection.provenance.index,
+                        @tagName(selection.provenance.selection_source),
+                        selection.provenance.srgb_capable,
+                        selection.provenance.depth_bits,
+                        selection.provenance.stencil_bits,
+                    },
+                );
+
+                if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0) {
+                    const err = windows.kernel32.GetLastError();
+                    recordOpenGLStartupWin32Failure(.set_pixel_format, err);
+                    return windows.unexpectedError(err);
+                }
+                pixel_format.validatePixelFormatSetTransition(
+                    format_before,
+                    selection.pixel_format,
+                    sys.GetPixelFormat(hdc),
+                ) catch |err| {
+                    recordOpenGLStartupError(.set_pixel_format, err);
+                    return err;
+                };
+                // The window keeps this format whatever happens next.
+                owned_format.* = selection.provenance;
+                break :set selection.provenance;
+            },
         };
 
         const hglrc = sys.wglCreateContext(hdc) orelse {
@@ -11858,7 +11871,7 @@ pub const App = struct {
         return .{
             .hdc = hdc,
             .hglrc = hglrc,
-            .provenance = selection.provenance,
+            .provenance = provenance,
         };
     }
 
@@ -35021,6 +35034,65 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
+        0x8050, 0x8051, 0x8052, 0x8053, 0x8054, 0x8058 => { // Test-only renderer lifecycle actions.
+            if (build_config.renderer_test_tools and build_config.d3d11) {
+                if (surface) |v| {
+                    if (!v.core_initialized) return 0;
+                    if (msg == 0x8052 or msg == 0x8053 or msg == 0x8058) {
+                        if (!v.core_surface.renderer.setTestFailures(msg == 0x8052, msg == 0x8053)) return 0;
+                    }
+                    if (msg == 0x8054) {
+                        if (!v.core_surface.renderer.failNextPresent()) return 0;
+                    } else if (msg != 0x8051 and !v.core_surface.renderer.requestDeviceLoss()) return 0;
+                    v.redraw() catch return 0;
+                    return 1;
+                }
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        0x8056 => { // Test-only actions through the production binding path.
+            if (build_config.renderer_test_tools) {
+                if (surface) |v| {
+                    if (!v.core_initialized) return 0;
+                    const action: input.Binding.Action = switch (wParam) {
+                        1 => .new_tab,
+                        2 => .{ .new_split = .right },
+                        3 => .{ .new_split = .down },
+                        4 => .previous_tab,
+                        5 => .next_tab,
+                        6 => .close_surface,
+                        7 => .reload_config,
+                        else => return 0,
+                    };
+                    return @intFromBool(v.core_surface.performBindingAction(action) catch false);
+                }
+            }
+            return 0;
+        },
+        0x8057 => { // Test-only DPI scale notification, without moving monitors.
+            if (build_config.renderer_test_tools) {
+                if (surface) |v| {
+                    // Down to half of 96, so a 96 DPI host can scale down too.
+                    if (!v.core_initialized or wParam < 48 or wParam > 384) return 0;
+                    const scale: f32 = @as(f32, @floatFromInt(wParam)) / 96;
+                    v.content_scale = .{ .x = scale, .y = scale };
+                    v.core_surface.contentScaleCallback(v.content_scale) catch return 0;
+                    return 1;
+                }
+            }
+            return 0;
+        },
+        0x0317, 0x0318 => { // Test-only in-app GPU readback (no DWM evidence).
+            if (build_config.renderer_test_tools and build_config.d3d11) {
+                if (surface) |v| {
+                    if (v.core_initialized and wParam != 0) {
+                        v.core_surface.renderer.capture(@ptrFromInt(wParam)) catch return 0;
+                        return 1;
+                    }
+                }
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
         c.WM_PAINT => {
             var ps: PAINTSTRUCT = undefined;
             _ = sys.BeginPaint(hwnd, &ps) orelse return 0;
@@ -35337,6 +35409,10 @@ pub const Surface = struct {
     placement: ChildPlacement = .{},
     hdc: HDC = null,
     hglrc: HGLRC = null,
+    /// The pixel format this window took, once `SetPixelFormat` succeeded.
+    /// A window keeps its format for good, so a later OpenGL attempt (a
+    /// fallback from D3D11 after an earlier one failed) must reuse it.
+    gl_pixel_format: ?pixel_format.WglPixelFormatProvenance = null,
     core_surface: CoreSurface = undefined,
     core_initialized: bool = false,
     adopted_session: ?ptypkg.AdoptedSession = null,
@@ -35422,6 +35498,7 @@ pub const Surface = struct {
     inspector_visible: bool = false,
     paint_pending: bool = false,
     live_resize_repaint_deferred: bool = false,
+    renderer_gl_prepared: bool = false,
     renderer_repaint_requested: std.atomic.Value(bool) = .init(false),
     renderer_repaint_retry_pending: std.atomic.Value(bool) = .init(false),
     /// One-shot post-show frame handshake for #224. Only ever touched from
@@ -35776,17 +35853,16 @@ pub const Surface = struct {
         log.debug("surface.init hwnd created", .{});
         self.noteBenchmarkMemoryStage(.child_hwnd_created, null);
 
-        if (app.test_surface_init_stage) |stage| try stage(self, .gl_context) else {
-            const gl = try app.createGLContext(hwnd);
-            self.hdc = gl.hdc;
-            self.hglrc = gl.hglrc;
-            // Must precede the stage note: `MemoryStageTrace.note` only emits
-            // the wgl_* provenance fields once the format has been published.
-            self.setBenchmarkWglPixelFormat(gl.provenance);
+        if (app.test_surface_init_stage) |stage| {
+            try stage(self, .gl_context);
+            self.noteBenchmarkMemoryStage(.gl_context_created, null);
+        } else if (!build_config.d3d11 or config.renderer == .opengl) {
+            // `ensureGLContext` publishes the pixel format before its stage
+            // note, which only emits the wgl_* provenance fields after that.
+            try self.ensureGLContext();
+            log.debug("surface.init gl context created", .{});
         }
         errdefer self.destroyGL();
-        self.noteBenchmarkMemoryStage(.gl_context_created, null);
-        log.debug("surface.init gl context created", .{});
 
         // `addSurface` below stops a running quit timer. If init then fails,
         // restart it once this Surface has left `windows`, or an app left
@@ -37161,11 +37237,11 @@ pub const Surface = struct {
         const hwnd = self.hwnd orelse return;
         if (sys.IsWindowVisible(hwnd) == 0) return;
         if (self.size.width == 0 or self.size.height == 0) return;
-        if (self.hdc == null or self.hglrc == null) return;
+        if (!build_config.d3d11 and (self.hdc == null or self.hglrc == null)) return;
         if (self.draw_in_progress) return;
         self.draw_in_progress = true;
         defer self.draw_in_progress = false;
-        try self.makeGLContextCurrent();
+        if (self.hglrc != null) try self.makeGLContextCurrent();
         try self.core_surface.draw();
     }
 
@@ -37205,6 +37281,24 @@ pub const Surface = struct {
             } else null,
             cursor_blinking,
         );
+    }
+
+    /// UI-thread-only notice using the same banner as other host diagnostics.
+    pub fn showRendererNotice(self: *Surface, message: []const u8) !void {
+        const host = self.host orelse return error.NoHost;
+        try host.setBanner(.info, message);
+    }
+
+    /// Lazily prepare WGL for an opted-in surface that needs OpenGL fallback.
+    /// Called on the UI thread, before publishing the replacement renderer.
+    pub fn ensureGLContext(self: *Surface) !void {
+        if (self.hglrc != null) return;
+        const hwnd = self.hwnd orelse return error.NoWindow;
+        const gl_context = try self.app.createGLContext(hwnd, &self.gl_pixel_format);
+        self.hdc = gl_context.hdc;
+        self.hglrc = gl_context.hglrc;
+        self.setBenchmarkWglPixelFormat(gl_context.provenance);
+        self.noteBenchmarkMemoryStage(.gl_context_created, null);
     }
 
     pub fn makeGLContextCurrent(self: *Surface) !void {
@@ -37272,6 +37366,11 @@ pub const Surface = struct {
             const err = windows.kernel32.GetLastError();
             return windows.unexpectedError(err);
         }
+        self.noteSuccessfulPresent();
+    }
+
+    /// Shared successful-content handshake for WGL and DXGI (S_OK only).
+    pub fn noteSuccessfulPresent(self: *Surface) void {
         self.render_trace.noteSwapBuffers();
         // Real content reached the screen, so the post-show handshake is
         // finished for good and can never wake the renderer again.
@@ -45611,6 +45710,39 @@ test "win32 runtime can initialize config" {
     defer app.terminate();
 
     try std.testing.expect(@intFromPtr(app.hinstance) != 0);
+}
+
+test "win32 an OpenGL retry on a window reuses the pixel format it set" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core = try CoreApp.create(std.testing.allocator);
+    defer core.destroy();
+    var app: App = undefined;
+    try app.init(core, .{});
+    defer app.terminate();
+
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    var owned: ?pixel_format.WglPixelFormatProvenance = null;
+    // No usable WGL format here (a hosted runner without a GL driver).
+    const first = app.createGLContext(hwnd, &owned) catch return error.SkipZigTest;
+    try std.testing.expect(owned != null);
+
+    // What a failed attempt leaves: the format set, no context.
+    _ = sys.wglMakeCurrent(null, null);
+    _ = sys.wglDeleteContext(first.hglrc);
+    _ = sys.ReleaseDC(hwnd, first.hdc);
+
+    // Its own format is reused, and the retry gets a context. (Refusing a
+    // format the window did not record is `planPixelFormat`'s table test:
+    // through here it logs an OpenGL startup error, which fails the run.)
+    const second = try app.createGLContext(hwnd, &owned);
+    defer {
+        _ = sys.wglMakeCurrent(null, null);
+        _ = sys.wglDeleteContext(second.hglrc);
+        _ = sys.ReleaseDC(hwnd, second.hdc);
+    }
+    try std.testing.expectEqual(owned.?.index, second.provenance.index);
 }
 
 test "win32 runtime leaves the real profile alone when a test starts it" {

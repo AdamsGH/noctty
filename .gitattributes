@@ -43,6 +43,9 @@ src/config/config-template text eol=lf
 src/config/testdata/* text eol=lf
 src/shell-integration/** text eol=lf
 src/font/res/*.bdf text eol=lf
+# The D3D11 shader source: terminal_bytecode.h records its SHA-256, and a test
+# compares that against the checked-out bytes, so a CRLF checkout must not differ.
+src/renderer/d3d11/*.hlsl text eol=lf
 
 # Static site sources - always LF
 site/*.html text eol=lf

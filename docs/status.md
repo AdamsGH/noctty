@@ -24,7 +24,7 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
   rather than degrade. ARM64 additionally needs the Microsoft Store
   "OpenCL, OpenGL, and Vulkan Compatibility Pack", because Qualcomm ships
   no desktop OpenGL driver; see
-  [windows.md](windows.md#windows-on-arm-needs-the-compatibility-pack).
+  [windows.md](windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack).
 - No macOS, Linux, or cross-platform app runtime ships from this repo.
   `libghostty-vt` stays buildable for non-Windows targets as a library.
 - WSL sessions work from the profile picker. Making WSL the default shell
