@@ -19348,15 +19348,9 @@ const Host = struct {
         if (!shown and had_focus) self.focusTerminalOrHost();
         _ = applyChildVisibility(hwnd, &self.banner_placement, shown);
         if (shown) {
-            // The terminal is a sibling that can sit above the banner
-            // (AGENTS.md 2026-09-10: the first surface is the topmost child),
-            // and `WS_CLIPSIBLINGS` on it only spares siblings above it, so
-            // a banner below it would be painted over by the next present.
-            if (self.hwnd) |parent| {
-                if (sys.GetWindow(parent, c.GW_CHILD) != hwnd) {
-                    _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
-                }
-            }
+            // Over the terminal's top rows (AGENTS.md 2026-09-10: the first
+            // surface is the topmost child).
+            if (self.hwnd) |parent| raiseChildToTop(parent, hwnd);
         } else {
             if (self.banner_pointer_inside) {
                 // A leave armed before the hide could otherwise arrive after
@@ -24584,11 +24578,17 @@ const Host = struct {
                         &self.palette_list_placement,
                         paletteListRect(width, list_x, padding, list_y, list_height),
                     ) or changed.*;
-                    changed.* = applyChildVisibility(
+                    const show_list = self.palette_list_visible_rows > 0 and has_list_width;
+                    const list_visibility_changed = applyChildVisibility(
                         list_hwnd,
                         &self.palette_list_placement,
-                        self.palette_list_visible_rows > 0 and has_list_width,
-                    ) or changed.*;
+                        show_list,
+                    );
+                    changed.* = list_visibility_changed or changed.*;
+                    // The list hangs over the terminal's top rows.
+                    if (show_list and list_visibility_changed) {
+                        if (self.hwnd) |parent| raiseChildToTop(parent, list_hwnd);
+                    }
                 }
             } else if (self.palette_list_hwnd) |list_hwnd| {
                 self.palette_list_visible_rows = 0;
@@ -24625,14 +24625,9 @@ const Host = struct {
                         preview_rect,
                     ) or changed.*;
                 }
-                // The terminal Surface sits at the TOP of the sibling
-                // z-order (measured: Surface at index 0, this pane at 9),
-                // and `WS_CLIPSIBLINGS` on the Surface only spares
-                // siblings ABOVE it. This is the only chrome child that
-                // deliberately overlaps the terminal — the band's own
-                // controls never intersect the Surface rect — so without
-                // raising it the next present paints straight over the
-                // pane and it reads as a flicker.
+                // Like the palette list, the pane overlaps the terminal
+                // (measured: Surface at index 0, this pane at 9), so it is
+                // raised over it each time it is shown.
                 const preview_visibility_changed = applyChildVisibility(
                     preview_hwnd,
                     &self.overlay_preview_placement,
@@ -24640,15 +24635,7 @@ const Host = struct {
                 );
                 changed.* = preview_visibility_changed or changed.*;
                 if (show_preview and preview_visibility_changed) {
-                    _ = sys.SetWindowPos(
-                        preview_hwnd,
-                        null, // HWND_TOP
-                        0,
-                        0,
-                        0,
-                        0,
-                        c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE,
-                    );
+                    if (self.hwnd) |parent| raiseChildToTop(parent, preview_hwnd);
                 }
             }
         } else {
@@ -26773,6 +26760,30 @@ fn applyChildVisibility(hwnd: HWND, placement: *ChildPlacement, visible: bool) b
     placement.visible = visible;
     placement.visible_known = true;
     return true;
+}
+
+/// Raise `child` to the top of its siblings, for a chrome child shown over
+/// a terminal pane. A child is created at the bottom of the z-order, below
+/// every pane that already exists, and nothing restacks a pane (measured:
+/// the palette list, created at the first open, came out under the first
+/// pane). Below a pane it is not seen: `WS_CLIPSIBLINGS` on the pane spares
+/// only siblings above it, so an OpenGL present paints over it, and a D3D11
+/// swap chain, which DWM composes in z-order, hides it altogether.
+fn raiseChildToTop(parent: HWND, child: HWND) void {
+    if (sys.GetWindow(parent, c.GW_CHILD) == child) return;
+    _ = sys.SetWindowPos(child, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
+}
+
+/// Put `child` directly above its sibling `pane` and leave every other child
+/// where it is: a child that belongs to one pane, such as its scrollbar,
+/// covers that pane without rising over chrome raised by `raiseChildToTop`.
+fn stackChildAbove(child: HWND, pane: HWND) void {
+    const above = sys.GetWindow(pane, c.GW_HWNDPREV);
+    if (above == child) return;
+    // `SetWindowPos` puts `child` just below the window it is given; null is
+    // HWND_TOP, for a pane that is the topmost child.
+    const insert_after: ?*anyopaque = if (above) |window| @ptrCast(window) else null;
+    _ = sys.SetWindowPos(child, insert_after, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
 }
 
 fn paletteVisibleRowCapacity(available_height: i32, row_height: i32) usize {
@@ -38278,7 +38289,16 @@ pub const Surface = struct {
         const host = self.host orelse return;
         const hwnd = host.hwnd orelse return;
         self.scrollbar_hwnd = sys.CreateWindowExW(
-            c.WS_EX_LAYERED,
+            // Drawn above its pane (`stackChildAbove`) but never hit: the
+            // pane keeps every mouse message over the bar, and its
+            // right-edge proxy (`scrollbarProxyPointFromSurfaceCursor`)
+            // drives the bar. A hit-testable bar would take the wheel and
+            // the right, middle and X buttons from the terminal, and the
+            // pointer crossing between bar and pane would trade
+            // `WM_MOUSELEAVE`s that clear the hover (measured with
+            // `WindowFromPoint`: the thumb and track hit the bar without
+            // this).
+            c.WS_EX_LAYERED | c.WS_EX_TRANSPARENT,
             scrollbar_class_name,
             std.unicode.utf8ToUtf16LeStringLiteral(""),
             c.WS_CHILD,
@@ -38473,7 +38493,11 @@ pub const Surface = struct {
         const scrollbar_hwnd = self.scrollbar_hwnd.?;
         const child_rect = self.scrollbarChildRect(self.placement.rect);
         _ = applyChildRect(scrollbar_hwnd, &self.scrollbar_placement, child_rect);
-        _ = applyChildVisibility(scrollbar_hwnd, &self.scrollbar_placement, true);
+        if (applyChildVisibility(scrollbar_hwnd, &self.scrollbar_placement, true)) {
+            // Created after its pane, the bar starts below it, where the
+            // pane hides it (measured: the bar at index 6, its pane at 0).
+            if (self.hwnd) |pane| stackChildAbove(scrollbar_hwnd, pane);
+        }
 
         const marker_budget = scrollbarMarkerBudgetForHeight(child_rect.bottom - child_rect.top);
         if (marker_budget != self.scrollbar_marker_budget) {
@@ -47785,6 +47809,45 @@ fn createTestHostWindow() !HWND {
         null,
     ) orelse return lastError();
     return hwnd;
+}
+
+fn expectTestChildOrder(parent: HWND, expected: []const HWND) !void {
+    var child = sys.GetWindow(parent, c.GW_CHILD);
+    for (expected) |want| {
+        try std.testing.expectEqual(@as(?HWND, want), child);
+        child = sys.GetWindow(child.?, c.GW_HWNDNEXT);
+    }
+    try std.testing.expectEqual(@as(?HWND, null), child);
+}
+
+test "win32 chrome is raised over the panes, and a pane's own child sits directly above its pane" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const parent = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(parent);
+    // A new child goes in at the bottom, so the first pane is on top and
+    // chrome made later, the palette list or a pane's scrollbar, is under it.
+    const pane = try createTestChromeChild(parent, prompt_label_class);
+    const chrome = try createTestChromeChild(parent, prompt_label_class);
+    const bar = try createTestChromeChild(parent, prompt_label_class);
+    try expectTestChildOrder(parent, &.{ pane, chrome, bar });
+
+    stackChildAbove(bar, pane);
+    try expectTestChildOrder(parent, &.{ bar, pane, chrome });
+    stackChildAbove(bar, pane);
+    try expectTestChildOrder(parent, &.{ bar, pane, chrome });
+
+    raiseChildToTop(parent, chrome);
+    try expectTestChildOrder(parent, &.{ chrome, bar, pane });
+    raiseChildToTop(parent, chrome);
+    try expectTestChildOrder(parent, &.{ chrome, bar, pane });
+
+    // From the bottom, the bar goes back directly above its pane, under the
+    // chrome rather than over it.
+    const hwnd_bottom: ?*anyopaque = @ptrFromInt(1);
+    _ = sys.SetWindowPos(bar, hwnd_bottom, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
+    try expectTestChildOrder(parent, &.{ chrome, pane, bar });
+    stackChildAbove(bar, pane);
+    try expectTestChildOrder(parent, &.{ chrome, bar, pane });
 }
 
 /// Assemble the state `Surface.init` has built by the time it calls
