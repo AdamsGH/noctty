@@ -18712,9 +18712,10 @@ const Host = struct {
         // Each opening refreshes the list, so a shell installed meanwhile
         // shows up, but on the discovery worker: until it answers the
         // picker shows the list it has, or says it is detecting one.
-        const had_list = self.profiles != null;
-        _ = self.profilesForChrome();
-        if (had_list) self.requestProfiles();
+        // One request either way: a list borrowed from another window is
+        // refreshed too, and with no worker it is one synchronous discovery.
+        if (self.profiles == null) _ = self.adoptProfilesFromAnotherHost(true);
+        self.requestProfiles();
         const initial = self.overlayInitialText(.profile);
         defer if (initial) |value| self.app.core_app.alloc.free(value);
         self.hideOverlay();

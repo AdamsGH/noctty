@@ -1050,6 +1050,10 @@ pub const JumpList = struct {
     /// built from an older copy of the model does not mark it clean.
     rebuild_seq: u64 = 0,
     rebuild_in_flight: ?InFlightRebuild = null,
+    /// Commits handed to the runner whose result has not landed, including
+    /// ones given up on.
+    rebuild_outstanding: u32 = 0,
+    watchdog_timer_id: ?UINT_PTR = null,
     /// Commits given up on since the last one that finished.
     rebuild_abandons: u8 = 0,
     next_rebuild_id: u64 = 0,
@@ -1079,6 +1083,7 @@ pub const JumpList = struct {
     }
 
     pub fn deinit(self: *JumpList) void {
+        self.stopWatchdog();
         self.stopTimer();
         if (self.persist_dirty) _ = self.persist();
         self.stopTimer();
@@ -1256,6 +1261,14 @@ pub const JumpList = struct {
     }
 
     pub fn handleTimer(self: *JumpList, timer_id: UINT_PTR) bool {
+        if (self.watchdog_timer_id) |watchdog| {
+            if (timer_id == watchdog) {
+                // A commit outlived its wait: `startRebuild` replaces it.
+                self.stopWatchdog();
+                self.flush();
+                return true;
+            }
+        }
         if (self.timer_id == null or timer_id != self.timer_id.?) return false;
         self.stopTimer();
         self.flush();
@@ -1277,9 +1290,9 @@ pub const JumpList = struct {
     }
 
     fn finishUseGuards(self: *JumpList, persisted: bool) void {
-        // A commit in flight was built with these guards; its removals are
-        // applied against them when it lands.
-        if (self.rebuild_in_flight != null) return;
+        // A commit still out (one given up on included) was built with these
+        // guards; its removals are applied against them when it lands.
+        if (self.rebuild_outstanding > 0) return;
         if (self.use_guards_rebuild_committed and persisted) {
             self.pending_recent_uses.deinit(self.alloc);
             self.pending_profile_uses.deinit(self.alloc);
@@ -1312,6 +1325,23 @@ pub const JumpList = struct {
         if (self.timer_id) |timer_id| {
             _ = KillTimer(null, timer_id);
             self.timer_id = null;
+        }
+    }
+
+    fn armWatchdog(self: *JumpList, ms: u64) void {
+        self.stopWatchdog();
+        const timer_id = SetTimer(null, 0, @intCast(@min(ms, std.math.maxInt(UINT))), null);
+        if (timer_id == 0) {
+            log.warn("jump list rebuild watchdog unavailable", .{});
+            return;
+        }
+        self.watchdog_timer_id = timer_id;
+    }
+
+    fn stopWatchdog(self: *JumpList) void {
+        if (self.watchdog_timer_id) |timer_id| {
+            _ = KillTimer(null, timer_id);
+            self.watchdog_timer_id = null;
         }
     }
 
@@ -1545,11 +1575,11 @@ pub const JumpList = struct {
         if (self.rebuild_in_flight) |in_flight| {
             // Its completion re-checks `rebuild_seq`. One that never ends
             // must not keep the list from updating again.
+            // Its watchdog replaces it once the wait is over.
             const wait_ms = rebuildAbandonMs(self.rebuild_abandons);
-            if (sys.GetTickCount64() -| in_flight.started_ms < wait_ms) {
-                // Look again later: a commit that hangs, or whose result is
-                // lost, is otherwise never replaced.
-                self.schedule();
+            const elapsed_ms = sys.GetTickCount64() -| in_flight.started_ms;
+            if (elapsed_ms < wait_ms) {
+                if (self.watchdog_timer_id == null) self.armWatchdog(wait_ms - elapsed_ms);
                 return;
             }
             log.warn("jump list rebuild unfinished after {d} ms; starting another", .{wait_ms});
@@ -1565,11 +1595,14 @@ pub const JumpList = struct {
         job.id = self.next_rebuild_id;
         self.rebuild_in_flight = .{ .id = job.id, .started_ms = sys.GetTickCount64() };
         if (self.runner) |runner| {
+            job.handed_off = true;
             if (runner.start(runner.ctx, job)) {
-                // Re-checks the commit if it never comes back.
-                self.schedule();
+                self.rebuild_outstanding += 1;
+                // Replaces the commit if it hangs or its result is lost.
+                self.armWatchdog(rebuildAbandonMs(self.rebuild_abandons));
                 return;
             }
+            job.handed_off = false;
             log.warn("jump list rebuild thread unavailable; rebuilding on this thread", .{});
         }
         job.run();
@@ -1606,7 +1639,11 @@ pub const JumpList = struct {
     /// caller still owns `job`.
     pub fn completeRebuild(self: *JumpList, job: *const RebuildJob) void {
         const current = if (self.rebuild_in_flight) |in_flight| in_flight.id == job.id else false;
-        if (current) self.rebuild_in_flight = null;
+        if (current) {
+            self.rebuild_in_flight = null;
+            self.stopWatchdog();
+        }
+        if (job.handed_off) self.rebuild_outstanding -|= 1;
         self.rebuild_abandons = 0;
         // As before the move off the UI thread, removals BeginList reported
         // are recorded even when the commit itself failed.
@@ -1728,6 +1765,8 @@ pub const RebuildJob = struct {
     profiles: []ProfileItem,
     /// What BeginList reported the user removed since the last commit.
     removed: RemovedArguments = .{},
+    /// Went to the runner's thread rather than running inline.
+    handed_off: bool = false,
     result: anyerror!void = error.NotStarted,
 
     pub fn deinit(self: *RebuildJob) void {
@@ -2894,12 +2933,51 @@ test "jump_list keeps use guards while a rebuild built with them is in flight" {
     defer jump.deinit();
     try std.testing.expect(try jump.pending_recent_uses.insert(alloc, "C:\\used"));
     jump.use_guards_rebuild_committed = true;
-    jump.rebuild_in_flight = .{ .id = 1, .started_ms = 0 };
+    jump.rebuild_outstanding = 1;
     jump.finishUseGuards(true);
     try std.testing.expectEqual(@as(usize, 1), jump.pending_recent_uses.items.items.len);
-    jump.rebuild_in_flight = null;
+    jump.rebuild_outstanding = 0;
     jump.finishUseGuards(true);
     try std.testing.expectEqual(@as(usize, 0), jump.pending_recent_uses.items.items.len);
+}
+
+test "jump_list a commit given up on cannot remove an item used since" {
+    const alloc = std.testing.allocator;
+    var jump = try testJumpListWithExe(alloc);
+    defer {
+        jump.persist_dirty = false;
+        jump.deinit();
+    }
+    try std.testing.expect(try jump.recents.insert(alloc, "C:\\reopened"));
+
+    // Job A read the user's removal and stalled; B replaced it.
+    const stalled = try jump.snapshotRebuild();
+    defer stalled.deinit();
+    stalled.id = 1;
+    stalled.handed_off = true;
+    const stalled_alloc = stalled.arena.allocator();
+    try stalled.removed.items.append(stalled_alloc, try buildWorkingDirectoryArgumentsAlloc(stalled_alloc, "C:\\reopened"));
+    stalled.result = {};
+    const replacement = try jump.snapshotRebuild();
+    defer replacement.deinit();
+    replacement.id = 2;
+    replacement.handed_off = true;
+    replacement.result = {};
+    jump.rebuild_outstanding = 2;
+    jump.rebuild_in_flight = .{ .id = 2, .started_ms = 0 };
+
+    // The user opens the directory again; B lands first and is persisted.
+    jump.noteRecent("C:\\reopened");
+    replacement.seq = jump.rebuild_seq;
+    jump.completeRebuild(replacement);
+    jump.finishUseGuards(true);
+    try std.testing.expect(try jump.pending_recent_uses.contains(alloc, "C:\\reopened"));
+
+    // A lands late: the use still protects the directory.
+    jump.completeRebuild(stalled);
+    try std.testing.expect(try jump.recents.contains(alloc, "C:\\reopened"));
+    try std.testing.expect(!try jump.removed_recents.contains(alloc, "C:\\reopened"));
+    try std.testing.expectEqual(@as(u32, 0), jump.rebuild_outstanding);
 }
 
 test "jump_list a finished rebuild records the user's removals in the model" {
