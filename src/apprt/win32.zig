@@ -11607,9 +11607,38 @@ fn queueTerminalHandoff(ctx: *anyopaque, pending: *win32_terminal_handoff.Pendin
     const delivery = self.delivery orelse return false;
     const server = self.terminal_handoff_server orelse return false;
     const id = server.queuePending(pending) catch return false;
-    if (delivery.notify(c.WM_WINHOSTTY_TERMINAL_HANDOFF, id)) return true;
-    _ = server.takePending(id);
-    return false;
+    return finishTerminalHandoffNotification(server, id, delivery.notify(c.WM_WINHOSTTY_TERMINAL_HANDOFF, id));
+}
+
+fn finishTerminalHandoffNotification(server: *win32_terminal_handoff.Server, id: win32_terminal_handoff.PendingId, notified: bool) bool {
+    if (notified) return true;
+    // The UI backstop can claim ownership before notification fails. Only
+    // return it to the RPC caller if rollback actually recovers the session.
+    return server.takePending(id) == null;
+}
+
+test "win32 handoff notification failure returns ownership only when rollback claims it" {
+    const Queue = struct {
+        fn call(_: *anyopaque, _: *win32_terminal_handoff.PendingSession) bool {
+            return false;
+        }
+    };
+    var context: u8 = 0;
+    var server = win32_terminal_handoff.Server.init(std.testing.allocator, &context, Queue.call);
+    defer server.pending.entries.deinit(std.testing.allocator);
+
+    inline for (.{ false, true }) |claimed| {
+        var session: win32_terminal_handoff.PendingSession = undefined;
+        const id = try server.queuePending(&session);
+        if (claimed) try std.testing.expectEqual(&session, server.pending.takeOldest().?);
+        try std.testing.expectEqual(claimed, finishTerminalHandoffNotification(&server, id, false));
+        try std.testing.expect(server.takePending(id) == null);
+    }
+
+    var session: win32_terminal_handoff.PendingSession = undefined;
+    const id = try server.queuePending(&session);
+    try std.testing.expect(finishTerminalHandoffNotification(&server, id, true));
+    try std.testing.expectEqual(&session, server.takePending(id).?);
 }
 
 fn winrtToastActivationCallback(ctx: *anyopaque, launch: []const u8) void {
