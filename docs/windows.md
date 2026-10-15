@@ -99,13 +99,16 @@ instead; nothing is migrated.
 
 ## Shells
 
-For a `command` whose initial program is a simple bare name such as `pwsh`,
-noctty resolves that name through the child's local, absolute `PATH` entries
-and `PATHEXT` before launching it. The pane's current directory is not searched
-implicitly. A name missing from PATH uses a system-directory path so cmd can
-report the failure and run any `||` fallback. An explicit path
-such as `.\tool`, cmd builtins, environment expansions and compound command
-syntax retain cmd semantics. Commands after the initial program are not rewritten.
+For commands launched through `cmd.exe /C`, noctty sets
+`NoDefaultCurrentDirectoryInExePath` in that wrapper's environment when it is
+absent. This disables cmd's implicit executable search in the pane's current
+directory, so a planted `pwsh.cmd` cannot override a `pwsh` on PATH. The guard
+is inherited by descendants: clearing it before the target would restore the
+unsafe search. Existing values are preserved, and direct launches receive no
+new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
+`||` fallback retain native cmd behavior, including PATH directories containing
+literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
+relative PATH entries such as `.`, still select programs relative to the pane.
 
 The profile picker detects:
 
