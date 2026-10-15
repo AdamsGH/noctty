@@ -1,0 +1,3 @@
+# STARTUP-STALL measurement (measurement only, not for merge)
+
+apply_stall.py (after apply_trace.py, apply_vsync.py and ../pkg38-harness/apply_lock.py) records every UI message-loop iteration (kind 16) and spans (kind 15): the jump-list flush and deferred discovery, tickCoreApp, discoverProfiles on the UI thread or the worker, the renderer rebuild, drawFrame's draw_mutex wait and body, and checkpoints 101-109 inside drawFrame. apply_nowsl.py is the A/B variant that skips the wsl.exe probe. stall_analyze.py lists iterations over 20 ms. Runs use ../pkg38-harness/contend-matrix.ps1 with the cmd type cases.
