@@ -163,7 +163,9 @@ fn appendConfiguredSshProfiles(
     // shells rather than propagating, because the caller treats an error as
     // "no profiles at all" and would leave the user with no picker.
     const hosts = windows_ssh_hosts.load(alloc) catch |err| {
-        warnSshDiscoveryOnce(err);
+        // Busy: another discovery was reading the config at the same
+        // moment. Not worth a warning; the incomplete list is retried.
+        if (err != error.SshConfigReadBusy) warnSshDiscoveryOnce(err);
         if (complete) |value| value.* = false;
         return shell_profiles;
     };
@@ -1248,7 +1250,7 @@ fn probeWslExecutable(alloc: Allocator, exe_path: []const u8) !bool {
     child.stderr_behavior = .Ignore;
     child.create_no_window = true;
 
-    child.spawn() catch |err| {
+    win32.spawnChildHoldingInheritLock(&child) catch |err| {
         log.warn("failed to probe wsl responsiveness exe={s} err={}", .{ exe_path, err });
         return false;
     };
@@ -1574,7 +1576,7 @@ fn listWslDistros(alloc: Allocator, exe_path: []const u8) ![][]u8 {
     child.stderr_behavior = .Ignore;
     child.create_no_window = true;
 
-    try child.spawn();
+    try win32.spawnChildHoldingInheritLock(&child);
     var child_running = true;
     errdefer {
         if (child_running) _ = child.kill() catch {};

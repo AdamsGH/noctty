@@ -1835,7 +1835,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_total,
-                .{ .total = v.total },
+                .{ .total = v.total, .invalid = v.invalid },
             );
         },
 
@@ -2234,6 +2234,14 @@ fn searchCallback_(
             self.pushSearchMessage(stopping, .{ .search_total = .{
                 .generation = generation,
                 .total = total,
+            } });
+        },
+
+        .invalid_query => {
+            self.pushSearchMessage(stopping, .{ .search_total = .{
+                .generation = generation,
+                .total = 0,
+                .invalid = true,
             } });
         },
 

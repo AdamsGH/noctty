@@ -122,6 +122,8 @@ pub const SC_MOVE: WPARAM = 0xF010;
 pub const WM_PAINT = 0x000F;
 pub const WM_PRINTCLIENT = 0x0318;
 pub const PRF_CLIENT: LPARAM = 0x0004;
+pub const GW_HWNDNEXT: UINT = 2;
+pub const GW_HWNDPREV: UINT = 3;
 pub const GW_CHILD: UINT = 5;
 pub const WM_QUIT = 0x0012;
 pub const WM_TIMER = 0x0113;
@@ -174,6 +176,8 @@ pub const WM_WINHOSTTY_QUIT = WM_APP + 12;
 pub const WM_WINHOSTTY_CONSOLE_VISIBILITY = WM_APP + 13;
 /// A profile discovery that ran off the UI thread finished (`App.startProfileDiscovery`).
 pub const WM_WINHOSTTY_PROFILES = WM_APP + 14;
+/// A jump-list commit that ran off the UI thread finished (`App.startJumpListRebuild`).
+pub const WM_WINHOSTTY_JUMP_LIST = WM_APP + 15;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;

@@ -65,6 +65,7 @@ pub const host_banner_inspector_inactive = "Inspector hidden. Terminal view is a
 const search_results_idle = "Type to search";
 const search_results_pending = "Searching";
 const search_results_none = "No matches";
+const search_results_invalid = "Invalid pattern";
 
 pub const SearchStatus = struct {
     active: bool = false,
@@ -1310,6 +1311,7 @@ pub fn buildSearchBarResultsText(
     if (bar.query.len == 0) return try alloc.dupe(u8, search_results_idle);
     if (!bar.searched or bar.total == null) return try alloc.dupe(u8, search_results_pending);
 
+    if (bar.invalid) return try alloc.dupe(u8, search_results_invalid);
     const total = bar.total.?;
     if (total == 0) return try alloc.dupe(u8, search_results_none);
     if (bar.selected) |selected| return try std.fmt.allocPrint(alloc, "{d}/{d}", .{ selected, total });
@@ -4225,6 +4227,18 @@ test "win32 buildSearchBarResultsText reflects docked search states" {
     const none = try buildSearchBarResultsText(std.testing.allocator, &bar);
     defer std.testing.allocator.free(none);
     try std.testing.expectEqualStrings(search_results_none, none);
+
+    // An unparsable pattern also reports no matches; it must not read as one.
+    bar.invalid = true;
+    const invalid = try buildSearchBarResultsText(std.testing.allocator, &bar);
+    defer std.testing.allocator.free(invalid);
+    try std.testing.expectEqualStrings(search_results_invalid, invalid);
+    // The next edit clears it, and the debounce shows "Searching" again.
+    try bar.setQuery("foo(", 20);
+    const retyped = try buildSearchBarResultsText(std.testing.allocator, &bar);
+    defer std.testing.allocator.free(retyped);
+    try std.testing.expectEqualStrings(search_results_pending, retyped);
+    bar.searched = true;
 
     bar.total = 12;
     bar.selected = 3;
