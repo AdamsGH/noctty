@@ -1425,10 +1425,12 @@ pub const SettingsControlProvider = struct {
             constants.UIA_LiveSettingPropertyId => if (self.role == .live_text) {
                 out.* = com.VARIANT.fromI4(constants.LiveSetting_Polite);
             },
-            // Only an invalid value is reported: a field with nothing wrong
-            // says nothing, as it did before.
-            constants.UIA_IsDataValidForFormPropertyId => if (self.data_invalid.load(.acquire)) {
-                out.* = com.VARIANT.fromBool(false);
+            // Said for every field, not only the invalid one: a property a
+            // provider leaves out reads as FALSE, which would make every field
+            // that was never touched look invalid.
+            constants.UIA_IsDataValidForFormPropertyId => switch (self.role) {
+                .edit, .combo_box, .check_box => out.* = com.VARIANT.fromBool(!self.data_invalid.load(.acquire)),
+                else => {},
             },
             else => {},
         }
@@ -8206,18 +8208,30 @@ test "SettingsControlProvider reports a field whose value Settings will not acce
     defer _ = SettingsControlProvider.Release(&edit.base);
 
     var value = com.VARIANT.empty();
-    // Nothing is said of a field with nothing wrong.
-    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
-    try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
-
-    edit.setDataInvalid(true);
+    // A field nothing is wrong with says so: left out, the property reads as
+    // FALSE (measured through UIA on a running window).
     try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
     try std.testing.expectEqual(@as(u16, com.VT_BOOL), value.vt);
+    try std.testing.expectEqual(@as(i16, com.VARIANT_TRUE), value.value.bool_val);
+
+    events.testing_property_changes = 0;
+    edit.setDataInvalid(true);
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
     try std.testing.expectEqual(@as(i16, com.VARIANT_FALSE), value.value.bool_val);
+    edit.setDataInvalid(true);
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
 
     edit.setDataInvalid(false);
-    value = com.VARIANT.empty();
+    try std.testing.expectEqual(@as(usize, 2), events.testing_property_changes);
     try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&edit.base, constants.UIA_IsDataValidForFormPropertyId, &value));
+    try std.testing.expectEqual(@as(i16, com.VARIANT_TRUE), value.value.bool_val);
+
+    // Text and buttons are not form fields.
+    const button = try SettingsControlProvider.create(std.testing.allocator, hwnd, .button, "Save");
+    defer _ = SettingsControlProvider.Release(&button.base);
+    value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&button.base, constants.UIA_IsDataValidForFormPropertyId, &value));
     try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
 }
 
