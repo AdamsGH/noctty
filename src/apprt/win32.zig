@@ -4623,14 +4623,9 @@ pub const App = struct {
         }
 
         if (self.windows.items.len > 0) self.markRecoveryWindowCreated();
-        // With a window up, the fonts the config names have been looked for
-        // and the problems have somewhere to show. Without one they wait in
-        // Settings and the palette.
-        if (self.windows.items.len > 0) {
-            _ = self.reportConfigProblems(&self.config);
-        } else {
-            self.recordConfigProblems(&self.config);
-        }
+        // Keep the banner text even without an initial window: every later
+        // host receives its own copy when it is created.
+        _ = self.reportConfigProblems(&self.config);
 
         // Armed here, released by `resolveRecoveryStartup` once the ready
         // marker is on disk. Spawning it here would let thread scheduling put
@@ -7767,7 +7762,9 @@ pub const App = struct {
                 // The config in effect, not the one just read: the app
                 // applies its conditional state (dark system, `theme =
                 // light:A,dark:B`) before it installs it.
-                if (self.reportConfigProblems(&self.config)) return true;
+                // config_change already recorded this load, including its
+                // font checks; explicitly re-announce without scanning twice.
+                if (self.reportRecordedConfigProblems()) return true;
                 if (self.config.@"app-notifications".@"config-reload") {
                     try self.showDesktopNotification(.app, "noctty", "Configuration reloaded");
                 }
@@ -9525,6 +9522,8 @@ pub const App = struct {
         }
 
         host.power_notifications = win32_power.Notifications.init(hwnd);
+
+        self.presentConfigProblemsOnHost(host);
 
         // The host stays hidden here. `Surface.init` shows it only after GL
         // and core initialization succeed, so a below-floor GPU reaches the
@@ -11611,7 +11610,7 @@ pub const App = struct {
 
         self.core_app.updateConfig(self, &reloaded) catch return error.ReloadFailed;
         // The reload read the file again, so what is wrong in it is news.
-        _ = self.reportConfigProblems(&self.config);
+        _ = self.reportRecordedConfigProblems();
         if (masked.len > 0) return error.SavedButMasked;
     }
 
@@ -12138,8 +12137,8 @@ pub const App = struct {
         return true;
     }
 
-    /// Keep a copy of what a config load found wrong, with the fonts the open
-    /// terminals could not find, for the banner, the Settings page and the
+    /// Keep a copy of what a config load found wrong, including configured
+    /// font families, for the banner, the Settings page and the
     /// palette. The config's own diagnostics are freed with the config.
     fn recordConfigProblems(self: *App, config: *const configpkg.Config) void {
         const alloc = self.core_app.alloc;
@@ -12150,14 +12149,18 @@ pub const App = struct {
                 log.warn("config problems: could not keep a diagnostic err={}", .{err});
             };
         }
-        // A family is listed once, however many tabs and windows use it.
-        for (self.windows.items) |surface| {
-            if (!surface.core_initialized) continue;
-            for (surface.core().missingFontFamilies()) |family| {
+        // Check the configured families once for the load, independently of
+        // which tabs exist or which styles have already been drawn.
+        if (self.core_app.font_grid_set.configuredMissingFamilies(alloc, config)) |families_value| {
+            var families = families_value;
+            defer families.deinit(alloc);
+            for (families.reportable()) |family| {
                 self.config_problems.addMissingFont(alloc, family) catch |err| {
                     log.warn("config problems: could not keep a missing font err={}", .{err});
                 };
             }
+        } else |err| {
+            log.warn("config problems: could not check configured fonts err={}", .{err});
         }
         self.settings_window.configProblemsChanged();
     }
@@ -12180,6 +12183,10 @@ pub const App = struct {
     /// there are problems.
     fn reportConfigProblems(self: *App, config: *const configpkg.Config) bool {
         self.recordConfigProblems(config);
+        return self.reportRecordedConfigProblems();
+    }
+
+    fn reportRecordedConfigProblems(self: *App) bool {
         if (self.config_problems.count() == 0) {
             self.clearConfigProblemsBanner();
             return false;
@@ -12188,8 +12195,8 @@ pub const App = struct {
         return true;
     }
 
-    /// Raise the banner for `config_problems`. False when there is nothing to
-    /// say or no window to say it on.
+    /// Keep the banner for `config_problems` and present it on every host.
+    /// False when there is nothing to say or no window to say it on.
     fn showConfigProblemsBanner(self: *App) bool {
         const alloc = self.core_app.alloc;
         // First, and on every host: the primary window can change between
@@ -12200,9 +12207,14 @@ pub const App = struct {
         // Kept so a later load that finds nothing can take down this banner,
         // and no other.
         self.config_problems_banner = text;
-        return self.showHostBanner(.app, .err, text) catch |err| {
+        for (self.hosts.items) |host| self.presentConfigProblemsOnHost(host);
+        return self.hosts.items.len > 0;
+    }
+
+    fn presentConfigProblemsOnHost(self: *App, host: *Host) void {
+        const text = self.config_problems_banner orelse return;
+        host.setConfigProblemsBanner(text) catch |err| {
             log.warn("config problems: banner failed err={}", .{err});
-            return false;
         };
     }
 
@@ -12214,6 +12226,9 @@ pub const App = struct {
             self.config_problems_banner = null;
         }
         for (self.hosts.items) |host| {
+            // Remove a queued config banner as well, before clearing the
+            // active one, so a clean load cannot resurrect stale problems.
+            appendOwnedString(alloc, &host.config_problems_text, null) catch unreachable;
             const shown = host.banner_text orelse continue;
             if (host.banner_kind != .err or !std.mem.eql(u8, shown, ours)) continue;
             host.setBanner(.none, null) catch |err| {
@@ -13504,6 +13519,9 @@ const Host = struct {
     focused_quick_slot: ?usize = null,
     banner_kind: HostBannerKind = .none,
     banner_text: ?[:0]const u8 = null,
+    /// This host's config problems, behind an earlier error until it is
+    /// dismissed. Owned separately from the ordinary single banner slot.
+    config_problems_text: ?[:0]const u8 = null,
     banner_hwnd: ?HWND = null,
     banner_placement: ChildPlacement = .{},
     banner_prev_proc: ?*const anyopaque = null,
@@ -16060,6 +16078,7 @@ const Host = struct {
         self.destroyChildControls();
 
         if (self.banner_text) |value| self.app.core_app.alloc.free(value);
+        if (self.config_problems_text) |value| self.app.core_app.alloc.free(value);
         // A prompt still open when its window goes, such as a window-close
         // prompt whose last terminal exited meanwhile.
         if (self.confirm_payload) |*payload| payload.deinit(self.app.core_app.alloc);
@@ -17814,10 +17833,31 @@ const Host = struct {
         _ = sys.SetFocus(hwnd);
     }
 
+    fn setConfigProblemsBanner(self: *Host, text: []const u8) !void {
+        try appendOwnedString(self.app.core_app.alloc, &self.config_problems_text, text);
+        // A startup layout failure (or another earlier error) remains the
+        // first thing to read. Closing it reveals the config problems.
+        if (self.banner_kind == .err and self.banner_text != null) return;
+        try self.setBanner(.err, text);
+    }
+
     fn setBanner(self: *Host, kind: HostBannerKind, text: ?[]const u8) !void {
-        const next_kind: HostBannerKind = if (text == null) .none else kind;
+        var next_text = text;
+        var next_kind: HostBannerKind = if (text == null) .none else kind;
+        if (text == null) {
+            if (self.config_problems_text) |pending| {
+                if (self.banner_kind == .err and ownedStringEquals(self.banner_text, pending)) {
+                    // Closing the config message acknowledges it on this
+                    // window; another window has its own acknowledgement.
+                    try appendOwnedString(self.app.core_app.alloc, &self.config_problems_text, null);
+                } else {
+                    next_text = pending;
+                    next_kind = .err;
+                }
+            }
+        }
         if (self.banner_kind == next_kind) {
-            if (text) |value| {
+            if (next_text) |value| {
                 if (ownedStringEquals(self.banner_text, value)) {
                     // The same message again (undo pressed twice): a full
                     // countdown again, without announcing it twice.
@@ -17831,7 +17871,7 @@ const Host = struct {
         }
 
         self.banner_kind = next_kind;
-        try appendOwnedString(self.app.core_app.alloc, &self.banner_text, text);
+        try appendOwnedString(self.app.core_app.alloc, &self.banner_text, next_text);
         // This announces the banner itself, below.
         self.banner_announce_pending = false;
         // A new message gets a full countdown of its own.
@@ -27882,6 +27922,132 @@ test "win32 config problems raise an error banner that only a clean load takes d
     try std.testing.expect(!app.reportConfigProblems(&clean));
     try std.testing.expectEqualStrings("New window could not be opened.", host.banner_text.?);
     try host.setBanner(.none, null);
+}
+
+test "win32 config problems reach every host even without a primary surface" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var second: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &first, .register = true },
+            .{ .storage = &second, .register = true },
+        },
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .key = "theme", .message = "missing theme" });
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqual(HostBannerKind.err, first.banner_kind);
+    try std.testing.expectEqualStrings(first.banner_text.?, second.banner_text.?);
+}
+
+test "win32 config problems preserve a pending launch-layout error until dismissed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    try host.setBanner(.err, "Layout could not be opened.");
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqualStrings("Layout could not be opened.", host.banner_text.?);
+    // Closing the earlier error makes the config problem visible next.
+    try host.setBanner(.none, null);
+    try std.testing.expectEqualStrings(app.config_problems_banner.?, host.banner_text.?);
+    try host.setBanner(.none, null);
+    try std.testing.expect(host.banner_text == null);
+}
+
+test "win32 config problems wait for a later host and clear queued errors on a clean load" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var later: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{ .{ .storage = &first }, .{ .storage = &later } },
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    app.config.@"initial-window" = false;
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
+    // No hosts exist when an initial-window=false process loads its config.
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expect(app.config_problems_banner != null);
+    try app.hosts.append(alloc, &first);
+    app.presentConfigProblemsOnHost(&first);
+    try std.testing.expectEqualStrings(app.config_problems_banner.?, first.banner_text.?);
+    try first.setBanner(.none, null);
+    // Another window still receives the load's problems after the first
+    // window acknowledged its own banner. No config load or font scan here.
+    try app.hosts.append(alloc, &later);
+    app.presentConfigProblemsOnHost(&later);
+    try std.testing.expectEqualStrings(app.config_problems_banner.?, later.banner_text.?);
+    try later.setBanner(.err, "Layout could not be opened.");
+    app.config._diagnostics = .{};
+    try std.testing.expect(!app.reportConfigProblems(&app.config));
+    try std.testing.expectEqualStrings("Layout could not be opened.", later.banner_text.?);
+    try later.setBanner(.none, null);
+    try std.testing.expect(later.banner_text == null);
+    try std.testing.expect(first.banner_text == null);
+}
+
+test "win32 config problems list configured fonts once per load without any terminal" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    const arena = app.config._arena.?.allocator();
+    try app.config.@"font-family".parseCLI(arena, "Consolas");
+    try app.config.@"font-family".parseCLI(arena, "Small05 Missing Fallback");
+    try app.config.@"font-family-bold".parseCLI(arena, "Small05 Missing Bold");
+    try app.config.@"font-family-italic".parseCLI(arena, "small05 missing bold");
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqual(@as(usize, 2), app.config_problems.count());
+    const before = app.config_problems.fingerprint();
+    try app.hosts.append(alloc, &host);
+    app.presentConfigProblemsOnHost(&host);
+    try std.testing.expectEqual(before, app.config_problems.fingerprint());
+    try std.testing.expectEqual(@as(usize, 2), app.config_problems.count());
+    // A reload rechecks the fonts, but does not duplicate their diagnostics.
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqual(before, app.config_problems.fingerprint());
+    try std.testing.expectEqual(@as(usize, 2), app.config_problems.count());
 }
 
 test "win32 a config change that brings other problems refreshes the list and speaks only when it is news" {
@@ -39275,6 +39441,7 @@ const TestSession = struct {
         while (host_index > 0) {
             host_index -= 1;
             const host = self.hosts[host_index] orelse continue;
+            appendOwnedString(self.allocator, &host.config_problems_text, null) catch unreachable;
             host.setBanner(.none, null) catch {};
             host.clearStructuralHistory(.normal);
             host.structural_undo_entries.deinit(self.allocator);
