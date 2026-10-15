@@ -341,11 +341,32 @@ pub fn normalizeWheelDelta(
     };
 }
 
+/// The keyboard state a test pinned on this thread (`TestingKeyboard`). The
+/// readers below report it instead of the live keyboard, so a test does not
+/// depend on which keys the user holds or whether NumLock is on while it runs.
+threadlocal var testing_pinned_state: ?[256]u8 = null;
+
+fn pinnedKeyboardState() ?*const [256]u8 {
+    if (builtin.is_test) {
+        if (testing_pinned_state) |*state| return state;
+    }
+    return null;
+}
+
+/// The pinned state of one key: 0 for a virtual key outside the table, as
+/// `GetKeyState` answers.
+fn pinnedKey(vk: i32) ?u8 {
+    const state = pinnedKeyboardState() orelse return null;
+    return state[std.math.cast(u8, vk) orelse return 0];
+}
+
 pub fn keyPressed(vk: i32) bool {
+    if (pinnedKey(vk)) |key| return (key & 0x80) != 0;
     return sys.GetKeyState(vk) < 0;
 }
 
 fn keyToggled(vk: i32) bool {
+    if (pinnedKey(vk)) |key| return (key & 1) != 0;
     return (sys.GetKeyState(vk) & 1) != 0;
 }
 
@@ -491,6 +512,10 @@ fn fallbackMods() input.Mods {
 }
 
 fn currentKeyboardState(state: *[256]u8) ?*const [256]u8 {
+    if (pinnedKeyboardState()) |pinned| {
+        state.* = pinned.*;
+        return state;
+    }
     if (sys.GetKeyboardState(state) == 0) return null;
     return state;
 }
@@ -1632,6 +1657,8 @@ fn testingScanCode(vk: UINT) LPARAM {
 // translates it to '/', so a release path still using the table shows up here.
 test "win32 unshifted codepoint agrees across press and release" {
     if (!testingUsLayout()) return error.SkipZigTest;
+    const keyboard = TestingKeyboard.pinNone();
+    defer keyboard.release();
 
     const keys = [_]UINT{ c.VK_DIVIDE, c.VK_MULTIPLY, c.VK_ADD, c.VK_A, c.VK_OEM_COMMA };
     for (keys) |vk| {
@@ -2420,6 +2447,43 @@ test "win32 IME commit reports the effect that closed the surface" {
     try std.testing.expectEqual(@as(usize, 0), closed.notes);
 }
 
+/// The keyboard a test means the calling thread to have, all 256 key states
+/// including the NumLock, CapsLock and ScrollLock toggles. The state is set on
+/// the thread, for what Windows reads itself (`TranslateMessage`), and pinned,
+/// so the readers in this file report it however the live keyboard changes
+/// meanwhile (a key the user holds, NumLock). `release` puts back the thread's
+/// own state and the previous pin.
+pub const TestingKeyboard = struct {
+    thread_state: [256]u8,
+    previous_pin: ?[256]u8,
+
+    pub fn pin(state: *const [256]u8) TestingKeyboard {
+        var thread_state: [256]u8 = [_]u8{0} ** 256;
+        _ = sys.GetKeyboardState(&thread_state);
+        const keyboard: TestingKeyboard = .{
+            .thread_state = thread_state,
+            .previous_pin = testing_pinned_state,
+        };
+        keyboard.set(state);
+        return keyboard;
+    }
+
+    /// No key down and no toggle on.
+    pub fn pinNone() TestingKeyboard {
+        return pin(&([_]u8{0} ** 256));
+    }
+
+    pub fn set(_: *const TestingKeyboard, state: *const [256]u8) void {
+        testing_pinned_state = state.*;
+        _ = sys.SetKeyboardState(state);
+    }
+
+    pub fn release(self: *const TestingKeyboard) void {
+        testing_pinned_state = self.previous_pin;
+        _ = sys.SetKeyboardState(&self.thread_state);
+    }
+};
+
 /// A keyboard layout made active for the test thread only. `KLF_NOTELLSHELL`
 /// keeps it out of the shell's input switcher, a layout the session did not
 /// already have is unloaded again, and the thread's previous layout and key
@@ -2525,6 +2589,16 @@ fn testingDeliverKeyMessage(
         .lPrivate = 0,
     };
     _ = sys.TranslateMessage(&key_message);
+    // The thread's live state moves once the key is translated, as drift in
+    // the live keyboard would (a held Ctrl, NumLock on): the dispatch has to
+    // report the state the test pinned.
+    var resynced: [256]u8 = [_]u8{0} ** 256;
+    resynced[c.VK_CONTROL] = 0x80;
+    resynced[c.VK_LCONTROL] = 0x80;
+    resynced[c.VK_NUMLOCK] = 1;
+    resynced[c.VK_CAPITAL] = 1;
+    resynced[c.VK_SCROLL] = 1;
+    _ = sys.SetKeyboardState(&resynced);
     const typed: TypedChars = if (msg == c.WM_KEYDOWN) takeTypedChars(hwnd) else .{};
     dispatchKeyMessage(terminal, chars, msg, vk, lParam, defer_plain_text, false, terminal.opts.win32InputRecords(), &typed);
 
@@ -2566,6 +2640,8 @@ fn testingTypeKeys(
 ) void {
     var chars: DeferredCharState = .{};
     var held: [256]u8 = [_]u8{0} ** 256;
+    const keyboard = TestingKeyboard.pin(&held);
+    defer keyboard.release();
     for (keys) |key| {
         var state = held;
         if (key.ctrl) {
@@ -2589,19 +2665,18 @@ fn testingTypeKeys(
         if (key.stroke != .up) {
             state[key.vk] = 0x80;
             if (key.stroke == .down) held[key.vk] = 0x80;
-            _ = sys.SetKeyboardState(&state);
+            keyboard.set(&state);
             const repeat: usize = if (key.stroke == .repeat) 1 << 30 else 0;
             testingDeliverKeyMessage(terminal, &chars, hwnd, c.WM_KEYDOWN, key.vk, @bitCast(down | repeat), defer_plain_text);
         }
         if (key.stroke == .tap or key.stroke == .up) {
             state[key.vk] = 0;
             held[key.vk] = 0;
-            _ = sys.SetKeyboardState(&state);
+            keyboard.set(&state);
             const up = down | (1 << 30) | (1 << 31);
             testingDeliverKeyMessage(terminal, &chars, hwnd, c.WM_KEYUP, key.vk, @bitCast(up), defer_plain_text);
         }
     }
-    _ = sys.SetKeyboardState(&([_]u8{0} ** 256));
 }
 
 test "win32 control key state mirrors the console host's record bits" {
@@ -2670,6 +2745,8 @@ test "win32 key record takes the pump's characters and translates releases" {
 // IME took. Neither does noctty, while the ordinary message keeps its record.
 test "win32 key record is skipped for the key messages the console host ignores" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const keyboard = TestingKeyboard.pinNone();
+    defer keyboard.release();
     const lParam: LPARAM = @bitCast(@as(usize, 1 | (29 << 16)));
     const real = keyMessage(c.WM_KEYDOWN, c.VK_CONTROL, lParam, false, null, true, false).?;
     try std.testing.expect(real.event.win32 != null);
@@ -2681,6 +2758,49 @@ test "win32 key record is skipped for the key messages the console host ignores"
     try std.testing.expect(fake_up.event.win32 == null);
     const ime = keyMessage(c.WM_KEYDOWN, c.VK_PROCESSKEY, lParam, false, null, true, false).?;
     try std.testing.expect(ime.event.win32 == null);
+}
+
+// The tests that run key messages through the live readers pin the thread's
+// whole keyboard state. "Expected NumLock bit 0, found 32" and a stray
+// LEFT_CTRL were those readers reporting a state other than the one the test
+// had set (why was not found), so the live keyboard changing after the pin
+// must change nothing.
+test "win32 key messages report the keyboard state a test pinned, not the live keyboard" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const keyboard = TestingKeyboard.pinNone();
+    defer keyboard.release();
+
+    // The thread's own state now says Ctrl is down and every toggle is on.
+    var live: [256]u8 = [_]u8{0} ** 256;
+    live[c.VK_CONTROL] = 0x80;
+    live[c.VK_LCONTROL] = 0x80;
+    live[c.VK_NUMLOCK] = 1;
+    live[c.VK_CAPITAL] = 1;
+    live[c.VK_SCROLL] = 1;
+    _ = sys.SetKeyboardState(&live);
+
+    const lParam: LPARAM = @bitCast(@as(usize, 1 | (30 << 16)));
+    const idle = keyMessage(c.WM_KEYDOWN, c.VK_A, lParam, false, null, true, false).?;
+    try std.testing.expectEqual(@as(u16, 0), idle.event.win32.?.control_key_state);
+    try std.testing.expect(std.meta.eql(input.Mods{}, idle.event.mods));
+    try std.testing.expect(!keyPressed(c.VK_CONTROL));
+    try std.testing.expect(!keyToggled(c.VK_NUMLOCK));
+
+    // What the test asks for is what the readers report, toggles included.
+    var wanted: [256]u8 = [_]u8{0} ** 256;
+    wanted[c.VK_SHIFT] = 0x80;
+    wanted[c.VK_LSHIFT] = 0x80;
+    wanted[c.VK_NUMLOCK] = 1;
+    keyboard.set(&wanted);
+    const locked = keyMessage(c.WM_KEYDOWN, c.VK_A, lParam, false, null, true, false).?;
+    try std.testing.expectEqual(
+        ControlKeyState.shift | ControlKeyState.numlock_on,
+        locked.event.win32.?.control_key_state,
+    );
+    try std.testing.expect(locked.event.mods.shift and locked.event.mods.num_lock);
+    try std.testing.expect(!locked.event.mods.ctrl and !locked.event.mods.caps_lock);
+    try std.testing.expect(keyPressed(c.VK_SHIFT) and !keyPressed(c.VK_CONTROL));
+    try std.testing.expect(keyToggled(c.VK_NUMLOCK) and !keyToggled(c.VK_CAPITAL));
 }
 
 // Driven through the real US and US-International layouts and the real
