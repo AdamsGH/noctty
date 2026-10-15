@@ -963,6 +963,7 @@ test "PKG48 shell wrapper ignores a planted cwd command and preserves the enviro
     try td.dir.makeDir("trusted tools");
     try td.dir.makeDir("untrusted");
     try td.dir.writeFile(.{ .sub_path = "untrusted/pkg48probe.cmd", .data = "@echo PLANTED\r\n" });
+    try td.dir.writeFile(.{ .sub_path = "trusted tools/my.tool.cmd", .data = "@echo DOTTED\r\n" });
     const trusted = try td.dir.realpathAlloc(alloc, "trusted tools");
     const cwd = try td.dir.realpathAlloc(alloc, "untrusted");
     var env = try std.process.getEnvMap(alloc);
@@ -978,6 +979,7 @@ test "PKG48 shell wrapper ignores a planted cwd command and preserves the enviro
     const cases = .{
         .{ "pkg48probe /d /c \"echo TRUSTED&&if defined NoDefaultCurrentDirectoryInExePath echo GUARD\"", "TRUSTED\r\n" },
         .{ "pkg48missing || echo FALLBACK", "FALLBACK\r\n" },
+        .{ "my.tool", "DOTTED\r\n" },
         .{ "if.foo || echo FALLBACK", "FALLBACK\r\n" },
         .{ "for.foo || echo FALLBACK", "FALLBACK\r\n" },
         .{ "\"echo\" HELLO || echo SAFE", "SAFE\r\n" },

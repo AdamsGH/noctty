@@ -280,10 +280,16 @@ fn lookupChildCommand(alloc: Allocator, exe: []const u8, env: *const std.process
             (dir[2] != '\\' and dir[2] != '/')) continue;
         if (internal_os.windows.driveTypeForLetter(dir[0]) == internal_os.windows.DRIVE_REMOTE)
             continue;
-        var extensions = std.mem.splitScalar(u8, if (extension.len > 0) "" else env.get("PATHEXT") orelse ".COM;.EXE;.BAT;.CMD", ';');
-        while (extensions.next()) |raw_ext| {
+        // cmd tries a dotted exact name, then PATHEXT, in each directory.
+        // Keep the executable-only caller's existing exact-extension policy.
+        var exact_pending = scripts and extension.len > 0;
+        var extensions = std.mem.splitScalar(u8, if (extension.len > 0 and !scripts) "" else env.get("PATHEXT") orelse ".COM;.EXE;.BAT;.CMD", ';');
+        while (true) {
+            const exact = exact_pending;
+            exact_pending = false;
+            const raw_ext = if (exact) "" else extensions.next() orelse break;
             const ext = std.mem.trim(u8, raw_ext, " \t");
-            if (extension.len == 0) {
+            if (!exact and (scripts or extension.len == 0)) {
                 if (ext.len < 2 or ext[0] != '.') continue;
                 // PATHEXT supplies suffixes, not paths or cmd syntax.
                 var valid = true;
@@ -377,6 +383,7 @@ test "PKG48 bare shell command uses child PATH without changing environment" {
     defer tmp.cleanup();
     try tmp.dir.makeDir("trusted tools");
     try tmp.dir.writeFile(.{ .sub_path = "trusted tools/pkg48probe.cmd", .data = "@echo TRUSTED\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "trusted tools/my.tool.cmd", .data = "@echo DOTTED\r\n" });
     const path = try tmp.dir.realpathAlloc(alloc, "trusted tools");
     var env = std.process.EnvMap.init(alloc);
     try env.put("PATH", path);
@@ -385,6 +392,25 @@ test "PKG48 bare shell command uses child PATH without changing environment" {
     const expected = try std.fmt.allocPrint(alloc, "\"{s}\\pkg48probe.CMD\" arg && echo tail", .{path});
     const result = try resolveShellCommand(alloc, .{ .shell = "pkg48probe arg && echo tail" }, &env);
     try testing.expectEqualStrings(expected, result.shell);
+    const dotted = try resolveShellCommand(alloc, .{ .shell = "my.tool arg" }, &env);
+    const dotted_expected = try std.fmt.allocPrint(alloc, "\"{s}\\my.tool.CMD\" arg", .{path});
+    try testing.expectEqualStrings(dotted_expected, dotted.shell);
+    // An earlier directory's suffix wins over a later exact name. In one
+    // directory, the exact dotted name wins before PATHEXT is considered.
+    try tmp.dir.makeDir("later");
+    try tmp.dir.writeFile(.{ .sub_path = "later/my.tool", .data = "" });
+    const later = try tmp.dir.realpathAlloc(alloc, "later");
+    try env.put("PATH", try std.fmt.allocPrint(alloc, "{s};{s}", .{ path, later }));
+    try testing.expectEqualStrings(dotted_expected, (try resolveShellCommand(alloc, .{ .shell = "my.tool arg" }, &env)).shell);
+    try tmp.dir.writeFile(.{ .sub_path = "trusted tools/my.tool", .data = "" });
+    const exact_expected = try std.fmt.allocPrint(alloc, "\"{s}\\my.tool\" arg", .{path});
+    try testing.expectEqualStrings(exact_expected, (try resolveShellCommand(alloc, .{ .shell = "my.tool arg" }, &env)).shell);
+    // cmd appends PATHEXT even after a known extension, but the pre-existing
+    // executable-only lookup deliberately retains its exact-extension policy.
+    try tmp.dir.writeFile(.{ .sub_path = "trusted tools/known.exe.cmd", .data = "" });
+    const known_expected = try std.fmt.allocPrint(alloc, "\"{s}\\known.exe.CMD\"", .{path});
+    try testing.expectEqualStrings(known_expected, (try resolveShellCommand(alloc, .{ .shell = "known.exe" }, &env)).shell);
+    try testing.expectEqual(@as(?[:0]const u8, null), try lookupChildExecutable(alloc, "known.exe", &env));
     try testing.expectEqualStrings("user-value", env.get("NoDefaultCurrentDirectoryInExePath").?);
     const missing = try resolveShellCommand(alloc, .{ .shell = "pkg48_missing_program || echo fallback" }, &env);
     try testing.expect(std.mem.endsWith(u8, missing.shell, "\\pkg48_missing_program\" || echo fallback"));
