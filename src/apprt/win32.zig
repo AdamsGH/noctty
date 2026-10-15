@@ -793,6 +793,35 @@ test "win32 clipboard contention stops retrying at its UI budget" {
     }
 }
 
+test "win32 clipboard retry stops when a yield crosses its UI budget" {
+    // The budget runs out while waiting for the next attempt: no second open.
+    const Fake = struct {
+        var calls: usize = 0;
+        reads: usize = 0,
+
+        fn read(self: *@This()) u64 {
+            defer self.reads += 1;
+            return switch (self.reads) {
+                0 => 0,
+                1 => clipboard_open_interval_ns / 2,
+                else => clipboard_open_budget_ns,
+            };
+        }
+
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return 0;
+        }
+    };
+
+    Fake.calls = 0;
+    var clock: Fake = .{};
+    try std.testing.expect(!openClipboardWithClock(Fake.open, null, &clock));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
+}
+
 test "win32 clipboard retry uses QPC without opening the real clipboard" {
     const Fake = struct {
         var calls: usize = 0;
