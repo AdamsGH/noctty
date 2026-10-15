@@ -72,7 +72,7 @@ later.
   acceleration.
 - On Windows on Arm PCs, first install the free **OpenCL, OpenGL, and Vulkan
   Compatibility Pack** from the Microsoft Store
-  ([why](docs/windows.md#windows-on-arm-needs-the-compatibility-pack)).
+  ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)).
 
 The latest release is
 [noctty 1.3.131](https://github.com/amanthanvi/noctty/releases/tag/v1.3.131),

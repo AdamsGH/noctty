@@ -1466,9 +1466,10 @@ Win32 or Zig error. On x64, try in order:
 4. On a hybrid-GPU system, force `noctty.exe` to the discrete or integrated
    GPU in Windows Graphics settings.
 
-Steps 3 and 4 do not apply on ARM64, where there is no GPU vendor driver to
+Steps 3 and 4 do not apply on an ARM64 PC whose GPU vendor ships no desktop
+OpenGL driver (any Snapdragon PC), where there is no vendor driver to
 reinstall. Use
-[Windows on ARM needs the Compatibility Pack](#windows-on-arm-needs-the-compatibility-pack)
+[Windows on ARM without a vendor OpenGL driver needs the Compatibility Pack](#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)
 instead.
 
 If startup fails with `LoadLibrary failed with error 126` or the startup
@@ -1478,7 +1479,7 @@ dependencies. This shows up most often on AMD+NVIDIA hybrid-GPU laptops
 while WGL loads the AMD OpenGL ICD from DriverStore; use the driver order in
 step 3 before retrying.
 
-#### OpenGL on Windows on ARM needs the Compatibility Pack
+#### Windows on ARM without a vendor OpenGL driver needs the Compatibility Pack
 
 Qualcomm Snapdragon PCs ship no desktop OpenGL driver. No Qualcomm
 implementation has ever appeared in the Khronos OpenGL conformant-products
