@@ -2400,6 +2400,13 @@ keybind: Keybinds = .{},
 ///   * `allow`
 ///   * `deny`
 ///
+/// On Windows, `ask` shows a prompt of its own that names the tab the
+/// request came from. It opens with Cancel focused, and Allow works only
+/// half a second after the prompt opened and after the last key it
+/// received, so keys you were typing when it appeared cannot approve it.
+/// A program's request never replaces a prompt, or the command palette,
+/// search or a rename, that is already open: it is declined instead.
+///
 @"clipboard-read": ClipboardAccess = .ask,
 @"clipboard-write": ClipboardAccess = .allow,
 

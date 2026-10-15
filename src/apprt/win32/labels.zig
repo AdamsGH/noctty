@@ -1595,6 +1595,103 @@ fn appendCodepoint(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cp: u21) 
     try out.appendSlice(alloc, buf[0..len]);
 }
 
+/// What a program in the terminal asked to do with the clipboard (OSC 52).
+pub const ProgramClipboardRequest = enum { read, write };
+
+/// Its own wording, so the prompt cannot be taken for the one the user's
+/// own unsafe paste raises.
+pub fn programClipboardPromptTitle(request: ProgramClipboardRequest) []const u8 {
+    return switch (request) {
+        .read => "Let a program read your clipboard?",
+        .write => "Let a program change your clipboard?",
+    };
+}
+
+/// Cells, and code points, of the tab title a program's clipboard prompt
+/// quotes.
+const program_prompt_title_width = 24;
+
+/// The body of a program's clipboard prompt, which names the tab that asked
+/// by its number and title, as the tab strip shows them. The title is the
+/// program's own text, so it may not crowd out or disguise the words
+/// around it: it is cut to `program_prompt_title_width` cells and as many
+/// code points (zero-width marks take no cell, and stacked they draw over
+/// the line), and controls, line and paragraph separators, and
+/// bidirectional formatting characters (which would reorder the words
+/// after it; see `isBidiFormatting`) become U+FFFD.
+pub fn buildProgramClipboardPromptBody(
+    alloc: Allocator,
+    request: ProgramClipboardRequest,
+    tab_number: usize,
+    tab_title: ?[]const u8,
+) ![]u8 {
+    const raw = tab_title orelse "noctty";
+    const limit = program_prompt_title_width;
+    var title: std.ArrayListUnmanaged(u8) = .empty;
+    defer title.deinit(alloc);
+    var cells: usize = 0;
+    var count: usize = 0;
+    // Where "..." goes if the title turns out not to fit.
+    var cut: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) {
+        const decoded = decodeCodepoint(raw, i) orelse DecodedCodepoint{ .cp = 0xFFFD, .len = 1 };
+        i += decoded.len;
+        const cp = switch (decoded.cp) {
+            0...0x1F, 0x7F...0x9F, 0x2028, 0x2029 => 0xFFFD, // controls, line and paragraph separators
+            else => if (isBidiFormatting(decoded.cp)) 0xFFFD else decoded.cp,
+        };
+        cells += codepointWidth(cp);
+        count += 1;
+        if (cells > limit or count > limit) {
+            title.shrinkRetainingCapacity(cut);
+            try title.appendSlice(alloc, "...");
+            break;
+        }
+        try appendCodepoint(alloc, &title, cp);
+        if (cells <= limit - 3 and count <= limit - 3) cut = title.items.len;
+    }
+    return switch (request) {
+        .read => std.fmt.allocPrint(alloc, "Tab {d} ({s}) asked to read your clipboard. Allow sends it the text below.", .{ tab_number, title.items }),
+        .write => std.fmt.allocPrint(alloc, "Tab {d} ({s}) asked to replace your clipboard with the text below.", .{ tab_number, title.items }),
+    };
+}
+
+test "a program's clipboard prompt names its tab and cannot be reordered by its title" {
+    const alloc = std.testing.allocator;
+
+    const read = try buildProgramClipboardPromptBody(alloc, .read, 2, "vim");
+    defer alloc.free(read);
+    try std.testing.expectEqualStrings("Tab 2 (vim) asked to read your clipboard. Allow sends it the text below.", read);
+
+    const write = try buildProgramClipboardPromptBody(alloc, .write, 1, null);
+    defer alloc.free(write);
+    try std.testing.expectEqualStrings("Tab 1 (noctty) asked to replace your clipboard with the text below.", write);
+
+    const long = try buildProgramClipboardPromptBody(alloc, .read, 3, "\u{202E}abcdefghijklmnopqrstuvwxyz0123456789");
+    defer alloc.free(long);
+    try std.testing.expectEqualStrings(
+        "Tab 3 (\u{FFFD}abcdefghijklmnopqrst...) asked to read your clipboard. Allow sends it the text below.",
+        long,
+    );
+
+    // Marks that take no cell are cut by count.
+    const marks = "x" ++ "\u{0301}" ** 50;
+    const stacked = try buildProgramClipboardPromptBody(alloc, .write, 4, marks);
+    defer alloc.free(stacked);
+    try std.testing.expectEqualStrings(
+        "Tab 4 (x" ++ "\u{0301}" ** 20 ++ "...) asked to replace your clipboard with the text below.",
+        stacked,
+    );
+
+    const control = try buildProgramClipboardPromptBody(alloc, .read, 5, "a\x1b[2Jb\u{9B}c\u{2028}d");
+    defer alloc.free(control);
+    try std.testing.expectEqualStrings(
+        "Tab 5 (a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d) asked to read your clipboard. Allow sends it the text below.",
+        control,
+    );
+}
+
 /// Render `data` for the confirm preview pane.
 ///
 /// The payload is shown as it is, matching upstream Ghostty's GTK and

@@ -140,10 +140,15 @@ pub fn formatFilePayload(
 // Text-drop formatting
 // ---------------------------------------------------------------------------
 
-/// Format a CF_UNICODETEXT payload.
+/// Format a CF_UNICODETEXT or CF_HTML text payload.
 ///
 /// Shift strips a single trailing line ending (`\r\n`, `\n`, or `\r`).
 /// Ctrl has no effect on text.
+///
+/// Every CRLF becomes LF, as on the clipboard paste path: a paste turns
+/// each LF into one CR, the shell's Enter, so a CRLF left in place reached
+/// a shell without bracketed paste as two Enters, an extra empty line
+/// after every dropped one. A lone CR is left alone, as there.
 ///
 /// Ownership: the returned slice is owned by `alloc`.
 pub fn formatTextPayload(
@@ -159,8 +164,9 @@ pub fn formatTextPayload(
             end -= 1;
         }
     }
-    const result = try alloc.alloc(u8, end);
-    @memcpy(result, text[0..end]);
+    const kept = text[0..end];
+    const result = try alloc.alloc(u8, std.mem.replacementSize(u8, kept, "\r\n", "\n"));
+    _ = std.mem.replace(u8, kept, "\r\n", "\n", result);
     return result;
 }
 
@@ -377,7 +383,18 @@ test "text: no-shift preserves trailing newline" {
     const alloc = std.testing.allocator;
     const result = try formatTextPayload(alloc, "hello\r\n", .{});
     defer alloc.free(result);
-    try std.testing.expectEqualStrings("hello\r\n", result);
+    try std.testing.expectEqualStrings("hello\n", result);
+}
+
+test "text: CRLF line endings become LF" {
+    const alloc = std.testing.allocator;
+    const result = try formatTextPayload(alloc, "a\r\nb\rc\nd", .{});
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("a\nb\rc\nd", result);
+
+    const shifted = try formatTextPayload(alloc, "a\r\nb\r\n", .{ .shift = true });
+    defer alloc.free(shifted);
+    try std.testing.expectEqualStrings("a\nb", shifted);
 }
 
 // -- extractShellUrl --

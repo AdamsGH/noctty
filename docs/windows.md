@@ -1195,7 +1195,9 @@ are. Measured on Windows 11 with Neovim 0.10.4, 0.11.7 and 0.12.5:
   `'ttimeoutlen'` of 50 leaked every time (13 of 13, from 1 KB to 200 KB).
   With an emulated round trip of 40 ms or less, none of 6 leaked, and with
   `clipboard-read = allow` or Allow clicked within 300 ms, none of 17 leaked
-  at a 60 to 100 ms round trip.
+  at a 60 to 100 ms round trip. (That was measured before the prompt began
+  ignoring Allow for its first half second; an answer that quick is no
+  longer possible.)
 
 With the default `'ttimeoutlen'` of 50, nothing leaked natively, in WSL, or
 over SSH to a host on the same machine, for clipboards from 64 KB to 700 KB.
