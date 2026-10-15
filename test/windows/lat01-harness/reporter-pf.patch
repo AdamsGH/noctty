@@ -1,0 +1,45 @@
+diff --git a/src/apprt/win32/pixel_format.zig b/src/apprt/win32/pixel_format.zig
+index b680aa1..7e9ec7b 100644
+--- a/src/apprt/win32/pixel_format.zig
++++ b/src/apprt/win32/pixel_format.zig
+@@ -168,7 +168,9 @@ fn classifyWglPixelFormatCandidate(
+ ) ?WglPixelFormatRejection {
+     // Keep these disjoint and ordered so the bounded startup diagnostic adds
+     // up to every returned match instead of double-counting unsuitable formats.
+-    if (!base_contract or candidate.color_bits < 32 or candidate.alpha_bits < 8) {
++    // Exactly 32 colour bits: fewer cannot carry RGBA8, more is a deep-colour
++    // or float swapchain (see `PixelFormatBaseCompatibilityFailure.wide_color`).
++    if (!base_contract or candidate.color_bits != 32 or candidate.alpha_bits < 8) {
+         return .base_contract;
+     }
+     if (!candidate.fully_accelerated) return .nonaccelerated;
+@@ -298,7 +300,12 @@ fn rankClassicPixelFormatCandidates(
+     return selected;
+ }
+ 
+-const max_wgl_pixel_formats = 1024;
++/// Upper bound on the extended WGL pixel-format inventory we are willing to
++/// walk. NVIDIA's R580 driver (32.0.16.1742) exposes 1172 formats, so the
++/// previous 1024 bound made the sRGB selector fail on every start and hand
++/// the choice to the classic enumerator (#299). Kept equal to the classic
++/// path's own `DescribePixelFormat` guard.
++const max_wgl_pixel_formats = 4096;
+ 
+ fn validatedWglPixelFormatCount(total_format_count: i32) !UINT {
+     if (total_format_count <= 0 or total_format_count > max_wgl_pixel_formats) {
+@@ -338,6 +345,7 @@ const PixelFormatBaseCompatibilityFailure = enum {
+     non_main_plane,
+     missing_required_flags,
+     insufficient_color,
++    wide_color,
+     insufficient_alpha,
+     stereo,
+ };
+@@ -355,6 +363,7 @@ fn pixelFormatBaseCompatibilityFailure(
+     const required_flags = c.PFD_DRAW_TO_WINDOW | c.PFD_SUPPORT_OPENGL | c.PFD_DOUBLEBUFFER;
+     if (pfd.dwFlags & required_flags != required_flags) return .missing_required_flags;
+     if (pfd.cColorBits < 32) return .insufficient_color;
++    if (pfd.cColorBits > 32) return .wide_color;
+     if (pfd.cAlphaBits < 8) return .insufficient_alpha;
+     if (pfd.dwFlags & PFD_STEREO != 0) return .stereo;
+     return null;
