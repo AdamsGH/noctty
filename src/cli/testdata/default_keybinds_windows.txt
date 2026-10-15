@@ -47,7 +47,6 @@ keybind = super+ctrl+shift+arrow_left=resize_split:left,10
 keybind = super+ctrl+shift+arrow_right=resize_split:right,10
 keybind = ctrl+shift+page_up=jump_to_prompt:-1
 keybind = ctrl+shift+page_down=jump_to_prompt:1
-keybind = ctrl+shift+y=copy_last_command_output
 keybind = ctrl+shift+f=start_search
 keybind = escape=end_search
 keybind = ctrl+shift+i=inspector:toggle
@@ -76,7 +75,7 @@ keybind = ctrl+shift+space=toggle_quick_select
 keybind = ctrl+f6=cycle_focus_region:next
 keybind = ctrl+shift+f6=cycle_focus_region:previous
 keybind = ctrl+shift+z=undo
-keybind = ctrl+alt+shift+z=redo
+keybind = ctrl+shift+y=redo
 keybind = f3=navigate_search:previous
 keybind = shift+f3=navigate_search:next
 keybind = ctrl+shift+x=toggle_copy_mode

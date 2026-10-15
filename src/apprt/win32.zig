@@ -3683,6 +3683,9 @@ pub const App = struct {
     /// the deadline was waiting for.
     recovery_retry_not_before_ms: ?u64 = null,
     next_undo_sequence: u64 = 1,
+    // App-scoped bindings from an empty host must retain their origin even
+    // when pruning expires (and destroys) that host during dispatch.
+    empty_host_key_id: ?u32 = null,
     running: bool = false,
     /// A normal last-host close destroys the native/session model before
     /// `terminate` runs. Preserve the successful pre-close snapshot instead
@@ -9005,14 +9008,27 @@ pub const App = struct {
         return self.focusedSurfaceForUndoRedo() orelse self.primarySurface();
     }
 
+    fn emptyHostKeyEvent(self: *App, host_id: u32, event: input.KeyEvent) bool {
+        const previous = self.empty_host_key_id;
+        self.empty_host_key_id = host_id;
+        defer self.empty_host_key_id = previous;
+        return self.core_app.keyEvent(self, event);
+    }
+
     fn undoRedoSurfaceForTarget(self: *App, target: apprt.Target) ?*Surface {
         return switch (target) {
-            .app => self.focusedSurfaceForUndoRedo() orelse self.primarySurface(),
+            .app => if (self.empty_host_key_id) |id|
+                if (self.findHostById(id)) |host| host.activeSurface() else null
+            else
+                self.focusedSurfaceForUndoRedo() orelse self.primarySurface(),
             .surface => |core_surface| self.findSurfaceByCore(core_surface),
         };
     }
 
     fn structuralUndoHostForTarget(self: *App, target: apprt.Target) ?*Host {
+        if (target == .app) {
+            if (self.empty_host_key_id) |id| return self.findHostById(id);
+        }
         if (self.undoRedoSurfaceForTarget(target)) |surface| {
             if (surface.host) |host| return host;
         }
@@ -9024,6 +9040,9 @@ pub const App = struct {
     }
 
     fn structuralRedoHostForTarget(self: *App, target: apprt.Target) ?*Host {
+        if (target == .app) {
+            if (self.empty_host_key_id) |id| return self.findHostById(id);
+        }
         if (self.undoRedoSurfaceForTarget(target)) |surface| {
             if (surface.host) |host| return host;
         }
@@ -15185,7 +15204,7 @@ const Host = struct {
         // `App.keyEvent` does not apply `key-remap` itself; only
         // `Surface.keyCallback` does, and there is no surface here.
         const event = remapWin32KeyEvent(message.event, &self.app.config.@"key-remap");
-        return self.app.core_app.keyEvent(self.app, event);
+        return self.app.emptyHostKeyEvent(self.id, event);
     }
 
     fn prepareActiveTabVisibility(self: *Host, active_index: usize) void {
@@ -38271,6 +38290,68 @@ test "win32 app undo redo replays last tab close without active surface" {
     try std.testing.expectEqual(@as(usize, 0), host.structural_redo_entries.items.len);
     try std.testing.expect(!surface.host_active);
     try std.testing.expect(!surface.window_visible);
+}
+
+test "PKG32 empty second host undo key restores its own tab and redo cannot target the first host" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b, .host = &host_b, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &surface_a, .id = 11 },
+            .{ .host = &host_b, .surface = &surface_b, .id = 22 },
+        },
+    });
+    defer session.deinit();
+    core_app.focused = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    const undo: input.KeyEvent = .{ .unshifted_codepoint = 'z', .mods = .{ .ctrl = true, .shift = true } };
+    const redo: input.KeyEvent = .{ .unshifted_codepoint = 'y', .mods = .{ .ctrl = true, .shift = true } };
+
+    // Both keys use the same app-scoped dispatch path as a native key on B.
+    // A still has a live surface, so a lost host identity would select A.
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, undo));
+    try std.testing.expectEqual(@as(usize, 1), host_b.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), host_b.structural_redo_entries.items.len);
+    try std.testing.expect(app.empty_host_key_id == null);
+
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, redo));
+    try std.testing.expectEqual(@as(usize, 0), host_b.tabs.items.len);
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, redo));
+    try std.testing.expectEqualStrings("Nothing to redo.", host_b.banner_text.?);
+    try std.testing.expect(host_a.banner_text == null);
+
+    // Expiry is checked before choosing a target. With B's history gone,
+    // the key still must not display a banner or consume history in A.
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+    host_b.structural_undo_entries.items[0].timestamp_ms = 0;
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, undo));
+    try std.testing.expectEqual(@as(usize, 0), host_b.structural_undo_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), host_b.tabs.items.len);
+    try std.testing.expect(host_a.banner_text == null);
+
+    // A pruned host can be removed; retain only its ID through dispatch.
+    _ = app.hosts.orderedRemove(1);
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, undo));
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, redo));
+    try std.testing.expect(host_a.banner_text == null);
+    try std.testing.expect(app.empty_host_key_id == null);
 }
 
 test "win32 app undo redo uses focused host" {

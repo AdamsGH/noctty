@@ -6815,13 +6815,8 @@ pub const Keybinds = struct {
             // `ctrl+shift+r`, the obvious chord for it, is what our own
             // getting-started guide shows users rebinding to reload_config.
             // It stays available from the command palette and user keybinds.
-            if (comptime builtin.target.os.tag == .windows) {
-                try self.set.put(
-                    alloc,
-                    .{ .key = .{ .unicode = 'y' }, .mods = .{ .shift = true, .ctrl = true } },
-                    .{ .copy_last_command_output = {} },
-                );
-            }
+            // `copy_last_command_output` is palette-only by default on
+            // Windows: Ctrl+Shift+Y is redo, paired with Ctrl+Shift+Z undo.
 
             // Search
             try self.set.putFlags(
@@ -6990,8 +6985,7 @@ pub const Keybinds = struct {
         // Undo and redo, and search navigation, on Windows. All are
         // performable: with nothing to undo, redo or navigate the chord goes to
         // the program in the pane (F3 is Midnight Commander's view and htop's
-        // search). Ctrl+Shift+Y is `copy_last_command_output`, so redo takes
-        // the same letter as undo with Alt added.
+        // search). Copy last command output remains in the command palette.
         if (comptime builtin.target.os.tag == .windows) {
             try self.set.putFlags(
                 alloc,
@@ -7001,7 +6995,7 @@ pub const Keybinds = struct {
             );
             try self.set.putFlags(
                 alloc,
-                .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .alt = true, .shift = true } },
+                .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .redo = {} },
                 .{ .performable = true },
             );
@@ -8132,7 +8126,7 @@ pub const Keybinds = struct {
             },
             .{
                 .trigger = .{ .key = .{ .unicode = 'y' }, .mods = .{ .shift = true, .ctrl = true } },
-                .action = .copy_last_command_output,
+                .action = .redo,
             },
         };
 
@@ -8370,11 +8364,9 @@ test "default Windows keybinds: clipboard, focus cycle, fullscreen, undo and sea
         // Performable: with nothing to undo, redo or step through, the chord
         // goes on to the program in the pane.
         .{ .trigger = .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .undo = {} }, .performable = true },
-        .{ .trigger = .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .alt = true, .shift = true } }, .action = .{ .redo = {} }, .performable = true },
+        .{ .trigger = .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .redo = {} }, .performable = true },
         .{ .trigger = .{ .key = .{ .physical = .f3 } }, .action = .{ .navigate_search = .previous }, .performable = true },
         .{ .trigger = .{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } }, .action = .{ .navigate_search = .next }, .performable = true },
-        // Ctrl+Shift+Y was already taken, so redo could not have it.
-        .{ .trigger = .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .copy_last_command_output = {} } },
     };
     for (cases) |case| {
         errdefer std.debug.print("default binding: {f}\n", .{case.trigger});
@@ -8406,7 +8398,10 @@ test "default Windows keybinds: clipboard, focus cycle, fullscreen, undo and sea
     // Windows has no selection clipboard, so nothing may default to pasting it.
     var it = set.bindings.iterator();
     while (it.next()) |entry| switch (entry.value_ptr.*) {
-        .leaf => |leaf| try testing.expect(leaf.action != .paste_from_selection),
+        .leaf => |leaf| {
+            try testing.expect(leaf.action != .paste_from_selection);
+            try testing.expect(leaf.action != .copy_last_command_output);
+        },
         else => {},
     };
 }

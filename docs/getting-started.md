@@ -110,7 +110,7 @@ Pane focus on `Alt+Arrow` is Windows-specific.
 | Paste                       | `Ctrl+Shift+V` or `Shift+Insert`    |
 | New tab                     | `Ctrl+Shift+T`                      |
 | Close tab                   | `Ctrl+Shift+W`                      |
-| Undo / redo                 | `Ctrl+Shift+Z` / `Ctrl+Alt+Shift+Z` |
+| Undo / redo                 | `Ctrl+Shift+Z` / `Ctrl+Shift+Y`     |
 | Next / previous tab         | `Ctrl+Tab` / `Ctrl+Shift+Tab`       |
 | Split pane right            | `Ctrl+Shift+\`                      |
 | Split pane down             | `Ctrl+Shift+E`                      |
@@ -131,6 +131,11 @@ undo chords act only when there is a search to step through or something to
 undo (a closed tab or split, `clear_screen`, `reset`); otherwise they reach
 the program too. `Ctrl+F6` moves keyboard focus between the terminal, the tab
 strip, the docked search and the host banner; `Esc` returns to the terminal.
+
+`Ctrl+Shift+Y` now redoes an action; **Copy Last Command Output** remains in
+the command palette and can be given a custom `copy_last_command_output`
+keybind. Fullscreen moved from `Ctrl+Enter` to `F11`, and the focus cycle
+moved from `F6` / `Shift+F6` to `Ctrl+F6` / `Ctrl+Shift+F6`.
 
 `noctty +list-keybinds` prints the full list. `Ctrl+Shift+O` also splits
 right; the docs use `Ctrl+Shift+\` because Narrator can reserve O-based

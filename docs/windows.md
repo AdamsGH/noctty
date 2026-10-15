@@ -139,7 +139,7 @@ With OSC 133 shell integration active, the command palette also offers:
 
 - `jump_to_prompt:-1` / `jump_to_prompt:1` (`Ctrl+Shift+PageUp` /
   `Ctrl+Shift+PageDown`): previous / next prompt.
-- `copy_last_command_output` (`Ctrl+Shift+Y`): copy the last completed
+- `copy_last_command_output` (no default keybind): copy the last completed
   command's output. Needs OSC 133;C and OSC 133;D boundaries.
 - `insert_last_command` (no default keybind): put the last recoverable
   single-line command back on the prompt without submitting it. Needs OSC

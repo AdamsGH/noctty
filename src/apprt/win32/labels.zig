@@ -259,8 +259,8 @@ pub fn searchButtonKeyAction(vk: WPARAM, shift_pressed: bool) ?SearchButtonKeyAc
 
 pub fn dockedSearchCoreDirectionFromKeyAction(action: SearchButtonKeyAction) ?input.Binding.Action.NavigateSearch {
     return switch (action) {
-        .previous => .previous,
-        .next => .next,
+        .previous => dockedSearchButtonDirection(c.SEARCH_PREV_ID),
+        .next => dockedSearchButtonDirection(c.SEARCH_NEXT_ID),
         .dismiss => null,
     };
 }
@@ -4912,11 +4912,11 @@ test "win32 docked search key actions preserve semantic next and previous naviga
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     try std.testing.expectEqual(
-        input.Binding.Action.NavigateSearch.next,
+        input.Binding.Action.NavigateSearch.previous,
         dockedSearchCoreDirectionFromKeyAction(.next).?,
     );
     try std.testing.expectEqual(
-        input.Binding.Action.NavigateSearch.previous,
+        input.Binding.Action.NavigateSearch.next,
         dockedSearchCoreDirectionFromKeyAction(.previous).?,
     );
     try std.testing.expect(dockedSearchCoreDirectionFromKeyAction(.dismiss) == null);
@@ -5615,7 +5615,7 @@ test "tabClosedMessage names the key bound to undo" {
     );
 }
 
-test "default F3 and Shift+F3 step through the search the way Enter and Shift+Enter do in the docked search bar" {
+test "PKG32 default F3 and Shift+F3 match the docked search F3 and Enter directions" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var cfg = try @import("../../config.zig").Config.default(std.testing.allocator);
@@ -5627,4 +5627,12 @@ test "default F3 and Shift+F3 step through the search the way Enter and Shift+En
         return error.ShiftF3Unbound;
     try std.testing.expectEqual(dockedSearchEnterDirection(false), f3.value_ptr.leaf.action.navigate_search);
     try std.testing.expectEqual(dockedSearchEnterDirection(true), shift_f3.value_ptr.leaf.action.navigate_search);
+    try std.testing.expectEqual(
+        f3.value_ptr.leaf.action.navigate_search,
+        dockedSearchCoreDirectionFromKeyAction(searchButtonKeyAction(c.VK_F3, false).?).?,
+    );
+    try std.testing.expectEqual(
+        shift_f3.value_ptr.leaf.action.navigate_search,
+        dockedSearchCoreDirectionFromKeyAction(searchButtonKeyAction(c.VK_F3, true).?).?,
+    );
 }
