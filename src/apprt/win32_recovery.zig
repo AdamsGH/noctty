@@ -3,13 +3,14 @@
 //! Integration order matters:
 //!   1. Load and parse the previous record.
 //!   2. Call `decide` before appending the current attempt.
-//!   3. Append the current attempt and persist it through `writePlanAlloc`.
-//!   4. Mark the latest attempt ready only after normal startup is usable.
+//!   3. Append the current attempt and persist it (`persistRecoveryRecordAtPath`
+//!      in win32.zig, under the ledger lock).
+//!   4. Flag the attempt with `mergeMarkSessionRestore` before restoring the
+//!      saved session, and mark it with `mergeMarkReady` only after normal
+//!      startup is usable.
 //!
 //! An attempt without `ready_at_unix_ms` is evidence that the process ended
-//! before reaching the ready marker. This module performs no filesystem work;
-//! callers execute its atomic-write and quarantine plans. In particular, a
-//! quarantine plan is a sibling move, never a deletion contract.
+//! before reaching the ready marker. This module performs no filesystem work.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,11 +26,15 @@ pub const Policy = struct {
 pub const Decision = enum {
     normal,
     safe_mode,
+    /// Safe mode, and set the saved session aside: the failures that selected
+    /// safe mode all died while restoring it.
     quarantine_session,
 };
 
 pub const StartupPhase = enum {
     init,
+    /// No longer written; kept so ledgers from builds that wrote it, and the
+    /// builds that still do, parse.
     window_created,
     ready,
     ready_persist_failed,
@@ -40,6 +45,42 @@ pub const StartupAttempt = struct {
     ready_at_unix_ms: ?u64 = null,
     phase: StartupPhase = .init,
     last_win32_error: ?u32 = null,
+    /// When this attempt began restoring the saved session. Written before the
+    /// first window is restored, so a launch that dies during restore keeps it.
+    session_restore_at_unix_ms: ?u64 = null,
+    /// The build that recorded the attempt.
+    version: ?BuildVersion = null,
+};
+
+/// A build's `version_string`, so a ledger shows which build wrote each
+/// attempt. Stored inline because attempts are copied out of the parse arena
+/// and outlive it.
+pub const BuildVersion = struct {
+    bytes: [capacity]u8 = undefined,
+    len: u8 = 0,
+
+    pub const capacity = 64;
+
+    /// A longer value keeps a prefix that ends on a UTF-8 boundary.
+    pub fn init(value: []const u8) BuildVersion {
+        var len = @min(value.len, capacity);
+        while (len > 0 and len < value.len and value[len] & 0xC0 == 0x80) len -= 1;
+        var result: BuildVersion = .{ .len = @intCast(len) };
+        @memcpy(result.bytes[0..len], value[0..len]);
+        return result;
+    }
+
+    pub fn slice(self: *const BuildVersion) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn jsonStringify(self: BuildVersion, jws: anytype) !void {
+        try jws.write(self.slice());
+    }
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !BuildVersion {
+        return .init(try std.json.innerParse([]const u8, alloc, source, options));
+    }
 };
 
 pub const StartupAttemptRecord = struct {
@@ -63,49 +104,10 @@ pub const AppendError = error{
     AttemptBeforeHistory,
 };
 
-pub const MarkReadyError = error{
-    NoAttempt,
-    AlreadyReady,
-    ReadyBeforeStart,
-};
-
 pub const MergeReadyError = error{
     OutputBufferTooSmall,
     TargetAttemptMissing,
     ReadyBeforeStart,
-};
-
-/// A caller-owned atomic replacement contract. Write `contents` to
-/// `temporary_path`, flush and close it, then atomically replace `target_path`.
-/// If replacement fails, remove only the temporary file; never remove the
-/// existing target.
-pub const AtomicWritePlan = struct {
-    alloc: Allocator,
-    target_path: []u8,
-    temporary_path: []u8,
-    contents: []u8,
-
-    pub fn deinit(self: *AtomicWritePlan) void {
-        self.alloc.free(self.target_path);
-        self.alloc.free(self.temporary_path);
-        self.alloc.free(self.contents);
-        self.* = undefined;
-    }
-};
-
-/// A caller-owned, non-destructive quarantine contract. Move `source_path` to
-/// `destination_path` only after the session payload has independently failed
-/// validation. A failed move leaves the source untouched.
-pub const QuarantinePlan = struct {
-    alloc: Allocator,
-    source_path: []u8,
-    destination_path: []u8,
-
-    pub fn deinit(self: *QuarantinePlan) void {
-        self.alloc.free(self.source_path);
-        self.alloc.free(self.destination_path);
-        self.* = undefined;
-    }
 };
 
 pub fn validate(record: StartupAttemptRecord) ValidationError!void {
@@ -205,26 +207,9 @@ pub fn appendBounded(
     };
 }
 
-/// Mark the newest caller-owned attempt ready. Persist the containing record
-/// after this succeeds; earlier attempts are deliberately immutable evidence.
-pub fn markLatestReady(
-    attempts: []StartupAttempt,
-    ready_at_unix_ms: u64,
-) MarkReadyError!void {
-    if (attempts.len == 0) return error.NoAttempt;
-    const latest = &attempts[attempts.len - 1];
-    if (latest.ready_at_unix_ms != null) return error.AlreadyReady;
-    if (ready_at_unix_ms < latest.started_at_unix_ms) {
-        return error.ReadyBeforeStart;
-    }
-    latest.ready_at_unix_ms = ready_at_unix_ms;
-    latest.phase = .ready;
-    latest.last_win32_error = null;
-}
-
 /// Merge two independently observed histories. Duplicate start markers name
 /// the same attempt; retain the furthest lifecycle phase, any ready marker,
-/// and the raw persistence diagnosis. The newest bounded history is returned.
+/// the raw persistence diagnosis, the restore flag and the version. The newest bounded history is returned.
 pub fn mergeRecords(
     first: StartupAttemptRecord,
     second: StartupAttemptRecord,
@@ -269,6 +254,10 @@ pub fn mergeRecords(
             } else if (phase_order == .eq and current.last_win32_error == null) {
                 current.last_win32_error = next.last_win32_error;
             }
+            if (current.session_restore_at_unix_ms == null) {
+                current.session_restore_at_unix_ms = next.session_restore_at_unix_ms;
+            }
+            if (current.version == null) current.version = next.version;
             continue;
         }
         merged[count] = next;
@@ -295,22 +284,36 @@ pub fn mergeMarkReady(
     out: []StartupAttempt,
 ) (ValidationError || MergeReadyError)!StartupAttemptRecord {
     const merged = try mergeRecords(disk, memory, out);
+    const attempt = try findAttempt(out[0..merged.attempts.len], target_started_at_unix_ms);
+    if (ready_at_unix_ms < attempt.started_at_unix_ms) return error.ReadyBeforeStart;
+    attempt.ready_at_unix_ms = ready_at_unix_ms;
+    attempt.phase = .ready;
+    attempt.last_win32_error = null;
+    return merged;
+}
 
-    var found = false;
-    for (out[0..merged.attempts.len]) |*attempt| {
-        if (attempt.started_at_unix_ms != target_started_at_unix_ms) continue;
-        if (ready_at_unix_ms < attempt.started_at_unix_ms) return error.ReadyBeforeStart;
-        attempt.ready_at_unix_ms = ready_at_unix_ms;
-        attempt.phase = .ready;
-        attempt.last_win32_error = null;
-        found = true;
-        break;
+/// As `mergeMarkReady`, but flag this process's attempt as restoring the
+/// saved session. An attempt flagged earlier keeps its first time.
+pub fn mergeMarkSessionRestore(
+    disk: StartupAttemptRecord,
+    memory: StartupAttemptRecord,
+    target_started_at_unix_ms: u64,
+    restore_at_unix_ms: u64,
+    out: []StartupAttempt,
+) (ValidationError || MergeReadyError)!StartupAttemptRecord {
+    const merged = try mergeRecords(disk, memory, out);
+    const attempt = try findAttempt(out[0..merged.attempts.len], target_started_at_unix_ms);
+    if (attempt.session_restore_at_unix_ms == null) {
+        attempt.session_restore_at_unix_ms = restore_at_unix_ms;
     }
-    if (!found) return error.TargetAttemptMissing;
+    return merged;
+}
 
-    const result: StartupAttemptRecord = .{ .attempts = out[0..merged.attempts.len] };
-    try validate(result);
-    return result;
+fn findAttempt(attempts: []StartupAttempt, started_at_unix_ms: u64) error{TargetAttemptMissing}!*StartupAttempt {
+    for (attempts) |*attempt| {
+        if (attempt.started_at_unix_ms == started_at_unix_ms) return attempt;
+    }
+    return error.TargetAttemptMissing;
 }
 
 /// Count consecutive unresolved attempts from newest to oldest. Counting stops
@@ -334,70 +337,21 @@ pub fn recentFailureCount(
     return count;
 }
 
-/// Invalid session data takes precedence so the caller can preserve it under a
-/// quarantine name before continuing. Otherwise repeated pre-ready failures
-/// select safe mode.
+/// Repeated pre-ready failures select safe mode. When the latest of them all
+/// died after they began restoring the saved session, safe mode alone only
+/// postpones the next round: the session is set aside as well.
 pub fn decide(
     record: StartupAttemptRecord,
     now_unix_ms: u64,
-    session_invalid: bool,
     policy: Policy,
 ) Decision {
-    if (session_invalid) return .quarantine_session;
-    if (policy.failure_threshold > 0 and
-        recentFailureCount(record, now_unix_ms, policy.max_failure_age_ms) >= policy.failure_threshold)
-    {
-        return .safe_mode;
+    const threshold = policy.failure_threshold;
+    if (threshold == 0) return .normal;
+    if (recentFailureCount(record, now_unix_ms, policy.max_failure_age_ms) < threshold) return .normal;
+    for (record.attempts[record.attempts.len - threshold ..]) |attempt| {
+        if (attempt.session_restore_at_unix_ms == null) return .safe_mode;
     }
-    return .normal;
-}
-
-pub fn writePlanAlloc(
-    alloc: Allocator,
-    target_path: []const u8,
-    record: StartupAttemptRecord,
-    nonce: u64,
-) !AtomicWritePlan {
-    const target_owned = try alloc.dupe(u8, target_path);
-    errdefer alloc.free(target_owned);
-
-    // The caller supplies a per-attempt nonce (for example a process/startup
-    // tuple hash). This keeps concurrent writers in the same directory from
-    // truncating or replacing each other's temporary file.
-    const temporary_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{x}", .{ target_path, nonce });
-    errdefer alloc.free(temporary_path);
-
-    const contents = try encodeAlloc(alloc, record);
-    errdefer alloc.free(contents);
-
-    return .{
-        .alloc = alloc,
-        .target_path = target_owned,
-        .temporary_path = temporary_path,
-        .contents = contents,
-    };
-}
-
-pub fn quarantinePlanAlloc(
-    alloc: Allocator,
-    session_path: []const u8,
-    now_unix_ms: u64,
-) !QuarantinePlan {
-    const source_path = try alloc.dupe(u8, session_path);
-    errdefer alloc.free(source_path);
-
-    const destination_path = try std.fmt.allocPrint(
-        alloc,
-        "{s}.invalid-{d}",
-        .{ session_path, now_unix_ms },
-    );
-    errdefer alloc.free(destination_path);
-
-    return .{
-        .alloc = alloc,
-        .source_path = source_path,
-        .destination_path = destination_path,
-    };
+    return .quarantine_session;
 }
 
 test "win32 recovery record round trips strict schema v1" {
@@ -601,7 +555,7 @@ test "win32 recovery ready attempt breaks consecutive failure count" {
     };
     const record: StartupAttemptRecord = .{ .attempts = &attempts };
     try std.testing.expectEqual(@as(usize, 2), recentFailureCount(record, 500, 1_000));
-    try std.testing.expectEqual(Decision.normal, decide(record, 500, false, .{}));
+    try std.testing.expectEqual(Decision.normal, decide(record, 500, .{}));
 }
 
 test "win32 recovery decision triggers safe mode after three recent failures" {
@@ -611,67 +565,104 @@ test "win32 recovery decision triggers safe mode after three recent failures" {
         .{ .started_at_unix_ms = 300 },
     };
     const record: StartupAttemptRecord = .{ .attempts = &attempts };
-    try std.testing.expectEqual(Decision.safe_mode, decide(record, 400, false, .{
+    try std.testing.expectEqual(Decision.safe_mode, decide(record, 400, .{
         .max_failure_age_ms = 1_000,
     }));
-    try std.testing.expectEqual(Decision.normal, decide(record, 10_000, false, .{
+    try std.testing.expectEqual(Decision.normal, decide(record, 10_000, .{
         .max_failure_age_ms = 1_000,
     }));
 }
 
-test "win32 recovery invalid session takes decision precedence" {
-    const attempts = [_]StartupAttempt{
+test "win32 recovery sets the session aside only when the latest failures all restored it" {
+    const restoring = [_]StartupAttempt{
         .{ .started_at_unix_ms = 100 },
+        .{ .started_at_unix_ms = 200, .session_restore_at_unix_ms = 210 },
+        .{ .started_at_unix_ms = 300, .session_restore_at_unix_ms = 310 },
+        .{ .started_at_unix_ms = 400, .session_restore_at_unix_ms = 410 },
+    };
+    // The unflagged fourth-newest failure is outside the threshold window.
+    try std.testing.expectEqual(
+        Decision.quarantine_session,
+        decide(.{ .attempts = &restoring }, 500, .{}),
+    );
+    // Below the threshold nothing changes, flags or not.
+    try std.testing.expectEqual(
+        Decision.normal,
+        decide(.{ .attempts = restoring[2..] }, 500, .{}),
+    );
+
+    // The newest failure (a safe-mode launch that died) restored nothing.
+    const safe_mode_died = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100, .session_restore_at_unix_ms = 110 },
+        .{ .started_at_unix_ms = 200, .session_restore_at_unix_ms = 210 },
+        .{ .started_at_unix_ms = 300, .session_restore_at_unix_ms = 310 },
+        .{ .started_at_unix_ms = 400 },
+    };
+    try std.testing.expectEqual(
+        Decision.safe_mode,
+        decide(.{ .attempts = &safe_mode_died }, 500, .{}),
+    );
+}
+
+test "win32 recovery session-restore merge flags this attempt and keeps a concurrent one" {
+    const memory_attempts = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100, .ready_at_unix_ms = 120 },
+        .{ .started_at_unix_ms = 200 },
+    };
+    const disk_attempts = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100, .ready_at_unix_ms = 120 },
         .{ .started_at_unix_ms = 200 },
         .{ .started_at_unix_ms = 300 },
     };
-    try std.testing.expectEqual(
-        Decision.quarantine_session,
-        decide(.{ .attempts = &attempts }, 400, true, .{}),
+    var out: [max_attempts]StartupAttempt = undefined;
+    const merged = try mergeMarkSessionRestore(
+        .{ .attempts = &disk_attempts },
+        .{ .attempts = &memory_attempts },
+        200,
+        250,
+        &out,
+    );
+    try std.testing.expectEqual(@as(usize, 3), merged.attempts.len);
+    try std.testing.expectEqual(@as(?u64, 250), merged.attempts[1].session_restore_at_unix_ms);
+    try std.testing.expectEqual(@as(?u64, null), merged.attempts[2].session_restore_at_unix_ms);
+
+    // The ready merge keeps the flag that only the disk copy carries.
+    var ready_out: [max_attempts]StartupAttempt = undefined;
+    const ready = try mergeMarkReady(merged, .{ .attempts = &memory_attempts }, 200, 260, &ready_out);
+    try std.testing.expectEqual(@as(?u64, 250), ready.attempts[1].session_restore_at_unix_ms);
+    try std.testing.expectEqual(@as(?u64, 260), ready.attempts[1].ready_at_unix_ms);
+    try std.testing.expectError(
+        error.TargetAttemptMissing,
+        mergeMarkSessionRestore(merged, .{}, 999, 1000, &out),
     );
 }
 
-test "win32 recovery mark ready mutates only newest attempt" {
-    var attempts = [_]StartupAttempt{
-        .{ .started_at_unix_ms = 100 },
-        .{ .started_at_unix_ms = 200 },
-    };
-    try markLatestReady(&attempts, 250);
-    try std.testing.expectEqual(@as(?u64, null), attempts[0].ready_at_unix_ms);
-    try std.testing.expectEqual(@as(?u64, 250), attempts[1].ready_at_unix_ms);
-    try std.testing.expectError(error.AlreadyReady, markLatestReady(&attempts, 260));
-}
-
-test "win32 recovery plans preserve target and session source paths" {
-    const attempts = [_]StartupAttempt{.{ .started_at_unix_ms = 100 }};
-    var write_plan = try writePlanAlloc(
-        std.testing.allocator,
-        "C:\\state\\startup-attempts.json",
-        .{ .attempts = &attempts },
-        0x1234,
-    );
-    defer write_plan.deinit();
-    try std.testing.expectEqualStrings("C:\\state\\startup-attempts.json", write_plan.target_path);
-    try std.testing.expectEqualStrings("C:\\state\\startup-attempts.json.tmp-1234", write_plan.temporary_path);
-
-    var second_write_plan = try writePlanAlloc(
-        std.testing.allocator,
-        "C:\\state\\startup-attempts.json",
-        .{ .attempts = &attempts },
-        0x5678,
-    );
-    defer second_write_plan.deinit();
-    try std.testing.expect(!std.mem.eql(u8, write_plan.temporary_path, second_write_plan.temporary_path));
-
-    var quarantine = try quarantinePlanAlloc(
-        std.testing.allocator,
-        "C:\\state\\session-state.json",
-        1234,
-    );
-    defer quarantine.deinit();
-    try std.testing.expectEqualStrings("C:\\state\\session-state.json", quarantine.source_path);
+test "win32 recovery attempt version round trips and stays bounded" {
+    const attempts = [_]StartupAttempt{.{
+        .started_at_unix_ms = 100,
+        .session_restore_at_unix_ms = 110,
+        .version = .init("1.3.2-dev+abc"),
+    }};
+    const encoded = try encodeAlloc(std.testing.allocator, .{ .attempts = &attempts });
+    defer std.testing.allocator.free(encoded);
     try std.testing.expectEqualStrings(
-        "C:\\state\\session-state.json.invalid-1234",
-        quarantine.destination_path,
+        "{\"schema_version\":1,\"attempts\":[{\"started_at_unix_ms\":100,\"phase\":\"init\",\"session_restore_at_unix_ms\":110,\"version\":\"1.3.2-dev+abc\"}]}",
+        encoded,
     );
+    var parsed = try parseAlloc(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("1.3.2-dev+abc", parsed.value.attempts[0].version.?.slice());
+    try std.testing.expectEqual(@as(?u64, 110), parsed.value.attempts[0].session_restore_at_unix_ms);
+
+    // A longer value from some other build is cut, never rejected, and never
+    // in the middle of a UTF-8 sequence.
+    const long = "v" ++ "\u{e9}" ** BuildVersion.capacity;
+    const bounded = BuildVersion.init(long);
+    try std.testing.expect(bounded.len < BuildVersion.capacity);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(bounded.slice()));
+    try std.testing.expect(std.mem.startsWith(u8, long, bounded.slice()));
+    const raw = "{\"schema_version\":1,\"attempts\":[{\"started_at_unix_ms\":1,\"version\":\"" ++ long ++ "\"}]}";
+    var long_parsed = try parseAlloc(std.testing.allocator, raw);
+    defer long_parsed.deinit();
+    try std.testing.expectEqualStrings(bounded.slice(), long_parsed.value.attempts[0].version.?.slice());
 }

@@ -58,36 +58,48 @@ fn loadWithParser(
     return .{ .loaded = parsed };
 }
 
+/// Copies kept per quarantined file and suffix: `<file><suffix>`, then
+/// `<file><suffix>.1` and up. Once every slot is taken, the copy written
+/// longest ago makes room, so a file that keeps failing cannot fill the
+/// directory.
+pub const max_quarantined_copies = 5;
+
 pub fn quarantineCorruptFileAlloc(alloc: Allocator, absolute_path: []const u8) ![]u8 {
-    var collision_index: usize = 0;
-    while (true) : (collision_index += 1) {
-        const destination = if (collision_index == 0)
-            try std.fmt.allocPrint(alloc, "{s}.corrupt", .{absolute_path})
-        else
-            try std.fmt.allocPrint(alloc, "{s}.corrupt.{d}", .{ absolute_path, collision_index });
+    return quarantineFileAlloc(alloc, absolute_path, ".corrupt");
+}
+
+/// Move `absolute_path` aside to the first free slot for `suffix`, or over
+/// the oldest one. A failed move leaves the source untouched.
+pub fn quarantineFileAlloc(alloc: Allocator, absolute_path: []const u8, suffix: []const u8) ![]u8 {
+    var oldest_index: usize = 0;
+    var oldest_mtime: i128 = std.math.maxInt(i128);
+    for (0..max_quarantined_copies) |index| {
+        const destination = try quarantineSlotPathAlloc(alloc, absolute_path, suffix, index);
         errdefer alloc.free(destination);
-
-        const exists = exists: {
-            std.fs.accessAbsolute(destination, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :exists false,
-                else => return err,
-            };
-            break :exists true;
-        };
-        if (exists) {
-            alloc.free(destination);
-            continue;
-        }
-
-        std.fs.renameAbsolute(absolute_path, destination) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                alloc.free(destination);
-                continue;
+        const stat = std.fs.cwd().statFile(destination) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.fs.renameAbsolute(absolute_path, destination);
+                return destination;
             },
             else => return err,
         };
-        return destination;
+        alloc.free(destination);
+        if (stat.mtime < oldest_mtime) {
+            oldest_index = index;
+            oldest_mtime = stat.mtime;
+        }
     }
+    const destination = try quarantineSlotPathAlloc(alloc, absolute_path, suffix, oldest_index);
+    errdefer alloc.free(destination);
+    try std.fs.renameAbsolute(absolute_path, destination);
+    return destination;
+}
+
+fn quarantineSlotPathAlloc(alloc: Allocator, absolute_path: []const u8, suffix: []const u8, index: usize) ![]u8 {
+    return if (index == 0)
+        std.fmt.allocPrint(alloc, "{s}{s}", .{ absolute_path, suffix })
+    else
+        std.fmt.allocPrint(alloc, "{s}{s}.{d}", .{ absolute_path, suffix, index });
 }
 
 pub fn deleteFileIfPresent(absolute_path: []const u8) !void {
