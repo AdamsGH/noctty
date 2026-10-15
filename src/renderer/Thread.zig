@@ -781,10 +781,11 @@ test "present pacer credits only a timer tick of lateness" {
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
-    self.drawFrameWithReservation(now, false);
+    _ = self.drawFrameWithReservation(now, false);
 }
 
-fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) void {
+/// Returns whether a paint was queued (or, off the app thread, drawn).
+fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) bool {
     // A caller-held reservation must be released on every path that does not
     // hand it to a paint. Leaking one leaves renderer_repaint_requested set
     // forever, after which every later repaint coalesces into a request that
@@ -797,25 +798,25 @@ fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) vo
         }
     };
 
-    const interval_ms = self.minimumPresentIntervalMs() orelse return;
+    const interval_ms = self.minimumPresentIntervalMs() orelse return false;
 
     // `now` is upstream's forced path (`drawNowCallback`), which pacing does
     // not apply to. Only a display link notifies `draw_now`, and the Win32
     // renderer has none (`DisplayLink` is void), so on Win32 every draw is
     // paced here, including the ones the apprt asks for with a wake when a
     // WM_PAINT finds no frame reserved.
-    if (!now and self.presentWaitMs(interval_ms) > 0) return;
+    if (!now and self.presentWaitMs(interval_ms) > 0) return false;
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`. Never true on Win32 (`hasVsync`).
-    if (!now and self.renderer.hasVsync()) return;
+    if (!now and self.renderer.hasVsync()) return false;
 
     if (must_draw_from_app_thread) {
         if (comptime @hasDecl(apprt.Surface, "noteRendererDrawRequest")) {
             self.surface.noteRendererDrawRequest();
         }
         if (comptime @hasDecl(apprt.Surface, "beginRendererRepaintRequest")) {
-            if (!repaint_reserved and !self.surface.beginRendererRepaintRequest()) return;
+            if (!repaint_reserved and !self.surface.beginRendererRepaintRequest()) return false;
         }
 
         // From here the reservation belongs to the queued paint: either the
@@ -829,18 +830,20 @@ fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) vo
             if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
                 self.surface.cancelRendererRepaintRequest();
             }
-        } else {
-            self.notePresentRequest(interval_ms);
+            return false;
         }
+        self.notePresentRequest(interval_ms);
+        return true;
     } else {
         // Not taken on Win32, which draws from the app thread. Nothing will
         // complete a reservation on this path, so the deferred cancel above
         // releases it once the synchronous draw returns.
         self.renderer.drawFrame(false) catch |err| {
             log.warn("error drawing err={}", .{err});
-            return;
+            return false;
         };
         self.notePresentRequest(interval_ms);
+        return true;
     }
 }
 
@@ -1003,9 +1006,9 @@ fn renderOnce(self: *Thread, pass: RenderPass) bool {
         return true;
     }
 
-    // Draw.
-    self.held_frame.notePresent();
-    self.drawFrameWithReservation(false, repaint_reserved);
+    // Draw. An owed repaint stays owed when no paint could be queued (a
+    // full app mailbox), so a later pass presents the held frame.
+    if (self.drawFrameWithReservation(false, repaint_reserved)) self.held_frame.notePresent();
 
     // On Win32, xev async wakes can coalesce while a render pass is still
     // in flight. If terminal dirtiness reappeared during the pass, keep a
