@@ -586,8 +586,31 @@ try {
         'exit'
     )
 
+    # ReadToEndAsync exposes no partial output while a child is stuck. Drain
+    # off the PowerShell runspace and keep a synchronized snapshot, including
+    # text without a trailing newline. This works on .NET Framework / PS 5.1.
+    if (-not ('NocttyInjectedChildOutput' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+public sealed class NocttyInjectedChildOutput {
+    private readonly StringBuilder text = new StringBuilder();
+    public async Task DrainAsync(TextReader reader) {
+        var buffer = new char[4096];
+        int count;
+        while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) != 0) {
+            lock (text) { text.Append(buffer, 0, count); }
+        }
+    }
+    public override string ToString() { lock (text) { return text.ToString(); } }
+}
+'@
+    }
+
     function Invoke-NocttyInjectedChild {
         param(
+            [Parameter(Mandatory)][string]$CaseName,
             [string]$Preamble,
             [string]$Postamble,
             [string[]]$Lines = $null,
@@ -595,7 +618,9 @@ try {
             [switch]$StandInReader,
             [string]$ExecutionPolicy = 'Bypass',
             [switch]$ScrubExecutionPolicy,
-            [string]$IntegrationPath = $script:IntegrationPath
+            [string]$IntegrationPath = $script:IntegrationPath,
+            [ValidateRange(1, 30000)][int]$TimeoutMs = 30000,
+            [string]$TimeoutReadyToken = ''
         )
 
         if ($null -eq $Lines) { $Lines = $script:ChildInput }
@@ -668,7 +693,8 @@ try {
             [Console]::InputEncoding = $parentInputEncoding
         }
         try {
-            $stderr = $process.StandardError.ReadToEndAsync()
+            $stderr = [NocttyInjectedChildOutput]::new()
+            $stderrTask = $stderr.DrainAsync($process.StandardError)
             # Never queue a test line until the child confirms isolation. A
             # malformed startup payload with -NoExit otherwise reads stdin
             # after its parse error, using the real PSReadLine history path.
@@ -679,7 +705,7 @@ try {
                 $remainingMs = [Math]::Max(0, [int]($startupDeadline - [DateTime]::UtcNow).TotalMilliseconds)
                 if (-not $ready.Wait($remainingMs) -or $null -eq $ready.Result) {
                     if (-not $process.HasExited) { $process.Kill() }
-                    throw "Child did not confirm history isolation before input (policy=$ExecutionPolicy, startupChars=$($startupOutput.Length))"
+                    throw "Child did not confirm history isolation before input (case=$CaseName, policy=$ExecutionPolicy, startupChars=$($startupOutput.Length))"
                 }
                 [void]$startupOutput.AppendLine($ready.Result)
                 # pwsh may prefix redirected output with terminal-mode CSI
@@ -687,15 +713,43 @@ try {
                 $readyText = $ready.Result -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
                 if ($readyText -eq 'HISTORY-ISOLATED') { break }
             }
-            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stdout = [NocttyInjectedChildOutput]::new()
+            $stdoutTask = $stdout.DrainAsync($process.StandardOutput)
             foreach ($line in $Lines) { $process.StandardInput.WriteLine($line) }
             $process.StandardInput.Close()
-            if (-not $process.WaitForExit(30000)) {
-                # This exact process object is the child just started here.
-                $process.Kill()
-                throw 'Injected PowerShell child timed out'
+            if ($TimeoutReadyToken) {
+                # The forced-timeout regression waits for its first command,
+                # not just history isolation, before starting the short timer.
+                # Bootstrap/scheduling delay must not make that test flaky.
+                $readyDeadline = [DateTime]::UtcNow.AddSeconds(30)
+                while (-not ($stdout.ToString().Contains($TimeoutReadyToken) -and $stderr.ToString().Contains($TimeoutReadyToken))) {
+                    if ($process.HasExited -or [DateTime]::UtcNow -ge $readyDeadline) {
+                        if (-not $process.HasExited) { $process.Kill() }
+                        throw "Timeout diagnostic fixture did not become ready (case=$CaseName)"
+                    }
+                    Start-Sleep -Milliseconds 10
+                }
             }
-            $output = $startupOutput.ToString() + $stdout.Result + $stderr.Result
+            if (-not $process.WaitForExit($TimeoutMs)) {
+                # Only fixture-controlled inputs/output belong in this
+                # diagnostic, never the bootstrap argv or environment. JSON
+                # escapes terminal controls before anything is printed.
+                $diagnostic = [ordered]@{
+                    Case = $CaseName
+                    Lines = @($Lines)
+                    Stdout = $startupOutput.ToString() + $stdout.ToString()
+                    Stderr = $stderr.ToString()
+                } | ConvertTo-Json -Depth 3 -Compress
+                # This exact process object is the child just started here.
+                if (-not $process.HasExited) { $process.Kill() }
+                [void]$process.WaitForExit(5000)
+                throw "Injected PowerShell child timed out: $diagnostic"
+            }
+            # Re-throw a stream read failure rather than returning truncated
+            # output as though it were a successful fixture run.
+            [void]$stdoutTask.GetAwaiter().GetResult()
+            [void]$stderrTask.GetAwaiter().GetResult()
+            $output = $startupOutput.ToString() + $stdout.ToString() + $stderr.ToString()
             Assert-True ($output.Contains('HISTORY-ISOLATED')) "Child did not confirm history isolation"
             return $output
         } finally {
@@ -705,6 +759,27 @@ try {
 
     $script:PsHost = $psHost
     $script:ChildInput = $childInput
+
+    # Force a stuck fixture to prove the timeout captures both live streams,
+    # even without newline/EOF. Tokens are assembled to avoid matching echo.
+    $timeoutLines = @(
+        '[Console]::Out.Write("PARTIAL" + "-OUT" + [char]27 + ("TIMEOUT" + "-READY")); [Console]::Error.Write("PARTIAL" + "-ERR" + ("TIMEOUT" + "-READY")); Start-Sleep -Seconds 60',
+        'exit'
+    )
+    $timeoutMessage = ''
+    try {
+        $null = Invoke-NocttyInjectedChild -CaseName 'timeout diagnostic fixture' -WithoutPSReadLine -Lines $timeoutLines -TimeoutReadyToken 'TIMEOUT-READY' -TimeoutMs 2000
+    } catch {
+        $timeoutMessage = $_.Exception.Message
+    }
+    $timeoutPrefix = 'Injected PowerShell child timed out: '
+    Assert-True ($timeoutMessage.StartsWith($timeoutPrefix)) "Timeout diagnostic fixture did not time out: $timeoutMessage"
+    $timeoutDiagnostic = $timeoutMessage.Substring($timeoutPrefix.Length) | ConvertFrom-Json
+    Assert-True ($timeoutDiagnostic.Case -eq 'timeout diagnostic fixture') 'Timeout diagnostic lost its case name'
+    Assert-True (($timeoutDiagnostic.Lines -join "`n") -ceq ($timeoutLines -join "`n")) 'Timeout diagnostic lost its input lines'
+    Assert-True ($timeoutDiagnostic.Stdout.Contains('HISTORY-ISOLATED') -and $timeoutDiagnostic.Stdout.Contains('PARTIAL-OUT')) 'Timeout diagnostic lost partial stdout'
+    Assert-True ($timeoutDiagnostic.Stderr.Contains('PARTIAL-ERR')) 'Timeout diagnostic lost partial stderr'
+    Assert-True (-not $timeoutMessage.Contains([string][char]27)) 'Timeout diagnostic must escape terminal controls'
 
     # File-based policies must not block the normal bootstrap. AllSigned
     # deliberately keeps file signature checks, and degrades to one warning.
@@ -716,7 +791,7 @@ try {
         @{ Policy = 'Restricted'; Path = $script:IntegrationPath },
         @{ Policy = 'RemoteSigned'; Path = $motwPath }
     )) {
-        $policyOut = Invoke-NocttyInjectedChild -ExecutionPolicy $policyCase.Policy -IntegrationPath $policyCase.Path -WithoutPSReadLine -ScrubExecutionPolicy `
+        $policyOut = Invoke-NocttyInjectedChild -CaseName ('policy ' + $policyCase.Policy) -ExecutionPolicy $policyCase.Policy -IntegrationPath $policyCase.Path -WithoutPSReadLine -ScrubExecutionPolicy `
             -Postamble '; ("POLICY" + "CHECK=") + (Microsoft.PowerShell.Security\Get-ExecutionPolicy); '
         Assert-True ($policyOut.Contains("POLICYCHECK=$($policyCase.Policy)")) "Policy-focused child did not use $($policyCase.Policy): $policyOut"
         Assert-True ($policyOut.Contains('HELPER-RESOLVED') -and $policyOut.Contains(']133;A;')) "Integration failed under $($policyCase.Policy): $policyOut"
@@ -724,7 +799,7 @@ try {
         Assert-True (-not ($policyOut -match 'PSSecurityException|UnauthorizedAccess|cannot be loaded')) "Policy load left an error wall: $policyOut"
     }
     Assert-True ($env:PSExecutionPolicyPreference -ceq $parentPolicyPreference) "Policy-focused cases changed the parent's execution policy preference"
-    $signedOut = Invoke-NocttyInjectedChild -ExecutionPolicy AllSigned -WithoutPSReadLine -Preamble '$Error.Clear(); ' `
+    $signedOut = Invoke-NocttyInjectedChild -CaseName 'unsigned AllSigned' -ExecutionPolicy AllSigned -WithoutPSReadLine -Preamble '$Error.Clear(); ' `
         -Postamble '; "ERR" + "COUNT=" + $Error.Count'
     Assert-True (-not $signedOut.Contains('HELPER-RESOLVED')) "AllSigned loaded an unsigned integration script"
     Assert-True ($signedOut.Contains('WARNING: noctty PowerShell integration')) "AllSigned gave no concise integration warning: $signedOut"
@@ -734,18 +809,18 @@ try {
         @{ Policy = 'AllSigned'; Path = $script:IntegrationPath },
         @{ Policy = 'Bypass'; Path = (Join-Path $script:TempDir 'missing.ps1') }
     )) {
-        $failedOut = Invoke-NocttyInjectedChild -ExecutionPolicy $loadCase.Policy -IntegrationPath $loadCase.Path -WithoutPSReadLine `
+        $failedOut = Invoke-NocttyInjectedChild -CaseName ('failed load ' + $loadCase.Policy) -ExecutionPolicy $loadCase.Policy -IntegrationPath $loadCase.Path -WithoutPSReadLine `
             -Preamble '$Error.Clear(); Write-Error ''existing error'' -ErrorAction SilentlyContinue; $Global:__noctty_seed_error = $Error[0]; ' `
             -Postamble '; if ($Error.Count -eq 1 -and [object]::ReferenceEquals($Error[0], $Global:__noctty_seed_error)) { ''ERROR'' + ''-PRESERVED'' }'
         Assert-True ($failedOut.Contains('ERROR-PRESERVED')) "A failed bootstrap erased or polluted the existing error history: $failedOut"
     }
 
-    $constrainedOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+    $constrainedOut = Invoke-NocttyInjectedChild -CaseName 'constrained language' -WithoutPSReadLine `
         -Preamble '$ExecutionContext.SessionState.LanguageMode = ''ConstrainedLanguage''; '
     Assert-True ($constrainedOut.Contains('unsupported language mode.') -and -not $constrainedOut.Contains('HELPER-RESOLVED')) "ConstrainedLanguage installed partial hooks or missed its warning: $constrainedOut"
 
     $driveRootQuoted = ConvertTo-PowerShellLiteralContent $specialDir
-    $driveOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+    $driveOut = Invoke-NocttyInjectedChild -CaseName 'filesystem PSDrive' -WithoutPSReadLine `
         -Preamble "New-PSDrive NocttyProbe FileSystem '$driveRootQuoted' | Out-Null; Set-Location 'NocttyProbe:\'; " `
         -Postamble '; "CWD" + "URI=" + (__ghostty_encode_cwd_uri)'
     Assert-True ($driveOut.Contains("CWDURI=$cwdUri")) "A real child reported the PSDrive name rather than the filesystem cwd: $driveOut"
@@ -755,7 +830,7 @@ try {
         New-Item -ItemType Directory -Path $quotedDir | Out-Null
         $quotedPath = Join-Path $quotedDir 'integration.ps1'
         Copy-Item -LiteralPath $script:IntegrationPath -Destination $quotedPath
-        $quoteOut = Invoke-NocttyInjectedChild -IntegrationPath $quotedPath -WithoutPSReadLine
+        $quoteOut = Invoke-NocttyInjectedChild -CaseName ('quoted path U+' + ('{0:X4}' -f $point)) -IntegrationPath $quotedPath -WithoutPSReadLine
         Assert-True ($quoteOut.Contains('HELPER-RESOLVED') -and $quoteOut.Contains('NOCTTYPROBE> ')) "Quoted integration path did not load (U+$('{0:X4}' -f $point)): $quoteOut"
     }
 
@@ -764,7 +839,7 @@ try {
     # name look like a POSIX cwd, so omit UNC reports and keep the previous cwd.
     if ($UncPath) {
         $uncQuoted = ConvertTo-PowerShellLiteralContent $UncPath
-        $uncOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+        $uncOut = Invoke-NocttyInjectedChild -CaseName 'UNC cwd' -WithoutPSReadLine `
             -Preamble "Set-Location -LiteralPath '$uncQuoted'; " `
             -Postamble '; if ($null -eq (__ghostty_encode_cwd_uri)) { "UNC" + "-CWD-SKIPPED" }'
         Assert-True ($uncOut.Contains('UNC-CWD-SKIPPED') -and -not $uncOut.Contains(']7;')) "A UNC child emitted a misleading OSC 7 cwd: $uncOut"
@@ -775,7 +850,7 @@ try {
     # stand-in reader so this is a real host read without PSReadLine pipe errors.
     foreach ($providerLocation in $unsupportedLocations) {
         $providerQuoted = ConvertTo-PowerShellLiteralContent $providerLocation
-        $providerOut = Invoke-NocttyInjectedChild -StandInReader `
+        $providerOut = Invoke-NocttyInjectedChild -CaseName ('provider ' + $providerLocation) -StandInReader `
             -Lines @(
                 "Set-Location -LiteralPath '$providerQuoted'; function global:prompt { 'PROVIDER> ' }",
                 '"PROVIDER" + "-READ"',
@@ -796,7 +871,7 @@ try {
         @{ Name = 'plain'; Preamble = '' }
         @{ Name = 'Set-StrictMode -Version Latest'; Preamble = 'Set-StrictMode -Version Latest; ' }
     )) {
-        $childOut = Invoke-NocttyInjectedChild -Preamble $case.Preamble
+        $childOut = Invoke-NocttyInjectedChild -CaseName $case.Name -Preamble $case.Preamble
         $shown = $childOut -replace [char]27, '<ESC>'
         $where = "[$($case.Name)]"
 
@@ -820,7 +895,7 @@ try {
     # re-init does it, is drawn once as it is and wrapped again when the
     # next line is read. The host still calls the line reader with stdin
     # piped (PSReadLine then fails inside it and the host reads the pipe).
-    $replacedOut = Invoke-NocttyInjectedChild -Lines @(
+    $replacedOut = Invoke-NocttyInjectedChild -CaseName 'replaced prompt' -Lines @(
         "function global:prompt { 'RE' + 'PLACED> ' }",
         "'fil' + 'ler'",
         'exit'
@@ -834,7 +909,7 @@ try {
     # native exit code still has to reach OSC 133;D, and a clean draw must
     # still report 0. Reading $LASTEXITCODE through Get-Variable is the part
     # that could silently have broken this.
-    $nativeOut = Invoke-NocttyInjectedChild `
+    $nativeOut = Invoke-NocttyInjectedChild -CaseName 'StrictMode native exit' `
         -Preamble 'Set-StrictMode -Version Latest; ' `
         -Lines @('cmd /c exit 7', 'exit')
     $nativeShown = $nativeOut -replace [char]27, '<ESC>'
@@ -858,7 +933,7 @@ try {
     # count the host's own `PSConsoleReadLine::ReadLine ... Specified method is
     # not supported` record, which this harness provokes by piping stdin into
     # an interactive host and which has nothing to do with the script.
-    $userSshOut = Invoke-NocttyInjectedChild `
+    $userSshOut = Invoke-NocttyInjectedChild -CaseName 'user ssh preserved' `
         -Preamble 'function global:ssh { ''USER-SSH-PRESERVED'' }; $Error.Clear(); ' `
         -Postamble '; $Global:__noctty_load_errors = $Error.Count' `
         -Lines @(
@@ -876,14 +951,14 @@ try {
         "function global:ssh { 'mine' }; ",
         "function global:NocttyUserSsh { 'mine' }; Set-Alias ssh NocttyUserSsh -Scope Global; "
     )) {
-        $ownedOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+        $ownedOut = Invoke-NocttyInjectedChild -CaseName ('existing ssh ' + $existingSsh) -WithoutPSReadLine `
             -Preamble ($existingSsh + "`$env:GHOSTTY_SHELL_FEATURES = 'ssh-env'; `$Error.Clear(); ") `
             -Postamble ("; function global:__ghostty_find_command_application { '$fakeQuoted' }; " + '; if ((ssh) -ceq "mine") { "USER" + "-SSH-SURVIVED" }; "ERR" + "COUNT=" + $Error.Count')
         Assert-True ($ownedOut.Contains('USER-SSH-SURVIVED') -and $ownedOut.Contains('ERRCOUNT=0')) "ssh-env replaced a profile function or alias: $ownedOut"
     }
 
     # Exercise the binder and cleanup after the bootstrap scope has died.
-    $sshChild = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+    $sshChild = Invoke-NocttyInjectedChild -CaseName 'ssh wrapper argv' -WithoutPSReadLine `
         -Preamble "`$env:GHOSTTY_SHELL_FEATURES = 'ssh-env'; " `
         -Postamble ("; function global:__ghostty_find_command_application { '$fakeQuoted' }; " +
             "`$env:FAKE_SSH_CAPTURE = '$captureQuoted'; " +
@@ -898,7 +973,7 @@ try {
 
     # With the feature on we DO install a wrapper, and it must be ours rather
     # than the user's function left in place.
-    $wrapperOut = Invoke-NocttyInjectedChild `
+    $wrapperOut = Invoke-NocttyInjectedChild -CaseName 'wrapper error history' `
         -Preamble "`$env:GHOSTTY_SHELL_FEATURES = 'ssh-env'; `$Error.Clear(); " `
         -Postamble '; $Global:__noctty_load_errors = $Error.Count' `
         -Lines @(
@@ -1071,7 +1146,7 @@ try {
     )
 
     foreach ($case in $dCases) {
-        $childOut = Invoke-NocttyInjectedChild `
+        $childOut = Invoke-NocttyInjectedChild -CaseName $case.Name `
             -Preamble $case.Pre `
             -Lines (@($case.Lines) + @('exit')) `
             -WithoutPSReadLine `
