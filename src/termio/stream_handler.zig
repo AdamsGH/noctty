@@ -380,6 +380,7 @@ pub const StreamHandler = struct {
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.decaln(),
             .window_title => try self.windowTitle(value.title),
+            .window_visibility => self.surfaceMessageWriter(.{ .window_visibility = value }),
             .report_pwd => try self.reportPwd(value.url, value.conemu),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
@@ -2480,6 +2481,16 @@ const TestStream = struct {
         try std.testing.expectEqualStrings(expected, pwd);
     }
 };
+
+test "ConPTY window visibility reaches the surface mailbox in order" {
+    var fixture: TestStream = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit(std.testing.allocator);
+    fixture.stream.nextSlice("\x1b[2t\x1b[1t");
+    try std.testing.expectEqual(false, (try fixture.expectSurfaceMessage()).window_visibility);
+    try std.testing.expectEqual(true, (try fixture.expectSurfaceMessage()).window_visibility);
+    try std.testing.expect(fixture.nextSurfaceMessage() == null);
+}
 
 test "OSC 9;9 sets the pwd from a plain Windows path" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;

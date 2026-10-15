@@ -344,9 +344,11 @@ programs name the window as they do anywhere else. When the client set
 `STARTF_USESHOWWINDOW`, `start /min` and `Start-Process -WindowStyle
 Minimized` open the window minimized without taking focus, `SW_SHOWNOACTIVATE`
 opens it without taking focus, and a maximized start opens it maximized.
-`powershell.exe -WindowStyle Hidden` is different: PowerShell hides its own
-console window after it starts, which noctty does not follow. A title set in
-the configuration stays in force. A client that asked
+`powershell.exe -WindowStyle Hidden` hides its own console window after it
+starts. For an adopted console, noctty follows OpenConsole's show/hide
+notifications as Windows Terminal does: hide minimizes the window, and show
+restores a minimized window. A title set in the configuration stays in force.
+A client that asked
 for a hidden console gets a minimized window that takes no focus: Windows
 hands every such console to the terminal, and a window nobody can bring back
 would be worse. Only `CREATE_NO_WINDOW` keeps a console from being delegated.

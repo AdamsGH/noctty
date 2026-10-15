@@ -9249,16 +9249,10 @@ pub const App = struct {
         defer config.deinit();
         const title_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, pending.title);
         defer self.core_app.alloc.free(title_w);
-        const surface = try self.createWindowSurface(&config, title_w.ptr, .{
+        _ = try self.createWindowSurface(&config, title_w.ptr, .{
             .adopted_session = pending,
             .show = adoptedInitialShow(pending.startup_flags, pending.show_window),
         });
-        // Nothing has drained the surface's mailbox yet, so this cannot
-        // overwrite a title the console already set. A `title` the user
-        // configured is static and already applied by the core.
-        if (config.title == null) surface.setTitle(pending.title) catch |err| {
-            log.warn("adopted window startup title failed err={}", .{err});
-        };
         win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_created");
     }
 
@@ -9313,7 +9307,9 @@ pub const App = struct {
         // core drop every title the console sets afterwards.
         try std.testing.expect(!Hook.title_pinned);
         try std.testing.expectEqual(InitialShow.minimized, Hook.show);
-        try std.testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", created.title.?);
+        // The creation hook returns an inert surface; title installation
+        // belongs to Surface.init, before its first show (tested below).
+        try std.testing.expect(created.title == null);
 
         // A title the user configured is static and wins over the client's.
         try appendOwnedString(core_app.alloc, &created.title, null);
@@ -9322,6 +9318,104 @@ pub const App = struct {
         try app.createAdoptedWindow(&pending);
         try std.testing.expect(Hook.title_pinned);
         try std.testing.expect(created.title == null);
+    }
+
+    test "an adopted window has its startup caption at its first show" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try Host.runOnPrivateDesktop(adoptedFirstCaptionTestBody);
+    }
+
+    fn adoptedFirstCaptionTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+        const instance = app.hinstance;
+        defer {
+            _ = sys.UnregisterClassW(class_name, instance);
+            _ = sys.UnregisterClassW(host_class_name, instance);
+            _ = sys.UnregisterClassW(palette_list_class_name, instance);
+            _ = sys.UnregisterClassW(scrollbar_class_name, instance);
+        }
+        try app.ensureWindowClass();
+        const Observe = struct {
+            var previous: ?*const anyopaque = null;
+            var caption: [256]u16 = @splat(0);
+            var shows: usize = 0;
+
+            fn proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+                if (msg == c.WM_SHOWWINDOW and wp != 0) {
+                    _ = sys.GetWindowTextW(hwnd, &caption, caption.len);
+                    shows += 1;
+                }
+                return sys.CallWindowProcW(previous, hwnd, msg, wp, lp);
+            }
+
+            fn stage(surface: *Surface, at: Surface.InitStage) anyerror!void {
+                if (at == .gl_context) {
+                    // The test executable has no layered-child manifest.
+                    surface.host.?.tab_container_hwnd = try createTestChromeChild(surface.host.?.hwnd.?, prompt_label_class);
+                    return;
+                }
+                if (at != .core_surface) return;
+                if (surface.app.config.title) |title| try surface.setTitle(title);
+                previous = @ptrFromInt(@as(usize, @bitCast(sys.SetWindowLongPtrW(
+                    surface.host.?.hwnd.?,
+                    c.GWLP_WNDPROC,
+                    @bitCast(@intFromPtr(&proc)),
+                ))));
+            }
+        };
+        app.test_surface_init_stage = &Observe.stage;
+        var pending: win32_terminal_handoff.PendingSession = .{
+            .alloc = core_app.alloc,
+            .adopted = null,
+            .title = try core_app.alloc.dupe(u8, "SMALL-06 client caption"),
+            .startup_flags = win32_terminal_handoff.STARTF_USESHOWWINDOW,
+            .show_window = c.SW_SHOWNOACTIVATE,
+        };
+        defer pending.deinit();
+        for ([_]?[:0]const u8{ null, "Configured caption" }) |configured| {
+            // Real pipes and owned handles, but no process, COM or registry.
+            var signal_read: windows.HANDLE = undefined;
+            var signal_write: windows.HANDLE = undefined;
+            try std.testing.expect(internal_os.windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+            defer _ = windows.CloseHandle(signal_read);
+            const Dup = struct {
+                fn current() !windows.HANDLE {
+                    var handle: windows.HANDLE = undefined;
+                    const current_process = windows.GetCurrentProcess();
+                    if (windows.kernel32.DuplicateHandle(current_process, current_process, current_process, &handle, 0, windows.FALSE, windows.DUPLICATE_SAME_ACCESS) == 0) return lastError();
+                    return handle;
+                }
+            };
+            pending.adopted = .{
+                .pty = try ptypkg.Pty.openAdopted(.{}, signal_write, try Dup.current(), try Dup.current()),
+                .client_process = try Dup.current(),
+            };
+            app.config.title = configured;
+            Observe.caption = @splat(0);
+            Observe.shows = 0;
+            try app.createAdoptedWindow(&pending);
+            const surface = app.windows.items[app.windows.items.len - 1];
+            const host_hwnd = surface.host.?.hwnd.?;
+            defer {
+                core_app.deleteSurface(surface);
+                _ = sys.DestroyWindow(host_hwnd);
+            }
+            const caption = try std.unicode.utf16LeToUtf8Alloc(core_app.alloc, std.mem.sliceTo(&Observe.caption, 0));
+            defer core_app.alloc.free(caption);
+            try std.testing.expectEqual(@as(usize, 1), Observe.shows);
+            try std.testing.expectEqualStrings(configured orelse pending.title, caption);
+            try std.testing.expectEqualStrings(configured orelse pending.title, surface.title.?);
+            // A later console title still replaces the startup title.
+            if (configured == null) {
+                try surface.setTitle("Later console title");
+                try std.testing.expectEqualStrings("Later console title", surface.title.?);
+            }
+        }
+        app.config.title = null;
     }
 
     test "a handed-off console's show state maps to the host's first show" {
@@ -18254,6 +18348,13 @@ const Host = struct {
     /// `DwmGetWindowAttribute` fails; see `win32_power.resolveCloaked`.
     fn refreshSurfaceVisibilityObserving(self: *Host, observed_cloaked: ?bool) void {
         const hwnd = self.hwnd orelse return;
+        // ConPTY tracks the owning window, including background tabs, not
+        // per-pane rendering occlusion or DWM cloaking.
+        const console_visible = sys.IsWindowVisible(hwnd) != 0 and sys.IsIconic(hwnd) == 0;
+        for (self.tabs.items) |*tab| {
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| entry.view.syncAdoptedConsoleVisibility(console_visible);
+        }
         const state = win32_power.queryHostVisibility(
             hwnd,
             self.dwm_cloaked,
@@ -32039,6 +32140,16 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
     return result;
 }
 
+fn applyConsoleWindowVisibility(hwnd: HWND, visible: bool) void {
+    if (visible) {
+        if (sys.IsIconic(hwnd) == 0) return;
+        _ = sys.DefWindowProcW(hwnd, c.WM_SYSCOMMAND, c.SC_RESTORE, 0);
+    } else {
+        if (sys.IsIconic(hwnd) != 0) return;
+        _ = sys.DefWindowProcW(hwnd, c.WM_SYSCOMMAND, c.SC_MINIMIZE, 0);
+    }
+}
+
 fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     if (msg == c.WM_NCCREATE) {
         const cs: *const CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
@@ -32049,6 +32160,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
 
     const host = getHost(hwnd);
     switch (msg) {
+        c.WM_WINHOSTTY_CONSOLE_VISIBILITY => {
+            if (host != null) applyConsoleWindowVisibility(hwnd, wParam != 0);
+            return 0;
+        },
         c.WM_WINHOSTTY_HOST_NEW_TAB => {
             if (host) |v| v.dispatchDeferredNewTab(if (wParam == 0) null else @as(u64, @intCast(wParam)));
             return 0;
@@ -33934,6 +34049,8 @@ pub const Surface = struct {
     core_surface: CoreSurface = undefined,
     core_initialized: bool = false,
     adopted_session: ?ptypkg.AdoptedSession = null,
+    adopted_console: bool = false,
+    console_window_visible: ?bool = null,
     destroy_on_wm_destroy: bool = false,
     content_scale: apprt.ContentScale = .{ .x = 1, .y = 1 },
     size: apprt.SurfaceSize = .{ .width = 800, .height = 600 },
@@ -34276,6 +34393,7 @@ pub const Surface = struct {
             .app = app,
             .host = host,
             .adopted_session = if (opts.adopted_session) |pending| pending.takeAdopted() else null,
+            .adopted_console = opts.adopted_session != null,
             .quick_terminal = opts.quick_terminal,
             .host_id = host.id,
             .host_active = true,
@@ -34529,6 +34647,16 @@ pub const Surface = struct {
         // Stop the core if a later step fails. This runs first, while the GL
         // context and the window its threads draw to are still alive.
         errdefer self.deinitCore();
+
+        // Seed the dynamic title after core init's automatic command title,
+        // but before any path can show the host. No UI mailbox has drained
+        // yet, so later console title messages still win. A configured title
+        // was already applied by the core and remains authoritative.
+        if (opts.adopted_session) |pending| if (config.title == null) {
+            self.setTitle(pending.title) catch |err| {
+                log.warn("adopted window startup title failed err={}", .{err});
+            };
+        };
 
         // Same-host tabs/splits must stay hidden through init, but they still
         // need an initial occlusion sync so hidden child GL surfaces stop
@@ -35864,6 +35992,122 @@ pub const Surface = struct {
         if (self.memory_stage_trace.claimFirstSwapObservation()) {
             self.noteBenchmarkMemoryStage(.first_successful_swap, null);
         }
+    }
+
+    /// Only an adopted console controls the host through ConPTY XTWINOPS.
+    /// Match Windows Terminal: hide minimizes, show restores only an iconic
+    /// window (preserving an already maximized or snapped window).
+    pub fn requestWindowVisibility(self: *Surface, visible: bool) void {
+        if (!self.adopted_console) return;
+        const host = self.host orelse return;
+        const hwnd = host.hwnd orelse return;
+        // Check iconic state at delivery, not here: a PTY batch may queue
+        // hide then show before either message has reached the native pump.
+        _ = sys.PostMessageW(hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, @intFromBool(visible), 0);
+    }
+
+    fn syncAdoptedConsoleVisibility(self: *Surface, visible: bool) void {
+        if (!self.adopted_console or !self.core_initialized) return;
+        if (self.console_window_visible == visible) return;
+        self.console_window_visible = visible;
+        self.core_surface.ptyVisibilityCallback(visible);
+    }
+
+    test "adopted ConPTY visibility follows the host across background tabs" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try Host.runOnPrivateDesktop(adoptedVisibilityTestBody);
+    }
+
+    fn adoptedVisibilityTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var first: Surface = undefined;
+        var background: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{ .{ .storage = &first, .host = &host }, .{ .storage = &background, .host = &host } },
+            .tabs = &.{ .{ .host = &host, .surface = &first, .id = 1 }, .{ .host = &host, .surface = &background, .id = 2 } },
+        });
+        defer session.deinit();
+        const hwnd = try createTestHostWindow();
+        defer _ = sys.DestroyWindow(hwnd);
+        host.hwnd = hwnd;
+        const termio = @import("../termio.zig");
+        first.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
+        defer first.core_surface.io.mailbox.deinit(core_app.alloc);
+        background.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
+        defer background.core_surface.io.mailbox.deinit(core_app.alloc);
+        for ([_]*Surface{ &first, &background }) |surface| {
+            surface.adopted_console = true;
+            surface.core_initialized = true;
+            surface.window_visible = false;
+            surface.core_surface.readonly = false;
+            surface.core_surface.rt_surface = surface;
+        }
+        defer {
+            first.core_initialized = false;
+            background.core_initialized = false;
+        }
+        const Check = struct {
+            fn sync(owner: *Host, surfaces: []const *Surface, expected: bool) !void {
+                // Keep rendering inert: only exercise the host-to-PTY path.
+                owner.surfaces_visible = win32_power.queryHostVisibility(owner.hwnd.?, false, null).visible;
+                owner.refreshSurfaceVisibility();
+                for (surfaces) |surface| {
+                    const queue = surface.core_surface.io.mailbox.spsc.queue;
+                    const message = queue.pop() orelse return error.MissingVisibilitySignal;
+                    try std.testing.expectEqual(expected, message.pty_visibility);
+                    try std.testing.expect(queue.pop() == null);
+                }
+                owner.refreshSurfaceVisibility();
+                for (surfaces) |surface| try std.testing.expect(surface.core_surface.io.mailbox.spsc.queue.pop() == null);
+            }
+            fn request(surface: *Surface, visible: bool) !void {
+                try surface.core_surface.handleMessage(.{ .window_visibility = visible });
+                var message: MSG = undefined;
+                if (sys.PeekMessageW(&message, surface.host.?.hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0) return error.MissingVisibilityRequest;
+                applyConsoleWindowVisibility(message.hwnd, message.wParam != 0);
+            }
+        };
+        const surfaces = [_]*Surface{ &first, &background };
+        try Check.sync(&host, &surfaces, false);
+        _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+        try Check.sync(&host, &surfaces, true);
+        // Even a background tab's adopted client controls the owning host.
+        try Check.request(&background, false);
+        try std.testing.expect(sys.IsIconic(hwnd) != 0);
+        try Check.sync(&host, &surfaces, false);
+        try Check.request(&background, true);
+        try std.testing.expect(sys.IsIconic(hwnd) == 0);
+        try Check.sync(&host, &surfaces, true);
+        // One PTY batch can carry opposing requests before the UI dispatches
+        // either native command. The last request must still win.
+        try background.core_surface.handleMessage(.{ .window_visibility = false });
+        try background.core_surface.handleMessage(.{ .window_visibility = true });
+        var burst: MSG = undefined;
+        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
+            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
+        }
+        try std.testing.expect(sys.IsIconic(hwnd) == 0);
+        _ = sys.ShowWindow(hwnd, c.SW_MINIMIZE);
+        try background.core_surface.handleMessage(.{ .window_visibility = true });
+        try background.core_surface.handleMessage(.{ .window_visibility = false });
+        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
+            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
+        }
+        try std.testing.expect(sys.IsIconic(hwnd) != 0);
+        _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+        try Check.request(&background, true);
+        try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+        // An ordinary surface cannot control host visibility this way.
+        first.adopted_console = false;
+        try first.core_surface.handleMessage(.{ .window_visibility = false });
+        var message: MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&message, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0);
     }
 
     fn setTitle(self: *Surface, title: []const u8) !void {

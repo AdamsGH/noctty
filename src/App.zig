@@ -602,6 +602,7 @@ fn messageSafeDuringModal(message: Message) bool {
             .password_input,
             .selection_scroll_tick,
             .present_surface,
+            .window_visibility,
             .search_viewport_matches,
             .search_selected_match,
             .search_clear,
