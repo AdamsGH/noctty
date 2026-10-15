@@ -9,6 +9,10 @@ pub const Intent = union(enum) {
     restore_tab: struct {
         tab: model.TabId,
         index: usize,
+        /// Bring the tab to the front, as when the tab that closed was in
+        /// front. A tab that closed behind the front one comes back behind
+        /// it. A window with no tab in front always gets the restored one.
+        activate: bool = true,
     },
     discard_detached_tab: model.TabId,
     reorder_tab: struct {

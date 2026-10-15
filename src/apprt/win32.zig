@@ -4163,10 +4163,11 @@ pub const App = struct {
         confirmed: bool,
     ) anyerror!void = null,
     /// Test-only interleaving seam for the focus revision race between a
-    /// structural split-close prepare and commit.
-    test_before_split_undo_shell_commit: ?*const fn (
+    /// structural prepare and commit (a split undone, a tab closed again).
+    /// `pane` is one whose focus the test moves.
+    test_before_structural_shell_commit: ?*const fn (
         app: *App,
-        source_pane: win32_shell.model.PaneId,
+        pane: win32_shell.model.PaneId,
     ) anyerror!void = null,
     /// Test-only stand-in for `ShellExecuteW` on a checked open target, so a
     /// unit test never launches a real handler.
@@ -10214,13 +10215,23 @@ pub const App = struct {
     }
 
     fn commitShellSurfaceFocus(self: *App, surface: *Surface) void {
+        self.commitShellSurfaceFocusIn(surface, true);
+    }
+
+    /// For a surface shown without taking the keyboard: the window shows it,
+    /// but is not recorded as the focused window.
+    fn commitShellSurfaceActivation(self: *App, surface: *Surface) void {
+        self.commitShellSurfaceFocusIn(surface, false);
+    }
+
+    fn commitShellSurfaceFocusIn(self: *App, surface: *Surface, take_window: bool) void {
         if (!self.shell_runtime_initialized) return;
         // Surface creation publishes provisional generational IDs before the
         // native HWND can receive its first focus message. Ignore that early
         // message until the prepared create transaction is authoritative.
         if (!surface.shell_committed) return;
         const pane_id = surface.shell_id orelse return;
-        _ = self.shell_runtime.focusPane(pane_id) catch |err| {
+        _ = (if (take_window) self.shell_runtime.focusPane(pane_id) else self.shell_runtime.activatePane(pane_id)) catch |err| {
             log.err("shell focus transaction rejected pane={d}:{d} err={}", .{ pane_id.index, pane_id.generation, err });
             return;
         };
@@ -10343,13 +10354,13 @@ pub const App = struct {
             if (found.tab.focused != handle) found.tab.focused = handle;
             if (!needs_host_sync) {
                 surface.setVisible(true);
-                self.commitShellSurfaceFocus(surface);
+                self.commitShellSurfaceActivation(surface);
                 self.syncTaskbarProgressForHost(surface.host_id);
                 return;
             }
         }
         self.showHostSurface(surface, false);
-        self.commitShellSurfaceFocus(surface);
+        self.commitShellSurfaceActivation(surface);
         self.syncTaskbarProgressForHost(surface.host_id);
     }
 
@@ -13897,6 +13908,11 @@ const Host = struct {
         index: usize,
         tab_id: u32,
         shell_id: ?win32_shell.model.TabId = null,
+        /// The tab was in front when it closed. Closing a background tab
+        /// from its button leaves the front tab alone, so undoing that close
+        /// must not bring the tab to the front either, or redo would then
+        /// close the front tab and hand the front to its neighbour.
+        was_active: bool = true,
     };
 
     const SplitCreateUndo = struct {
@@ -14286,6 +14302,7 @@ const Host = struct {
             self.tabs.items[self.active_tab].id
         else
             null;
+        const was_active = index == self.active_tab;
         var removed = self.tabs.orderedRemove(index);
         const tab_id = removed.id;
         self.destroyTabButton(&removed);
@@ -14310,6 +14327,7 @@ const Host = struct {
                 .index = index,
                 .tab_id = tab_id,
                 .shell_id = removed.shell_id,
+                .was_active = was_active,
             } },
         };
     }
@@ -14317,10 +14335,16 @@ const Host = struct {
     fn restoreClosedTabEntryNative(self: *Host, value: *CloseTabUndo) Allocator.Error!bool {
         const tab = value.tab orelse return false;
         const insert_index = clampTabInsertIndex(value.index, self.tabs.items.len);
+        // A tab that closed behind the front one comes back behind it.
+        const keeps_front = !value.was_active and self.tabs.items.len > 0;
         try self.tabs.insert(self.app.core_app.alloc, insert_index, tab);
         value.tab = null;
         value.index = insert_index;
-        self.active_tab = insert_index;
+        if (!keeps_front) {
+            self.active_tab = insert_index;
+        } else if (insert_index <= self.active_tab) {
+            self.active_tab += 1;
+        }
         // Its programs may have ended while the tab waited in undo history.
         self.refreshTabStatus(insert_index);
         return self.activeSurface() != null;
@@ -14338,12 +14362,15 @@ const Host = struct {
             shell_prepared = try self.app.shell_runtime.prepare(.{ .restore_tab = .{
                 .tab = shell_id,
                 .index = insert_index,
+                .activate = value.was_active,
             } });
         }
         defer if (shell_prepared) |*prepared| prepared.deinit();
+        const previous_active = self.active_tab;
         if (!(try self.restoreClosedTabEntryNative(value))) return false;
         if (shell_prepared) |*prepared| prepared.commit(&self.app.shell_runtime) catch |err| {
             value.tab = self.tabs.orderedRemove(insert_index);
+            self.active_tab = previous_active;
             return err;
         };
         // Detaching destroys the tab button and its UIA provider. Rebuild the
@@ -14364,6 +14391,9 @@ const Host = struct {
             self.tabs.items[self.active_tab].id
         else
             null;
+        // Read before the panes are hidden: the focus message that follows
+        // can move `active_tab`.
+        const previous_active = self.active_tab;
         var shell_prepared: ?win32_shell.runtime.Prepared = null;
         if (self.app.shell_runtime_initialized) {
             const shell_id = value.shell_id orelse return error.ShellStateOutOfSync;
@@ -14383,9 +14413,16 @@ const Host = struct {
 
         value.index = index;
         value.tab = removed;
-        const previous_active = self.active_tab;
+        // What the next undo has to put back is the tab as it stands now.
+        value.was_active = index == previous_active;
         self.active_tab = activeTabAfterRemoval(previous_active, index, self.tabs.items.len);
-        if (shell_prepared) |*prepared| prepared.commit(&self.app.shell_runtime) catch |err| {
+        // Hiding the panes of a tab that was in front moves the keyboard to
+        // the next one, and that focus message commits to the model between
+        // the prepare above and this commit, as it can for a pane's close.
+        if (self.app.test_before_structural_shell_commit) |hook| {
+            if (self.activeSurface()) |next| if (next.shell_id) |pane| try hook(self.app, pane);
+        }
+        if (shell_prepared) |*prepared| prepared.commitRetryingInterleavedFocus(&self.app.shell_runtime) catch |err| {
             try self.tabs.insert(self.app.core_app.alloc, index, removed);
             value.tab = null;
             self.active_tab = previous_active;
@@ -14423,7 +14460,7 @@ const Host = struct {
         value.created_surface.setVisible(false);
         value.detached = true;
         self.active_tab = found.index;
-        if (self.app.test_before_split_undo_shell_commit) |hook| {
+        if (self.app.test_before_structural_shell_commit) |hook| {
             try hook(self.app, value.source_surface.shell_id.?);
         }
         if (shell_prepared) |*prepared| prepared.commitRetryingInterleavedFocus(&self.app.shell_runtime) catch |err| {
@@ -17325,11 +17362,10 @@ const Host = struct {
         try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
         try std.testing.expectEqual(host.tabStripFocusHwnd(), sys.GetFocus());
 
-        // Undo brings A back in front; with C in front again, redo closes
-        // A in the background and the strip closes the gap again.
+        // Undo brings A back behind C, which the close left in front; redo
+        // closes A in the background again and the strip closes the gap again.
         _ = try host.applyLatestStructuralUndo();
-        try std.testing.expectEqual(@as(?*Surface, &surface_a), host.activeSurface());
-        app.activateSurface(&surface_c);
+        try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
         surface_c.window_visible = true;
         surface_c.window_focused = true;
         try std.testing.expect(host.tabs.items[0].button_placement.rect.left == first_left);
@@ -17481,6 +17517,127 @@ const Host = struct {
         try std.testing.expect(try host.restoreClosedTabEntry(&entry.payload.close_tab));
         try std.testing.expect(host.tabs.items[2].button_hwnd != null);
         try std.testing.expectEqual(detached + 1, events.testing_structure_changes);
+    }
+
+    test "moving the zoom hides the old pane before it shows the new one" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(zoomMoveOrderTestBody);
+    }
+
+    /// Stand-in pane windows that note when one is about to be shown over
+    /// the other, which is on screen: for a moment both would be, on top of
+    /// each other (`WM_SHOWWINDOW` comes before the change, at the rect the
+    /// window still has).
+    const PaneShowRecorder = struct {
+        var panes: [2]?HWND = .{ null, null };
+        var previous: [2]?*const anyopaque = .{ null, null };
+        var overlapped: bool = false;
+
+        fn install(first: HWND, second: HWND) void {
+            panes = .{ first, second };
+            overlapped = false;
+            for (panes, 0..) |pane, i| {
+                const old = sys.SetWindowLongPtrW(
+                    pane.?,
+                    c.GWLP_WNDPROC,
+                    @as(LONG_PTR, @intCast(@intFromPtr(&proc))),
+                );
+                previous[i] = if (old == 0) null else @ptrFromInt(@as(usize, @intCast(old)));
+            }
+        }
+
+        fn proc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+            if (msg == c.WM_SHOWWINDOW and wParam != 0) {
+                var mine: RECT = undefined;
+                _ = sys.GetWindowRect(hwnd, &mine);
+                for (panes) |other| {
+                    if (other.? == hwnd or sys.IsWindowVisible(other.?) == 0) continue;
+                    var theirs: RECT = undefined;
+                    _ = sys.GetWindowRect(other.?, &theirs);
+                    if (mine.left < theirs.right and theirs.left < mine.right and
+                        mine.top < theirs.bottom and theirs.top < mine.bottom) overlapped = true;
+                }
+            }
+            for (panes, 0..) |pane, i| {
+                if (pane.? == hwnd) return sys.CallWindowProcW(previous[i], hwnd, msg, wParam, lParam);
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+    };
+
+    fn zoomMoveOrderTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{.{ .host = &host, .surface = &surface_a, .id = 1 }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        surface_a.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_b.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        defer for ([_]*Surface{ &surface_a, &surface_b }) |surface| {
+            surface.hwnd = null;
+        };
+
+        // [A | B], zoomed on B, which comes later in the tree than A.
+        var inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+        defer inserted.deinit();
+        const tab = &host.tabs.items[0];
+        const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+        tab.tree.deinit();
+        tab.tree = next_tree;
+        const handle_a = tab.findHandle(&surface_a).?;
+        const handle_b = tab.findHandle(&surface_b).?;
+        tab.tree.zoom(handle_b);
+        try host.layout();
+        try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) != 0);
+        try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) == 0);
+
+        // The zoom moves to A, as `goto_split` does with `split-preserve-zoom
+        // = navigation`. A is reached first, so B has to be hidden before A
+        // is shown, or two GL windows overlap for the length of the pass
+        // (the hazard `prepareActiveTabVisibility` is there for).
+        PaneShowRecorder.install(surface_a.hwnd.?, surface_b.hwnd.?);
+        tab.tree.zoom(handle_a);
+        try host.layout();
+        try std.testing.expect(!PaneShowRecorder.overlapped);
+        try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) != 0);
+        try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) == 0);
+
+        // And back: B is shown after A is hidden, as well.
+        tab.tree.zoom(handle_b);
+        try host.layout();
+        try std.testing.expect(!PaneShowRecorder.overlapped);
+        try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) != 0);
+        try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) == 0);
+
+        // Leaving the zoom, as `goto_split` does by default: the zoomed pane
+        // shrinks to its slot, and the other is placed in its own before it
+        // comes up, or it would be shown over the zoomed one. Whichever the
+        // tree visits first.
+        for ([_]SplitTreeSurface.Node.Handle{ handle_b, handle_a }) |zoomed_pane| {
+            tab.tree.zoom(zoomed_pane);
+            try host.layout();
+            tab.tree.zoom(null);
+            try host.layout();
+            try std.testing.expect(!PaneShowRecorder.overlapped);
+            try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) != 0);
+            try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) != 0);
+        }
     }
 
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
@@ -23729,94 +23886,109 @@ const Host = struct {
         self.prepareActiveTabVisibility(self.active_tab);
 
         if (active_tab.tree.zoomed) |zoomed| {
-            var it = active_tab.tree.iterator();
-            while (it.next()) |entry| {
-                const visible = entry.handle == zoomed;
-                const visibility_changed = entry.view.window_visible != visible;
+            // The other panes go first, as the other tabs do above: moving the
+            // zoom shows a pane that may come before the old one in the tree,
+            // and two GL child windows must not overlap, even within this pass.
+            var hiding = active_tab.tree.iterator();
+            while (hiding.next()) |entry| {
+                if (entry.handle == zoomed) continue;
+                const visibility_changed = entry.view.window_visible;
                 content_layout_changed = content_layout_changed or visibility_changed;
-                entry.view.setVisible(visible);
-                if (visible) {
-                    const placement = win32_layout.zoomedSurfacePlacement(
-                        layout_content_rect,
-                        entry.view.search_bar.visible,
-                        search_bar_height,
-                    );
-                    if (placement.search_frame_rect) |search_frame_rect| {
-                        content_layout_changed = (try entry.view.layoutSearchBarControls(
-                            layoutRectToWin32(search_frame_rect),
-                            true,
-                        )) or content_layout_changed;
-                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                    } else {
-                        content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                    }
-                    const pane_rect = layoutRectToWin32(placement.pane_rect);
-                    var pane_rect_changed = false;
-                    if (entry.view.hwnd) |surface_hwnd| {
-                        pane_rect_changed = applyChildRect(
-                            surface_hwnd,
-                            &entry.view.placement,
-                            pane_rect,
-                        );
-                        content_layout_changed = pane_rect_changed or content_layout_changed;
-                    }
-                    const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                    if (runtime_sync.scrollbar_refresh) {
-                        try entry.view.refreshScrollbarWindow();
-                    }
-                    if (runtime_sync.core_size_sync) {
-                        entry.view.syncCoreSizeFromClientRect();
-                    }
-                    entry.view.syncContentScaleToHostDpi();
-                } else {
-                    content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                    if (visibility_changed) {
-                        try entry.view.refreshScrollbarWindow();
-                    }
+                entry.view.setVisible(false);
+                content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
+                if (visibility_changed) {
+                    try entry.view.refreshScrollbarWindow();
                 }
             }
-        } else {
-            var spatial = try active_tab.tree.spatial(self.app.core_app.alloc);
-            defer spatial.deinit(self.app.core_app.alloc);
-            const has_multi_panes = active_tab.leafCount() > 1;
             var it = active_tab.tree.iterator();
             while (it.next()) |entry| {
+                if (entry.handle != zoomed) continue;
                 const visibility_changed = !entry.view.window_visible;
                 content_layout_changed = content_layout_changed or visibility_changed;
                 entry.view.setVisible(true);
+                const placement = win32_layout.zoomedSurfacePlacement(
+                    layout_content_rect,
+                    entry.view.search_bar.visible,
+                    search_bar_height,
+                );
+                if (placement.search_frame_rect) |search_frame_rect| {
+                    content_layout_changed = (try entry.view.layoutSearchBarControls(
+                        layoutRectToWin32(search_frame_rect),
+                        true,
+                    )) or content_layout_changed;
+                    if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
+                } else {
+                    content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
+                }
+                const pane_rect = layoutRectToWin32(placement.pane_rect);
+                var pane_rect_changed = false;
                 if (entry.view.hwnd) |surface_hwnd| {
-                    const placement = self.splitPanePlacement(
-                        content_rect,
-                        spatial,
-                        entry.handle,
-                        has_multi_panes,
-                        entry.view.search_bar.visible,
-                    );
-                    if (placement.search_frame_rect) |search_frame_rect| {
-                        content_layout_changed = (try entry.view.layoutSearchBarControls(
-                            layoutRectToWin32(search_frame_rect),
-                            true,
-                        )) or content_layout_changed;
-                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                    } else {
-                        content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                    }
-                    const pane_rect = layoutRectToWin32(placement.pane_rect);
-                    const pane_rect_changed = applyChildRect(
+                    pane_rect_changed = applyChildRect(
                         surface_hwnd,
                         &entry.view.placement,
                         pane_rect,
                     );
                     content_layout_changed = pane_rect_changed or content_layout_changed;
-                    const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                    if (runtime_sync.scrollbar_refresh) {
-                        try entry.view.refreshScrollbarWindow();
-                    }
-                    if (runtime_sync.core_size_sync) {
-                        entry.view.syncCoreSizeFromClientRect();
-                    }
+                }
+                const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
+                if (runtime_sync.scrollbar_refresh) {
+                    try entry.view.refreshScrollbarWindow();
+                }
+                if (runtime_sync.core_size_sync) {
+                    entry.view.syncCoreSizeFromClientRect();
                 }
                 entry.view.syncContentScaleToHostDpi();
+            }
+        } else {
+            var spatial = try active_tab.tree.spatial(self.app.core_app.alloc);
+            defer spatial.deinit(self.app.core_app.alloc);
+            const has_multi_panes = active_tab.leafCount() > 1;
+            // Panes already on screen are placed before the hidden ones are
+            // shown: leaving a zoom, the zoomed pane shrinks to its slot first,
+            // so the others do not come up over it.
+            for ([_]bool{ true, false }) |on_screen| {
+                var it = active_tab.tree.iterator();
+                while (it.next()) |entry| {
+                    if (entry.view.window_visible != on_screen) continue;
+                    const visibility_changed = !entry.view.window_visible;
+                    content_layout_changed = content_layout_changed or visibility_changed;
+                    if (entry.view.hwnd) |surface_hwnd| {
+                        const placement = self.splitPanePlacement(
+                            content_rect,
+                            spatial,
+                            entry.handle,
+                            has_multi_panes,
+                            entry.view.search_bar.visible,
+                        );
+                        if (placement.search_frame_rect) |search_frame_rect| {
+                            content_layout_changed = (try entry.view.layoutSearchBarControls(
+                                layoutRectToWin32(search_frame_rect),
+                                true,
+                            )) or content_layout_changed;
+                            if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
+                        } else {
+                            content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
+                        }
+                        const pane_rect = layoutRectToWin32(placement.pane_rect);
+                        const pane_rect_changed = applyChildRect(
+                            surface_hwnd,
+                            &entry.view.placement,
+                            pane_rect,
+                        );
+                        content_layout_changed = pane_rect_changed or content_layout_changed;
+                        const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
+                        if (runtime_sync.scrollbar_refresh) {
+                            try entry.view.refreshScrollbarWindow();
+                        }
+                        if (runtime_sync.core_size_sync) {
+                            entry.view.syncCoreSizeFromClientRect();
+                        }
+                    }
+                    // In its slot first: shown at the rect it had before, a pane
+                    // that came out of a zoom would cover its neighbours.
+                    entry.view.setVisible(true);
+                    entry.view.syncContentScaleToHostDpi();
+                }
             }
         }
         self.layoutBanner(content_rect, banner_top);
@@ -43443,6 +43615,161 @@ test "win32 a background tab's exit keeps the active tab" {
     try app.validateShellNativeMapping();
 }
 
+test "win32 undoing then redoing an in-place tab close leaves the same tab in front" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var surface_d: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+            .{ .storage = &surface_d, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // Tabs [A, B, C, D] with C active, natively and in the shell model.
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c, &surface_d };
+    for (surfaces, 0..) |surface, index| {
+        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = window.created.window.? });
+        defer if (created) |*prepared| prepared.deinit();
+        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
+        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
+        surface.shell_committed = true;
+        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
+        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
+        try host.tabs.append(std.testing.allocator, tab);
+    }
+    host.active_tab = 2;
+    _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
+    try app.validateShellNativeMapping();
+
+    // A closes from its button and C stays in front. Undo puts A back and
+    // redo closes it again: each leaves the tab the close left in front, not
+    // A itself and not B, the tab that ends up at A's place.
+    try std.testing.expect(host.closeTabInPlace(0));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(usize, 4), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_a), host.tabs.items[0].focusedSurface());
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+    _ = try host.applyLatestStructuralRedo();
+    try std.testing.expectEqual(@as(usize, 3), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+
+    // The tab in front closing is the other case: undo brings it back in
+    // front, redo gives the front to the tab now at its place (D).
+    try std.testing.expect(host.closeTabInPlace(1));
+    try std.testing.expectEqual(@as(?*Surface, &surface_d), host.activeSurface());
+    try app.validateShellNativeMapping();
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+
+    // Hiding the front tab's panes moves the keyboard to D, and that focus
+    // message commits to the model between the redo's prepare and commit.
+    // The redo has to survive it, not fail with a stale revision.
+    const Interleave = struct {
+        fn run(target: *App, pane: win32_shell.model.PaneId) !void {
+            try std.testing.expect(try target.shell_runtime.focusPane(pane));
+        }
+    };
+    app.test_before_structural_shell_commit = &Interleave.run;
+    _ = try host.applyLatestStructuralRedo();
+    try std.testing.expectEqual(@as(?*Surface, &surface_d), host.activeSurface());
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try app.validateShellNativeMapping();
+}
+
+test "win32 a window brought up without focus is not recorded as the focused one" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b1: Surface = undefined;
+    var surface_b2: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b1, .host = &host_b, .register = true },
+            .{ .storage = &surface_b2, .host = &host_b, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // Window A with one tab, window B with two, natively and in the model.
+    var window_a = try app.shell_runtime.prepare(.create_window);
+    defer window_a.deinit();
+    try window_a.commit(&app.shell_runtime);
+    var window_b = try app.shell_runtime.prepare(.create_window);
+    defer window_b.deinit();
+    try window_b.commit(&app.shell_runtime);
+    var tab_b2 = try app.shell_runtime.prepare(.{ .create_tab = window_b.created.window.? });
+    defer tab_b2.deinit();
+    try tab_b2.commit(&app.shell_runtime);
+    host_a.shell_id = window_a.created.window;
+    host_b.shell_id = window_b.created.window;
+    surface_a.shell_id = window_a.created.pane;
+    surface_b1.shell_id = window_b.created.pane;
+    surface_b2.shell_id = tab_b2.created.pane;
+    for ([_]*Surface{ &surface_a, &surface_b1, &surface_b2 }) |surface| surface.shell_committed = true;
+    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
+    tab.shell_id = window_a.created.tab;
+    try host_a.tabs.append(std.testing.allocator, tab);
+    tab = try Tab.init(std.testing.allocator, 1, &surface_b1);
+    tab.shell_id = window_b.created.tab;
+    try host_b.tabs.append(std.testing.allocator, tab);
+    tab = try Tab.init(std.testing.allocator, 2, &surface_b2);
+    tab.shell_id = tab_b2.created.tab;
+    try host_b.tabs.append(std.testing.allocator, tab);
+
+    // The user is in A, whose pane has the keyboard.
+    _ = try app.shell_runtime.focusPane(surface_a.shell_id.?);
+    const state = &app.shell_runtime.state;
+    try std.testing.expect(state.focused_window.?.eql(window_a.created.window.?));
+
+    // B's second tab comes up without taking focus, as when a pane exits in
+    // a window that is not in front. B shows it; A is still the focused window.
+    app.activateSurfaceNoFocus(&surface_b2);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b2), host_b.activeSurface());
+    try std.testing.expect(state.windowConst(window_b.created.window.?).?.active_tab.?.eql(tab_b2.created.tab.?));
+    try std.testing.expect(state.focused_window.?.eql(window_a.created.window.?));
+
+    // A real focus message does move the focused window.
+    _ = app.noteSurfaceFocused(&surface_b2);
+    try std.testing.expect(state.focused_window.?.eql(window_b.created.window.?));
+}
+
 test "win32 terminal undo snapshot restores terminal state" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -43658,7 +43985,7 @@ test "win32 split_create structural undo removes and redoes the split" {
             try std.testing.expect(try target_app.shell_runtime.focusPane(source_pane));
         }
     };
-    app.test_before_split_undo_shell_commit = &FocusInterleave.run;
+    app.test_before_structural_shell_commit = &FocusInterleave.run;
 
     try std.testing.expect(try host.undoSplitCreateEntry(&split_create));
     try std.testing.expectEqual(@as(?SplitTreeSurface.Node.Handle, null), host.tabs.items[0].findHandle(&surface_b));
