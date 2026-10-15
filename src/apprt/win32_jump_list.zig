@@ -1050,6 +1050,8 @@ pub const JumpList = struct {
     /// built from an older copy of the model does not mark it clean.
     rebuild_seq: u64 = 0,
     rebuild_in_flight: ?InFlightRebuild = null,
+    /// Commits given up on since the last one that finished.
+    rebuild_abandons: u8 = 0,
     next_rebuild_id: u64 = 0,
     /// Runs the commit on another thread; null runs it on the caller's.
     runner: ?RebuildRunner = null,
@@ -1543,13 +1545,17 @@ pub const JumpList = struct {
         if (self.rebuild_in_flight) |in_flight| {
             // Its completion re-checks `rebuild_seq`. One that never ends
             // must not keep the list from updating again.
-            if (sys.GetTickCount64() -| in_flight.started_ms < rebuild_abandon_ms) {
+            const wait_ms = rebuildAbandonMs(self.rebuild_abandons);
+            if (sys.GetTickCount64() -| in_flight.started_ms < wait_ms) {
                 // Look again later: a commit that hangs, or whose result is
-                // lost, is otherwise only replaced by a change after 10 s.
+                // lost, is otherwise never replaced.
                 self.schedule();
                 return;
             }
-            log.warn("jump list rebuild unfinished after {d} ms; starting another", .{rebuild_abandon_ms});
+            log.warn("jump list rebuild unfinished after {d} ms; starting another", .{wait_ms});
+            // A wedged worker never exits; wait longer each time so a hung
+            // Shell does not collect one thread per interval.
+            self.rebuild_abandons +|= 1;
         }
         const job = self.snapshotRebuild() catch |err| {
             self.rebuildFailed(err);
@@ -1559,7 +1565,11 @@ pub const JumpList = struct {
         job.id = self.next_rebuild_id;
         self.rebuild_in_flight = .{ .id = job.id, .started_ms = sys.GetTickCount64() };
         if (self.runner) |runner| {
-            if (runner.start(runner.ctx, job)) return;
+            if (runner.start(runner.ctx, job)) {
+                // Re-checks the commit if it never comes back.
+                self.schedule();
+                return;
+            }
             log.warn("jump list rebuild thread unavailable; rebuilding on this thread", .{});
         }
         job.run();
@@ -1597,6 +1607,7 @@ pub const JumpList = struct {
     pub fn completeRebuild(self: *JumpList, job: *const RebuildJob) void {
         const current = if (self.rebuild_in_flight) |in_flight| in_flight.id == job.id else false;
         if (current) self.rebuild_in_flight = null;
+        self.rebuild_abandons = 0;
         // As before the move off the UI thread, removals BeginList reported
         // are recorded even when the commit itself failed.
         self.applyRemoved(&job.removed) catch |err| {
@@ -1693,8 +1704,13 @@ const InFlightRebuild = struct {
     started_ms: u64,
 };
 
-/// Longer than a commit takes when it works.
-const rebuild_abandon_ms: u64 = 10 * std.time.ms_per_s;
+/// How long a commit may run before another replaces it: far longer than
+/// one takes when it works, doubling per commit already given up on, up to
+/// about 10 minutes.
+fn rebuildAbandonMs(abandons: u8) u64 {
+    const doublings: u6 = @intCast(@min(abandons, 6));
+    return @as(u64, 10 * std.time.ms_per_s) << doublings;
+}
 
 /// One Shell list commit, built from a copy of the model so it can run on a
 /// thread of its own. Everything lives in `arena`, so it borrows nothing
@@ -2863,6 +2879,13 @@ test "jump_list a finished rebuild marks the list clean only for the current cop
     current.id = 3;
     jump.completeRebuild(current);
     try std.testing.expect(jump.rebuild_dirty);
+}
+
+test "jump_list waits longer before replacing each commit it gave up on" {
+    try std.testing.expectEqual(@as(u64, 10_000), rebuildAbandonMs(0));
+    try std.testing.expectEqual(@as(u64, 20_000), rebuildAbandonMs(1));
+    try std.testing.expectEqual(@as(u64, 640_000), rebuildAbandonMs(6));
+    try std.testing.expectEqual(@as(u64, 640_000), rebuildAbandonMs(255));
 }
 
 test "jump_list keeps use guards while a rebuild built with them is in flight" {

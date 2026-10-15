@@ -5184,7 +5184,9 @@ pub const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         const delivery = self.delivery orelse return false;
         delivery.retain();
-        const thread = std.Thread.spawn(.{}, jumpListRebuildThreadMain, .{ delivery, job }) catch |err| {
+        // Windows' default stack: Zig's 16 MiB default is committed, not
+        // just reserved, and a wedged commit keeps its thread.
+        const thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, jumpListRebuildThreadMain, .{ delivery, job }) catch |err| {
             delivery.release();
             log.warn("jump list rebuild thread unavailable err={}", .{err});
             return false;
@@ -7304,6 +7306,12 @@ pub const App = struct {
             if (!host.profiles_requested and !(host == primary and primary_wants)) continue;
             host.profiles_requested = false;
             const had_profiles = host.profiles != null;
+            // An incomplete list (a probe timed out, the SSH config was
+            // busy) does not replace a complete one.
+            if (!discovery.complete and host.profiles_complete) {
+                if (host != self.profiles_requesting_host) host.profilesArrived(had_profiles);
+                continue;
+            }
             const profiles = windows_shell.cloneProfiles(self.core_app.alloc, discovery.profiles) catch |err| {
                 log.warn("deferred profile discovery failed err={}", .{err});
                 continue;
@@ -8186,7 +8194,10 @@ pub const App = struct {
                             for (self.hosts.items) |host| host.invalidateProfiles();
                         }
                         for (self.hosts.items) |host| {
-                            if (ssh_config_hosts_changed and host.overlay_mode == .profile) host.requestProfiles();
+                            if (ssh_config_hosts_changed and host.overlay_mode == .profile) {
+                                host.requestProfiles();
+                                host.refreshProfileChrome();
+                            }
                             if (host.overlay_mode == .command_palette) host.rebuildPaletteList();
                         }
                         if (jump_list_profiles_pending) {
@@ -13190,6 +13201,21 @@ test "win32 a finished discovery reaches only the windows that asked for it" {
     try std.testing.expectEqual(@as(usize, 2), first.profiles.?.len);
     try std.testing.expect(first.profiles_complete);
     try std.testing.expectEqual(@as(usize, 1), second.profiles.?.len);
+    try std.testing.expectEqualStrings("old", second.profiles.?[0].key);
+
+    // An incomplete list does not replace a complete one.
+    second.profiles_requested = true;
+    var partial: ProfileDiscoveryCompletion = .{
+        .arena = .init(std.testing.allocator),
+        .generation = app.profiles_generation,
+    };
+    defer partial.deinit();
+    partial.result = .{
+        .profiles = try testProfileList(partial.arena.allocator(), &.{"partial"}),
+        .complete = false,
+    };
+    app.handleProfileDiscovery(&partial);
+    try std.testing.expect(!second.profiles_requested);
     try std.testing.expectEqualStrings("old", second.profiles.?[0].key);
 
     // A result that started before a list was applied is dropped.
