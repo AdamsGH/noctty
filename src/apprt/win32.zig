@@ -3205,6 +3205,16 @@ fn settingsDiskVerdict(
     user_edited: SettingsEditedKeySet,
 ) win32_settings.SaveError!bool {
     try settingsIncludesOpenable(alloc, detail, disk);
+    // A UTF-16 file that does not decode is skipped whole, with a diagnostic
+    // and everything it set missing: as incomplete as one that will not open.
+    if (disk._undecodable_file) |path| {
+        if (detail) |d| {
+            const text = std.fmt.allocPrint(alloc, "the file {s}", .{path}) catch return error.OutOfMemory;
+            defer alloc.free(text);
+            d.set(alloc, text);
+        }
+        return error.UnsupportedEncoding;
+    }
     return settingsDiskEditConflict(original, pending, disk, state, user_edited);
 }
 
@@ -26625,7 +26635,14 @@ fn persistSettings(
         break :blk try alloc.realloc(slice, n);
     };
     defer alloc.free(raw_before);
-    if (settingsTextProblem(raw_before)) |problem| return problem;
+    if (settingsTextProblem(raw_before)) |problem| {
+        if (detail) |d| {
+            const text = std.fmt.allocPrint(alloc, "the config file {s}", .{target.path}) catch return error.OutOfMemory;
+            defer alloc.free(text);
+            d.set(alloc, text);
+        }
+        return problem;
+    }
 
     var patched: std.ArrayListUnmanaged(u8) = .{};
     defer patched.deinit(alloc);
@@ -26944,6 +26961,20 @@ test "win32 settings disk check stops at a config file it cannot open, not at a 
     const state: configpkg.ConditionalState = .{};
     try std.testing.expectError(error.FileUnopenable, settingsDiskVerdict(alloc, null, &same, &same, &config, state, edited));
     try std.testing.expect(!try settingsDiskVerdict(alloc, null, &same, &same, &same, state, edited));
+
+    // So is a UTF-16 file that does not decode (a lone surrogate): the load
+    // skips it whole, and the defaults it leaves must not pass for an edit.
+    try tmp.dir.writeFile(.{ .sub_path = "bad16.conf", .data = "\xff\xfe\x00\xd8f\x00o\x00" });
+    const bad_path = try std.fs.path.join(alloc, &.{ missing, "bad16.conf" });
+    defer alloc.free(bad_path);
+    var skipped = try configpkg.Config.default(alloc);
+    defer skipped.deinit();
+    try skipped.loadFile(alloc, bad_path);
+    detail.clear(alloc);
+    try std.testing.expectError(error.UnsupportedEncoding, settingsDiskVerdict(alloc, &detail, &same, &same, &skipped, state, edited));
+    const expected_skipped = try std.fmt.allocPrint(alloc, "the file {s}", .{bad_path});
+    defer alloc.free(expected_skipped);
+    try std.testing.expectEqualStrings(expected_skipped, detail.text.?);
 }
 
 test "win32 palette theme save failures say what the person can do about them" {
@@ -27172,6 +27203,8 @@ test "win32 settings save refuses UTF-16 text and leaves the file as it was" {
     // What Windows PowerShell 5.1 writes for `'copy-on-select = false' > file`
     // (UTF-16LE with a byte order mark and CRLF), the same text big-endian,
     // a bare byte order mark, and UTF-16 and UTF-32 without one.
+    var detail: win32_settings.FailureDetail = .{};
+    defer detail.clear(alloc);
     // A byte order mark is named as such (UTF-16 is what PowerShell writes);
     // NUL bytes without one are named for what they are.
     const refused = [_]struct { bytes: []const u8, err: win32_settings.SaveError }{
@@ -27186,7 +27219,10 @@ test "win32 settings save refuses UTF-16 text and leaves the file as it was" {
     for (refused) |case| {
         const bytes = case.bytes;
         try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = bytes });
-        try std.testing.expectError(case.err, persistSettings(alloc, path, &draft.pending, draft.edited, null));
+        detail.clear(alloc);
+        try std.testing.expectError(case.err, persistSettings(alloc, path, &draft.pending, draft.edited, &detail));
+        // The status line is told which file.
+        try std.testing.expect(std.mem.startsWith(u8, detail.text.?, "the config file "));
         try scratch.expectContent("config.ghostty", bytes);
         try scratch.expectNames(&.{"config.ghostty"});
     }

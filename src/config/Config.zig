@@ -3418,6 +3418,11 @@ _arena: ?ArenaAllocator = null,
 /// supplied by a config layer. The executable stays available to runtime callers.
 _command_defaulted: bool = false,
 
+/// The last config file that was skipped whole because it is UTF-16 text that
+/// does not decode (see `loadReader`); everything it set is missing from this
+/// load. Lives in the arena of this load and is not carried by `clone`.
+_undecodable_file: ?[:0]const u8 = null,
+
 /// List of diagnostics that were generated during the loading of
 /// the configuration.
 _diagnostics: cli.DiagnosticList = .{},
@@ -3626,6 +3631,7 @@ fn decodeUtf16(
 
 fn invalidUtf16(self: *Config, path: []const u8, reason: []const u8) error{ OutOfMemory, InvalidUtf16 } {
     const arena_alloc = self._arena.?.allocator();
+    self._undecodable_file = arena_alloc.dupeZ(u8, path) catch return error.OutOfMemory;
     const diag: cli.Diagnostic = .{
         .message = std.fmt.allocPrintSentinel(
             arena_alloc,
@@ -3932,6 +3938,8 @@ test "UTF-16 config files are read as the text they hold" {
         try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "config.ghostty") != null);
         try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "UTF-16") != null);
         try testing.expectEqual(@as(f32, 12), cfg.@"font-size");
+        // Callers that must not act on a partial load can tell which file it was.
+        try testing.expectEqualStrings("/home/ghostty/.config/ghostty/config.ghostty", cfg._undecodable_file.?);
     }
 }
 

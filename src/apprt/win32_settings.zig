@@ -592,7 +592,7 @@ const StatusNote = enum {
     /// Whether the sentence can name the file it is about (`textWithDetail`).
     fn takesDetail(self: StatusNote) bool {
         return switch (self) {
-            .file_unopenable, .write_incomplete => true,
+            .file_unopenable, .write_incomplete, .unsupported_encoding, .binary_config => true,
             else => false,
         };
     }
@@ -601,6 +601,8 @@ const StatusNote = enum {
     /// phrase ending in one. Owned.
     fn textWithDetail(self: StatusNote, alloc: std.mem.Allocator, detail: []const u8) std.mem.Allocator.Error![]u8 {
         return switch (self) {
+            .unsupported_encoding => std.fmt.allocPrint(alloc, "Nothing was saved: {s} is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
+            .binary_config => std.fmt.allocPrint(alloc, "Nothing was saved: {s} contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
             .file_unopenable => std.fmt.allocPrint(alloc, "Nothing was saved: {s} cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.", .{detail}),
             .write_incomplete => std.fmt.allocPrint(alloc, "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in {s}. Copy that over the config file, then save again. Your edits are kept.", .{detail}),
             else => alloc.dupe(u8, self.text()),
@@ -5996,6 +5998,14 @@ test "settings status line names the file a failed save is about" {
     settings.setSaveFailureNote(error.IncompleteWrite);
     try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "may now be incomplete") != null);
     try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "kept in C:\\dotfiles\\config.ghostty.tmp-1-2") != null);
+
+    // The encoding sentences name the file too, so an include is not blamed on
+    // the config file.
+    lender.text = "the file C:\\dotfiles\\inc.conf";
+    settings.setSaveFailureNote(error.UnsupportedEncoding);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the file C:\\dotfiles\\inc.conf is not readable as UTF-8 text") != null);
+    settings.setSaveFailureNote(error.BinaryConfig);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the file C:\\dotfiles\\inc.conf contains NUL bytes") != null);
 
     // Nothing lent, or an error with no file to name: the plain sentence.
     lender.text = null;
