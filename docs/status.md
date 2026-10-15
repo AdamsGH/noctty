@@ -30,8 +30,9 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
   (`windows-11-arm`), and the one interactive job is a self-hosted Windows 11
   machine that runs only on request. No job and no harness run on Windows 10,
   so chrome, input and startup changes are unmeasured there unless a page says
-  otherwise (for example [windows.md](windows.md#windows-tabs-and-splits) on
-  the frameless undecorated window).
+  otherwise. [windows.md](windows.md#windows-tabs-and-splits) describes the
+  frameless undecorated window on Windows 10, which was exercised only by
+  forcing that code path on Windows 11.
 - No macOS, Linux, or cross-platform app runtime ships from this repo.
   `libghostty-vt` stays buildable for non-Windows targets as a library.
 - WSL sessions work from the profile picker. Making WSL the default shell
@@ -237,7 +238,7 @@ noctty you already have open, and elevated consoles were not verified. Details i
 Covered: tabs expose TabItem with selection state; the new-tab and overflow
 buttons have real names instead of their painted glyphs; the integrated
 title bar's minimize, maximize/restore and close buttons are named, invokable
-Button elements (since 1.3.131); the docked-search
+Button elements (since 1.3.125); the docked-search
 toggles expose Toggle state; the search result count and host banners are
 live regions; the terminal scrollbar exposes RangeValue; and the command
 palette and settings sections expose list and selection semantics. Terminal

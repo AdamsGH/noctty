@@ -4422,8 +4422,8 @@ pub const App = struct {
     /// Whether the current core-app tick already spent its one synchronous
     /// renderer paint. See `rendererTickRepaintMode`.
     renderer_sync_paint_spent: bool = false,
-    /// Hyperlink hover-dwell tracker. Reset via `dismiss()` whenever
-    /// focus leaves a surface or a click arrives.
+    /// Hyperlink hover-dwell tracker, meant to be reset via `dismiss()`
+    /// whenever focus leaves a surface or a click arrives.
     ///
     /// Not driven yet: initialized here and in a test, but nothing calls
     /// `onMouseMove`, `tick` or `dismiss` outside its own tests, and the

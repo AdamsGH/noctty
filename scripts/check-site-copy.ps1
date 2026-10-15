@@ -28,7 +28,7 @@ $forbiddenRules = @(
     @{ Pattern = "silent auto-update"; Reason = "Updater apply must stay user-initiated." },
     @{ Pattern = "releases are unsigned"; Reason = "Release copy should reflect the signed-release track." },
     @{ Pattern = "currently unsigned"; Reason = "Release copy should reflect the signed-release track." },
-    @{ Pattern = "(?i)update checks? per launch"; Regex = $true; Reason = "The updater checks at most once per 24 hours (throttle_seconds in src/update/github_releases.zig), not on every launch." },
+    @{ Pattern = "(?i)update checks? per launch"; Regex = $true; Reason = "The updater skips the check for 24 hours after a successful one (throttle_seconds in src/update/github_releases.zig), so it is not once per launch." },
     @{ Pattern = "allowDowngrade"; Reason = "The latest-release fetch must never downgrade the compiled site version." },
     @{ Pattern = "full parity"; Reason = "Avoid overclaiming protocol or platform parity." },
     @{ Pattern = "The Ghostty you know and love"; Reason = "Avoid broad compatibility claims that exceed the documented shared core." },

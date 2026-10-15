@@ -202,7 +202,7 @@ Unix-like shells such as Git Bash. WSL sessions manage their own
 integration inside the distribution. PowerShell integration emits OSC 7
 working-directory updates and OSC 133 prompt markers.
 
-noctty does not inject anything into `wsl.exe` profiles, so a WSL shell reports
+noctty injects no shell integration into `wsl.exe` profiles, so a WSL shell reports
 no working directory until its startup file does, so a new tab or split from
 it starts in the profile's own directory (the home folder for the built-in WSL
 profiles, which launch with `--cd ~`), not where you were. To report the
@@ -739,11 +739,14 @@ when at least two swaps are present and the time difference is positive.
 Key events are translated with the active Windows keyboard layout, so the
 terminal receives the text a key produces on that layout rather than a
 US-layout approximation. Control chords are encoded from the unmodified
-layout text: `ctrl+c` sends `0x03`. `ctrl+,` and `ctrl+.` have no C0 byte,
-and `ctrl+m`, `ctrl+i` and `ctrl+[` would collide with Enter (`0x0D`), Tab
-(`0x09`) and Escape (`0x1B`), so all five send the fixterms
-`CSI <codepoint>;5u` form that editors such as Neovim and Helix understand
-and that lets them tell the chords apart from those keys.
+layout text: `ctrl+c` sends `0x03`. While no application has enabled the Kitty
+keyboard protocol, `ctrl+m`, `ctrl+i` and `ctrl+[` send their console C0
+bytes (`0x0D`, `0x09`, `0x1B`), so they are the same as Enter, Tab and
+Escape, and `ctrl+,` and `ctrl+.` have no C0 byte and send their plain text.
+An application that enables the protocol, as Neovim and Helix can, receives
+the fixterms `CSI <codepoint>;5u` form for these chords and can tell them
+apart. In ConPTY's Win32 input mode the keys travel as console key records
+instead; see [windows-vt-conformance.md](windows-vt-conformance.md#measured-win32-input-mode-records).
 
 AltGr is a layout shift, not a Ctrl+Alt chord. Windows synthesizes left Ctrl
 plus right Alt whenever AltGr is pressed, and noctty drops that synthetic

@@ -149,11 +149,12 @@ Logging to `stderr` is always available. Debug builds also emit
 additional diagnostic output.
 
 Opt-in traces are off unless their environment variable is set:
-`NOCTTY_RENDER_TRACE_FILE` and `NOCTTY_TERMIO_TRACE_FILE` each take an
-absolute path and write one JSON document (the render trace is described in
-[docs/windows.md](docs/windows.md)), and `NOCTTY_HANDOFF_TRACE=1` appends to
-`%LOCALAPPDATA%\noctty\handoff.log`. Nothing writes a log file to the working
-directory.
+`NOCTTY_RENDER_TRACE_FILE` and `NOCTTY_TERMIO_TRACE_FILE` name a file that
+receives one JSON document (use an absolute path; the render trace is
+described in [docs/windows.md](docs/windows.md)), and `NOCTTY_HANDOFF_TRACE=1`
+appends to `%LOCALAPPDATA%\noctty\handoff.log`. Other `NOCTTY_*_TRACE_FILE`
+variables serve the benchmark and IME harnesses. No default log file is
+written to the working directory.
 
 ## Formatting
 

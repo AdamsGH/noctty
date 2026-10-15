@@ -5,7 +5,7 @@ Windows. Cells stay short; rows with real nuance point into the
 [Notes](#notes) section below. Update rows when Windows behavior changes or
 when upstream docs add or remove a surface that this fork cares about.
 
-Last reviewed: 2026-09-02.
+Last reviewed: 2026-10-15 (renderer, handoff, graphics and inert-settings notes; other rows 2026-09-02).
 
 ## Status legend
 
@@ -346,20 +346,20 @@ supported on Windows", so nobody there toggles it and waits for a change.
 ### Settings accepted without effect
 
 noctty keeps the full upstream configuration surface so that a shared config
-file loads, and no key-specific code warns about a key that has no Windows
-consumer. Searching `src/` (outside `Config.zig`, the doc generators and the tests'
-deny-lists) on `e6dae0919` finds no reader for these keys, so setting them
-changes nothing on Windows:
+file loads, and only `background-blur` (below) logs a warning when it is set.
+Searching `src/` (outside `Config.zig`, the doc generators and the tests'
+deny-lists) on `e6dae0919` finds no code that acts on these keys, so setting
+them changes nothing on Windows:
 
-- `focus-follows-mouse`, `window-inherit-font-size` and
-  `resize-overlay-position`: the Win32 runtime has no code for them (a new
+- `focus-follows-mouse`, `window-inherit-font-size`, `resize-overlay`,
+  `resize-overlay-position` and `resize-overlay-duration`: the Win32 runtime has no code for them (a new
   window or tab does not inherit an adjusted font size).
 - `bell-features`, `bell-audio-path` and `bell-audio-volume`: a bell, and the
   bell part of `notify-on-command-finish-action`, always plays the system
   `MessageBeep`; the attention, title and border features and the custom
   sound are not implemented.
-- `quick-terminal-space-behavior`: parsed into the quick-terminal settings and
-  never read.
+- `quick-terminal-space-behavior`: copied into the quick-terminal settings,
+  where nothing reads it.
 - The GTK and X11 keys: `gtk-opengl-debug`, `gtk-single-instance`,
   `gtk-custom-css`, `gtk-quick-terminal-layer`, `gtk-quick-terminal-namespace`,
   `gtk-titlebar`, `gtk-titlebar-style`, `gtk-titlebar-hide-when-maximized`,
