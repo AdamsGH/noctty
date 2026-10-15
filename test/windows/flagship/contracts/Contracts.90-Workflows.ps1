@@ -110,12 +110,15 @@ $windowsArmWorkflow = Join-Path $repoRoot '.github\workflows\windows-arm64.yml'
 $windowsArmWorkflowText = Get-Content -LiteralPath $windowsArmWorkflow -Raw
 $windowsHostedJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows' -Source $testWorkflow
 foreach ($shellCase in @(
-        @{ Name = 'PowerShell shell integration tests (PowerShell 7)'; Shell = 'pwsh' },
-        @{ Name = 'PowerShell shell integration tests (Windows PowerShell 5.1)'; Shell = 'powershell' }
+        @{ Name = 'PowerShell shell integration tests (PowerShell 7)'; Shell = 'pwsh'; Script = 'powershell-shell-integration' },
+        @{ Name = 'PowerShell shell integration tests (Windows PowerShell 5.1)'; Shell = 'powershell'; Script = 'powershell-shell-integration' },
+        @{ Name = 'Bash shell integration tests (Git Bash)'; Shell = 'pwsh'; Script = 'bash-shell-integration' }
     )) {
     $step = Get-YamlStepBlock -Content $windowsHostedJob -Name $shellCase.Name -Source $testWorkflow
-    if ($step -notmatch ('(?m)^\s+shell: ' + $shellCase.Shell + '\s*$') -or
-        $step -notmatch 'run: ./test/windows/powershell-shell-integration\.ps1') {
+    # Step fields sit at eight spaces; the lines of a `run: |` body sit deeper,
+    # so a script name in a comment or string there does not count.
+    if ($step -notmatch ('(?m)^ {8}shell: ' + $shellCase.Shell + '\s*$') -or
+        $step -notmatch ('(?m)^ {8}run: \./test/windows/' + $shellCase.Script + '\.ps1\s*$')) {
         throw "Missing behavioural shell-integration coverage: $($shellCase.Name)"
     }
 }
@@ -148,6 +151,7 @@ foreach ($coverage in @(
         @{ Job = $windowsHostedJob; Steps = @(
                 'PowerShell shell integration tests (PowerShell 7)',
                 'PowerShell shell integration tests (Windows PowerShell 5.1)',
+                'Bash shell integration tests (Git Bash)',
                 'Interactive hints contract checks'
             ) },
         @{ Job = $libVtJob; Steps = @('Run libghostty-vt and C API tests') }

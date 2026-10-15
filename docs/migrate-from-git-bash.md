@@ -24,10 +24,14 @@ on the
 ## 2. Launch the detected Git Bash profile
 
 Press `Ctrl+Shift+P`, search for Git Bash, and select that profile. Noctty finds
-the Git for Windows Bash executable and launches it as an interactive login
-shell (`--login -i`). Shell integration is automatic for directly launched
-Unix-like shells, so prompt marks and working-directory reporting work without
-replacing Bash's line editor.
+the Git for Windows Bash executable (the install `git.exe` belongs to, then the
+one Git's installer registered, then a `bash.exe` on `PATH` that is not WSL's
+launcher). That last step can pick up an MSYS2 or Cygwin `bash.exe`, which
+Noctty still lists as Git Bash and integrates the same way. It launches the
+shell as an interactive login shell (`--login -i`). Shell
+integration is automatic for directly launched Unix-like shells, so prompt
+marks, exit statuses and working-directory reporting work without replacing
+Bash's line editor.
 
 If the profile is missing, confirm Git for Windows is installed, then set the
 command explicitly in `%LOCALAPPDATA%\noctty\config.ghostty`. The path contains

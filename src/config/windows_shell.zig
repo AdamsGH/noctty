@@ -1288,22 +1288,166 @@ fn lookupExecutable(alloc: Allocator, exe: []const u8) !?[]u8 {
     return try internal_os.path.expand(alloc, exe);
 }
 
+/// Git for Windows' `bash.exe`, from the most to the least trustworthy source:
+/// the install that `git.exe` on PATH belongs to, the install its installer
+/// registered, and last a `bash.exe` on PATH that is not a WSL launcher.
+///
+/// The last source can name a `bash.exe` that is not Git's, such as MSYS2's or
+/// Cygwin's; it is still offered as the "Git Bash" profile, as it was before
+/// this lookup existed, and gets the same automatic shell integration.
+///
+/// A plain PATH search is not enough. The installer puts only `Git\cmd` on
+/// PATH, so on a machine with WSL the first `bash.exe` is the launcher in
+/// System32, and the "Git Bash" profile would open a Linux distribution.
 fn lookupGitBash(alloc: Allocator, lookup: anytype) !?[]u8 {
-    if (try lookup(alloc, "bash.exe")) |path| return path;
+    return try lookupGitBashWithHost(alloc, lookup, GitBashHost);
+}
 
-    if (try lookup(alloc, "git.exe")) |git_path| {
-        defer alloc.free(git_path);
+/// Hives `GitBashHost.registryInstallRoot` reads: HKCU, then HKLM.
+const git_registry_hives = 2;
 
-        const git_dir = std.fs.path.dirname(git_path) orelse return null;
-        const root = std.fs.path.dirname(git_dir) orelse return null;
-        const candidate = try std.fs.path.join(alloc, &.{ root, "bin", "bash.exe" });
-        errdefer alloc.free(candidate);
-
-        std.fs.accessAbsolute(candidate, .{}) catch return null;
-        return candidate;
+const GitBashHost = struct {
+    fn fileExists(path: []const u8) bool {
+        std.fs.cwd().access(path, .{}) catch return false;
+        return true;
     }
 
+    /// `InstallPath` of the Git for Windows installer in hive `index`: the
+    /// per-user install (0) is tried before the all-users one (1).
+    fn registryInstallRoot(alloc: Allocator, index: usize) !?[]u8 {
+        // Tests must not depend on whether this machine has Git installed.
+        if (builtin.is_test) return null;
+        const hives = [git_registry_hives]windows.HKEY{ windows.HKEY_CURRENT_USER, windows.HKEY_LOCAL_MACHINE };
+        return try registryString(
+            alloc,
+            hives[index],
+            std.unicode.utf8ToUtf16LeStringLiteral("SOFTWARE\\GitForWindows"),
+            std.unicode.utf8ToUtf16LeStringLiteral("InstallPath"),
+        );
+    }
+
+    fn systemRoot(alloc: Allocator) ![]u8 {
+        return std.process.getEnvVarOwned(alloc, "SystemRoot") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound, error.InvalidWtf8 => try alloc.dupe(u8, "C:\\Windows"),
+            else => |e| return e,
+        };
+    }
+};
+
+/// A non-empty `REG_SZ` value as UTF-8, or null when the key or value is
+/// missing, not a string, or empty.
+fn registryString(
+    alloc: Allocator,
+    hive: windows.HKEY,
+    subkey: [*:0]const u16,
+    name: [*:0]const u16,
+) !?[]u8 {
+    var buf: [windows.PATH_MAX_WIDE:0]u16 = undefined;
+    var bytes: windows.DWORD = @sizeOf(@TypeOf(buf));
+    const status = windows.advapi32.RegGetValueW(
+        hive,
+        subkey,
+        name,
+        windows.advapi32.RRF.RT_REG_SZ | windows.advapi32.RRF.ZEROONFAILURE,
+        null,
+        @ptrCast(&buf),
+        &bytes,
+    );
+    if (status != @intFromEnum(windows.Win32Error.SUCCESS)) return null;
+    // The size counts the terminator.
+    if (bytes < @sizeOf(u16) or bytes % @sizeOf(u16) != 0) return null;
+    const len = bytes / @sizeOf(u16) - 1;
+    if (len == 0) return null;
+    // WTF-8 holds any registry text, an unpaired surrogate included.
+    return try std.unicode.wtf16LeToWtf8Alloc(alloc, buf[0..len]);
+}
+
+fn lookupGitBashWithHost(alloc: Allocator, lookup: anytype, comptime Host: type) !?[]u8 {
+    if (try lookup(alloc, "git.exe")) |git_path| {
+        defer alloc.free(git_path);
+        if (try gitBashBesideGit(alloc, git_path, Host)) |path| return path;
+    }
+
+    // A hive can name an install that was removed while the other holds a
+    // working one, so each root is checked before the next hive is read.
+    for (0..git_registry_hives) |hive| {
+        const root = (try Host.registryInstallRoot(alloc, hive)) orelse continue;
+        defer alloc.free(root);
+        const candidate = try std.fs.path.join(alloc, &.{ root, "bin", "bash.exe" });
+        if (Host.fileExists(candidate)) return candidate;
+        alloc.free(candidate);
+    }
+
+    const path = (try lookup(alloc, "bash.exe")) orelse return null;
+    errdefer alloc.free(path);
+    const system_root = try Host.systemRoot(alloc);
+    defer alloc.free(system_root);
+    if (isWslBashLauncher(path, system_root)) {
+        alloc.free(path);
+        return null;
+    }
+    return path;
+}
+
+/// `bin\bash.exe` of the Git install `git_path` belongs to. `git.exe` lives in
+/// `cmd` (what the installer adds to PATH), in `bin`, or in a MinGW
+/// environment's `bin` (`mingw64\bin`); any other folder is not recognised as
+/// part of an install, so a shim or an unrelated `git.exe` leads nowhere.
+fn gitBashBesideGit(alloc: Allocator, git_path: []const u8, comptime Host: type) !?[]u8 {
+    const dir = std.fs.path.dirname(git_path) orelse return null;
+    var root = std.fs.path.dirname(dir) orelse return null;
+    const leaf = std.fs.path.basename(dir);
+    if (std.ascii.eqlIgnoreCase(leaf, "bin")) {
+        const env = std.fs.path.basename(root);
+        if (std.ascii.startsWithIgnoreCase(env, "mingw") or
+            std.ascii.eqlIgnoreCase(env, "ucrt64") or
+            std.ascii.eqlIgnoreCase(env, "clang64") or
+            std.ascii.eqlIgnoreCase(env, "clangarm64"))
+        {
+            root = std.fs.path.dirname(root) orelse return null;
+        }
+    } else if (!std.ascii.eqlIgnoreCase(leaf, "cmd")) {
+        return null;
+    }
+
+    const candidate = try std.fs.path.join(alloc, &.{ root, "bin", "bash.exe" });
+    if (Host.fileExists(candidate)) return candidate;
+    alloc.free(candidate);
     return null;
+}
+
+/// True for the `bash.exe` that starts WSL: the launcher in System32 (or its
+/// SysWOW64 and Sysnative views) and the WindowsApps alias. Neither is Git
+/// Bash, and shell integration cannot reach into the Linux side (the
+/// environment it relies on does not cross into WSL), so a bash started there
+/// would stay in POSIX mode.
+fn isWslBashLauncher(path: []const u8, system_root: []const u8) bool {
+    if (pathIsUnder(path, system_root)) return true;
+    var it = std.mem.tokenizeAny(u8, path, "/\\");
+    while (it.next()) |component| {
+        if (std.ascii.eqlIgnoreCase(component, "WindowsApps")) return true;
+    }
+    return false;
+}
+
+/// Whether `path` is `dir` or below it, ignoring case and the kind of
+/// separator, as Windows does.
+fn pathIsUnder(path: []const u8, dir: []const u8) bool {
+    const root = std.mem.trimRight(u8, dir, "/\\");
+    if (root.len == 0 or path.len <= root.len) return false;
+    for (root, path[0..root.len]) |a, b| {
+        if (isSeparator(a) and isSeparator(b)) continue;
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return isSeparator(path[root.len]);
+}
+
+/// `isWslBashLauncher` for a path from the command line, which shell
+/// integration must leave alone.
+pub fn isWslBashLauncherPath(alloc: Allocator, path: []const u8) !bool {
+    const system_root = try GitBashHost.systemRoot(alloc);
+    defer alloc.free(system_root);
+    return isWslBashLauncher(path, system_root);
 }
 
 const WslOutputDrain = struct {
@@ -1724,20 +1868,199 @@ test "defaultCommandNoWslWithLookup skips wsl and prefers pwsh" {
     try testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", command.direct[0]);
 }
 
-test "lookupGitBash infers Git Bash from git.exe" {
+/// A machine for `lookupGitBashWithHost`: the files that exist and the install
+/// the Git installer registered in HKCU and HKLM. SystemRoot is `C:\WINDOWS`.
+fn FakeGitBashHost(
+    comptime files: []const []const u8,
+    comptime registry: [git_registry_hives]?[]const u8,
+) type {
+    return struct {
+        fn fileExists(path: []const u8) bool {
+            inline for (files) |file| {
+                if (std.ascii.eqlIgnoreCase(file, path)) return true;
+            }
+            return false;
+        }
+
+        fn registryInstallRoot(a: Allocator, index: usize) !?[]u8 {
+            return if (registry[index]) |root| try a.dupe(u8, root) else null;
+        }
+
+        fn systemRoot(a: Allocator) ![]u8 {
+            return try a.dupe(u8, "C:\\WINDOWS");
+        }
+    };
+}
+
+/// A PATH holding `git` and `bash`, each possibly absent.
+fn PathLookup(comptime git: ?[]const u8, comptime bash: ?[]const u8) type {
+    return struct {
+        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
+            const found = if (std.mem.eql(u8, exe, "git.exe")) git else if (std.mem.eql(u8, exe, "bash.exe")) bash else null;
+            return if (found) |path| try a.dupe(u8, path) else null;
+        }
+    };
+}
+
+fn expectGitBash(expected: ?[]const u8, actual: ?[]u8) !void {
+    defer if (actual) |path| std.testing.allocator.free(path);
+    if (expected) |want| {
+        try std.testing.expectEqualStrings(want, actual orelse return error.TestExpectedEqual);
+    } else {
+        try std.testing.expect(actual == null);
+    }
+}
+
+const test_wsl_launcher = "C:\\WINDOWS\\system32\\bash.exe";
+const test_git_bash = "C:\\Program Files\\Git\\bin\\bash.exe";
+
+test "lookupGitBash takes the install git.exe belongs to over a WSL launcher earlier on PATH" {
+    const alloc = std.testing.allocator;
+    // The installer puts only Git\cmd on PATH; System32 holds WSL's bash.exe.
+    try expectGitBash(test_git_bash, try lookupGitBashWithHost(
+        alloc,
+        PathLookup("C:\\Program Files\\Git\\cmd\\git.exe", test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{test_git_bash}, .{ null, null }),
+    ));
+    // git.exe in bin, and in mingw64\bin, name the same install.
+    try expectGitBash(test_git_bash, try lookupGitBashWithHost(
+        alloc,
+        PathLookup("C:\\Program Files\\Git\\bin\\git.exe", test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{test_git_bash}, .{ null, null }),
+    ));
+    try expectGitBash(test_git_bash, try lookupGitBashWithHost(
+        alloc,
+        PathLookup("C:\\Program Files\\Git\\mingw64\\bin\\git.exe", test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{test_git_bash}, .{ null, null }),
+    ));
+    // A MinGit without bash does not borrow a bash.exe from a folder above its install.
+    try expectGitBash(null, try lookupGitBashWithHost(
+        alloc,
+        PathLookup("C:\\X\\Git\\cmd\\git.exe", null).lookup,
+        FakeGitBashHost(&.{"C:\\X\\bin\\bash.exe"}, .{ null, null }),
+    ));
+}
+
+test "lookupGitBash falls back to the registered install, then to a PATH bash that is not WSL" {
+    const alloc = std.testing.allocator;
+    // No git.exe on PATH (the installer's "Git Bash only" choice): the registry names the install.
+    try expectGitBash(test_git_bash, try lookupGitBashWithHost(
+        alloc,
+        PathLookup(null, test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{test_git_bash}, .{ null, "C:\\Program Files\\Git" }),
+    ));
+    // A git.exe whose install has no bash.exe (a shim, a stale entry) is skipped.
+    try expectGitBash(test_git_bash, try lookupGitBashWithHost(
+        alloc,
+        PathLookup("C:\\Users\\me\\scoop\\shims\\git.exe", test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{test_git_bash}, .{ null, "C:\\Program Files\\Git" }),
+    ));
+    // HKCU names a removed per-user install; the all-users one in HKLM still works.
+    try expectGitBash(test_git_bash, try lookupGitBashWithHost(
+        alloc,
+        PathLookup(null, test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{test_git_bash}, .{ "C:\\Users\\me\\AppData\\Local\\Programs\\Git", "C:\\Program Files\\Git" }),
+    ));
+    // The registry points at deleted installs: PATH is next.
+    try expectGitBash("C:\\msys64\\usr\\bin\\bash.exe", try lookupGitBashWithHost(
+        alloc,
+        PathLookup(null, "C:\\msys64\\usr\\bin\\bash.exe").lookup,
+        FakeGitBashHost(&.{}, .{ "C:\\Gone\\Git", "C:\\Gone\\Too" }),
+    ));
+}
+
+test "lookupGitBash offers no Git Bash when only WSL's bash.exe exists" {
+    const alloc = std.testing.allocator;
+    try expectGitBash(null, try lookupGitBashWithHost(
+        alloc,
+        PathLookup(null, test_wsl_launcher).lookup,
+        FakeGitBashHost(&.{}, .{ null, null }),
+    ));
+    try expectGitBash(null, try lookupGitBashWithHost(
+        alloc,
+        PathLookup(null, "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe").lookup,
+        FakeGitBashHost(&.{}, .{ null, null }),
+    ));
+    try expectGitBash(null, try lookupGitBashWithHost(
+        alloc,
+        PathLookup(null, null).lookup,
+        FakeGitBashHost(&.{}, .{ null, null }),
+    ));
+}
+
+test "registryString reads a string value and nothing else" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
+    const Reg = struct {
+        extern "advapi32" fn RegCreateKeyExW(
+            key: windows.HKEY,
+            sub: [*:0]const u16,
+            reserved: windows.DWORD,
+            class: ?[*:0]const u16,
+            options: windows.DWORD,
+            sam: windows.DWORD,
+            security: ?*anyopaque,
+            result: *windows.HKEY,
+            disposition: ?*windows.DWORD,
+        ) callconv(.winapi) i32;
+        extern "advapi32" fn RegSetValueExW(
+            key: windows.HKEY,
+            name: [*:0]const u16,
+            reserved: windows.DWORD,
+            kind: windows.DWORD,
+            data: [*]const u8,
+            size: windows.DWORD,
+        ) callconv(.winapi) i32;
+        extern "advapi32" fn RegDeleteKeyW(key: windows.HKEY, sub: [*:0]const u16) callconv(.winapi) i32;
+    };
+    const reg_sz: windows.DWORD = 1;
+    const reg_dword: windows.DWORD = 4;
+    const key_write: windows.DWORD = 0x20006;
 
-    const path = (try lookupGitBash(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "bash.exe")) return null;
-            if (std.mem.eql(u8, exe, "git.exe")) return try a.dupe(u8, "C:\\Program Files\\Git\\cmd\\git.exe");
-            return null;
-        }
-    }.lookup)).?;
-    defer alloc.free(path);
+    // A key of this test's own, under HKCU, deleted at the end.
+    const key_name = try std.fmt.allocPrint(alloc, "Software\\noctty-test-pkg17-{d}", .{windows.GetCurrentProcessId()});
+    defer alloc.free(key_name);
+    const subkey = try std.unicode.utf8ToUtf16LeAllocZ(alloc, key_name);
+    defer alloc.free(subkey);
+    const value = std.unicode.utf8ToUtf16LeStringLiteral("InstallPath");
 
-    try testing.expectEqualStrings("C:\\Program Files\\Git\\bin\\bash.exe", path);
+    try testing.expect((try registryString(alloc, windows.HKEY_CURRENT_USER, subkey, value)) == null);
+
+    var key: windows.HKEY = undefined;
+    try testing.expectEqual(@as(i32, 0), Reg.RegCreateKeyExW(windows.HKEY_CURRENT_USER, subkey, 0, null, 0, key_write, null, &key, null));
+    defer _ = Reg.RegDeleteKeyW(windows.HKEY_CURRENT_USER, subkey);
+    defer _ = windows.advapi32.RegCloseKey(key);
+
+    // Present but not a string.
+    const number: windows.DWORD = 7;
+    try testing.expectEqual(@as(i32, 0), Reg.RegSetValueExW(key, value, 0, reg_dword, @ptrCast(&number), @sizeOf(windows.DWORD)));
+    try testing.expect((try registryString(alloc, windows.HKEY_CURRENT_USER, subkey, value)) == null);
+
+    // Empty.
+    const empty = [_]u16{0};
+    try testing.expectEqual(@as(i32, 0), Reg.RegSetValueExW(key, value, 0, reg_sz, @ptrCast(&empty), @sizeOf(@TypeOf(empty))));
+    try testing.expect((try registryString(alloc, windows.HKEY_CURRENT_USER, subkey, value)) == null);
+
+    const root = std.unicode.utf8ToUtf16LeStringLiteral("C:\\Program Files\\Git");
+    try testing.expectEqual(@as(i32, 0), Reg.RegSetValueExW(key, value, 0, reg_sz, @ptrCast(root), @intCast((root.len + 1) * @sizeOf(u16))));
+    const got = (try registryString(alloc, windows.HKEY_CURRENT_USER, subkey, value)).?;
+    defer alloc.free(got);
+    try testing.expectEqualStrings("C:\\Program Files\\Git", got);
+}
+
+test "isWslBashLauncher matches the Windows folders whatever the case or separator" {
+    const root = "C:\\WINDOWS";
+    try std.testing.expect(isWslBashLauncher("C:\\WINDOWS\\system32\\bash.exe", root));
+    try std.testing.expect(isWslBashLauncher("c:\\windows\\System32\\bash.exe", root));
+    try std.testing.expect(isWslBashLauncher("C:/Windows/Sysnative/bash.exe", root));
+    try std.testing.expect(isWslBashLauncher("C:\\Windows\\SysWOW64\\bash.exe", "C:\\Windows\\"));
+    try std.testing.expect(isWslBashLauncher("C:\\Users\\me\\AppData\\Local\\Microsoft\\windowsapps\\bash.exe", root));
+
+    try std.testing.expect(!isWslBashLauncher("C:\\Program Files\\Git\\usr\\bin\\bash.exe", root));
+    // A sibling folder that only shares the prefix, and the root itself.
+    try std.testing.expect(!isWslBashLauncher("C:\\Windows.old\\bash.exe", root));
+    try std.testing.expect(!isWslBashLauncher("C:\\WINDOWS", root));
 }
 
 test "listProfilesWithLookupAndProbeAndWslList enumerates windows profiles" {

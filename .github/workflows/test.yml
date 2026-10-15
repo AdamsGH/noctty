@@ -52,6 +52,10 @@ jobs:
         shell: powershell
         run: ./test/windows/powershell-shell-integration.ps1
 
+      - name: Bash shell integration tests (Git Bash)
+        shell: pwsh
+        run: ./test/windows/bash-shell-integration.ps1
+
       - name: Site copy checks
         shell: pwsh
         run: ./scripts/check-site-copy.ps1

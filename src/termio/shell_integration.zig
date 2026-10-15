@@ -112,6 +112,16 @@ pub fn setup(
                 shell_fallback = shell != .powershell;
             }
         }
+
+        // WSL's bash.exe launcher starts a Linux distribution, which neither
+        // sees the ENV and GHOSTTY_* variables injection relies on (WSLENV
+        // does not list them) nor leaves the `--posix` it would be given.
+        if (shell == .bash) {
+            var bash_iter = try command.argIterator(alloc_arena);
+            defer bash_iter.deinit();
+            const bash = bash_iter.next() orelse return null;
+            if (try windows_shell.isWslBashLauncherPath(alloc_arena, bash)) return null;
+        }
     }
 
     const new_command: config.Command = switch (shell) {
@@ -1938,6 +1948,37 @@ fn setupBashWithLaunchForm(
 
     // Return a copy of our modified command line to use as the shell command.
     return launch_command;
+}
+
+test "PKG17 WSL's bash.exe launcher gets no bash injection" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var res: TmpResourcesDir = try .init(alloc, .bash);
+    defer res.deinit();
+    const system_root = try std.process.getEnvVarOwned(alloc, "SystemRoot");
+    const launchers = [_][]const u8{
+        try std.fs.path.join(alloc, &.{ system_root, "System32", "bash.exe" }),
+        "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe",
+    };
+    for (launchers) |launcher| {
+        var env = EnvMap.init(alloc);
+        const result = try setup(alloc, res.path, .{
+            .direct = &.{ try alloc.dupeZ(u8, launcher), "--login", "-i" },
+        }, &env, null, false);
+        try std.testing.expect(result == null);
+        // Nothing was injected, so the launcher's environment is untouched.
+        try std.testing.expectEqual(@as(usize, 0), env.count());
+    }
+
+    // The same launch of Git's bash is integrated.
+    var env = EnvMap.init(alloc);
+    const result = (try setup(alloc, res.path, .{
+        .direct = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "--login", "-i" },
+    }, &env, null, false)).?;
+    try std.testing.expectEqual(Shell.bash, result.shell);
+    try std.testing.expect(env.get("ENV") != null);
 }
 
 test "PKG08 bash direct argv preserves Program Files and quoted arguments" {
