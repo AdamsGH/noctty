@@ -30437,6 +30437,41 @@ test "stripHtmlTags preserves plain text" {
     try testing.expectEqualStrings("no tags here", out);
 }
 
+test "copied terminal text keeps only web and mail links as anchors" {
+    const alloc = std.testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]8;;javascript:alert(1)\x1b\\evil\x1b]8;;\x1b\\ ");
+    stream.nextSlice("\x1b]8;;file://attacker/share/x\x1b\\unc\x1b]8;;\x1b\\ ");
+    stream.nextSlice("\x1b]8;;https://example.com\x1b\\good\x1b]8;;\x1b\\");
+
+    // The same formatter the mixed copy runs, then the CF_HTML envelope
+    // `Surface.writeClipboardHtml` hands the clipboard, with no clipboard
+    // involved.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var formatter: terminal.formatter.ScreenFormatter = .init(
+        t.screens.active,
+        .{ .emit = .html },
+    );
+    try formatter.format(&aw.writer);
+
+    const out = try win32_clipboard_html.wrapFragment(alloc, aw.writer.buffered());
+    defer alloc.free(out);
+    const range = win32_clipboard_html.fragmentRange(out).?;
+    const fragment = out[range.start..range.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "evil unc ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<a href=\"https://example.com\">good</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "javascript:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "file://") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fragment, "<a "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fragment, "</a>"));
+}
+
 test "win32 appendOwnedString replaces existing value and frees old allocation" {
     const testing = std.testing;
     var target: ?[:0]const u8 = null;
@@ -44839,12 +44874,21 @@ test "win32 terminal undo snapshot restores terminal state" {
     stream.nextSlice("line1\r\nline2\r\nline3");
 
     const expected_scrollbar = t.screens.active.pages.scrollbar();
+    const expected_x = t.screens.active.cursor.x;
+    const expected_y = t.screens.active.cursor.y;
+    // After "line3" the cursor is at column 5, short of the last tab stop.
+    try std.testing.expectEqual(@as(@TypeOf(expected_x), 5), expected_x);
     const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
     defer alloc.free(snapshot);
 
     t.fullReset();
 
     const restored = restoreTerminalUndoState(&t, snapshot);
+
+    // The snapshot sets the tab stops after the cursor position, which used
+    // to leave the cursor on the last stop (column 8 of 12).
+    try std.testing.expectEqual(expected_x, t.screens.active.cursor.x);
+    try std.testing.expectEqual(expected_y, t.screens.active.cursor.y);
 
     const plain = try t.plainString(alloc);
     defer alloc.free(plain);
