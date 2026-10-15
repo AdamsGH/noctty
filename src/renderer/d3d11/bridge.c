@@ -768,7 +768,9 @@ int32_t noctty_d3d11_texture_write(NocttyD3DTexture *t, uint32_t x, uint32_t y, 
     if (FAILED(hr)) return t->owner->stats.recovery_pending && !t->owner->stats.unavailable ? S_OK : hr;
     if (!t->owner->context || !t->gpu) return record_result(t->owner, E_FAIL);
     D3D11_BOX box = { x, y, 0, x + width, y + height, 1 };
-    ID3D11DeviceContext_UpdateSubresource(t->owner->context, (ID3D11Resource *)t->gpu, 0, &box, data, (UINT)pitch, 0);
+    /* Upload from the mirror recovery rebuilds from, as buffer writes do. */
+    const unsigned char *src = t->cpu + ((size_t)y * t->width + x) * t->pixel_size;
+    ID3D11DeviceContext_UpdateSubresource(t->owner->context, (ID3D11Resource *)t->gpu, 0, &box, src, (UINT)((size_t)t->width * t->pixel_size), 0);
     t->owner->stats.upload_bytes += pitch * height;
     return S_OK;
 }

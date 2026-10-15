@@ -86,7 +86,12 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
         if (candidate == .opengl) break;
         var candidate_options = options;
         candidate_options.config.renderer_backend = candidate;
-        const value = try alloc.create(D3D);
+        // An allocation failure is a candidate failure: OpenGL still gets its turn.
+        const value = alloc.create(D3D) catch |err| {
+            log.warn("{s} startup failed err={}", .{ @tagName(candidate), err });
+            result.setNotice("OpenGL: D3D11 startup failed ({s}).", .{@errorName(err)});
+            continue;
+        };
         if (D3D.init(alloc, candidate_options)) |initialized| {
             value.* = initialized;
             value.config.renderer_backend = config.renderer_backend;

@@ -61,7 +61,9 @@ if (!$Driver) {
             if ($wait.Elapsed.TotalMinutes -gt 10) { throw 'Hidden renderer driver timed out; inspect exact driver PID.' }
         }
         $code = 0; [void][RendererNative]::GetExitCodeProcess($pi.process, [ref]$code)
-        $receipt = Get-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Raw | ConvertFrom-Json
+        $receiptPath = Join-Path $OutputDirectory 'result.json'
+        if (!(Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw "Renderer parity driver exited with code $code before writing result.json." }
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
         $receipt | ConvertTo-Json -Depth 12
         if ($code -ne 0 -or $receipt.status -ne 'pass') { throw 'Renderer parity driver failed; see result.json.' }
     } finally {
