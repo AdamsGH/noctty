@@ -78,6 +78,7 @@ pub fn deinit(self: *SharedGridSet) void {
         const v = entry.value_ptr.*;
         v.grid.deinit(self.alloc);
         self.alloc.destroy(v.grid);
+        entry.value_ptr.missing.deinit(self.alloc);
     }
     self.map.deinit(self.alloc);
 
@@ -144,6 +145,9 @@ pub fn ref(
     self.lock.lock();
     defer self.lock.unlock();
 
+    var missing: MissingFamilies = .{};
+    errdefer missing.deinit(self.alloc);
+
     const gop = try self.map.getOrPut(self.alloc, key);
     if (gop.found_existing) {
         log.debug("found cached grid for font config", .{});
@@ -171,7 +175,7 @@ pub fn ref(
         // Build our collection. This is the expensive operation that
         // involves finding fonts, loading them (maybe, some are deferred),
         // etc.
-        var c = try self.collection(&key, font_size, config);
+        var c = try self.collection(&key, font_size, config, &missing);
         errdefer c.deinit(self.alloc);
 
         // Setup our enabled/disabled styles
@@ -190,8 +194,68 @@ pub fn ref(
     });
     errdefer grid.deinit(self.alloc);
 
+    gop.value_ptr.missing = missing;
     return .{ gop.key_ptr.*, gop.value_ptr.grid };
 }
+
+/// The families the grid for `key` was configured with that no installed font
+/// matched, so it shows the built-in font instead. The names are borrowed from
+/// the set and stay valid while `key` is referenced.
+pub fn missingFamilies(self: *SharedGridSet, key: Key) []const [:0]const u8 {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const entry = self.map.get(key) orelse return &.{};
+    return entry.missing.reportable();
+}
+
+/// Font families a configuration asked for and discovery found nothing for.
+pub const MissingFamilies = struct {
+    names: std.ArrayListUnmanaged([:0]const u8) = .empty,
+    /// Some family of the regular style matched an installed font.
+    regular_matched: bool = false,
+
+    pub fn deinit(self: *MissingFamilies, alloc: Allocator) void {
+        for (self.names.items) |name| alloc.free(name);
+        self.names.deinit(alloc);
+    }
+
+    /// Note that no face matched `family` for `style`. Only the regular style
+    /// counts: the bold and italic lookups ask for the same family, so a
+    /// miss there repeats the regular one or is only a missing style, which
+    /// `completeStyles` makes up. Each family is kept once, and the built-in
+    /// font's own name is no miss, since the built-in font is what it asks for.
+    pub fn note(
+        self: *MissingFamilies,
+        alloc: Allocator,
+        style: Style,
+        family: []const u8,
+    ) Allocator.Error!void {
+        if (style != .regular) return;
+        if (std.ascii.eqlIgnoreCase(family, embedded_family)) return;
+        for (self.names.items) |seen| {
+            if (std.ascii.eqlIgnoreCase(seen, family)) return;
+        }
+        const owned = try alloc.dupeZ(u8, family);
+        errdefer alloc.free(owned);
+        try self.names.append(alloc, owned);
+    }
+
+    /// Note that a face was found for `style`.
+    pub fn matched(self: *MissingFamilies, style: Style) void {
+        if (style == .regular) self.regular_matched = true;
+    }
+
+    /// The families to tell the user about: the ones named when none of the
+    /// regular style's families matched, since the built-in font is only what
+    /// is shown then. A list whose later entries are fallbacks for the first
+    /// that matched has nothing to report.
+    pub fn reportable(self: *const MissingFamilies) []const [:0]const u8 {
+        return if (self.regular_matched) &.{} else self.names.items;
+    }
+
+    /// The family name of `font.embedded.variable`.
+    const embedded_family = "JetBrains Mono";
+};
 
 /// Builds the Collection for the given configuration key and
 /// initial font size.
@@ -200,6 +264,7 @@ fn collection(
     key: *const Key,
     size: DesiredSize,
     config: *const DerivedConfig,
+    missing: *MissingFamilies,
 ) !Collection {
     // A quick note on memory management:
     // - font_lib is owned by the SharedGridSet
@@ -256,6 +321,7 @@ fn collection(
                             // No size adjustment for primary fonts.
                             .size_adjustment = .none,
                         });
+                        missing.matched(style);
 
                         continue;
                     }
@@ -296,6 +362,7 @@ fn collection(
                     field.name,
                     desc.family.?,
                 });
+                try missing.note(self.alloc, style, desc.family.?);
             }
         }
     }
@@ -458,6 +525,7 @@ pub fn deref(self: *SharedGridSet, key: Key) void {
     entry.key_ptr.deinit();
     entry.value_ptr.grid.deinit(self.alloc);
     self.alloc.destroy(entry.value_ptr.grid);
+    entry.value_ptr.missing.deinit(self.alloc);
     self.map.removeByPtr(entry.key_ptr);
 }
 
@@ -500,6 +568,7 @@ fn discover(self: *SharedGridSet) !?*Discover {
 const ReffedGrid = struct {
     grid: *SharedGrid,
     ref: u32 = 0,
+    missing: MissingFamilies = .{},
 };
 
 /// This is the configuration required to create a key without having
@@ -901,5 +970,76 @@ test "SharedGridSet builds a grid that names no font without a font scan" {
         const key, _ = try set.ref(&keycfg, .{ .points = 12 });
         defer set.deref(key);
         try testing.expect(set.font_discover.?.state == null);
+    } else return error.SkipZigTest;
+}
+
+test "MissingFamilies keeps each regular-style miss once and skips the built-in font" {
+    const testing = std.testing;
+    var missing: MissingFamilies = .{};
+    defer missing.deinit(testing.allocator);
+
+    try missing.note(testing.allocator, .regular, "Pkg22 Mono");
+    try missing.note(testing.allocator, .regular, "pkg22 mono");
+    try missing.note(testing.allocator, .regular, "Second Mono");
+    // The bold, italic and bold italic lookups ask for the same family.
+    try missing.note(testing.allocator, .bold, "Pkg22 Mono");
+    try missing.note(testing.allocator, .italic, "Only In Italic");
+    try missing.note(testing.allocator, .bold_italic, "Only In Bold Italic");
+    // The built-in font is what this family asks for.
+    try missing.note(testing.allocator, .regular, "jetbrains mono");
+
+    try testing.expectEqual(@as(usize, 2), missing.reportable().len);
+    try testing.expectEqualStrings("Pkg22 Mono", missing.reportable()[0]);
+    try testing.expectEqualStrings("Second Mono", missing.reportable()[1]);
+
+    // A family of the regular style matched (`font-family = A`, then a
+    // fallback `font-family = B`): the built-in font is not what is shown.
+    missing.matched(.bold);
+    try testing.expectEqual(@as(usize, 2), missing.reportable().len);
+    missing.matched(.regular);
+    try testing.expectEqual(@as(usize, 0), missing.reportable().len);
+}
+
+test "SharedGridSet reports a configured family that no installed font matches" {
+    if (comptime builtin.target.os.tag == .windows) {
+        const testing = std.testing;
+        const alloc = testing.allocator;
+
+        var set = try SharedGridSet.init(alloc);
+        defer set.deinit();
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.@"font-family".parseCLI(cfg._arena.?.allocator(), "Pkg22 No Such Font");
+        var keycfg = try DerivedConfig.init(alloc, &cfg);
+        defer keycfg.deinit();
+
+        const key, _ = try set.ref(&keycfg, .{ .points = 12 });
+        defer set.deref(key);
+        const missing = set.missingFamilies(key);
+        try testing.expectEqual(@as(usize, 1), missing.len);
+        try testing.expectEqualStrings("Pkg22 No Such Font", missing[0]);
+
+        // A second reference to the same grid has the same answer and adds none.
+        const key2, _ = try set.ref(&keycfg, .{ .points = 12 });
+        defer set.deref(key2);
+        try testing.expectEqual(@as(usize, 1), set.missingFamilies(key2).len);
+    } else return error.SkipZigTest;
+}
+
+test "SharedGridSet reports no miss for the default font" {
+    if (comptime builtin.target.os.tag == .windows) {
+        const testing = std.testing;
+        const alloc = testing.allocator;
+
+        var set = try SharedGridSet.init(alloc);
+        defer set.deinit();
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var keycfg = try DerivedConfig.init(alloc, &cfg);
+        defer keycfg.deinit();
+
+        const key, _ = try set.ref(&keycfg, .{ .points = 12 });
+        defer set.deref(key);
+        try testing.expectEqual(@as(usize, 0), set.missingFamilies(key).len);
     } else return error.SkipZigTest;
 }

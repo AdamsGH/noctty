@@ -35,6 +35,7 @@ pub const HelpTarget = enum {
     keyboard_shortcuts,
     settings,
     configuration,
+    config_problems,
     troubleshooting,
     diagnostics,
     accessibility,
@@ -89,6 +90,7 @@ pub const reviewed_help = [_]struct {
     .{ .target = .keyboard_shortcuts, .title = "Keyboard shortcuts", .description = "Review keyboard navigation and bindings", .keywords = "keys keybindings commands" },
     .{ .target = .settings, .title = "Open settings", .description = "Configure noctty", .keywords = "preferences options" },
     .{ .target = .configuration, .title = "Configuration guide", .description = "Learn the noctty configuration format", .keywords = "config file syntax" },
+    .{ .target = .config_problems, .title = "Config problems", .description = "Show what noctty could not use from the config file", .keywords = "errors invalid unknown key theme font diagnostics validate" },
     .{ .target = .troubleshooting, .title = "Troubleshooting", .description = "Resolve common terminal problems", .keywords = "help repair support" },
     .{ .target = .diagnostics, .title = "Export diagnostics", .description = "Create a local redacted diagnostic bundle", .keywords = "logs debug bundle" },
     .{ .target = .accessibility, .title = "Accessibility", .description = "Keyboard, screen reader, contrast, and motion guidance", .keywords = "narrator nvda contrast reduced motion" },
@@ -496,6 +498,10 @@ test "installed theme snapshot and reviewed help produce typed payloads" {
     try std.testing.expectEqualStrings("Noctty Dark", catalog.payloadFor(theme_results[0]).?.theme);
     const help_results = catalog.rank("?keyboard", .{}, &ranked_storage);
     try std.testing.expectEqual(HelpTarget.keyboard_shortcuts, catalog.payloadFor(help_results[0]).?.help);
+    // The way to the problems the banner counts is a typed row.
+    const problem_results = catalog.rank("?config problems", .{}, &ranked_storage);
+    try std.testing.expect(problem_results.len > 0);
+    try std.testing.expectEqual(HelpTarget.config_problems, catalog.payloadFor(problem_results[0]).?.help);
 }
 
 test "theme display labels do not truncate identity or invocation payloads" {

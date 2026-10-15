@@ -99,6 +99,15 @@ Save, then press `Ctrl+Shift+,` to reload without restarting.
 `noctty +show-config --default --docs | more` lists every option with its
 docs, including the keybind grammar.
 
+When the config has a mistake (an unknown key, a value that does not parse, an
+include that is missing, a theme or font that is not installed), noctty shows
+an error banner with the number of problems and the first one, and the banner
+stays until you close it. **Config problems** in the command palette opens
+Settings > Advanced, which lists the problems with their file and line where
+noctty knows them, and shows the file Settings saves to. When the list does not
+fit, or a line is cut short, `noctty +validate-config` prints the problems in
+the config files in full in a terminal.
+
 ## Keybindings
 
 Defaults are Ctrl chords, mostly the same as Ghostty's non-macOS defaults.

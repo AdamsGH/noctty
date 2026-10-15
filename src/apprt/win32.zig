@@ -10,6 +10,8 @@ const CoreSurface = @import("../Surface.zig");
 const cli_args = @import("../cli/args.zig");
 const configpkg = @import("../config.zig");
 const config_edit = @import("../config/edit.zig");
+const config_file_load = @import("../config/file_load.zig");
+const cli_diagnostics = @import("../cli/diagnostics.zig");
 const themepkg = @import("../config/theme.zig");
 const windows_shell = @import("../config/windows_shell.zig");
 const windows_ssh_hosts = @import("../config/windows_ssh_hosts.zig");
@@ -89,8 +91,10 @@ const app_delivery = @import("win32/app_delivery.zig");
 const save_target = @import("win32/save_target.zig");
 const focus_region = @import("win32/focus_region.zig");
 const first_frame = @import("win32/first_frame.zig");
+const win32_config_problems = @import("win32/config_problems.zig");
 
 test {
+    _ = @import("win32/config_problems.zig");
     _ = @import("win32/render_trace.zig");
     _ = @import("win32/gl_startup.zig");
     _ = @import("win32/pixel_format.zig");
@@ -3208,6 +3212,40 @@ fn settingsEditedValueMasked(
     return pending.changed(reloaded, comptime key);
 }
 
+/// The most bytes `settingsMaskedKeyNames` writes: every editable key, and a
+/// separator after each.
+const settings_masked_keys_capacity = capacity: {
+    var total: usize = 0;
+    for (win32_settings.editable_keys) |key| total += @tagName(key).len + 2;
+    break :capacity total;
+};
+
+/// The config keys among the user's edits whose saved value `reloaded` does
+/// not hold, because a later config file or a command-line option sets them
+/// again: comma separated, in the order the settings are listed, written to
+/// `buf`. Empty when the reload holds everything that was saved. It allocates
+/// nothing, so it cannot fail after the file was written.
+fn settingsMaskedKeyNames(
+    buf: *[settings_masked_keys_capacity]u8,
+    user_edited: SettingsEditedKeySet,
+    pending: *const configpkg.Config,
+    reloaded: *const configpkg.Config,
+) []const u8 {
+    var len: usize = 0;
+    inline for (win32_settings.editable_keys) |key| {
+        if (user_edited.isSet(@intFromEnum(key)) and settingsEditedValueMasked(pending, reloaded, key)) {
+            if (len > 0) {
+                @memcpy(buf[len..][0..2], ", ");
+                len += 2;
+            }
+            const name = @tagName(key);
+            @memcpy(buf[len..][0..name.len], name);
+            len += name.len;
+        }
+    }
+    return buf[0..len];
+}
+
 /// Whether the file now says something else, for a setting the draft changes,
 /// than both the value this session started from (`original`) and the draft:
 /// someone else changed what the user is changing. A file that agrees with the
@@ -4101,6 +4139,16 @@ pub const App = struct {
     cli_config_override_path: ?[]u8 = null,
     /// The file the last failed Settings save names in its status line.
     settings_failure_detail: win32_settings.FailureDetail = .{},
+    /// The config keys the last Settings save wrote that a later layer
+    /// overrides, comma separated, for its status line and notification.
+    settings_masked_keys: win32_settings.FailureDetail = .{},
+    /// What the config last loaded (startup, reload, Settings save) found
+    /// wrong, and the fonts it names that no installed font matches. Copies:
+    /// the config that held the diagnostics is gone after a reload.
+    config_problems: win32_config_problems.Problems = .{},
+    /// The text of the banner raised for `config_problems`, so a reload that
+    /// finds none can take that banner down, and only that one.
+    config_problems_banner: ?[]u8 = null,
     /// Startup-time cwd snapshot. `Config.load()` resolves relative
     /// `--config-file` argv entries via realpath-against-cwd, so any
     /// reload that happens after `sanitizeCurrentDirectory()` would
@@ -4340,6 +4388,9 @@ pub const App = struct {
             .notifyConflict = &settingsNotifyConflictThunk,
             .reconcileDisk = &settingsReconcileDiskThunk,
             .failureDetail = &settingsFailureDetailThunk,
+            .maskedKeys = &settingsMaskedKeysThunk,
+            .saveTarget = &settingsSaveTargetThunk,
+            .configProblems = &settingsConfigProblemsThunk,
             .notifySuccess = &settingsNotifySuccessThunk,
             .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
             .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
@@ -4513,6 +4564,14 @@ pub const App = struct {
         }
 
         if (self.windows.items.len > 0) self.markRecoveryWindowCreated();
+        // With a window up, the fonts the config names have been looked for
+        // and the problems have somewhere to show. Without one they wait in
+        // Settings and the palette.
+        if (self.windows.items.len > 0) {
+            _ = self.reportConfigProblems(&self.config);
+        } else {
+            self.recordConfigProblems(&self.config);
+        }
 
         // Armed here, released by `resolveRecoveryStartup` once the ready
         // marker is on disk. Spawning it here would let thread scheduling put
@@ -4758,6 +4817,12 @@ pub const App = struct {
             self.cli_config_override_path = null;
         }
         self.settings_failure_detail.clear(self.core_app.alloc);
+        self.settings_masked_keys.clear(self.core_app.alloc);
+        self.config_problems.deinit(self.core_app.alloc);
+        if (self.config_problems_banner) |text| {
+            self.core_app.alloc.free(text);
+            self.config_problems_banner = null;
+        }
         if (self.startup_cwd) |path| {
             self.core_app.alloc.free(path);
             self.startup_cwd = null;
@@ -7359,6 +7424,7 @@ pub const App = struct {
                             try surface.applyRuntimeConfig(&self.config);
                         }
                         self.settings_window.externalConfigChanged(&self.config, self.config_revision);
+                        self.refreshConfigProblems();
                         if (self.windows.items.len == 0) {
                             self.startQuitTimer();
                         } else {
@@ -7425,6 +7491,12 @@ pub const App = struct {
                 var config = try configpkg.Config.load(self.core_app.alloc);
                 defer config.deinit();
                 try self.core_app.updateConfig(self, &config);
+                // A reload that found problems says so, whatever
+                // `app-notifications` allows: "reloaded" would be false.
+                // The config in effect, not the one just read: the app
+                // applies its conditional state (dark system, `theme =
+                // light:A,dark:B`) before it installs it.
+                if (self.reportConfigProblems(&self.config)) return true;
                 if (self.config.@"app-notifications".@"config-reload") {
                     try self.showDesktopNotification(.app, "noctty", "Configuration reloaded");
                 }
@@ -11257,20 +11329,19 @@ pub const App = struct {
         // runtime value doesn't match. Track whether ANY field is
         // masked so we can return a distinct error variant; the
         // settings-window caller surfaces this differently from a
-        // generic write failure.
-        var any_masked = false;
-        inline for (win32_settings.editable_keys) |key| {
-            if (user_edited.isSet(@intFromEnum(key)) and settingsEditedValueMasked(pending, &reloaded, key)) {
-                std.log.warn(
-                    "settings save: field '{s}' was saved but is masked by a later config-file layer",
-                    .{@tagName(key)},
-                );
-                any_masked = true;
-            }
+        // generic write failure. The status line names the fields.
+        self.settings_masked_keys.clear(alloc);
+        var masked_buf: [settings_masked_keys_capacity]u8 = undefined;
+        const masked = settingsMaskedKeyNames(&masked_buf, user_edited, pending, &reloaded);
+        if (masked.len > 0) {
+            std.log.warn("settings save: saved but masked by a later config-file layer: {s}", .{masked});
+            self.settings_masked_keys.set(alloc, masked);
         }
 
         self.core_app.updateConfig(self, &reloaded) catch return error.ReloadFailed;
-        if (any_masked) return error.SavedButMasked;
+        // The reload read the file again, so what is wrong in it is news.
+        _ = self.reportConfigProblems(&self.config);
+        if (masked.len > 0) return error.SavedButMasked;
     }
 
     fn settingsTargetPath(self: *App, alloc: Allocator) win32_settings.SaveError![]const u8 {
@@ -11280,6 +11351,13 @@ pub const App = struct {
         // CLI path would resolve to the wrong absolute file.
         if (self.cli_config_override_path) |cli_path| return try alloc.dupe(u8, cli_path);
         return config_edit.openPath(alloc) catch error.PathResolveFailed;
+    }
+
+    /// The file a Save writes (`settingsTargetPath`), to show in Settings:
+    /// looking must not create the file or its folder. Owned.
+    fn settingsTargetPathForDisplay(self: *App, alloc: Allocator) ![]const u8 {
+        if (self.cli_config_override_path) |cli_path| return try alloc.dupe(u8, cli_path);
+        return config_file_load.preferredDefaultFilePath(alloc);
     }
 
     /// `Config.load` as the process started.
@@ -11787,6 +11865,90 @@ pub const App = struct {
         const host = surface.host orelse return false;
         try host.setBanner(kind, message);
         return true;
+    }
+
+    /// Keep a copy of what a config load found wrong, with the fonts the open
+    /// terminals could not find, for the banner, the Settings page and the
+    /// palette. The config's own diagnostics are freed with the config.
+    fn recordConfigProblems(self: *App, config: *const configpkg.Config) void {
+        const alloc = self.core_app.alloc;
+        self.config_problems.clear(alloc);
+        for (config._diagnostics.items()) |diag| {
+            if (isLaunchArgumentDiagnostic(diag, self.safe_mode)) continue;
+            self.config_problems.addDiagnostics(alloc, &.{diag}) catch |err| {
+                log.warn("config problems: could not keep a diagnostic err={}", .{err});
+            };
+        }
+        // A family is listed once, however many tabs and windows use it.
+        for (self.windows.items) |surface| {
+            if (!surface.core_initialized) continue;
+            for (surface.core().missingFontFamilies()) |family| {
+                self.config_problems.addMissingFont(alloc, family) catch |err| {
+                    log.warn("config problems: could not keep a missing font err={}", .{err});
+                };
+            }
+        }
+        self.settings_window.configProblemsChanged();
+    }
+
+    /// The config in effect changed, whoever asked: a reload, a Save, or the
+    /// system switching between light and dark under `theme =
+    /// light:A,dark:B`, which installs the other half's problems. Keep the
+    /// list current, and raise the banner only when what it says is news, so
+    /// a banner the user closed does not come back at every switch.
+    fn refreshConfigProblems(self: *App) void {
+        const before = self.config_problems.fingerprint();
+        self.recordConfigProblems(&self.config);
+        if (self.config_problems.count() == 0) return self.clearConfigProblemsBanner();
+        if (self.config_problems.fingerprint() != before) _ = self.showConfigProblemsBanner();
+    }
+
+    /// `recordConfigProblems`, then say so: an error banner with the count
+    /// and the first problem, which stays until dismissed. A load that found
+    /// none takes down the banner an earlier one raised. Returns whether
+    /// there are problems.
+    fn reportConfigProblems(self: *App, config: *const configpkg.Config) bool {
+        self.recordConfigProblems(config);
+        if (self.config_problems.count() == 0) {
+            self.clearConfigProblemsBanner();
+            return false;
+        }
+        _ = self.showConfigProblemsBanner();
+        return true;
+    }
+
+    /// Raise the banner for `config_problems`. False when there is nothing to
+    /// say or no window to say it on.
+    fn showConfigProblemsBanner(self: *App) bool {
+        const alloc = self.core_app.alloc;
+        // First, and on every host: the primary window can change between
+        // loads, an old banner on another window would no longer match the
+        // text below, and one that cannot be replaced must not stay up stale.
+        self.clearConfigProblemsBanner();
+        const text = (self.config_problems.bannerText(alloc) catch null) orelse return false;
+        // Kept so a later load that finds nothing can take down this banner,
+        // and no other.
+        self.config_problems_banner = text;
+        return self.showHostBanner(.app, .err, text) catch |err| {
+            log.warn("config problems: banner failed err={}", .{err});
+            return false;
+        };
+    }
+
+    fn clearConfigProblemsBanner(self: *App) void {
+        const alloc = self.core_app.alloc;
+        const ours = self.config_problems_banner orelse return;
+        defer {
+            alloc.free(ours);
+            self.config_problems_banner = null;
+        }
+        for (self.hosts.items) |host| {
+            const shown = host.banner_text orelse continue;
+            if (host.banner_kind != .err or !std.mem.eql(u8, shown, ours)) continue;
+            host.setBanner(.none, null) catch |err| {
+                log.warn("config problems: could not take down the banner err={}", .{err});
+            };
+        }
     }
 };
 
@@ -14991,6 +15153,14 @@ const Host = struct {
                     self.app.settings_window.openField(.font_size) catch |err| {
                         log.warn("palette help settings open failed err={}", .{err});
                         self.abortPaletteAction("Settings help could not be opened.");
+                        return;
+                    };
+                },
+                .config_problems => {
+                    self.hideOverlay();
+                    self.app.settings_window.openSection(.advanced) catch |err| {
+                        log.warn("palette config problems open failed err={}", .{err});
+                        self.abortPaletteAction("Settings could not be opened.");
                         return;
                     };
                 },
@@ -26167,10 +26337,49 @@ fn settingsReconcileDiskThunk(
     return app.settingsReconcileDisk(pending, original, true);
 }
 
+/// Whether `diag` is the loader's complaint about an argument that starts this
+/// process instead of configuring it: the `--safe-mode` switch (`global.zig`
+/// reads it, it is no config key) and the positional `wgh://activate?...` URI
+/// of an Action Center launch (`scanToastActivationArg` reads it). The loader
+/// reports both as unknown, and argv does not change, so every reload would
+/// raise them again.
+///
+/// Not a diagnostic of a file's line: that is a mistake in the file. The
+/// conditional state rebuilds a config through an iterator that has no place
+/// to give, so a rebuilt config's diagnostics come without one, and the
+/// command-line ones cannot be told apart by it. `safe_mode` is whether this
+/// process was started with `--safe-mode`.
+fn isLaunchArgumentDiagnostic(diag: cli_diagnostics.Diagnostic, safe_mode: bool) bool {
+    if (diag.location == .file) return false;
+    if (safe_mode and std.mem.eql(u8, diag.key, "safe-mode")) return true;
+    _ = win32_toast_activation.parseLaunchArg(diag.key) catch return false;
+    return true;
+}
+
 fn settingsFailureDetailThunk(ctx: *anyopaque) ?[]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return app.settings_failure_detail.text;
 }
+fn settingsMaskedKeysThunk(ctx: *anyopaque) ?[]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.settings_masked_keys.text;
+}
+fn settingsSaveTargetThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const alloc = app.core_app.alloc;
+    if (buf.len < settings_save_target_bytes + 3) return null;
+    const path = app.settingsTargetPathForDisplay(alloc) catch return null;
+    defer alloc.free(path);
+    return win32_config_problems.pathTail(buf, path, settings_save_target_bytes);
+}
+fn settingsConfigProblemsThunk(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.config_problems.listText(buf);
+}
+
+/// The most of the save target's path Settings shows; a longer path keeps
+/// its end, which is what tells files apart.
+const settings_save_target_bytes = 240;
 fn settingsSaveAndReloadThunk(
     ctx: *anyopaque,
     pending: *const configpkg.Config,
@@ -26207,6 +26416,11 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
     // Always show local chrome feedback for the Save button, even
     // when system/reload notifications are disabled.
     const alloc = app.core_app.alloc;
+    // Problems the save's reload found are an error that stays until
+    // dismissed. An info banner would replace it and then expire, and so
+    // would the banner a refused system toast falls back to, so neither is
+    // raised: the Settings status line already says the save went through.
+    if (app.config_problems.count() > 0 and app.showConfigProblemsBanner()) return;
     const banner_text = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
         title,
         if (body.len > 0) ": " else "",
@@ -27182,6 +27396,302 @@ test "win32 settings automatic command is not masked by default resolution" {
     try std.testing.expect(!settingsEditedValueMasked(&pending, &reloaded, .command));
     try settingsTestLoadText(&reloaded, "command = direct:cmd.exe\n");
     try std.testing.expect(settingsEditedValueMasked(&pending, &reloaded, .command));
+}
+
+test "win32 settings save names the edited keys a later config layer overrides" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The file holds both edits; an included file loaded after the font size
+    // sets it again, which is what a save reports as masked.
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.ghostty",
+        .data = "font-size = 14\ncopy-on-select = true\nconfig-file = later.conf\n",
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "later.conf", .data = "font-size = 18\n" });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"font-size" = 14;
+    pending.@"copy-on-select" = .true;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expectEqual(@as(usize, 2), edited.count());
+
+    var reloaded = try configpkg.Config.default(alloc);
+    defer reloaded.deinit();
+    try reloaded.loadFile(alloc, path);
+    try reloaded.loadRecursiveFiles(alloc);
+    var names_buf: [settings_masked_keys_capacity]u8 = undefined;
+    try std.testing.expectEqualStrings("font-size", settingsMaskedKeyNames(&names_buf, edited, &pending, &reloaded));
+
+    // Two keys masked are both named, in the order Settings lists them.
+    try tmp.dir.writeFile(.{ .sub_path = "later.conf", .data = "copy-on-select = false\nfont-size = 18\n" });
+    var both = try configpkg.Config.default(alloc);
+    defer both.deinit();
+    try both.loadFile(alloc, path);
+    try both.loadRecursiveFiles(alloc);
+    try std.testing.expectEqualStrings("font-size, copy-on-select", settingsMaskedKeyNames(&names_buf, edited, &pending, &both));
+
+    // A reload that holds what was saved names nothing.
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 14\ncopy-on-select = true\n" });
+    var clean = try configpkg.Config.default(alloc);
+    defer clean.deinit();
+    try clean.loadFile(alloc, path);
+    try std.testing.expectEqual(@as(usize, 0), settingsMaskedKeyNames(&names_buf, edited, &pending, &clean).len);
+
+    // Nearly every editable key masked at once still fits the buffer.
+    var everything = try configpkg.Config.default(alloc);
+    defer everything.deinit();
+    try settingsTestLoadText(&everything,
+        \\scrollback-limit = 123456
+        \\font-size = 13.25
+        \\background-opacity = 0.875
+        \\window-padding-x = 5,7
+        \\window-padding-y = 9,11
+        \\clipboard-trim-trailing-spaces = false
+        \\desktop-notifications = false
+        \\app-notifications = no-clipboard-copy,no-config-reload
+        \\confirm-close-surface = always
+        \\copy-on-select = clipboard
+        \\clipboard-read = deny
+        \\clipboard-write = deny
+        \\window-theme = dark
+        \\shell-integration = none
+        \\cursor-style = bar
+        \\window-padding-balance = true
+        \\auto-update = off
+        \\auto-update-channel = tip
+        \\font-family = Second Font
+        \\theme = light:Light,dark:Dark
+        \\command = direct:pwsh.exe -NoLogo
+    );
+    var all: SettingsEditedKeySet = .initEmpty();
+    inline for (win32_settings.editable_keys) |key| all.set(@intFromEnum(key));
+    var defaults = try configpkg.Config.default(alloc);
+    defer defaults.deinit();
+    const crowded = settingsMaskedKeyNames(&names_buf, all, &everything, &defaults);
+    try std.testing.expect(std.mem.count(u8, crowded, ", ") >= 15);
+    try std.testing.expect(std.mem.startsWith(u8, crowded, "scrollback-limit, font-size, "));
+}
+
+test "win32 config problems leave out the arguments that start the process" {
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    // What a launch from an Action Center toast and a safe-mode launch leave in
+    // argv for every later load, and two real mistakes among them.
+    // The wrapper is what the loader reads argv through; it gives each
+    // diagnostic its place on the command line.
+    var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{ .iterator = cli_args.sliceIterator(&.{
+        "--safe-mode",
+        "wgh://activate?surface=12&tab=3",
+        "--font-szie=14",
+        "stray-word",
+        "--theme=light:No1pkg22,dark:No2pkg22",
+    }) };
+    try config.loadIter(alloc, &args);
+    try config.finalize();
+    // The two launch arguments, the two mistakes and the missing light theme.
+    try std.testing.expectEqual(@as(usize, 5), config._diagnostics.items().len);
+
+    var kept: usize = 0;
+    for (config._diagnostics.items()) |diag| {
+        if (isLaunchArgumentDiagnostic(diag, true)) continue;
+        kept += 1;
+        // The mistakes, the stray word and the theme are still the user's to hear about.
+        try std.testing.expect(!std.mem.eql(u8, diag.key, "safe-mode") and !std.mem.startsWith(u8, diag.key, "wgh:"));
+    }
+    try std.testing.expectEqual(@as(usize, 3), kept);
+
+    // A process that was not started with --safe-mode has no such argument.
+    const safe_mode_complaint: cli_diagnostics.Diagnostic = .{ .location = .{ .cli = 1 }, .key = "safe-mode", .message = "unknown field" };
+    try std.testing.expect(isLaunchArgumentDiagnostic(safe_mode_complaint, true));
+    try std.testing.expect(!isLaunchArgumentDiagnostic(safe_mode_complaint, false));
+
+    // A conditional theme rebuilds the config through an iterator with no
+    // place to give: the complaints come back without one, and still go.
+    var rebuilt = (try config.changeConditionalState(.{ .theme = .dark })).?;
+    defer rebuilt.deinit();
+    var rebuilt_kept: usize = 0;
+    for (rebuilt._diagnostics.items()) |diag| {
+        try std.testing.expect(diag.location != .cli);
+        if (!isLaunchArgumentDiagnostic(diag, true)) rebuilt_kept += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), rebuilt_kept);
+
+    // A file's own line with the same text is a mistake in that file.
+    try std.testing.expect(!isLaunchArgumentDiagnostic(.{
+        .location = .{ .file = .{ .path = "C:\\c", .line = 1 } },
+        .key = "safe-mode",
+        .message = "unknown field",
+    }, true));
+}
+
+test "win32 a config with an unknown key, a bad value, a missing include and a missing theme has four problems" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.ghostty",
+        .data = "font-szie = 14\nfont-size = big\nconfig-file = missing-include.conf\ntheme = No-Such-Theme-pkg22\n",
+    });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    try config.loadFile(alloc, path);
+    try config.loadRecursiveFiles(alloc);
+    try config.finalize();
+
+    var problems: win32_config_problems.Problems = .{};
+    defer problems.deinit(alloc);
+    try problems.addDiagnostics(alloc, config._diagnostics.items());
+    var buf: [2048]u8 = undefined;
+    const list = problems.listText(&buf);
+    // The banner counts them, and the list names each with its file and line.
+    try std.testing.expectEqual(@as(usize, 4), problems.count());
+    try std.testing.expect(std.mem.indexOf(u8, list, "font-szie") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "font-size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "missing-include.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "No-Such-Theme-pkg22") != null);
+    const banner = (try problems.bannerText(alloc)).?;
+    defer alloc.free(banner);
+    try std.testing.expect(std.mem.startsWith(u8, banner, "4 config problems: "));
+}
+
+test "win32 config problems raise an error banner that only a clean load takes down" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-szie = 14\nfont-size = big\n" });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+    var broken = try configpkg.Config.default(alloc);
+    defer broken.deinit();
+    try broken.loadFile(alloc, path);
+    var clean = try configpkg.Config.default(alloc);
+    defer clean.deinit();
+
+    try std.testing.expect(app.reportConfigProblems(&broken));
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "2 config problems: font-szie: "));
+
+    // A load that finds nothing takes down this banner...
+    try std.testing.expect(!app.reportConfigProblems(&clean));
+    try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+    try std.testing.expect(host.banner_text == null);
+    try std.testing.expectEqual(@as(usize, 0), app.config_problems.count());
+
+    // ... and not another message that took its place.
+    try std.testing.expect(app.reportConfigProblems(&broken));
+    try host.setBanner(.err, "New window could not be opened.");
+    try std.testing.expect(!app.reportConfigProblems(&clean));
+    try std.testing.expectEqualStrings("New window could not be opened.", host.banner_text.?);
+    try host.setBanner(.none, null);
+}
+
+test "win32 a config change that brings other problems refreshes the list and speaks only when it is news" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+
+    // The system switched to dark under `theme = light:Installed,dark:Missing`:
+    // the config now in effect carries the other half's problem.
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "theme \"Missing\" not found" });
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(@as(usize, 1), app.config_problems.count());
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "Config problem: theme \"Missing\" not found"));
+
+    // The user closes the banner; a change that finds the same problem does
+    // not bring it back.
+    try host.setBanner(.none, null);
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+
+    // Back to light: no problem, and nothing of the old one is left.
+    app.config._diagnostics = .{};
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(@as(usize, 0), app.config_problems.count());
+    try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+
+    // A different problem is news again.
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "theme \"Other\" not found" });
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try host.setBanner(.none, null);
+}
+
+test "win32 a Settings save does not replace the config problems banner with its own" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+
+    // No problems: the save says so, as an info banner.
+    settingsNotifySuccessThunk(&app, "Settings saved", "");
+    try std.testing.expectEqual(HostBannerKind.info, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "Settings saved"));
+
+    // Problems in the file the save reloaded: the error stays, and the
+    // desktop-notification fallback (no WinRT toast here) does not take its place.
+    try app.config_problems.addDiagnostics(alloc, &.{.{ .key = "font-szie", .message = "unknown field" }});
+    settingsNotifySuccessThunk(&app, "Settings saved", "");
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "Config problem: font-szie: unknown field"));
+    try host.setBanner(.none, null);
 }
 
 test "win32 settings disk edit is a conflict only for an edited setting the file now says differently" {
@@ -38386,6 +38896,9 @@ const TestSession = struct {
                 .notifyConflict = &settingsNotifyConflictThunk,
                 .reconcileDisk = &settingsReconcileDiskThunk,
                 .failureDetail = &settingsFailureDetailThunk,
+                .maskedKeys = &settingsMaskedKeysThunk,
+                .saveTarget = &settingsSaveTargetThunk,
+                .configProblems = &settingsConfigProblemsThunk,
                 .notifySuccess = &settingsNotifySuccessThunk,
                 .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
                 .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,

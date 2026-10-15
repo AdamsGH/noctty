@@ -29,6 +29,7 @@ const focus_cue = @import("win32/focus_cue.zig");
 const win32_input = @import("win32/input.zig");
 const settings_transaction = @import("win32_settings_transaction.zig");
 const sys = @import("win32/sys.zig");
+const config_problems = @import("win32/config_problems.zig");
 const SetFocus = sys.SetFocus;
 
 /// Minimal set of Win32 aliases + externs we need here. Shared ABI structs
@@ -331,7 +332,7 @@ pub const Section = enum(u32) {
             .privacy => "What programs may do with your clipboard, links, and notifications.",
             .updates => "Whether noctty checks for updates, and which releases it follows.",
             .keybindings => "Key bindings are set in the config file. Open it here, or list the current bindings from a terminal.",
-            .advanced => "Open the config file in your text editor for settings that have no control here. Changes you have not saved yet are listed below.",
+            .advanced => "Open the config file in your text editor for settings that have no control here. The file Settings saves to, the problems found in the config, and changes you have not saved yet are listed below.",
         };
     }
 };
@@ -589,18 +590,20 @@ const StatusNote = enum {
         };
     }
 
-    /// Whether the sentence can name the file it is about (`textWithDetail`).
+    /// Whether the sentence can name what it is about (`textWithDetail`): a
+    /// file, or for a save that a later layer overrides, the settings.
     fn takesDetail(self: StatusNote) bool {
         return switch (self) {
-            .file_unopenable, .write_incomplete, .unsupported_encoding, .binary_config => true,
+            .file_unopenable, .write_incomplete, .unsupported_encoding, .binary_config, .saved_overridden => true,
             else => false,
         };
     }
 
     /// `text` with the file named: what `detail` holds is a path, or a short
-    /// phrase ending in one. Owned.
+    /// phrase ending in one; for `saved_overridden`, the config keys. Owned.
     fn textWithDetail(self: StatusNote, alloc: std.mem.Allocator, detail: []const u8) std.mem.Allocator.Error![]u8 {
         return switch (self) {
+            .saved_overridden => std.fmt.allocPrint(alloc, "Saved, but a later config file or command-line option overrides {s}, so the saved value is not used.", .{detail}),
             .unsupported_encoding => std.fmt.allocPrint(alloc, "Nothing was saved: {s} is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
             .binary_config => std.fmt.allocPrint(alloc, "Nothing was saved: {s} contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
             .file_unopenable => std.fmt.allocPrint(alloc, "Nothing was saved: {s} cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.", .{detail}),
@@ -1405,6 +1408,20 @@ fn saveFailureNote(err: SaveError) StatusNote {
     };
 }
 
+/// What the notification for a save that something overrides says. It names
+/// the settings, in the words a config file uses for them, when the app told
+/// which; the pointer to the log it used to give is gone, since a GUI launch
+/// has none to read.
+fn maskedNotificationBody(buf: []u8, keys: ?[]const u8) []const u8 {
+    const generic = "A later config file or a command-line option overrides them, so they will not take effect. Check the config-file lines and the launch options.";
+    const named = keys orelse return generic;
+    return std.fmt.bufPrint(
+        buf,
+        "{s}: a later config file or a command-line option overrides the saved value, so it will not take effect. Check the config-file lines and the launch options.",
+        .{named},
+    ) catch generic;
+}
+
 pub fn saveReloadOutcome(result: SaveError!void) SaveReloadOutcome {
     result catch |err| return switch (err) {
         error.SavedButMasked => .completed_masked,
@@ -1575,6 +1592,17 @@ pub const AppHandle = struct {
     /// whose status sentence names one (`StatusNote.takesDetail`). Borrowed
     /// until the next save.
     failureDetail: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
+    /// Optional. The config keys the save that just completed wrote and a later
+    /// config file or command-line option overrides, comma separated, for
+    /// the status line and the notification. Borrowed until the next save.
+    maskedKeys: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
+    /// Optional. The file a save writes, copied into `buf` (at least 243 bytes),
+    /// for the Advanced page; null when it cannot be resolved. Looking must not
+    /// create the file.
+    saveTarget: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
+    /// Optional. The problems the config load found, as the Advanced page lists
+    /// them (`config_problems.Problems.listText`), copied into `buf`.
+    configProblems: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
     /// Optional asynchronous two-phase persistence hook. The receiver must
     /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
     /// When absent, `saveAndReload` remains the synchronous compatibility path.
@@ -2098,7 +2126,8 @@ pub const SettingsWindow = struct {
     fn idleStatusText(self: *const SettingsWindow) []const u8 {
         switch (self.status_note) {
             // A save's result stays up whatever the draft looks like now.
-            .saved, .saved_overridden => return self.status_note.text(),
+            .saved => return self.status_note.text(),
+            .saved_overridden => return self.noteText(),
             // These are about edits that are still there to be saved.
             .save_failed,
             .unsupported_encoding,
@@ -3245,13 +3274,49 @@ pub const SettingsWindow = struct {
     fn refreshNativeSectionText(self: *SettingsWindow) void {
         setWindowTextUtf8(self.text_header, self.active_section.headerText());
         setWindowTextUtf8(self.text_summary, self.active_section.placeholderText());
-        var diff_buf: [2048]u8 = undefined;
+        // A static text holds 2047 UTF-16 units, so the page is built in as
+        // many bytes.
+        var help_buf: [2047]u8 = undefined;
         const help = switch (self.active_section) {
             .keybindings => keybindingsHelpText(),
-            .advanced => self.pendingDiffText(&diff_buf),
+            .advanced => self.advancedHelpText(&help_buf),
             else => "",
         };
         setWindowTextUtf8(self.text_help, help);
+    }
+
+    /// The app loaded the config again, so what the Advanced page lists as
+    /// wrong with it may have changed.
+    pub fn configProblemsChanged(self: *SettingsWindow) void {
+        if (self.hwnd == null) return;
+        self.refreshNativeSectionText();
+        if (self.active_section == .advanced) layoutChildren(self);
+    }
+
+    /// The Advanced page: the file a save writes, what is wrong with the config
+    /// as loaded, and the changes waiting to be saved. The first two are cut to
+    /// their share of the room (whole entries, `config_problems`); what is
+    /// left goes to the changes.
+    fn advancedHelpText(self: *const SettingsWindow, buf: []u8) []const u8 {
+        const head = buf[0..@min(buf.len, advanced_head_bytes)];
+        var len: usize = 0;
+        if (self.handle.saveTarget) |lend| {
+            var path_buf: [advanced_target_bytes]u8 = undefined;
+            if (lend(self.handle.ctx, &path_buf)) |path| {
+                config_problems.appendWhole(head, &len, "Settings saves to ");
+                config_problems.appendWhole(head, &len, path);
+                config_problems.appendWhole(head, &len, "\n\n");
+            }
+        }
+        if (self.handle.configProblems) |lend| {
+            var problems_buf: [advanced_problems_bytes]u8 = undefined;
+            config_problems.appendWhole(head, &len, lend(self.handle.ctx, &problems_buf));
+            config_problems.appendWhole(head, &len, "\n");
+        }
+        const changes = self.pendingDiffText(buf[len..]);
+        // Short answers are literals, longer ones were written into `buf`.
+        if (changes.ptr != buf[len..].ptr) config_problems.appendWhole(buf, &len, changes) else len += changes.len;
+        return buf[0..len];
     }
 
     fn setStatus(self: *SettingsWindow, text: []const u8) void {
@@ -4469,7 +4534,17 @@ pub const SettingsWindow = struct {
     fn finishSuccessfulSave(self: *SettingsWindow, masked: bool) void {
         const should_close = self.close_after_save;
         // Before anything repaints the status: the note outlives the reset.
+        self.freeNoteText();
         self.status_note = if (masked) .saved_overridden else .saved;
+        // The settings the save wrote that something later overrides, by the
+        // names a config file knows them by.
+        const masked_keys: ?[]const u8 = if (masked)
+            if (self.handle.maskedKeys) |lend| lend(self.handle.ctx) else null
+        else
+            null;
+        if (masked_keys) |keys| {
+            self.note_text = StatusNote.saved_overridden.textWithDetail(self.handle.alloc, keys) catch null;
+        }
         self.adoptCurrentConfig() catch |err| {
             std.log.err("settings: failed to refresh saved config snapshot err={}", .{err});
             if (should_close) self.cancelClosePrompt();
@@ -4478,10 +4553,12 @@ pub const SettingsWindow = struct {
         self.refreshAllControls();
         self.updateSaveEnabled();
         if (masked) {
+            var body_buf: [1024]u8 = undefined;
+            const body = maskedNotificationBody(&body_buf, masked_keys);
             self.handle.notifySuccess(
                 self.handle.ctx,
                 "Settings saved, but some values are overridden",
-                "A later config file or a command-line option overrides them, so they will not take effect. Check the config-file lines and the launch options.",
+                body,
             );
         } else {
             self.handle.notifySuccess(self.handle.ctx, "Settings saved", "");
@@ -4580,6 +4657,13 @@ pub const SettingsWindow = struct {
                 _ = SetFocus(button);
             }
         }
+    }
+
+    /// Open Settings on `section`, with focus on its rail button.
+    pub fn openSection(self: *SettingsWindow, section: Section) !void {
+        try self.open();
+        self.setActiveSection(section);
+        if (self.sectionButton(section)) |button| _ = SetFocus(button);
     }
 
     /// Bring the settings window up. Idempotent: a subsequent open
@@ -8366,6 +8450,97 @@ test "settings pending changes drop a line that does not fit, not the lines befo
     try std.testing.expect(std.unicode.utf8ValidateSlice(text));
 }
 
+test "settings a save that something overrides names the settings and no log" {
+    const alloc = std.testing.allocator;
+    const text = try StatusNote.saved_overridden.textWithDetail(alloc, "font-size, theme");
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "Saved, but a later config file or command-line option overrides font-size, theme, so the saved value is not used.",
+        text,
+    );
+    try std.testing.expect(StatusNote.saved_overridden.takesDetail());
+
+    var buf: [1024]u8 = undefined;
+    const named = maskedNotificationBody(&buf, "font-size, theme");
+    try std.testing.expect(std.mem.startsWith(u8, named, "font-size, theme: a later config file"));
+    // A GUI launch has no log to read.
+    try std.testing.expect(std.mem.indexOf(u8, named, "log") == null);
+    const unnamed = maskedNotificationBody(&buf, null);
+    try std.testing.expect(std.mem.indexOf(u8, unnamed, "Check the config-file lines") != null);
+    // Names too long for the buffer fall back to the sentence without them.
+    var small: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(unnamed, maskedNotificationBody(&small, "font-size, theme"));
+}
+
+test "settings the Advanced page lists the save target, the config problems and the pending changes" {
+    const Lender = struct {
+        fn target(_: *anyopaque, buf: []u8) ?[]const u8 {
+            const path = "C:\\cfg\\config.ghostty";
+            @memcpy(buf[0..path.len], path);
+            return buf[0..path.len];
+        }
+        fn problems(_: *anyopaque, buf: []u8) []const u8 {
+            const list = "Config problems (1):\n1. font-szie: unknown field\n";
+            @memcpy(buf[0..list.len], list);
+            return buf[0..list.len];
+        }
+    };
+    var context: u8 = 0;
+    var handle = modelOnlyHandle();
+    handle.ctx = &context;
+    handle.saveTarget = Lender.target;
+    handle.configProblems = Lender.problems;
+    var settings: SettingsWindow = .{ .handle = handle };
+
+    var buf: [2047]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Settings saves to C:\\cfg\\config.ghostty\n\n" ++
+            "Config problems (1):\n1. font-szie: unknown field\n\n" ++
+            no_pending_changes_text,
+        settings.advancedHelpText(&buf),
+    );
+
+    // A window with nothing to say about either still shows the changes.
+    var bare: SettingsWindow = .{ .handle = modelOnlyHandle() };
+    try std.testing.expectEqualStrings(no_pending_changes_text, bare.advancedHelpText(&buf));
+}
+
+test "settings the Advanced page keeps within one static text however long the problems list is" {
+    const Lender = struct {
+        fn target(_: *anyopaque, buf: []u8) ?[]const u8 {
+            @memset(buf[0..240], 'p');
+            return buf[0..240];
+        }
+        fn problems(_: *anyopaque, buf: []u8) []const u8 {
+            @memset(buf, 'x');
+            return buf;
+        }
+    };
+    var context: u8 = 0;
+    var handle = modelOnlyHandle();
+    handle.ctx = &context;
+    handle.saveTarget = Lender.target;
+    handle.configProblems = Lender.problems;
+    var current = try Config.default(std.testing.allocator);
+    current.@"font-size" = 12;
+    var settings: SettingsWindow = .{
+        .handle = handle,
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+    settings.pending.?.@"font-size" = 14;
+    settings.trackEdit(.font_size, true);
+
+    var buf: [2047]u8 = undefined;
+    const text = settings.advancedHelpText(&buf);
+    try std.testing.expect(text.len <= buf.len);
+    // The change still gets its line when the head has taken its whole share.
+    try std.testing.expect(std.mem.endsWith(u8, text, "Font size: 12 pt -> 14 pt\n"));
+}
+
 test "settings diff writes every field's values without debug syntax" {
     var buf: [256]u8 = undefined;
     for (std.enums.values(SettingField)) |field| {
@@ -9997,6 +10172,12 @@ fn writeOwnedSettingValue(writer: *std.Io.Writer, config: *const Config, field: 
     }
 }
 
+/// The room the Advanced page gives the save target and the config problems
+/// ahead of the pending changes, and the part of it for each. The save target
+/// is at most 240 bytes of path and an ellipsis.
+const advanced_head_bytes = 1400;
+const advanced_problems_bytes = 1000;
+const advanced_target_bytes = 243;
 const no_pending_changes_text = "No changes waiting to be saved.";
 
 fn writePaddingValue(writer: *std.Io.Writer, padding: @FieldType(Config, "window-padding-x")) !void {

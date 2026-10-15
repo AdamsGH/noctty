@@ -2877,6 +2877,13 @@ pub fn dumpTextLocked(
     };
 }
 
+/// The font families this surface's config names that no installed font
+/// matched, so it shows the built-in font instead. Borrowed: valid until the
+/// surface's font changes.
+pub fn missingFontFamilies(self: *const Surface) []const [:0]const u8 {
+    return self.app.font_grid_set.missingFamilies(self.font_grid_key);
+}
+
 /// Returns true if the terminal has a selection.
 pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
