@@ -942,9 +942,11 @@ that installing closes all windows and running sessions, and **Install**
 asks first, like quitting, when a terminal still has a running process. It
 then re-verifies the staged installer, records apply intent, launches the
 installer elevated (UAC may prompt), and exits the app. The silent setup
-starts noctty again when it finishes, through Explorer so that it runs as the
-logged-on user and not elevated, so an update that works ends with a new
-window. (The wizard's "Launch noctty" box starts it the same way.) If a later
+starts noctty again when it finishes, through Explorer so that it is meant to
+run as the logged-on user and not elevated, so an update that works ends with
+a new window. (The wizard's "Launch noctty" box starts it the same way.) That
+de-elevation is the intended result and has not been measured on a real
+install. If a later
 start finds that the build is still the old one after an Install, and that
 Setup is no longer running, a banner says the update did not finish and names
 the setup log (`updates\<version>\logs\apply.log` under the noctty state

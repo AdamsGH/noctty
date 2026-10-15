@@ -4144,6 +4144,9 @@ pub const App = struct {
     /// Set when Install starts applying, so a second press that gets in while
     /// `ShellExecuteW` pumps messages cannot start a second Setup.
     update_apply_in_flight: bool = false,
+    /// Set from the confirm's answer until the loop takes the apply off the
+    /// queue, so a second answer in between queues nothing.
+    update_apply_queued: bool = false,
     update_startup_ready: bool = false,
     /// Most-recently-used command palette actions; newest first. Strings
     /// are owned by `core_app.alloc` and freed in `App.deinit`. Surfaced
@@ -4260,6 +4263,9 @@ pub const App = struct {
     const DeferredOpen = union(enum) {
         target: []u8,
         on_screen_keyboard,
+        /// Install or Apply, once it is confirmed: `applyStagedUpdate` reaches
+        /// `ShellExecuteW`, so it runs from the loop like the opens do.
+        apply_staged_update,
         elevated_window: struct { parameters: [:0]u8, cwd: ?[]const u8 },
 
         fn deinit(self: DeferredOpen, alloc: Allocator) void {
@@ -4269,7 +4275,7 @@ pub const App = struct {
                     alloc.free(launch.parameters);
                     if (launch.cwd) |cwd| alloc.free(cwd);
                 },
-                .on_screen_keyboard => {},
+                .on_screen_keyboard, .apply_staged_update => {},
             }
         }
     };
@@ -10977,26 +10983,43 @@ pub const App = struct {
     }
 
     /// Install and Apply end every session the way a quit does, so they ask
-    /// the same way, in the same place. The answer runs `applyStagedUpdate`.
+    /// the same way, in the same place. The answer queues `applyStagedUpdate`.
     fn requestApplyStagedUpdate(self: *App) !void {
-        if (try self.settingsHoldInstall()) return;
+        // Before the prompt, so nobody is asked to close their sessions for an
+        // install that then declines.
+        if (self.settingsHoldInstall()) return;
         if (!self.session_ending) {
             if (self.pendingCloseAsk(&updateApplyConfirmAccept, self.update_action_host)) |ask| {
                 ask.host.askBeforeClosing(.update, ask.count, &updateApplyConfirmAccept, self);
                 return;
             }
         }
-        try self.applyStagedUpdate();
+        try self.queueApplyStagedUpdate();
     }
 
     /// Quit asks about unsaved Settings edits and resumes the quit once they
     /// are saved or discarded; nothing resumes an install, so it waits for the
-    /// user to do that first. Checked again when the confirm is answered,
-    /// since Settings is a separate window that can be edited meanwhile.
-    fn settingsHoldInstall(self: *App) !bool {
+    /// user to do that first. Checked again right before the apply runs
+    /// (`dispatchDeferredOpen`), since Settings is a separate window that can
+    /// be edited while the confirm is open. It fails closed: the edits are
+    /// what an install would lose, so a banner that could not be shown does
+    /// not let it through.
+    fn settingsHoldInstall(self: *App) bool {
         if (self.settings_window.hwnd == null or !self.settings_window.hasPendingChanges()) return false;
-        try self.showUpdateInfo(.err, "Save or discard your Settings changes first, then press Install again.");
+        self.showUpdateInfo(.err, "Save or discard your Settings changes first, then press Install again.") catch |err| {
+            log.warn("failed to show the unsaved Settings notice; install held anyway err={}", .{err});
+        };
         return true;
+    }
+
+    /// `applyStagedUpdate` reaches `ShellExecuteW`, which dispatches window
+    /// messages (see `runDeferredOpens`), and the confirm's answer arrives
+    /// inside the overlay's own handlers, so the apply waits for the loop.
+    /// While one is queued or under way, asking again does nothing.
+    fn queueApplyStagedUpdate(self: *App) !void {
+        if (self.update_apply_queued or self.update_apply_in_flight) return;
+        try self.deferShellRequest(.apply_staged_update);
+        self.update_apply_queued = true;
     }
 
     /// Where to ask, and about how many terminals, before an app-wide close
@@ -11211,11 +11234,18 @@ pub const App = struct {
         // Checked again just before dispatch, as when URL opens ran in place.
         switch (request.*) {
             .target => |target| return openWin32Target(self.core_app.alloc, self, target, dispatchOpenTarget),
+            // Off the queue now, so a later answer queues again if this one
+            // is held or fails.
+            .apply_staged_update => self.update_apply_queued = false,
             else => {},
         }
         if (self.test_shell_request) |hook| return hook(self, request);
         switch (request.*) {
             .target => unreachable,
+            .apply_staged_update => {
+                if (self.settingsHoldInstall()) return;
+                try self.applyStagedUpdate();
+            },
             .on_screen_keyboard => try self.launchOnScreenKeyboard(),
             .elevated_window => |launch| switch (try win32_elevation.launchElevated(self.core_app.alloc, launch.parameters, launch.cwd)) {
                 .launched => {},
@@ -11264,6 +11294,7 @@ pub const App = struct {
         for (self.deferred_opens.items) |request| request.deinit(alloc);
         self.deferred_opens.deinit(alloc);
         self.deferred_opens = .empty;
+        self.update_apply_queued = false;
     }
 
     fn openWin32Target(
@@ -26946,16 +26977,14 @@ fn appQuitConfirmAccept(userdata: ?*anyopaque) void {
 }
 
 /// Install for the update prompt. `userdata` is the App, which outlives every
-/// window the install destroys, including the one showing the prompt.
+/// window the install destroys, including the one showing the prompt. This
+/// runs inside the overlay's handlers, so it only queues the install: the
+/// message loop applies it once this has returned, and checks for unsaved
+/// Settings edits then.
 fn updateApplyConfirmAccept(userdata: ?*anyopaque) void {
     const app: *App = @ptrCast(@alignCast(userdata orelse return));
-    const held = app.settingsHoldInstall() catch |err| blk: {
-        log.warn("settings check before install failed err={}", .{err});
-        break :blk false;
-    };
-    if (held) return;
-    app.applyStagedUpdate() catch |err| {
-        log.warn("staged update apply after confirm failed err={}", .{err});
+    app.queueApplyStagedUpdate() catch |err| {
+        log.warn("failed to queue the staged update apply after confirm err={}", .{err});
     };
 }
 
@@ -41098,7 +41127,7 @@ test "win32 Install asks about running terminals on the window whose button was 
     // The real entry point asks the same way and applies nothing until the
     // answer (it would apply whatever the real state directory has staged).
     // The in-flight flag is set so that, were the prompt ever skipped, the
-    // apply it falls through to returns before it reads any real state.
+    // request it falls through to queues nothing.
     app.update_action_host = &host_b;
     defer app.update_action_host = null;
     app.update_apply_in_flight = true;
@@ -41118,6 +41147,97 @@ test "win32 Install asks about running terminals on the window whose button was 
     app.update_apply_in_flight = true;
     try app.applyStagedUpdate();
     try std.testing.expect(app.update_apply_in_flight);
+}
+
+test "win32 the confirmed install is queued for the message loop and asked once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var session: TestSession = .{};
+    try session.init(.{ .core_app = &core_app, .app = &app });
+    defer session.deinit();
+
+    // The hook stands in for the apply, which would act on whatever update the
+    // real state directory has staged.
+    const Hook = struct {
+        var applies: usize = 0;
+        fn launch(_: *App, request: *const App.DeferredOpen) anyerror!void {
+            if (request.* == .apply_staged_update) applies += 1;
+        }
+    };
+    Hook.applies = 0;
+    app.test_shell_request = &Hook.launch;
+
+    // The answer inside the overlay's handler only queues.
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+    try std.testing.expect(app.update_apply_queued);
+    try std.testing.expectEqual(@as(usize, 0), Hook.applies);
+
+    // A second answer while it is queued adds nothing.
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+
+    // The loop runs it once.
+    try std.testing.expect(app.runDeferredOpens());
+    try std.testing.expectEqual(@as(usize, 1), Hook.applies);
+    try std.testing.expect(!app.update_apply_queued);
+    try std.testing.expect(!app.runDeferredOpens());
+    try std.testing.expectEqual(@as(usize, 1), Hook.applies);
+
+    // One that was dispatched but not completed (held, or failed) can be asked
+    // for again; one under way cannot.
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+    try std.testing.expect(app.runDeferredOpens());
+    app.update_apply_in_flight = true;
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+    app.update_apply_in_flight = false;
+}
+
+test "win32 an install waits for unsaved Settings edits, also when the notice cannot be shown" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .id = 1, .register = true }},
+    });
+    defer session.deinit();
+
+    // Settings counts as open with a pending edit; nothing here touches the
+    // window handle.
+    app.settings_window.hwnd = @ptrFromInt(0x1000);
+    defer app.settings_window.hwnd = null;
+    app.settings_window.raw_scalar_dirty[0] = true;
+    defer app.settings_window.raw_scalar_dirty[0] = false;
+
+    // Asking for the install says so and queues nothing.
+    try app.requestApplyStagedUpdate();
+    try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+    try std.testing.expectEqualStrings(
+        "Save or discard your Settings changes first, then press Install again.",
+        host.banner_text.?,
+    );
+
+    // When the banner cannot be allocated the install is held all the same.
+    try host.setBanner(.none, null);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = core_app.alloc;
+    core_app.alloc = failing.allocator();
+    defer core_app.alloc = alloc;
+    try std.testing.expect(app.settingsHoldInstall());
+    try std.testing.expect(failing.has_induced_failure);
+
+    // Saved or discarded, nothing holds it.
+    app.settings_window.raw_scalar_dirty[0] = false;
+    try std.testing.expect(!app.settingsHoldInstall());
 }
 
 test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {
