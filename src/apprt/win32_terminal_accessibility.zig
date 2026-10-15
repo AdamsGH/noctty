@@ -1364,7 +1364,22 @@ test "terminal focus loss cancels speech and echo backlog" {
     try std.testing.expectEqual(@as(usize, 0), session.recent_input_len);
 }
 
-test "a continuity reset forgets typed input that was still waiting for its echo" {
+test "a screen switch makes the echo check forget typed input at that point of the output" {
+    const TerminalOutputTransport = @import("surface.zig").TerminalOutputTransport;
+    const SemanticOutputCapture = @import("../termio/semantic_output_capture.zig").SemanticOutputCapture;
+
+    // The consumer win32.zig wires to the transport.
+    const Consumer = struct {
+        fn callback(raw: *anyopaque, item: TerminalOutputTransport.Item) void {
+            const session: *TerminalAccessibilitySession = @ptrCast(@alignCast(raw));
+            switch (item) {
+                .reset => session.resetSemanticOutputContinuity(),
+                .data => |output| session.noteSemanticOutput(output),
+                .omitted => session.noteOutputOmitted(),
+            }
+        }
+    };
+
     var ctx: u8 = 0;
     const session = try TerminalAccessibilitySession.create(
         std.testing.allocator,
@@ -1373,20 +1388,39 @@ test "a continuity reset forgets typed input that was still waiting for its echo
         0,
     );
     defer session.deinit();
+    var transport: TerminalOutputTransport = .{};
+    transport.setInterested(true);
+    const epoch = transport.captureEpoch().?;
+    var capture: SemanticOutputCapture = .{};
 
-    // Typed characters are dropped from the output that starts with them...
+    // `ls` was typed into a full-screen program, and when it exits a
+    // primary-screen line that is exactly `ls` is real output: it is spoken.
     session.noteInput("ls");
-    const echo = session.stripRecentInputEcho("ls foo", sys.GetTickCount64());
-    try std.testing.expectEqualStrings("", echo.held_prefix);
-    try std.testing.expectEqualStrings("foo", echo.output);
+    capture.begin(true);
+    capture.noteScreenSwitch();
+    for ("ls") |ch| capture.recordPrint(ch);
+    capture.recordCarriageReturn();
+    capture.recordLinefeed();
+    var batch = capture.finish();
+    _ = transport.pushSemanticCapture(epoch, batch.slice(), batch.omitted_after, batch.reset_at);
+    transport.drain(session, Consumer.callback);
+    try std.testing.expect(session.announcement_normalizer.has_text);
 
-    // ...unless the screen changed first (the stream handler resets the
-    // consumer then), when such a line is real output and is spoken whole.
-    session.noteInput("ls");
+    // The echo of typed text that comes before the switch in the same batch
+    // is still recognised as the echo: the reset is placed after it.
     session.resetSemanticOutputContinuity();
-    const fresh = session.stripRecentInputEcho("ls foo", sys.GetTickCount64());
-    try std.testing.expectEqualStrings("", fresh.held_prefix);
-    try std.testing.expectEqualStrings("ls foo", fresh.output);
+    session.noteInput("ls");
+    capture.begin(true);
+    for ("ls") |ch| capture.recordPrint(ch);
+    capture.recordCarriageReturn();
+    capture.recordLinefeed();
+    capture.noteScreenSwitch();
+    batch = capture.finish();
+    try std.testing.expectEqual(@as(?usize, 4), batch.reset_at);
+    _ = transport.pushSemanticCapture(epoch, batch.slice(), batch.omitted_after, batch.reset_at);
+    transport.drain(session, Consumer.callback);
+    try std.testing.expect(!session.announcement_normalizer.has_text);
+    try std.testing.expectEqual(@as(usize, 0), session.recent_input_len);
 }
 
 test "terminal name cache refreshes without an event listener" {
