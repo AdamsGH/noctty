@@ -106,5 +106,15 @@ rep("""    else { $cmd="`"$exe`" "+($args2 -join ' ')+" -e `"$cmdexe`" /d /c typ
 """, """    elseif($env:PKG73_QUIET) { $cmd="`"$exe`" "+($args2 -join ' ')+" -e `"$cmdexe`" /d /k echo ready" }
     else { $cmd="`"$exe`" "+($args2 -join ' ')+" -e `"$cmdexe`" /d /c type `"$flood`"" }
 """)
+rep("""        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'stacksamp.exe') -Destination (Join-Path $Run 'stacksamp.exe')
+""", """        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'stacksamp.exe') -Destination (Join-Path $Run 'stacksamp.exe')
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'threadlog.dll') -Destination (Join-Path $Run 'threadlog.dll')
+""")
+rep("""        $env:NOCTTY_GLDIAG_FILE=Join-Path $Run 'gldiag.txt'
+""", """        $env:NOCTTY_GLDIAG_FILE=Join-Path $Run 'gldiag.txt'
+        $env:PKG73_THREADLOG_DLL=Join-Path $Run 'threadlog.dll'; $env:PKG73_THREADLOG=Join-Path $Run 'threadlog.txt'
+""")
+rep("'NOCTTY_RENDER_TRACE_LIVE','NOCTTY_GLDIAG_FILE',", "'NOCTTY_RENDER_TRACE_LIVE','NOCTTY_GLDIAG_FILE','PKG73_THREADLOG_DLL','PKG73_THREADLOG',")
+rep("'gldiag.txt','threads.txt','stacks.txt')", "'gldiag.txt','threads.txt','stacks.txt','threadlog.txt')")
 (here / "relaunch-probe.ps1").write_bytes(s.encode("utf-8"))
 print("ok")

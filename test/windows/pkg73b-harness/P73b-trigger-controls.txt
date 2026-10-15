@@ -1,0 +1,36 @@
+I-RW1: B stalls: 1046(165)
+  first thread start after first swap: -6.4 tid=8520 noctty.exe+0x56ceb0
+    1048.1 N tid=11836 noctty.exe+0x4992c0
+I-RW2: B stalls: 964(170)
+  first thread start after first swap: -8.8 tid=49392 noctty.exe+0x56ceb0
+     966.0 N tid=38724 noctty.exe+0x4992c0
+I-x1: B stalls: 1156(167)
+  first thread start after first swap: -6.1 tid=35152 noctty.exe+0x56ceb0
+    1156.0 N tid=30376 noctty.exe+0x43ab70
+I-x2: B stalls: 527(184)
+  first thread start after first swap: -6.3 tid=36232 noctty.exe+0x56ceb0
+     527.3 N tid=22144 noctty.exe+0x43ab70
+G-x1       A 31(110) STALL 941(175) worker@941
+G-x2       A 10(96) STALL 699(162) worker@699
+G-x3       A 14(99) STALL 836(184) worker@837
+G-D1       A 19(97) defer@571 worker@5598
+G-D2       A 12(100) STALL 4881(196) defer@1232 worker@4881
+G-D3       A 25(96) STALL 4796(195) defer@1010 worker@4797
+G-DT1      A 23(98) STALL 535(229) defer@535 noop_thread@535 worker@4943
+G-DT2      A 54(109) STALL 595(171) defer@595 noop_thread@595 worker@4742
+G-DT3      A 27(106) STALL 1221(183) defer@1221 noop_thread@1221 worker@4770
+G-DP1      A 54(110) STALL 4751(231) defer@644 cmd@644 worker@4751
+G-DP2      A 77(130) defer@607 cmd@607 worker@4639
+G-DP3      A 29(96) STALL 5297(222) defer@1231 cmd@1231 worker@5297
+H-x1       A 23(103) STALL 531(193) worker@531
+H-x2       A 11(100) STALL 1338(178) worker@1338
+H-x3       A 11(96) STALL 1065(170) worker@1066
+H-R1       A 13(96) STALL 837(161) park@787 worker@787
+H-R2       A 43(106) STALL 647(190) park@570 worker@570
+H-R3       A 12(100) STALL 1052(162) park@994 worker@994
+H-RW1      A 11(100) STALL 1218(189) park@1218 worker@1218 park@1977 worker@1977 park@3201 worker@3201 park@3992 worker@3992
+H-RW2      A 32(107) STALL 551(183) park@551 worker@551 park@1559 worker@1559 park@2583 worker@2583 park@3416 worker@3416
+H-RW3      A 3(94) STALL 526(166) park@525 worker@526 park@1471 worker@1471 park@1996 worker@1996 park@2500 worker@2500
+H-W1       A 11(110) STALL 672(195) worker@672 worker@1705 worker@2583 worker@3108
+H-W2       A 15(95) STALL 760(180) worker@760 worker@2023 worker@2527 worker@3048
+H-W3       A 9(103) STALL 1010(177) worker@1010 worker@1804 worker@2330 worker@2855
