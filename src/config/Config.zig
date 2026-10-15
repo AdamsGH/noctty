@@ -2013,9 +2013,9 @@ keybind: Keybinds = .{},
 /// live output side by side with your active pane.
 ///
 /// Lower values reduce CPU, GPU, and power use at the cost of less fluid
-/// background updates. Values below 1 are treated as 1, and values above
-/// 125 have no additional effect because the renderer never presents more
-/// often than every 8 ms. The default is `30`.
+/// background updates. Values below 1 are treated as 1, and from 125 up an
+/// unfocused pane is limited no more than the focused one (only
+/// `power-saver-rendering` then limits either). The default is `30`.
 ///
 /// This can be changed at runtime and affects all open terminals.
 @"unfocused-render-fps": u32 = 30,
