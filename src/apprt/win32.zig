@@ -682,23 +682,49 @@ test "win32 clipboard text with a lone surrogate still pastes" {
 
 /// Another program can hold the clipboard open for a few milliseconds (a
 /// clipboard manager, RDP's clipboard sync, Office), and one failed
-/// `OpenClipboard` used to drop the whole paste or copy. Tries it 10 times
-/// with a 5 ms sleep between. A sleep rounds up to the timer tick, about
-/// 15.6 ms unless something raised the resolution, so a clipboard held
-/// throughout costs the UI thread up to about 140 ms before the paste or
-/// copy fails as it did at once before. On false, `GetLastError` still
-/// holds the last attempt's error.
+/// `OpenClipboard` used to drop the whole paste or copy. Retry within a
+/// 5 ms QPC budget, without timer-tick sleeps or dispatching messages.
+/// Keeping the call synchronous preserves copy/paste order and the
+/// confirmation that owns a pending operation. On false, `GetLastError`
+/// still holds the last open's error. Scheduling and OpenClipboard itself
+/// can take longer; never start another retry after the budget expires.
 fn openClipboard(hwnd: ?HWND) bool {
     return openClipboardWith(sys.OpenClipboard, hwnd);
 }
 
 const clipboard_open_attempts = 10;
+const clipboard_open_budget_ns = 5 * std.time.ns_per_ms;
+const clipboard_open_interval_ns = std.time.ns_per_ms / 2;
 
 fn openClipboardWith(open: *const fn (?HWND) callconv(.winapi) BOOL, hwnd: ?HWND) bool {
+    var timer = std.time.Timer.start() catch return open(hwnd) != 0;
+    return openClipboardWithClock(open, hwnd, &timer);
+}
+
+fn openClipboardWithClock(open: *const fn (?HWND) callconv(.winapi) BOOL, hwnd: ?HWND, timer: anytype) bool {
+    var open_error: windows.Win32Error = .SUCCESS;
+    var next_attempt: u64 = 0;
     for (0..clipboard_open_attempts) |attempt| {
+        if (attempt > 0) {
+            while (true) {
+                const elapsed = timer.read();
+                if (elapsed >= clipboard_open_budget_ns) {
+                    windows.kernel32.SetLastError(open_error);
+                    return false;
+                }
+                if (elapsed >= next_attempt) break;
+                // SwitchToThread, not Sleep: offer the clipboard owner
+                // the CPU without waiting for the next timer tick.
+                std.Thread.yield() catch {};
+            }
+        }
         if (open(hwnd) != 0) return true;
-        if (attempt + 1 < clipboard_open_attempts) std.Thread.sleep(5 * std.time.ns_per_ms);
+        open_error = windows.kernel32.GetLastError();
+        const elapsed = timer.read();
+        if (elapsed >= clipboard_open_budget_ns) break;
+        next_attempt = elapsed + clipboard_open_interval_ns;
     }
+    windows.kernel32.SetLastError(open_error);
     return false;
 }
 
@@ -706,6 +732,13 @@ test "win32 clipboard open retries while another program holds it" {
     const Fake = struct {
         var calls: usize = 0;
         var fail_first: usize = 0;
+        elapsed: u64 = 0,
+
+        fn read(self: *@This()) u64 {
+            defer self.elapsed += std.time.ns_per_ms / 20;
+            return self.elapsed;
+        }
+
         fn open(_: ?HWND) callconv(.winapi) BOOL {
             calls += 1;
             return if (calls > fail_first) 1 else 0;
@@ -714,14 +747,102 @@ test "win32 clipboard open retries while another program holds it" {
 
     Fake.calls = 0;
     Fake.fail_first = 3;
-    try std.testing.expect(openClipboardWith(Fake.open, null));
+    var clock: Fake = .{};
+    try std.testing.expect(openClipboardWithClock(Fake.open, null, &clock));
     try std.testing.expectEqual(@as(usize, 4), Fake.calls);
 
     // Held for good: gives up after the last attempt, without one more sleep.
     Fake.calls = 0;
     Fake.fail_first = std.math.maxInt(usize);
-    try std.testing.expect(!openClipboardWith(Fake.open, null));
+    clock = .{};
+    try std.testing.expect(!openClipboardWithClock(Fake.open, null, &clock));
     try std.testing.expectEqual(@as(usize, clipboard_open_attempts), Fake.calls);
+}
+
+test "win32 clipboard contention stops retrying at its UI budget" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var owner: ?HWND = null;
+        elapsed: u64 = 0,
+        step: u64,
+
+        fn read(self: *@This()) u64 {
+            // A wait (or a preemption) can overrun the whole budget.
+            // Clock and yield calls must not replace the open error.
+            windows.kernel32.SetLastError(.INVALID_HANDLE);
+            defer self.elapsed += self.step;
+            return self.elapsed;
+        }
+
+        fn open(hwnd: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            owner = hwnd;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return 0;
+        }
+    };
+
+    for ([_]u64{ clipboard_open_budget_ns, 16 * std.time.ns_per_ms }) |step| {
+        Fake.calls = 0;
+        var clock: Fake = .{ .step = step };
+        const owner: HWND = @ptrFromInt(0x1234); // passed only to the fake
+        try std.testing.expect(!openClipboardWithClock(Fake.open, owner, &clock));
+        try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+        try std.testing.expectEqual(owner, Fake.owner.?);
+        try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
+    }
+}
+
+test "win32 clipboard retry stops when a yield crosses its UI budget" {
+    // The budget runs out while waiting for the next attempt: no second open.
+    const Fake = struct {
+        var calls: usize = 0;
+        reads: usize = 0,
+
+        fn read(self: *@This()) u64 {
+            defer self.reads += 1;
+            return switch (self.reads) {
+                0 => 0,
+                1 => clipboard_open_interval_ns / 2,
+                else => clipboard_open_budget_ns,
+            };
+        }
+
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return 0;
+        }
+    };
+
+    Fake.calls = 0;
+    var clock: Fake = .{};
+    try std.testing.expect(!openClipboardWithClock(Fake.open, null, &clock));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
+}
+
+test "win32 clipboard retry uses QPC without opening the real clipboard" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var busy: bool = false;
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return if (busy) 0 else 1;
+        }
+    };
+
+    Fake.calls = 0;
+    Fake.busy = false;
+    try std.testing.expect(openClipboardWith(Fake.open, null));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+
+    Fake.calls = 0;
+    Fake.busy = true;
+    try std.testing.expect(!openClipboardWith(Fake.open, null));
+    try std.testing.expect(Fake.calls >= 1 and Fake.calls <= clipboard_open_attempts);
+    try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
 }
 
 fn surfaceWindowStyle() u32 {
@@ -2806,7 +2927,7 @@ const UpdateNotice = struct {
             .message_text = if (staged)
                 try std.fmt.allocPrint(
                     alloc,
-                    "Update downloaded and verified: noctty {s} is ready to install.",
+                    "Update downloaded and verified: noctty {s} is ready to install. Installing closes all windows and running sessions.",
                     .{version_text},
                 )
             else
@@ -2817,6 +2938,16 @@ const UpdateNotice = struct {
                 ),
             .staged = staged,
         };
+    }
+
+    test "a staged notice says that installing closes the sessions" {
+        const alloc = std.testing.allocator;
+        var staged = try UpdateNotice.init(alloc, "1.3.200", "https://example.invalid/release", true);
+        defer staged.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, staged.message_text.?, "Installing closes all windows and running sessions.") != null);
+        var plain = try UpdateNotice.init(alloc, "1.3.200", "https://example.invalid/release", false);
+        defer plain.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, plain.message_text.?, "closes") == null);
     }
 
     fn deinit(self: *UpdateNotice, alloc: Allocator) void {
@@ -4128,6 +4259,15 @@ pub const App = struct {
     /// Detected on first use: the install directory cannot change under a
     /// running process.
     install_kind: ?InstallKind = null,
+    /// The last Install is looked at once per run, when a window can show the
+    /// result (`reportFailedInstallerApply`).
+    installer_apply_checked: bool = false,
+    /// Set when Install starts applying, so a second press that gets in while
+    /// `ShellExecuteW` pumps messages cannot start a second Setup.
+    update_apply_in_flight: bool = false,
+    /// Set from the confirm's answer until the loop takes the apply off the
+    /// queue, so a second answer in between queues nothing.
+    update_apply_queued: bool = false,
     update_startup_ready: bool = false,
     /// Most-recently-used command palette actions; newest first. Strings
     /// are owned by `core_app.alloc` and freed in `App.deinit`. Surfaced
@@ -4244,6 +4384,9 @@ pub const App = struct {
     const DeferredOpen = union(enum) {
         target: []u8,
         on_screen_keyboard,
+        /// Install or Apply, once it is confirmed: `applyStagedUpdate` reaches
+        /// `ShellExecuteW`, so it runs from the loop like the opens do.
+        apply_staged_update,
         elevated_window: struct { parameters: [:0]u8, cwd: ?[]const u8 },
 
         fn deinit(self: DeferredOpen, alloc: Allocator) void {
@@ -4253,7 +4396,7 @@ pub const App = struct {
                     alloc.free(launch.parameters);
                     if (launch.cwd) |cwd| alloc.free(cwd);
                 },
-                .on_screen_keyboard => {},
+                .on_screen_keyboard, .apply_staged_update => {},
             }
         }
     };
@@ -4623,14 +4766,9 @@ pub const App = struct {
         }
 
         if (self.windows.items.len > 0) self.markRecoveryWindowCreated();
-        // With a window up, the fonts the config names have been looked for
-        // and the problems have somewhere to show. Without one they wait in
-        // Settings and the palette.
-        if (self.windows.items.len > 0) {
-            _ = self.reportConfigProblems(&self.config);
-        } else {
-            self.recordConfigProblems(&self.config);
-        }
+        // Keep the banner text even without an initial window: every later
+        // host receives its own copy when it is created.
+        _ = self.reportConfigProblems(&self.config);
 
         // Armed here, released by `resolveRecoveryStartup` once the ready
         // marker is on disk. Spawning it here would let thread scheduling put
@@ -4666,6 +4804,9 @@ pub const App = struct {
             log.warn("portable update startup confirmation failed err={}", .{err});
         };
         self.update_startup_ready = true;
+        // Before the check below: staging compares the state it started from
+        // with the state it finishes in, and this clears a field in it.
+        if (self.windows.items.len > 0) self.reportFailedInstallerApply();
         if (self.windows.items.len > 0) self.maybeScheduleAutomaticUpdateCheck();
         const portable_failure = updatepkg.takePortableUpdateFailure(self.core_app.alloc) catch |err| failure: {
             log.warn("failed to read portable update failure err={}", .{err});
@@ -6926,7 +7067,7 @@ pub const App = struct {
                     return;
                 }
             }
-            try self.applyStagedUpdate();
+            try self.requestApplyStagedUpdate();
             return;
         }
         try self.openUrl(notice.release_url.?);
@@ -6995,6 +7136,9 @@ pub const App = struct {
     }
 
     fn applyStagedUpdate(self: *App) !void {
+        if (self.update_apply_in_flight) return;
+        self.update_apply_in_flight = true;
+        errdefer self.update_apply_in_flight = false;
         const state_path = try updatepkg.defaultStatePath(self.core_app.alloc);
         defer self.core_app.alloc.free(state_path);
 
@@ -7053,12 +7197,9 @@ pub const App = struct {
         }
 
         const stage_dir = std.fs.path.dirname(staged.artifact_path) orelse return error.InvalidStagedInstallerPath;
-        const logs_dir = try std.fs.path.join(self.core_app.alloc, &.{ stage_dir, "logs" });
-        defer self.core_app.alloc.free(logs_dir);
-        try std.fs.cwd().makePath(logs_dir);
-
-        const log_path = try std.fs.path.join(self.core_app.alloc, &.{ logs_dir, "apply.log" });
+        const log_path = try updatepkg.applyLogPathAlloc(self.core_app.alloc, staged.artifact_path);
         defer self.core_app.alloc.free(log_path);
+        try std.fs.cwd().makePath(std.fs.path.dirname(log_path).?);
 
         const params = try buildInstallerApplyArgs(self.core_app.alloc, install_dir, log_path);
         defer self.core_app.alloc.free(params);
@@ -7094,6 +7235,34 @@ pub const App = struct {
         self.running = false;
         self.destroyAllWindows();
         if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+    }
+
+    /// Install quits the app and nothing watches Setup, so the next start is
+    /// where a setup that did not replace this build is found. Only a
+    /// setup-managed copy can have started one: the update state is shared by
+    /// every copy of the user's, and an older Scoop or dev build starting after
+    /// a successful install must not report (and consume) the request. Needs
+    /// a window for the banner; without one the request stays for the next
+    /// start.
+    fn reportFailedInstallerApply(self: *App) void {
+        if (self.installer_apply_checked) return;
+        self.installer_apply_checked = true;
+        if (self.installKind() != .installer) return;
+        const state_path = updatepkg.defaultStatePath(self.core_app.alloc) catch return;
+        defer self.core_app.alloc.free(state_path);
+        const message = updatepkg.takeFailedInstallerApply(
+            self.core_app.alloc,
+            state_path,
+            build_config.version,
+        ) catch |err| {
+            log.warn("failed to check the last installer apply err={}", .{err});
+            return;
+        } orelse return;
+        defer self.core_app.alloc.free(message);
+        log.warn("{s}", .{message});
+        self.showUpdateInfo(.err, message) catch |err| {
+            log.warn("failed to surface installer apply failure err={}", .{err});
+        };
     }
 
     fn canApplyStagedUpdate(self: *App) bool {
@@ -7767,7 +7936,9 @@ pub const App = struct {
                 // The config in effect, not the one just read: the app
                 // applies its conditional state (dark system, `theme =
                 // light:A,dark:B`) before it installs it.
-                if (self.reportConfigProblems(&self.config)) return true;
+                // config_change already recorded this load, including its
+                // font checks; explicitly re-announce without scanning twice.
+                if (self.reportRecordedConfigProblems()) return true;
                 if (self.config.@"app-notifications".@"config-reload") {
                     try self.showDesktopNotification(.app, "noctty", "Configuration reloaded");
                 }
@@ -9526,6 +9697,8 @@ pub const App = struct {
 
         host.power_notifications = win32_power.Notifications.init(hwnd);
 
+        self.presentConfigProblemsOnHost(host);
+
         // The host stays hidden here. `Surface.init` shows it only after GL
         // and core initialization succeed, so a below-floor GPU reaches the
         // startup dialog without first flashing a blank window.
@@ -10921,26 +11094,79 @@ pub const App = struct {
     fn requestQuit(self: *App, near: ?*Surface) void {
         if (!self.session_ending) {
             if (self.settings_window.holdQuitForUnsavedChanges()) return;
-            var count: usize = 0;
-            var open: ?*Host = null;
-            var busy: ?*Host = null;
-            for (self.hosts.items) |host| {
-                if (host.showsConfirm(&appQuitConfirmAccept, self)) open = host;
-                const host_count = tabsCloseConfirmCount(host.tabs.items);
-                if (host_count == 0) continue;
-                count += host_count;
-                if (busy == null or (!busy.?.isShown() and host.isShown())) busy = host;
-            }
-            if (count > 0) {
-                var prompt_host = open orelse busy.?;
-                if (open == null) if (near) |surface| if (surface.host) |near_host| {
-                    if (near_host.tabs.items.len > 0) prompt_host = near_host;
-                };
-                prompt_host.askBeforeClosing(.app, count, &appQuitConfirmAccept, self);
+            if (self.pendingCloseAsk(&appQuitConfirmAccept, if (near) |surface| surface.host else null)) |ask| {
+                ask.host.askBeforeClosing(.app, ask.count, &appQuitConfirmAccept, self);
                 return;
             }
         }
         self.quitConfirmed();
+    }
+
+    /// Install and Apply end every session the way a quit does, so they ask
+    /// the same way, in the same place. The answer queues `applyStagedUpdate`.
+    fn requestApplyStagedUpdate(self: *App) !void {
+        // Before the prompt, so nobody is asked to close their sessions for an
+        // install that then declines.
+        if (self.settingsHoldInstall()) return;
+        if (!self.session_ending) {
+            if (self.pendingCloseAsk(&updateApplyConfirmAccept, self.update_action_host)) |ask| {
+                ask.host.askBeforeClosing(.update, ask.count, &updateApplyConfirmAccept, self);
+                return;
+            }
+        }
+        try self.queueApplyStagedUpdate();
+    }
+
+    /// Quit asks about unsaved Settings edits and resumes the quit once they
+    /// are saved or discarded; nothing resumes an install, so it waits for the
+    /// user to do that first. Checked again right before the apply runs
+    /// (`dispatchDeferredOpen`), since Settings is a separate window that can
+    /// be edited while the confirm is open. It fails closed: the edits are
+    /// what an install would lose, so a banner that could not be shown does
+    /// not let it through.
+    fn settingsHoldInstall(self: *App) bool {
+        if (self.settings_window.hwnd == null or !self.settings_window.hasPendingChanges()) return false;
+        self.showUpdateInfo(.err, "Save or discard your Settings changes first, then press Install again.") catch |err| {
+            log.warn("failed to show the unsaved Settings notice; install held anyway err={}", .{err});
+        };
+        return true;
+    }
+
+    /// `applyStagedUpdate` reaches `ShellExecuteW`, which dispatches window
+    /// messages (see `runDeferredOpens`), and the confirm's answer arrives
+    /// inside the overlay's own handlers, so the apply waits for the loop.
+    /// While one is queued or under way, asking again does nothing.
+    fn queueApplyStagedUpdate(self: *App) !void {
+        if (self.update_apply_queued or self.update_apply_in_flight) return;
+        try self.deferShellRequest(.apply_staged_update);
+        self.update_apply_queued = true;
+    }
+
+    /// Where to ask, and about how many terminals, before an app-wide close
+    /// that `on_accept` confirms: null when `confirm-close-surface` asks about
+    /// none. The prompt already open comes first, then `near_host`'s window,
+    /// then a shown window with such a terminal.
+    fn pendingCloseAsk(
+        self: *App,
+        on_accept: *const fn (userdata: ?*anyopaque) void,
+        near_host: ?*Host,
+    ) ?struct { count: usize, host: *Host } {
+        var count: usize = 0;
+        var open: ?*Host = null;
+        var busy: ?*Host = null;
+        for (self.hosts.items) |host| {
+            if (host.showsConfirm(on_accept, self)) open = host;
+            const host_count = tabsCloseConfirmCount(host.tabs.items);
+            if (host_count == 0) continue;
+            count += host_count;
+            if (busy == null or (!busy.?.isShown() and host.isShown())) busy = host;
+        }
+        if (count == 0) return null;
+        var prompt_host = open orelse busy.?;
+        if (open == null) if (near_host) |host| {
+            if (host.tabs.items.len > 0) prompt_host = host;
+        };
+        return .{ .count = count, .host = prompt_host };
     }
 
     fn quitConfirmed(self: *App) void {
@@ -11128,11 +11354,18 @@ pub const App = struct {
         // Checked again just before dispatch, as when URL opens ran in place.
         switch (request.*) {
             .target => |target| return openWin32Target(self.core_app.alloc, self, target, dispatchOpenTarget),
+            // Off the queue now, so a later answer queues again if this one
+            // is held or fails.
+            .apply_staged_update => self.update_apply_queued = false,
             else => {},
         }
         if (self.test_shell_request) |hook| return hook(self, request);
         switch (request.*) {
             .target => unreachable,
+            .apply_staged_update => {
+                if (self.settingsHoldInstall()) return;
+                try self.applyStagedUpdate();
+            },
             .on_screen_keyboard => try self.launchOnScreenKeyboard(),
             .elevated_window => |launch| switch (try win32_elevation.launchElevated(self.core_app.alloc, launch.parameters, launch.cwd)) {
                 .launched => {},
@@ -11181,6 +11414,7 @@ pub const App = struct {
         for (self.deferred_opens.items) |request| request.deinit(alloc);
         self.deferred_opens.deinit(alloc);
         self.deferred_opens = .empty;
+        self.update_apply_queued = false;
     }
 
     fn openWin32Target(
@@ -11611,7 +11845,7 @@ pub const App = struct {
 
         self.core_app.updateConfig(self, &reloaded) catch return error.ReloadFailed;
         // The reload read the file again, so what is wrong in it is news.
-        _ = self.reportConfigProblems(&self.config);
+        _ = self.reportRecordedConfigProblems();
         if (masked.len > 0) return error.SavedButMasked;
     }
 
@@ -12138,8 +12372,8 @@ pub const App = struct {
         return true;
     }
 
-    /// Keep a copy of what a config load found wrong, with the fonts the open
-    /// terminals could not find, for the banner, the Settings page and the
+    /// Keep a copy of what a config load found wrong, including configured
+    /// font families, for the banner, the Settings page and the
     /// palette. The config's own diagnostics are freed with the config.
     fn recordConfigProblems(self: *App, config: *const configpkg.Config) void {
         const alloc = self.core_app.alloc;
@@ -12150,14 +12384,18 @@ pub const App = struct {
                 log.warn("config problems: could not keep a diagnostic err={}", .{err});
             };
         }
-        // A family is listed once, however many tabs and windows use it.
-        for (self.windows.items) |surface| {
-            if (!surface.core_initialized) continue;
-            for (surface.core().missingFontFamilies()) |family| {
+        // Check the configured families once for the load, independently of
+        // which tabs exist or which styles have already been drawn.
+        if (self.core_app.font_grid_set.configuredMissingFamilies(alloc, config)) |families_value| {
+            var families = families_value;
+            defer families.deinit(alloc);
+            for (families.reportable()) |family| {
                 self.config_problems.addMissingFont(alloc, family) catch |err| {
                     log.warn("config problems: could not keep a missing font err={}", .{err});
                 };
             }
+        } else |err| {
+            log.warn("config problems: could not check configured fonts err={}", .{err});
         }
         self.settings_window.configProblemsChanged();
     }
@@ -12180,6 +12418,10 @@ pub const App = struct {
     /// there are problems.
     fn reportConfigProblems(self: *App, config: *const configpkg.Config) bool {
         self.recordConfigProblems(config);
+        return self.reportRecordedConfigProblems();
+    }
+
+    fn reportRecordedConfigProblems(self: *App) bool {
         if (self.config_problems.count() == 0) {
             self.clearConfigProblemsBanner();
             return false;
@@ -12188,8 +12430,8 @@ pub const App = struct {
         return true;
     }
 
-    /// Raise the banner for `config_problems`. False when there is nothing to
-    /// say or no window to say it on.
+    /// Keep the banner for `config_problems` and present it on every host.
+    /// False when there is nothing to say or no window to say it on.
     fn showConfigProblemsBanner(self: *App) bool {
         const alloc = self.core_app.alloc;
         // First, and on every host: the primary window can change between
@@ -12200,9 +12442,14 @@ pub const App = struct {
         // Kept so a later load that finds nothing can take down this banner,
         // and no other.
         self.config_problems_banner = text;
-        return self.showHostBanner(.app, .err, text) catch |err| {
+        for (self.hosts.items) |host| self.presentConfigProblemsOnHost(host);
+        return self.hosts.items.len > 0;
+    }
+
+    fn presentConfigProblemsOnHost(self: *App, host: *Host) void {
+        const text = self.config_problems_banner orelse return;
+        host.setConfigProblemsBanner(text) catch |err| {
             log.warn("config problems: banner failed err={}", .{err});
-            return false;
         };
     }
 
@@ -12214,6 +12461,9 @@ pub const App = struct {
             self.config_problems_banner = null;
         }
         for (self.hosts.items) |host| {
+            // Remove a queued config banner as well, before clearing the
+            // active one, so a clean load cannot resurrect stale problems.
+            appendOwnedString(alloc, &host.config_problems_text, null) catch unreachable;
             const shown = host.banner_text orelse continue;
             if (host.banner_kind != .err or !std.mem.eql(u8, shown, ours)) continue;
             host.setBanner(.none, null) catch |err| {
@@ -12494,7 +12744,10 @@ fn buildInstallerApplyArgs(alloc: Allocator, install_dir: []const u8, log_path: 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try buf.appendSlice(alloc, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS");
+    // /RELAUNCH=1 is ours, not Inno's: dist/windows/noctty.iss starts noctty
+    // again when it is given and Setup is silent. noctty has quit by the time
+    // Setup replaces its files, so /RESTARTAPPLICATIONS has nothing to restart.
+    try buf.appendSlice(alloc, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /RELAUNCH=1");
     try appendInnoQuotedArg(alloc, &buf, " /DIR=", install_dir);
     try appendInnoQuotedArg(alloc, &buf, " /LOG=", log_path);
     return try buf.toOwnedSlice(alloc);
@@ -13053,7 +13306,7 @@ const program_confirm_arming_ms = 500;
 
 /// What a close that ends several terminals at once is closing. One pane
 /// keeps its own prompt in `Surface.close`.
-const CloseScope = enum { window, this_tab, other_tabs, right_tabs, app };
+const CloseScope = enum { window, this_tab, other_tabs, right_tabs, app, update };
 
 /// The prompt for a close that would end `count` (at least 1) terminals
 /// that `confirm-close-surface` asks about. The body may live in `body_buf`.
@@ -13090,6 +13343,12 @@ fn closeScopePrompt(scope: CloseScope, count: usize, body_buf: *[256]u8) Confirm
                     .accept = "Quit",
                     .one = "A process is still running. Quitting noctty will terminate it.",
                     .many = "Processes are still running in {d} terminals. Quitting noctty will terminate them.",
+                },
+                .update => .{
+                    .title = "Install the update?",
+                    .accept = "Install",
+                    .one = "A process is still running. Installing the update closes noctty and will terminate it.",
+                    .many = "Processes are still running in {d} terminals. Installing the update closes noctty and will terminate them.",
                 },
             };
             return .{
@@ -13504,6 +13763,9 @@ const Host = struct {
     focused_quick_slot: ?usize = null,
     banner_kind: HostBannerKind = .none,
     banner_text: ?[:0]const u8 = null,
+    /// This host's config problems, behind an earlier error until it is
+    /// dismissed. Owned separately from the ordinary single banner slot.
+    config_problems_text: ?[:0]const u8 = null,
     banner_hwnd: ?HWND = null,
     banner_placement: ChildPlacement = .{},
     banner_prev_proc: ?*const anyopaque = null,
@@ -16060,6 +16322,7 @@ const Host = struct {
         self.destroyChildControls();
 
         if (self.banner_text) |value| self.app.core_app.alloc.free(value);
+        if (self.config_problems_text) |value| self.app.core_app.alloc.free(value);
         // A prompt still open when its window goes, such as a window-close
         // prompt whose last terminal exited meanwhile.
         if (self.confirm_payload) |*payload| payload.deinit(self.app.core_app.alloc);
@@ -17814,10 +18077,31 @@ const Host = struct {
         _ = sys.SetFocus(hwnd);
     }
 
+    fn setConfigProblemsBanner(self: *Host, text: []const u8) !void {
+        try appendOwnedString(self.app.core_app.alloc, &self.config_problems_text, text);
+        // A startup layout failure (or another earlier error) remains the
+        // first thing to read. Closing it reveals the config problems.
+        if (self.banner_kind == .err and self.banner_text != null) return;
+        try self.setBanner(.err, text);
+    }
+
     fn setBanner(self: *Host, kind: HostBannerKind, text: ?[]const u8) !void {
-        const next_kind: HostBannerKind = if (text == null) .none else kind;
+        var next_text = text;
+        var next_kind: HostBannerKind = if (text == null) .none else kind;
+        if (text == null) {
+            if (self.config_problems_text) |pending| {
+                if (self.banner_kind == .err and ownedStringEquals(self.banner_text, pending)) {
+                    // Closing the config message acknowledges it on this
+                    // window; another window has its own acknowledgement.
+                    try appendOwnedString(self.app.core_app.alloc, &self.config_problems_text, null);
+                } else {
+                    next_text = pending;
+                    next_kind = .err;
+                }
+            }
+        }
         if (self.banner_kind == next_kind) {
-            if (text) |value| {
+            if (next_text) |value| {
                 if (ownedStringEquals(self.banner_text, value)) {
                     // The same message again (undo pressed twice): a full
                     // countdown again, without announcing it twice.
@@ -17831,7 +18115,7 @@ const Host = struct {
         }
 
         self.banner_kind = next_kind;
-        try appendOwnedString(self.app.core_app.alloc, &self.banner_text, text);
+        try appendOwnedString(self.app.core_app.alloc, &self.banner_text, next_text);
         // This announces the banner itself, below.
         self.banner_announce_pending = false;
         // A new message gets a full countdown of its own.
@@ -26853,6 +27137,18 @@ fn appQuitConfirmAccept(userdata: ?*anyopaque) void {
     app.quitConfirmed();
 }
 
+/// Install for the update prompt. `userdata` is the App, which outlives every
+/// window the install destroys, including the one showing the prompt. This
+/// runs inside the overlay's handlers, so it only queues the install: the
+/// message loop applies it once this has returned, and checks for unsaved
+/// Settings edits then.
+fn updateApplyConfirmAccept(userdata: ?*anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(userdata orelse return));
+    app.queueApplyStagedUpdate() catch |err| {
+        log.warn("failed to queue the staged update apply after confirm err={}", .{err});
+    };
+}
+
 /// Close tabs for the other-tabs prompt. `userdata` is the Surface the
 /// tabs are kept beside: its destruction cancels the prompt
 /// (`cancelConfirmIfOwnedBy`), and the tabs are found again here because
@@ -27882,6 +28178,132 @@ test "win32 config problems raise an error banner that only a clean load takes d
     try std.testing.expect(!app.reportConfigProblems(&clean));
     try std.testing.expectEqualStrings("New window could not be opened.", host.banner_text.?);
     try host.setBanner(.none, null);
+}
+
+test "win32 config problems reach every host even without a primary surface" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var second: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &first, .register = true },
+            .{ .storage = &second, .register = true },
+        },
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .key = "theme", .message = "missing theme" });
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqual(HostBannerKind.err, first.banner_kind);
+    try std.testing.expectEqualStrings(first.banner_text.?, second.banner_text.?);
+}
+
+test "win32 config problems preserve a pending launch-layout error until dismissed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    try host.setBanner(.err, "Layout could not be opened.");
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqualStrings("Layout could not be opened.", host.banner_text.?);
+    // Closing the earlier error makes the config problem visible next.
+    try host.setBanner(.none, null);
+    try std.testing.expectEqualStrings(app.config_problems_banner.?, host.banner_text.?);
+    try host.setBanner(.none, null);
+    try std.testing.expect(host.banner_text == null);
+}
+
+test "win32 config problems wait for a later host and clear queued errors on a clean load" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var later: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{ .{ .storage = &first }, .{ .storage = &later } },
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    app.config.@"initial-window" = false;
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
+    // No hosts exist when an initial-window=false process loads its config.
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expect(app.config_problems_banner != null);
+    try app.hosts.append(alloc, &first);
+    app.presentConfigProblemsOnHost(&first);
+    try std.testing.expectEqualStrings(app.config_problems_banner.?, first.banner_text.?);
+    try first.setBanner(.none, null);
+    // Another window still receives the load's problems after the first
+    // window acknowledged its own banner. No config load or font scan here.
+    try app.hosts.append(alloc, &later);
+    app.presentConfigProblemsOnHost(&later);
+    try std.testing.expectEqualStrings(app.config_problems_banner.?, later.banner_text.?);
+    try later.setBanner(.err, "Layout could not be opened.");
+    app.config._diagnostics = .{};
+    try std.testing.expect(!app.reportConfigProblems(&app.config));
+    try std.testing.expectEqualStrings("Layout could not be opened.", later.banner_text.?);
+    try later.setBanner(.none, null);
+    try std.testing.expect(later.banner_text == null);
+    try std.testing.expect(first.banner_text == null);
+}
+
+test "win32 config problems list configured fonts once per load without any terminal" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+    const arena = app.config._arena.?.allocator();
+    try app.config.@"font-family".parseCLI(arena, "Consolas");
+    try app.config.@"font-family".parseCLI(arena, "Small05 Missing Fallback");
+    try app.config.@"font-family-bold".parseCLI(arena, "Small05 Missing Bold");
+    try app.config.@"font-family-italic".parseCLI(arena, "small05 missing bold");
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqual(@as(usize, 2), app.config_problems.count());
+    const before = app.config_problems.fingerprint();
+    try app.hosts.append(alloc, &host);
+    app.presentConfigProblemsOnHost(&host);
+    try std.testing.expectEqual(before, app.config_problems.fingerprint());
+    try std.testing.expectEqual(@as(usize, 2), app.config_problems.count());
+    // A reload rechecks the fonts, but does not duplicate their diagnostics.
+    try std.testing.expect(app.reportConfigProblems(&app.config));
+    try std.testing.expectEqual(before, app.config_problems.fingerprint());
+    try std.testing.expectEqual(@as(usize, 2), app.config_problems.count());
 }
 
 test "win32 a config change that brings other problems refreshes the list and speaks only when it is news" {
@@ -33878,7 +34300,12 @@ pub const Surface = struct {
                 }
             }
             if (opts.show.takesFocus()) self.presentWindow();
-            if (app.update_startup_ready) app.maybeScheduleAutomaticUpdateCheck();
+            if (app.update_startup_ready) {
+                // The first window of a start that opened none (initial-window
+                // off) is where the failed-install banner can first show.
+                app.reportFailedInstallerApply();
+                app.maybeScheduleAutomaticUpdateCheck();
+            }
             try self.requestRepaint();
         }
 
@@ -39357,6 +39784,7 @@ const TestSession = struct {
         while (host_index > 0) {
             host_index -= 1;
             const host = self.hosts[host_index] orelse continue;
+            appendOwnedString(self.allocator, &host.config_problems_text, null) catch unreachable;
             host.setBanner(.none, null) catch {};
             host.clearStructuralHistory(.normal);
             host.structural_undo_entries.deinit(self.allocator);
@@ -41016,6 +41444,172 @@ test "win32 quit asks once on the window it came from" {
     try std.testing.expect(app.running);
 }
 
+test "win32 Install asks about running terminals on the window whose button was pressed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b, .host = &host_b, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &surface_a, .id = 1 },
+            .{ .host = &host_b, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    app.running = true;
+    // `readonly` stands in for a busy terminal, as in the quit test above.
+    surface_b.core_surface.readonly = true;
+
+    // The busy terminal is in the other window; the prompt shows where the
+    // banner button was pressed. Never answer it here: Install would apply
+    // whatever update the real state directory has staged.
+    surface_b.core_initialized = true;
+    defer surface_b.core_initialized = false;
+    const ask = app.pendingCloseAsk(&updateApplyConfirmAccept, &host_a).?;
+    try std.testing.expectEqual(&host_a, ask.host);
+    try std.testing.expectEqual(@as(usize, 1), ask.count);
+    ask.host.askBeforeClosing(.update, ask.count, &updateApplyConfirmAccept, &app);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expectEqualStrings("Install the update?", host_a.confirm_payload.?.title);
+    try std.testing.expectEqualStrings("Install", host_a.confirm_payload.?.accept_label);
+    try std.testing.expect(std.mem.indexOf(u8, host_a.confirm_payload.?.body, "terminate it") != null);
+    // Pressed again from the other window, the one prompt stays.
+    try std.testing.expectEqual(&host_a, app.pendingCloseAsk(&updateApplyConfirmAccept, &host_b).?.host);
+    host_a.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+
+    // The real entry point asks the same way and applies nothing until the
+    // answer (it would apply whatever the real state directory has staged).
+    // The in-flight flag is set so that, were the prompt ever skipped, the
+    // request it falls through to queues nothing.
+    app.update_action_host = &host_b;
+    defer app.update_action_host = null;
+    app.update_apply_in_flight = true;
+    try app.requestApplyStagedUpdate();
+    app.update_apply_in_flight = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_b.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    host_b.invokeConfirmCancel();
+
+    // Nothing running anywhere: Install goes straight through.
+    surface_b.core_initialized = false;
+    try std.testing.expect(app.pendingCloseAsk(&updateApplyConfirmAccept, &host_a) == null);
+
+    // A press that gets in while one apply is under way (`ShellExecuteW`
+    // pumps messages) does nothing, so it cannot raise a second elevation
+    // prompt and start a second Setup. It returns before reading any state.
+    app.update_apply_in_flight = true;
+    try app.applyStagedUpdate();
+    try std.testing.expect(app.update_apply_in_flight);
+}
+
+test "win32 the confirmed install is queued for the message loop and asked once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var session: TestSession = .{};
+    try session.init(.{ .core_app = &core_app, .app = &app });
+    defer session.deinit();
+
+    // The hook stands in for the apply, which would act on whatever update the
+    // real state directory has staged.
+    const Hook = struct {
+        var applies: usize = 0;
+        fn launch(_: *App, request: *const App.DeferredOpen) anyerror!void {
+            if (request.* == .apply_staged_update) applies += 1;
+        }
+    };
+    Hook.applies = 0;
+    app.test_shell_request = &Hook.launch;
+
+    // The answer inside the overlay's handler only queues.
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+    try std.testing.expect(app.update_apply_queued);
+    try std.testing.expectEqual(@as(usize, 0), Hook.applies);
+
+    // A second answer while it is queued adds nothing.
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+
+    // The loop runs it once.
+    try std.testing.expect(app.runDeferredOpens());
+    try std.testing.expectEqual(@as(usize, 1), Hook.applies);
+    try std.testing.expect(!app.update_apply_queued);
+    try std.testing.expect(!app.runDeferredOpens());
+    try std.testing.expectEqual(@as(usize, 1), Hook.applies);
+
+    // One that was dispatched but not completed (held, or failed) can be asked
+    // for again; one under way cannot.
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+    try std.testing.expect(app.runDeferredOpens());
+    app.update_apply_in_flight = true;
+    updateApplyConfirmAccept(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+    app.update_apply_in_flight = false;
+}
+
+test "win32 an install waits for unsaved Settings edits, also when the notice cannot be shown" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .id = 1, .register = true }},
+    });
+    defer session.deinit();
+
+    // Settings counts as open with a pending edit; nothing here touches the
+    // window handle.
+    app.settings_window.hwnd = @ptrFromInt(0x1000);
+    defer app.settings_window.hwnd = null;
+    app.settings_window.raw_scalar_dirty[0] = true;
+    defer app.settings_window.raw_scalar_dirty[0] = false;
+
+    // Asking for the install says so and queues nothing.
+    try app.requestApplyStagedUpdate();
+    try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+    try std.testing.expectEqualStrings(
+        "Save or discard your Settings changes first, then press Install again.",
+        host.banner_text.?,
+    );
+
+    // When the banner cannot be allocated the install is held all the same.
+    try host.setBanner(.none, null);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = core_app.alloc;
+    core_app.alloc = failing.allocator();
+    defer core_app.alloc = alloc;
+    try std.testing.expect(app.settingsHoldInstall());
+    try std.testing.expect(failing.has_induced_failure);
+
+    // Saved or discarded, nothing holds it.
+    app.settings_window.raw_scalar_dirty[0] = false;
+    try std.testing.expect(!app.settingsHoldInstall());
+}
+
 test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -41199,6 +41793,13 @@ test "win32 close prompts count the terminals they would end" {
     try std.testing.expectEqualStrings(
         "Processes are still running in 3 terminals. Quitting noctty will terminate them.",
         many.body,
+    );
+    const update = closeScopePrompt(.update, 2, &buf);
+    try std.testing.expectEqualStrings("Install the update?", update.title);
+    try std.testing.expectEqualStrings("Install", update.accept_label);
+    try std.testing.expectEqualStrings(
+        "Processes are still running in 2 terminals. Installing the update closes noctty and will terminate them.",
+        update.body,
     );
 }
 
@@ -50122,6 +50723,8 @@ test "win32 installer apply args preserve install dir and log path" {
     try std.testing.expect(std.mem.indexOf(u8, args, "/NORESTART") != null);
     try std.testing.expect(std.mem.indexOf(u8, args, "/CLOSEAPPLICATIONS") != null);
     try std.testing.expect(std.mem.indexOf(u8, args, "/RESTARTAPPLICATIONS") != null);
+    // noctty.iss reads this one to start the app again after a silent apply.
+    try std.testing.expect(std.mem.indexOf(u8, args, " /RELAUNCH=1 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, args, "/DIR=\"C:\\Program Files\\noctty\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, args, "/LOG=\"C:\\Users\\Aman\\AppData\\Local\\noctty\\updates\\1.3.101\\logs\\apply.log\"") != null);
 }

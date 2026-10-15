@@ -384,6 +384,18 @@ moving either file afterward requires registering again. Registration
 refuses to proceed when the proxy DLL is missing, or when
 `DelegationConsole` is missing, empty, or set to the inbox console host.
 
+Deleting a copy that registered itself leaves `DelegationTerminal` pointing
+at files that are gone, and every console then opens in OpenConsole's own
+window. The installer's uninstaller runs `+unregister-default-terminal`
+first. So does the Scoop manifest's `pre_uninstall`, on `scoop uninstall`
+only (never `scoop update`), and only when the registration points into
+that app's Scoop folder and no process is running from it. Otherwise it
+skips and leaves the registration in place, as it does when the command
+fails to start or exits nonzero, which it reports without failing the
+uninstall. To be sure with Scoop, close noctty and run
+`noctty +unregister-default-terminal` before `scoop uninstall`. For a
+portable ZIP, run it yourself before deleting the folder.
+
 The three shared Microsoft `ITerminalHandoff` Interface mappings are
 snapshotted before noctty changes them. Unregistration restores each prior
 raw value only while that mapping still points to noctty's proxy, so a newer
@@ -508,7 +520,11 @@ merged `HKCR` view. So if you registered the verbs from a portable build and
 later install noctty per-machine, the per-user copy keeps pointing at the
 portable executable until you remove it: before deleting a portable copy,
 run `.\noctty.com +unregister-shell-menu` as the user that registered the
-verbs. The installer's uninstaller removes only its own registration.
+verbs. The installer's uninstaller removes only its own registration, and
+`+unregister-shell-menu` cannot remove the installer's all-users one (it never
+writes or deletes `HKLM`): on an installed copy it reports the current user's
+keys as already absent and then says the all-users entries remain, which only
+uninstalling noctty removes.
 
 On Windows 11 these classic verbs appear under **Show more options**;
 `Shift+F10` opens the classic menu directly. There is no top-level modern
@@ -613,9 +629,13 @@ verified on a machine with a battery; see the
 [status caveats](status.md#known-caveats).
 
 - `unfocused-render-fps` caps presentation for visible, unfocused surfaces.
-  Default `30`. Values below `1` are treated as `1`; values above `125` have
-  no additional effect, because the renderer never presents more often than
-  every 8 ms.
+  Default `30`. Values below `1` are treated as `1`; from `125` up an
+  unfocused surface is capped no more than a focused one (saver pacing
+  still caps both). The cap holds on average. Frames the renderer's own
+  timers bring (a deferred update, a custom-shader animation) wait for the
+  system timer tick, 15.6 ms by default, so one can land up to a tick late
+  and the next comes that much sooner, and such frames never come faster
+  than one a tick (64 fps).
 - `power-saver-rendering` accepts `auto`, `on`, or `off`. Default `auto`,
   which follows Windows Battery Saver or Energy Saver; `on` forces saver
   pacing and `off` disables it. `auto` does not key off battery power alone:
@@ -994,9 +1014,25 @@ forced or answered from the 24 hour cache, and dismissing the notice for a
 staged update keeps the staged files and records the dismissal.
 
 For installer-managed installs, the update notice can launch the verified
-staged installer. Applying an update is always user-initiated: it
-re-verifies the staged installer, records apply intent, launches the
-installer elevated (UAC may prompt), and exits the app.
+staged installer. Applying an update is always user-initiated. The notice says
+that installing closes all windows and running sessions, and **Install**
+asks first, like quitting, when a terminal still has a running process. It
+then re-verifies the staged installer, records apply intent, launches the
+installer elevated (UAC may prompt), and exits the app. The silent setup
+starts noctty again when it finishes, through Explorer so that it is meant to
+run as the logged-on user and not elevated, so an update that works ends with
+a new window. (The wizard's "Launch noctty" box starts it the same way.) That
+de-elevation is the intended result and has not been measured on a real
+install. If a later
+start finds that the build is still the old one after an Install, and that
+Setup is no longer running, a banner says the update did not finish and names
+the setup log (`updates\<version>\logs\apply.log` under the noctty state
+directory); the staged installer is kept, so **Install** is offered again. A
+banner that says Setup left no log means it started but could not write one,
+or was stopped first. Only a setup-managed copy reports this, because the
+update state is shared by every copy of the user's. Declining the elevation
+prompt does not quit noctty or record anything: the banner just says the
+installer could not be launched.
 
 For portable installs, **Apply** re-verifies the staged ZIP payload, records the
 pending update, and exits noctty. On the next launch, noctty backs up the files

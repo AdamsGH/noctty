@@ -22,7 +22,9 @@ pub const Options = struct {
 /// folders, folder backgrounds, and drives.
 ///
 /// The action removes only noctty's six owned keys under
-/// `HKCU\Software\Classes` and succeeds when they are already absent.
+/// `HKCU\Software\Classes` and succeeds when they are already absent. The
+/// installer's all-users entries (HKLM) are not its to remove, so when they
+/// exist it says they remain.
 pub fn run(alloc: Allocator) !u8 {
     var opts: Options = .{};
     defer opts.deinit();
@@ -59,7 +61,15 @@ fn runInner(
         );
         return 1;
     };
+    return report(stdout, stderr, results, shell_menu.machineVerbsPresent(alloc));
+}
 
+fn report(
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    results: [shell_menu.unregister_key_paths.len]shell_menu.DeleteResult,
+    machine_verbs: bool,
+) !u8 {
     var failed = false;
     for (shell_menu.unregister_key_paths, results) |path, result| {
         switch (result) {
@@ -84,5 +94,41 @@ fn runInner(
             },
         }
     }
+    // The installer registers the same entries for all users, and "Already
+    // absent" above is about this user's only.
+    if (machine_verbs) {
+        try stdout.print(
+            "Note: the noctty installer also registered \"Open noctty here\" for all users (HKLM\\Software\\Classes). " ++
+                "This action removes only the current user's entries and cannot remove those; uninstalling noctty does.\n",
+            .{},
+        );
+    }
     return if (failed) 1 else 0;
+}
+
+test "unregister reports the installer's all-users entries that it cannot remove" {
+    var out_buf: [2048]u8 = undefined;
+    var err_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err: std.Io.Writer = .fixed(&err_buf);
+    const absent: [shell_menu.unregister_key_paths.len]shell_menu.DeleteResult = @splat(.absent);
+
+    // Nothing of this user's was there, and the all-users entries are: the
+    // "Already absent" lines alone would read as the menu being gone.
+    try std.testing.expectEqual(@as(u8, 0), try report(&out, &err, absent, true));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "Already absent HKCU\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "for all users (HKLM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "uninstalling noctty does") != null);
+
+    out = .fixed(&out_buf);
+    try std.testing.expectEqual(@as(u8, 0), try report(&out, &err, absent, false));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "HKLM") == null);
+
+    // A failure still exits 1, and the note still comes out.
+    var failed = absent;
+    failed[0] = .{ .failed = ERROR_ACCESS_DENIED };
+    out = .fixed(&out_buf);
+    try std.testing.expectEqual(@as(u8, 1), try report(&out, &err, failed, true));
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "Win32 status 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "for all users (HKLM") != null);
 }

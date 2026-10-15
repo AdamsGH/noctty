@@ -460,10 +460,12 @@ fn pollIfStaleWith(now: u64, read: PowerStatusReader) void {
     publishPolledSnapshot(parseSystemPowerStatus(raw, snapshot()), generation);
 }
 
-/// Monotonic millisecond clock shared with Win32 notification and visibility
-/// code. Renderer pacing uses this only when throttling is active.
-pub fn tickCountMs() u64 {
-    return sys.GetTickCount64();
+/// Monotonic millisecond clock for render pacing, read from
+/// QueryPerformanceCounter. GetTickCount64 advances in 15.6 ms steps, too
+/// coarse to measure a 34 ms present interval with.
+pub fn pacingClockMs() u64 {
+    const counter: u128 = windows.QueryPerformanceCounter();
+    return @intCast(counter * std.time.ms_per_s / windows.QueryPerformanceFrequency());
 }
 
 /// Whether saver-specific pacing is active for the current configuration.

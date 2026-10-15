@@ -2068,7 +2068,7 @@ pub const SettingsWindow = struct {
         self.updateSaveEnabled();
     }
 
-    fn hasPendingChanges(self: *const SettingsWindow) bool {
+    pub fn hasPendingChanges(self: *const SettingsWindow) bool {
         for (self.raw_scalar_dirty) |dirty| if (dirty) return true;
         for (self.owned_text_changed, self.owned_dirty, self.owned_conflict) |text_changed, dirty, conflict| {
             if (text_changed or dirty or conflict) return true;

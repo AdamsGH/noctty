@@ -249,6 +249,9 @@ pub const CommonDerivedConfig = struct {
 pub const CommonFrameUpdate = struct {
     cursor_blinking: bool,
     output_progress: ?renderer.State.OutputProgress = null,
+    /// Synchronized output (mode 2026) held the frame, so nothing
+    /// was rebuilt and the previous frame is still current.
+    synchronized_output: bool = false,
 };
 
 pub fn Renderer(comptime GraphicsAPI: type) type {
@@ -1027,6 +1030,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This is called by the GTK apprt after the surface is
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
+        ///
+        /// Nothing calls this in this fork. A caller must also mark
+        /// `bg_cells_dirty` full and reset `fg_cells_dirty_from` to 0: the
+        /// new swap chain's cell buffers start empty, and the dirty trackers
+        /// assume everything not marked was already uploaded.
         pub fn displayRealized(self: *Self) !void {
             // If our API has to do things on realize, let it.
             if (@hasDecl(GraphicsAPI, "displayRealized")) {
@@ -1104,7 +1112,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
         /// is responsible for triggering draw_now calls to the render thread.
-        /// That is the only way to trigger a drawFrame.
+        /// That is the only way to trigger a drawFrame. Always false on
+        /// Win32, so the render thread paces its own draws there.
         pub fn hasVsync(self: *const Self) bool {
             // Win32 swap interval blocks presentation, but it does not yet
             // provide the display-link style draw_now driver this render loop
@@ -1276,7 +1285,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
                     log.debug("synchronized output started, skipping render", .{});
-                    return .{ .cursor_blinking = cursor_blinking };
+                    return .{
+                        .cursor_blinking = cursor_blinking,
+                        .synchronized_output = true,
+                    };
                 }
 
                 // If scroll-to-bottom on output is enabled, check if the final line
@@ -1625,6 +1637,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Win32 owns its OpenGL buffer presentation in the redraw
                 // path, so re-presenting an unchanged frame only adds another
                 // SwapBuffers call into the driver with no visible benefit.
+                // Unreached today: every Win32 paint goes through
+                // `Surface.draw`, which passes `sync = true`.
                 if (apprt.runtime == apprt.win32) {
                     if (comptime @hasDecl(GraphicsAPI, "requires_retained_present") and GraphicsAPI.requires_retained_present) {
                         try self.api.presentLastTarget();
