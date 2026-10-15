@@ -1,0 +1,3 @@
+# PKG-38 mutex contention measurement (measurement only, not for merge)
+
+apply_lock.py adds latency_trace events for renderer_state.mutex: update_lock (renderer updateFrame), io_lock (termio processOutput) and ui_lock (every app-thread lock site in Surface.zig and win32.zig), each with wait and hold. contend-probe.ps1 (built by make_contend.py from LAT-01's lat-driver2.ps1) floods a portable noctty on a private desktop with cmd type or fastcat.exe (64 KiB writes), optionally unfocused (posted WM_KILLFOCUS) or under power-saver-rendering, and probes the UI thread. P38-summary.txt is the baseline on main 7a025aabc.
