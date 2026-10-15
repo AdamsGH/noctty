@@ -421,8 +421,7 @@ fn drainMailbox(
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
     while (mailbox.pop()) |message| {
-        // If we have a message we always redraw
-        redraw = true;
+        if (messageNeedsRedraw(message)) redraw = true;
 
         log.debug("mailbox message={s}", .{@tagName(message)});
         switch (message) {
@@ -474,6 +473,38 @@ fn drainMailbox(
     if (redraw) {
         try io.renderer_wakeup.notify();
     }
+}
+
+/// Whether handling `message` can change what the renderer draws.
+///
+/// A pty write changes nothing on screen: whatever the child echoes back
+/// arrives as output, which wakes the renderer itself, and a caller that
+/// changes the screen before writing (a typed key scrolling to the bottom,
+/// a reported click dropping the selection) queues its own render. Since
+/// Win32 input mode (#335) every key release and modifier press writes a
+/// record, and waking the renderer for those presented one extra,
+/// unchanged frame per keystroke on the UI thread.
+fn messageNeedsRedraw(message: termio.Message) bool {
+    return switch (message) {
+        .write_small, .write_stable, .write_alloc => false,
+        else => true,
+    };
+}
+
+test "termio pty writes do not ask the renderer for a frame" {
+    const testing = std.testing;
+    var empty: [0]u8 = .{};
+    try testing.expect(!messageNeedsRedraw(.{ .write_small = .{} }));
+    try testing.expect(!messageNeedsRedraw(.{ .write_stable = "\x1b[65;30;97;0;0;1_" }));
+    try testing.expect(!messageNeedsRedraw(.{ .write_alloc = .{
+        .alloc = testing.allocator,
+        .data = &empty,
+    } }));
+
+    try testing.expect(messageNeedsRedraw(.{ .clear_screen = .{ .history = false } }));
+    try testing.expect(messageNeedsRedraw(.{ .scroll_viewport = .{ .bottom = {} } }));
+    try testing.expect(messageNeedsRedraw(.{ .jump_to_prompt = -1 }));
+    try testing.expect(messageNeedsRedraw(.{ .focused = true }));
 }
 
 fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {

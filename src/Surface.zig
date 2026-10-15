@@ -3395,6 +3395,17 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     }
 }
 
+/// Drop the selection before input that goes to the child (a reported
+/// click or wheel tick, or alternate scroll), redrawing only if there was
+/// one: the pty write that follows does not wake the renderer.
+///
+/// Precondition: the render_state mutex must be held.
+fn clearSelectionForChildInput(self: *Surface) !void {
+    if (self.io.terminal.screens.active.selection == null) return;
+    try self.setSelection(null);
+    try self.queueRender();
+}
+
 /// Change the cell size for the terminal grid. This can happen as
 /// a result of changing the font size at runtime.
 fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
@@ -5033,7 +5044,7 @@ pub fn scrollCallback(
         // The selection can occur if the user uses the shift mod key to
         // override mouse grabbing from the window.
         if (self.isMouseReporting()) {
-            try self.setSelection(null);
+            try self.clearSelectionForChildInput();
         }
 
         // If we're in alternate screen with alternate scroll enabled, then
@@ -5047,7 +5058,7 @@ pub fn scrollCallback(
             if (y.delta != 0) {
                 // When we send mouse events as cursor keys we always
                 // clear the selection.
-                try self.setSelection(null);
+                try self.clearSelectionForChildInput();
 
                 const seq = if (self.io.terminal.modes.get(.cursor_keys)) seq: {
                     // cursor key: application mode
@@ -5408,7 +5419,7 @@ pub fn mouseButtonCallback(
             } else {
                 // Outside copy mode the underlying application owns reported
                 // clicks, so clear terminal selection as before.
-                try self.setSelection(null);
+                try self.clearSelectionForChildInput();
             }
 
             const report_action: input.MouseAction = switch (action) {
