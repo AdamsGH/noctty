@@ -7496,6 +7496,13 @@ pub const App = struct {
         ) catch std.math.maxInt(u64);
     }
 
+    /// `undo-timeout = 0`: the prune timer takes every entry the moment it
+    /// fires, so nothing can be restored. Only exactly 0 counts; a nonzero
+    /// timeout leaves a window, however short.
+    fn undoOff(self: *const App) bool {
+        return self.undoTimeoutMs() == 0;
+    }
+
     fn nextUndoSequence(self: *App) u64 {
         const sequence = self.next_undo_sequence;
         self.next_undo_sequence +%= 1;
@@ -10476,7 +10483,7 @@ pub const App = struct {
                 self.followShellFocus(host);
             }
             host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-            if (tab_removed) host.notifyTabRemovedUia();
+            if (tab_removed) host.notifyTabListUiaChanged();
 
             var shell_mapping_stable = true;
             if (host.tabs.items.len == 0) {
@@ -10646,7 +10653,7 @@ pub const App = struct {
             .this => {
                 // With `undo-timeout = 0` the close cannot be taken back, so it
                 // asks like the closes that are not undoable.
-                if (self.undoTimeoutMs() == 0) {
+                if (self.undoOff()) {
                     const count = tabsCloseConfirmCount(host.tabs.items[current_idx..][0..1]);
                     if (count != 0) {
                         host.askBeforeClosing(.this_tab, count, &closeThisTabConfirmAccept, current);
@@ -10709,7 +10716,7 @@ pub const App = struct {
             break :shell;
         }
         // Only now: a close that rolled back above left the list as it was.
-        host.notifyTabRemovedUia();
+        host.notifyTabListUiaChanged();
         if (stored_entry.payload.close_tab.tab) |*tab| tab.clearRedoHistory();
         if (host.activeSurface()) |replacement| {
             if (current_idx != previous_active) {
@@ -10730,7 +10737,11 @@ pub const App = struct {
                 "tab close banner failed",
                 host.setBanner(.info, labels.tabClosedMessage(
                     &self.config.keybind.set,
-                    .{ .has_modifier_remaps = self.config.@"key-remap".map.count() != 0, .us_layout = sys.GetKeyboardLayout(0) == 0x04090409 },
+                    .{
+                        .has_modifier_remaps = self.config.@"key-remap".map.count() != 0,
+                        .us_layout = sys.GetKeyboardLayout(0) == 0x04090409,
+                        .undo_available = !self.undoOff(),
+                    },
                     &hint_buf,
                 )),
             );
@@ -13305,7 +13316,8 @@ const ConfirmPrompt = struct {
 const program_confirm_arming_ms = 500;
 
 /// What a close that ends several terminals at once is closing. One pane
-/// keeps its own prompt in `Surface.close`.
+/// keeps its own prompt in `Surface.close`. The userdata of a `.this_tab`
+/// prompt is the Surface of the tab, which names the tab when it is behind.
 const CloseScope = enum { window, this_tab, other_tabs, right_tabs, app, update };
 
 /// The prompt for a close that would end `count` (at least 1) terminals
@@ -14382,7 +14394,7 @@ const Host = struct {
             return err;
         };
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.notifyTabRemovedUia();
+        self.notifyTabListUiaChanged();
         self.app.auditShellNativeMapping("tab-redetach");
         return true;
     }
@@ -14575,7 +14587,7 @@ const Host = struct {
             return err;
         };
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.notifyTabRemovedUia();
+        self.notifyTabListUiaChanged();
         self.prepareActiveTabVisibility(self.active_tab);
         self.layout() catch |err| log.warn("tab split transfer redo layout sync failed err={}", .{err});
         self.refreshChrome() catch |err| log.warn("tab split transfer redo chrome sync failed err={}", .{err});
@@ -17132,7 +17144,7 @@ const Host = struct {
         // a failed commit above restores the target's own panes.
         self.refreshTabStatus(self.active_tab);
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.notifyTabRemovedUia();
+        self.notifyTabListUiaChanged();
         self.tabs.items[self.active_tab].clearRedoHistory();
         while (self.structural_undo_entries.items.len > win32_undo.max_entries) {
             win32_structural_history.evictOldest(
@@ -17400,6 +17412,77 @@ const Host = struct {
         try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
     }
 
+    test "a tab button that appears tells UIA the tab list changed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(tabButtonAddedUiaTestBody);
+    }
+
+    fn tabButtonAddedUiaTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var surface_c: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+                .{ .storage = &surface_c, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        // Layout repaints the active tab's panes, which need windows.
+        for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+            surface.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        }
+        defer for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+            surface.hwnd = null;
+        };
+        const root = try win32_uia.RootProvider.create(std.testing.allocator, @ptrFromInt(0x1));
+        defer _ = win32_uia.RootProvider.Release(&root.base);
+        host.root_uia_provider = root;
+        defer host.root_uia_provider = null;
+        const events = &win32_uia.events;
+
+        // The first chrome pass gives the two tabs their buttons.
+        const before = events.testing_structure_changes;
+        try host.refreshChrome();
+        try std.testing.expect(host.tabs.items[1].button_hwnd != null);
+        try std.testing.expectEqual(before + 1, events.testing_structure_changes);
+
+        // A pass that creates no button says nothing.
+        try host.refreshChrome();
+        try std.testing.expectEqual(before + 1, events.testing_structure_changes);
+
+        // A new tab, as `Surface.init` attaches one: the button that the next
+        // chrome pass creates is what a reader's tab list is missing.
+        try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 3, &surface_c));
+        try host.refreshChrome();
+        try std.testing.expect(host.tabs.items[2].button_hwnd != null);
+        try std.testing.expectEqual(before + 2, events.testing_structure_changes);
+
+        // Undo of a close builds the restored tab's button anew. Detaching it
+        // is the removal, which is told separately (CLOSE-01).
+        var entry = host.detachTabForUndo(2).?;
+        defer entry.dispose(&host, .host_destroy) catch {}; // Best-effort test teardown.
+        const detached = events.testing_structure_changes;
+        try std.testing.expect(try host.restoreClosedTabEntry(&entry.payload.close_tab));
+        try std.testing.expect(host.tabs.items[2].button_hwnd != null);
+        try std.testing.expectEqual(detached + 1, events.testing_structure_changes);
+    }
+
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
     /// and repaint it when that changed. Assistive technology hears when
     /// what `ItemStatus` says changes other than by progress: a new state,
@@ -17434,12 +17517,13 @@ const Host = struct {
         for (0..self.tabs.items.len) |index| self.refreshTabStatus(index);
     }
 
-    /// A tab left the strip. Removing a background tab changes no selection,
-    /// so `notifyActiveTabUiaSelectionChanged` stays silent and a reader's tab
+    /// A tab joined or left the strip. Neither needs to change a selection (a
+    /// background tab closes, or is restored behind the front one), so
+    /// `notifyActiveTabUiaSelectionChanged` can stay silent and a reader's tab
     /// list would go stale. The tab buttons are child windows of the host, not
     /// children of the Selection container, so the host's root is told its
     /// children changed.
-    fn notifyTabRemovedUia(self: *Host) void {
+    fn notifyTabListUiaChanged(self: *Host) void {
         if (!self.shouldShowTabBar()) return;
         if (self.root_uia_provider) |provider| provider.raiseChildrenInvalidated();
     }
@@ -22356,9 +22440,54 @@ const Host = struct {
             return;
         }
         var body: [256]u8 = undefined;
-        self.showConfirm(closeScopePrompt(scope, count, &body), on_accept, null, userdata) catch |err| {
+        var title: [32]u8 = undefined;
+        var prompt = closeScopePrompt(scope, count, &body);
+        // A tab closed from its button need not be the one in front, and
+        // "this tab" would then name the wrong one.
+        const named_body = if (scope == .this_tab)
+            self.nameBackgroundTab(&prompt, count, @ptrCast(@alignCast(userdata)), &title)
+        else
+            null;
+        defer if (named_body) |text| self.app.core_app.alloc.free(text);
+        self.showConfirm(prompt, on_accept, null, userdata) catch |err| {
             log.warn("close confirm unavailable err={}; declining close to honour confirm-close-surface", .{err});
         };
+    }
+
+    /// Words the `.this_tab` prompt for the tab holding `surface` as the
+    /// tab's number and title when another tab is in front, as the OSC 52
+    /// prompt names the tab that asked. Returns the body it allocated, which
+    /// `prompt` borrows; null leaves the prompt as it was (the tab in front,
+    /// or no memory for the words).
+    fn nameBackgroundTab(self: *Host, prompt: *ConfirmPrompt, count: usize, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
+        const found = self.app.findTabForSurface(surface) orelse return null;
+        if (found.host != self or found.index == self.active_tab) return null;
+        // The title needs no memory, so it names the tab even if the body cannot.
+        prompt.title = labels.backgroundTabClosePromptTitle(title_buf, found.index + 1);
+        const body = labels.buildBackgroundTabClosePromptBody(
+            self.app.core_app.alloc,
+            count,
+            found.index + 1,
+            surface.effectiveTitle(),
+        ) catch return null;
+        prompt.body = body;
+        return body;
+    }
+
+    /// The same for the prompt of a terminal that closes by itself, which
+    /// `Surface.close` raises whatever tab the terminal is in.
+    fn nameBackgroundTerminal(self: *Host, prompt: *ConfirmPrompt, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
+        const found = self.app.findTabForSurface(surface) orelse return null;
+        if (found.host != self or found.index == self.active_tab) return null;
+        prompt.title = labels.backgroundTerminalClosePromptTitle(title_buf, found.index + 1);
+        const body = labels.buildBackgroundTerminalClosePromptBody(
+            self.app.core_app.alloc,
+            found.index + 1,
+            surface.effectiveTitle(),
+            surface.core_initialized and surface.core_surface.child_exited,
+        ) catch return null;
+        prompt.body = body;
+        return body;
     }
 
     /// Shown on screen, minimized included; a hidden quick terminal is not.
@@ -22946,6 +23075,10 @@ const Host = struct {
         const button_width = @max(1, @divTrunc(tab_area_width, visible_count));
         const label_max_width = hostTabLabelMaxWidth(button_width);
         var tooltip_title_changed = false;
+        var button_created = false;
+        // A pass that fails after making a button has still changed the list,
+        // and the next pass has no new button to say so.
+        errdefer if (button_created) self.notifyTabListUiaChanged();
         for (self.tabs.items, 0..) |*tab, i| {
             const surface = tab.focusedSurface() orelse continue;
             const title = if (surface.effectiveTitle()) |value| value else null;
@@ -23036,6 +23169,7 @@ const Host = struct {
                     .selected = &tabItemUiaSelected,
                     .selection_container = &tabContainerUiaProvider,
                 });
+                button_created = true;
             } else if (label_changed) {
                 try appendOwnedString(self.app.core_app.alloc, &tab.cached_button_label, label);
                 const label_w = try std.unicode.utf8ToUtf16LeAllocZ(self.app.core_app.alloc, label);
@@ -23070,6 +23204,11 @@ const Host = struct {
         }
         var chrome_changed = false;
         _ = self.layoutChromeForRect(rect, &chrome_changed);
+        // Every way a tab joins the strip (a new tab or window, a restored
+        // session, an undo, a tab moved in) ends in a button made here, and
+        // none of them has to change the selection. Told once, after the
+        // layout, so the reader finds each button where it is.
+        if (button_created) self.notifyTabListUiaChanged();
         // Refresh whenever a tooltip is up, not only when its own tab's label
         // was rebuilt: a tab that scrolls out of `visibleTabRange` because
         // ANOTHER tab was activated keeps every label input and is never
@@ -34132,8 +34271,13 @@ pub const Surface = struct {
         // in host.tabs, causing use-after-free on subsequent refreshChrome/layout.
         errdefer {
             // The chrome may have given the new tab a button and a UIA
-            // provider, which the tab must not outlive (`Tab.deinit`).
-            if (inserted_tab_index) |index| if (index < host.tabs.items.len) host.destroyTabButton(&host.tabs.items[index]);
+            // provider, which the tab must not outlive (`Tab.deinit`), and a
+            // reader was told about the button.
+            var had_button = false;
+            if (inserted_tab_index) |index| if (index < host.tabs.items.len) {
+                had_button = host.tabs.items[index].button_hwnd != null;
+                host.destroyTabButton(&host.tabs.items[index]);
+            };
             rollbackFailedSurfaceAttach(
                 &host.tabs,
                 &host.active_tab,
@@ -34142,6 +34286,7 @@ pub const Surface = struct {
                 inserted_tab_index,
                 &split_rollback,
             );
+            if (had_button) host.notifyTabListUiaChanged();
             // The core's `set_title` may have relabelled a host that stays
             // for the tabs it had; `windowDestroyed` would refresh them.
             if (!created_host) runUiActionOrLog("failed surface chrome refresh failed", host.refreshChrome());
@@ -34363,6 +34508,14 @@ pub const Surface = struct {
         // The owner's last window already took the session's final snapshot.
         app.session_state_saved_before_last_host_close = true;
 
+        // A reader was told about the new tab's button, so it hears that the
+        // button is gone again when init fails.
+        const root = try win32_uia.RootProvider.create(std.testing.allocator, @ptrFromInt(0x1));
+        defer _ = win32_uia.RootProvider.Release(&root.base);
+        host.root_uia_provider = root;
+        defer host.root_uia_provider = null;
+        const announced = win32_uia.events.testing_structure_changes;
+
         // Before the fix, the unwinding DestroyWindow sent WM_DESTROY, which
         // freed the Surface; the errdefers then read it and
         // `createWindowSurface` freed it a second time. The title, the tab's
@@ -34372,6 +34525,7 @@ pub const Surface = struct {
             error.StaleRevision,
             app.createWindowSurface(&app.config, default_title, .{ .host_id = host.id }),
         );
+        try std.testing.expectEqual(announced + 1, win32_uia.events.testing_structure_changes);
         app.running = false;
         try std.testing.expect(sys.IsWindow(Stage.surface_hwnd.?) == 0);
         try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
@@ -34505,15 +34659,22 @@ pub const Surface = struct {
                 _ = mutable.requestClose();
                 return;
             };
+            // Not always the key that closed a terminal in front: a read-only
+            // terminal whose program exits closes itself and asks, in
+            // whichever tab it is.
+            var title_buf: [32]u8 = undefined;
+            var prompt: ConfirmPrompt = .{
+                .title = "Close this terminal?",
+                .body = "A process is still running. Closing this surface will terminate it.",
+                .accept_label = "Close",
+                .cancel_label = "Cancel",
+                // Nothing to preview: this prompt is about a running
+                // process, not about a payload.
+            };
+            const named_body = host.nameBackgroundTerminal(&prompt, mutable, &title_buf);
+            defer if (named_body) |text| mutable.app.core_app.alloc.free(text);
             host.showConfirm(
-                .{
-                    .title = "Close this terminal?",
-                    .body = "A process is still running. Closing this surface will terminate it.",
-                    .accept_label = "Close",
-                    .cancel_label = "Cancel",
-                    // Nothing to preview: this prompt is about a running
-                    // process, not about a payload.
-                },
+                prompt,
                 &surfaceConfirmCloseAccept,
                 null,
                 @ptrCast(mutable),
@@ -41750,6 +41911,36 @@ test "win32 closeTab this on last tab detaches tab for undo" {
     try std.testing.expectEqual(@as(usize, 0), surface.undo_stack.redoDepth());
 }
 
+test "win32 the banner after the last tab closes offers undo only while undo is on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+
+    // Undo is on: the banner says how to use it.
+    try std.testing.expect(try app.closeTab(.app, .this));
+    try std.testing.expect(std.mem.indexOf(u8, host.banner_text.?, "undo") != null);
+
+    // Put the tab back, then close it with undo off (`undo-timeout = 0`).
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+    try host.setBanner(.none, null);
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+    try std.testing.expect(try app.closeTab(.app, .this));
+    try std.testing.expectEqualStrings("Tab closed.", host.banner_text.?);
+}
+
 test "win32 close_tab this asks first once undo is off" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -41782,7 +41973,12 @@ test "win32 close_tab this asks first once undo is off" {
     try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
     surface_a.core_initialized = false;
     try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
-    try std.testing.expectEqualStrings("Close this tab?", host.confirm_payload.?.title);
+    // Tab 2 is in front, so the prompt says which tab it is about.
+    try std.testing.expectEqualStrings("Close tab 1?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 1 (noctty). Closing that tab will terminate it, and undo is off.",
+        host.confirm_payload.?.body,
+    );
     // Nothing closed, and nothing sits in undo history: the tab was not detached.
     try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
     try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
@@ -41791,6 +41987,19 @@ test "win32 close_tab this asks first once undo is off" {
     try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
     try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
 
+    // The tab in front is "this tab", as it was.
+    surface_b.core_surface.readonly = true;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqualStrings("Close this tab?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in this tab. Closing the tab will terminate it, and undo is off.",
+        host.confirm_payload.?.body,
+    );
+    host.invokeConfirmCancel();
+    surface_b.core_surface.readonly = false;
+
     surface_a.core_initialized = true;
     try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
     surface_a.core_initialized = false;
@@ -41798,6 +42007,61 @@ test "win32 close_tab this asks first once undo is off" {
     try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
     try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
     try std.testing.expectEqual(@as(?*Surface, &surface_b), host.activeSurface());
+}
+
+test "win32 a terminal that asks to close in a tab behind the front one names that tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // A read-only terminal asks before it closes, even when its program has
+    // exited and it closes by itself, so the prompt can come from tab 1 while
+    // tab 2 is in front.
+    surface_a.close(true);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close terminal in tab 1?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 1 (noctty). Closing that terminal will terminate it.",
+        host.confirm_payload.?.body,
+    );
+    host.invokeConfirmCancel();
+
+    // That is the usual way in: the program has exited, and the prompt must
+    // not say a process is running.
+    surface_a.core_surface.child_exited = true;
+    surface_a.core_initialized = true;
+    surface_a.close(true);
+    surface_a.core_initialized = false;
+    try std.testing.expectEqualStrings(
+        "The program in Tab 1 (noctty) has exited. Read-only mode makes closing that terminal ask first.",
+        host.confirm_payload.?.body,
+    );
+    host.invokeConfirmCancel();
+
+    // The one in front keeps the plain wording.
+    surface_b.close(true);
+    try std.testing.expectEqualStrings("Close this terminal?", host.confirm_payload.?.title);
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
 }
 
 test "win32 close_tab this closes at once while undo is on or nothing would be lost" {
