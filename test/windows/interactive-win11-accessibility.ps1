@@ -5455,6 +5455,7 @@ try {
                 @{ Name = 'Window padding X'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Window padding Y'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Window padding balance'; Type = [System.Windows.Automation.ControlType]::ComboBox },
+                @{ Name = 'Follow Windows accent color'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Background blur'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }

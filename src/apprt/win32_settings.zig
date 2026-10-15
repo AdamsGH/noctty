@@ -217,6 +217,7 @@ const COMBO_CLIPBOARD_READ: usize = 422;
 const COMBO_CLIPBOARD_WRITE: usize = 423;
 const COMBO_LINK_URL: usize = 424;
 const COMBO_LINK_PREVIEWS: usize = 425;
+const CHK_ACCENT_FOLLOW: usize = 426;
 const ES_NUMBER: u32 = 0x2000;
 const ES_AUTOHSCROLL: u32 = 0x80;
 const EN_CHANGE: u16 = 0x0300;
@@ -407,6 +408,7 @@ pub const SettingField = enum {
     padding_balance,
     auto_update,
     auto_update_channel,
+    accent_follow_system,
 
     /// The name a person sees for this setting in the conflict message, the
     /// Advanced page and the command palette. The enum tag is an internal
@@ -436,6 +438,7 @@ pub const SettingField = enum {
             .padding_balance => "Window padding balance",
             .auto_update => "Auto-update mode",
             .auto_update_channel => "Auto-update channel",
+            .accent_follow_system => "Follow the Windows accent color",
         };
     }
 
@@ -464,6 +467,7 @@ pub const SettingField = enum {
             .padding_balance => "window-padding-balance",
             .auto_update => "auto-update",
             .auto_update_channel => "auto-update-channel",
+            .accent_follow_system => "accent-follow-system",
         };
     }
 
@@ -499,6 +503,7 @@ pub const SettingField = enum {
             .padding_balance => kw("window-padding-balance margin"),
             .auto_update => kw("auto-update upgrade"),
             .auto_update_channel => kw("auto-update-channel stable tip release"),
+            .accent_follow_system => kw("accent-follow-system accent color highlight tab windows personalization"),
         };
     }
 };
@@ -537,6 +542,7 @@ pub const editable_keys = .{
     Config.Key.@"shell-integration",      Config.Key.@"cursor-style",      Config.Key.@"background-blur",
     Config.Key.@"window-padding-balance", Config.Key.@"auto-update",       Config.Key.@"auto-update-channel",
     Config.Key.@"font-family",            Config.Key.theme,                Config.Key.command,
+    Config.Key.@"accent-follow-system",
 };
 
 /// Scalar EDIT controls whose raw text can temporarily be invalid and
@@ -669,6 +675,7 @@ pub const SettingValue = union(SettingField) {
     padding_balance: @FieldType(Config, "window-padding-balance"),
     auto_update: @FieldType(Config, "auto-update"),
     auto_update_channel: @FieldType(Config, "auto-update-channel"),
+    accent_follow_system: @FieldType(Config, "accent-follow-system"),
 };
 
 fn settingValueEql(a: SettingValue, b: SettingValue) bool {
@@ -732,8 +739,9 @@ pub const PreviewEffect = enum { none, theme, opacity };
 
 pub fn previewEffect(field: SettingField) PreviewEffect {
     return switch (field) {
-        // `resolveTheme` reads `window-theme`, nothing else a preview edits.
-        .window_theme => .theme,
+        // `resolveTheme` reads `window-theme` and `accent-follow-system`,
+        // nothing else a preview edits.
+        .window_theme, .accent_follow_system => .theme,
         // The layered alpha of the host window is the only thing that makes
         // `background-opacity` visible on Win32.
         .background_opacity => .opacity,
@@ -768,6 +776,7 @@ fn settingValue(config: *const Config, field: SettingField) SettingValue {
         .padding_balance => .{ .padding_balance = config.@"window-padding-balance" },
         .auto_update => .{ .auto_update = config.@"auto-update" },
         .auto_update_channel => .{ .auto_update_channel = config.@"auto-update-channel" },
+        .accent_follow_system => .{ .accent_follow_system = config.@"accent-follow-system" },
     };
 }
 
@@ -795,6 +804,7 @@ fn setSettingValue(config: *Config, value: SettingValue) void {
         .padding_balance => |v| config.@"window-padding-balance" = v,
         .auto_update => |v| config.@"auto-update" = v,
         .auto_update_channel => |v| config.@"auto-update-channel" = v,
+        .accent_follow_system => |v| config.@"accent-follow-system" = v,
     }
 }
 
@@ -1249,6 +1259,9 @@ const settings_text_count = 5 + settings_label_specs.len;
 const text_status_index = 2;
 const text_close_prompt_index = 3;
 const background_blur_label = "Background blur (not supported on Windows)";
+/// A file-level constant: `open` already spends its comptime branch quota on
+/// the other labels, and one more literal there fails the build.
+const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow the Windows accent color (tab strip)");
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
 const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
     .{ .role = .edit, .name = "Scrollback limit" },
@@ -1278,6 +1291,7 @@ const settings_control_specs = [_]struct { role: SettingsControlRole, name: []co
     .{ .role = .combo_box, .name = "Auto-update channel" },
     .{ .role = .button, .name = "Keybind configuration" },
     .{ .role = .button, .name = "Full config editor" },
+    .{ .role = .check_box, .name = "Follow Windows accent color" },
     .{ .role = .button, .name = "Save" },
     .{ .role = .button, .name = "Keep mine" },
     .{ .role = .button, .name = "Use disk" },
@@ -1315,6 +1329,7 @@ const appearance_form_items = [_]FormItem{
     .{ .control_index = 10, .label_index = 9 },
     .{ .control_index = 11, .label_index = 10 },
     .{ .control_index = 12, .label_index = 11 },
+    .{ .control_index = 27, .checkbox = true },
     .{ .control_index = 13, .checkbox = true },
 };
 const shell_form_items = [_]FormItem{
@@ -1760,6 +1775,7 @@ pub const SettingsWindow = struct {
     combo_link_previews: ?HWND = null,
     combo_cursor_style: ?HWND = null,
     chk_bg_blur: ?HWND = null,
+    chk_accent_follow: ?HWND = null,
     combo_pad_balance: ?HWND = null,
     combo_auto_update: ?HWND = null,
     combo_auto_update_channel: ?HWND = null,
@@ -1989,6 +2005,7 @@ pub const SettingsWindow = struct {
         self.combo_link_previews = null;
         self.combo_cursor_style = null;
         self.chk_bg_blur = null;
+        self.chk_accent_follow = null;
         self.combo_pad_balance = null;
         self.combo_auto_update = null;
         self.combo_auto_update_channel = null;
@@ -2825,6 +2842,7 @@ pub const SettingsWindow = struct {
         self.combo_link_previews = null;
         self.combo_cursor_style = null;
         self.chk_bg_blur = null;
+        self.chk_accent_follow = null;
         self.combo_pad_balance = null;
         self.combo_auto_update = null;
         self.combo_auto_update_channel = null;
@@ -3013,13 +3031,14 @@ pub const SettingsWindow = struct {
             24 => self.combo_auto_update_channel,
             25 => self.btn_keybindings_editor,
             26 => self.btn_open_editor,
-            27 => self.btn_save,
-            28 => self.btn_conflict_keep,
-            29 => self.btn_conflict_use_disk,
-            30 => self.btn_close_save,
-            31 => self.btn_close_discard,
-            32 => self.btn_close_keep_editing,
-            33 => self.btn_discard_changes,
+            27 => self.chk_accent_follow,
+            28 => self.btn_save,
+            29 => self.btn_conflict_keep,
+            30 => self.btn_conflict_use_disk,
+            31 => self.btn_close_save,
+            32 => self.btn_close_discard,
+            33 => self.btn_close_keep_editing,
+            34 => self.btn_discard_changes,
             else => null,
         };
     }
@@ -4299,6 +4318,22 @@ pub const SettingsWindow = struct {
         self.suppress_edit_events = false;
     }
 
+    fn syncAccentFollowFromCheckbox(self: *SettingsWindow) void {
+        if (self.suppress_edit_events) return;
+        const p = &(self.pending orelse return);
+        const chk = self.chk_accent_follow orelse return;
+        p.*.@"accent-follow-system" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        self.trackEdit(.accent_follow_system, true);
+    }
+
+    fn displayAccentFollowInCheckbox(self: *SettingsWindow) void {
+        const chk = self.chk_accent_follow orelse return;
+        const p = self.pending orelse return;
+        self.suppress_edit_events = true;
+        _ = sys.SendMessageW(chk, BM_SETCHECK, if (p.@"accent-follow-system") BST_CHECKED else BST_UNCHECKED, 0);
+        self.suppress_edit_events = false;
+    }
+
     fn syncPadBalanceFromCombo(self: *SettingsWindow) void {
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
@@ -4378,6 +4413,7 @@ pub const SettingsWindow = struct {
         self.displayShellIntegInCombo();
         self.displayCursorStyleInCombo();
         self.displayBgBlurInCheckbox();
+        self.displayAccentFollowInCheckbox();
         self.displayPadBalanceInCombo();
         self.displayAutoUpdateInCombo();
         self.displayAutoUpdateChannelInCombo();
@@ -4735,6 +4771,7 @@ pub const SettingsWindow = struct {
             .window_theme => .{ .section = .appearance, .hwnd = self.combo_window_theme },
             .cursor_style => .{ .section = .appearance, .hwnd = self.combo_cursor_style },
             .background_blur => .{ .section = .appearance, .hwnd = self.chk_bg_blur },
+            .accent_follow_system => .{ .section = .appearance, .hwnd = self.chk_accent_follow },
             .padding_balance => .{ .section = .appearance, .hwnd = self.combo_pad_balance },
             .scrollback_limit => .{ .section = .terminal, .hwnd = self.edit_scrollback },
             .trim_trailing_spaces => .{ .section = .terminal, .hwnd = self.chk_trim_trail },
@@ -5240,6 +5277,13 @@ pub const SettingsWindow = struct {
             COMBO_CURSOR_STYLE,
             settings_combo_popup_height,
             &cursor_style_labels,
+        );
+
+        self.chk_accent_follow = makeCheckbox(
+            form,
+            self.handle.hinstance,
+            CHK_ACCENT_FOLLOW,
+            accent_follow_label,
         );
 
         // Nothing in the Win32 runtime can show a backdrop blur (AGENTS.md,
@@ -6680,6 +6724,44 @@ test "settings status and close prompt are live regions" {
             settings.status_note = .none;
             settings.active_conflict_field = .font_size;
             try std.testing.expect(settings.statusAnnounces());
+        }
+    }.body);
+}
+
+test "settings offers accent-follow-system as a checkbox that previews the theme" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const chk = settings.chk_accent_follow.?;
+            var buf: [256]u8 = undefined;
+
+            // It sits in Appearance, shows the config value, and is not the
+            // disabled blur box.
+            try std.testing.expectEqual(Section.appearance, settings.controlSection(27).?);
+            try std.testing.expect(sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            try std.testing.expect(sys.IsWindowEnabled(chk) != 0);
+            try std.testing.expectEqual(PreviewEffect.theme, previewEffect(.accent_follow_system));
+
+            _ = sys.SendMessageW(chk, BM_SETCHECK, BST_UNCHECKED, 0);
+            settings.syncAccentFollowFromCheckbox();
+            try std.testing.expect(!settings.pending.?.@"accent-follow-system");
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+            try std.testing.expectEqualStrings("Previewing now. Save to keep it.", try statusTextOf(settings, &buf));
+            try std.testing.expectEqual(win32_uia.SettingsSectionMarker.unsaved, settings.section_markers[@intFromEnum(Section.appearance)]);
+
+            var diff: [512]u8 = undefined;
+            try std.testing.expect(std.mem.indexOf(u8, settings.pendingDiffText(&diff), "Follow the Windows accent color: On -> Off") != null);
+
+            // Discard puts the box back.
+            settings.discardChanges();
+            try std.testing.expect(sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+            // The palette finds it by its config key and by the words for it.
+            const keywords = paletteDescriptor(.accent_follow_system).item.keywords;
+            try std.testing.expect(std.mem.indexOf(u8, keywords, "accent-follow-system") != null);
+            try std.testing.expect(std.mem.indexOf(u8, keywords, "accent color") != null);
         }
     }.body);
 }
@@ -8731,6 +8813,86 @@ test "settings field frames take the new colours when the theme changes" {
     }.body);
 }
 
+test "settings rail marks draw for unsaved and invalid sections at 100% and 150% in light, dark and High Contrast" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn highContrast(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn darkColors(_: *anyopaque) win32_theme.ThemeColors {
+            return win32_theme.darkTheme();
+        }
+
+        /// The capture's pixel (0x00RRGGBB) as a COLORREF (0x00BBGGRR).
+        fn colorAt(capture: dialog_test.Capture, x: i32, y: i32) u32 {
+            const pixel = capture.pixels[@as(usize, @intCast(y)) * capture.width + @as(usize, @intCast(x))];
+            return ((pixel & 0xFF) << 16) | (pixel & 0xFF00) | ((pixel >> 16) & 0xFF);
+        }
+
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const button = settings.sectionButton(.appearance).?;
+            const Mode = enum { light, dark, high_contrast };
+
+            for ([_]Mode{ .light, .dark, .high_contrast }) |mode| for ([_]u32{ 96, 144 }) |dpi| {
+                settings.discardChanges();
+                settings.handle.themeColors = if (mode == .dark) &darkColors else null;
+                settings.handle.highContrast = if (mode == .high_contrast) &highContrast else null;
+                settings.themeChanged();
+                dialog_test.simulateDpi(hwnd, dpi);
+                try std.testing.expectEqual(mode == .high_contrast, settings.theme_adapter.colors.high_contrast);
+                const colors = settings.theme_adapter.colors;
+                // The section opened with the window is the selected one.
+                const outer = dialog_test.rectIn(hwnd, button);
+                const inner: RECT = .{ .left = 0, .top = 0, .right = outer.right - outer.left, .bottom = outer.bottom - outer.top };
+
+                dialog_test.flushPaint(hwnd);
+                const clean = try dialog_test.Capture.take(hwnd);
+                defer clean.deinit();
+
+                // Unsaved: the dot, in the accent (a text colour in High Contrast).
+                _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+                settings.syncCursorStyleFromCombo();
+                dialog_test.flushPaint(hwnd);
+                const unsaved = try dialog_test.Capture.take(hwnd);
+                defer unsaved.deinit();
+                const dot = sectionMarkerRect(settings, inner, .unsaved);
+                const dot_x = outer.left + @divTrunc(dot.left + dot.right, 2);
+                const dot_y = outer.top + @divTrunc(dot.top + dot.bottom, 2);
+                const dot_fill = sectionMarkerFill(colors, .unsaved, true);
+                try std.testing.expectEqual(dot_fill, colorAt(unsaved, dot_x, dot_y));
+                try std.testing.expect(colorAt(clean, dot_x, dot_y) != dot_fill);
+
+                // Invalid: the larger disc with its mark, in the error colour.
+                typeInto(settings.edit_font_size.?, "1");
+                settings.validationQuietElapsed();
+                dialog_test.flushPaint(hwnd);
+                const invalid = try dialog_test.Capture.take(hwnd);
+                defer invalid.deinit();
+                const disc = sectionMarkerRect(settings, inner, .invalid);
+                try std.testing.expect(disc.right - disc.left > dot.right - dot.left);
+                // Left of where the dot ends and inside the disc: only the disc.
+                const probe_x = outer.left + disc.left + settings.px(3);
+                const probe_y = outer.top + @divTrunc(disc.top + disc.bottom, 2);
+                try std.testing.expect(probe_x < outer.left + dot.left);
+                try std.testing.expectEqual(colors.error_text, colorAt(invalid, probe_x, probe_y));
+                try std.testing.expect(colorAt(unsaved, probe_x, probe_y) != colors.error_text);
+
+                // Nothing is marked once the draft is thrown away.
+                settings.discardChanges();
+                dialog_test.flushPaint(hwnd);
+                const discarded = try dialog_test.Capture.take(hwnd);
+                defer discarded.deinit();
+                try std.testing.expect(colorAt(discarded, probe_x, probe_y) != colors.error_text);
+                try std.testing.expect(colorAt(discarded, dot_x, dot_y) != dot_fill);
+            };
+        }
+    }.body);
+}
+
 test "settings an empty focused text field shows that it has focus" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
@@ -9871,6 +10033,22 @@ fn paintSettingsSectionButton(hwnd: HWND, settings: *SettingsWindow) void {
     }
 }
 
+/// Where the mark sits in a rail button of client rectangle `rect`: the disc
+/// of an invalid value is larger than the dot of an unsaved change.
+fn sectionMarkerRect(settings: *const SettingsWindow, rect: RECT, marker: win32_uia.SettingsSectionMarker) RECT {
+    const diameter = settings.px(if (marker == .invalid) settings_metrics.space_6 else settings_metrics.space_3);
+    const right = rect.right - settings.px(settings_metrics.space_4);
+    const top = rect.top + @divTrunc(rect.bottom - rect.top - diameter, 2);
+    return .{ .left = right - diameter, .top = top, .right = right, .bottom = top + diameter };
+}
+
+/// The color the mark is filled with.
+fn sectionMarkerFill(colors: win32_theme.SettingsColors, marker: win32_uia.SettingsSectionMarker, selected: bool) COLORREF {
+    if (marker == .invalid) return colors.error_text;
+    if (colors.high_contrast) return if (selected) colors.selection_text else colors.text;
+    return colors.accent;
+}
+
 /// The mark at the right end of a rail button (`SettingsWindow.syncMarkers`).
 /// A small dot means unsaved changes; an invalid value is a larger disc with
 /// an exclamation mark. They differ in shape and size, not only in colour, and
@@ -9883,17 +10061,9 @@ fn drawSectionMarker(
     background: COLORREF,
     selected: bool,
 ) void {
-    const colors = settings.theme_adapter.colors;
     const invalid = marker == .invalid;
-    const diameter = settings.px(if (invalid) settings_metrics.space_6 else settings_metrics.space_3);
-    const right = rect.right - settings.px(settings_metrics.space_4);
-    const top = rect.top + @divTrunc(rect.bottom - rect.top - diameter, 2);
-    const fill = if (invalid)
-        colors.error_text
-    else if (colors.high_contrast)
-        (if (selected) colors.selection_text else colors.text)
-    else
-        colors.accent;
+    const bounds = sectionMarkerRect(settings, rect, marker);
+    const fill = sectionMarkerFill(settings.theme_adapter.colors, marker, selected);
     const brush = CreateSolidBrush(fill) orelse return;
     defer _ = DeleteObject(brush);
     const previous_brush = SelectObject(hdc, brush);
@@ -9903,9 +10073,9 @@ fn drawSectionMarker(
         if (previous_brush) |value| _ = SelectObject(hdc, value);
     }
     // The null pen leaves the right and bottom edges out of the ellipse.
-    _ = sys.Ellipse(hdc, right - diameter, top, right + 1, top + diameter + 1);
+    _ = sys.Ellipse(hdc, bounds.left, bounds.top, bounds.right + 1, bounds.bottom + 1);
     if (!invalid) return;
-    var glyph: RECT = .{ .left = right - diameter, .top = top, .right = right, .bottom = top + diameter };
+    var glyph = bounds;
     const previous_font = if (settings.emphasis_font) |font| SelectObject(hdc, font) else null;
     defer {
         if (previous_font) |value| _ = SelectObject(hdc, value);
@@ -10367,6 +10537,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 if (owner) |o| o.syncCursorStyleFromCombo();
                 return 0;
             }
+            if (id == CHK_ACCENT_FOLLOW and notify == BN_CLICKED) {
+                if (owner) |o| o.syncAccentFollowFromCheckbox();
+                return 0;
+            }
             if (id == CHK_BG_BLUR and notify == BN_CLICKED) {
                 if (owner) |o| o.syncBgBlurFromCheckbox();
                 return 0;
@@ -10729,6 +10903,7 @@ fn writeSettingValue(writer: *std.Io.Writer, value: SettingValue) !void {
         .desktop_notifications,
         .app_notify_clipboard,
         .app_notify_config,
+        .accent_follow_system,
         => |v| try writeOnOff(writer, v),
         .confirm_close => |v| try writer.writeAll(confirm_close_labels[comboIndexFromConfirmClose(v)]),
         .copy_on_select => |v| try writer.writeAll(copy_on_select_labels[comboIndexFromCopyOnSelect(v)]),

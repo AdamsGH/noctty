@@ -700,7 +700,7 @@ named layouts, and native settings in one fuzzy-ranked, keyboard-driven
 list. Type a prefix to filter one category: `>` actions, `@` tabs, `/`
 panes, `~` profiles, `:` settings, `%` themes, `!` recent commands, `^`
 layouts, or `?` for help. The native Settings window stages edits until Save
-and patches your config without rewriting unrelated text. Details for both
+(or Discard changes) and patches your config without rewriting unrelated text. Details for both
 are in the [capability matrix notes](windows-capability-matrix.md#notes).
 
 ## Running elevated
