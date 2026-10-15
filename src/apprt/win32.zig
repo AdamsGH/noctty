@@ -9671,7 +9671,11 @@ pub const App = struct {
                     var hint_buf: [96]u8 = undefined;
                     runUiActionOrLog(
                         "tab close banner failed",
-                        host.setBanner(.info, labels.tabClosedMessage(&self.config.keybind.set, &hint_buf)),
+                        host.setBanner(.info, labels.tabClosedMessage(
+                            &self.config.keybind.set,
+                            self.config.@"key-remap".map.count() != 0,
+                            &hint_buf,
+                        )),
                     );
                 }
                 return true;

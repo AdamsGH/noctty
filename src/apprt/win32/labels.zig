@@ -291,9 +291,10 @@ pub fn dockedSearchArrowDirection(vk: WPARAM) ?input.Binding.Action.NavigateSear
 
 /// The banner for the last tab of a window being closed. It names the key bound
 /// to `undo` (the first one found, in the way a hint is written: `Ctrl+Shift+Z`)
-/// and falls back to a hint without a key when `undo` is unbound.
-pub fn tabClosedMessage(set: *const input.Binding.Set, buf: []u8) []const u8 {
+/// and falls back when `undo` is unbound or customization makes dispatch ambiguous.
+pub fn tabClosedMessage(set: *const input.Binding.Set, has_modifier_remaps: bool, buf: []u8) []const u8 {
     const fallback = "Tab closed. Use undo to restore it.";
+    if (has_modifier_remaps) return fallback;
     var it = set.bindings.iterator();
     const trigger = while (it.next()) |entry| {
         switch (entry.value_ptr.*) {
@@ -301,6 +302,27 @@ pub fn tabClosedMessage(set: *const input.Binding.Set, buf: []u8) []const u8 {
             else => {},
         }
     } else return fallback;
+
+    switch (trigger.key) {
+        .unicode => |cp| {
+            // The layout decides which physical key produces this letter.
+            // Physical and translated-text bindings precede the unshifted
+            // codepoint in getEvent, so do not promise a shadowed chord.
+            if (cp < 'a' or cp > 'z') return fallback;
+            var overrides = set.bindings.iterator();
+            while (overrides.next()) |entry| {
+                if (!entry.key_ptr.mods.binding().equal(trigger.mods.binding())) continue;
+                switch (entry.key_ptr.key) {
+                    .physical => |key| if (key.printable()) return fallback,
+                    .unicode => |other| if (other == std.ascii.toUpper(@intCast(cp)) or
+                        (trigger.mods.ctrl and other == (cp & 0x1f))) return fallback,
+                    .catch_all => {},
+                }
+            }
+        },
+        .physical => |key| if (key.printable()) return fallback,
+        .catch_all => return fallback,
+    }
 
     var writer: std.Io.Writer = .fixed(buf);
     writer.writeAll("Tab closed. Press ") catch return fallback;
@@ -5581,13 +5603,13 @@ test "tabClosedMessage names the key bound to undo" {
     var set: input.Binding.Set = .{};
     try std.testing.expectEqualStrings(
         "Tab closed. Use undo to restore it.",
-        tabClosedMessage(&set, &buf),
+        tabClosedMessage(&set, false, &buf),
     );
 
     try set.put(arena.allocator(), .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true } }, .{ .new_tab = {} });
     try std.testing.expectEqualStrings(
         "Tab closed. Use undo to restore it.",
-        tabClosedMessage(&set, &buf),
+        tabClosedMessage(&set, false, &buf),
     );
 
     try set.putFlags(
@@ -5598,7 +5620,7 @@ test "tabClosedMessage names the key bound to undo" {
     );
     try std.testing.expectEqualStrings(
         "Tab closed. Press Ctrl+Shift+Z to undo.",
-        tabClosedMessage(&set, &buf),
+        tabClosedMessage(&set, false, &buf),
     );
 
     // A physical key, and a buffer too small for the hint.
@@ -5606,12 +5628,40 @@ test "tabClosedMessage names the key bound to undo" {
     try other.put(arena.allocator(), .{ .key = .{ .physical = .f9 }, .mods = .{ .alt = true } }, .{ .undo = {} });
     try std.testing.expectEqualStrings(
         "Tab closed. Press Alt+F9 to undo.",
-        tabClosedMessage(&other, &buf),
+        tabClosedMessage(&other, false, &buf),
     );
     var tiny: [8]u8 = undefined;
     try std.testing.expectEqualStrings(
         "Tab closed. Use undo to restore it.",
-        tabClosedMessage(&other, &tiny),
+        tabClosedMessage(&other, false, &tiny),
+    );
+}
+
+test "PKG32 tabClosedMessage does not advertise a shadowed or remapped undo chord" {
+    var cfg = try @import("../../config.zig").Config.default(std.testing.allocator);
+    defer cfg.deinit();
+    var buf: [96]u8 = undefined;
+    const fallback = "Tab closed. Use undo to restore it.";
+    const set = &cfg.keybind.set;
+    try set.put(cfg._arena.?.allocator(), .{
+        .key = .{ .physical = .key_z },
+        .mods = .{ .ctrl = true, .shift = true },
+    }, .ignore);
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, false, &buf));
+
+    // Restore an unambiguous default, then introduce an actual modifier map.
+    set.remove(cfg._arena.?.allocator(), .{ .key = .{ .physical = .key_z }, .mods = .{ .ctrl = true, .shift = true } });
+    try std.testing.expectEqualStrings("Tab closed. Press Ctrl+Shift+Z to undo.", tabClosedMessage(set, false, &buf));
+    for ([_]u21{ 'Z', 0x1a }) |cp| {
+        const trigger: input.Binding.Trigger = .{ .key = .{ .unicode = cp }, .mods = .{ .ctrl = true, .shift = true } };
+        try set.put(cfg._arena.?.allocator(), trigger, .ignore);
+        try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, false, &buf));
+        set.remove(cfg._arena.?.allocator(), trigger);
+    }
+    try cfg.@"key-remap".parse(cfg._arena.?.allocator(), "ctrl=alt");
+    try std.testing.expectEqualStrings(
+        fallback,
+        tabClosedMessage(set, cfg.@"key-remap".map.count() != 0, &buf),
     );
 }
 
