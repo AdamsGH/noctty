@@ -6120,14 +6120,14 @@ pub const App = struct {
     ) !win32_session_state.SessionState {
         var count: usize = 0;
         for (self.hosts.items) |host| {
-            if (hostSessionTabCount(host) > 0) count += 1;
+            if (hostSessionTabs(host).len > 0) count += 1;
         }
 
         const windows_state = try alloc.alloc(win32_session_state.Window, count);
         var remaining_scrollback_budget = win32_session_state.max_total_scrollback_bytes;
         var built: usize = 0;
         for (self.hosts.items) |host| {
-            if (hostSessionTabCount(host) == 0) continue;
+            if (hostSessionTabs(host).len == 0) continue;
             windows_state[built] = try buildSessionWindow(
                 alloc,
                 host,
@@ -6153,22 +6153,19 @@ pub const App = struct {
         scrollback_lines: usize,
         remaining_scrollback_budget: *usize,
     ) !win32_session_state.Window {
-        const tab_count = hostSessionTabCount(host);
-        if (scope == .layout and tab_count == 0) return error.EmptyTabs;
-        const tabs = try alloc.alloc(win32_session_state.Tab, tab_count);
+        const session_tabs = hostSessionTabs(host);
+        if (scope == .layout and session_tabs.len == 0) return error.EmptyTabs;
+        const tabs = try alloc.alloc(win32_session_state.Tab, session_tabs.len);
         var selected_tab: usize = 0;
-        var built: usize = 0;
-        for (host.tabs.items, 0..) |*tab, i| {
-            if (tabContainsQuickTerminal(tab)) continue;
-            if (i <= host.active_tab) selected_tab = built;
-            tabs[built] = try buildSessionTab(
+        for (session_tabs, 0..) |*tab, i| {
+            if (i <= host.active_tab) selected_tab = i;
+            tabs[i] = try buildSessionTab(
                 alloc,
                 tab,
                 scope,
                 scrollback_lines,
                 remaining_scrollback_budget,
             );
-            built += 1;
         }
 
         var window: win32_session_state.Window = .{
@@ -6313,27 +6310,10 @@ pub const App = struct {
         return null;
     }
 
-    fn hostContainsQuickTerminal(host: *const Host) bool {
-        for (host.tabs.items) |*tab| {
-            if (tabContainsQuickTerminal(tab)) return true;
-        }
-        return false;
-    }
-
-    fn hostSessionTabCount(host: *const Host) usize {
-        var count: usize = 0;
-        for (host.tabs.items) |*tab| {
-            if (!tabContainsQuickTerminal(tab)) count += 1;
-        }
-        return count;
-    }
-
-    fn tabContainsQuickTerminal(tab: *const Tab) bool {
-        var it = tab.tree.iterator();
-        while (it.next()) |entry| {
-            if (entry.view.quick_terminal) return true;
-        }
-        return false;
+    /// The tabs of `host` a session or layout file records: none for the
+    /// quick terminal, which is never restored.
+    fn hostSessionTabs(host: *const Host) []const Tab {
+        return if (host.quick_terminal) &.{} else host.tabs.items;
     }
 
     fn preferredSplitDirection(
@@ -7662,7 +7642,7 @@ pub const App = struct {
                     _ = self.launchNamedLayout(name, banner_host);
                     return true;
                 }
-                const source = self.findSurfaceForTarget(target);
+                const source = self.newWindowSource(target);
                 _ = self.createWindowSurface(&config, default_title, .{
                     .clone_state_from = source,
                 }) catch |err| {
@@ -7981,17 +7961,12 @@ pub const App = struct {
             .toggle_visibility => {
                 self.windows_hidden = !self.windows_hidden;
                 if (self.windows_hidden) {
-                    for (self.hosts.items) |host| host.setVisible(false);
+                    for (self.hosts.items) |host| host.hideForToggle();
                 } else {
-                    for (self.hosts.items) |host| {
-                        host.setVisible(true);
-                        try host.layout();
-                    }
-                    if (self.findSurfaceForTarget(target)) |surface| {
-                        self.activateSurface(surface);
-                    } else if (self.primarySurface()) |surface| {
-                        self.activateSurface(surface);
-                    }
+                    for (self.hosts.items) |host| try host.showAfterToggle();
+                    // Focus goes to a window that is on screen: a quick
+                    // terminal dismissed before the hide stays dismissed.
+                    if (self.shownSurfaceForTarget(target)) |surface| self.activateSurface(surface);
                 }
                 return true;
             },
@@ -9223,7 +9198,7 @@ pub const App = struct {
             else
                 null,
             .tab_id = tab_id,
-            .clone_state_from = source,
+            .clone_state_from = if (open_target == .window) self.newWindowSource(target) else source,
         });
         try appendOwnedString(self.core_app.alloc, &surface.launch_profile_key, profile.key);
         surface.launched_ssh = profile.kind == .ssh;
@@ -10020,21 +9995,32 @@ pub const App = struct {
         return surface;
     }
 
-    fn inheritHostWindowState(_: *App, destination: *Host, source: *Host) !void {
+    /// Whether a window on screen has its top-left corner where `rect` does,
+    /// other than `except`.
+    fn windowStartsAt(self: *App, rect: RECT, except: ?HWND) bool {
+        for (self.hosts.items) |host| {
+            const hwnd = host.hwnd orelse continue;
+            if (hwnd == except or sys.IsWindowVisible(hwnd) == 0 or sys.IsIconic(hwnd) != 0) continue;
+            var other: RECT = undefined;
+            if (sys.GetWindowRect(hwnd, &other) == 0) continue;
+            if (other.left == rect.left and other.top == rect.top) return true;
+        }
+        return false;
+    }
+
+    fn inheritHostWindowState(self: *App, destination: *Host, source: *Host) !void {
         const dst_hwnd = destination.hwnd orelse return;
         const src_hwnd = source.hwnd orelse return;
-        var rect: RECT = undefined;
-        if (sys.GetWindowRect(src_hwnd, &rect) == 0) {
-            return lastError();
-        }
+        const fullscreen = if (source.activeSurface()) |surface| surface.fullscreen else false;
+        const placed = try newWindowPlacement(self, src_hwnd, fullscreen, dst_hwnd);
         if (sys.SetWindowPos(
             dst_hwnd,
             null,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            c.SWP_NOACTIVATE,
+            placed.rect.left,
+            placed.rect.top,
+            placed.rect.right - placed.rect.left,
+            placed.rect.bottom - placed.rect.top,
+            newWindowSetPosFlags(&self.config, placed),
         ) == 0) {
             return lastError();
         }
@@ -10045,6 +10031,39 @@ pub const App = struct {
             .app => self.primarySurface(),
             .surface => |core_surface| self.findSurfaceByCore(core_surface),
         };
+    }
+
+    /// `findSurfaceForTarget`, unless its window is hidden: then the active
+    /// surface of the first window on screen.
+    fn shownSurfaceForTarget(self: *App, target: apprt.Target) ?*Surface {
+        if (self.findSurfaceForTarget(target)) |surface| {
+            if (surface.windowHwnd()) |hwnd| {
+                if (sys.IsWindowVisible(hwnd) != 0) return surface;
+            }
+        }
+        for (self.hosts.items) |host| {
+            const hwnd = host.hwnd orelse continue;
+            if (sys.IsWindowVisible(hwnd) == 0) continue;
+            if (host.activeSurface()) |surface| return surface;
+        }
+        return null;
+    }
+
+    /// The window a new one copies its state from: the target's, but never
+    /// the quick terminal's. That is a floating, undecorated strip pinned to
+    /// a screen edge, and a window copied from it would be too. From the
+    /// quick terminal a new window follows an ordinary window if there is
+    /// one, and is otherwise an ordinary new window.
+    fn newWindowSource(self: *App, target: apprt.Target) ?*Surface {
+        const surface = self.findSurfaceForTarget(target) orelse return null;
+        const host = surface.host orelse return surface;
+        if (!host.quick_terminal) return surface;
+        for (self.hosts.items) |other| {
+            if (!other.quick_terminal) {
+                if (other.activeSurface()) |ordinary| return ordinary;
+            }
+        }
+        return null;
     }
 
     fn focusedSurfaceForUndoRedo(self: *App) ?*Surface {
@@ -10944,25 +10963,32 @@ pub const App = struct {
         return true;
     }
 
-    fn quickTerminalSurface(self: *App) ?*Surface {
-        for (self.windows.items) |surface| {
-            if (surface.quick_terminal) return surface;
+    /// The quick terminal is its host window, whatever tabs and splits it
+    /// holds. Surfaces carry no flag of their own: one opened inside it later
+    /// is as much the quick terminal as the pane it was created with, and
+    /// that pane closing leaves it where it is.
+    fn quickTerminalHost(self: *App) ?*Host {
+        for (self.hosts.items) |host| {
+            if (host.quick_terminal) return host;
         }
         return null;
     }
 
-    fn quickTerminalSurfaceForHost(self: *App, host: *Host) ?*Surface {
-        for (self.windows.items) |surface| {
-            if (surface.quick_terminal and surface.host == host) return surface;
-        }
-        return null;
+    fn hideQuickTerminalHost(host: *Host) void {
+        host.cancelQuickTerminalAnimation();
+        host.setVisible(false);
     }
 
-    fn hideQuickTerminalSurface(surface: *Surface) void {
-        const top_level = surface.windowHwnd() orelse return;
-        if (surface.host) |host| host.cancelQuickTerminalAnimation();
-        surface.setVisible(false);
-        _ = sys.ShowWindow(top_level, c.SW_HIDE);
+    /// Puts the quick terminal window on its screen edge and shows it.
+    fn showQuickTerminalWindow(self: *App, top_level: HWND, want_focus: bool) void {
+        self.windows_hidden = false;
+        self.applyQuickTerminalGeometry(top_level, true) catch |err| {
+            std.log.warn("QT geometry failed err={}", .{err});
+        };
+        _ = sys.ShowWindow(
+            top_level,
+            if (want_focus) c.SW_SHOW else c.SW_SHOWNOACTIVATE,
+        );
     }
 
     fn quickTerminalFocusPolicy(self: *App) win32_quick_terminal.FocusPolicy {
@@ -10993,31 +11019,54 @@ pub const App = struct {
             std.log.warn("quick-terminal-keyboard-interactivity=exclusive maps to focused input on Win32; global keyboard capture is unsupported", .{});
         }
 
-        if (self.quickTerminalSurface()) |surface| {
-            // The quick terminal is a child surface inside a real
-            // top-level host window. Visibility + geometry must be
-            // applied to the HOST hwnd (the outer frame); the child
-            // surface HWND is only the GL content area. Using the
-            // child hwnd would leave an empty host window on screen
-            // when hidden, and would run `MonitorFromWindow` /
+        if (self.quickTerminalHost()) |host| {
+            // The quick terminal is its host window, an outer frame around
+            // child GL surfaces. Visibility + geometry apply to the HOST
+            // hwnd: using a child hwnd would leave an empty host window on
+            // screen when hidden, and would run `MonitorFromWindow` /
             // `SetWindowPos` against the wrong target when showing.
-            const top_level = surface.windowHwnd() orelse return;
-            const visible = sys.IsWindowVisible(top_level) != 0;
-            if (visible) {
-                hideQuickTerminalSurface(surface);
-            } else {
-                self.windows_hidden = false;
-                self.applyQuickTerminalGeometry(top_level, true) catch |err| {
-                    std.log.warn("QT geometry failed err={}", .{err});
-                };
-                _ = sys.ShowWindow(
-                    top_level,
-                    if (want_focus) c.SW_SHOW else c.SW_SHOWNOACTIVATE,
+            const visible = if (host.hwnd) |top_level| sys.IsWindowVisible(top_level) != 0 else false;
+            const surface = host.activeSurface() orelse {
+                // `close_tab:this` on its last tab keeps the host, and the
+                // surface detached from it, for undo. The detached surface
+                // is not something to show: dismiss the empty window, or
+                // open a fresh tab in it.
+                if (visible) {
+                    hideQuickTerminalHost(host);
+                    return;
+                }
+                var config = try apprt.surface.newConfig(
+                    self.core_app,
+                    &self.config,
+                    .window,
                 );
-                // Mirror the hide-side invariant: tell the surface
-                // it's visible so the renderer wakes and the
+                defer config.deinit();
+                const fresh = try self.createWindowSurface(&config, quick_terminal_title, .{
+                    .host_id = host.id,
+                });
+                // Floating is the surface's state: the window follows the
+                // active tab's.
+                try fresh.setFloatWindow(.on);
+                if (host.hwnd) |top_level| self.showQuickTerminalWindow(top_level, want_focus);
+                self.showHostSurface(fresh, want_focus);
+                return;
+            };
+            const top_level = host.hwnd orelse return;
+            if (visible) {
+                hideQuickTerminalHost(host);
+            } else {
+                self.showQuickTerminalWindow(top_level, want_focus);
+                // Mirror the hide-side invariant: tell every pane of the
+                // active tab it's visible so the renderer wakes and the
                 // occlusion callback flips back to "not occluded".
-                surface.setVisible(true);
+                // Hiding marked every pane not visible, including the ones a
+                // zoom keeps out of view.
+                if (host.activeTab()) |tab| {
+                    var it = tab.tree.iterator();
+                    while (it.next()) |entry| {
+                        entry.view.setVisible(tab.tree.zoomed == null or tab.tree.zoomed.? == entry.handle);
+                    }
+                }
                 if (want_focus) surface.present();
             }
             return;
@@ -13674,7 +13723,15 @@ const Host = struct {
     surfaces_visible: bool = true,
     dwm_cloaked: bool = false,
     cached_decorations_visible: bool = true,
+    /// This host is the quick terminal. Its tabs and splits are all part of
+    /// it, so this, not a flag on one surface, says what the window is.
     quick_terminal: bool = false,
+    /// The window was on screen when `toggle_visibility` hid every window,
+    /// so showing them again brings it back. A window hidden before that,
+    /// such as a dismissed quick terminal, stays hidden. Anything else that
+    /// shows the window (`WM_SHOWWINDOW`) clears it: the window is not
+    /// waiting for the toggle any more.
+    hidden_by_toggle: bool = false,
     tabs: std.ArrayListUnmanaged(Tab) = .empty,
     active_tab: usize = 0,
     next_tab_id: u32 = 1,
@@ -18324,6 +18381,25 @@ const Host = struct {
             null
         else
             @ptrFromInt(@as(usize, @intCast(previous)));
+    }
+
+    /// `toggle_visibility` hiding every window: remember which ones were on
+    /// screen, and hide them. A window an earlier hide took off screen, and
+    /// that nothing has shown since, stays marked.
+    fn hideForToggle(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        const was_visible = sys.IsWindowVisible(hwnd) != 0;
+        self.setVisible(false);
+        self.hidden_by_toggle = self.hidden_by_toggle or was_visible;
+    }
+
+    /// `toggle_visibility` showing them again: only a window it hid comes
+    /// back.
+    fn showAfterToggle(self: *Host) !void {
+        if (!self.hidden_by_toggle) return;
+        self.hidden_by_toggle = false;
+        self.setVisible(true);
+        try self.layout();
     }
 
     fn setVisible(self: *Host, visible: bool) void {
@@ -27857,6 +27933,323 @@ test "win32 DPI suggestions preserve a quick terminal tween but resize ordinary 
     try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
 }
 
+/// Runs `body` on a thread attached to a desktop of its own, so a test can
+/// show, hide and minimize windows without touching the user's desktop.
+/// `SetThreadDesktop` fails on a thread that owns a window, so the runner's
+/// own thread cannot do it (AGENTS.md 2026-10-06).
+fn runOnHiddenDesktop(comptime body: anytype) !void {
+    const Desktop = struct {
+        extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+        extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+
+        fn run(desktop: *anyopaque, result: *anyerror!void) void {
+            if (SetThreadDesktop(desktop) == 0) {
+                result.* = lastError();
+                return;
+            }
+            body() catch |err| {
+                // The test fails at `return result` on the runner's thread;
+                // this trace shows which check failed.
+                if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+                result.* = err;
+            };
+        }
+    };
+    var name_buf: [80]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "noctty-pkg43-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+    const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+    defer std.testing.allocator.free(wide_name);
+    const desktop = Desktop.CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+    defer _ = Desktop.CloseDesktop(desktop);
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
+    thread.join();
+    return result;
+}
+
+/// A quick terminal host that a test has put on screen, with the pieces a
+/// toggle needs: a registered host, one tab, and the surface that tab shows.
+/// `other` is a second host with a window and no tab, not registered until a
+/// test appends it to `app.hosts`.
+const QuickTerminalToggleFixture = struct {
+    core_app: CoreApp = undefined,
+    app: App = undefined,
+    host: Host = undefined,
+    other: Host = undefined,
+    surface: Surface = undefined,
+    /// What `QuickTerminalFreshTab` hands back as a tab created later.
+    fresh: Surface = undefined,
+    session: TestSession = .{},
+
+    fn init(self: *QuickTerminalToggleFixture) !void {
+        try self.session.init(.{
+            .core_app = &self.core_app,
+            .app = &self.app,
+            .hosts = &.{
+                .{ .storage = &self.host, .register = true, .next_tab_id = 2 },
+                .{ .storage = &self.other, .id = 2 },
+            },
+            .surfaces = &.{
+                .{ .storage = &self.surface, .host = &self.host, .register = true },
+                .{ .storage = &self.fresh, .host = &self.host, .window_visible = false },
+            },
+            .tabs = &.{.{ .host = &self.host, .surface = &self.surface, .id = 1 }},
+        });
+        errdefer self.session.deinit();
+        // `none` shows the window without the activation machinery, which
+        // needs a real chrome the fixture does not have.
+        self.app.config.@"quick-terminal-keyboard-interactivity" = .none;
+        self.host.quick_terminal = true;
+        self.host.hwnd = try createTestHostWindow();
+        errdefer _ = sys.DestroyWindow(self.host.hwnd.?);
+        self.other.hwnd = try createTestHostWindow();
+        _ = sys.ShowWindow(self.host.hwnd.?, c.SW_SHOWNOACTIVATE);
+        _ = sys.ShowWindow(self.other.hwnd.?, c.SW_SHOWNOACTIVATE);
+    }
+
+    fn deinit(self: *QuickTerminalToggleFixture) void {
+        _ = sys.DestroyWindow(self.other.hwnd.?);
+        _ = sys.DestroyWindow(self.host.hwnd.?);
+        self.session.deinit();
+    }
+
+    fn visible(self: *const QuickTerminalToggleFixture) bool {
+        return sys.IsWindowVisible(self.host.hwnd.?) != 0;
+    }
+
+    fn otherVisible(self: *const QuickTerminalToggleFixture) bool {
+        return sys.IsWindowVisible(self.other.hwnd.?) != 0;
+    }
+};
+
+const QuickTerminalCreateCounter = struct {
+    var calls: usize = 0;
+    var host_id: ?u32 = null;
+
+    fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+        calls += 1;
+        host_id = opts.host_id;
+        return error.TestWindowCreateFailed;
+    }
+};
+
+test "win32 toggle_quick_terminal follows its host after the first pane is gone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // Only the pane the window was created with ever carried the
+            // per-surface flag. This tab was opened in the quick terminal
+            // later, so its surface is not flagged, but its host is.
+            QuickTerminalCreateCounter.calls = 0;
+            fixture.app.test_create_window_surface = &QuickTerminalCreateCounter.createSurface;
+
+            try std.testing.expect(fixture.visible());
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expect(!fixture.surface.window_visible);
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.surface.window_visible);
+            // A second quick terminal was never made.
+            try std.testing.expectEqual(@as(usize, 0), QuickTerminalCreateCounter.calls);
+            try std.testing.expectEqual(@as(usize, 1), fixture.app.hosts.items.len);
+        }
+    }.body);
+}
+
+/// Stands in for the tab `toggleQuickTerminal` opens in an empty quick
+/// terminal host: `fixture.fresh`, inserted as the host's only tab.
+const QuickTerminalFreshTab = struct {
+    var fixture: *QuickTerminalToggleFixture = undefined;
+    var calls: usize = 0;
+    var host_id: ?u32 = null;
+
+    fn createSurface(app: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+        calls += 1;
+        host_id = opts.host_id;
+        const surface = &fixture.fresh;
+        try app.windows.append(app.core_app.alloc, surface);
+        try fixture.host.tabs.insert(
+            app.core_app.alloc,
+            0,
+            try Tab.init(app.core_app.alloc, fixture.host.nextTabId(), surface),
+        );
+        return surface;
+    }
+};
+
+test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing one detached for undo" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // `close_tab:this` on the only tab keeps the host and the
+            // surface for undo, and nothing in the host shows it.
+            var detached = fixture.host.tabs.orderedRemove(0);
+            defer detached.deinit();
+            fixture.surface.window_visible = false;
+
+            QuickTerminalFreshTab.fixture = &fixture;
+            QuickTerminalFreshTab.calls = 0;
+            QuickTerminalFreshTab.host_id = null;
+            fixture.app.test_create_window_surface = &QuickTerminalFreshTab.createSurface;
+
+            // On screen and empty, the toggle dismisses it.
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expectEqual(@as(usize, 0), QuickTerminalFreshTab.calls);
+
+            // Dismissed, it opens a fresh tab and shows that, never the
+            // surface that was detached.
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expectEqual(@as(usize, 1), QuickTerminalFreshTab.calls);
+            try std.testing.expectEqual(@as(?u32, fixture.host.id), QuickTerminalFreshTab.host_id);
+            try std.testing.expect(!fixture.surface.window_visible);
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.fresh.window_visible);
+            try std.testing.expect(fixture.host.activeSurface() == &fixture.fresh);
+            // The window floats with the tab it shows, so a tab switch or
+            // undo does not drop it below other windows.
+            try std.testing.expect(fixture.fresh.topmost);
+            // Its chrome windows are not created by this fixture, so showing
+            // it logged a refresh failure that left its title behind.
+            appendOwnedString(std.testing.allocator, &fixture.host.cached_window_title, null) catch unreachable;
+        }
+    }.body);
+}
+
+test "win32 toggle_quick_terminal keeps a pane a zoom hides out of view" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // Two panes in the one tab, the first zoomed.
+            const inserted = try SplitTreeSurface.init(std.testing.allocator, &fixture.fresh);
+            defer {
+                var cleanup = inserted;
+                cleanup.deinit();
+            }
+            const tab = &fixture.host.tabs.items[0];
+            const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+            tab.tree.deinit();
+            tab.tree = next_tree;
+            tab.focused = tab.findHandle(&fixture.surface) orelse tab.focused;
+            tab.tree.zoom(tab.findHandle(&fixture.surface));
+            fixture.fresh.window_visible = false;
+
+            try fixture.app.toggleQuickTerminal();
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(fixture.surface.window_visible);
+            try std.testing.expect(!fixture.fresh.window_visible);
+        }
+    }.body);
+}
+
+test "win32 quick-terminal-autohide hides the quick terminal host, not a flagged pane" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            fixture.app.config.@"quick-terminal-autohide" = true;
+            const hwnd = fixture.host.hwnd.?;
+            setWindowData(hwnd, &fixture.host);
+            defer setWindowData(hwnd, null);
+
+            try std.testing.expect(fixture.visible());
+            _ = hostWindowProc(hwnd, c.WM_ACTIVATE, c.WA_INACTIVE, 0);
+            try std.testing.expect(!fixture.visible());
+        }
+    }.body);
+}
+
+test "win32 toggle_visibility does not show a quick terminal the user dismissed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // An ordinary window beside it. Neither host has anything to
+            // activate once the windows are back, since `other` has no tab
+            // and the quick terminal's surface has no window.
+            try fixture.app.hosts.append(std.testing.allocator, &fixture.other);
+            // The quick terminal is dismissed by its own toggle.
+            _ = sys.ShowWindow(fixture.host.hwnd.?, c.SW_HIDE);
+
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expect(!fixture.otherVisible());
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(fixture.otherVisible());
+            try std.testing.expect(!fixture.visible());
+
+            // One that was on screen when the windows were hidden comes back
+            // with them. (Its tab is detached first: laying out a tab needs
+            // the chrome windows this fixture does not create.)
+            var detached = fixture.host.tabs.orderedRemove(0);
+            defer detached.deinit();
+            _ = sys.ShowWindow(fixture.host.hwnd.?, c.SW_SHOWNOACTIVATE);
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expect(!fixture.otherVisible());
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.otherVisible());
+
+            // The windows are hidden, then something shows one of them alone
+            // and clears `windows_hidden`, as the quick terminal's own toggle
+            // does. Hiding them again must not forget the ordinary window
+            // that is still waiting to come back.
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible() and !fixture.otherVisible());
+            _ = sys.ShowWindow(fixture.host.hwnd.?, c.SW_SHOWNOACTIVATE);
+            // What `WM_SHOWWINDOW` does on the real host window.
+            fixture.host.hidden_by_toggle = false;
+            fixture.app.windows_hidden = false;
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible() and !fixture.otherVisible());
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.otherVisible());
+        }
+    }.body);
+}
+
+test "win32 showing a host window by any other means ends its wait for toggle_visibility" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const hwnd = fixture.other.hwnd.?;
+            setWindowData(hwnd, &fixture.other);
+            defer setWindowData(hwnd, null);
+
+            fixture.other.hideForToggle();
+            try std.testing.expect(fixture.other.hidden_by_toggle);
+            // Hiding it again keeps the mark: it is not on screen to read.
+            fixture.other.hideForToggle();
+            try std.testing.expect(fixture.other.hidden_by_toggle);
+
+            _ = hostWindowProc(hwnd, c.WM_SHOWWINDOW, 0, 0);
+            try std.testing.expect(fixture.other.hidden_by_toggle);
+            _ = hostWindowProc(hwnd, c.WM_SHOWWINDOW, 1, 0);
+            try std.testing.expect(!fixture.other.hidden_by_toggle);
+        }
+    }.body);
+}
+
 const FullscreenMonitor = struct {
     monitor: sys.HMONITOR,
     info: MONITORINFO,
@@ -27864,18 +28257,139 @@ const FullscreenMonitor = struct {
 };
 
 fn fullscreenRestoreRect(rect: RECT, old_work: RECT, new_work: RECT, old_dpi: u32, new_dpi: u32) RECT {
-    var left = rect.left + new_work.left - old_work.left;
-    var top = rect.top + new_work.top - old_work.top;
     const scaled_width = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.right - rect.left, @intCast(new_dpi), @intCast(old_dpi)) else rect.right - rect.left;
     const scaled_height = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.bottom - rect.top, @intCast(new_dpi), @intCast(old_dpi)) else rect.bottom - rect.top;
-    // Keep the logical size when it fits. An oversized rectangle can overlap
-    // a neighbour more than this monitor, causing Windows to select that
-    // neighbour's DPI again; cap it to the destination's work area.
-    const width = @min(scaled_width, new_work.right - new_work.left);
-    const height = @min(scaled_height, new_work.bottom - new_work.top);
-    left = @max(new_work.left, @min(left, new_work.right - width));
-    top = @max(new_work.top, @min(top, new_work.bottom - height));
-    return .{ .left = left, .top = top, .right = left + width, .bottom = top + height };
+    return fitRectInWork(
+        rect.left + new_work.left - old_work.left,
+        rect.top + new_work.top - old_work.top,
+        scaled_width,
+        scaled_height,
+        new_work,
+    );
+}
+
+/// The rect at (`left`, `top`) of the given size, moved to the nearest place
+/// inside `work`. Keep the logical size when it fits. An oversized rectangle
+/// can overlap a neighbour more than this monitor, causing Windows to select
+/// that neighbour's DPI again; cap it to the work area.
+fn fitRectInWork(left: i32, top: i32, width: i32, height: i32, work: RECT) RECT {
+    const fitted_width = @min(width, work.right - work.left);
+    const fitted_height = @min(height, work.bottom - work.top);
+    const fitted_left = @max(work.left, @min(left, work.right - fitted_width));
+    const fitted_top = @max(work.top, @min(top, work.bottom - fitted_height));
+    return .{
+        .left = fitted_left,
+        .top = fitted_top,
+        .right = fitted_left + fitted_width,
+        .bottom = fitted_top + fitted_height,
+    };
+}
+
+/// How far a new window sits below and right of the one it was opened from,
+/// about a caption height.
+fn cascadeStep(dpi: u32) i32 {
+    return sys.MulDiv(32, @intCast(@max(dpi, 96)), 96);
+}
+
+/// A rect in workspace coordinates (what `GetWindowPlacement` reports for a
+/// window without `WS_EX_TOOLWINDOW`) as screen coordinates, for the monitor
+/// the window is on. This is the convention `leaveFullscreen` uses.
+fn workspaceRectToScreen(rect: RECT, monitor: MONITORINFO) RECT {
+    const dx = monitor.rcWork.left - monitor.rcMonitor.left;
+    const dy = monitor.rcWork.top - monitor.rcMonitor.top;
+    return .{
+        .left = rect.left + dx,
+        .top = rect.top + dy,
+        .right = rect.right + dx,
+        .bottom = rect.bottom + dy,
+    };
+}
+
+/// `SetWindowPos` flags for a window placed like the one it was opened from.
+/// `window-position-x/y` says where every new window goes, so with it set the
+/// window keeps that place and takes only the source's size. A fullscreen
+/// window covers its monitor wherever the config would put it.
+fn newWindowSetPosFlags(config: *const configpkg.Config, placed: NewWindowPlacement) UINT {
+    var flags: UINT = c.SWP_NOACTIVATE;
+    if (!placed.copied and configuredHostWindowPosition(config) != null) flags |= c.SWP_NOMOVE;
+    return flags;
+}
+
+/// Where a window opened from another one (`new_window`, a profile in a new
+/// window) starts.
+const NewWindowPlacement = struct {
+    /// In screen coordinates: the size the source has when it is a normal
+    /// window, one cascade step down and right so the new window does not
+    /// sit exactly on it, kept inside the source's monitor. Never the rect of
+    /// a minimized source, which is not on screen, nor the monitor-sized rect
+    /// of a maximized one.
+    rect: RECT,
+    /// Set when the source is, or restores to, maximized: its placement,
+    /// for `Surface.maximizeWithPlacement`.
+    maximize: ?WINDOWPLACEMENT,
+    /// `rect` is the source's own, unchanged: it is fullscreen, so the new
+    /// window is too and covers the same monitor.
+    copied: bool = false,
+};
+
+/// `destination` is the window being placed, if it already exists: it is not
+/// one of the windows the new one steps past.
+fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?HWND) !NewWindowPlacement {
+    var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+    placement.length = @sizeOf(WINDOWPLACEMENT);
+    if (sys.GetWindowPlacement(source, &placement) == 0) return lastError();
+    // For a minimized window this is the monitor it was on, not the one its
+    // icon is on.
+    const monitor = sys.MonitorFromWindow(source, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+    var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+    info.cbSize = @sizeOf(MONITORINFO);
+    if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+
+    // The monitor, not the source's rect, which is a sliver under the
+    // taskbar once the source is minimized.
+    if (fullscreen) return .{ .rect = info.rcMonitor, .maximize = null, .copied = true };
+
+    // A window minimized from maximized restores to maximized. The flag
+    // alone says nothing about a window that was restored since: Windows
+    // keeps it set on a normal window.
+    const iconic = sys.IsIconic(source) != 0;
+    const zoomed = sys.IsZoomed(source) != 0 or (iconic and (placement.flags & c.WPF_RESTORETOMAXIMIZED) != 0);
+    if (zoomed) {
+        // It is maximized again, never minimized with it.
+        placement.showCmd = c.SW_MAXIMIZE;
+        return .{
+            .rect = workspaceRectToScreen(placement.rcNormalPosition, info),
+            .maximize = placement,
+        };
+    }
+
+    var rect: RECT = undefined;
+    if (iconic) {
+        rect = workspaceRectToScreen(placement.rcNormalPosition, info);
+    } else if (sys.GetWindowRect(source, &rect) == 0) {
+        return lastError();
+    }
+    const step = cascadeStep(sys.GetDpiForWindow(source));
+    // One step off the source, and on past any window already there: every
+    // new window of a forwarded launch is opened from the same first window.
+    var placed = fitRectInWork(
+        rect.left + step,
+        rect.top + step,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        info.rcWork,
+    );
+    var steps: u8 = 0;
+    while (steps < 8 and app.windowStartsAt(placed, destination)) : (steps += 1) {
+        placed = fitRectInWork(
+            placed.left + step,
+            placed.top + step,
+            placed.right - placed.left,
+            placed.bottom - placed.top,
+            info.rcWork,
+        );
+    }
+    return .{ .rect = placed, .maximize = null };
 }
 
 test "win32 fullscreen restore translates work areas and scales size to fit" {
@@ -32189,15 +32703,8 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     // never left the tab sends no WM_MOUSELEAVE, and the popup
                     // would sit over whatever the user switched to.
                     v.hideTabTooltip();
-                    if (v.app.config.@"quick-terminal-autohide") {
-                        if (v.app.quickTerminalSurfaceForHost(v)) |surface| {
-                            if (surface.window_visible) {
-                                const top_level = surface.windowHwnd() orelse return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
-                                if (sys.IsWindowVisible(top_level) != 0) {
-                                    App.hideQuickTerminalSurface(surface);
-                                }
-                            }
-                        }
+                    if (v.quick_terminal and v.app.config.@"quick-terminal-autohide") {
+                        if (sys.IsWindowVisible(hwnd) != 0) App.hideQuickTerminalHost(v);
                     }
                 }
             }
@@ -32783,6 +33290,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         c.WM_SHOWWINDOW => {
             const result = sys.DefWindowProcW(hwnd, msg, wParam, lParam);
             if (host) |v| {
+                if (wParam != 0) v.hidden_by_toggle = false;
                 v.refreshSurfaceVisibility();
                 // Hiding or showing a window changes no size, so WM_SIZE
                 // never fires and this is the only notice that the caption
@@ -34068,7 +34576,6 @@ pub const Surface = struct {
     mouse_visible: bool = true,
     hovered_link: ?[:0]const u8 = null,
     window_focused: bool = false,
-    quick_terminal: bool = false,
     decorations_visible: bool = true,
     decorations_visible_overridden: bool = false,
     fullscreen: bool = false,
@@ -34394,7 +34901,6 @@ pub const Surface = struct {
             .host = host,
             .adopted_session = if (opts.adopted_session) |pending| pending.takeAdopted() else null,
             .adopted_console = opts.adopted_session != null,
-            .quick_terminal = opts.quick_terminal,
             .host_id = host.id,
             .host_active = true,
             .window_visible = false,
@@ -38644,28 +39150,26 @@ pub const Surface = struct {
 
         const hwnd = self.windowHwnd() orelse return;
         const source_hwnd = source.windowHwnd() orelse return;
-        var rect: RECT = undefined;
-        var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
-        placement.length = @sizeOf(WINDOWPLACEMENT);
-        if (sys.GetWindowRect(source_hwnd, &rect) == 0 or
-            sys.GetWindowPlacement(source_hwnd, &placement) == 0) return lastError();
+        const placed = try newWindowPlacement(self.app, source_hwnd, source.fullscreen, hwnd);
+        var flags = newWindowSetPosFlags(&self.app.config, placed) | c.SWP_FRAMECHANGED;
+        // Another tab of the source's own window is already where it goes.
+        if (hwnd == source_hwnd) flags |= c.SWP_NOMOVE | c.SWP_NOSIZE;
         if (sys.SetWindowPos(
             hwnd,
             if (self.topmost) HWND_TOPMOST else HWND_NOTOPMOST,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            c.SWP_NOACTIVATE | c.SWP_FRAMECHANGED,
+            placed.rect.left,
+            placed.rect.top,
+            placed.rect.right - placed.rect.left,
+            placed.rect.bottom - placed.rect.top,
+            flags,
         ) == 0) {
             return lastError();
         }
 
         if (!self.fullscreen) {
-            if (sys.IsZoomed(source_hwnd) != 0) {
-                // The move above made the source's maximized rect this
-                // window's normal rect; it takes the source's instead.
-                try maximizeWithPlacement(hwnd, &placement);
+            if (placed.maximize) |*placement| {
+                // The source's normal rect, not the monitor-sized one.
+                try maximizeWithPlacement(hwnd, placement);
             } else {
                 _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
             }
@@ -38706,7 +39210,7 @@ pub const Surface = struct {
     /// terminal flag is the host's: a split or tab opened inside the quick
     /// terminal is an ordinary surface in the quick terminal's window.
     fn keepsFrameUndecorated(self: *const Surface) bool {
-        const quick_terminal = if (self.host) |host| host.quick_terminal else self.quick_terminal;
+        const quick_terminal = if (self.host) |host| host.quick_terminal else false;
         return undecoratedKeepsFrame(self.app.os_build, quick_terminal);
     }
 
@@ -45360,7 +45864,6 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                 sys.GetModuleHandleW(null),
                 null,
             ) orelse return lastError();
-            surface.quick_terminal = false;
             surface.decorations_visible = true;
             surface.fullscreen = false;
             surface.topmost = false;
@@ -45396,6 +45899,8 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             _ = sys.SetThreadDpiAwarenessContext(-4);
             var app: App = undefined;
             app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
             var surface = try window(&app, 100);
             const hwnd = surface.hwnd.?;
             defer _ = sys.DestroyWindow(hwnd);
@@ -45495,6 +46000,390 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
     const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
     thread.join();
     try result;
+}
+
+/// A hostless surface whose top-level window sits at (`left`, `top`) and is
+/// 640x480, with every field `inheritWindowStateFrom` copies set.
+fn placementTestSurface(app: *App, left: i32, top: i32) !Surface {
+    var surface: Surface = undefined;
+    surface.app = app;
+    surface.host = null;
+    surface.hwnd = sys.CreateWindowExW(
+        0,
+        prompt_label_class,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        WS_OVERLAPPEDWINDOW,
+        left,
+        top,
+        640,
+        480,
+        null,
+        null,
+        sys.GetModuleHandleW(null),
+        null,
+    ) orelse return lastError();
+    surface.decorations_visible = true;
+    surface.decorations_visible_overridden = false;
+    surface.fullscreen = false;
+    surface.topmost = false;
+    surface.restore_rect = std.mem.zeroes(RECT);
+    surface.restore_placement = std.mem.zeroes(WINDOWPLACEMENT);
+    surface.restore_monitor = null;
+    surface.default_client_size = null;
+    surface.cell_size_pixels = .{ .width = 0, .height = 0 };
+    surface.background_opacity_default = 1.0;
+    surface.background_opacity_force_opaque = false;
+    surface.size_limit = .{ .min_width = 0, .min_height = 0, .max_width = 0, .max_height = 0 };
+    return surface;
+}
+
+test "win32 a window opened from a minimized one starts on screen at its restored size" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWNOACTIVATE);
+            var restored: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(source.hwnd.?, &restored) != 0);
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(source.hwnd.?) != 0);
+
+            try clone.inheritWindowStateFrom(&source);
+
+            // The iconic rect is near (-32000, -32000); what the source
+            // restores to is its normal rect.
+            try std.testing.expect(sys.IsIconic(clone.hwnd.?) == 0);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+            try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
+            try std.testing.expectEqual(restored.bottom - restored.top, rect.bottom - rect.top);
+            // One cascade step down and right, so it does not cover the
+            // source's restored place.
+            const dx = rect.left - restored.left;
+            const dy = rect.top - restored.top;
+            try std.testing.expect(dx > 0 and dx <= 96);
+            try std.testing.expect(dy > 0 and dy <= 96);
+        }
+    }.body);
+}
+
+test "win32 a new window cascades from its source, stays on its monitor and follows its state" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            const source_hwnd = source.hwnd.?;
+            const clone_hwnd = clone.hwnd.?;
+            _ = sys.ShowWindow(source_hwnd, c.SW_SHOWNOACTIVATE);
+            var restored: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(source_hwnd, &restored) != 0);
+            const step = sys.MulDiv(32, @intCast(sys.GetDpiForWindow(source_hwnd)), 96);
+
+            // A normal source: one step down and right, same size.
+            try clone.inheritWindowStateFrom(&source);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
+            try std.testing.expectEqual(restored.left + step, rect.left);
+            try std.testing.expectEqual(restored.top + step, rect.top);
+            try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
+            try std.testing.expectEqual(restored.bottom - restored.top, rect.bottom - rect.top);
+
+            // At the corner of its monitor there is no room to step: the new
+            // window stays on the monitor, at the same size.
+            const monitor = sys.MonitorFromWindow(source_hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+            const info = monitorInfo(monitor) orelse return lastError();
+            try std.testing.expect(sys.SetWindowPos(source_hwnd, null, info.work_area.right - 640, info.work_area.bottom - 480, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
+            try std.testing.expect(rect.left >= info.work_area.left and rect.right <= info.work_area.right);
+            try std.testing.expect(rect.top >= info.work_area.top and rect.bottom <= info.work_area.bottom);
+            try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
+            try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
+
+            // `window-position-x/y` still says where it goes; only the size
+            // comes from the source.
+            try std.testing.expect(sys.SetWindowPos(source_hwnd, null, 80, 90, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            try std.testing.expect(sys.SetWindowPos(clone_hwnd, null, 300, 310, 400, 300, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            app.config.@"window-position-x" = 300;
+            app.config.@"window-position-y" = 310;
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
+            try std.testing.expectEqual(@as(i32, 300), rect.left);
+            try std.testing.expectEqual(@as(i32, 310), rect.top);
+            try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
+            try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
+            app.config.@"window-position-x" = null;
+            app.config.@"window-position-y" = null;
+
+            // A source minimized from maximized restores to maximized, so
+            // the new window is maximized, with the source's normal rect.
+            var normal_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            normal_placement.length = @sizeOf(WINDOWPLACEMENT);
+            try std.testing.expect(sys.GetWindowPlacement(source_hwnd, &normal_placement) != 0);
+            _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+            _ = sys.ShowWindow(source_hwnd, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(source_hwnd) != 0);
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.IsIconic(clone_hwnd) == 0);
+            try std.testing.expect(sys.IsZoomed(clone_hwnd) != 0);
+            var clone_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            clone_placement.length = @sizeOf(WINDOWPLACEMENT);
+            try std.testing.expect(sys.GetWindowPlacement(clone_hwnd, &clone_placement) != 0);
+            try std.testing.expectEqualDeep(normal_placement.rcNormalPosition, clone_placement.rcNormalPosition);
+        }
+    }.body);
+}
+
+test "win32 a host opened from a minimized host starts on screen" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            const core = try CoreApp.create(std.testing.allocator);
+            defer core.destroy();
+            var app: App = undefined;
+            try app.init(core, .{ .safe_mode = true });
+            const hinstance = app.hinstance;
+            defer {
+                app.terminate();
+                _ = sys.UnregisterClassW(host_class_name, hinstance);
+                _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+                _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+            }
+            const title = std.unicode.utf8ToUtf16LeStringLiteral("");
+            const source = try app.createHost(title, null, false);
+            const hwnd = source.hwnd.?;
+            try std.testing.expect(sys.SetWindowPos(hwnd, null, 60, 70, 700, 500, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            var restored: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(hwnd, &restored) != 0);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(hwnd) != 0);
+
+            // `createHost` gives the new host the source's place before
+            // anything is shown.
+            const clone = try app.createHost(title, null, false);
+            try app.inheritHostWindowState(clone, source);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+            try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
+            try std.testing.expectEqual(restored.bottom - restored.top, rect.bottom - rect.top);
+            try std.testing.expect(rect.left > restored.left and rect.left <= restored.left + 96);
+            try std.testing.expect(rect.top > restored.top and rect.top <= restored.top + 96);
+        }
+    }.body);
+}
+
+test "win32 new_window does not copy state from a quick terminal" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var quick_host: Host = undefined;
+    var host: Host = undefined;
+    var quick_surface: Surface = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        // The quick terminal comes first, so it is what the app target
+        // resolves to.
+        .hosts = &.{
+            .{ .storage = &quick_host, .id = 1, .register = true, .next_tab_id = 2 },
+            .{ .storage = &host, .id = 2, .register = true, .next_tab_id = 2 },
+        },
+        .surfaces = &.{
+            .{ .storage = &quick_surface, .host = &quick_host, .register = true },
+            .{ .storage = &surface, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &quick_host, .surface = &quick_surface, .id = 1 },
+            .{ .host = &host, .surface = &surface, .id = 1 },
+        },
+    });
+    defer session.deinit();
+    quick_host.quick_terminal = true;
+
+    const Hook = struct {
+        var calls: usize = 0;
+        var clone_state_from: ?*const Surface = null;
+
+        fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+            calls += 1;
+            clone_state_from = opts.clone_state_from;
+            return error.TestWindowCreateFailed;
+        }
+    };
+    app.test_create_window_surface = &Hook.createSurface;
+
+    // The quick terminal is a floating strip pinned to a screen edge: a
+    // window copied from it would be topmost and sit on that strip. A new
+    // window opened from it follows an ordinary one.
+    Hook.calls = 0;
+    _ = app.performAction(.app, .new_window, .{}) catch {};
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls);
+    try std.testing.expect(Hook.clone_state_from == &surface);
+
+    // With no ordinary window it is an ordinary new window.
+    _ = app.hosts.orderedRemove(1);
+    _ = app.performAction(.app, .new_window, .{}) catch {};
+    try std.testing.expectEqual(@as(usize, 2), Hook.calls);
+    try std.testing.expect(Hook.clone_state_from == null);
+
+    // An ordinary window is what a new one copies.
+    app.hosts.clearRetainingCapacity();
+    try app.hosts.append(std.testing.allocator, &host);
+    _ = app.performAction(.app, .new_window, .{}) catch {};
+    try std.testing.expectEqual(@as(usize, 3), Hook.calls);
+    try std.testing.expect(Hook.clone_state_from == &surface);
+}
+
+test "win32 a new window is not maximized by a restore-to-maximized flag left on a normal window" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            const hwnd = source.hwnd.?;
+
+            // Maximize, minimize, restore (back to maximized), restore again.
+            // Windows keeps WPF_RESTORETOMAXIMIZED in the placement of the
+            // normal window this leaves.
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expect(sys.IsZoomed(hwnd) == 0 and sys.IsIconic(hwnd) == 0);
+
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.IsZoomed(clone.hwnd.?) == 0);
+
+            // Another tab of the same window syncing its state does not
+            // maximize the window either.
+            var twin = source;
+            try twin.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+        }
+    }.body);
+}
+
+test "win32 a new window from a fullscreen window covers the same monitor" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            const monitor = sys.MonitorFromWindow(source.hwnd.?, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+            const full = (monitorInfo(monitor) orelse return lastError()).full_rect;
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWNOACTIVATE);
+            source.fullscreen = true;
+            try std.testing.expect(sys.SetWindowPos(source.hwnd.?, null, full.left, full.top, full.width(), full.height(), c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+
+            // Not stepped down and fitted to the work area, which would show
+            // the taskbar under a window that is meant to be fullscreen, and
+            // not moved by `window-position-x/y`.
+            for ([_]bool{ false, true }) |configured| {
+                if (configured) {
+                    app.config.@"window-position-x" = 300;
+                    app.config.@"window-position-y" = 310;
+                }
+                try std.testing.expect(sys.SetWindowPos(clone.hwnd.?, null, 700, 300, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+                try clone.inheritWindowStateFrom(&source);
+                try std.testing.expect(clone.fullscreen);
+                var rect: RECT = undefined;
+                try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+                try std.testing.expectEqualDeep(RECT{ .left = full.left, .top = full.top, .right = full.right, .bottom = full.bottom }, rect);
+            }
+
+            // Minimized, the source's own rect is a sliver under the
+            // taskbar; the monitor is still where it is fullscreen.
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(source.hwnd.?) != 0);
+            try clone.inheritWindowStateFrom(&source);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+            try std.testing.expectEqualDeep(RECT{ .left = full.left, .top = full.top, .right = full.right, .bottom = full.bottom }, rect);
+        }
+    }.body);
+}
+
+test "win32 new windows from one source step past the windows already there" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            defer app.hosts.deinit(std.testing.allocator);
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWNOACTIVATE);
+            var origin: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(source.hwnd.?, &origin) != 0);
+            const step = sys.MulDiv(32, @intCast(sys.GetDpiForWindow(source.hwnd.?)), 96);
+
+            // Every forwarded launch is opened from the same first window.
+            // The next one goes where the last one is not.
+            var rect: RECT = undefined;
+            for ([_]i32{ 1, 2, 3 }) |n| {
+                try clone.inheritWindowStateFrom(&source);
+                try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+                try std.testing.expectEqual(origin.left + n * step, rect.left);
+                try std.testing.expectEqual(origin.top + n * step, rect.top);
+                var opened = try placementTestSurface(&app, rect.left, rect.top);
+                _ = sys.ShowWindow(opened.hwnd.?, c.SW_SHOWNOACTIVATE);
+                const host = try std.testing.allocator.create(Host);
+                host.* = .{ .app = &app, .id = @intCast(n), .hwnd = opened.hwnd };
+                try app.hosts.append(std.testing.allocator, host);
+                // Kept until the end of the body: `opened` is a copy of the
+                // window handle, destroyed with the loop's other windows.
+                _ = &opened;
+            }
+            for (app.hosts.items) |host| {
+                _ = sys.DestroyWindow(host.hwnd.?);
+                std.testing.allocator.destroy(host);
+            }
+            app.hosts.clearRetainingCapacity();
+        }
+    }.body);
 }
 
 test "win32 shouldShowSurfaceImmediately only for new hosts" {
@@ -49655,40 +50544,54 @@ test "win32 session scrollback restore refuses panes it cannot restore safely" {
     }
 }
 
-test "win32 session save skips quick terminal tabs" {
+test "win32 session save skips every tab of the quick terminal host" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var app: App = undefined;
     app.hosts = .empty;
     defer app.hosts.deinit(std.testing.allocator);
 
-    var host: Host = .{
+    var quick_host: Host = .{
         .app = &app,
         .id = 1,
+        .quick_terminal = true,
+    };
+    var host: Host = .{
+        .app = &app,
+        .id = 2,
     };
     defer {
+        for (quick_host.tabs.items) |*tab| tab.deinit();
+        quick_host.tabs.deinit(std.testing.allocator);
         for (host.tabs.items) |*tab| tab.deinit();
         host.tabs.deinit(std.testing.allocator);
     }
 
-    var surface: Surface = undefined;
-    surface.quick_terminal = true;
-    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 1, &surface));
-    try app.hosts.append(std.testing.allocator, &host);
+    // Two tabs in the quick terminal, neither the one it was created with:
+    // what is left once that first pane closes.
+    var first: Surface = undefined;
+    var second: Surface = undefined;
+    try quick_host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 1, &first));
+    try quick_host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &second));
+    try app.hosts.append(std.testing.allocator, &quick_host);
 
     const state = try app.buildSessionState(std.testing.allocator, 0);
     defer std.testing.allocator.free(state.windows);
     try std.testing.expectEqual(@as(usize, 0), state.windows.len);
-    try std.testing.expect(App.hostContainsQuickTerminal(&host));
+    try std.testing.expectEqual(@as(usize, 0), App.hostSessionTabs(&quick_host).len);
+    var no_budget: usize = 0;
+    try std.testing.expectError(
+        error.EmptyTabs,
+        App.buildSessionWindow(std.testing.allocator, &quick_host, .layout, 0, &no_budget),
+    );
 
     var normal_surface: Surface = undefined;
-    normal_surface.quick_terminal = false;
     normal_surface.pwd = null;
     normal_surface.launch_profile_key = null;
     normal_surface.title_override = null;
     normal_surface.tab_title_override = null;
-    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &normal_surface));
-    host.active_tab = 1;
+    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 3, &normal_surface));
+    try app.hosts.append(std.testing.allocator, &host);
 
     const mixed_state = try app.buildSessionState(std.testing.allocator, 0);
     defer {
@@ -49720,7 +50623,6 @@ test "security regression win32 session save drops one hostile pane field" {
     }
 
     var surface: Surface = undefined;
-    surface.quick_terminal = false;
     surface.launched_ssh = false;
     surface.pwd = "C:\\src\\noctty";
     surface.launch_profile_key = "pwsh";
@@ -51442,7 +52344,7 @@ test "win32 DPI catches up on minimized restore and quick terminal show" {
     surface.syncOcclusion();
     try std.testing.expectEqual(@as(f32, 1.5), surface.content_scale.x);
 
-    surface.quick_terminal = true;
+    host.quick_terminal = true;
     surface.setVisible(false);
     host.surfaces_visible = false;
     host.current_dpi = 96;
