@@ -128,8 +128,8 @@ Win32-validated VT protocol coverage is tracked in
 - `key-remap` applies to focused and in-app keybinds and to terminal
   encoding, but not to `global:` hotkeys, which register the literal chord.
 - Native settings window (Appearance, Terminal, Shell, Privacy, Updates,
-  Keybindings, Advanced) that stages edits until Save and patches your
-  config without rewriting unrelated text.
+  Keybindings, Advanced) that stages edits until Save or Discard changes
+  and patches your config without rewriting unrelated text.
 - Universal palette: actions, tabs, panes, profiles, named layouts, themes,
   native settings, help, and recent commands in one fuzzy-searched,
   keyboard-driven list.

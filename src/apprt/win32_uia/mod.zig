@@ -36,6 +36,7 @@ pub const PaletteListGeometry = widgets.PaletteListGeometry;
 pub const PaletteListRowBounds = widgets.PaletteListRowBounds;
 pub const SettingsSectionGroupProvider = widgets.SettingsSectionGroupProvider;
 pub const SettingsSectionProvider = widgets.SettingsSectionProvider;
+pub const SettingsSectionMarker = widgets.SettingsSectionMarker;
 pub const SettingsControlProvider = widgets.SettingsControlProvider;
 pub const ChromeControlProvider = widgets.ChromeControlProvider;
 pub const ChromeControlState = widgets.ChromeControlState;

@@ -26982,6 +26982,7 @@ fn settingsPreviewFieldThunk(
         .padding_balance => app.config.@"window-padding-balance" = value.padding_balance,
         .auto_update => app.config.@"auto-update" = value.auto_update,
         .auto_update_channel => app.config.@"auto-update-channel" = value.auto_update_channel,
+        .accent_follow_system => app.config.@"accent-follow-system" = value.accent_follow_system,
     }
     switch (win32_settings.previewEffect(field)) {
         .none => {},
@@ -27017,6 +27018,12 @@ test "settings live preview refreshes only what the field shows" {
     settingsPreviewFieldThunk(&app, .window_theme, .{ .window_theme = .light });
     try std.testing.expectEqual(baseline + 1, app.theme_rebuilds);
     try std.testing.expect(app.config.@"window-theme" == .light);
+
+    // The tab strip follows the accent only while the setting is on, so the
+    // checkbox rebuilds the theme like the window theme does.
+    settingsPreviewFieldThunk(&app, .accent_follow_system, .{ .accent_follow_system = false });
+    try std.testing.expectEqual(baseline + 2, app.theme_rebuilds);
+    try std.testing.expect(!app.config.@"accent-follow-system");
 }
 fn settingsNotifyConflictThunk(ctx: *anyopaque, field: win32_settings.SettingField) void {
     const app: *App = @ptrCast(@alignCast(ctx));
