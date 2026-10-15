@@ -9989,8 +9989,15 @@ pub const App = struct {
         };
         const post_host = (if (near) |surface| surface.host else null) orelse
             if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        // A failed post declines the quit: running it here instead is the
+        // teardown under the key handler that this function exists to avoid.
         if (post_host) |host| if (host.hwnd) |hwnd| {
-            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, @intFromBool(near != null), 0) != 0) return;
+            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, @intFromBool(near != null), 0) == 0) {
+                log.warn("quit declined: could not post it to the message loop err={}", .{
+                    windows.kernel32.GetLastError(),
+                });
+            }
+            return;
         };
         self.requestQuit(near);
     }
@@ -38085,6 +38092,21 @@ test "win32 quit asks once on the window it came from" {
     var msg: sys.MSG = undefined;
     try std.testing.expect(sys.PeekMessageW(&msg, hwnd, c.WM_WINHOSTTY_QUIT, c.WM_WINHOSTTY_QUIT, c.PM_REMOVE) != 0);
     try std.testing.expectEqual(@as(WPARAM, 1), msg.wParam);
+
+    // A post that fails declines the quit rather than running it under
+    // the key handler. The non-null edit handle stands in for the overlay
+    // controls, so a quit run in place would open its prompt here.
+    const dead_hwnd = try createTestHostWindow();
+    _ = sys.DestroyWindow(dead_hwnd);
+    host_a.hwnd = dead_hwnd;
+    host_a.overlay_edit_hwnd = dead_hwnd;
+    defer host_a.overlay_edit_hwnd = null;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expect(app.running);
 }
 
 test "win32 close prompts count the terminals they would end" {
