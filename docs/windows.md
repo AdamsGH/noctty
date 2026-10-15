@@ -1014,14 +1014,38 @@ cancels and returns keyboard focus to the terminal. Quick select also closes
 on resize, on a click, and when the surface loses focus.
 
 Completing a label copies the matched text to the clipboard. Hold Ctrl while
-completing to open a target that begins with an allowed URL scheme; other
-targets are copied. Hold Alt to paste through the normal protected-paste
-path. Opening is narrower than matching: `file:` URLs are labeled and can be
-copied, but Ctrl will not open them, because the system handler would run
-`file:///C:/...exe` straight from terminal output. Alt-paste also runs the
-same classifier as the drag-and-drop path, so a match carrying shell
-metacharacters, environment-variable expansion, or control bytes raises the
-paste confirmation.
+completing to open a target that begins with an allowed URL scheme or names a
+file or folder on this machine (`C:\dir\file.txt`, `.\src\main.zig:12:5`,
+`src\a.cs(3,4)`); other targets, network shares included, are copied. A path
+opens through the same checks as a Ctrl+click on it, with a trailing
+`:line:col` or `(line,col)` left off: it must exist and must not be a program
+or script. When it is refused, a banner says it was not opened. Hold Alt to
+paste through the normal protected-paste path. Opening is narrower than
+matching: `file:` URLs are labeled and can be copied, but Ctrl will not open
+them, because the system handler would run `file:///C:/...exe` straight from
+terminal output. Alt-paste also runs the same classifier as the
+drag-and-drop path, so a match carrying shell metacharacters,
+environment-variable expansion, or control bytes raises the paste
+confirmation.
+
+The same matcher finds paths for Ctrl+click links and double-click selection:
+`C:\dir\file`, `C:/dir/file`, `\\server\share\file`, `.\file` and
+`dir\file.ext`, with an optional `:line:col` or `(line,col)`. A path ends at
+`;`, `,`, `"`, an unbalanced bracket, and a trailing `.`, `!`, `'` or `}`; a
+pair of brackets inside it, as in `Program Files (x86)`, stays. Spaces inside
+a path stay part of it: a space continues the path after a word whose last
+segment has no dot (`Program`), and after one that has a dot (`git.exe`,
+`Node.js`) only when the next word starts like a folder name and has a
+backslash in it (`Tools\x.exe`), so a URL or another path after a file name is
+its own link. So `C:\a.txt copied` ends at `.txt` and
+`C:\Program Files\Git\bin\git.exe failed` at `git.exe`, while
+`C:\Program Files\Node.js Tools\x.exe` stays whole. A path whose last segment
+has no dot still takes the words after it (`C:\Users\amant and then` is one
+match), because that cannot be told from a folder with a space in its name.
+A path inside single or double quotes ends at its closing quote.
+
+A quick select with nothing to label, or with too many targets to label
+without overlap, says so in the banner.
 
 Targets are re-checked against the live screen when you act. If the running
 program rewrote a labeled region while the overlay was up, that target is

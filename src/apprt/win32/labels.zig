@@ -106,6 +106,12 @@ pub const HostBannerKind = enum {
     err,
 };
 
+/// A link or path the opener refused: missing, a program or script, or on the
+/// network.
+pub const open_refused_banner = "Not opened: only known link types and existing documents or folders can be opened.";
+pub const quick_select_no_targets_banner = "No quick-select targets in view.";
+pub const quick_select_too_many_banner = "Too many quick-select targets in view to label. Clear or narrow the screen.";
+
 const TabButtonKeyAction = enum {
     activate,
     previous,
