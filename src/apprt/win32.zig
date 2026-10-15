@@ -2827,6 +2827,13 @@ const UpdateNotice = struct {
     }
 };
 
+/// How often a running process asks the automatic check to run again. The
+/// check's 24 hour throttle (`updatepkg.throttle_seconds`) decides whether a
+/// request is actually made, so this only has to be shorter than the throttle
+/// by a margin: six hours means a release is noticed within a day of the
+/// throttle expiring, and an early tick just reads the saved state.
+const update_recheck_interval_ms: u32 = 6 * 60 * 60 * 1000;
+
 const UpdateCheckRequest = struct {
     alloc: Allocator,
     delivery: *AppDelivery,
@@ -3461,6 +3468,51 @@ fn isPortableModeActive(alloc: Allocator) bool {
     return true;
 }
 
+/// How this copy of noctty gets updated. A setup-managed copy applies a
+/// staged installer and a portable-marker copy a staged ZIP. Anything else
+/// (Scoop, a ZIP extracted without its marker) was put there by someone else
+/// and cannot apply either, so downloading a staged update for it is wasted
+/// and its "ready to install" notice would be untrue.
+const InstallKind = enum {
+    installer,
+    portable,
+    other,
+
+    fn classify(portable_marker: bool, installer_managed: bool) InstallKind {
+        if (portable_marker) return .portable;
+        return if (installer_managed) .installer else .other;
+    }
+
+    /// What to stage for this copy, or null when nothing can be applied.
+    fn stagedKind(self: InstallKind) ?updatepkg.portable_apply.StagedKind {
+        return switch (self) {
+            .installer => .installer,
+            .portable => .portable,
+            .other => null,
+        };
+    }
+
+    /// A failed probe is `.other`: refusing to stage is the safe answer.
+    fn detect(alloc: Allocator) InstallKind {
+        if (isPortableModeActive(alloc)) return .portable;
+        const install_dir = currentInstallDir(alloc) catch return .other;
+        defer alloc.free(install_dir);
+        return classify(false, internal_os.windows.isInstallerManagedInstallDir(install_dir));
+    }
+
+    test "only setup-managed and portable-marker copies stage an update" {
+        try std.testing.expectEqual(InstallKind.installer, classify(false, true));
+        try std.testing.expectEqual(InstallKind.portable, classify(true, false));
+        // A portable marker beside a setup-managed layout is still portable.
+        try std.testing.expectEqual(InstallKind.portable, classify(true, true));
+        try std.testing.expectEqual(InstallKind.other, classify(false, false));
+
+        try std.testing.expectEqual(@as(?updatepkg.portable_apply.StagedKind, .installer), InstallKind.installer.stagedKind());
+        try std.testing.expectEqual(@as(?updatepkg.portable_apply.StagedKind, .portable), InstallKind.portable.stagedKind());
+        try std.testing.expectEqual(@as(?updatepkg.portable_apply.StagedKind, null), InstallKind.other.stagedKind());
+    }
+};
+
 fn installTerminfo(alloc: Allocator, term: []const u8) void {
     const names = terminfo.compiled.fileNames(terminfo.ghostty) catch return;
     for (names) |name| {
@@ -4070,6 +4122,12 @@ pub const App = struct {
     /// the length of that synchronous call (`Host.activateBannerButton`).
     update_action_host: ?*Host = null,
     update_auto_check_started: bool = false,
+    /// Repeating thread timer that re-runs the automatic check in a process
+    /// that stays open for days. See `update_recheck_interval_ms`.
+    update_recheck_timer_id: ?UINT_PTR = null,
+    /// Detected on first use: the install directory cannot change under a
+    /// running process.
+    install_kind: ?InstallKind = null,
     update_startup_ready: bool = false,
     /// Most-recently-used command palette actions; newest first. Strings
     /// are owned by `core_app.alloc` and freed in `App.deinit`. Surfaced
@@ -4485,6 +4543,7 @@ pub const App = struct {
             self.stopTerminalHandoffIdleTimer();
             self.stopRecoveryRetryTimer();
             self.stopProgramStatusNotifyTimer();
+            self.stopUpdateRecheckTimer();
             @atomicStore(DWORD, &self.ui_thread_id, 0, .release);
             self.closeMessageWindow();
             self.running = false;
@@ -4712,6 +4771,12 @@ pub const App = struct {
                         continue;
                     }
                 }
+                if (self.update_recheck_timer_id) |timer_id| {
+                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
+                        self.onUpdateRecheckTimer();
+                        continue;
+                    }
+                }
             }
 
             if (msg.message == c.WM_HOTKEY) {
@@ -4757,6 +4822,7 @@ pub const App = struct {
         self.stopTerminalHandoffIdleTimer();
         self.stopRecoveryRetryTimer();
         self.stopProgramStatusNotifyTimer();
+        self.stopUpdateRecheckTimer();
         if (self.update_notice) |*notice| {
             notice.deinit(self.core_app.alloc);
             self.update_notice = null;
@@ -6545,13 +6611,22 @@ pub const App = struct {
         _ = delivery.wake(c.WM_WINHOSTTY_WAKE);
     }
 
+    fn automaticUpdateChecksEnabled(self: *const App) bool {
+        return self.config.@"auto-update" != .off and
+            self.config.@"auto-update-channel" == .stable and
+            self.ui_thread_id != 0;
+    }
+
     fn maybeScheduleAutomaticUpdateCheck(self: *App) void {
         if (self.update_auto_check_started) return;
-        if (self.config.@"auto-update" == .off) return;
-        if (self.config.@"auto-update-channel" != .stable) return;
-        if (self.ui_thread_id == 0) return;
+        if (!self.automaticUpdateChecksEnabled()) return;
 
         self.update_auto_check_started = true;
+        self.runAutomaticUpdateCheck();
+        self.startUpdateRecheckTimer();
+    }
+
+    fn runAutomaticUpdateCheck(self: *App) void {
         self.scheduleUpdateCheck(.{
             .force = false,
             .manual = false,
@@ -6559,6 +6634,161 @@ pub const App = struct {
         }) catch |err| {
             log.warn("failed to start automatic update check err={}", .{err});
         };
+    }
+
+    /// A terminal that stays open for weeks would otherwise learn about a
+    /// release only after a restart. The tick is cheap: the check's own
+    /// 24 hour throttle answers from the saved state (no request, no
+    /// download) until a day has passed, and a dismissed version stays
+    /// dismissed because the check respects it. With no window open the tick
+    /// does nothing, so an idle background process makes no request.
+    fn startUpdateRecheckTimer(self: *App) void {
+        if (self.update_recheck_timer_id != null) return;
+        const timer_id = sys.SetTimer(null, 0, update_recheck_interval_ms, null);
+        if (timer_id == 0) {
+            log.warn("failed to start win32 update recheck timer err={}", .{windows.kernel32.GetLastError()});
+            return;
+        }
+        self.update_recheck_timer_id = timer_id;
+    }
+
+    fn stopUpdateRecheckTimer(self: *App) void {
+        if (self.update_recheck_timer_id) |timer_id| {
+            _ = sys.KillTimer(null, timer_id);
+            self.update_recheck_timer_id = null;
+        }
+    }
+
+    /// Applying a staged update sets `running = false` first; nothing is left
+    /// to tell about a release then. A staged notice that is already up is
+    /// left alone: the check would only re-verify it (and for a portable ZIP
+    /// re-extract it) while the user may be about to press Install.
+    fn updateRecheckWanted(self: *const App) bool {
+        if (self.update_notice) |notice| if (notice.staged) return false;
+        return self.running and self.windows.items.len > 0 and self.automaticUpdateChecksEnabled();
+    }
+
+    test "the update recheck timer is armed once, stopped on request, and ticks only with a window" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .surfaces = &.{.{ .storage = &surface }},
+        });
+        defer session.deinit();
+
+        app.startUpdateRecheckTimer();
+        defer app.stopUpdateRecheckTimer();
+        const timer_id = app.update_recheck_timer_id.?;
+        app.startUpdateRecheckTimer();
+        try std.testing.expectEqual(timer_id, app.update_recheck_timer_id.?);
+        app.stopUpdateRecheckTimer();
+        try std.testing.expectEqual(@as(?UINT_PTR, null), app.update_recheck_timer_id);
+
+        // A tick asks for a check only while the app runs with a window and
+        // automatic checks are on for the stable channel.
+        app.config.@"auto-update" = .check;
+        app.config.@"auto-update-channel" = .stable;
+        app.ui_thread_id = 1;
+        defer app.ui_thread_id = 0;
+        app.running = true;
+        try std.testing.expect(!app.updateRecheckWanted());
+        try app.windows.append(std.testing.allocator, &surface);
+        defer app.windows.clearAndFree(std.testing.allocator);
+        try std.testing.expect(app.updateRecheckWanted());
+        // A staged notice that is already up is left alone; an unstaged one
+        // is not, since a newer release should replace it.
+        app.update_notice = try UpdateNotice.init(std.testing.allocator, "1.3.200", "https://example.invalid/release", true);
+        try std.testing.expect(!app.updateRecheckWanted());
+        app.update_notice.?.staged = false;
+        try std.testing.expect(app.updateRecheckWanted());
+        app.update_notice.?.deinit(std.testing.allocator);
+        app.update_notice = null;
+        app.config.@"auto-update" = .off;
+        try std.testing.expect(!app.updateRecheckWanted());
+        app.config.@"auto-update" = .check;
+        app.config.@"auto-update-channel" = .tip;
+        try std.testing.expect(!app.updateRecheckWanted());
+        app.config.@"auto-update-channel" = .stable;
+        app.running = false;
+        try std.testing.expect(!app.updateRecheckWanted());
+    }
+
+    fn onUpdateRecheckTimer(self: *App) void {
+        if (self.updateRecheckWanted()) self.runAutomaticUpdateCheck();
+    }
+
+    fn installKind(self: *App) InstallKind {
+        if (self.install_kind) |kind| return kind;
+        const kind = InstallKind.detect(self.core_app.alloc);
+        self.install_kind = kind;
+        return kind;
+    }
+
+    /// What a check should download and stage, or null for a notice only:
+    /// `auto-update = download` on a copy that can apply what it stages.
+    fn updateStageKind(self: *App) ?updatepkg.portable_apply.StagedKind {
+        if (self.config.@"auto-update" != .download) return null;
+        return self.installKind().stagedKind();
+    }
+
+    test "a check stages only when auto-update is download and this copy can apply the result" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const Staged = updatepkg.portable_apply.StagedKind;
+        const cases = [_]struct { mode: configpkg.Config.AutoUpdate, kind: InstallKind, stages: ?Staged }{
+            .{ .mode = .download, .kind = .installer, .stages = .installer },
+            .{ .mode = .download, .kind = .portable, .stages = .portable },
+            .{ .mode = .download, .kind = .other, .stages = null },
+            .{ .mode = .check, .kind = .installer, .stages = null },
+            .{ .mode = .off, .kind = .portable, .stages = null },
+        };
+        for (cases) |case| {
+            app.config.@"auto-update" = case.mode;
+            app.install_kind = case.kind;
+            try std.testing.expectEqual(case.stages, app.updateStageKind());
+        }
+    }
+
+    test "the first automatic check arms the recheck timer once" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        // The session has no delivery channel, so no check thread starts.
+        app.config.@"auto-update" = .check;
+        app.config.@"auto-update-channel" = .stable;
+        app.ui_thread_id = 1;
+        defer app.ui_thread_id = 0;
+        defer app.stopUpdateRecheckTimer();
+        app.maybeScheduleAutomaticUpdateCheck();
+        try std.testing.expect(app.update_auto_check_started);
+        const timer_id = app.update_recheck_timer_id.?;
+        app.maybeScheduleAutomaticUpdateCheck();
+        try std.testing.expectEqual(timer_id, app.update_recheck_timer_id.?);
+
+        // Automatic checks off: no timer for a process that never checks.
+        app.stopUpdateRecheckTimer();
+        app.update_auto_check_started = false;
+        app.config.@"auto-update" = .off;
+        app.maybeScheduleAutomaticUpdateCheck();
+        try std.testing.expect(!app.update_auto_check_started);
+        try std.testing.expectEqual(@as(?UINT_PTR, null), app.update_recheck_timer_id);
     }
 
     fn scheduleUpdateCheck(
@@ -6591,8 +6821,9 @@ pub const App = struct {
         );
         const release_feed_url = resolved_feed.url;
         defer self.core_app.alloc.free(release_feed_url);
-        const staged_kind: updatepkg.portable_apply.StagedKind =
-            if (isPortableModeActive(self.core_app.alloc)) .portable else .installer;
+        // Only a copy that can apply a staged update gets one downloaded.
+        // The notice for any other falls back to "Open Release".
+        const stage_kind = self.updateStageKind();
 
         // The detached worker must not borrow the core allocator's lifetime.
         // Page allocator storage and a retained channel remain valid after UI exit.
@@ -6614,8 +6845,8 @@ pub const App = struct {
             .manual = opts.manual,
             .ignored_feed_source = resolved_feed.ignored_non_https,
             .respect_dismissal = opts.respect_dismissal,
-            .download = self.config.@"auto-update" == .download,
-            .staged_kind = staged_kind,
+            .download = stage_kind != null,
+            .staged_kind = stage_kind orelse .installer,
         };
 
         delivery.retain();
@@ -6701,29 +6932,66 @@ pub const App = struct {
         try self.openUrl(notice.release_url.?);
     }
 
+    /// A staged notice is recorded too, or it would come back at every launch.
+    /// Only the dismissal is written: the staged install stays on disk, so a
+    /// manual check can offer it again without downloading.
     fn dismissUpdateNotice(self: *App) void {
-        const notice = self.update_notice orelse return;
-        if (notice.staged) {
-            self.clearUpdateNotice();
-            return;
-        }
-
-        const version_text = notice.version_text orelse {
-            self.clearUpdateNotice();
-            return;
-        };
-
+        if (self.update_notice == null) return;
         const state_path = updatepkg.defaultStatePath(self.core_app.alloc) catch |err| {
             log.warn("failed to resolve updater state path err={}", .{err});
             self.clearUpdateNotice();
             return;
         };
         defer self.core_app.alloc.free(state_path);
+        self.dismissUpdateNoticeAt(state_path);
+    }
 
-        updatepkg.recordDismissal(self.core_app.alloc, state_path, version_text) catch |err| {
-            log.warn("failed to record updater dismissal err={}", .{err});
-        };
+    fn dismissUpdateNoticeAt(self: *App, state_path: []const u8) void {
+        const notice = self.update_notice orelse return;
+        if (notice.version_text) |version_text| {
+            updatepkg.recordDismissal(self.core_app.alloc, state_path, version_text) catch |err| {
+                log.warn("failed to record updater dismissal err={}", .{err});
+            };
+        }
         self.clearUpdateNotice();
+    }
+
+    test "dismissing a staged update notice records the dismissal and keeps the staged install" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(root);
+        const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+        defer alloc.free(state_path);
+        var staged: updatepkg.State = .{
+            .staged_version = try alloc.dupe(u8, "1.3.200"),
+            .staged_kind = .installer,
+            .staged_installer_path = try alloc.dupe(u8, "setup.exe"),
+            .staged_sha256 = try alloc.dupe(u8, "00"),
+        };
+        defer staged.deinit(alloc);
+        try updatepkg.saveState(state_path, &staged);
+
+        for ([_]bool{ true, false }) |is_staged| {
+            app.update_notice = try UpdateNotice.init(alloc, "1.3.200", "https://example.invalid/release", is_staged);
+            app.dismissUpdateNoticeAt(state_path);
+            try std.testing.expectEqual(@as(?UpdateNotice, null), app.update_notice);
+
+            var after = try updatepkg.loadState(alloc, state_path);
+            defer after.deinit(alloc);
+            try std.testing.expectEqualStrings("1.3.200", after.dismissed_version.?);
+            try std.testing.expectEqualStrings("1.3.200", after.staged_version.?);
+            try updatepkg.clearDismissal(alloc, state_path);
+        }
     }
 
     fn applyStagedUpdate(self: *App) !void {
@@ -7423,6 +7691,9 @@ pub const App = struct {
                         for (self.windows.items) |surface| {
                             try surface.applyRuntimeConfig(&self.config);
                         }
+                        // A reload that turns automatic checks on in a process
+                        // that started with them off (or on another channel).
+                        if (self.windows.items.len > 0 and self.update_startup_ready) self.maybeScheduleAutomaticUpdateCheck();
                         self.settings_window.externalConfigChanged(&self.config, self.config_revision);
                         self.refreshConfigProblems();
                         if (self.windows.items.len == 0) {
@@ -12029,7 +12300,7 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
                     if (request.manual) {
                         completion.manual_message = std.fmt.allocPrint(
                             alloc,
-                            "noctty {s} was downloaded, verified, and staged.",
+                            "noctty {s} is downloaded, verified, and staged.",
                             .{release.version_text},
                         ) catch null;
                     }
