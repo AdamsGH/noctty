@@ -85,6 +85,7 @@ const chrome_layout = @import("win32/chrome_layout.zig");
 const gdi = @import("win32/gdi.zig");
 const c = @import("win32/consts.zig");
 const sys = @import("win32/sys.zig");
+const app_delivery = @import("win32/app_delivery.zig");
 const focus_region = @import("win32/focus_region.zig");
 const first_frame = @import("win32/first_frame.zig");
 
@@ -2729,7 +2730,7 @@ const UpdateNotice = struct {
 
 const UpdateCheckRequest = struct {
     alloc: Allocator,
-    ui_thread_id: DWORD,
+    delivery: *AppDelivery,
     state_path: []u8,
     current_version: std.SemanticVersion,
     current_version_string: []u8,
@@ -2766,6 +2767,28 @@ const UpdateCheckCompletion = struct {
         self.* = undefined;
     }
 };
+
+const AppDeliveryPayload = union(enum) {
+    update: *UpdateCheckCompletion,
+    toast: win32_toast_activation.ActivationTarget,
+    uia_disconnect: *DeferredUiaDisconnect,
+
+    pub fn deinit(self: *AppDeliveryPayload) void {
+        switch (self.*) {
+            .update => |completion| {
+                const alloc = completion.alloc;
+                completion.deinit();
+                alloc.destroy(completion);
+            },
+            .toast => {},
+            .uia_disconnect => |pending| {
+                pending.release(pending.ctx);
+                std.heap.page_allocator.destroy(pending);
+            },
+        }
+    }
+};
+const AppDelivery = app_delivery.Channel(AppDeliveryPayload);
 
 const RecoveryStartup = struct {
     attempts: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined,
@@ -3014,9 +3037,9 @@ const RecoverySafeModeNotice = struct {
 /// UI thread sends messages that thread must pump. `App.run` starts this
 /// notice at the `showRecoverySafeModeNotice` call site *before* it enters its
 /// `GetMessageW` loop, so there is a window where the UI thread is not
-/// pumping. (Calling `MessageBoxW` on the UI thread itself is worse still: its
-/// nested modal loop dispatches `WM_WINHOSTTY_WAKE` to a wndproc that returns
-/// 0 without ticking, stalling the app mailbox.)
+/// pumping. The App's message-only window now keeps safe mailbox work moving
+/// inside native modal loops, but lifetime-changing work still waits for the
+/// outer loop; this informational notice must not delay that work.
 ///
 /// Finally, `initial-window = false` means there is no host HWND at all, so an
 /// ownerless path has to exist regardless. Safe mode is a usable session; the
@@ -3670,6 +3693,11 @@ pub const App = struct {
     global_hotkeys: std.ArrayListUnmanaged(RegisteredGlobalHotkey) = .empty,
     global_hotkeys_dirty: bool = false,
     ui_thread_id: DWORD = 0,
+    /// Published before any producer starts; retained until producers stop.
+    /// Detached update workers hold their own reference, without borrowing App.
+    delivery: ?*AppDelivery = null,
+    message_hwnd: ?HWND = null,
+    core_ticking: bool = false,
     quit_timer_id: ?UINT_PTR = null,
     terminal_handoff_idle_timer_id: ?UINT_PTR = null,
     terminal_handoff_server: ?*win32_terminal_handoff.Server = null,
@@ -3714,7 +3742,6 @@ pub const App = struct {
     session_restore_rollback_host: ?*Host = null,
     windows_hidden: bool = false,
     quick_terminal_keyboard_diagnostic_logged: bool = false,
-    update_check_running: std.atomic.Value(bool) = .init(false),
     update_notice: ?UpdateNotice = null,
     /// The host whose banner button started the running update action, so
     /// its feedback lands in the window the user is looking at. Set only for
@@ -3781,7 +3808,6 @@ pub const App = struct {
     /// Persisted taskbar destinations and their debounced shell COM commit.
     /// `null` when the app-state path cannot be resolved or initialized.
     jump_list: ?win32_jump_list.JumpList = null,
-    toast_activation_post_pending: std.atomic.Value(bool) = .init(false),
     /// Absolute path supplied via `--config-file <path>` on the CLI.
     /// Resolved ONCE against the startup cwd during `App.init` — that's
     /// important because `run()` later calls `sanitizeCurrentDirectory()`,
@@ -3945,9 +3971,6 @@ pub const App = struct {
             std.log.warn("winrt toast init failed err={}; falling back to host notifications", .{err});
             break :blk null;
         };
-        if (self.winrt_toast) |*toast| {
-            toast.setActivationCallback(self, winrtToastActivationCallback);
-        }
 
         // Install the PowerShell shell-integration script into
         // %LOCALAPPDATA%\noctty\shell-integration\powershell\
@@ -4114,16 +4137,17 @@ pub const App = struct {
 
         self.running = true;
         const ui_thread_id = sys.GetCurrentThreadId();
-        @atomicStore(DWORD, &self.ui_thread_id, ui_thread_id, .release);
         ensureMessageQueue();
+        try self.createMessageWindow();
+        @atomicStore(DWORD, &self.ui_thread_id, ui_thread_id, .release);
         defer {
             self.stopUndoPruneTimer();
             self.stopQuitTimer();
             self.stopTerminalHandoffIdleTimer();
             self.stopRecoveryRetryTimer();
             self.stopProgramStatusNotifyTimer();
-            drainDeferredUiaDisconnects(ui_thread_id);
             @atomicStore(DWORD, &self.ui_thread_id, 0, .release);
+            self.closeMessageWindow();
             self.running = false;
         }
 
@@ -4259,93 +4283,12 @@ pub const App = struct {
             // Opens queued while the previous message was handled run here,
             // with no window procedure on the stack.
             if (try self.drainDeferredOpens()) break;
+            self.drainPendingHandoffs();
 
             const result = sys.GetMessageW(&msg, null, 0, 0);
             if (result == -1) return lastError();
             if (result == 0) break;
             self.showPendingConPtyFallbackBanner();
-
-            if (msg.message == c.WM_WINHOSTTY_WAKE) {
-                self.syncDirtyGlobalHotkeys();
-                try self.tickCoreApp();
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_UPDATE) {
-                const completion: *UpdateCheckCompletion = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-                defer {
-                    completion.deinit();
-                    self.core_app.alloc.destroy(completion);
-                }
-                self.handleUpdateCheckCompletion(completion);
-                try self.tickCoreApp();
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_TOAST_ACTIVATION) {
-                const activation: *win32_toast_activation.ActivationTarget = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-                defer std.heap.page_allocator.destroy(activation);
-                defer self.toast_activation_post_pending.store(false, .release);
-                if (!self.handleToastActivation(activation.*)) {
-                    self.pending_toast_activation = activation.*;
-                }
-                try self.tickCoreApp();
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_TERMINAL_HANDOFF) {
-                // The message carries an opaque identifier, never a pointer.
-                // Any process on this desktop at our integrity level can post
-                // into this loop, and a pointer taken from the message would be
-                // an address of the sender's choosing that we dereference,
-                // deinitialize and free. Identifiers are resolved against the
-                // server's own table and anything unrecognized is dropped.
-                const server = self.terminal_handoff_server orelse {
-                    log.warn("terminal handoff message arrived without a handoff server", .{});
-                    continue;
-                };
-                const pending = server.takePending(terminalHandoffId(msg.lParam)) orelse {
-                    log.warn("ignoring terminal handoff message with an unknown session id", .{});
-                    continue;
-                };
-                defer {
-                    pending.deinit();
-                    self.core_app.alloc.destroy(pending);
-                }
-                self.stopTerminalHandoffIdleTimer();
-                // Nothing to close here: `EstablishPtyHandoff` already released
-                // the two OpenConsole-side pipe ends, because returning S_OK
-                // transfers them to the RPC stub. See
-                // `Pty.releaseHandoffPipeCopies`.
-                self.createAdoptedWindow(pending) catch |err| {
-                    win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_failed");
-                    log.err("terminal handoff surface creation failed err={}", .{err});
-                    if (self.embedding_mode and self.windows.items.len == 0) {
-                        if (self.exitEmbeddingServerIfIdle()) {
-                            self.running = false;
-                            sys.PostQuitMessage(1);
-                        } else {
-                            self.startTerminalHandoffIdleTimer();
-                        }
-                    }
-                };
-                try self.core_app.tick(self);
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_UIA_DISCONNECT) {
-                if (msg.lParam == 0) {
-                    log.warn("win32 UIA deferred disconnect message had no context", .{});
-                    continue;
-                }
-                const pending: *DeferredUiaDisconnect = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-                processDeferredUiaDisconnect(self.ui_thread_id, pending);
-                continue;
-            }
 
             if (msg.message == c.WM_TIMER) {
                 if (self.recovery_retry_timer_id) |timer_id| {
@@ -4357,6 +4300,7 @@ pub const App = struct {
                 if (self.terminal_handoff_idle_timer_id) |timer_id| {
                     if (msg.wParam == timer_id) {
                         self.stopTerminalHandoffIdleTimer();
+                        self.drainPendingHandoffs();
                         if (self.embedding_mode and self.windows.items.len == 0) {
                             if (self.exitEmbeddingServerIfIdle()) {
                                 log.info("terminal handoff server idle timeout", .{});
@@ -4466,7 +4410,6 @@ pub const App = struct {
         self.stopTerminalHandoffIdleTimer();
         self.stopRecoveryRetryTimer();
         self.stopProgramStatusNotifyTimer();
-        self.update_check_running.store(false, .release);
         if (self.update_notice) |*notice| {
             notice.deinit(self.core_app.alloc);
             self.update_notice = null;
@@ -4535,6 +4478,10 @@ pub const App = struct {
         if (self.com_initialized) {
             sys.OleUninitialize();
             self.com_initialized = false;
+        }
+        if (self.delivery) |delivery| {
+            delivery.release();
+            self.delivery = null;
         }
     }
 
@@ -4958,6 +4905,97 @@ pub const App = struct {
         self.renderer_sync_paint_spent = false;
         try self.core_app.tick(self);
         self.resolveRecoveryStartup();
+    }
+
+    fn tickCoreAppModal(self: *App) void {
+        if (self.core_ticking) return;
+        self.core_ticking = true;
+        defer self.core_ticking = false;
+        self.renderer_sync_paint_spent = false;
+        self.core_app.tickModal(self) catch |err| {
+            log.warn("modal mailbox tick failed err={}", .{err});
+        };
+    }
+
+    fn createMessageWindow(self: *App) !void {
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.app");
+        var wc: WNDCLASSEXW = .{
+            .cbSize = @sizeOf(WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = &appMessageWindowProc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = self.hinstance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = name,
+            .hIconSm = null,
+        };
+        if (sys.RegisterClassExW(&wc) == 0 and windows.kernel32.GetLastError() != .CLASS_ALREADY_EXISTS)
+            return lastError(); // ERROR_CLASS_ALREADY_EXISTS is expected in tests.
+        const delivery = try AppDelivery.create();
+        errdefer delivery.release();
+        const hwnd = sys.CreateWindowExW(
+            0,
+            name,
+            name,
+            0,
+            0,
+            0,
+            0,
+            0,
+            @ptrFromInt(@as(usize, @bitCast(@as(isize, -3)))), // HWND_MESSAGE
+            null,
+            self.hinstance,
+            null,
+        ) orelse return lastError();
+        setWindowData(hwnd, self);
+        self.message_hwnd = hwnd;
+        self.delivery = delivery;
+        if (self.winrt_toast) |*toast| {
+            toast.setActivationCallback(delivery, winrtToastActivationCallback, .{
+                .retain = retainToastDelivery,
+                .release = releaseToastDelivery,
+            });
+        }
+        delivery.publish(hwnd);
+    }
+
+    fn closeMessageWindow(self: *App) void {
+        const delivery = self.delivery orelse return;
+        delivery.close();
+        while (delivery.pop()) |value| {
+            var payload = value;
+            if (payload == .uia_disconnect) {
+                processDeferredUiaDisconnect(null, payload.uia_disconnect);
+            } else payload.deinit();
+        }
+        delivery.update_running.store(false, .release);
+        delivery.toast_pending.store(false, .release);
+        if (self.message_hwnd) |hwnd| {
+            setWindowData(hwnd, null);
+            _ = sys.DestroyWindow(hwnd);
+            self.message_hwnd = null;
+        }
+    }
+
+    /// Called only by the outer pump, never while an owner WndProc is under
+    /// a native modal loop. Taking oldest also recovers a lost notification.
+    fn drainPendingHandoffs(self: *App) void {
+        const server = self.terminal_handoff_server orelse return;
+        while (server.pending.takeOldest()) |pending| {
+            defer {
+                pending.deinit();
+                self.core_app.alloc.destroy(pending);
+            }
+            self.createAdoptedWindow(pending) catch |err| {
+                win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_failed");
+                log.err("terminal handoff surface creation failed err={}", .{err});
+            };
+            if (self.windows.items.len == 0) self.startTerminalHandoffIdleTimer();
+        }
     }
 
     fn syncDirtyGlobalHotkeys(self: *App) void {
@@ -6148,15 +6186,9 @@ pub const App = struct {
     }
 
     pub fn wakeup(self: *App) void {
-        if (self.windows.items.len > 0) {
-            const hwnd = self.windows.items[0].hwnd orelse return;
-            _ = sys.PostMessageW(hwnd, c.WM_WINHOSTTY_WAKE, 0, 0);
-            return;
-        }
-
-        if (self.ui_thread_id != 0) {
-            _ = sys.PostThreadMessageW(self.ui_thread_id, c.WM_WINHOSTTY_WAKE, 0, 0);
-        }
+        if (@atomicLoad(DWORD, &self.ui_thread_id, .acquire) == 0) return;
+        const delivery = self.delivery orelse return;
+        _ = delivery.wake(c.WM_WINHOSTTY_WAKE);
     }
 
     fn maybeScheduleAutomaticUpdateCheck(self: *App) void {
@@ -6185,15 +6217,16 @@ pub const App = struct {
     ) !void {
         if (self.ui_thread_id == 0) return;
 
-        const current = self.update_check_running.cmpxchgStrong(false, true, .acq_rel, .acquire);
+        const delivery = self.delivery orelse return;
+        const current = delivery.update_running.cmpxchgStrong(false, true, .acq_rel, .acquire);
         if (current != null) {
             if (opts.manual) try self.showUpdateInfo(.info, "Update check already running.");
             return;
         }
-        errdefer self.update_check_running.store(false, .release);
+        errdefer delivery.update_running.store(false, .release);
 
-        const request = try self.core_app.alloc.create(UpdateCheckRequest);
-        errdefer self.core_app.alloc.destroy(request);
+        const request = try std.heap.page_allocator.create(UpdateCheckRequest);
+        errdefer std.heap.page_allocator.destroy(request);
 
         // The ignored-feed note has to come from the resolver, not from the
         // config value alone: NOCTTY_UPDATE_FEED_URL is also a feed source
@@ -6203,17 +6236,26 @@ pub const App = struct {
             self.config.@"auto-update-feed-url",
         );
         const release_feed_url = resolved_feed.url;
-        errdefer self.core_app.alloc.free(release_feed_url);
+        defer self.core_app.alloc.free(release_feed_url);
         const staged_kind: updatepkg.portable_apply.StagedKind =
             if (isPortableModeActive(self.core_app.alloc)) .portable else .installer;
 
+        // The detached worker must not borrow the core allocator's lifetime.
+        // Page allocator storage and a retained channel remain valid after UI exit.
+        const state_path = try updatepkg.defaultStatePath(std.heap.page_allocator);
+        errdefer std.heap.page_allocator.free(state_path);
+        const current_version_string = try std.heap.page_allocator.dupe(u8, build_config.version_string);
+        errdefer std.heap.page_allocator.free(current_version_string);
+        const worker_feed = try std.heap.page_allocator.dupe(u8, release_feed_url);
+        errdefer std.heap.page_allocator.free(worker_feed);
+
         request.* = .{
-            .alloc = self.core_app.alloc,
-            .ui_thread_id = self.ui_thread_id,
-            .state_path = try updatepkg.defaultStatePath(self.core_app.alloc),
+            .alloc = std.heap.page_allocator,
+            .delivery = delivery,
+            .state_path = state_path,
             .current_version = build_config.version,
-            .current_version_string = try self.core_app.alloc.dupe(u8, build_config.version_string),
-            .release_feed_url = release_feed_url,
+            .current_version_string = current_version_string,
+            .release_feed_url = worker_feed,
             .force = opts.force,
             .manual = opts.manual,
             .ignored_feed_source = resolved_feed.ignored_non_https,
@@ -6222,12 +6264,14 @@ pub const App = struct {
             .staged_kind = staged_kind,
         };
 
+        delivery.retain();
+        errdefer delivery.release();
         const thread = try std.Thread.spawn(.{}, updateCheckThreadMain, .{request});
         thread.detach();
     }
 
     fn handleUpdateCheckCompletion(self: *App, completion: *UpdateCheckCompletion) void {
-        self.update_check_running.store(false, .release);
+        if (self.delivery) |delivery| delivery.update_running.store(false, .release);
 
         // The old notice offers Install (staged installer from the old feed)
         // or Open Release (release URL from the old feed). Once the check
@@ -11284,14 +11328,12 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
         alloc.destroy(request);
     }
 
+    defer request.delivery.release();
     const completion = alloc.create(UpdateCheckCompletion) catch {
+        request.delivery.update_running.store(false, .release);
         return;
     };
     completion.* = .{ .alloc = alloc };
-    errdefer {
-        completion.deinit();
-        alloc.destroy(completion);
-    }
 
     const outcome = updatepkg.checkLatestStableRelease(alloc, request.state_path, .{
         .current_version = request.current_version,
@@ -11307,7 +11349,7 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
             ) catch null;
         }
         appendConfiguredFeedIgnoredNote(request, completion);
-        postUpdateCheckCompletion(request.ui_thread_id, completion);
+        postUpdateCheckCompletion(request.delivery, completion);
         return;
     };
     defer {
@@ -11377,7 +11419,48 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
     }
 
     appendConfiguredFeedIgnoredNote(request, completion);
-    postUpdateCheckCompletion(request.ui_thread_id, completion);
+    postUpdateCheckCompletion(request.delivery, completion);
+}
+
+test "update worker OOM clears running and releases its detached lifetime" {
+    const delivery = try AppDelivery.create();
+    defer delivery.release();
+    delivery.update_running.store(true, .release);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    // Allocate request storage and strings through the backing allocator;
+    // the failing wrapper delegates frees, but its first allocation (the
+    // worker's completion) fails before any network or state-file access.
+    const request = try std.testing.allocator.create(UpdateCheckRequest);
+    request.* = .{
+        .alloc = alloc,
+        .delivery = delivery,
+        .state_path = try std.testing.allocator.dupe(u8, "unused"),
+        .current_version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .current_version_string = try std.testing.allocator.dupe(u8, "1.0.0"),
+        .release_feed_url = try std.testing.allocator.dupe(u8, "https://example.invalid"),
+        .force = false,
+        .manual = false,
+        .ignored_feed_source = null,
+        .respect_dismissal = true,
+        .download = false,
+        .staged_kind = .portable,
+    };
+    delivery.retain();
+    updateCheckThreadMain(request);
+    try std.testing.expect(!delivery.update_running.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), delivery.refs.load(.acquire));
+}
+
+test "update completion post failure clears running and frees its payload" {
+    const delivery = try AppDelivery.create();
+    defer delivery.release();
+    delivery.update_running.store(true, .release);
+    const completion = try std.testing.allocator.create(UpdateCheckCompletion);
+    completion.* = .{ .alloc = std.testing.allocator, .manual_message = try std.testing.allocator.dupe(u8, "status") };
+    postUpdateCheckCompletion(delivery, completion);
+    try std.testing.expect(!delivery.update_running.load(.acquire));
+    try std.testing.expect(delivery.pop() == null);
 }
 
 fn tryOrNull(alloc: Allocator, text: []const u8) ?[]u8 {
@@ -11512,83 +11595,41 @@ fn appendInnoQuotedArg(
     try buf.append(alloc, '"');
 }
 
-fn postUpdateCheckCompletion(ui_thread_id: DWORD, completion: *UpdateCheckCompletion) void {
-    if (sys.PostThreadMessageW(
-        ui_thread_id,
-        c.WM_WINHOSTTY_UPDATE,
-        0,
-        @as(LPARAM, @bitCast(@as(usize, @intFromPtr(completion)))),
-    ) == 0) {
-        completion.deinit();
-        completion.alloc.destroy(completion);
-    }
-}
-
-/// Read a handoff session identifier out of a message parameter. The value is
-/// attacker-controlled, so it is only ever used as a lookup key.
-fn terminalHandoffId(lparam: LPARAM) win32_terminal_handoff.PendingId {
-    return @bitCast(lparam);
+fn postUpdateCheckCompletion(delivery: *AppDelivery, completion: *UpdateCheckCompletion) void {
+    if (delivery.post(c.WM_WINHOSTTY_UPDATE, .{ .update = completion })) return;
+    delivery.update_running.store(false, .release);
+    var payload: AppDeliveryPayload = .{ .update = completion };
+    payload.deinit();
 }
 
 fn queueTerminalHandoff(ctx: *anyopaque, pending: *win32_terminal_handoff.PendingSession) bool {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const ui_thread_id = @atomicLoad(DWORD, &self.ui_thread_id, .acquire);
-    if (ui_thread_id == 0) return false;
+    const delivery = self.delivery orelse return false;
     const server = self.terminal_handoff_server orelse return false;
-
-    // The session stays in process-owned state; the message carries only the
-    // identifier that stands for it.
     const id = server.queuePending(pending) catch return false;
-    if (sys.PostThreadMessageW(
-        ui_thread_id,
-        c.WM_WINHOSTTY_TERMINAL_HANDOFF,
-        0,
-        @as(LPARAM, @bitCast(id)),
-    ) != 0) return true;
-
-    // Nothing will ever claim the identifier, so hand ownership back to the
-    // caller rather than leaking the session into the table.
+    if (delivery.notify(c.WM_WINHOSTTY_TERMINAL_HANDOFF, id)) return true;
     _ = server.takePending(id);
     return false;
 }
 
 fn winrtToastActivationCallback(ctx: *anyopaque, launch: []const u8) void {
-    const self: *App = @ptrCast(@alignCast(ctx));
-    const ui_thread_id = @atomicLoad(DWORD, &self.ui_thread_id, .acquire);
-    if (ui_thread_id == 0) {
-        std.log.warn("dropping winrt toast activation before ui thread id is available", .{});
-        return;
+    // The agile WinRT handler owns a reference to this channel, never App.
+    const delivery: *AppDelivery = @ptrCast(@alignCast(ctx));
+    const parsed = win32_toast_activation.parseLaunchArg(launch) catch return;
+    if (delivery.toast_pending.swap(true, .acq_rel)) return;
+    if (!delivery.post(c.WM_WINHOSTTY_TOAST_ACTIVATION, .{ .toast = parsed })) {
+        delivery.toast_pending.store(false, .release);
     }
+}
 
-    const parsed = win32_toast_activation.parseLaunchArg(launch) catch |err| {
-        std.log.warn("dropping malformed winrt toast activation launch err={}", .{err});
-        return;
-    };
+fn retainToastDelivery(ctx: *anyopaque) void {
+    const delivery: *AppDelivery = @ptrCast(@alignCast(ctx));
+    delivery.retain();
+}
 
-    if (self.toast_activation_post_pending.swap(true, .acq_rel)) {
-        std.log.warn("dropping winrt toast activation while another activation is queued", .{});
-        return;
-    }
-
-    const activation = std.heap.page_allocator.create(win32_toast_activation.ActivationTarget) catch |err| {
-        std.log.warn("dropping winrt toast activation allocation failed err={}", .{err});
-        self.toast_activation_post_pending.store(false, .release);
-        return;
-    };
-    activation.* = parsed;
-
-    if (sys.PostThreadMessageW(
-        ui_thread_id,
-        c.WM_WINHOSTTY_TOAST_ACTIVATION,
-        0,
-        @as(LPARAM, @bitCast(@as(usize, @intFromPtr(activation)))),
-    ) == 0) {
-        std.log.warn("dropping winrt toast activation post failed err={}", .{
-            windows.kernel32.GetLastError(),
-        });
-        std.heap.page_allocator.destroy(activation);
-        self.toast_activation_post_pending.store(false, .release);
-    }
+fn releaseToastDelivery(ctx: *anyopaque) void {
+    const delivery: *AppDelivery = @ptrCast(@alignCast(ctx));
+    delivery.release();
 }
 
 const SearchStatus = labels.SearchStatus;
@@ -27245,21 +27286,373 @@ fn refocusHostAfterActivation(host: *Host) void {
     }
 }
 
-fn postDeferredUiaDisconnect(thread_id: DWORD, pending: *DeferredUiaDisconnect) bool {
-    if (thread_id == 0) return false;
-    return sys.PostThreadMessageW(
-        thread_id,
-        c.WM_WINHOSTTY_UIA_DISCONNECT,
-        0,
-        @as(LPARAM, @bitCast(@as(usize, @intFromPtr(pending)))),
-    ) != 0;
+/// Window messages are dispatched by native menu/size/dialog pumps too. The
+/// only receiver with completion authority is this message-only App window.
+fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    const app = windowData(App, hwnd) orelse return sys.DefWindowProcW(hwnd, message, wparam, lparam);
+    const delivery = app.delivery orelse return 0;
+    switch (message) {
+        c.WM_WINHOSTTY_WAKE => {
+            app.tickCoreAppModal();
+            return 0;
+        },
+        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT => {
+            var payload = delivery.take(message, @bitCast(lparam)) orelse return 0;
+            switch (payload) {
+                .update => |completion| {
+                    defer payload.deinit();
+                    app.handleUpdateCheckCompletion(completion);
+                },
+                .toast => |activation| {
+                    defer delivery.toast_pending.store(false, .release);
+                    if (!app.handleToastActivation(activation)) app.pending_toast_activation = activation;
+                },
+                .uia_disconnect => |pending| processDeferredUiaDisconnect(delivery, pending),
+            }
+            app.tickCoreAppModal();
+            return 0;
+        },
+        c.WM_WINHOSTTY_TERMINAL_HANDOFF => {
+            // Adoption is done at the top of the outer pump, where no owner
+            // window procedure or COM call has a borrowed Host on its stack.
+            return 0;
+        },
+        else => return sys.DefWindowProcW(hwnd, message, wparam, lparam),
+    }
 }
 
-fn processDeferredUiaDisconnect(thread_id: DWORD, pending: *DeferredUiaDisconnect) void {
+/// Native modal delivery tests run on a private desktop without a shell,
+/// renderer, clipboard operation, or COM initialization.
+const Pkg19NativeDeliveryTest = struct {
+    extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn EndMenu() callconv(.winapi) BOOL;
+
+    const FakeUia = struct {
+        disconnects: usize = 0,
+        releases: usize = 0,
+        fn disconnect(raw: *anyopaque) win32_uia.HRESULT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disconnects += 1;
+            return win32_uia.S_OK;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+
+    const Popup = struct {
+        app: *App,
+        title_surface: *Surface,
+        closing_surface: *Surface,
+        fake: *FakeUia,
+        entered: bool = false,
+        open: bool = false,
+        exited: bool = false,
+        observed_inside: bool = false,
+        timed_out: bool = false,
+        completions_posted: bool = false,
+        ticks: usize = 0,
+
+        fn proc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+            if (windowData(@This(), hwnd)) |self| switch (message) {
+                0x0211 => { // WM_ENTERMENULOOP
+                    self.entered = true;
+                    self.open = true;
+                },
+                0x0212 => { // WM_EXITMENULOOP
+                    self.open = false;
+                    self.exited = true;
+                },
+                else => {},
+            };
+            return sys.DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+
+        fn timer(hwnd: ?HWND, _: UINT, _: UINT_PTR, _: DWORD) callconv(.winapi) void {
+            const self = windowData(@This(), hwnd orelse return) orelse return;
+            self.ticks += 1;
+            // First require wake alone to apply the title. Only then post
+            // completions, whose own modal tick cannot mask a broken wake.
+            // Never tick the core, dispatch delivery, or remove messages here.
+            if (!self.completions_posted and self.open and
+                self.title_surface.title != null and
+                std.mem.eql(u8, self.title_surface.title.?, "modal-delivered"))
+            {
+                self.completions_posted = true;
+                self.app.delivery.?.update_running.store(true, .release);
+                postUpdate(self.app.delivery.?) catch {
+                    self.timed_out = true;
+                    _ = EndMenu();
+                    return;
+                };
+                postUia(self.app.delivery.?, self.fake) catch {
+                    self.timed_out = true;
+                    _ = EndMenu();
+                    return;
+                };
+            }
+            if (self.open and self.title_surface.title != null and
+                std.mem.eql(u8, self.title_surface.title.?, "modal-delivered") and
+                self.fake.disconnects == 1 and self.fake.releases == 1 and
+                !self.app.delivery.?.update_running.load(.acquire) and
+                self.app.running and sys.IsWindow(self.closing_surface.hwnd.?) != 0)
+            {
+                self.observed_inside = true;
+                _ = EndMenu();
+            } else if (self.ticks >= 100) {
+                self.timed_out = true;
+                _ = EndMenu();
+            }
+        }
+    };
+
+    fn run(comptime body: anytype) !void {
+        const Thread = struct {
+            fn entry(desktop: *anyopaque, result: *anyerror!void) void {
+                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
+            }
+        };
+        var name_buf: [80]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "noctty-pkg19-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+        defer std.testing.allocator.free(wide_name);
+        const desktop = CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+        defer _ = CloseDesktop(desktop);
+        var result: anyerror!void = {};
+        const thread = try std.Thread.spawn(.{}, Thread.entry, .{ desktop, &result });
+        thread.join();
+        try result;
+    }
+
+    fn pending(fake: *FakeUia) !*DeferredUiaDisconnect {
+        const value = try std.heap.page_allocator.create(DeferredUiaDisconnect);
+        value.* = .{ .ctx = fake, .disconnect = &FakeUia.disconnect, .release = &FakeUia.release };
+        return value;
+    }
+
+    fn postUia(delivery: *AppDelivery, fake: *FakeUia) !void {
+        const value = try pending(fake);
+        if (!postDeferredUiaDisconnect(delivery, value)) {
+            std.heap.page_allocator.destroy(value);
+            return error.TestPostFailed;
+        }
+    }
+
+    fn postUpdate(delivery: *AppDelivery) !void {
+        const value = try std.testing.allocator.create(UpdateCheckCompletion);
+        value.* = .{ .alloc = std.testing.allocator };
+        if (!delivery.post(c.WM_WINHOSTTY_UPDATE, .{ .update = value })) {
+            std.testing.allocator.destroy(value);
+            return error.TestPostFailed;
+        }
+    }
+
+    fn closeAppWindow(app: *App) void {
+        const delivery = app.delivery orelse return;
+        app.closeMessageWindow();
+        app.delivery = null;
+        delivery.release();
+    }
+
+    fn popupBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var title_surface: Surface = undefined;
+        var closing_surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            // Host is deliberately not in App.hosts: this dummy native owner
+            // does not run the production Host destruction procedure.
+            .hosts = &.{.{ .storage = &host }},
+            .surfaces = &.{
+                .{ .storage = &title_surface, .register = true },
+                .{ .storage = &closing_surface, .host = &host, .register = true },
+            },
+            .tabs = &.{.{ .host = &host, .surface = &closing_surface, .id = 1 }},
+        });
+        defer session.deinit();
+        try app.createMessageWindow();
+        defer closeAppWindow(&app);
+        app.running = true;
+        @atomicStore(DWORD, &app.ui_thread_id, sys.GetCurrentThreadId(), .release);
+
+        // A partial CoreSurface fixture, never initialized/deinitialized as a
+        // complete CoreSurface. These are exactly the fields read by the two
+        // dispatched core methods: set_title and close/needsConfirmQuit.
+        title_surface.core_surface.rt_app = &app;
+        title_surface.core_surface.config.title = null;
+        closing_surface.core_surface.rt_surface = &closing_surface;
+        closing_surface.core_surface.readonly = false;
+        closing_surface.core_surface.child_exited = true;
+        try core_app.surfaces.append(std.testing.allocator, &title_surface);
+        // TestSession owns the runtime fixtures; CoreApp must never call
+        // Surface.deinit on these partial core fixtures at teardown.
+        defer core_app.surfaces.clearRetainingCapacity();
+        try core_app.surfaces.append(std.testing.allocator, &closing_surface);
+        defer if (title_surface.title) |value| std.testing.allocator.free(value);
+
+        var fake: FakeUia = .{};
+        var popup: Popup = .{ .app = &app, .title_surface = &title_surface, .closing_surface = &closing_surface, .fake = &fake };
+        const popup_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.pkg19.popup-test");
+        var wc: WNDCLASSEXW = .{
+            .cbSize = @sizeOf(WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = &Popup.proc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = app.hinstance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = popup_class_name,
+            .hIconSm = null,
+        };
+        if (sys.RegisterClassExW(&wc) == 0 and windows.kernel32.GetLastError() != .CLASS_ALREADY_EXISTS) return lastError();
+        const owner = sys.CreateWindowExW(0, popup_class_name, popup_class_name, WS_OVERLAPPEDWINDOW, 100, 100, 300, 200, null, null, app.hinstance, null) orelse return lastError();
+        defer _ = sys.DestroyWindow(owner);
+        setWindowData(owner, &popup);
+        defer setWindowData(owner, null);
+        _ = sys.ShowWindow(owner, c.SW_SHOWNOACTIVATE);
+        const closing_hwnd = sys.CreateWindowExW(0, prompt_label_class, default_title, c.WS_CHILD, 0, 0, 10, 10, owner, null, app.hinstance, null) orelse return lastError();
+        closing_surface.hwnd = closing_hwnd;
+        defer if (sys.IsWindow(closing_hwnd) != 0) {
+            _ = sys.DestroyWindow(closing_hwnd);
+        };
+
+        // Unsafe work precedes safe work, so failing to defer it would close
+        // the child / quit before the observable title reaches the fixture.
+        try std.testing.expect(core_app.mailbox.push(.{ .close = &closing_surface.core_surface }, .instant) != 0);
+        try std.testing.expect(core_app.mailbox.push(.quit, .instant) != 0);
+        var title: [256]u8 = @splat(0);
+        @memcpy(title[0.."modal-delivered".len], "modal-delivered");
+        try std.testing.expect(core_app.mailbox.push(.{ .surface_message = .{ .surface = &title_surface.core_surface, .message = .{ .set_title = title } } }, .instant) != 0);
+        try std.testing.expect(app.delivery.?.wake(c.WM_WINHOSTTY_WAKE));
+        try std.testing.expect(title_surface.title == null);
+        try std.testing.expectEqual(@as(usize, 0), fake.disconnects);
+
+        const menu = sys.CreatePopupMenu();
+        defer _ = sys.DestroyMenu(menu);
+        try std.testing.expect(sys.AppendMenuW(menu, c.MF_STRING, 1, default_title) != 0);
+        const timer = sys.SetTimer(owner, 0x1919, 20, @ptrCast(&Popup.timer));
+        if (timer == 0) return lastError();
+        defer _ = sys.KillTimer(owner, timer);
+        _ = sys.TrackPopupMenu(menu, c.TPM_RETURNCMD | c.TPM_RIGHTBUTTON, 120, 120, 0, owner, null);
+        try std.testing.expect(popup.entered and popup.exited and !popup.open);
+        try std.testing.expect(!popup.timed_out);
+        try std.testing.expect(popup.observed_inside);
+        try std.testing.expect(app.running);
+        try std.testing.expect(sys.IsWindow(closing_hwnd) != 0);
+
+        // Only the outer tick may execute lifetime operations.
+        try core_app.tick(&app);
+        try std.testing.expect(sys.IsWindow(closing_hwnd) == 0);
+        try std.testing.expect(!app.running);
+    }
+
+    fn queued(hwnd: HWND, message: UINT) !MSG {
+        var msg: MSG = undefined;
+        if (sys.PeekMessageW(&msg, hwnd, message, message, c.PM_REMOVE) == 0) return error.TestMissingDeliveryMessage;
+        return msg;
+    }
+
+    fn capabilitiesBody() !void {
+        var core_a: CoreApp = undefined;
+        var app_a: App = undefined;
+        var core_b: CoreApp = undefined;
+        var app_b: App = undefined;
+        var session_a: TestSession = .{};
+        var session_b: TestSession = .{};
+        try session_a.init(.{ .core_app = &core_a, .app = &app_a });
+        defer session_a.deinit();
+        try session_b.init(.{ .core_app = &core_b, .app = &app_b });
+        defer session_b.deinit();
+        try app_a.createMessageWindow();
+        defer closeAppWindow(&app_a);
+        try app_b.createMessageWindow();
+        defer closeAppWindow(&app_b);
+        const a = app_a.message_hwnd.?;
+        const b = app_b.message_hwnd.?;
+        var fake: FakeUia = .{};
+        try postUia(app_a.delivery.?, &fake);
+        const uia = try queued(a, c.WM_WINHOSTTY_UIA_DISCONNECT);
+        // Null, arbitrary pointer-shaped input, a real token at another App
+        // HWND, and a real token with another message kind do nothing.
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UIA_DISCONNECT, 0, 0);
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UIA_DISCONNECT, 0, @bitCast(@intFromPtr(&fake)));
+        _ = sys.SendMessageW(b, uia.message, uia.wParam, uia.lParam);
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UPDATE, 0, uia.lParam);
+        try std.testing.expectEqual(@as(usize, 0), fake.disconnects);
+        try std.testing.expectEqual(@as(usize, 0), fake.releases);
+        _ = sys.SendMessageW(a, uia.message, uia.wParam, uia.lParam);
+        try std.testing.expectEqual(@as(usize, 1), fake.disconnects);
+        try std.testing.expectEqual(@as(usize, 1), fake.releases);
+        _ = sys.SendMessageW(a, uia.message, uia.wParam, uia.lParam);
+        try std.testing.expectEqual(@as(usize, 1), fake.disconnects);
+        try std.testing.expectEqual(@as(usize, 1), fake.releases);
+
+        app_a.delivery.?.update_running.store(true, .release);
+        try postUpdate(app_a.delivery.?);
+        const update = try queued(a, c.WM_WINHOSTTY_UPDATE);
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UPDATE, 0, 0);
+        _ = sys.SendMessageW(b, update.message, 0, update.lParam);
+        try std.testing.expect(app_a.delivery.?.update_running.load(.acquire));
+        _ = sys.SendMessageW(a, update.message, 0, update.lParam);
+        try std.testing.expect(!app_a.delivery.?.update_running.load(.acquire));
+        // Replaying a consumed update must not clear a subsequent check.
+        app_a.delivery.?.update_running.store(true, .release);
+        _ = sys.SendMessageW(a, update.message, 0, update.lParam);
+        try std.testing.expect(app_a.delivery.?.update_running.load(.acquire));
+
+        const activation: win32_toast_activation.ActivationTarget = .{ .window_id = 19, .tab_id = 7 };
+        app_a.delivery.?.toast_pending.store(true, .release);
+        try std.testing.expect(app_a.delivery.?.post(c.WM_WINHOSTTY_TOAST_ACTIVATION, .{ .toast = activation }));
+        const toast = try queued(a, c.WM_WINHOSTTY_TOAST_ACTIVATION);
+        _ = sys.SendMessageW(a, toast.message, 0, 0);
+        _ = sys.SendMessageW(b, toast.message, 0, toast.lParam);
+        try std.testing.expect(app_a.pending_toast_activation == null);
+        try std.testing.expect(app_b.pending_toast_activation == null);
+        try std.testing.expect(app_a.delivery.?.toast_pending.load(.acquire));
+        _ = sys.SendMessageW(a, toast.message, 0, toast.lParam);
+        try std.testing.expect(activation.eql(app_a.pending_toast_activation.?));
+        try std.testing.expect(!app_a.delivery.?.toast_pending.load(.acquire));
+        app_a.pending_toast_activation = null;
+        app_a.delivery.?.toast_pending.store(true, .release);
+        _ = sys.SendMessageW(a, toast.message, 0, toast.lParam);
+        try std.testing.expect(app_a.pending_toast_activation == null);
+        try std.testing.expect(app_a.delivery.?.toast_pending.load(.acquire));
+    }
+};
+
+test "win32 App delivery drains title and UIA in native popup while close and quit wait" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.popupBody);
+}
+
+test "win32 App delivery validates owned tokens by kind HWND and single consumption" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.capabilitiesBody);
+}
+
+fn postDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) bool {
+    const target = delivery orelse return false;
+    return target.post(c.WM_WINHOSTTY_UIA_DISCONNECT, .{ .uia_disconnect = pending });
+}
+
+fn processDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) void {
     const hr = pending.disconnect(pending.ctx);
     if (hr == win32_uia.RPC_E_CANTCALLOUT_ININPUTSYNCCALL and pending.retries < 3) {
         pending.retries += 1;
-        if (postDeferredUiaDisconnect(thread_id, pending)) return;
+        if (postDeferredUiaDisconnect(delivery, pending)) return;
+        // During shutdown no message target remains. Finish bounded retries
+        // in place before releasing the provider's final reference.
+        if (delivery == null) return processDeferredUiaDisconnect(null, pending);
     }
     if (hr != win32_uia.S_OK) {
         log.warn("win32 UIA deferred disconnect failed hr=0x{x} retries={d}", .{
@@ -27269,28 +27662,6 @@ fn processDeferredUiaDisconnect(thread_id: DWORD, pending: *DeferredUiaDisconnec
     }
     pending.release(pending.ctx);
     std.heap.page_allocator.destroy(pending);
-}
-
-fn drainDeferredUiaDisconnects(thread_id: DWORD) void {
-    var msg: MSG = undefined;
-    while (sys.PeekMessageW(
-        &msg,
-        null,
-        c.WM_WINHOSTTY_UIA_DISCONNECT,
-        c.WM_WINHOSTTY_UIA_DISCONNECT,
-        c.PM_REMOVE,
-    ) != 0) {
-        // PeekMessage always returns WM_QUIT regardless of the filter.
-        // Consume it during shutdown, but never interpret its lParam as a
-        // deferred-disconnect pointer.
-        if (msg.message != c.WM_WINHOSTTY_UIA_DISCONNECT) continue;
-        if (msg.lParam == 0) {
-            log.warn("win32 UIA deferred disconnect message had no context", .{});
-            continue;
-        }
-        const pending: *DeferredUiaDisconnect = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-        processDeferredUiaDisconnect(thread_id, pending);
-    }
 }
 
 fn scheduleDeferredUiaDisconnect(
@@ -27309,9 +27680,9 @@ fn scheduleDeferredUiaDisconnect(
         return;
     };
     pending.* = .{ .ctx = ctx, .disconnect = disconnect, .release = release };
-    if (!postDeferredUiaDisconnect(app.ui_thread_id, pending)) {
+    if (!postDeferredUiaDisconnect(app.delivery, pending)) {
         log.warn("win32 UIA deferred disconnect post failed", .{});
-        processDeferredUiaDisconnect(0, pending);
+        processDeferredUiaDisconnect(null, pending);
     }
 }
 
@@ -27337,30 +27708,16 @@ test "win32 deferred UIA disconnect drain retries and releases once" {
     };
 
     var fake: Fake = .{};
-    var queue_probe: MSG = undefined;
-    _ = sys.PeekMessageW(&queue_probe, null, 0, 0, c.PM_NOREMOVE);
     const pending = try std.heap.page_allocator.create(DeferredUiaDisconnect);
-    pending.* = .{
-        .ctx = @ptrCast(&fake),
-        .disconnect = &Fake.disconnect,
-        .release = &Fake.release,
-    };
-    const thread_id = sys.GetCurrentThreadId();
-    sys.PostQuitMessage(0);
-    try std.testing.expect(postDeferredUiaDisconnect(thread_id, pending));
-    drainDeferredUiaDisconnects(thread_id);
+    pending.* = .{ .ctx = @ptrCast(&fake), .disconnect = &Fake.disconnect, .release = &Fake.release };
+    processDeferredUiaDisconnect(null, pending);
     try std.testing.expectEqual(@as(usize, 2), fake.disconnects);
     try std.testing.expectEqual(@as(usize, 1), fake.releases);
 
     var exhausted: Fake = .{ .always_rpc = true };
     const retry_pending = try std.heap.page_allocator.create(DeferredUiaDisconnect);
-    retry_pending.* = .{
-        .ctx = @ptrCast(&exhausted),
-        .disconnect = &Fake.disconnect,
-        .release = &Fake.release,
-    };
-    try std.testing.expect(postDeferredUiaDisconnect(thread_id, retry_pending));
-    drainDeferredUiaDisconnects(thread_id);
+    retry_pending.* = .{ .ctx = @ptrCast(&exhausted), .disconnect = &Fake.disconnect, .release = &Fake.release };
+    processDeferredUiaDisconnect(null, retry_pending);
     try std.testing.expectEqual(@as(usize, 4), exhausted.disconnects);
     try std.testing.expectEqual(@as(usize, 1), exhausted.releases);
 }
