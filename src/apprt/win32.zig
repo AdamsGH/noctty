@@ -6757,10 +6757,7 @@ pub const App = struct {
     ) !bool {
         switch (action) {
             .quit => {
-                self.stopQuitTimer();
-                self.running = false;
-                self.destroyAllWindows();
-                if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+                self.postQuit(target);
                 return true;
             },
 
@@ -6952,10 +6949,8 @@ pub const App = struct {
             },
 
             .close_all_windows => {
-                self.stopQuitTimer();
-                self.running = false;
-                self.destroyAllWindows();
-                if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+                // Closing every window quits, as `quit` does.
+                self.postQuit(target);
                 return true;
             },
 
@@ -9653,41 +9648,54 @@ pub const App = struct {
                 return true;
             },
 
-            .other => {
-                if (host.tabs.items.len <= 1) return false;
-                if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
-                found.tab.clearRedoHistory();
-                var closed = false;
-                var i = host.tabs.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (i == current_idx) continue;
-                    host.tabs.items[i].clearRedoHistory();
-                    var it = host.tabs.items[i].tree.iterator();
-                    while (it.next()) |entry| entry.view.close(false);
-                    closed = true;
-                }
-                if (closed) self.activateSurface(current);
-                return closed;
-            },
-
-            .right => {
-                if (current_idx + 1 >= host.tabs.items.len) return false;
-                if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
-                found.tab.clearRedoHistory();
-                var closed = false;
-                var i = host.tabs.items.len;
-                while (i > current_idx + 1) {
-                    i -= 1;
-                    host.tabs.items[i].clearRedoHistory();
-                    var it = host.tabs.items[i].tree.iterator();
-                    while (it.next()) |entry| entry.view.close(false);
-                    closed = true;
-                }
-                if (closed) self.activateSurface(current);
-                return closed;
+            // Not undoable, unlike `.this`: ask first when a terminal in
+            // the closing tabs would lose a running process.
+            inline .other, .right => |beside| {
+                const tabs = host.tabs.items;
+                if (beside == .other and tabs.len <= 1) return false;
+                if (beside == .right and current_idx + 1 >= tabs.len) return false;
+                const count = if (beside == .other)
+                    tabsCloseConfirmCount(tabs[0..current_idx]) + tabsCloseConfirmCount(tabs[current_idx + 1 ..])
+                else
+                    tabsCloseConfirmCount(tabs[current_idx + 1 ..]);
+                if (count == 0) return try self.closeTabsBeside(current, beside);
+                if (beside == .other)
+                    host.askBeforeClosing(.other_tabs, count, &closeOtherTabsConfirmAccept, current)
+                else
+                    host.askBeforeClosing(.right_tabs, count, &closeRightTabsConfirmAccept, current);
+                return true;
             },
         }
+    }
+
+    /// Close every tab beside `current`'s (`.other`), or the tabs to its
+    /// right, without asking. Not undoable: the history goes first. The
+    /// panes are listed before any of them closes, because each close
+    /// replaces or removes its tab's split tree.
+    fn closeTabsBeside(self: *App, current: *Surface, comptime beside: apprt.action.CloseTabMode) !bool {
+        comptime std.debug.assert(beside != .this);
+        const found = self.findTabForSurface(current) orelse return false;
+        const host = found.host;
+        const keep = found.index;
+        const alloc = self.core_app.alloc;
+        var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer surfaces.deinit(alloc);
+        var i = host.tabs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (i == keep or (beside == .right and i < keep)) continue;
+            var it = host.tabs.items[i].tree.iterator();
+            while (it.next()) |entry| try surfaces.append(alloc, entry.view);
+        }
+        if (surfaces.items.len == 0) return false;
+        if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
+        for (host.tabs.items, 0..) |*tab, index| {
+            if (beside == .right and index < keep) continue;
+            tab.clearRedoHistory();
+        }
+        for (surfaces.items) |surface| surface.close(false);
+        self.activateSurface(current);
+        return true;
     }
 
     fn gotoTab(self: *App, target: apprt.Target, goto: apprt.action.GotoTab) !bool {
@@ -9963,6 +9971,73 @@ pub const App = struct {
         defer self.core_app.alloc.free(osk_w);
         const result = sys.ShellExecuteW(null, shell_open, osk_w.ptr, null, null, c.SW_SHOW);
         if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+    }
+
+    /// `quit` and `close_all_windows` run from the message loop, through the
+    /// target's window. Core does not count either as a closing action
+    /// (`closingAction`) and goes on using the terminal whose key binding
+    /// asked for it, so destroying the windows from inside that call freed
+    /// the terminal under its own key handler: an access violation in
+    /// `endKeySequence` in Debug builds.
+    fn postQuit(self: *App, target: apprt.Target) void {
+        // A quit from a terminal asks on its window. One from the app as a
+        // whole (a global key, automation) asks on the focused window, if
+        // any, else on a window with a running process.
+        const near: ?*Surface = switch (target) {
+            .app => self.focusedSurfaceForUndoRedo(),
+            .surface => |core_surface| self.findSurfaceByCore(core_surface),
+        };
+        const post_host = (if (near) |surface| surface.host else null) orelse
+            if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        // A failed post declines the quit: running it here instead is the
+        // teardown under the key handler that this function exists to avoid.
+        if (post_host) |host| if (host.hwnd) |hwnd| {
+            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, @intFromBool(near != null), 0) == 0) {
+                log.warn("quit declined: could not post it to the message loop err={}", .{
+                    windows.kernel32.GetLastError(),
+                });
+            }
+            return;
+        };
+        self.requestQuit(near);
+    }
+
+    /// `quit` and `close_all_windows`. Unsaved Settings edits ask first, in
+    /// the Settings window, which resumes the quit once they are saved or
+    /// discarded (`settingsOnClosedThunk`). Then terminals that
+    /// `confirm-close-surface` asks about get one prompt: the one already
+    /// open, or on `near`'s window, or on a shown window with one of those
+    /// terminals. Closed tabs kept for undo are not asked about.
+    fn requestQuit(self: *App, near: ?*Surface) void {
+        if (!self.session_ending) {
+            if (self.settings_window.holdQuitForUnsavedChanges()) return;
+            var count: usize = 0;
+            var open: ?*Host = null;
+            var busy: ?*Host = null;
+            for (self.hosts.items) |host| {
+                if (host.showsConfirm(&appQuitConfirmAccept, self)) open = host;
+                const host_count = tabsCloseConfirmCount(host.tabs.items);
+                if (host_count == 0) continue;
+                count += host_count;
+                if (busy == null or (!busy.?.isShown() and host.isShown())) busy = host;
+            }
+            if (count > 0) {
+                var prompt_host = open orelse busy.?;
+                if (open == null) if (near) |surface| if (surface.host) |near_host| {
+                    if (near_host.tabs.items.len > 0) prompt_host = near_host;
+                };
+                prompt_host.askBeforeClosing(.app, count, &appQuitConfirmAccept, self);
+                return;
+            }
+        }
+        self.quitConfirmed();
+    }
+
+    fn quitConfirmed(self: *App) void {
+        self.stopQuitTimer();
+        self.running = false;
+        self.destroyAllWindows();
+        if (self.windows.items.len == 0) sys.PostQuitMessage(0);
     }
 
     fn destroyAllWindows(self: *App) void {
@@ -11975,6 +12050,63 @@ const ConfirmPrompt = struct {
     /// the close-surface prompt.
     contents: ?[]const u8 = null,
 };
+
+/// What a close that ends several terminals at once is closing. One pane
+/// keeps its own prompt in `Surface.close`.
+const CloseScope = enum { window, other_tabs, right_tabs, app };
+
+/// The prompt for a close that would end `count` (at least 1) terminals
+/// that `confirm-close-surface` asks about. The body may live in `body_buf`.
+fn closeScopePrompt(scope: CloseScope, count: usize, body_buf: *[256]u8) ConfirmPrompt {
+    switch (scope) {
+        inline else => |comptime_scope| {
+            const text: struct { title: []const u8, accept: []const u8, one: []const u8, many: []const u8 } = comptime switch (comptime_scope) {
+                .window => .{
+                    .title = "Close this window?",
+                    .accept = "Close",
+                    .one = "A process is still running in this window. Closing the window will terminate it.",
+                    .many = "Processes are still running in {d} terminals in this window. Closing the window will terminate them.",
+                },
+                .other_tabs => .{
+                    .title = "Close the other tabs?",
+                    .accept = "Close tabs",
+                    .one = "A process is still running in another tab. Closing the other tabs will terminate it.",
+                    .many = "Processes are still running in {d} terminals in the other tabs. Closing those tabs will terminate them.",
+                },
+                .right_tabs => .{
+                    .title = "Close the tabs to the right?",
+                    .accept = "Close tabs",
+                    .one = "A process is still running in a tab to the right. Closing those tabs will terminate it.",
+                    .many = "Processes are still running in {d} terminals in the tabs to the right. Closing those tabs will terminate them.",
+                },
+                .app => .{
+                    .title = "Quit noctty?",
+                    .accept = "Quit",
+                    .one = "A process is still running. Quitting noctty will terminate it.",
+                    .many = "Processes are still running in {d} terminals. Quitting noctty will terminate them.",
+                },
+            };
+            return .{
+                .title = text.title,
+                .body = if (count <= 1) text.one else std.fmt.bufPrint(body_buf, text.many, .{count}) catch text.one,
+                .accept_label = text.accept,
+                .cancel_label = "Cancel",
+            };
+        },
+    }
+}
+
+/// How many panes in `tabs` `confirm-close-surface` asks about.
+fn tabsCloseConfirmCount(tabs: []Tab) usize {
+    var count: usize = 0;
+    for (tabs) |*tab| {
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| {
+            if (entry.view.needsCloseConfirm()) count += 1;
+        }
+    }
+    return count;
+}
 
 /// Payload for a non-modal confirm overlay. The callbacks receive the
 /// `userdata` pointer passed at construction time so the issuer can
@@ -14883,6 +15015,9 @@ const Host = struct {
         self.destroyChildControls();
 
         if (self.banner_text) |value| self.app.core_app.alloc.free(value);
+        // A prompt still open when its window goes, such as a window-close
+        // prompt whose last terminal exited meanwhile.
+        if (self.confirm_payload) |*payload| payload.deinit(self.app.core_app.alloc);
         if (self.overlay_completion_seed) |value| self.app.core_app.alloc.free(value);
         if (self.overlay_completion_value) |value| self.app.core_app.alloc.free(value);
         if (self.cached_overlay_edit) |value| self.app.core_app.alloc.free(value);
@@ -20534,7 +20669,66 @@ const Host = struct {
         return rect;
     }
 
+    /// WM_CLOSE (the caption button, Alt+F4, the taskbar) and
+    /// `close_window`. When a terminal in the window would lose a running
+    /// process (`confirm-close-surface`), ask once for the whole window;
+    /// its Close runs `closeConfirmed`. A sign-out never asks.
     fn close(self: *Host) void {
+        const count = tabsCloseConfirmCount(self.tabs.items);
+        if (count == 0 or self.app.session_ending) return self.closeConfirmed();
+        self.askBeforeClosing(.window, count, &hostCloseConfirmAccept, self);
+    }
+
+    /// One prompt for a close that ends `count` terminals which
+    /// `confirm-close-surface` asks about. The window comes up first, so a
+    /// close from the taskbar or a quit never waits on a prompt nobody can
+    /// see, and asking again keeps the prompt already open. If the prompt
+    /// cannot open, nothing closes, as in `Surface.close`: closing anyway
+    /// would defeat the setting, and the user can retry.
+    fn askBeforeClosing(
+        self: *Host,
+        scope: CloseScope,
+        count: usize,
+        on_accept: *const fn (userdata: ?*anyopaque) void,
+        userdata: *anyopaque,
+    ) void {
+        const raised = self.presentForPrompt();
+        if (self.showsConfirm(on_accept, userdata)) {
+            // Raising the window focused its terminal; the prompt keeps the keys.
+            if (raised) if (self.overlay_accept_hwnd) |accept| {
+                _ = sys.SetFocus(accept);
+            };
+            return;
+        }
+        var body: [256]u8 = undefined;
+        self.showConfirm(closeScopePrompt(scope, count, &body), on_accept, null, userdata) catch |err| {
+            log.warn("close confirm unavailable err={}; declining close to honour confirm-close-surface", .{err});
+        };
+    }
+
+    /// Shown on screen, minimized included; a hidden quick terminal is not.
+    fn isShown(self: *const Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        return sys.IsWindowVisible(hwnd) != 0;
+    }
+
+    fn showsConfirm(self: *const Host, on_accept: *const fn (userdata: ?*anyopaque) void, userdata: *anyopaque) bool {
+        const payload = self.confirm_payload orelse return false;
+        return payload.on_accept == on_accept and payload.userdata == userdata;
+    }
+
+    /// Restore and raise the window for a prompt unless it is already the
+    /// foreground window. Returns whether it did.
+    fn presentForPrompt(self: *Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        if (sys.GetForegroundWindow() == hwnd and sys.IsIconic(hwnd) == 0) return false;
+        const surface = self.activeSurface() orelse return false;
+        self.app.activateSurface(surface);
+        return true;
+    }
+
+    /// Close every terminal in the window without asking.
+    fn closeConfirmed(self: *Host) void {
         const alloc = self.app.core_app.alloc;
         const fallback_hwnd = self.hwnd;
         var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
@@ -25003,9 +25197,10 @@ fn settingsOnClosedThunk(ctx: *anyopaque) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const restore_id = app.settings_restore_surface_id;
     app.settings_restore_surface_id = null;
-    if (settingsRestoreSurface(app, restore_id)) |surface| {
-        app.activateSurface(surface);
-    }
+    const restored = settingsRestoreSurface(app, restore_id);
+    if (restored) |surface| app.activateSurface(surface);
+    // Saved or discarded from the prompt a quit raised: carry on quitting.
+    if (app.settings_window.takeQuitAfterClose()) return app.requestQuit(restored);
     // Mirrors the kick after the last terminal window closes; the
     // quit timer observes `hasLiveUiWindows()` so this is a no-op
     // when any terminal HWND is still alive.
@@ -25127,6 +25322,41 @@ fn surfaceConfirmCloseAccept(userdata: ?*anyopaque) void {
     const ud = userdata orelse return;
     const surface: *Surface = @ptrCast(@alignCast(ud));
     _ = surface.requestClose();
+}
+
+/// Close for the window-close prompt. `userdata` is the Host that shows
+/// the prompt, so it is alive whenever the prompt can be answered.
+fn hostCloseConfirmAccept(userdata: ?*anyopaque) void {
+    const host: *Host = @ptrCast(@alignCast(userdata orelse return));
+    host.closeConfirmed();
+}
+
+/// Quit for the quit prompt. `userdata` is the App, which outlives every
+/// window the quit destroys, including the one showing the prompt.
+fn appQuitConfirmAccept(userdata: ?*anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(userdata orelse return));
+    // Settings may have gained unsaved edits while this prompt waited.
+    if (app.settings_window.holdQuitForUnsavedChanges()) return;
+    app.quitConfirmed();
+}
+
+/// Close tabs for the other-tabs prompt. `userdata` is the Surface the
+/// tabs are kept beside: its destruction cancels the prompt
+/// (`cancelConfirmIfOwnedBy`), and the tabs are found again here because
+/// they may have changed while the prompt was open.
+fn closeOtherTabsConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    _ = surface.app.closeTabsBeside(surface, .other) catch |err| {
+        log.warn("close other tabs after confirm failed err={}", .{err});
+    };
+}
+
+/// Close tabs for the tabs-to-the-right prompt; see `closeOtherTabsConfirmAccept`.
+fn closeRightTabsConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    _ = surface.app.closeTabsBeside(surface, .right) catch |err| {
+        log.warn("close tabs to the right after confirm failed err={}", .{err});
+    };
 }
 
 /// Accept callback for a deferred paste confirm. Ownership of the
@@ -28945,6 +29175,12 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             if (host) |v| v.app.checkpointSessionState();
             return 0;
         },
+        c.WM_WINHOSTTY_QUIT => {
+            // wParam: whether the quit came from this window. May destroy
+            // this window: nothing after the call reads `v`.
+            if (host) |v| v.app.requestQuit(if (wParam != 0) v.activeSurface() else null);
+            return 0;
+        },
 
         c.WM_SHOWWINDOW => {
             const result = sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -31127,6 +31363,14 @@ pub const Surface = struct {
         }
         const mutable: *Surface = @constCast(self);
         _ = mutable.requestClose();
+    }
+
+    /// Core's `confirm-close-surface` answer for this pane (a running
+    /// process, `always`, or read-only mode), for a close that ends more
+    /// than this pane. A pane whose core is not up has no process to lose.
+    fn needsCloseConfirm(self: *Surface) bool {
+        if (!self.core_initialized) return false;
+        return self.core_surface.needsConfirmQuit();
     }
 
     fn requestClose(self: *Surface) bool {
@@ -37649,6 +37893,237 @@ test "win32 closeTab right no-op preserves redo and structural history" {
     try std.testing.expectEqual(@as(usize, 1), surface_a.undo_stack.redoDepth());
     try std.testing.expectEqual(@as(usize, 1), surface_b.undo_stack.undoDepth());
     try std.testing.expectEqual(@as(usize, 1), surface_b.undo_stack.redoDepth());
+}
+
+test "win32 window close asks first when a terminal would lose its process" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // A read-only core answers `needsConfirmQuit` before it reads the
+    // terminal, so the inert fixture core can stand in for a busy one.
+    surface_b.core_surface.readonly = true;
+    surface_b.core_initialized = true;
+    host.close();
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close this window?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in this window. Closing the window will terminate it.",
+        host.confirm_payload.?.body,
+    );
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    // Cancel leaves the window as it was.
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    // Nothing to lose, or a sign-out: no prompt.
+    host.close();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    app.session_ending = true;
+    surface_b.core_initialized = true;
+    host.close();
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+}
+
+test "win32 close other tabs asks first and keeps history until Close" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+        },
+    });
+    defer session.deinit();
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .close_tab,
+        .timestamp_ms = 10,
+        .payload = .{ .close_tab = .{ .tab = null, .index = 3, .tab_id = 4 } },
+    });
+
+    // Only the tab to the left is busy: closing the tabs to the right of
+    // tab 2 has nothing to ask about.
+    surface_a.core_surface.readonly = true;
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.app, .right));
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .close_tab,
+        .timestamp_ms = 20,
+        .payload = .{ .close_tab = .{ .tab = null, .index = 3, .tab_id = 4 } },
+    });
+    try std.testing.expect(try app.closeTab(.app, .other));
+    surface_a.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close the other tabs?", host.confirm_payload.?.title);
+    // Not closed yet, so not cleared yet: Cancel must leave undo intact.
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), host.tabs.items.len);
+
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.app, .other));
+    surface_a.core_initialized = false;
+    host.invokeConfirmAccept();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+}
+
+test "win32 quit asks once on the window it came from" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b, .host = &host_b, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &surface_a, .id = 1 },
+            .{ .host = &host_b, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    app.running = true;
+    // Ids for the lookups Settings makes when it closes. The inert fixture
+    // cores are otherwise only read for `readonly`, which `needsConfirmQuit`
+    // checks before anything else and which stands in for a busy terminal.
+    surface_a.core_surface.id = 1;
+    surface_b.core_surface.id = 2;
+    surface_b.core_surface.readonly = true;
+
+    // The busy terminal is in the other window; the prompt still shows
+    // where the quit came from.
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expectEqualStrings("Quit noctty?", host_a.confirm_payload.?.title);
+    try std.testing.expect(app.running);
+    // Asking again from the other window keeps the one prompt.
+    try std.testing.expect(try app.performAction(.{ .surface = surface_b.core() }, .quit, {}));
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    host_a.invokeConfirmCancel();
+
+    // `close_all_windows` quits too, and asks the same way. With no window
+    // named and none focused, the window with the running process asks.
+    try std.testing.expect(try app.performAction(.app, .close_all_windows, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_b.overlay_mode);
+    try std.testing.expect(app.running);
+    try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+    host_b.invokeConfirmCancel();
+
+    // Save or Discard in a Settings prompt that a quit raised resumes it,
+    // on the window Settings hands focus back to.
+    app.settings_window.quit_after_close = true;
+    surface_b.core_initialized = true;
+    settingsOnClosedThunk(@ptrCast(&app));
+    surface_b.core_initialized = false;
+    try std.testing.expect(!app.settings_window.quit_after_close);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    host_a.invokeConfirmCancel();
+    try std.testing.expect(app.running);
+
+    // With a window to post to, the quit waits for the message loop: core
+    // keeps using the terminal whose key asked for it after this returns.
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    host_a.hwnd = hwnd;
+    defer host_a.hwnd = null;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    var msg: sys.MSG = undefined;
+    try std.testing.expect(sys.PeekMessageW(&msg, hwnd, c.WM_WINHOSTTY_QUIT, c.WM_WINHOSTTY_QUIT, c.PM_REMOVE) != 0);
+    try std.testing.expectEqual(@as(WPARAM, 1), msg.wParam);
+
+    // A post that fails declines the quit rather than running it under
+    // the key handler. The non-null edit handle stands in for the overlay
+    // controls, so a quit run in place would open its prompt here.
+    const dead_hwnd = try createTestHostWindow();
+    _ = sys.DestroyWindow(dead_hwnd);
+    host_a.hwnd = dead_hwnd;
+    host_a.overlay_edit_hwnd = dead_hwnd;
+    defer host_a.overlay_edit_hwnd = null;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expect(app.running);
+}
+
+test "win32 close prompts count the terminals they would end" {
+    var buf: [256]u8 = undefined;
+    const one = closeScopePrompt(.right_tabs, 1, &buf);
+    try std.testing.expectEqualStrings("Close the tabs to the right?", one.title);
+    try std.testing.expectEqualStrings("Close tabs", one.accept_label);
+    try std.testing.expectEqualStrings(
+        "A process is still running in a tab to the right. Closing those tabs will terminate it.",
+        one.body,
+    );
+    const many = closeScopePrompt(.app, 3, &buf);
+    try std.testing.expectEqualStrings("Quit", many.accept_label);
+    try std.testing.expectEqualStrings(
+        "Processes are still running in 3 terminals. Quitting noctty will terminate them.",
+        many.body,
+    );
 }
 
 test "win32 closeTab this on last tab detaches tab for undo" {

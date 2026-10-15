@@ -1582,6 +1582,7 @@ pub const SettingsWindow = struct {
     close_prompt_measure_width: i32 = -1,
     close_prompt_measure_dpi: u32 = 0,
     close_prompt_measure_saving: bool = false,
+    close_prompt_measure_quitting: bool = false,
     close_prompt_measure_height: i32 = 0,
     edit_scrollback: ?HWND = null,
     edit_font_family: ?HWND = null,
@@ -1646,6 +1647,12 @@ pub const SettingsWindow = struct {
     close_after_save: bool = false,
     close_posted: bool = false,
     close_notified: bool = false,
+    /// The app's quit waits on the close prompt: set by
+    /// `holdQuitForUnsavedChanges`, cleared by Keep editing or a failed
+    /// save, and taken by the app's `onClosed` once Save or Discard closed
+    /// the window. Outlives the window's state reset in WM_NCDESTROY,
+    /// which runs before `onClosed`.
+    quit_after_close: bool = false,
     close_prior_focus: ?HWND = null,
     validation_control: ?HWND = null,
     owned_validation_control: ?HWND = null,
@@ -1825,6 +1832,7 @@ pub const SettingsWindow = struct {
         self.combo_auto_update = null;
         self.combo_auto_update_channel = null;
         self.resetClosePromptState();
+        self.quit_after_close = false;
         self.clearPending();
     }
 
@@ -4142,7 +4150,7 @@ pub const SettingsWindow = struct {
 
     fn syncClosePromptText(self: *SettingsWindow, announce: bool) void {
         const text = self.text_close_prompt orelse return;
-        setWindowTextUtf8(text, closePromptText(self.save_in_flight));
+        setWindowTextUtf8(text, closePromptText(self.save_in_flight, self.quit_after_close));
         if (announce) {
             sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, text, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
         }
@@ -4175,9 +4183,35 @@ pub const SettingsWindow = struct {
         if (self.btn_close_keep_editing) |button| _ = sys.SetFocus(button);
     }
 
+    /// The app's quit asks here first. With unsaved changes, raise the window
+    /// with its close prompt and hold the quit: Save or Discard closes the
+    /// window and `onClosed` resumes the quit (`takeQuitAfterClose`), while
+    /// Keep editing, or a save that fails, drops it. Returns whether the
+    /// quit has to wait.
+    pub fn holdQuitForUnsavedChanges(self: *SettingsWindow) bool {
+        const hwnd = self.hwnd orelse return false;
+        if (self.close_posted or !self.hasPendingChanges()) return false;
+        if (sys.IsIconic(hwnd) != 0) _ = sys.ShowWindow(hwnd, SW_RESTORE);
+        _ = SetForegroundWindow(hwnd);
+        self.quit_after_close = true;
+        // An open prompt still says "closing"; say "quitting" instead.
+        if (self.close_prompt_visible) {
+            self.syncClosePromptText(true);
+            layoutChildren(self);
+        }
+        self.showClosePrompt();
+        return true;
+    }
+
+    pub fn takeQuitAfterClose(self: *SettingsWindow) bool {
+        defer self.quit_after_close = false;
+        return self.quit_after_close;
+    }
+
     fn cancelClosePrompt(self: *SettingsWindow) void {
         if (!closePromptCanCancel(self.close_prompt_visible, self.close_posted)) return;
         const prior_focus = self.close_prior_focus;
+        self.quit_after_close = false;
         self.close_prompt_visible = false;
         self.close_after_save = false;
         self.close_prior_focus = null;
@@ -5464,9 +5498,11 @@ fn closePromptCanCancel(visible: bool, close_posted: bool) bool {
     return visible and !close_posted;
 }
 
-fn closePromptText(save_in_flight: bool) []const u8 {
+fn closePromptText(save_in_flight: bool, quitting: bool) []const u8 {
     return if (save_in_flight)
         "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open."
+    else if (quitting)
+        "Save changes before quitting?"
     else
         "Save changes before closing?";
 }
@@ -5499,10 +5535,11 @@ test "settings dirty close transition is conservative and idempotent" {
 }
 
 test "settings close prompt uses one display and measurement text source" {
-    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false));
+    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false, false));
+    try std.testing.expectEqualStrings("Save changes before quitting?", closePromptText(false, true));
     try std.testing.expectEqualStrings(
         "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open.",
-        closePromptText(true),
+        closePromptText(true, false),
     );
 }
 
@@ -6272,6 +6309,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     if (self.close_prompt_measure_width == pane_width and
         self.close_prompt_measure_dpi == self.dpi and
         self.close_prompt_measure_saving == self.save_in_flight and
+        self.close_prompt_measure_quitting == self.quit_after_close and
         self.close_prompt_measure_height > 0)
     {
         return self.close_prompt_measure_height;
@@ -6285,7 +6323,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     }
 
     var text_w: [256]u16 = undefined;
-    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight)));
+    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight, self.quit_after_close)));
     var measure = RECT{
         .left = 0,
         .top = 0,
@@ -6303,6 +6341,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     self.close_prompt_measure_width = pane_width;
     self.close_prompt_measure_dpi = self.dpi;
     self.close_prompt_measure_saving = self.save_in_flight;
+    self.close_prompt_measure_quitting = self.quit_after_close;
     self.close_prompt_measure_height = height;
     return height;
 }
@@ -7186,6 +7225,39 @@ test "settings Escape without the close prompt closes a clean window and prompts
             try std.testing.expect(fixture.pumpKey(0x1B));
             try std.testing.expectEqual(@as(u32, 1), fixture.closed);
             try std.testing.expect(sys.IsWindow(hwnd) == 0);
+        }
+    }.body);
+}
+
+test "settings holds a quit for unsaved changes until Save or Discard closes the window" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            // Nothing unsaved: the quit goes ahead.
+            try std.testing.expect(!settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(!settings.close_prompt_visible);
+
+            // Unsaved: the close prompt holds the quit; Keep editing drops it.
+            settings.markRawScalarEdit(.font_size);
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expect(!settings.takeQuitAfterClose());
+
+            // Discard closes the window and hands the quit back once.
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            settings.discardAndClose();
+            try std.testing.expect(settings.close_posted);
+            _ = SendMessageW(hwnd, WM_SETTINGS_CLOSE_NOW, 0, 0);
+            try std.testing.expectEqual(@as(u32, 1), fixture.closed);
+            try std.testing.expect(sys.IsWindow(hwnd) == 0);
+            try std.testing.expect(settings.takeQuitAfterClose());
+            try std.testing.expect(!settings.takeQuitAfterClose());
         }
     }.body);
 }
