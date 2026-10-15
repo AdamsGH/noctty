@@ -445,6 +445,7 @@ pub const VK_OEM_MINUS = 0xBD;
 pub const VK_OEM_PERIOD = 0xBE;
 pub const VK_OEM_2 = 0xBF;
 pub const VK_OEM_3 = 0xC0;
+pub const VK_ABNT_C1 = 0xC1;
 pub const VK_OEM_4 = 0xDB;
 pub const VK_OEM_5 = 0xDC;
 pub const VK_OEM_6 = 0xDD;
