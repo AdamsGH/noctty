@@ -682,23 +682,49 @@ test "win32 clipboard text with a lone surrogate still pastes" {
 
 /// Another program can hold the clipboard open for a few milliseconds (a
 /// clipboard manager, RDP's clipboard sync, Office), and one failed
-/// `OpenClipboard` used to drop the whole paste or copy. Tries it 10 times
-/// with a 5 ms sleep between. A sleep rounds up to the timer tick, about
-/// 15.6 ms unless something raised the resolution, so a clipboard held
-/// throughout costs the UI thread up to about 140 ms before the paste or
-/// copy fails as it did at once before. On false, `GetLastError` still
-/// holds the last attempt's error.
+/// `OpenClipboard` used to drop the whole paste or copy. Retry within a
+/// 5 ms QPC budget, without timer-tick sleeps or dispatching messages.
+/// Keeping the call synchronous preserves copy/paste order and the
+/// confirmation that owns a pending operation. On false, `GetLastError`
+/// still holds the last open's error. Scheduling and OpenClipboard itself
+/// can take longer; never start another retry after the budget expires.
 fn openClipboard(hwnd: ?HWND) bool {
     return openClipboardWith(sys.OpenClipboard, hwnd);
 }
 
 const clipboard_open_attempts = 10;
+const clipboard_open_budget_ns = 5 * std.time.ns_per_ms;
+const clipboard_open_interval_ns = std.time.ns_per_ms / 2;
 
 fn openClipboardWith(open: *const fn (?HWND) callconv(.winapi) BOOL, hwnd: ?HWND) bool {
+    var timer = std.time.Timer.start() catch return open(hwnd) != 0;
+    return openClipboardWithClock(open, hwnd, &timer);
+}
+
+fn openClipboardWithClock(open: *const fn (?HWND) callconv(.winapi) BOOL, hwnd: ?HWND, timer: anytype) bool {
+    var open_error: windows.Win32Error = .SUCCESS;
+    var next_attempt: u64 = 0;
     for (0..clipboard_open_attempts) |attempt| {
+        if (attempt > 0) {
+            while (true) {
+                const elapsed = timer.read();
+                if (elapsed >= clipboard_open_budget_ns) {
+                    windows.kernel32.SetLastError(open_error);
+                    return false;
+                }
+                if (elapsed >= next_attempt) break;
+                // SwitchToThread, not Sleep: offer the clipboard owner
+                // the CPU without waiting for the next timer tick.
+                std.Thread.yield() catch {};
+            }
+        }
         if (open(hwnd) != 0) return true;
-        if (attempt + 1 < clipboard_open_attempts) std.Thread.sleep(5 * std.time.ns_per_ms);
+        open_error = windows.kernel32.GetLastError();
+        const elapsed = timer.read();
+        if (elapsed >= clipboard_open_budget_ns) break;
+        next_attempt = elapsed + clipboard_open_interval_ns;
     }
+    windows.kernel32.SetLastError(open_error);
     return false;
 }
 
@@ -706,6 +732,13 @@ test "win32 clipboard open retries while another program holds it" {
     const Fake = struct {
         var calls: usize = 0;
         var fail_first: usize = 0;
+        elapsed: u64 = 0,
+
+        fn read(self: *@This()) u64 {
+            defer self.elapsed += std.time.ns_per_ms / 20;
+            return self.elapsed;
+        }
+
         fn open(_: ?HWND) callconv(.winapi) BOOL {
             calls += 1;
             return if (calls > fail_first) 1 else 0;
@@ -714,14 +747,102 @@ test "win32 clipboard open retries while another program holds it" {
 
     Fake.calls = 0;
     Fake.fail_first = 3;
-    try std.testing.expect(openClipboardWith(Fake.open, null));
+    var clock: Fake = .{};
+    try std.testing.expect(openClipboardWithClock(Fake.open, null, &clock));
     try std.testing.expectEqual(@as(usize, 4), Fake.calls);
 
     // Held for good: gives up after the last attempt, without one more sleep.
     Fake.calls = 0;
     Fake.fail_first = std.math.maxInt(usize);
-    try std.testing.expect(!openClipboardWith(Fake.open, null));
+    clock = .{};
+    try std.testing.expect(!openClipboardWithClock(Fake.open, null, &clock));
     try std.testing.expectEqual(@as(usize, clipboard_open_attempts), Fake.calls);
+}
+
+test "win32 clipboard contention stops retrying at its UI budget" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var owner: ?HWND = null;
+        elapsed: u64 = 0,
+        step: u64,
+
+        fn read(self: *@This()) u64 {
+            // A wait (or a preemption) can overrun the whole budget.
+            // Clock and yield calls must not replace the open error.
+            windows.kernel32.SetLastError(.INVALID_HANDLE);
+            defer self.elapsed += self.step;
+            return self.elapsed;
+        }
+
+        fn open(hwnd: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            owner = hwnd;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return 0;
+        }
+    };
+
+    for ([_]u64{ clipboard_open_budget_ns, 16 * std.time.ns_per_ms }) |step| {
+        Fake.calls = 0;
+        var clock: Fake = .{ .step = step };
+        const owner: HWND = @ptrFromInt(0x1234); // passed only to the fake
+        try std.testing.expect(!openClipboardWithClock(Fake.open, owner, &clock));
+        try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+        try std.testing.expectEqual(owner, Fake.owner.?);
+        try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
+    }
+}
+
+test "win32 clipboard retry stops when a yield crosses its UI budget" {
+    // The budget runs out while waiting for the next attempt: no second open.
+    const Fake = struct {
+        var calls: usize = 0;
+        reads: usize = 0,
+
+        fn read(self: *@This()) u64 {
+            defer self.reads += 1;
+            return switch (self.reads) {
+                0 => 0,
+                1 => clipboard_open_interval_ns / 2,
+                else => clipboard_open_budget_ns,
+            };
+        }
+
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return 0;
+        }
+    };
+
+    Fake.calls = 0;
+    var clock: Fake = .{};
+    try std.testing.expect(!openClipboardWithClock(Fake.open, null, &clock));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
+}
+
+test "win32 clipboard retry uses QPC without opening the real clipboard" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var busy: bool = false;
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            windows.kernel32.SetLastError(.ACCESS_DENIED);
+            return if (busy) 0 else 1;
+        }
+    };
+
+    Fake.calls = 0;
+    Fake.busy = false;
+    try std.testing.expect(openClipboardWith(Fake.open, null));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+
+    Fake.calls = 0;
+    Fake.busy = true;
+    try std.testing.expect(!openClipboardWith(Fake.open, null));
+    try std.testing.expect(Fake.calls >= 1 and Fake.calls <= clipboard_open_attempts);
+    try std.testing.expectEqual(windows.Win32Error.ACCESS_DENIED, windows.kernel32.GetLastError());
 }
 
 fn surfaceWindowStyle() u32 {
