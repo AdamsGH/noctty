@@ -300,6 +300,32 @@ pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.
     return null;
 }
 
+/// Disable cmd's implicit cwd executable search for the final shell wrapper.
+/// Keep this in its environment: clearing it before the target immediately
+/// restores cwd lookup. Explicit paths and PATH entries retain cmd semantics.
+pub fn configureShellSearch(env: *std.process.EnvMap, windows_cmd_shell: bool) !void {
+    if (builtin.os.tag == .windows and windows_cmd_shell and
+        env.get("NoDefaultCurrentDirectoryInExePath") == null)
+        try env.put("NoDefaultCurrentDirectoryInExePath", "1");
+}
+
+test "PKG48 only shell wrappers receive the inherited cwd search guard" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var env = std.process.EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "relative;C:\\Tools!;%literal%");
+    try configureShellSearch(&env, false);
+    try std.testing.expect(env.get("NoDefaultCurrentDirectoryInExePath") == null);
+    try configureShellSearch(&env, true);
+    try std.testing.expectEqualStrings("1", env.get("NoDefaultCurrentDirectoryInExePath").?);
+    inline for (.{ "user-value", "" }) |value| {
+        try env.put("NoDefaultCurrentDirectoryInExePath", value);
+        try configureShellSearch(&env, true);
+        try std.testing.expectEqualStrings(value, env.get("NoDefaultCurrentDirectoryInExePath").?);
+    }
+    try std.testing.expectEqualStrings("relative;C:\\Tools!;%literal%", env.get("PATH").?);
+}
+
 /// App Execution Aliases are reparse points whose target cannot be opened
 /// or stat'ed as an ordinary file. Query the path itself, accepting aliases.
 /// Callers must screen network/device paths and remote drives first.

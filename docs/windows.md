@@ -99,6 +99,17 @@ instead; nothing is migrated.
 
 ## Shells
 
+For commands launched through `cmd.exe /C`, noctty sets
+`NoDefaultCurrentDirectoryInExePath` in that wrapper's environment when it is
+absent. This disables cmd's implicit executable search in the pane's current
+directory, so a planted `pwsh.cmd` cannot override a `pwsh` on PATH. The guard
+is inherited by descendants: clearing it before the target would restore the
+unsafe search. Existing values are preserved, and direct launches receive no
+new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
+`||` fallback retain native cmd behavior, including PATH directories containing
+literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
+relative PATH entries such as `.`, still select programs relative to the pane.
+
 The profile picker detects:
 
 - PowerShell 7+ (`pwsh.exe`)
@@ -115,14 +126,17 @@ working-directory updates and OSC 133 prompt markers.
 For `cmd.exe`, noctty wraps the inherited `PROMPT` (or cmd's `$P$G` default)
 so the shell emits OSC 133 A/B prompt marks and an OSC 9;9 working-directory
 report; a `PROMPT` set through `env = PROMPT=...` is applied afterward and
-replaces the wrapper. If `clink.bat` or `clink_x64.exe` is found under
-`%LOCALAPPDATA%\clink` or on a local, mounted, drive-qualified `PATH` entry
-(remote, UNC, and relative entries are skipped so a dead network path cannot
-stall a new tab), noctty prepends its shipped Lua directory to `CLINK_PATH`.
+replaces the wrapper. When the shipped `noctty-shell-integration.lua` is present,
+noctty prepends its Lua directory to `CLINK_PATH`, preserving existing entries.
 That only makes the script discoverable once Clink is already active through
 autorun, `clink inject`, or an explicit Clink launch; noctty never injects or
 launches Clink. When loaded, the script adds OSC 133 C/D command marks and the
-exit code before the next prompt, truthful only while Clink's
+exit code before the next prompt. It also wraps the final normal prompt after
+Clink filters, so themes which replace the prompt and stop the filter chain keep
+prompt and cwd marks. Existing OSC 133 A marks are respected, and right and
+transient prompts are left alone. This final-prompt hook uses Clink's guarded
+`_internal._filter_prompt` seam (verified with Clink 1.9.34); versions without it
+retain the PROMPT fallback and C/D hooks. Exit codes are truthful only while Clink's
 `cmd.get_errorlevel` setting is enabled (its default). Without it, prompt
 navigation and cwd reporting still work, but there are no command-finish marks
 or exit codes.
@@ -254,7 +268,8 @@ as its only argument, in a new tab in your home directory. Set
   drive letter. The drive check uses `GetDriveTypeW`, which answers from the
   local mount table without contacting the server. It misses a directory
   junction or `subst` alias with a remote target, but the bounded worker
-  still keeps that open off the UI thread.
+  still keeps that open off the UI thread. Skipped glob Includes emit a warning
+  once, sharing the warning budget for unreadable SSH configuration files.
 - The root config and `Include` opens run off the UI thread under one shared
   50 ms refresh budget. A slow or blocked path is skipped; a later profile
   refresh can retry it.

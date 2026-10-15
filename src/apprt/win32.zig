@@ -7738,15 +7738,10 @@ pub const App = struct {
                 );
                 errdefer alloc.free(parameters);
 
-                // `--working-directory` above carries the terminal path
-                // verbatim; ShellExecuteExW needs a Windows-local directory
-                // instead, or a WSL-backed surface's POSIX pwd fails the
-                // launch before the child ever parses that argument.
-                const host_cwd = try win32_elevation.resolveElevatedHostDirectory(
-                    alloc,
-                    cwd,
-                );
-                errdefer if (host_cwd) |directory| alloc.free(directory);
+                // The terminal keeps its pwd in --working-directory; the
+                // elevated host must not search that directory for programs.
+                const host_cwd = try win32_elevation.elevatedHostDirectory(alloc);
+                errdefer alloc.free(host_cwd);
 
                 try self.deferShellRequest(.{ .elevated_window = .{
                     .parameters = parameters,
