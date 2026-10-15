@@ -1,0 +1,136 @@
+##### LAT-02 final: main 77400e41f (mbase) vs this change (mfinal = 67911ab34), both + measurement-only trace patch
+##### F-v60: emulated 60 Hz present, ssh-like reader, 2 runs x 240 keys, interleaved
+== display (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v60  mbase    480    25.85    33.17    33.90    47.64
+d0-ssh-steady-primary-bundled-v60  mfinal   480     8.80    16.66    17.16    20.47
+d20-ssh-steady-primary-bundled-v60 mbase    480    35.65    48.49    49.86    52.20
+d20-ssh-steady-primary-bundled-v60 mfinal   480    29.23    36.25    37.17    38.14
+d55-ssh-burst-line-primary-bundled-v60 mbase    476    84.03    98.82   104.94   116.17  missing=4
+d55-ssh-burst-line-primary-bundled-v60 mfinal   476    65.19    71.87    76.51    85.85  missing=4
+d55-ssh-steady-primary-bundled-v60 mbase    480    63.50    71.71    72.42    79.07
+d55-ssh-steady-primary-bundled-v60 mfinal   480    63.97    71.35    72.28    83.02
+d70-ssh-steady-primary-bundled-v60 mbase    480    79.74    86.83    87.29    97.92
+d70-ssh-steady-primary-bundled-v60 mfinal   480    78.88    86.71    87.23    94.07
+== swap (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v60  mbase    480    15.42    26.77    30.02    42.17
+d0-ssh-steady-primary-bundled-v60  mfinal   480     0.68     1.77     3.20     6.76
+d20-ssh-steady-primary-bundled-v60 mbase    480    21.09    38.30    39.26    46.88
+d20-ssh-steady-primary-bundled-v60 mfinal   480    20.66    21.20    22.11    22.47
+d55-ssh-burst-line-primary-bundled-v60 mbase    476    72.55    88.99    97.19   106.08  missing=4
+d55-ssh-burst-line-primary-bundled-v60 mfinal   476    55.65    56.80    64.71    76.31  missing=4
+d55-ssh-steady-primary-bundled-v60 mbase    480    55.92    56.71    57.38    65.98
+d55-ssh-steady-primary-bundled-v60 mfinal   480    55.71    56.30    57.12    66.95
+d70-ssh-steady-primary-bundled-v60 mbase    480    70.66    72.14    78.28    94.86
+d70-ssh-steady-primary-bundled-v60 mfinal   480    70.69    71.27    72.27    85.67
+scenario                               build            keys          swaps  content_swaps         frames          wakes w:core_surface    w:io_output w:apprt_repain w:cursor_blink      w:mailbox run_swap_buffe
+d0-ssh-steady-primary-bundled-v60      mbase             480            970            480            970           1448            480            480            482              9              0           1012
+d0-ssh-steady-primary-bundled-v60      mfinal            480            486            480            486            486              0            480              0              9              0            529
+d20-ssh-steady-primary-bundled-v60     mbase             480           1381            480           1381           1446            480            480            483              4              0           1424
+d20-ssh-steady-primary-bundled-v60     mfinal            480            482            480            482            482              0            480              0              3              0            526
+d55-ssh-burst-line-primary-bundled-v60 mbase             480           1258            480           1258           1528            480            480            513             73              0           1302
+d55-ssh-burst-line-primary-bundled-v60 mfinal            480            548            480            548            549              0            480              1             78              0            591
+d55-ssh-steady-primary-bundled-v60     mbase             480           1433            480           1433           1433            480            480            465             10              0           1475
+d55-ssh-steady-primary-bundled-v60     mfinal            480            486            480            486            486              0            480              0              7              0            529
+d70-ssh-steady-primary-bundled-v60     mbase             480           1432            480           1432           1432            480            480            466              6              0           1475
+d70-ssh-steady-primary-bundled-v60     mfinal            480            489            480            489            491              0            480              2              9              0            530
+
+##### F-cursor: arrow keys (cursor-only echo), emulated 60 Hz, 2 runs x 160 arrows
+== pty_output (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318     0.24     0.58     0.86     1.43
+d0-vt-cursor-primary-bundled-v60       mfinal   318     0.22     0.52     1.16     2.07
+d30-vt-cursor-primary-bundled-v60      mbase    318    30.19    30.52    30.81    32.39
+d30-vt-cursor-primary-bundled-v60      mfinal   318    30.18    30.39    30.82    30.94
+== frame_update (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318     0.56   121.09   124.10   125.53
+d0-vt-cursor-primary-bundled-v60       mfinal   318     0.25     0.77    14.90   117.23
+d30-vt-cursor-primary-bundled-v60      mbase    318   105.85   124.05   125.08   125.10
+d30-vt-cursor-primary-bundled-v60      mfinal   318    30.21    30.66   121.17   139.20
+== swap (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318    21.30   121.42   125.36   126.04
+d0-vt-cursor-primary-bundled-v60       mfinal   318     0.59    17.96    30.35   117.56
+d30-vt-cursor-primary-bundled-v60      mbase    318   106.29   124.28   125.38   125.40
+d30-vt-cursor-primary-bundled-v60      mfinal   318    30.55    51.80   121.47   139.62
+== display (ms; arrow keys whose echo only moves the cursor)
+scenario                               build      n   median      p95      p99      max
+d0-vt-cursor-primary-bundled-v60       mbase    318    30.37   131.41   138.43   140.12
+d0-vt-cursor-primary-bundled-v60       mfinal   318    10.24    27.35    43.15   129.37
+d30-vt-cursor-primary-bundled-v60      mbase    318   113.17   133.51   139.00   141.82
+d30-vt-cursor-primary-bundled-v60      mfinal   318    40.67    60.66   130.37   154.56
+scenario                               build            keys          swaps  content_swaps         frames          wakes w:core_surface    w:io_output w:apprt_repain w:cursor_blink      w:mailbox run_swap_buffe
+d0-vt-cursor-primary-bundled-v60       mbase             400            694            400            693            864            400            172            287              8              0            737
+d0-vt-cursor-primary-bundled-v60       mfinal            400            465            453            465            525              0            461             58              8              0            508
+d30-vt-cursor-primary-bundled-v60      mbase             400            814            466            814            817            400            161            253              4              0            858
+d30-vt-cursor-primary-bundled-v60      mfinal            400            466            459            466            528              0            462             62              5              0            509
+
+##### F-saver: power-saver-rendering=on, emulated 60 Hz, 2 runs x 200 keys
+== display (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-burst-primary-bundled-v60   mbase    400    40.97    64.73    71.59    75.75
+d0-ssh-burst-primary-bundled-v60   mfinal   400    28.69    53.71    59.84    66.20
+d0-ssh-steady-primary-bundled-v60  mbase    400    53.87    68.20    73.18    76.71
+d0-ssh-steady-primary-bundled-v60  mfinal   400     9.05    16.86    56.39   364.24
+d0-vt-cursor-primary-bundled-v60   mbase     80    54.26    64.86    68.96    69.63  missing=320
+d0-vt-cursor-primary-bundled-v60   mfinal    80     8.15    16.71    17.04    17.37  missing=320
+sed: -e expression #1, char 16: unterminated address regex
+Exception ignored on flushing sys.stdout:
+OSError: [Errno 22] Invalid argument
+scenario                               build            keys          swaps  content_swaps         frames          wakes w:core_surface    w:io_output w:apprt_repain w:cursor_blink      w:mailbox run_swap_buffe
+d0-ssh-burst-primary-bundled-v60       mbase             400            410            306            410            854            400            400              0             61              0            437
+d0-ssh-burst-primary-bundled-v60       mfinal            400            391            335            391            456              0            400              0             60              0            421
+d0-ssh-steady-primary-bundled-v60      mbase             400            762            400            762            806            400            400              0              8              0            789
+d0-ssh-steady-primary-bundled-v60      mfinal            400            405            398            405            405              0            398              0              9              0            436
+d0-vt-cursor-primary-bundled-v60       mbase             400            495            400            495            585            400            180              0             10              0            521
+d0-vt-cursor-primary-bundled-v60       mfinal            400            463            457            463            466              0            462              0              7              0            494
+
+##### F-v0: hidden desktop, real SwapBuffers
+== swap (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v0   mbase    480     1.19     2.02     2.77     3.72
+d0-ssh-steady-primary-bundled-v0   mfinal   480     0.69     1.88     2.55     5.72
+d30-ssh-burst-line-primary-bundled-v0 mbase    478    30.65    31.47    31.90    33.34  missing=2
+d30-ssh-burst-line-primary-bundled-v0 mfinal   477    30.67    31.51    32.53    33.39  missing=3
+scenario                               build            keys          swaps  content_swaps         frames          wakes w:core_surface    w:io_output w:apprt_repain w:cursor_blink      w:mailbox run_swap_buffe
+d0-ssh-steady-primary-bundled-v0       mbase             480            968            480            968           1445            480            480            481              9              0           1011
+d0-ssh-steady-primary-bundled-v0       mfinal            480            487            480            487            487              0            480              0              9              0            530
+d30-ssh-burst-line-primary-bundled-v0  mbase             480           1383            480           1383           1420            480            480            400             70              0           1425
+d30-ssh-burst-line-primary-bundled-v0  mfinal            480            545            480            545            545              0            480              0             73              0            587
+
+##### F-flood: #310 case (50 MB type, jump resize at 1.5 s, WM_NULL every 7 ms)
+mbase-r1     n=1347 resize-second max=109.6 ms  after 2.5 s: n=1112 p50=0.8 p99=3.8 max=4.1  over100ms=2 total=11.3s
+mfinal-r1    n=1279 resize-second max=135.0 ms  after 2.5 s: n=1120 p50=0.8 p99=3.3 max=4.6  over100ms=3 total=11.3s
+mfinal-r2    n=1353 resize-second max=139.8 ms  after 2.5 s: n=1112 p50=0.9 p99=3.5 max=5.8  over100ms=2 total=11.3s
+mbase-r2     n=1356 resize-second max=138.2 ms  after 2.5 s: n=1112 p50=0.9 p99=3.7 max=4.3  over100ms=2 total=11.3s
+mbase-r3     n=1350 resize-second max=141.2 ms  after 2.5 s: n=1115 p50=0.9 p99=3.7 max=4.3  over100ms=2 total=11.3s
+mfinal-r3    n=1360 resize-second max=111.0 ms  after 2.5 s: n=1113 p50=0.9 p99=3.7 max=5.0  over100ms=2 total=11.3s
+flood done: C:\Users\amant\.t3\worktrees\winghostty\_scratch-lat02\runs\F-flood
+
+##### F-anim: 60 fps synchronized-output TUI for 10 s
+mbase-f60-v0-r1              frames=600 frames_in_output=600 frames_shown=600 presents=932 content_presents=601 presents_per_s=92.4
+mfinal-f60-v0-r1             frames=600 frames_in_output=600 frames_shown=600 presents=646 content_presents=601 presents_per_s=64.1
+mfinal-f60-v0-r2             frames=600 frames_in_output=600 frames_shown=600 presents=645 content_presents=601 presents_per_s=64.0
+mbase-f60-v0-r2              frames=600 frames_in_output=600 frames_shown=600 presents=928 content_presents=601 presents_per_s=92.0
+anim done: C:\Users\amant\.t3\worktrees\winghostty\_scratch-lat02\runs\F-anim-v0
+mbase-f60-v60-r1             frames=600 frames_in_output=600 frames_shown=593 presents=602 content_presents=593 presents_per_s=59.7
+mfinal-f60-v60-r1            frames=600 frames_in_output=600 frames_shown=574 presents=602 content_presents=575 presents_per_s=59.7
+mfinal-f60-v60-r2            frames=600 frames_in_output=600 frames_shown=573 presents=601 content_presents=573 presents_per_s=59.6
+mbase-f60-v60-r2             frames=600 frames_in_output=600 frames_shown=558 presents=602 content_presents=558 presents_per_s=59.7
+anim done: C:\Users\amant\.t3\worktrees\winghostty\_scratch-lat02\runs\F-anim-v60
+
+##### R1-v60 (earlier head b0ffcf5e2, same scenarios)
+== display (ms; pooled keys)
+scenario                           build      n   median      p95      p99      max
+d0-ssh-steady-primary-bundled-v60  mbase    480    25.45    33.20    33.58    37.23
+d0-ssh-steady-primary-bundled-v60  mfinal   480     8.96    16.66    17.25    23.62
+d20-ssh-steady-primary-bundled-v60 mbase    480    36.05    48.89    50.28    61.04
+d20-ssh-steady-primary-bundled-v60 mfinal   480    29.22    36.63    37.66    38.39
+d55-ssh-burst-line-primary-bundled-v60 mbase    476    83.55    98.22   104.42   118.08  missing=4
+d55-ssh-burst-line-primary-bundled-v60 mfinal   476    65.12    72.17    82.72    87.40  missing=4
+d55-ssh-steady-primary-bundled-v60 mbase    480    63.70    71.68    72.38    84.01
+d55-ssh-steady-primary-bundled-v60 mfinal   480    63.44    71.67    72.35    80.13
+d70-ssh-steady-primary-bundled-v60 mbase    480    79.30    86.35    87.33    94.98
+d70-ssh-steady-primary-bundled-v60 mfinal   480    79.78    87.13    90.15   108.50
