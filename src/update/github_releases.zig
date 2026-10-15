@@ -696,14 +696,89 @@ pub fn stageWindowsInstall(
     release: *const Release,
     kind: portable_apply.StagedKind,
 ) !StagedWindowsInstall {
-    return stageWindowsInstallWithDownloader(
+    return stageWindowsInstallReusing(
         alloc,
         state_path,
         release_feed_url,
         release,
         kind,
+        verifyStagedWindowsInstall,
         downloadUrlToFile,
     );
+}
+
+/// A version that is already staged and still verifies is the answer, and
+/// nothing is downloaded. That has to come before anything that needs the
+/// release's asset list: the throttle cache keeps a release's version and URL
+/// but not its assets, so a cached `release` has no `windows_install`, and a
+/// restart inside the throttle window used to find nothing to stage, while a
+/// forced check staged the same ~30 MB again.
+///
+/// A cached release with nothing to reuse still cannot be staged
+/// (`WindowsInstallNotEligible`): fetching its assets here would make a stage
+/// that keeps failing (a signature the pin rejects, a bad checksum) cost a
+/// download at every launch and timer tick instead of one per throttle window.
+fn stageWindowsInstallReusing(
+    alloc: Allocator,
+    state_path: []const u8,
+    release_feed_url: []const u8,
+    release: *const Release,
+    kind: portable_apply.StagedKind,
+    comptime verify: anytype,
+    comptime download: anytype,
+) !StagedWindowsInstall {
+    if (!std.fs.path.isAbsolute(state_path)) return error.InvalidStatePath;
+
+    if (try reuseStagedWindowsInstall(alloc, state_path, release_feed_url, release.version_text, kind, verify)) |staged| {
+        return staged;
+    }
+    return stageWindowsInstallWithDownloader(alloc, state_path, release_feed_url, release, kind, download);
+}
+
+/// The staged install for `version_text`, if one is recorded for this feed
+/// and kind and `verify` still accepts it (hash, signature, portable manifest
+/// and the kind and feed checks live in `verifyStagedWindowsInstall`); null
+/// when staging has to start over. State is only read until a candidate is
+/// found, so a release with nothing staged leaves no files behind.
+fn reuseStagedWindowsInstall(
+    alloc: Allocator,
+    state_path: []const u8,
+    release_feed_url: []const u8,
+    version_text: []const u8,
+    kind: portable_apply.StagedKind,
+    comptime verify: anytype,
+) !?StagedWindowsInstall {
+    {
+        var peek = try loadState(alloc, state_path);
+        defer peek.deinit(alloc);
+        if (!stagedInstallMatches(&peek, release_feed_url, version_text, kind)) return null;
+    }
+
+    // Staging holds this lock for its whole run, so what is read below cannot
+    // be replaced by another process half way through.
+    var staging_lock = try openStagingWorkLock(alloc, state_path);
+    defer staging_lock.close();
+    var baseline = try loadState(alloc, state_path);
+    defer baseline.deinit(alloc);
+    if (baseline.portable_apply_phase != null) return error.PortableUpdateTransactionActive;
+    if (!stagedInstallMatches(&baseline, release_feed_url, version_text, kind)) return null;
+
+    return verify(alloc, state_path, release_feed_url, kind) catch |err| {
+        log.warn("staged update for {s} no longer verifies, staging it again err={}", .{ version_text, err });
+        return null;
+    };
+}
+
+fn stagedInstallMatches(
+    state: *const State,
+    release_feed_url: []const u8,
+    version_text: []const u8,
+    kind: portable_apply.StagedKind,
+) bool {
+    const staged_version = state.staged_version orelse return false;
+    return std.mem.eql(u8, staged_version, version_text) and
+        state.staged_kind == kind and
+        std.mem.eql(u8, state.stagedFeedUrl(), release_feed_url);
 }
 
 fn stageWindowsInstallWithDownloader(
@@ -4599,6 +4674,186 @@ test "failed update staging removes attempts and preserves the prior staged vers
     const prior = try tmp.dir.readFileAlloc(alloc, "updates/1.3.100/keep.txt", 32);
     defer alloc.free(prior);
     try std.testing.expectEqualStrings("prior-stage", prior);
+}
+
+/// Stand-ins for the two things `stageWindowsInstallReusing` reaches out for,
+/// with counters, so the tests can say what was and was not touched.
+const StageReuseFake = struct {
+    var verify_ok = true;
+    var verify_calls: usize = 0;
+    var downloads: usize = 0;
+
+    fn reset() void {
+        verify_ok = true;
+        verify_calls = 0;
+        downloads = 0;
+    }
+
+    fn verify(alloc: Allocator, _: []const u8, _: []const u8, kind: portable_apply.StagedKind) !StagedWindowsInstall {
+        verify_calls += 1;
+        if (!verify_ok) return error.InstallerChecksumMismatch;
+        return .{
+            .kind = kind,
+            .version_text = try alloc.dupe(u8, "1.3.200"),
+            .artifact_path = try alloc.dupe(u8, "setup.exe"),
+            .sha256_hex = try alloc.dupe(u8, "00"),
+        };
+    }
+
+    fn download(_: Allocator, _: []const u8, _: []const u8) !void {
+        downloads += 1;
+        return error.TestDownloadStopped;
+    }
+
+    /// What the throttle cache hands back: no asset list.
+    fn cached(alloc: Allocator) !Release {
+        return .{
+            .version_text = try alloc.dupe(u8, "1.3.200"),
+            .release_url = try alloc.dupe(u8, "https://example.invalid/release"),
+        };
+    }
+
+    fn withInstall(alloc: Allocator, version: []const u8) !Release {
+        return .{
+            .version_text = try alloc.dupe(u8, version),
+            .release_url = try alloc.dupe(u8, "https://example.invalid/release"),
+            .windows_install = .{
+                .installer_name = try alloc.dupe(u8, "setup.exe"),
+                .installer_url = try alloc.dupe(u8, "https://example.invalid/setup.exe"),
+                .checksums_url = try alloc.dupe(u8, "https://example.invalid/SHA256SUMS.txt"),
+            },
+        };
+    }
+
+    /// Records `staged_version` as staged for the default feed.
+    fn writeStaged(alloc: Allocator, state_path: []const u8, staged_version: []const u8, kind: portable_apply.StagedKind) !void {
+        var state: State = .{
+            .staged_version = try alloc.dupe(u8, staged_version),
+            .staged_kind = kind,
+            .staged_installer_path = try alloc.dupe(u8, "setup.exe"),
+            .staged_sha256 = try alloc.dupe(u8, "00"),
+        };
+        defer state.deinit(alloc);
+        try saveState(state_path, &state);
+    }
+
+    fn stage(alloc: Allocator, state_path: []const u8, release: *const Release, kind: portable_apply.StagedKind) !StagedWindowsInstall {
+        return stageWindowsInstallReusing(alloc, state_path, latest_stable_api_url, release, kind, verify, download);
+    }
+};
+
+test "a cached release stages as the verified install already on disk, without downloading" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+    try StageReuseFake.writeStaged(alloc, state_path, "1.3.200", .installer);
+
+    // The throttle cache hands back a release with no asset list; a forced
+    // check hands back one with it.
+    for ([_]bool{ true, false }) |from_cache| {
+        StageReuseFake.reset();
+        var release = if (from_cache)
+            try StageReuseFake.cached(alloc)
+        else
+            try StageReuseFake.withInstall(alloc, "1.3.200");
+        defer release.deinit(alloc);
+
+        var staged = try StageReuseFake.stage(alloc, state_path, &release, .installer);
+        staged.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), StageReuseFake.verify_calls);
+        try std.testing.expectEqual(@as(usize, 0), StageReuseFake.downloads);
+    }
+}
+
+test "a staged install that does not match or no longer verifies is staged again, not reused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+
+    // Nothing staged: only reading state, so no file is created to find out.
+    StageReuseFake.reset();
+    var release = try StageReuseFake.withInstall(alloc, "1.3.200");
+    defer release.deinit(alloc);
+    try std.testing.expectError(error.TestDownloadStopped, StageReuseFake.stage(alloc, state_path, &release, .installer));
+    try std.testing.expectEqual(@as(usize, 0), StageReuseFake.verify_calls);
+    try std.testing.expectEqual(@as(usize, 1), StageReuseFake.downloads);
+
+    // Staged but no longer verifying, staged for another version, staged for
+    // another kind. Only the first is even handed to the verifier.
+    const stale = [_]struct { version: []const u8, kind: portable_apply.StagedKind, verified: bool, ok: bool }{
+        .{ .version = "1.3.200", .kind = .installer, .verified = true, .ok = false },
+        .{ .version = "1.3.199", .kind = .installer, .verified = false, .ok = true },
+        .{ .version = "1.3.200", .kind = .portable, .verified = false, .ok = true },
+    };
+    for (stale) |case| {
+        StageReuseFake.reset();
+        StageReuseFake.verify_ok = case.ok;
+        try StageReuseFake.writeStaged(alloc, state_path, case.version, case.kind);
+        try std.testing.expectError(error.TestDownloadStopped, StageReuseFake.stage(alloc, state_path, &release, .installer));
+        try std.testing.expectEqual(@as(usize, if (case.verified) 1 else 0), StageReuseFake.verify_calls);
+        try std.testing.expectEqual(@as(usize, 1), StageReuseFake.downloads);
+    }
+}
+
+test "a cached release with nothing to reuse is not staged and costs no download" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+
+    var release = try StageReuseFake.cached(alloc);
+    defer release.deinit(alloc);
+    // Nothing staged, and a staged install that fails to verify: either way
+    // the cached release has no assets to stage from.
+    for ([_]bool{ false, true }) |staged| {
+        StageReuseFake.reset();
+        StageReuseFake.verify_ok = false;
+        if (staged) try StageReuseFake.writeStaged(alloc, state_path, "1.3.200", .installer);
+        try std.testing.expectError(error.WindowsInstallNotEligible, StageReuseFake.stage(alloc, state_path, &release, .installer));
+        try std.testing.expectEqual(@as(usize, if (staged) 1 else 0), StageReuseFake.verify_calls);
+        try std.testing.expectEqual(@as(usize, 0), StageReuseFake.downloads);
+    }
+}
+
+test "reusing a staged install still refuses an active portable apply" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+
+    var release = try StageReuseFake.cached(alloc);
+    defer release.deinit(alloc);
+    for (std.enums.values(portable_apply.Phase)) |phase| {
+        StageReuseFake.reset();
+        var state: State = .{
+            .staged_version = try alloc.dupe(u8, "1.3.200"),
+            .staged_kind = .installer,
+            .staged_installer_path = try alloc.dupe(u8, "setup.exe"),
+            .staged_sha256 = try alloc.dupe(u8, "00"),
+            .portable_apply_phase = phase,
+        };
+        defer state.deinit(alloc);
+        try saveState(state_path, &state);
+        try std.testing.expectError(
+            error.PortableUpdateTransactionActive,
+            StageReuseFake.stage(alloc, state_path, &release, .installer),
+        );
+        try std.testing.expectEqual(@as(usize, 0), StageReuseFake.verify_calls);
+    }
 }
 
 test "update staging refuses a new target when obsolete pruning is blocked" {

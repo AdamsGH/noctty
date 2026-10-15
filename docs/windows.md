@@ -870,7 +870,10 @@ auto-update = check
 ```
 
 The updater checks the configured release feed when the app starts, unless a
-check succeeded in the last 24 hours, and never replaces binaries silently. The feed defaults to noctty's GitHub
+check succeeded in the last 24 hours, and never replaces binaries silently. A
+copy that stays open re-runs the same check every six hours while a window is
+open and no staged update is waiting; the 24 hour limit and a dismissed version
+still apply, so most of those ticks make no request. The feed defaults to noctty's GitHub
 Releases API and can be changed with `auto-update-feed-url`; checksum,
 Authenticode, and pinned-publisher-key verification stay mandatory whatever
 the feed host. For tests and diagnostics, `NOCTTY_UPDATE_FEED_URL` overrides
@@ -908,6 +911,14 @@ path. Every other PE keeps the publisher pin.
 See
 [ADR 0005](adr/0005-pin-updater-publisher-public-keys.md) for the pinning
 and key-rotation rules.
+
+Only a setup-managed copy or one with the `noctty.portable` marker stages
+anything. A copy installed another way (Scoop, a ZIP extracted without the
+marker) cannot apply a staged update, so `download` mode downloads nothing for
+it and its notice opens the release page. A version that is already staged and
+still verifies is reused instead of downloaded again, whether the check was
+forced or answered from the 24 hour cache, and dismissing the notice for a
+staged update keeps the staged files and records the dismissal.
 
 For installer-managed installs, the update notice can launch the verified
 staged installer. Applying an update is always user-initiated: it
