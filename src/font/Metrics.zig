@@ -29,8 +29,10 @@ overline_thickness: u32,
 /// Thickness in pixels of box drawing characters.
 box_thickness: u32,
 
-/// The thickness in pixels of the cursor sprite. This has a default value
-/// because it is not determined by fonts but rather by user configuration.
+/// The thickness in pixels of the cursor sprite. `calc` starts it at the
+/// underline thickness so the cursor scales with the DPI like the other
+/// strokes; `adjust-cursor-thickness` modifies that. The default only
+/// serves hand-built metrics.
 cursor_thickness: u32 = 1,
 
 /// The height in pixels of the cursor sprite.
@@ -317,6 +319,7 @@ pub fn calc(face: FaceMetrics) Metrics {
         .overline_position = 0,
         .overline_thickness = @intFromFloat(underline_thickness),
         .box_thickness = @intFromFloat(underline_thickness),
+        .cursor_thickness = @intFromFloat(underline_thickness),
         .cursor_height = @intFromFloat(cell_height),
         .icon_height = icon_height,
         .icon_height_single = icon_height_single,
@@ -747,6 +750,41 @@ test "Metrics: adjust icon height by absolute pixels" {
     // Face metrics not affected
     try testing.expectEqual(100.0, m.face_height);
     try testing.expectEqual(1.0, m.face_y);
+}
+
+test "Metrics: the cursor is as thick as the underline at any scale" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // The same face at 100%, 200% and 300% scaling: every stroke is the
+    // DPI-scaled thickness, so the cursor sprite must scale with it.
+    for ([_]f64{ 1, 2, 3 }) |scale| {
+        const m = calc(.{
+            .px_per_em = 16 * scale,
+            .cell_width = 8 * scale,
+            .ascent = 12.5 * scale,
+            .descent = -3.5 * scale,
+            .line_gap = 0,
+            .underline_thickness = scale,
+        });
+        try testing.expectEqual(@as(u32, @intFromFloat(scale)), m.underline_thickness);
+        try testing.expectEqual(m.underline_thickness, m.cursor_thickness);
+    }
+
+    // `adjust-cursor-thickness` still applies on top of the scaled base.
+    var m = calc(.{
+        .px_per_em = 32,
+        .cell_width = 16,
+        .ascent = 25,
+        .descent = -7,
+        .line_gap = 0,
+        .underline_thickness = 2,
+    });
+    var set: ModifierSet = .{};
+    defer set.deinit(alloc);
+    try set.put(alloc, .cursor_thickness, .{ .absolute = 1 });
+    m.apply(set);
+    try testing.expectEqual(@as(u32, 3), m.cursor_thickness);
 }
 
 test "Modifier: parse absolute" {
