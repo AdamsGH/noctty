@@ -172,6 +172,8 @@ pub const WM_WINHOSTTY_SESSION_CHECKPOINT = WM_APP + 11;
 /// Quit from the message loop (see `App.postQuit`).
 pub const WM_WINHOSTTY_QUIT = WM_APP + 12;
 pub const WM_WINHOSTTY_CONSOLE_VISIBILITY = WM_APP + 13;
+/// A profile discovery that ran off the UI thread finished (`App.startProfileDiscovery`).
+pub const WM_WINHOSTTY_PROFILES = WM_APP + 14;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;
