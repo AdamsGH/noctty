@@ -224,19 +224,42 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             Start-Sleep -Milliseconds 400
             $case.unminimized = & $capture 'unminimized'
             $dpi = [RendererNative]::GetDpiForWindow($hostWindow)
-            if (![RendererNative]::Scale($surfaceWindow, 192)) { throw 'DPI scale notification rejected.' }
-            Start-Sleep -Milliseconds 400
-            $case.scaled = & $capture 'scaled-192dpi'
-            if ($dpi -ne 192 -and $case.scaled.pixels.width -eq $case.initial.pixels.width -and $case.scaled.pixels.height -eq $case.initial.pixels.height) { throw 'DPI scale did not change the render target.' }
-            if (![RendererNative]::Scale($surfaceWindow, $dpi)) { throw 'DPI scale restore rejected.' }
-            Start-Sleep -Milliseconds 400
-            # Font-scale notifications preserve the grid and can round the host
-            # by a few physical pixels. Restore geometry before exact parity.
-            [void][RendererNative]::Resize($hostWindow, $rect.r - $rect.l, $rect.b - $rect.t)
-            Start-Sleep -Milliseconds 300
-            $case.scaleRestored = & $capture 'scale-restored'
-            $case.scaleDiff = [RendererNative]::Diff($case.initial.path, $case.scaleRestored.path, (Join-Path $run 'scale-diff.png')) | ConvertFrom-Json
-            if ($case.scaleDiff.different -ne 0) { throw 'DPI scale round trip changed pixels.' }
+            # A DPI round trip is exact only while the grid survives it. Scaling
+            # up a host that cannot grow to fit its work area (a 1024x768 hosted
+            # runner) shrinks the grid, so lines wrap and rows move into history,
+            # and a Windows pty does not pull them back when the grid grows again
+            # (PKG-14 turned resize_pull_scrollback off). Scaling down only grows
+            # the grid, so it runs first and everywhere; scaling up runs only
+            # where the scaled host fits the work area.
+            $hostWidth = $rect.r - $rect.l
+            $hostHeight = $rect.b - $rect.t
+            $work = [RendererNative]::WorkArea($hostWindow)
+            $scaleDown = [int][Math]::Floor($dpi * 3 / 4)
+            $scaleUpFits = [Math]::Ceiling($hostWidth * 192 / $dpi) -le ($work.r - $work.l) -and [Math]::Ceiling($hostHeight * 192 / $dpi) -le ($work.b - $work.t)
+            $scaleSteps = @(@{ dpi = $scaleDown; frame = 'scaledDown'; label = "scaled-down-${scaleDown}dpi"; restored = 'scale-down-restored'; keys = 'scaleDown' })
+            if ($dpi -lt 192 -and $scaleUpFits) {
+                $scaleSteps += @{ dpi = 192; frame = 'scaled'; label = 'scaled-192dpi'; restored = 'scale-restored'; keys = 'scale' }
+            } else {
+                $case.scaleUpSkipped = "a ${hostWidth}x${hostHeight} host at $dpi DPI would not fit the $($work.r - $work.l)x$($work.b - $work.t) work area at 192 DPI"
+            }
+            foreach ($step in $scaleSteps) {
+                if (![RendererNative]::Scale($surfaceWindow, $step.dpi)) { throw 'DPI scale notification rejected.' }
+                Start-Sleep -Milliseconds 400
+                $scaled = & $capture $step.label
+                $case[$step.frame] = $scaled
+                if ($scaled.pixels.width -eq $case.initial.pixels.width -and $scaled.pixels.height -eq $case.initial.pixels.height -and (Get-FileHash -LiteralPath $scaled.path).Hash -eq (Get-FileHash -LiteralPath $case.initial.path).Hash) { throw 'DPI scale did not change the rendered frame.' }
+                if (![RendererNative]::Scale($surfaceWindow, $dpi)) { throw 'DPI scale restore rejected.' }
+                Start-Sleep -Milliseconds 400
+                # Font-scale notifications can round the host by a few physical
+                # pixels. Restore geometry before exact parity.
+                [void][RendererNative]::Resize($hostWindow, $hostWidth, $hostHeight)
+                Start-Sleep -Milliseconds 300
+                $restored = & $capture $step.restored
+                $case[$step.keys + 'Restored'] = $restored
+                $diff = [RendererNative]::Diff($case.initial.path, $restored.path, (Join-Path $run ($step.restored + '-diff.png'))) | ConvertFrom-Json
+                $case[$step.keys + 'Diff'] = $diff
+                if ($diff.different -ne 0) { throw "DPI scale round trip through $($step.dpi) DPI changed pixels." }
+            }
         }
         if ($ReloadUnsupported) {
             $reloadShader = Join-Path $run 'reload.glsl'

@@ -13,6 +13,7 @@ public static class RendererNative {
  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct SI { public int cb; public string reserved,desktop,title; public int x,y,w,h,charsX,charsY,fill,flags; public short show,reserved2; public IntPtr reservedPtr,stdin,stdout,stderr; }
  [StructLayout(LayoutKind.Sequential)] public struct PI { public IntPtr process,thread; public int pid,tid; }
  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int l,t,r,b; }
+ [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cb; public RECT monitor,work; public uint flags; }
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  [DllImport("user32",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr d,IntPtr m,int f,uint a,IntPtr s);
  [DllImport("user32")] public static extern bool CloseDesktop(IntPtr h);
@@ -31,6 +32,8 @@ public static class RendererNative {
  [DllImport("user32",CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h,StringBuilder b,int n);
  [DllImport("user32")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32")] public static extern uint GetDpiForWindow(IntPtr h);
+ [DllImport("user32")] public static extern IntPtr MonitorFromWindow(IntPtr h,uint flags);
+ [DllImport("user32")] public static extern bool GetMonitorInfoW(IntPtr m,ref MONITORINFO mi);
  [DllImport("user32")] public static extern bool ShowWindow(IntPtr h,int cmd);
  [DllImport("user32")] public static extern bool GetClientRect(IntPtr h,out RECT r);
  [DllImport("user32")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
@@ -48,6 +51,7 @@ public static class RendererNative {
  public static bool LoseDevice(IntPtr surf) { IntPtr result;return SendMessageTimeoutW(surf,0x8050,IntPtr.Zero,IntPtr.Zero,2,5000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
  public static bool RetryHardware(IntPtr surf) { IntPtr result;return SendMessageTimeoutW(surf,0x8058,IntPtr.Zero,IntPtr.Zero,2,5000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
  public static bool Replay(IntPtr surf) { IntPtr result;return SendMessageTimeoutW(surf,0x8051,IntPtr.Zero,IntPtr.Zero,2,5000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
+ public static RECT WorkArea(IntPtr h) { var mi=new MONITORINFO();mi.cb=Marshal.SizeOf(typeof(MONITORINFO));if(!GetMonitorInfoW(MonitorFromWindow(h,2),ref mi))throw new Exception("Cannot read the monitor work area");return mi.work; }
  public static bool Resize(IntPtr host,int w,int h) { return SetWindowPos(host,IntPtr.Zero,0,0,w,h,0x16); }
  public static void Readback(string bmp,string png) {using(var image=new Bitmap(bmp)){image.Save(png,ImageFormat.Png);} }
  public static bool Capture(IntPtr h,string path) { RECT r;GetClientRect(h,out r); using(var b=new Bitmap(Math.Max(1,r.r),Math.Max(1,r.b),PixelFormat.Format32bppArgb)) { bool ok;using(var g=Graphics.FromImage(b)){g.Clear(Color.Magenta);IntPtr dc=g.GetHdc();try{IntPtr result;ok=SendMessageTimeoutW(h,0x0318,dc,(IntPtr)4,2,5000,out result)!=IntPtr.Zero && result!=IntPtr.Zero;}finally{g.ReleaseHdc(dc);}}b.Save(path,ImageFormat.Png);return ok;} }

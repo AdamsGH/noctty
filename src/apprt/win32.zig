@@ -32913,7 +32913,8 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
         0x8057 => { // Test-only DPI scale notification, without moving monitors.
             if (build_config.renderer_test_tools) {
                 if (surface) |v| {
-                    if (!v.core_initialized or wParam < 96 or wParam > 384) return 0;
+                    // Down to half of 96, so a 96 DPI host can scale down too.
+                    if (!v.core_initialized or wParam < 48 or wParam > 384) return 0;
                     const scale: f32 = @as(f32, @floatFromInt(wParam)) / 96;
                     v.content_scale = .{ .x = scale, .y = scale };
                     v.core_surface.contentScaleCallback(v.content_scale) catch return 0;

@@ -27,6 +27,11 @@ idle occlusion probes, tabs/splits and pane closure, streaming output under
 power-saver pacing, shader reload, and unsupported-feature fallback. The DPI
 test calls the production surface scale callback and restores physical
 geometry; it does not simulate a real monitor crossing or host WM_DPICHANGED.
+It scales down to three quarters of the host's DPI everywhere, and up to 192
+DPI only where the scaled host fits the monitor's work area: a host that cannot
+grow shrinks the grid, and since PKG-14 a Windows pty does not pull the rows it
+pushed into history back when the grid grows again, so that round trip cannot
+be exact (a 1024x768 hosted runner records why it skipped the upscale).
 The fault hooks exercise production HRESULT handling, without resetting the
 system graphics driver. Every local case must close gracefully; the exact-PID
 fallback exists only for cleanup after a failure.
