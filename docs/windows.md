@@ -322,15 +322,19 @@ value saved at registration only when noctty is still selected, then removes
 noctty's per-user COM registration. It never overwrites a default-terminal
 choice made after noctty was registered. Registration state written by an
 earlier build did not record which keys it created, so unregistering it
-leaves those keys in place, as before.
+leaves those keys in place, as before; registering again does not add the
+record while noctty's mapping is still in place.
 
 An adopted console starts with the title and show state its client asked for.
 The window title is the startup title (usually the program's path) until the
 console sets another one, so cmd's `title`, PowerShell and full-screen
 programs name the window as they do anywhere else. When the client set
-`STARTF_USESHOWWINDOW`, `start /min` and `-WindowStyle Minimized` open the
-window minimized without taking focus, `SW_SHOWNOACTIVATE` opens it without
-taking focus, and a maximized start opens it maximized. A client that asked
+`STARTF_USESHOWWINDOW`, `start /min` and `Start-Process -WindowStyle
+Minimized` open the window minimized without taking focus, `SW_SHOWNOACTIVATE`
+opens it without taking focus, and a maximized start opens it maximized.
+`powershell.exe -WindowStyle Hidden` is different: PowerShell hides its own
+console window after it starts, which noctty does not follow. A title set in
+the configuration stays in force. A client that asked
 for a hidden console gets a minimized window that takes no focus: Windows
 hands every such console to the terminal, and a window nobody can bring back
 would be worse. Only `CREATE_NO_WINDOW` keeps a console from being delegated.

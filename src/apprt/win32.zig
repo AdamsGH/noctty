@@ -8446,8 +8446,9 @@ pub const App = struct {
             .show = adoptedInitialShow(pending.startup_flags, pending.show_window),
         });
         // Nothing has drained the surface's mailbox yet, so this cannot
-        // overwrite a title the console already set.
-        surface.setTitle(pending.title) catch |err| {
+        // overwrite a title the console already set. A `title` the user
+        // configured is static and already applied by the core.
+        if (config.title == null) surface.setTitle(pending.title) catch |err| {
             log.warn("adopted window startup title failed err={}", .{err});
         };
         win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_created");
@@ -8505,6 +8506,14 @@ pub const App = struct {
         try std.testing.expect(!Hook.title_pinned);
         try std.testing.expectEqual(InitialShow.minimized, Hook.show);
         try std.testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", created.title.?);
+
+        // A title the user configured is static and wins over the client's.
+        try appendOwnedString(core_app.alloc, &created.title, null);
+        app.config.title = "My Term";
+        defer app.config.title = null;
+        try app.createAdoptedWindow(&pending);
+        try std.testing.expect(Hook.title_pinned);
+        try std.testing.expect(created.title == null);
     }
 
     test "a handed-off console's show state maps to the host's first show" {
@@ -23458,8 +23467,8 @@ const InitialShow = enum {
     /// Maximized, with focus.
     maximized,
 
-    /// The `ShowWindow` command that precedes presenting the window with
-    /// focus, if any.
+    /// The `ShowWindow` command for the first show, if it is not left to
+    /// `presentWindow`. A maximize is followed by `presentWindow` for focus.
     fn showCommand(self: InitialShow) ?i32 {
         return switch (self) {
             .activate => null,
