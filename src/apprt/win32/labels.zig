@@ -292,9 +292,9 @@ pub fn dockedSearchArrowDirection(vk: WPARAM) ?input.Binding.Action.NavigateSear
 /// The banner for the last tab of a window being closed. It names the key bound
 /// to `undo` (the first one found, in the way a hint is written: `Ctrl+Shift+Z`)
 /// and falls back when `undo` is unbound or customization makes dispatch ambiguous.
-pub fn tabClosedMessage(set: *const input.Binding.Set, has_modifier_remaps: bool, buf: []u8) []const u8 {
+pub fn tabClosedMessage(set: *const input.Binding.Set, options: struct { has_modifier_remaps: bool = false, us_layout: bool = false }, buf: []u8) []const u8 {
     const fallback = "Tab closed. Use undo to restore it.";
-    if (has_modifier_remaps) return fallback;
+    if (options.has_modifier_remaps) return fallback;
     var it = set.bindings.iterator();
     const trigger = while (it.next()) |entry| {
         switch (entry.value_ptr.*) {
@@ -305,9 +305,11 @@ pub fn tabClosedMessage(set: *const input.Binding.Set, has_modifier_remaps: bool
 
     switch (trigger.key) {
         .unicode => |cp| {
-            // Win32 keyFromVirtualKey maps VK_A..VK_Z directly to key_a..key_z.
-            // That physical binding and translated-text bindings precede the
-            // unshifted letter in getEvent; unrelated keys cannot shadow it.
+            // Only the exact US layout establishes these physical/text
+            // identities. Other layouts (including US-International and
+            // Turkish Q) can produce this letter from a different key or
+            // different shifted text, so use generic wording there.
+            if (!options.us_layout) return fallback;
             if (cp < 'a' or cp > 'z') return fallback;
             var overrides = set.bindings.iterator();
             while (overrides.next()) |entry| {
@@ -5603,13 +5605,13 @@ test "tabClosedMessage names the key bound to undo" {
     var set: input.Binding.Set = .{};
     try std.testing.expectEqualStrings(
         "Tab closed. Use undo to restore it.",
-        tabClosedMessage(&set, false, &buf),
+        tabClosedMessage(&set, .{ .us_layout = true }, &buf),
     );
 
     try set.put(arena.allocator(), .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true } }, .{ .new_tab = {} });
     try std.testing.expectEqualStrings(
         "Tab closed. Use undo to restore it.",
-        tabClosedMessage(&set, false, &buf),
+        tabClosedMessage(&set, .{ .us_layout = true }, &buf),
     );
 
     try set.putFlags(
@@ -5620,7 +5622,7 @@ test "tabClosedMessage names the key bound to undo" {
     );
     try std.testing.expectEqualStrings(
         "Tab closed. Press Ctrl+Shift+Z to undo.",
-        tabClosedMessage(&set, false, &buf),
+        tabClosedMessage(&set, .{ .us_layout = true }, &buf),
     );
 
     // A physical key, and a buffer too small for the hint.
@@ -5628,12 +5630,12 @@ test "tabClosedMessage names the key bound to undo" {
     try other.put(arena.allocator(), .{ .key = .{ .physical = .f9 }, .mods = .{ .alt = true } }, .{ .undo = {} });
     try std.testing.expectEqualStrings(
         "Tab closed. Press Alt+F9 to undo.",
-        tabClosedMessage(&other, false, &buf),
+        tabClosedMessage(&other, .{ .us_layout = true }, &buf),
     );
     var tiny: [8]u8 = undefined;
     try std.testing.expectEqualStrings(
         "Tab closed. Use undo to restore it.",
-        tabClosedMessage(&other, false, &tiny),
+        tabClosedMessage(&other, .{ .us_layout = true }, &tiny),
     );
 }
 
@@ -5647,22 +5649,49 @@ test "PKG32 tabClosedMessage does not advertise a shadowed or remapped undo chor
         .key = .{ .physical = .key_z },
         .mods = .{ .ctrl = true, .shift = true },
     }, .ignore);
-    try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, false, &buf));
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, .{ .us_layout = true }, &buf));
 
     // Restore an unambiguous default, then introduce an actual modifier map.
     set.remove(cfg._arena.?.allocator(), .{ .key = .{ .physical = .key_z }, .mods = .{ .ctrl = true, .shift = true } });
-    try std.testing.expectEqualStrings("Tab closed. Press Ctrl+Shift+Z to undo.", tabClosedMessage(set, false, &buf));
+    try std.testing.expectEqualStrings("Tab closed. Press Ctrl+Shift+Z to undo.", tabClosedMessage(set, .{ .us_layout = true }, &buf));
     for ([_]u21{ 'Z', 0x1a }) |cp| {
         const trigger: input.Binding.Trigger = .{ .key = .{ .unicode = cp }, .mods = .{ .ctrl = true, .shift = true } };
         try set.put(cfg._arena.?.allocator(), trigger, .ignore);
-        try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, false, &buf));
+        try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, .{ .us_layout = true }, &buf));
         set.remove(cfg._arena.?.allocator(), trigger);
     }
     try cfg.@"key-remap".parse(cfg._arena.?.allocator(), "ctrl=alt");
     try std.testing.expectEqualStrings(
         fallback,
-        tabClosedMessage(set, cfg.@"key-remap".map.count() != 0, &buf),
+        tabClosedMessage(set, .{ .us_layout = true, .has_modifier_remaps = cfg.@"key-remap".map.count() != 0 }, &buf),
     );
+}
+
+test "PKG32 tabClosedMessage falls back for layout-dependent physical and text overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var set: input.Binding.Set = .{};
+    const mods: input.Mods = .{ .ctrl = true, .shift = true };
+    try set.put(alloc, .{ .key = .{ .unicode = 'i' }, .mods = mods }, .undo);
+    const physical: input.Binding.Trigger = .{ .key = .{ .physical = .quote }, .mods = mods };
+    try set.put(alloc, physical, .ignore);
+    // Turkish Q: the dotted i is VK_OEM_7 and its shifted text is U+0130.
+    const event: input.KeyEvent = .{
+        .action = .press,
+        .key = .quote,
+        .mods = mods,
+        .unshifted_codepoint = 'i',
+        .utf8 = "İ",
+    };
+    var buf: [96]u8 = undefined;
+    const fallback = "Tab closed. Use undo to restore it.";
+    try std.testing.expectEqual(input.Binding.Action.ignore, set.getEvent(event).?.value_ptr.leaf.action);
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(&set, .{}, &buf));
+    set.remove(alloc, physical);
+    try set.put(alloc, .{ .key = .{ .unicode = 'İ' }, .mods = mods }, .ignore);
+    try std.testing.expectEqual(input.Binding.Action.ignore, set.getEvent(event).?.value_ptr.leaf.action);
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(&set, .{}, &buf));
 }
 
 test "PKG32 default F3 and Shift+F3 match the docked search F3 and Enter directions" {

@@ -9673,7 +9673,7 @@ pub const App = struct {
                         "tab close banner failed",
                         host.setBanner(.info, labels.tabClosedMessage(
                             &self.config.keybind.set,
-                            self.config.@"key-remap".map.count() != 0,
+                            .{ .has_modifier_remaps = self.config.@"key-remap".map.count() != 0, .us_layout = sys.GetKeyboardLayout(0) == 0x04090409 },
                             &hint_buf,
                         )),
                     );
