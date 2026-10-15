@@ -2,6 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 
+/// Held across a spawn that hands a child inheritable pipe ends and across
+/// the shell spawn, which passes `bInheritHandles = TRUE` and so takes every
+/// inheritable handle in the process. A shell started while profile
+/// discovery was creating `wsl.exe -l -q` could otherwise inherit the write
+/// end of `wsl.exe`'s stdout pipe, and discovery's read of that pipe would
+/// never see end of file.
+pub var inheritable_spawn_lock: std.Thread.Mutex = .{};
+
 // Export any constants or functions we need from the Windows API so
 // we can just import one file.
 pub const kernel32 = windows.kernel32;

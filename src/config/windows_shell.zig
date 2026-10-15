@@ -163,7 +163,9 @@ fn appendConfiguredSshProfiles(
     // shells rather than propagating, because the caller treats an error as
     // "no profiles at all" and would leave the user with no picker.
     const hosts = windows_ssh_hosts.load(alloc) catch |err| {
-        warnSshDiscoveryOnce(err);
+        // Busy: another discovery was reading the config at the same
+        // moment. Not worth a warning; the incomplete list is retried.
+        if (err != error.SshConfigReadBusy) warnSshDiscoveryOnce(err);
         if (complete) |value| value.* = false;
         return shell_profiles;
     };
@@ -1248,7 +1250,7 @@ fn probeWslExecutable(alloc: Allocator, exe_path: []const u8) !bool {
     child.stderr_behavior = .Ignore;
     child.create_no_window = true;
 
-    child.spawn() catch |err| {
+    spawnHoldingInheritLock(&child) catch |err| {
         log.warn("failed to probe wsl responsiveness exe={s} err={}", .{ exe_path, err });
         return false;
     };
@@ -1567,6 +1569,15 @@ const WslOutputDrain = struct {
     }
 };
 
+/// `std.process.Child` creates inheritable ends for its pipes and closes them
+/// in this process after `CreateProcessW`. Holding the lock across that keeps
+/// a concurrent shell spawn from inheriting them.
+fn spawnHoldingInheritLock(child: *std.process.Child) !void {
+    win32.inheritable_spawn_lock.lock();
+    defer win32.inheritable_spawn_lock.unlock();
+    try child.spawn();
+}
+
 fn listWslDistros(alloc: Allocator, exe_path: []const u8) ![][]u8 {
     var child = std.process.Child.init(&.{ exe_path, "-l", "-q" }, alloc);
     child.stdin_behavior = .Ignore;
@@ -1574,7 +1585,7 @@ fn listWslDistros(alloc: Allocator, exe_path: []const u8) ![][]u8 {
     child.stderr_behavior = .Ignore;
     child.create_no_window = true;
 
-    try child.spawn();
+    try spawnHoldingInheritLock(&child);
     var child_running = true;
     errdefer {
         if (child_running) _ = child.kill() catch {};

@@ -174,6 +174,8 @@ pub const WM_WINHOSTTY_QUIT = WM_APP + 12;
 pub const WM_WINHOSTTY_CONSOLE_VISIBILITY = WM_APP + 13;
 /// A profile discovery that ran off the UI thread finished (`App.startProfileDiscovery`).
 pub const WM_WINHOSTTY_PROFILES = WM_APP + 14;
+/// A jump-list commit that ran off the UI thread finished (`App.startJumpListRebuild`).
+pub const WM_WINHOSTTY_JUMP_LIST = WM_APP + 15;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;

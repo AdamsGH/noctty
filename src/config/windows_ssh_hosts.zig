@@ -76,6 +76,10 @@ fn loadFromHome(alloc: Allocator, home_dir: []const u8) ![]Host {
         .ssh_config_read_started_ns = std.time.nanoTimestamp(),
     };
     try load_context.parseFile(config_path, 0);
+    // Another discovery was reading a config file at the same moment, so
+    // this list may be missing hosts. Say so instead of returning it as
+    // the whole answer; the caller marks its discovery incomplete.
+    if (load_context.busy) return error.SshConfigReadBusy;
     return try hosts.toOwnedSlice(alloc);
 }
 
@@ -93,6 +97,8 @@ const LoadContext = struct {
     hosts: *std.ArrayList(Host),
     includes_read: usize = 0,
     ssh_config_read_started_ns: i128,
+    /// A file was skipped because another read was in progress.
+    busy: bool = false,
 
     fn parseFile(self: *LoadContext, path: []const u8, depth: u8) Allocator.Error!void {
         const contents = switch (try self.readFileWithinBudget(path)) {
@@ -115,6 +121,10 @@ const LoadContext = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.FileNotFound => return .missing,
+            error.SshConfigReadBusy => {
+                self.busy = true;
+                return .skipped;
+            },
             else => {
                 warnReadOnce(path, err);
                 return .skipped;
@@ -441,7 +451,7 @@ fn readSshConfigFileBounded(
 ) !?[]u8 {
     if (timeout_ns == 0) return null;
     if (ssh_config_read_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
-        return null;
+        return error.SshConfigReadBusy;
     }
 
     const worker_alloc = std.heap.page_allocator;
@@ -889,6 +899,15 @@ test "ssh config bounds file opens away from the caller" {
         slowRead,
     )) == null);
 
+    // The timed-out read still owns the slot, so a second read is busy,
+    // not empty.
+    try testing.expectError(error.SshConfigReadBusy, readSshConfigFileBounded(
+        alloc,
+        path,
+        std.time.ns_per_s,
+        readFile,
+    ));
+
     const wait_started = std.time.nanoTimestamp();
     while (ssh_config_read_in_progress.load(.acquire)) {
         if (std.time.nanoTimestamp() - wait_started > std.time.ns_per_s) {
@@ -896,6 +915,22 @@ test "ssh config bounds file opens away from the caller" {
         }
         std.Thread.sleep(std.time.ns_per_ms);
     }
+}
+
+test "ssh config load reports a read skipped for a concurrent one" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".ssh");
+    try tmp.dir.writeFile(.{ .sub_path = ".ssh/config", .data = "Host alpha\n" });
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    // Another discovery's read holds the single slot.
+    try testing.expect(ssh_config_read_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) == null);
+    defer ssh_config_read_in_progress.store(false, .release);
+    try testing.expectError(error.SshConfigReadBusy, loadFromHome(alloc, home));
 }
 
 test "ssh config missing unreadable and oversized roots produce empty lists" {
