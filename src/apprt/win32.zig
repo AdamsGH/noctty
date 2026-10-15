@@ -5707,9 +5707,11 @@ pub const App = struct {
             defer self.core_app.alloc.free(ledger_path);
             markRecoverySessionRestoreAtPath(self.core_app.alloc, ledger_path, &self.recovery_startup, unixMillis());
         }
-        // Debug-only fault for the restore crash loop harness.
+        // Debug-only fault for the restore crash-loop harness: the process
+        // ends mid-restore, as a release abort does (ExitProcess(3)), without
+        // the breakpoint a Debug panic raises.
         if (builtin.mode == .Debug and std.process.hasEnvVarConstant("NOCTTY_DEBUG_CRASH_SESSION_RESTORE")) {
-            @panic("NOCTTY_DEBUG_CRASH_SESSION_RESTORE");
+            std.process.exit(3);
         }
 
         var restored = false;
