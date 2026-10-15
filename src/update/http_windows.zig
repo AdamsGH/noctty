@@ -291,6 +291,7 @@ const FakePeer = struct {
     server: std.net.Server,
     mode: enum { tls, head, body, capture, progress },
     response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    fragment_bytes: usize = 0,
     stop: std.Thread.ResetEvent = .{},
     head: [4096]u8 = undefined,
     head_len: usize = 0,
@@ -312,6 +313,20 @@ const FakePeer = struct {
         self.head_len = @min(request.head_buffer.len, self.head.len);
         @memcpy(self.head[0..self.head_len], request.head_buffer[0..self.head_len]);
         if (self.mode == .capture) {
+            if (self.fragment_bytes != 0) {
+                var offset: usize = 0;
+                while (offset < self.response.len) {
+                    // Split early framing byte by byte, including the first
+                    // multi-digit chunk size and its CRLF; then fragment data.
+                    const fragment_len: usize = if (offset < 128) 1 else self.fragment_bytes;
+                    const end = @min(offset + fragment_len, self.response.len);
+                    writer.interface.writeAll(self.response[offset..end]) catch return;
+                    writer.interface.flush() catch return;
+                    offset = end;
+                    self.stop.timedWait(std.time.ns_per_ms) catch {};
+                }
+                return;
+            }
             writer.interface.writeAll(self.response) catch return;
             writer.interface.flush() catch {};
             return;
@@ -438,6 +453,94 @@ test "update HTTP transport decodes gzip aliases and deflate with the decompress
             } else {
                 try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(alloc, &out.writer, cap));
             }
+        }
+    }
+}
+
+test "update HTTP transport decodes a large gzip body across reader boundaries" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const contents = try alloc.alloc(u8, 48 * 1024 + 17);
+    defer alloc.free(contents);
+    var random = std.Random.DefaultPrng.init(0x706b673632);
+    random.random().bytes(contents);
+    var compressed: std.Io.Writer.Allocating = .init(alloc);
+    defer compressed.deinit();
+    // A gzip member with one stored DEFLATE block keeps the encoded fixture
+    // larger than 16 KiB without relying on Zig 0.15's unfinished compressor.
+    try compressed.writer.writeAll("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x01");
+    var lengths: [4]u8 = undefined;
+    const block_len: u16 = @intCast(contents.len);
+    std.mem.writeInt(u16, lengths[0..2], block_len, .little);
+    std.mem.writeInt(u16, lengths[2..4], ~block_len, .little);
+    try compressed.writer.writeAll(&lengths);
+    try compressed.writer.writeAll(contents);
+    var footer: [8]u8 = undefined;
+    std.mem.writeInt(u32, footer[0..4], std.hash.Crc32.hash(contents), .little);
+    std.mem.writeInt(u32, footer[4..8], @intCast(contents.len), .little);
+    try compressed.writer.writeAll(&footer);
+    // Both encoded and decoded data must span the transport's 16 KiB buffer.
+    try std.testing.expect(compressed.written().len > 16 * 1024);
+    const reply = try std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ compressed.written().len, compressed.written() });
+    defer alloc.free(reply);
+    for ([_]usize{ contents.len, contents.len - 1 }) |cap| {
+        var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = .capture, .response = reply };
+        const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
+        defer peer.finish(thread);
+        var url: [256]u8 = undefined;
+        var response = try Response.openImpl(alloc, try peer.uri(&url), &.{}, 1000, false);
+        defer response.deinit();
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (cap == contents.len) {
+            try response.streamBody(alloc, &out.writer, cap);
+            try std.testing.expectEqualSlices(u8, contents, out.written());
+        } else {
+            try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(alloc, &out.writer, cap));
+        }
+    }
+}
+
+test "update HTTP transport decodes fragmented chunked replies across reader boundaries" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const contents = try alloc.alloc(u8, 48 * 1024 + 17);
+    defer alloc.free(contents);
+    for (contents, 0..) |*byte, i| byte.* = @truncate(i *% 37 +% (i / 251));
+    var reply: std.Io.Writer.Allocating = .init(alloc);
+    defer reply.deinit();
+    try reply.writer.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    var offset: usize = 0;
+    for ([_]usize{ 1, 16383, 16385, 73, contents.len - 32842 }) |chunk_len| {
+        try reply.writer.print("{x}\r\n", .{chunk_len});
+        try reply.writer.writeAll(contents[offset..][0..chunk_len]);
+        try reply.writer.writeAll("\r\n");
+        offset += chunk_len;
+    }
+    try std.testing.expectEqual(contents.len, offset);
+    try reply.writer.writeAll("0\r\n\r\n");
+    for ([_]usize{ contents.len, contents.len - 1 }) |cap| {
+        var peer: FakePeer = .{
+            .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}),
+            .mode = .capture,
+            .response = reply.written(),
+            // Split chunk lengths, CRLFs and payloads across separate writes.
+            .fragment_bytes = 257,
+        };
+        const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
+        defer peer.finish(thread);
+        var url: [256]u8 = undefined;
+        // This tests framing, not deadlines. Bytewise writes can each wait a
+        // whole Windows timer tick even though the peer requests only 1 ms.
+        var response = try Response.openImpl(alloc, try peer.uri(&url), &.{}, 5000, false);
+        defer response.deinit();
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (cap == contents.len) {
+            try response.streamBody(alloc, &out.writer, cap);
+            try std.testing.expectEqualSlices(u8, contents, out.written());
+        } else {
+            try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(alloc, &out.writer, cap));
         }
     }
 }
