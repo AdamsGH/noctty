@@ -4250,6 +4250,10 @@ pub const App = struct {
     /// When the running discovery started (GetTickCount64), so one that never
     /// finishes does not block every later attempt.
     profile_discovery_started_ms: u64 = 0,
+    /// Fires once after a worker starts, unless its result arrived, to start
+    /// another attempt: nothing else re-arms the jump list's timer when a
+    /// worker hangs or cannot deliver.
+    profile_discovery_watchdog_id: ?UINT_PTR = null,
     message_hwnd: ?HWND = null,
     core_ticking: bool = false,
     quit_timer_id: ?UINT_PTR = null,
@@ -4739,6 +4743,7 @@ pub const App = struct {
             self.stopRecoveryRetryTimer();
             self.stopProgramStatusNotifyTimer();
             self.stopUpdateRecheckTimer();
+            self.stopProfileDiscoveryWatchdog();
             @atomicStore(DWORD, &self.ui_thread_id, 0, .release);
             if (self.pending_profile_discovery) |pending| pending.deinit();
             self.pending_profile_discovery = null;
@@ -4963,6 +4968,14 @@ pub const App = struct {
                 if (self.update_recheck_timer_id) |timer_id| {
                     if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
                         self.onUpdateRecheckTimer();
+                        continue;
+                    }
+                }
+                if (self.profile_discovery_watchdog_id) |timer_id| {
+                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
+                        self.stopProfileDiscoveryWatchdog();
+                        const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
+                        if (pending and self.hosts.items.len > 0) self.startProfileDiscovery();
                         continue;
                     }
                 }
@@ -7056,6 +7069,16 @@ pub const App = struct {
             return self.discoverStartupProfilesNow();
         };
         thread.detach();
+        self.stopProfileDiscoveryWatchdog();
+        const timer_id = sys.SetTimer(null, 0, @intCast(profile_discovery_abandon_ms + std.time.ms_per_s), null);
+        if (timer_id != 0) self.profile_discovery_watchdog_id = timer_id;
+    }
+
+    fn stopProfileDiscoveryWatchdog(self: *App) void {
+        if (self.profile_discovery_watchdog_id) |timer_id| {
+            _ = sys.KillTimer(null, timer_id);
+            self.profile_discovery_watchdog_id = null;
+        }
     }
 
     fn applyPendingProfileDiscovery(self: *App) void {
@@ -7063,6 +7086,7 @@ pub const App = struct {
         self.pending_profile_discovery = null;
         defer pending.deinit();
         if (self.delivery) |delivery| delivery.profiles_running.store(false, .release);
+        self.stopProfileDiscoveryWatchdog();
         self.handleProfileDiscovery(pending);
     }
 
@@ -12797,7 +12821,8 @@ fn automationHostFocused(
 
 /// `App.startProfileDiscovery`'s detached worker. It holds a reference on
 /// the delivery channel and allocates from the page allocator, so it may
-/// outlive the App; a result nobody takes is freed by the channel.
+/// outlive the App; a result nobody takes is freed by the channel. When it
+/// cannot deliver, the App's watchdog timer starts another attempt.
 fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, generation: u64) void {
     defer delivery.release();
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
