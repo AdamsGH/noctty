@@ -197,6 +197,10 @@ Optional:
   requires an explicit http(s) URL.
 - Environment or repo variable: `WINDOWS_CODESIGN_TRUST_SELF_SIGNED`
   Default: unset / false
+- Environment or repo variable: `WINDOWS_CODESIGN_MIN_VALIDITY_DAYS`
+  Default: 180, which is also the minimum. Preflight rejects a value that is
+  not an integer of at least 180, and rejects a signing certificate with
+  fewer than this many days of validity left. Set it only to raise the floor.
 
 Recommended setup:
 

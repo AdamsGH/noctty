@@ -216,6 +216,8 @@ if ($latestVersion) {
     Require-Regex -RelativePath "site/version.js" -Pattern "DEFAULT_NC_VERSION\s*=\s*'$escapedVersion'" -Reason "Site source default release version should match README."
     Require-Regex -RelativePath "site/terminal.js" -Pattern "NC_VERSION\s*=\s*\(typeof window !== 'undefined' && window\.NC_VERSION\)\s*\|\|\s*'$escapedVersion'" -Reason "Site terminal default release version should match README."
     Require-Regex -RelativePath "site/index.html" -Pattern "(?<![\d.])$escapedVersion(?![\d.])" -Reason "The landing page should ship the current README release version as its compiled default."
+    Require-Regex -RelativePath "site/why-noctty.html" -Pattern ('id="nc-version">v' + $escapedVersion + '</strong>') -Reason "The trust page's static latest-release text should match README; it only changes when version.js finds a newer tag."
+    Require-Regex -RelativePath "site/why-noctty.html" -Pattern ('id="nc-version-summary">Version ' + $escapedVersion + ',') -Reason "The trust page's screen-reader summary should match README."
     Require-Regex -RelativePath "docs/getting-started.md" -Pattern ('current stable release is\s+`?' + $escapedVersion + '`?(?![\d.])') -Reason "Getting-started stable version should match README."
 }
 

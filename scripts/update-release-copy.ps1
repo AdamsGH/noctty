@@ -36,6 +36,14 @@ foreach ($relative in @(
     [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
 }
 
+# The trust page also names older versions on purpose (the verifier floor v1.3.124,
+# the legacy v1.3.123 path), so only its two latest-release elements are rewritten.
+$trustPath = Join-Path $repoRoot 'site/why-noctty.html'
+$trust = [System.IO.File]::ReadAllText($trustPath)
+$trust = [regex]::Replace($trust, '(id="nc-version">v)\d+\.\d+\.\d+', "`${1}$Version", 1)
+$trust = [regex]::Replace($trust, '(id="nc-version-summary">Version )\d+\.\d+\.\d+', "`${1}$Version", 1)
+[System.IO.File]::WriteAllText($trustPath, $trust, [System.Text.UTF8Encoding]::new($false))
+
 if (-not $SkipSiteBuild) {
     & node (Join-Path $repoRoot 'scripts/build-site-assets.mjs')
     if ($LASTEXITCODE -ne 0) { throw "Site asset refresh failed with exit code $LASTEXITCODE." }

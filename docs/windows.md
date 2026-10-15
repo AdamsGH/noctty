@@ -162,6 +162,12 @@ with one of those names is not a marker. A freshly extracted ZIP is not
 portable by default, because it ships `config-template.ghostty`, which is not
 a marker. An empty `noctty.portable` is enough.
 
+`config.ghostty` is a marker only for portable extracts: when the setup
+installer's machine-wide uninstall entry records the directory as its
+`InstallLocation`, a lone `config.ghostty` is ignored, so a config file dropped
+beside an installed `noctty.exe` does not move its data. `noctty.portable` and
+`portable.txt` still count in an installed directory.
+
 In portable mode, config, state, and cache live beside the executable
 (`config.ghostty`, `update-state.json`, session state, crash dumps, caches).
 That location takes precedence over `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
@@ -698,9 +704,11 @@ when at least two swaps are present and the time difference is positive.
 Key events are translated with the active Windows keyboard layout, so the
 terminal receives the text a key produces on that layout rather than a
 US-layout approximation. Control chords are encoded from the unmodified
-layout text: `ctrl+c` sends `0x03`, and combinations with no C0 byte
-(`ctrl+,`, `ctrl+.`, `ctrl+m`, `ctrl+i`, `ctrl+[`) send the fixterms
-`CSI <codepoint>;5u` form that editors such as Neovim and Helix understand.
+layout text: `ctrl+c` sends `0x03`. `ctrl+,` and `ctrl+.` have no C0 byte,
+and `ctrl+m`, `ctrl+i` and `ctrl+[` would collide with Enter (`0x0D`), Tab
+(`0x09`) and Escape (`0x1B`), so all five send the fixterms
+`CSI <codepoint>;5u` form that editors such as Neovim and Helix understand
+and that lets them tell the chords apart from those keys.
 
 AltGr is a layout shift, not a Ctrl+Alt chord. Windows synthesizes left Ctrl
 plus right Alt whenever AltGr is pressed, and noctty drops that synthetic
