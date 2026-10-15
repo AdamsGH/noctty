@@ -292,7 +292,9 @@ pub fn dockedSearchArrowDirection(vk: WPARAM) ?input.Binding.Action.NavigateSear
 /// The banner for the last tab of a window being closed. It names the key bound
 /// to `undo` (the first one found, in the way a hint is written: `Ctrl+Shift+Z`)
 /// and falls back when `undo` is unbound or customization makes dispatch ambiguous.
-pub fn tabClosedMessage(set: *const input.Binding.Set, options: struct { has_modifier_remaps: bool = false, us_layout: bool = false }, buf: []u8) []const u8 {
+/// With `undo-timeout = 0` nothing can be restored, so it offers nothing.
+pub fn tabClosedMessage(set: *const input.Binding.Set, options: struct { has_modifier_remaps: bool = false, us_layout: bool = false, undo_available: bool = true }, buf: []u8) []const u8 {
+    if (!options.undo_available) return "Tab closed.";
     const fallback = "Tab closed. Use undo to restore it.";
     if (options.has_modifier_remaps) return fallback;
     var it = set.bindings.iterator();
@@ -1611,20 +1613,16 @@ pub fn programClipboardPromptTitle(request: ProgramClipboardRequest) []const u8 
 /// quotes.
 const program_prompt_title_width = 24;
 
-/// The body of a program's clipboard prompt, which names the tab that asked
-/// by its number and title, as the tab strip shows them. The title is the
-/// program's own text, so it may not crowd out or disguise the words
-/// around it: it is cut to `program_prompt_title_width` cells and as many
-/// code points (zero-width marks take no cell, and stacked they draw over
-/// the line), and controls, line and paragraph separators, and
-/// bidirectional formatting characters (which would reorder the words
-/// after it; see `isBidiFormatting`) become U+FFFD.
-pub fn buildProgramClipboardPromptBody(
-    alloc: Allocator,
-    request: ProgramClipboardRequest,
-    tab_number: usize,
-    tab_title: ?[]const u8,
-) ![]u8 {
+/// A tab as a prompt names it, by its number and title as the tab strip
+/// shows them: `Tab 2 (vim)`. The title is the program's own text, so it may
+/// not crowd out or disguise the words around it: it is cut to
+/// `program_prompt_title_width` cells and as many code points (zero-width
+/// marks take no cell, and stacked they draw over the line), and controls,
+/// line and paragraph separators, and bidirectional formatting characters
+/// (which would reorder the words after it; see `isBidiFormatting`) become
+/// U+FFFD. Any prompt that can come from a tab other than the one in front
+/// names it this way.
+pub fn promptTabName(alloc: Allocator, tab_number: usize, tab_title: ?[]const u8) ![]u8 {
     const raw = tab_title orelse "noctty";
     const limit = program_prompt_title_width;
     var title: std.ArrayListUnmanaged(u8) = .empty;
@@ -1651,10 +1649,64 @@ pub fn buildProgramClipboardPromptBody(
         try appendCodepoint(alloc, &title, cp);
         if (cells <= limit - 3 and count <= limit - 3) cut = title.items.len;
     }
+    return std.fmt.allocPrint(alloc, "Tab {d} ({s})", .{ tab_number, title.items });
+}
+
+/// The body of a program's clipboard prompt, which names the tab that asked.
+pub fn buildProgramClipboardPromptBody(
+    alloc: Allocator,
+    request: ProgramClipboardRequest,
+    tab_number: usize,
+    tab_title: ?[]const u8,
+) ![]u8 {
+    const tab = try promptTabName(alloc, tab_number, tab_title);
+    defer alloc.free(tab);
     return switch (request) {
-        .read => std.fmt.allocPrint(alloc, "Tab {d} ({s}) asked to read your clipboard. Allow sends it the text below.", .{ tab_number, title.items }),
-        .write => std.fmt.allocPrint(alloc, "Tab {d} ({s}) asked to replace your clipboard with the text below.", .{ tab_number, title.items }),
+        .read => std.fmt.allocPrint(alloc, "{s} asked to read your clipboard. Allow sends it the text below.", .{tab}),
+        .write => std.fmt.allocPrint(alloc, "{s} asked to replace your clipboard with the text below.", .{tab}),
     };
+}
+
+/// The title of the prompt for closing a tab that is not the one in front
+/// (`close_tab:this` from its button), which has to say which tab.
+pub fn backgroundTabClosePromptTitle(buf: *[32]u8, tab_number: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "Close tab {d}?", .{tab_number}) catch "Close a tab?";
+}
+
+/// The same for a terminal that closes by itself in a tab that is not the
+/// one in front (a read-only terminal whose program exited asks first).
+pub fn backgroundTerminalClosePromptTitle(buf: *[32]u8, tab_number: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "Close terminal in tab {d}?", .{tab_number}) catch "Close a terminal?";
+}
+
+pub fn buildBackgroundTerminalClosePromptBody(
+    alloc: Allocator,
+    tab_number: usize,
+    tab_title: ?[]const u8,
+    program_exited: bool,
+) ![]u8 {
+    const tab = try promptTabName(alloc, tab_number, tab_title);
+    defer alloc.free(tab);
+    // Read-only mode is why a terminal whose program has exited still asks.
+    return if (program_exited)
+        std.fmt.allocPrint(alloc, "The program in {s} has exited. Read-only mode makes closing that terminal ask first.", .{tab})
+    else
+        std.fmt.allocPrint(alloc, "A process is still running in {s}. Closing that terminal will terminate it.", .{tab});
+}
+
+/// Its body, for `count` terminals the tab would end, with undo off.
+pub fn buildBackgroundTabClosePromptBody(
+    alloc: Allocator,
+    count: usize,
+    tab_number: usize,
+    tab_title: ?[]const u8,
+) ![]u8 {
+    const tab = try promptTabName(alloc, tab_number, tab_title);
+    defer alloc.free(tab);
+    return if (count <= 1)
+        std.fmt.allocPrint(alloc, "A process is still running in {s}. Closing that tab will terminate it, and undo is off.", .{tab})
+    else
+        std.fmt.allocPrint(alloc, "Processes are still running in {d} terminals in {s}. Closing that tab will terminate them, and undo is off.", .{ count, tab });
 }
 
 test "a program's clipboard prompt names its tab and cannot be reordered by its title" {
@@ -1689,6 +1741,48 @@ test "a program's clipboard prompt names its tab and cannot be reordered by its 
     try std.testing.expectEqualStrings(
         "Tab 5 (a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d) asked to read your clipboard. Allow sends it the text below.",
         control,
+    );
+}
+
+test "the close prompt for a tab behind the front one names it as the clipboard prompt does" {
+    const alloc = std.testing.allocator;
+    var title_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Close tab 3?", backgroundTabClosePromptTitle(&title_buf, 3));
+    try std.testing.expectEqualStrings("Close terminal in tab 3?", backgroundTerminalClosePromptTitle(&title_buf, 3));
+
+    const one = try buildBackgroundTabClosePromptBody(alloc, 1, 3, "vim");
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 3 (vim). Closing that tab will terminate it, and undo is off.",
+        one,
+    );
+
+    const many = try buildBackgroundTabClosePromptBody(alloc, 2, 12, null);
+    defer alloc.free(many);
+    try std.testing.expectEqualStrings(
+        "Processes are still running in 2 terminals in Tab 12 (noctty). Closing that tab will terminate them, and undo is off.",
+        many,
+    );
+
+    const running = try buildBackgroundTerminalClosePromptBody(alloc, 2, "vim", false);
+    defer alloc.free(running);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 2 (vim). Closing that terminal will terminate it.",
+        running,
+    );
+    const exited = try buildBackgroundTerminalClosePromptBody(alloc, 2, "vim", true);
+    defer alloc.free(exited);
+    try std.testing.expectEqualStrings(
+        "The program in Tab 2 (vim) has exited. Read-only mode makes closing that terminal ask first.",
+        exited,
+    );
+
+    // The title is the program's own text: bounded and stripped the same way.
+    const hostile = try buildBackgroundTabClosePromptBody(alloc, 1, 4, "\u{202E}abcdefghijklmnopqrstuvwxyz0123456789");
+    defer alloc.free(hostile);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 4 (\u{FFFD}abcdefghijklmnopqrst...). Closing that tab will terminate it, and undo is off.",
+        hostile,
     );
 }
 
@@ -5720,6 +5814,17 @@ test "tabClosedMessage names the key bound to undo" {
     try std.testing.expectEqualStrings(
         "Tab closed. Press Ctrl+Shift+Z to undo.",
         tabClosedMessage(&set, .{ .us_layout = true }, &buf),
+    );
+
+    // `undo-timeout = 0`: bound or not, there is nothing to undo.
+    try std.testing.expectEqualStrings(
+        "Tab closed.",
+        tabClosedMessage(&set, .{ .us_layout = true, .undo_available = false }, &buf),
+    );
+    var unbound: input.Binding.Set = .{};
+    try std.testing.expectEqualStrings(
+        "Tab closed.",
+        tabClosedMessage(&unbound, .{ .undo_available = false }, &buf),
     );
 
     // A physical key, and a buffer too small for the hint.
