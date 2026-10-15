@@ -35,6 +35,13 @@ jobs:
           version: 0.15.2
           use-cache: false
 
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
       - name: Configure Zig cache directories
         shell: pwsh
         run: |
