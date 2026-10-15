@@ -1,0 +1,15 @@
+T-diag2/mdiag-colour-focused-type-r1     stall  210.2 ms msg=0xf at  1253.2 from output,  1300.6 from context, swaps_before=275 updates_before=276
+T-diag2/mdiag-colour-focused-type-r2     stall  175.4 ms msg=0xf at  1414.5 from output,  1464.0 from context, swaps_before=306 updates_before=307
+T-diag2/mdiag-colour-focused-type-r3     stall  189.6 ms msg=0xf at   755.5 from output,   806.8 from context, swaps_before=159 updates_before=160
+T-diag2/mdiag-colour-focused-type-r4     stall  218.1 ms msg=0xf at   547.0 from output,   607.5 from context, swaps_before=92 updates_before=93
+T-samp2/mdiag-colour-focused-type-r1     stall  213.4 ms msg=0xf at   787.2 from output,   861.3 from context, swaps_before=140 updates_before=141
+T-samp2/mdiag-colour-focused-type-r2     stall  399.0 ms msg=0x800a at    76.9 from output,   152.6 from context, swaps_before=1 updates_before=2
+T-samp2/mdiag-colour-focused-type-r3     stall  143.7 ms msg=0x31f at     6.7 from output,    67.1 from context, swaps_before=1 updates_before=2
+T-samp3/mdiag-colour-focused-type-r1     stall  166.3 ms msg=0x31f at    43.4 from output,    97.1 from context, swaps_before=1 updates_before=2
+T-samp3/mdiag-colour-focused-type-r2     stall  242.2 ms msg=0xf at   583.6 from output,   642.2 from context, swaps_before=89 updates_before=90
+T-fat/mdiag-colour-focused-type-r1     stall  210.6 ms msg=0xf at   639.0 from output,   707.3 from context, swaps_before=112 updates_before=113
+T-fat/mdiag-colour-focused-type-r2     stall  109.1 ms msg=0x31f at    17.0 from output,    62.7 from context, swaps_before=1 updates_before=2
+T-fat/mfat-colour-focused-type-r1      stall  209.8 ms msg=0xf at   523.3 from output,   578.8 from context, swaps_before=90 updates_before=91
+T-fat/mfat-colour-focused-type-r2      stall  135.3 ms msg=0x31f at    39.0 from output,   114.6 from context, swaps_before=1 updates_before=2
+T-newtab/mdiag-colour-focused-type-r1     stall  177.8 ms msg=0xf at   896.3 from output,   937.2 from context, swaps_before=194 updates_before=195
+T-newtab/mdiag-colour-focused-type-r2     stall  208.8 ms msg=0xf at   561.3 from output,   605.3 from context, swaps_before=112 updates_before=113

@@ -1,0 +1,12 @@
+T-warm1        A= 154.5 B=  17.7 gap= 171.5 ttff= 312 first_swap= 265
+T-warm2        A= 129.5 B=  52.6 gap= 308.8 ttff= 422 first_swap= 359
+T-warm3        A= 121.3 B=  26.8 gap= 139.0 ttff= 344 first_swap= 281
+T-warm4        A= 160.0 B=  14.3 gap= 174.9 ttff= 313 first_swap= 250
+T-warm5        A= 117.5 B=  20.0 gap= 136.7 ttff= 360 first_swap= 297
+T-nowarm1      A= 104.4 B= 176.4 gap= 176.2 ttff= 187 first_swap= 156
+T-nowarm2      A= 103.1 B= 186.6 gap= 186.2 ttff= 203 first_swap= 172
+T-nowarm3      A= 102.3 B= 162.3 gap= 162.3 ttff= 281 first_swap= 250
+T-nowarm4      A= 104.8 B= 194.5 gap= 194.3 ttff= 219 first_swap= 204
+T-nowarm5      A= 107.9 B= 201.2 gap= 200.8 ttff= 266 first_swap= 235
+T-warm         n=5 median A=130 B=20 gap=172 ttff=344 first_swap=281 | max A=160 B=53 gap=309
+T-nowarm       n=5 median A=104 B=187 gap=186 ttff=219 first_swap=204 | max A=108 B=201 gap=201

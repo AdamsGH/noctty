@@ -1,0 +1,11 @@
+      11.3 iter  101.5 msg=0x31f swaps_before=1 9=1, 7=1, 3=11
+     896.3 iter  177.8 msg=0xf swaps_before=194 10=95, 9=177
+    1625.2 iter   60.7 msg=0x113 swaps_before=330 1=61
+    4549.6 iter   45.5 msg=0x113 swaps_before=867 1=45
+    7551.1 iter   49.6 msg=0x113 swaps_before=876 1=50
+      24.6 iter   93.2 msg=0x31f swaps_before=1 3=12
+     561.3 iter  208.8 msg=0xf swaps_before=112 10=107, 9=208
+    1461.1 iter   66.8 msg=0x113 swaps_before=282 1=67
+    3856.4 iter   44.9 msg=0x8004 swaps_before=842 
+    4516.5 iter   46.3 msg=0x113 swaps_before=848 1=46
+    7516.6 iter   48.6 msg=0x113 swaps_before=857 1=49
