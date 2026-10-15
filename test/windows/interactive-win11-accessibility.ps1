@@ -6365,15 +6365,20 @@ try {
     }
     $keepEditingInvoke.Invoke()
     Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description 'settings keep-editing draft preservation' -Condition {
-        $visibleCloseActions = @($ownerSettingsElement.FindAll(
+        $visibleButtons = @($ownerSettingsElement.FindAll(
             [System.Windows.Automation.TreeScope]::Descendants,
             [System.Windows.Automation.Condition]::TrueCondition
         ) | Where-Object {
             $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
-            $_.Current.Name -in @('Save and close', 'Discard changes', 'Keep editing') -and
             -not $_.Current.IsOffscreen
         })
+        # The prompt's own buttons are gone; the action bar's Discard changes
+        # (same name, beside Save) is back, which is why it is counted apart.
+        $visibleCloseActions = @($visibleButtons | Where-Object { $_.Current.Name -in @('Save and close', 'Keep editing') })
+        $visibleBarDiscard = @($visibleButtons | Where-Object { $_.Current.Name -eq 'Discard changes' })
         return $visibleCloseActions.Count -eq 0 -and
+            $visibleBarDiscard.Count -eq 1 -and
+            $visibleBarDiscard[0].Current.IsEnabled -and
             $scrollbackValuePattern.Current.Value -eq $draftScrollbackText -and
             $ownerSaveButton.Current.IsEnabled
     }

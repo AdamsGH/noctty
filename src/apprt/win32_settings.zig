@@ -162,6 +162,8 @@ const WM_SETTINGS_PROOF_CHILD: UINT = WM_APP + 0x107;
 const WM_SETTINGS_PROOF_SET_FOCUS: UINT = WM_APP + 0x108;
 const WM_SETTINGS_PROOF_PAINT_COUNT: UINT = WM_APP + 0x109;
 const WM_SETTINGS_PROOF_LAYOUT_BATCHED: UINT = WM_APP + 0x10A;
+/// Posted by a raw scalar field's `EN_KILLFOCUS`; wParam is its `RawScalarField`.
+const WM_SETTINGS_FIELD_LEFT: UINT = WM_APP + 0x10B;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_TABSTOP: u32 = 0x00010000;
@@ -438,7 +440,7 @@ pub const SettingField = enum {
             .padding_balance => "Window padding balance",
             .auto_update => "Auto-update mode",
             .auto_update_channel => "Auto-update channel",
-            .accent_follow_system => "Follow the Windows accent color",
+            .accent_follow_system => "Follow Windows accent color",
         };
     }
 
@@ -1261,7 +1263,7 @@ const text_close_prompt_index = 3;
 const background_blur_label = "Background blur (not supported on Windows)";
 /// A file-level constant: `open` already spends its comptime branch quota on
 /// the other labels, and one more literal there fails the build.
-const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow the Windows accent color (tab strip)");
+const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow Windows accent color");
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
 const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
     .{ .role = .edit, .name = "Scrollback limit" },
@@ -1895,6 +1897,9 @@ pub const SettingsWindow = struct {
     /// What clicking Save does, gated on the button's own state so a shortcut
     /// cannot save while the button is disabled, hidden or the prompt is open.
     fn saveIfAllowed(self: *SettingsWindow) void {
+        // A shortcut for a Save that is off because a field is still inside its
+        // quiet period says why now.
+        if (!self.close_prompt_visible) self.showRawScalarErrors(null);
         const button_enabled = if (self.btn_save) |button| sys.IsWindowEnabled(button) != 0 else false;
         const button_visible = if (self.btn_save) |button| sys.IsWindowVisible(button) != 0 else false;
         if (saveCommandCanDispatch(
@@ -2014,17 +2019,23 @@ pub const SettingsWindow = struct {
         self.clearPending();
     }
 
+    /// Put every live preview back to the saved value. The preview writes the
+    /// draft into the app's config, which is what `currentConfig` hands out, so
+    /// anything that reads it as "what is saved" has to run this first.
+    fn rollbackPreviews(self: *SettingsWindow) void {
+        const transaction = &(self.transaction orelse return);
+        var effects: [setting_field_count]SettingsTransaction.Effect = undefined;
+        if (transaction.dispatch(.revert, &effects)) |emitted| {
+            self.dispatchEffects(emitted);
+        } else |err| std.log.warn("settings: preview rollback failed err={}", .{err});
+    }
+
     /// Drop the pending draft (if any) and its arena. Safe to call
     /// multiple times. Called from close paths and after Save so the
     /// next `open` starts with a fresh clone of the (possibly just-
     /// reloaded) app config.
     fn clearPending(self: *SettingsWindow) void {
-        if (self.transaction) |*transaction| {
-            var effects: [setting_field_count]SettingsTransaction.Effect = undefined;
-            if (transaction.dispatch(.revert, &effects)) |emitted| {
-                self.dispatchEffects(emitted);
-            } else |err| std.log.warn("settings: preview rollback failed err={}", .{err});
-        }
+        self.rollbackPreviews();
         self.transaction = null;
         self.validation_control = null;
         self.owned_validation_control = null;
@@ -2290,6 +2301,16 @@ pub const SettingsWindow = struct {
             changed = true;
         }
         if (changed) self.surfaceNextValidation(false);
+    }
+
+    /// Focus left `field`'s text field (`WM_SETTINGS_FIELD_LEFT`, posted from
+    /// its `EN_KILLFOCUS`): say what is wrong with it without waiting out the
+    /// quiet period. Pressing "Discard changes" takes focus first, and its
+    /// click throws the text away, so an error would flash up for nothing.
+    fn fieldLeft(self: *SettingsWindow, field: RawScalarField) void {
+        if (self.close_notified) return;
+        if (self.btn_discard_changes) |button| if (GetFocus() == button) return;
+        self.showRawScalarErrors(field);
     }
 
     /// `validation_quiet_ms` passed without a key in an invalid field.
@@ -4579,6 +4600,8 @@ pub const SettingsWindow = struct {
         _ = self.syncConflictControls();
         self.updateSaveEnabled();
         layoutChildren(self);
+        // An error that came up while the prompt hid the line was not spoken.
+        if (self.nextStatus() != .none) self.announceText(text_status_index);
 
         if (prior_focus) |control| {
             const belongs_to_settings = if (self.hwnd) |settings_hwnd|
@@ -4624,14 +4647,22 @@ pub const SettingsWindow = struct {
     /// discarded close (`adoptCurrentConfig`), and `clearPending` rolls back
     /// every live preview on the way.
     fn discardChanges(self: *SettingsWindow) void {
-        if (self.close_prompt_visible or self.close_posted or !self.hasPendingChanges()) return;
+        // Not while the button is hidden: UIA can invoke it there.
+        const button = self.btn_discard_changes orelse return;
+        if (sys.IsWindowVisible(button) == 0 or self.close_posted or !self.hasPendingChanges()) return;
         self.freeNoteText();
+        // The saved config is read next, and the previews have written the
+        // draft over it.
+        self.rollbackPreviews();
         self.adoptCurrentConfig() catch |err| {
             std.log.warn("settings: discarding the draft failed err={}", .{err});
             self.setNote(.discard_failed);
             return;
         };
         self.refreshAllControls();
+        // The Advanced page lists the pending changes.
+        self.refreshNativeSectionText();
+        if (self.active_section == .advanced) layoutChildren(self);
         self.setNote(.discarded);
     }
 
@@ -5419,9 +5450,12 @@ fn annotateAccessibleControls(self: *SettingsWindow) void {
     defer service.release();
 
     // The names the custom UIA providers serve, so a client that falls back to
-    // MSAA (`customUiaProvidersEnabled` false) hears the same ones.
+    // MSAA (`customUiaProvidersEnabled` false) hears the same ones. Only for
+    // the fields and dropdowns, whose captions are separate labels. A checkbox
+    // or button already speaks its own caption, and a name that leaves the
+    // caption out breaks voice control ("click Discard changes").
     inline for (settings_control_specs, 0..) |spec, index| {
-        setAccessibleName(service, self.controlHwnd(index), spec.name);
+        if (spec.role == .edit or spec.role == .combo_box) setAccessibleName(service, self.controlHwnd(index), spec.name);
     }
 }
 
@@ -6583,8 +6617,18 @@ test "settings the quiet period is a real timer and leaving the field ends it" {
             try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.font_size)] != null);
             try std.testing.expect(!settings.raw_scalar_shown[@intFromEnum(RawScalarField.font_size)]);
 
-            // Focus leaving the field shows it without waiting.
-            _ = sys.SendMessageW(hwnd, WM_COMMAND, (@as(usize, EN_KILLFOCUS) << 16) | EDIT_FONT_SIZE, @bitCast(@intFromPtr(edit)));
+            // Focus leaving the field for the Discard button does not show it:
+            // the click that follows throws the text away.
+            const kill_focus = (@as(usize, EN_KILLFOCUS) << 16) | EDIT_FONT_SIZE;
+            _ = sys.SetFocus(settings.btn_discard_changes.?);
+            _ = sys.SendMessageW(hwnd, WM_COMMAND, kill_focus, @bitCast(@intFromPtr(edit)));
+            dialog_test.pump();
+            try std.testing.expect(!settings.raw_scalar_shown[@intFromEnum(RawScalarField.font_size)]);
+
+            // Focus leaving the field for anywhere else shows it without waiting.
+            _ = sys.SetFocus(settings.sectionButton(.terminal).?);
+            _ = sys.SendMessageW(hwnd, WM_COMMAND, kill_focus, @bitCast(@intFromPtr(edit)));
+            dialog_test.pump();
             try std.testing.expect(settings.raw_scalar_shown[@intFromEnum(RawScalarField.font_size)]);
             try std.testing.expectEqualStrings(
                 "Error: Font size must be from 6 through 72 points.",
@@ -6724,6 +6768,31 @@ test "settings status and close prompt are live regions" {
             settings.status_note = .none;
             settings.active_conflict_field = .font_size;
             try std.testing.expect(settings.statusAnnounces());
+            settings.active_conflict_field = null;
+
+            // And what actually reaches UIA, counted where the events are raised.
+            const events = win32_uia.events;
+            events.testing_live_regions = 0;
+            // A half-typed number and the hint that follows an edit: silent.
+            typeInto(settings.edit_font_size.?, "1");
+            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncConfirmCloseFromCombo();
+            try std.testing.expectEqual(@as(usize, 0), events.testing_live_regions);
+            // The error, once it is shown: spoken, once, and not again for the
+            // same words.
+            settings.validationQuietElapsed();
+            try std.testing.expectEqual(@as(usize, 1), events.testing_live_regions);
+            settings.validationQuietElapsed();
+            try std.testing.expectEqual(@as(usize, 1), events.testing_live_regions);
+            // The close prompt is spoken when it opens ...
+            settings.showClosePrompt();
+            try std.testing.expectEqual(@as(usize, 2), events.testing_live_regions);
+            // ... and the error that came up behind it, when it goes away.
+            settings.cancelClosePrompt();
+            try std.testing.expectEqual(@as(usize, 3), events.testing_live_regions);
+            // The outcome of a discard.
+            settings.discardChanges();
+            try std.testing.expectEqual(@as(usize, 4), events.testing_live_regions);
         }
     }.body);
 }
@@ -6744,19 +6813,23 @@ test "settings offers accent-follow-system as a checkbox that previews the theme
             try std.testing.expect(sys.IsWindowEnabled(chk) != 0);
             try std.testing.expectEqual(PreviewEffect.theme, previewEffect(.accent_follow_system));
 
+            fixture.live_previews = true;
             _ = sys.SendMessageW(chk, BM_SETCHECK, BST_UNCHECKED, 0);
             settings.syncAccentFollowFromCheckbox();
             try std.testing.expect(!settings.pending.?.@"accent-follow-system");
+            try std.testing.expect(!fixture.config.@"accent-follow-system");
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
             try std.testing.expectEqualStrings("Previewing now. Save to keep it.", try statusTextOf(settings, &buf));
             try std.testing.expectEqual(win32_uia.SettingsSectionMarker.unsaved, settings.section_markers[@intFromEnum(Section.appearance)]);
 
             var diff: [512]u8 = undefined;
-            try std.testing.expect(std.mem.indexOf(u8, settings.pendingDiffText(&diff), "Follow the Windows accent color: On -> Off") != null);
+            try std.testing.expect(std.mem.indexOf(u8, settings.pendingDiffText(&diff), "Follow Windows accent color: On -> Off") != null);
 
-            // Discard puts the box back.
+            // Discard puts the box back, and the preview with it.
             settings.discardChanges();
             try std.testing.expect(sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            try std.testing.expect(fixture.config.@"accent-follow-system");
+            try std.testing.expect(settings.pending.?.@"accent-follow-system");
 
             // The palette finds it by its config key and by the words for it.
             const keywords = paletteDescriptor(.accent_follow_system).item.keywords;
@@ -6783,10 +6856,16 @@ test "settings Discard changes throws the draft away and keeps the window" {
             try std.testing.expect(discard_rect.right <= save_rect.left);
             try std.testing.expectEqual(discard_rect.top, save_rect.top);
 
-            // Edits across sections, one of them half typed.
+            // Edits across sections, one of them half typed. The App's live
+            // preview writes a valid draft into the config `currentConfig`
+            // hands out, so Discard has to take it back before it reads it.
+            fixture.live_previews = true;
             const original_cursor = settings.original.?.@"cursor-style";
             _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
             settings.syncCursorStyleFromCombo();
+            typeInto(settings.edit_font_size.?, "16");
+            try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
+            try std.testing.expect(fixture.config.@"cursor-style" != original_cursor);
             typeInto(settings.edit_font_size.?, "1");
             try std.testing.expect(sys.IsWindowEnabled(discard) != 0);
 
@@ -6796,6 +6875,9 @@ test "settings Discard changes throws the draft away and keeps the window" {
             // Everything is back to what is saved, the window is open, and the
             // button that was pressed is no longer where the keyboard sits.
             try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expectEqual(original_cursor, fixture.config.@"cursor-style");
+            try std.testing.expectEqual(@as(f32, 12), fixture.config.@"font-size");
+            try std.testing.expectEqual(@as(f32, 12), settings.pending.?.@"font-size");
             try std.testing.expectEqual(original_cursor, settings.pending.?.@"cursor-style");
             try std.testing.expectEqual(
                 @as(LRESULT, @intCast(comboIndexFromCursorStyle(original_cursor))),
@@ -7886,6 +7968,16 @@ const dialog_test = struct {
         _ = SendMessageW(hwnd, WM_DPICHANGED, (@as(usize, dpi) << 16) | dpi, @bitCast(@intFromPtr(&rect)));
     }
 
+    /// Dispatch the messages that are queued for this thread: posted ones and
+    /// a timer that has come due.
+    fn pump() void {
+        var msg: sys.MSG = undefined;
+        while (sys.PeekMessageW(&msg, null, 0, 0, 1) != 0) {
+            _ = sys.TranslateMessage(&msg);
+            _ = sys.DispatchMessageW(&msg);
+        }
+    }
+
     /// Paint everything that is waiting to be painted, children included.
     fn flushPaint(hwnd: HWND) void {
         _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
@@ -8012,6 +8104,9 @@ const dialog_test = struct {
         editor_opened: u32 = 0,
         saved: u32 = 0,
         custom_uia: bool = false,
+        /// Whether a live preview writes into `config`, as the App's does into
+        /// `app.config`, which is what `currentConfig` hands back.
+        live_previews: bool = false,
 
         fn start() !*Fixture {
             return startWith(false);
@@ -8039,6 +8134,7 @@ const dialog_test = struct {
                 .saveAndReload = &saveAndReload,
                 .notifySuccess = &notifySuccess,
                 .customUiaProvidersEnabled = &customUia,
+                .previewField = &previewField,
                 .onClosed = &onClosed,
             });
             self.settings.wheel_lines_override = 3;
@@ -8076,6 +8172,11 @@ const dialog_test = struct {
         fn saveAndReload(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
             const self: *Fixture = @ptrCast(@alignCast(ctx));
             self.saved += 1;
+        }
+
+        fn previewField(ctx: *anyopaque, _: SettingField, value: SettingValue) void {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            if (self.live_previews) setSettingValue(&self.config, value);
         }
 
         fn customUia(ctx: *anyopaque) bool {
@@ -8878,8 +8979,16 @@ test "settings rail marks draw for unsaved and invalid sections at 100% and 150%
                 const probe_x = outer.left + disc.left + settings.px(3);
                 const probe_y = outer.top + @divTrunc(disc.top + disc.bottom, 2);
                 try std.testing.expect(probe_x < outer.left + dot.left);
-                try std.testing.expectEqual(colors.error_text, colorAt(invalid, probe_x, probe_y));
-                try std.testing.expect(colorAt(unsaved, probe_x, probe_y) != colors.error_text);
+                const disc_fill = sectionMarkerFill(colors, .invalid, true);
+                try std.testing.expectEqual(disc_fill, colorAt(invalid, probe_x, probe_y));
+                try std.testing.expect(colorAt(unsaved, probe_x, probe_y) != disc_fill);
+                // Light and dark: the error color. High Contrast: the color of
+                // the text on the selected (Highlight) button, which is what
+                // reads against it, and not ButtonText.
+                try std.testing.expectEqual(
+                    if (mode == .high_contrast) colors.selection_text else colors.error_text,
+                    disc_fill,
+                );
 
                 // Nothing is marked once the draft is thrown away.
                 settings.discardChanges();
@@ -8933,7 +9042,8 @@ test "settings field frame insets centre one line inside the stroke" {
     try std.testing.expectEqual(FieldFrameInsets{ .x = 1, .y = 1 }, fieldFrameInsets(3, 3, 0, 2));
     try std.testing.expectEqual(FieldFrameInsets{ .x = 0, .y = 0 }, fieldFrameInsets(-5, -5, 10, 2));
     // Focus wins over an invalid value while the user is typing it.
-    try std.testing.expectEqual(FieldFrameState.focused, fieldFrameState(true, true));
+    try std.testing.expectEqual(FieldFrameState.invalid, fieldFrameState(true, true));
+    try std.testing.expectEqual(FieldFrameState.focused, fieldFrameState(true, false));
     try std.testing.expectEqual(FieldFrameState.invalid, fieldFrameState(false, true));
     try std.testing.expectEqual(FieldFrameState.rest, fieldFrameState(false, false));
     // A dropdown is asked for its field height less its own frame.
@@ -9835,12 +9945,13 @@ fn fieldFrameInsets(width: i32, height: i32, line_height: i32, stroke: i32) Fiel
 
 const FieldFrameState = enum { rest, focused, invalid };
 
-/// Focus wins: the field being typed in shows the accent even while its value
-/// does not parse, so the error colour does not flash on each keystroke. It
-/// shows once the user leaves the field (the status line says why at once).
+/// An error wins over focus. A raw scalar field is only `invalid` once its
+/// error is on screen, after the quiet period or when the user leaves it, so
+/// the stroke does not flash with each keystroke, and a field that keeps focus
+/// while it says it is wrong still looks wrong.
 fn fieldFrameState(focused: bool, invalid: bool) FieldFrameState {
-    if (focused) return .focused;
     if (invalid) return .invalid;
+    if (focused) return .focused;
     return .rest;
 }
 
@@ -10042,11 +10153,12 @@ fn sectionMarkerRect(settings: *const SettingsWindow, rect: RECT, marker: win32_
     return .{ .left = right - diameter, .top = top, .right = right, .bottom = top + diameter };
 }
 
-/// The color the mark is filled with.
+/// The color the mark is filled with. High Contrast has one text color per
+/// background, so the disc and the dot differ by shape; the error color there
+/// is ButtonText, which the selected button's Highlight fill does not carry.
 fn sectionMarkerFill(colors: win32_theme.SettingsColors, marker: win32_uia.SettingsSectionMarker, selected: bool) COLORREF {
-    if (marker == .invalid) return colors.error_text;
     if (colors.high_contrast) return if (selected) colors.selection_text else colors.text;
-    return colors.accent;
+    return if (marker == .invalid) colors.error_text else colors.accent;
 }
 
 /// The mark at the right end of a rail button (`SettingsWindow.syncMarkers`).
@@ -10439,7 +10551,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             // A field the user leaves says what is wrong with it without
             // waiting out the quiet period.
             if (notify == EN_KILLFOCUS) if (rawScalarForEditId(id)) |field| {
-                if (owner) |o| o.showRawScalarErrors(field);
+                // Posted: the notification does not say where focus went.
+                if (owner != null) _ = sys.PostMessageW(hwnd, WM_SETTINGS_FIELD_LEFT, @intFromEnum(field), 0);
                 return 0;
             };
             // These parse into pending._arena; record raw dirtiness immediately
@@ -10582,6 +10695,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_TIMER => {
             if (wParam != validation_timer_id) return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
             if (owner) |o| o.validationQuietElapsed();
+            return 0;
+        },
+        WM_SETTINGS_FIELD_LEFT => {
+            if (owner) |o| if (wParam < raw_scalar_field_count) o.fieldLeft(@enumFromInt(wParam));
             return 0;
         },
         WM_SETTINGS_CLOSE_NOW => {

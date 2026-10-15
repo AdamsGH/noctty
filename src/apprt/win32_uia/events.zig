@@ -77,7 +77,15 @@ pub fn raiseTextSelectionChanged(provider: *com.IRawElementProviderSimple) void 
     logIfFailed("UIA_Text_TextSelectionChangedEventId", hr);
 }
 
+/// Under test, how many live-region changes were asked for on this thread
+/// (counted, not raised, like `testing_property_changes`).
+pub threadlocal var testing_live_regions: usize = 0;
+
 pub fn raiseLiveRegionChanged(provider: *com.IRawElementProviderSimple) void {
+    if (builtin.is_test) {
+        testing_live_regions += 1;
+        return;
+    }
     if (!clientsAreListening()) return;
     const hr = com.UiaRaiseAutomationEvent(
         provider,
