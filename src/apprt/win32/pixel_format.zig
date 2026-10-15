@@ -145,6 +145,7 @@ const WglPixelFormatCandidate = struct {
     stencil_bits: u8,
     srgb_capable: bool,
     fully_accelerated: bool,
+    pixel_type: i32,
     stereo: bool = false,
     accum_bits: u8 = 0,
     aux_buffers: u8 = 0,
@@ -168,7 +169,15 @@ fn classifyWglPixelFormatCandidate(
 ) ?WglPixelFormatRejection {
     // Keep these disjoint and ordered so the bounded startup diagnostic adds
     // up to every returned match instead of double-counting unsuitable formats.
-    if (!base_contract or candidate.color_bits < 32 or candidate.alpha_bits < 8) {
+    // The renderer draws 8-bit channels, so the contract is fixed-point RGBA8
+    // exactly. A float or deeper format is refused, not ranked lower: NVIDIA's
+    // only accumulation-free window formats are RGBA16F, which the attachment
+    // ranking would otherwise prefer (#299).
+    if (!base_contract or
+        candidate.pixel_type != WGL_TYPE_RGBA_EXT or
+        candidate.color_bits != 32 or
+        candidate.alpha_bits != 8)
+    {
         return .base_contract;
     }
     if (!candidate.fully_accelerated) return .nonaccelerated;
@@ -220,15 +229,24 @@ fn betterWglPixelFormatCandidate(
     return candidate.index < current.index;
 }
 
+/// One step of the extended inventory walk, for a candidate that already
+/// passed classification and the descriptor cross-check.
+fn keepBetterWglPixelFormatCandidate(
+    selected: *?WglPixelFormatCandidate,
+    candidate: WglPixelFormatCandidate,
+) void {
+    if (selected.* == null or betterWglPixelFormatCandidate(candidate, selected.*.?)) {
+        selected.* = candidate;
+    }
+}
+
 fn rankWglPixelFormatCandidates(
     candidates: []const WglPixelFormatCandidate,
 ) ?WglPixelFormatCandidate {
     var selected: ?WglPixelFormatCandidate = null;
     for (candidates) |candidate| {
         if (!wglPixelFormatCandidateUsable(candidate)) continue;
-        if (selected == null or betterWglPixelFormatCandidate(candidate, selected.?)) {
-            selected = candidate;
-        }
+        keepBetterWglPixelFormatCandidate(&selected, candidate);
     }
     return selected;
 }
@@ -298,10 +316,16 @@ fn rankClassicPixelFormatCandidates(
     return selected;
 }
 
-const max_wgl_pixel_formats = 1024;
+/// Sanity bound on a driver-reported format count, for both inventories.
+/// NVIDIA 32.0.16.1742 reports 670 extended formats on an RTX 5070 Ti
+/// (measured) and 1172 on the #299 reporter's RTX A5500 laptop, which the old
+/// 1024 bound sent to the classic enumerator on every surface. The work is
+/// linear in the count, and the extended path keeps only the index array
+/// (16 KiB).
+const max_pixel_formats = 4096;
 
 fn validatedWglPixelFormatCount(total_format_count: i32) !UINT {
-    if (total_format_count <= 0 or total_format_count > max_wgl_pixel_formats) {
+    if (total_format_count <= 0 or total_format_count > max_pixel_formats) {
         return error.WglPixelFormatCandidateCapacityExceeded;
     }
     return @intCast(total_format_count);
@@ -339,6 +363,7 @@ const PixelFormatBaseCompatibilityFailure = enum {
     missing_required_flags,
     insufficient_color,
     insufficient_alpha,
+    deep_color,
     stereo,
 };
 
@@ -356,6 +381,9 @@ fn pixelFormatBaseCompatibilityFailure(
     if (pfd.dwFlags & required_flags != required_flags) return .missing_required_flags;
     if (pfd.cColorBits < 32) return .insufficient_color;
     if (pfd.cAlphaBits < 8) return .insufficient_alpha;
+    // A descriptor has no float type: NVIDIA describes its RGBA16F formats as
+    // PFD_TYPE_RGBA with 64 colour and 16 alpha bits (#299).
+    if (pfd.cColorBits > 32 or pfd.cAlphaBits > 8) return .deep_color;
     if (pfd.dwFlags & PFD_STEREO != 0) return .stereo;
     return null;
 }
@@ -842,12 +870,12 @@ const WglPixelFormatSelector = struct {
         const max_format_count = validatedWglPixelFormatCount(total_format_count) catch |err| {
             log.warn(
                 "WGL extended pixel-format inventory exceeds deterministic capacity total={} capacity={}",
-                .{ total_format_count, max_wgl_pixel_formats },
+                .{ total_format_count, max_pixel_formats },
             );
             return err;
         };
 
-        var pixel_formats: [max_wgl_pixel_formats]i32 = undefined;
+        var pixel_formats: [max_pixel_formats]i32 = undefined;
         var pixel_format_count: UINT = 0;
         if (self.functions.choose(
             hdc,
@@ -902,8 +930,7 @@ const WglPixelFormatSelector = struct {
             &query_attributes_multisample
         else
             &query_attributes_base;
-        var candidates: [pixel_formats.len]WglPixelFormatCandidate = undefined;
-        var candidate_count: usize = 0;
+        var selected: ?WglPixelFormatCandidate = null;
         for (pixel_formats[0..count]) |pixel_format| {
             var values: [query_attributes_multisample.len]i32 = undefined;
             if (self.functions.getAttributes(
@@ -945,6 +972,7 @@ const WglPixelFormatSelector = struct {
                 .stencil_bits = @intCast(values[10]),
                 .fully_accelerated = values[11] == WGL_FULL_ACCELERATION_EXT,
                 .srgb_capable = values[12] == srgb_attribute.value,
+                .pixel_type = values[4],
                 .stereo = values[3] != 0,
                 .accum_bits = @intCast(values[7]),
                 .aux_buffers = @intCast(values[8]),
@@ -954,8 +982,7 @@ const WglPixelFormatSelector = struct {
             };
             const base_contract = values[0] == 1 and
                 values[1] == 1 and
-                values[2] == 1 and
-                values[4] == WGL_TYPE_RGBA_EXT;
+                values[2] == 1;
             if (classifyWglPixelFormatCandidate(candidate, base_contract) != null) {
                 continue;
             }
@@ -981,13 +1008,10 @@ const WglPixelFormatSelector = struct {
                 continue;
             }
 
-            candidates[candidate_count] = candidate;
-            candidate_count += 1;
+            keepBetterWglPixelFormatCandidate(&selected, candidate);
         }
 
-        const selected_candidate = rankWglPixelFormatCandidates(candidates[0..candidate_count]) orelse {
-            return null;
-        };
+        const selected_candidate = selected orelse return null;
         var selected_pfd: PIXELFORMATDESCRIPTOR = undefined;
         if (DescribePixelFormat(
             hdc,
@@ -1114,6 +1138,25 @@ fn chooseClassicCompatibilityPixelFormat(hdc: HDC) !WglPixelFormatSelection {
     };
 }
 
+/// One step of the classic inventory walk: keeps `descriptor` in `selected`
+/// when it is base-compatible and ranks above the current choice.
+fn considerClassicPixelFormat(
+    selected: *?ClassicPixelFormatCandidate,
+    pixel_format: i32,
+    descriptor: PIXELFORMATDESCRIPTOR,
+) void {
+    const provenance = validateSelectedPixelFormat(pixel_format, descriptor) catch return;
+    const candidate: ClassicPixelFormatCandidate = .{
+        .index = pixel_format,
+        .descriptor = descriptor,
+        .provenance = provenance,
+        .acceleration = classicPixelFormatAcceleration(descriptor.dwFlags),
+    };
+    if (selected.* == null or betterClassicPixelFormatCandidate(candidate, selected.*.?)) {
+        selected.* = candidate;
+    }
+}
+
 fn enumerateClassicPixelFormat(hdc: HDC) !WglPixelFormatSelection {
     var descriptor: PIXELFORMATDESCRIPTOR = undefined;
     const format_count = DescribePixelFormat(
@@ -1122,7 +1165,7 @@ fn enumerateClassicPixelFormat(hdc: HDC) !WglPixelFormatSelection {
         @sizeOf(PIXELFORMATDESCRIPTOR),
         &descriptor,
     );
-    if (format_count <= 0 or format_count > 4096) {
+    if (format_count <= 0 or format_count > max_pixel_formats) {
         gl_startup.recordOpenGLStartupError(.describe_pixel_format, error.InvalidPixelFormatInventory);
         return error.InvalidPixelFormatInventory;
     }
@@ -1140,16 +1183,7 @@ fn enumerateClassicPixelFormat(hdc: HDC) !WglPixelFormatSelection {
             gl_startup.recordOpenGLStartupWin32Failure(.describe_pixel_format, err);
             return windows.unexpectedError(err);
         }
-        const provenance = validateSelectedPixelFormat(pixel_format, descriptor) catch continue;
-        const candidate: ClassicPixelFormatCandidate = .{
-            .index = pixel_format,
-            .descriptor = descriptor,
-            .provenance = provenance,
-            .acceleration = classicPixelFormatAcceleration(descriptor.dwFlags),
-        };
-        if (selected == null or betterClassicPixelFormatCandidate(candidate, selected.?)) {
-            selected = candidate;
-        }
+        considerClassicPixelFormat(&selected, pixel_format, descriptor);
     }
 
     const candidate = selected orelse {
@@ -1330,6 +1364,7 @@ test "win32 sRGB pixel format ranking prefers depthless stencil-less" {
             .stencil_bits = 8,
             .srgb_capable = true,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
         },
         .{
             .index = 14,
@@ -1339,6 +1374,7 @@ test "win32 sRGB pixel format ranking prefers depthless stencil-less" {
             .stencil_bits = 0,
             .srgb_capable = true,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
         },
         .{
             .index = 16,
@@ -1348,6 +1384,7 @@ test "win32 sRGB pixel format ranking prefers depthless stencil-less" {
             .stencil_bits = 0,
             .srgb_capable = false,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
         },
     };
 
@@ -1365,6 +1402,7 @@ test "win32 sRGB pixel format ranking honestly falls back to attached depth" {
             .stencil_bits = 8,
             .srgb_capable = true,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
         },
         .{
             .index = 10,
@@ -1374,6 +1412,7 @@ test "win32 sRGB pixel format ranking honestly falls back to attached depth" {
             .stencil_bits = 0,
             .srgb_capable = true,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
         },
     };
 
@@ -1386,8 +1425,8 @@ test "win32 sRGB pixel format ranking honestly falls back to attached depth" {
 test "win32 pixel format inventory accepts observed full count without truncation" {
     try std.testing.expectEqual(@as(UINT, 670), try validatedWglPixelFormatCount(670));
     try std.testing.expectEqual(
-        @as(UINT, max_wgl_pixel_formats),
-        try validatedWglPixelFormatCount(max_wgl_pixel_formats),
+        @as(UINT, max_pixel_formats),
+        try validatedWglPixelFormatCount(max_pixel_formats),
     );
     try std.testing.expectError(
         error.WglPixelFormatCandidateCapacityExceeded,
@@ -1395,7 +1434,7 @@ test "win32 pixel format inventory accepts observed full count without truncatio
     );
     try std.testing.expectError(
         error.WglPixelFormatCandidateCapacityExceeded,
-        validatedWglPixelFormatCount(max_wgl_pixel_formats + 1),
+        validatedWglPixelFormatCount(max_pixel_formats + 1),
     );
 }
 
@@ -1409,6 +1448,7 @@ test "win32 pixel format ranking prefers zero attachments but permits honest fal
             .stencil_bits = 0,
             .srgb_capable = true,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
             .accum_bits = 64,
         },
         .{
@@ -1419,6 +1459,7 @@ test "win32 pixel format ranking prefers zero attachments but permits honest fal
             .stencil_bits = 0,
             .srgb_capable = true,
             .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
         },
     };
     try std.testing.expectEqual(
@@ -1428,6 +1469,249 @@ test "win32 pixel format ranking prefers zero attachments but permits honest fal
     const attached = rankWglPixelFormatCandidates(candidates[0..1]).?;
     try std.testing.expectEqual(@as(i32, 8), attached.index);
     try std.testing.expectEqual(@as(u8, 64), attached.accum_bits);
+}
+
+/// One format of a table shaped like NVIDIA's R580 inventory (#299). The
+/// reporter's laptop exposed 1172 extended formats; an RTX 5070 Ti on the same
+/// driver (32.0.16.1742) measured 670 with this layout. Every RGBA8 window
+/// format carries a 64-bit accumulation buffer. The only accumulation-free
+/// window family is RGBA16F (`WGL_TYPE_RGBA_FLOAT_ARB`, 16 bits a channel,
+/// 121-128 here), which `DescribePixelFormat` reports as plain
+/// `PFD_TYPE_RGBA` with 64 colour and 16 alpha bits. 257-288 carry the sRGB
+/// colorspace, 1-8 are single-buffered like the measured first block, and 289
+/// and up stand in for the rest of the table, which has no window formats.
+/// Indices 10, 12, 14, 123, 258, 262 and 270 match the reporter's rows. The
+/// classic test walks the whole table; a real classic inventory is shorter
+/// (220 formats here).
+// WGL_ARB_pixel_format_float. NVIDIA's RGBA16F window formats carry it.
+const WGL_TYPE_RGBA_FLOAT_ARB = 0x21A0;
+
+const R580FixtureFormat = struct {
+    wgl: WglPixelFormatCandidate,
+    base_contract: bool,
+    colorspace_srgb: bool,
+    pfd: PIXELFORMATDESCRIPTOR,
+};
+
+const r580_fixture_format_count = 1172;
+
+fn r580FixtureFormat(index: i32) R580FixtureFormat {
+    const float_family = index >= 121 and index <= 128;
+    const window = index <= 288;
+    const double_buffered = window and index > 8;
+    // Measured order: (depth, stencil) = 24/0, 24/8, 0/0, 0/8; RGBA8 formats
+    // alternate alpha 0 and alpha 8 within each attachment pair.
+    const slot: u32 = @intCast(if (float_family) index - 121 else @divTrunc(@mod(index - 1, 8), 2));
+    const depth_bits: u8 = if (slot % 4 < 2) 24 else 0;
+    const stencil_bits: u8 = if (slot % 2 == 1) 8 else 0;
+    const channel_bits: u8 = if (float_family) 16 else 8;
+    const alpha_bits: u8 = if (float_family) 16 else if (@mod(index - 1, 2) == 1) 8 else 0;
+    const color_bits: u8 = if (float_family) 64 else 32;
+    const accum_bits: u8 = if (float_family) 0 else 64;
+    var pfd = std.mem.zeroes(PIXELFORMATDESCRIPTOR);
+    pfd.nSize = @sizeOf(PIXELFORMATDESCRIPTOR);
+    pfd.nVersion = 1;
+    pfd.dwFlags = c.PFD_SUPPORT_OPENGL;
+    if (window) pfd.dwFlags |= c.PFD_DRAW_TO_WINDOW;
+    if (double_buffered) pfd.dwFlags |= c.PFD_DOUBLEBUFFER;
+    pfd.iPixelType = c.PFD_TYPE_RGBA;
+    pfd.cColorBits = color_bits;
+    pfd.cRedBits = channel_bits;
+    pfd.cGreenBits = channel_bits;
+    pfd.cBlueBits = channel_bits;
+    pfd.cAlphaBits = alpha_bits;
+    pfd.cAccumBits = accum_bits;
+    pfd.cDepthBits = depth_bits;
+    pfd.cStencilBits = stencil_bits;
+    pfd.cAuxBuffers = 4;
+    pfd.iLayerType = c.PFD_MAIN_PLANE;
+    return .{
+        .wgl = .{
+            .index = index,
+            .color_bits = color_bits,
+            .alpha_bits = alpha_bits,
+            .depth_bits = depth_bits,
+            .stencil_bits = stencil_bits,
+            .srgb_capable = !float_family,
+            .fully_accelerated = true,
+            .pixel_type = if (float_family) WGL_TYPE_RGBA_FLOAT_ARB else WGL_TYPE_RGBA_EXT,
+            .accum_bits = accum_bits,
+            .aux_buffers = 4,
+            .multisample_query_supported = true,
+            .sample_buffers = 0,
+            .samples = 0,
+        },
+        .base_contract = double_buffered,
+        .colorspace_srgb = index >= 257 and index <= 288,
+        .pfd = pfd,
+    };
+}
+
+test "win32 R580 fixture matches the reporter's rows" {
+    const rows = [_]struct { index: i32, color: u8, alpha: u8, depth: u8, stencil: u8, accum: u8 }{
+        .{ .index = 10, .color = 32, .alpha = 8, .depth = 24, .stencil = 0, .accum = 64 },
+        .{ .index = 12, .color = 32, .alpha = 8, .depth = 24, .stencil = 8, .accum = 64 },
+        .{ .index = 14, .color = 32, .alpha = 8, .depth = 0, .stencil = 0, .accum = 64 },
+        .{ .index = 123, .color = 64, .alpha = 16, .depth = 0, .stencil = 0, .accum = 0 },
+        .{ .index = 258, .color = 32, .alpha = 8, .depth = 24, .stencil = 0, .accum = 64 },
+        .{ .index = 262, .color = 32, .alpha = 8, .depth = 0, .stencil = 0, .accum = 64 },
+        .{ .index = 270, .color = 32, .alpha = 8, .depth = 0, .stencil = 0, .accum = 64 },
+    };
+    for (rows) |row| {
+        const format = r580FixtureFormat(row.index);
+        try std.testing.expectEqual(row.color, format.pfd.cColorBits);
+        try std.testing.expectEqual(row.alpha, format.pfd.cAlphaBits);
+        try std.testing.expectEqual(row.depth, format.pfd.cDepthBits);
+        try std.testing.expectEqual(row.stencil, format.pfd.cStencilBits);
+        try std.testing.expectEqual(row.accum, format.pfd.cAccumBits);
+    }
+    try std.testing.expect(r580FixtureFormat(262).colorspace_srgb);
+    try std.testing.expect(!r580FixtureFormat(14).colorspace_srgb);
+}
+
+test "win32 classic inventory never selects the R580 accumulation-free RGBA16F family" {
+    var selected: ?ClassicPixelFormatCandidate = null;
+    var index: i32 = 1;
+    while (index <= r580_fixture_format_count) : (index += 1) {
+        considerClassicPixelFormat(&selected, index, r580FixtureFormat(index).pfd);
+    }
+    const chosen = selected.?;
+    try std.testing.expectEqual(@as(i32, 14), chosen.index);
+    try std.testing.expectEqual(@as(u8, 32), chosen.provenance.color_bits);
+    try std.testing.expectEqual(@as(u8, 8), chosen.provenance.alpha_bits);
+    try std.testing.expectEqual(@as(u8, 64), chosen.provenance.accum_bits);
+}
+
+test "win32 WGL sRGB selection reaches and ranks the R580 1172-format table" {
+    try std.testing.expectEqual(
+        @as(UINT, r580_fixture_format_count),
+        try validatedWglPixelFormatCount(r580_fixture_format_count),
+    );
+    // Every double-buffered window format: more than the inventory request
+    // returns, which also leaves out the alpha-0 and float rows.
+    var colorspace: [r580_fixture_format_count]WglPixelFormatCandidate = undefined;
+    var framebuffer_srgb: [r580_fixture_format_count]WglPixelFormatCandidate = undefined;
+    var all_srgb: [r580_fixture_format_count]WglPixelFormatCandidate = undefined;
+    var count: usize = 0;
+    var index: i32 = 1;
+    while (index <= r580_fixture_format_count) : (index += 1) {
+        const format = r580FixtureFormat(index);
+        if (!format.base_contract) continue;
+        framebuffer_srgb[count] = format.wgl;
+        colorspace[count] = format.wgl;
+        colorspace[count].srgb_capable = format.colorspace_srgb;
+        all_srgb[count] = format.wgl;
+        all_srgb[count].srgb_capable = true;
+        count += 1;
+    }
+    // The reporter's patched build logged index=262 source=arb_ext_colorspace_srgb.
+    try std.testing.expectEqual(@as(i32, 262), rankWglPixelFormatCandidates(colorspace[0..count]).?.index);
+    try std.testing.expectEqual(@as(i32, 14), rankWglPixelFormatCandidates(framebuffer_srgb[0..count]).?.index);
+    // The float family is non-sRGB on R580; refused on its own merits too.
+    try std.testing.expectEqual(@as(i32, 14), rankWglPixelFormatCandidates(all_srgb[0..count]).?.index);
+}
+
+test "win32 pixel format selection refuses deep colour even when it ranks first" {
+    // Vendor-neutral: an sRGB-capable 16-bit-a-channel format with no
+    // attachments outranks every RGBA8 format on attachments alone.
+    const deep: WglPixelFormatCandidate = .{
+        .index = 5,
+        .color_bits = 64,
+        .alpha_bits = 16,
+        .depth_bits = 0,
+        .stencil_bits = 0,
+        .srgb_capable = true,
+        .fully_accelerated = true,
+        .pixel_type = WGL_TYPE_RGBA_EXT,
+    };
+    const rgba8: WglPixelFormatCandidate = .{
+        .index = 6,
+        .color_bits = 32,
+        .alpha_bits = 8,
+        .depth_bits = 24,
+        .stencil_bits = 8,
+        .srgb_capable = true,
+        .fully_accelerated = true,
+        .pixel_type = WGL_TYPE_RGBA_EXT,
+        .accum_bits = 64,
+    };
+    try std.testing.expectEqual(@as(i32, 6), rankWglPixelFormatCandidates(&.{ deep, rgba8 }).?.index);
+    try std.testing.expectEqual(@as(?WglPixelFormatCandidate, null), rankWglPixelFormatCandidates(&.{deep}));
+
+    var selected: ?ClassicPixelFormatCandidate = null;
+    considerClassicPixelFormat(&selected, 7, r580FixtureFormat(123).pfd);
+    try std.testing.expectEqual(@as(?ClassicPixelFormatCandidate, null), selected);
+    considerClassicPixelFormat(&selected, 8, r580FixtureFormat(12).pfd);
+    considerClassicPixelFormat(&selected, 9, r580FixtureFormat(123).pfd);
+    try std.testing.expectEqual(@as(i32, 8), selected.?.index);
+}
+
+test "win32 WGL selection refuses a float pixel type on its own" {
+    // The type is checked explicitly, not inferred from colour depth: a float
+    // format is refused even if it reported RGBA8 depths and sRGB.
+    var float_rgba8 = r580FixtureFormat(14).wgl;
+    float_rgba8.pixel_type = WGL_TYPE_RGBA_FLOAT_ARB;
+    try std.testing.expectEqual(
+        @as(?WglPixelFormatRejection, .base_contract),
+        classifyWglPixelFormatCandidate(float_rgba8, true),
+    );
+    var float_srgb = r580FixtureFormat(123).wgl;
+    float_srgb.srgb_capable = true;
+    try std.testing.expectEqual(
+        @as(?WglPixelFormatCandidate, null),
+        rankWglPixelFormatCandidates(&.{ float_rgba8, float_srgb }),
+    );
+    try std.testing.expectEqual(
+        @as(?WglPixelFormatRejection, null),
+        classifyWglPixelFormatCandidate(r580FixtureFormat(14).wgl, true),
+    );
+}
+
+test "win32 pixel format choice is unchanged on an accumulation-free RGBA8 table" {
+    // Shaped like the tables the selector was tuned on (synthetic, not a
+    // measured Intel or AMD dump): RGBA8 window formats with and without
+    // accumulation, and a float format that is not a window format.
+    const Row = struct { color: u8, alpha: u8, depth: u8, stencil: u8, accum: u8, srgb: bool, window: bool = true };
+    const rows = [_]Row{
+        .{ .color = 32, .alpha = 8, .depth = 24, .stencil = 8, .accum = 64, .srgb = false },
+        .{ .color = 32, .alpha = 8, .depth = 24, .stencil = 8, .accum = 0, .srgb = true },
+        .{ .color = 32, .alpha = 8, .depth = 24, .stencil = 0, .accum = 0, .srgb = true },
+        .{ .color = 32, .alpha = 0, .depth = 0, .stencil = 0, .accum = 0, .srgb = true },
+        .{ .color = 32, .alpha = 8, .depth = 0, .stencil = 0, .accum = 64, .srgb = true },
+        .{ .color = 32, .alpha = 8, .depth = 0, .stencil = 0, .accum = 0, .srgb = true },
+        .{ .color = 32, .alpha = 8, .depth = 0, .stencil = 0, .accum = 0, .srgb = false },
+        .{ .color = 64, .alpha = 16, .depth = 0, .stencil = 0, .accum = 0, .srgb = false, .window = false },
+    };
+    var candidates: [rows.len]WglPixelFormatCandidate = undefined;
+    var count: usize = 0;
+    var classic: ?ClassicPixelFormatCandidate = null;
+    for (rows, 1..) |row, position| {
+        const index: i32 = @intCast(position);
+        var pfd = defaultPixelFormatDescriptor();
+        pfd.dwFlags = c.PFD_SUPPORT_OPENGL;
+        if (row.window) pfd.dwFlags |= c.PFD_DRAW_TO_WINDOW | c.PFD_DOUBLEBUFFER;
+        pfd.cColorBits = row.color;
+        pfd.cAlphaBits = row.alpha;
+        pfd.cDepthBits = row.depth;
+        pfd.cStencilBits = row.stencil;
+        pfd.cAccumBits = row.accum;
+        considerClassicPixelFormat(&classic, index, pfd);
+        if (!row.window) continue;
+        candidates[count] = .{
+            .index = index,
+            .color_bits = row.color,
+            .alpha_bits = row.alpha,
+            .depth_bits = row.depth,
+            .stencil_bits = row.stencil,
+            .srgb_capable = row.srgb,
+            .fully_accelerated = true,
+            .pixel_type = WGL_TYPE_RGBA_EXT,
+            .accum_bits = row.accum,
+        };
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(i32, 6), classic.?.index);
+    try std.testing.expectEqual(@as(i32, 6), rankWglPixelFormatCandidates(candidates[0..count]).?.index);
 }
 
 test "win32 pixel format SetPixelFormat transition requires zero to selected" {
@@ -1697,6 +1981,16 @@ test "win32 selected pixel format validation rejects missing requirements" {
     try std.testing.expectError(
         error.InvalidSelectedPixelFormat,
         validateSelectedPixelFormat(7, no_alpha),
+    );
+
+    const deep = r580FixtureFormat(123).pfd;
+    try std.testing.expectEqual(
+        @as(?PixelFormatBaseCompatibilityFailure, .deep_color),
+        pixelFormatBaseCompatibilityFailure(7, deep),
+    );
+    try std.testing.expectError(
+        error.InvalidSelectedPixelFormat,
+        validateSelectedPixelFormat(7, deep),
     );
 
     var stereo = valid;
