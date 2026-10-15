@@ -8562,7 +8562,7 @@ pub const App = struct {
 
             .search_total => {
                 if (self.findSurfaceForTarget(target)) |surface| {
-                    try surface.setSearchTotal(value.total);
+                    try surface.setSearchTotal(value.total, value.invalid);
                     return true;
                 }
                 return false;
@@ -31160,20 +31160,6 @@ const buildSearchBarResultsText = labels.buildSearchBarResultsText;
 const SearchBarResultsVisual = labels.SearchBarResultsVisual;
 const SearchBarToolbarVisual = labels.SearchBarToolbarVisual;
 
-const SearchBarChromeLayout = struct {
-    pad_x: i32,
-    pad_y: i32,
-    gap: i32,
-    section_gap: i32,
-    close_gap: i32,
-    nav_w: i32,
-    toggle_w: i32,
-    close_w: i32,
-    results_w: i32,
-    min_edit_w: i32,
-    control_h: i32,
-};
-
 const SearchBarButtonRole = labels.SearchBarButtonRole;
 
 const search_bar_button_roles = [_]SearchBarButtonRole{
@@ -31195,22 +31181,8 @@ const searchBarShouldInvalidateCoreSearchOnEdit = labels.searchBarShouldInvalida
 
 const shouldAcceptCoreSearchUpdates = labels.shouldAcceptCoreSearchUpdates;
 
-fn searchBarChromeLayout(host: *const Host, frame_rect: RECT) SearchBarChromeLayout {
-    _ = frame_rect;
-    return .{
-        .pad_x = host.scaled(8),
-        .pad_y = host.scaled(6),
-        .gap = host.scaled(2),
-        .section_gap = host.scaled(10),
-        .close_gap = host.scaled(10),
-        .nav_w = host.scaled(30),
-        .toggle_w = host.scaled(30),
-        .close_w = host.scaled(30),
-        .results_w = host.scaled(72),
-        .min_edit_w = host.scaled(120),
-        .control_h = host.scaled(28),
-    };
-}
+const searchBarChromeLayout = chrome_layout.searchBarChromeLayout;
+const searchBarFit = chrome_layout.searchBarFit;
 
 const searchBarButtonShowsLabel = labels.searchBarButtonShowsLabel;
 
@@ -38859,6 +38831,17 @@ pub const Surface = struct {
         self.search_bar_frame_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     }
 
+    /// Hides a search bar button the pane is too narrow for. The edit takes
+    /// the focus the button had: hiding the window that has it leaves the
+    /// keyboard with no window of ours.
+    fn hideSearchBarButton(self: *Surface, role: SearchBarButtonRole) bool {
+        const hwnd = self.searchBarButtonHwnd(role) orelse return false;
+        if (sys.GetFocus() == hwnd) {
+            if (self.search_bar_edit_hwnd) |edit| _ = sys.SetFocus(edit);
+        }
+        return applyChildVisibility(hwnd, self.searchBarButtonPlacement(role), false);
+    }
+
     fn layoutSearchBarControls(self: *Surface, frame_rect: RECT, visible: bool) !bool {
         if (!visible or !self.search_bar.visible) return self.hideSearchBarControls();
 
@@ -38867,7 +38850,8 @@ pub const Surface = struct {
 
         var changed = false;
         var bg_changed = false;
-        const layout = searchBarChromeLayout(host, frame_rect);
+        const layout = searchBarChromeLayout(host.current_dpi);
+        const fit = searchBarFit(frame_rect.right - frame_rect.left, layout);
         const control_top = frame_rect.top + layout.pad_y;
         const left = frame_rect.left + layout.pad_x;
         var right = frame_rect.right - layout.pad_x;
@@ -38892,65 +38876,76 @@ pub const Surface = struct {
         ) or changed;
         right -= layout.close_w + layout.close_gap;
 
-        changed = applyChildRect(
-            self.search_bar_word_hwnd.?,
-            &self.search_bar_word_placement,
-            childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_word_hwnd.?,
-            &self.search_bar_word_placement,
-            true,
-        ) or changed;
-        right -= layout.toggle_w + layout.gap;
+        if (fit.toggles) {
+            changed = applyChildRect(
+                self.search_bar_word_hwnd.?,
+                &self.search_bar_word_placement,
+                childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
+            ) or changed;
+            changed = applyChildVisibility(
+                self.search_bar_word_hwnd.?,
+                &self.search_bar_word_placement,
+                true,
+            ) or changed;
+            right -= layout.toggle_w + layout.gap;
 
-        changed = applyChildRect(
-            self.search_bar_case_hwnd.?,
-            &self.search_bar_case_placement,
-            childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_case_hwnd.?,
-            &self.search_bar_case_placement,
-            true,
-        ) or changed;
-        right -= layout.toggle_w + layout.gap;
+            changed = applyChildRect(
+                self.search_bar_case_hwnd.?,
+                &self.search_bar_case_placement,
+                childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
+            ) or changed;
+            changed = applyChildVisibility(
+                self.search_bar_case_hwnd.?,
+                &self.search_bar_case_placement,
+                true,
+            ) or changed;
+            right -= layout.toggle_w + layout.gap;
 
-        changed = applyChildRect(
-            self.search_bar_regex_hwnd.?,
-            &self.search_bar_regex_placement,
-            childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_regex_hwnd.?,
-            &self.search_bar_regex_placement,
-            true,
-        ) or changed;
-        right -= layout.toggle_w + layout.section_gap;
+            changed = applyChildRect(
+                self.search_bar_regex_hwnd.?,
+                &self.search_bar_regex_placement,
+                childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
+            ) or changed;
+            changed = applyChildVisibility(
+                self.search_bar_regex_hwnd.?,
+                &self.search_bar_regex_placement,
+                true,
+            ) or changed;
+            right -= layout.toggle_w + layout.section_gap;
+        } else {
+            changed = self.hideSearchBarButton(.whole_word) or changed;
+            changed = self.hideSearchBarButton(.case_sensitive) or changed;
+            changed = self.hideSearchBarButton(.regex) or changed;
+        }
 
-        changed = applyChildRect(
-            self.search_bar_next_hwnd.?,
-            &self.search_bar_next_placement,
-            childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_next_hwnd.?,
-            &self.search_bar_next_placement,
-            true,
-        ) or changed;
-        right -= layout.nav_w + layout.gap;
+        if (fit.nav) {
+            changed = applyChildRect(
+                self.search_bar_next_hwnd.?,
+                &self.search_bar_next_placement,
+                childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
+            ) or changed;
+            changed = applyChildVisibility(
+                self.search_bar_next_hwnd.?,
+                &self.search_bar_next_placement,
+                true,
+            ) or changed;
+            right -= layout.nav_w + layout.gap;
 
-        changed = applyChildRect(
-            self.search_bar_prev_hwnd.?,
-            &self.search_bar_prev_placement,
-            childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_prev_hwnd.?,
-            &self.search_bar_prev_placement,
-            true,
-        ) or changed;
-        right -= layout.nav_w + layout.section_gap;
+            changed = applyChildRect(
+                self.search_bar_prev_hwnd.?,
+                &self.search_bar_prev_placement,
+                childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
+            ) or changed;
+            changed = applyChildVisibility(
+                self.search_bar_prev_hwnd.?,
+                &self.search_bar_prev_placement,
+                true,
+            ) or changed;
+            right -= layout.nav_w + layout.section_gap;
+        } else {
+            changed = self.hideSearchBarButton(.next) or changed;
+            changed = self.hideSearchBarButton(.prev) or changed;
+        }
 
         const show_results = showSearchBarResults(&self.search_bar) and
             (right - layout.results_w - layout.section_gap - left) >= layout.min_edit_w;
@@ -40589,6 +40584,7 @@ pub const Surface = struct {
         self.search_selected = null;
         self.search_bar.total = null;
         self.search_bar.selected = null;
+        self.search_bar.invalid = false;
         if (!active) {
             self.search_bar.searched = self.search_bar.query.len == 0;
             self.search_bar.last_edit_ms = 0;
@@ -40612,12 +40608,13 @@ pub const Surface = struct {
         self.invalidateStatusBarState();
     }
 
-    fn setSearchTotal(self: *Surface, total: ?usize) !void {
+    fn setSearchTotal(self: *Surface, total: ?usize, invalid: bool) !void {
         if (!shouldAcceptCoreSearchUpdates(&self.search_bar)) return;
         const selected = searchSelectedDisplayFromRaw(self.search_selected_raw, total);
         const searched = searchBarSearchedStateForTotal(total);
         if (self.search_total == total and
             self.search_selected == selected and
+            self.search_bar.invalid == invalid and
             !searchBarDisplayStateChanged(&self.search_bar, searched, total, selected))
         {
             return;
@@ -40625,6 +40622,7 @@ pub const Surface = struct {
         self.search_total = total;
         self.search_bar.searched = searched;
         self.search_bar.total = total;
+        self.search_bar.invalid = invalid;
         self.search_selected = selected;
         self.search_bar.selected = selected;
         _ = try self.syncSearchBarResultsText();
