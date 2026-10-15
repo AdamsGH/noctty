@@ -327,6 +327,7 @@ pub const COLOR_GRAYTEXT = 17;
 pub const COLOR_HIGHLIGHT = 13;
 pub const COLOR_HIGHLIGHTTEXT = 14;
 pub const HKEY_CURRENT_USER: usize = 0x80000001;
+pub const HKEY_LOCAL_MACHINE: usize = 0x80000002;
 pub const KEY_READ: DWORD = 0x20019;
 pub const REG_DWORD: DWORD = 4;
 pub const ERROR_SUCCESS: i32 = 0;
