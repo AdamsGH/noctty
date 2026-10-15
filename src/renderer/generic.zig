@@ -1281,6 +1281,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
+                state.drawn_undirtied = .init(state.terminal);
 
                 // Cached search pins target row geometry. If the grid
                 // changed, drop them so highlights are recomputed

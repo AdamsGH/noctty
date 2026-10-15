@@ -2278,23 +2278,44 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
         // We also need to update the renderer so it knows if it should
         // highlight links. Additionally, mark the screen as dirty so
         // that the highlight state of all links is properly updated.
-        {
+        const redraw = redraw: {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
             self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
 
+            // A frame no link can change would present for every Shift or
+            // Ctrl press, ahead of the character it types.
+            if (!modsChangeIsDrawn(self.renderer_state.mouse.point, self.config.links)) {
+                break :redraw false;
+            }
+
             // We use the clear screen dirty flag to force a rebuild of all
             // rows because changing mouse mods can affect the highlight state
-            // of a link. If there is no link this seems very wasteful but
-            // its really only one frame so it's not so bad.
+            // of a link.
             self.renderer_state.terminal.flags.dirty.clear = true;
-        }
+            break :redraw true;
+        };
 
-        self.queueRender() catch |err| {
+        if (redraw) self.queueRender() catch |err| {
             // Not a big deal if this fails.
             log.warn("failed to notify renderer of mods change err={}", .{err});
         };
     }
+}
+
+/// Whether a change of the mouse mods can change a frame. They only decide
+/// link highlighting: of the link under the pointer, for which
+/// `mouseRefreshLinks` leaves the renderer's mouse `point` set (OSC 8 links,
+/// `hover_mods`), and of `always_mods` links wherever the pointer is.
+fn modsChangeIsDrawn(
+    point: ?terminal.point.Coordinate,
+    links: []const DerivedConfig.Link,
+) bool {
+    if (point != null) return true;
+    for (links) |link| {
+        if (link.highlight == .always_mods) return true;
+    }
+    return false;
 }
 
 /// Whether a mods update changes anything the mouse actually tracks.
@@ -2408,6 +2429,10 @@ fn mouseRefreshLinks(
         try self.queueRender();
         return;
     }
+
+    // No link under the pointer for the renderer to light up either, so a
+    // later modifier press need not redraw (`modsChangeIsDrawn`).
+    self.renderer_state.mouse.point = null;
 
     // No link, if we're previously over a link then we need to clear
     // the over-link apprt state.
@@ -3395,15 +3420,134 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     }
 }
 
-/// Drop the selection before input that goes to the child (a reported
-/// click or wheel tick, or alternate scroll), redrawing only if there was
-/// one: the pty write that follows does not wake the renderer.
+/// Drop the selection before input that goes to the child (a typed key, a
+/// reported click or wheel tick, or alternate scroll), redrawing only if
+/// there was one: the pty write that follows does not wake the renderer.
 ///
 /// Precondition: the render_state mutex must be held.
 fn clearSelectionForChildInput(self: *Surface) !void {
     if (self.io.terminal.screens.active.selection == null) return;
     try self.setSelection(null);
     try self.queueRender();
+}
+
+/// Drop the selection (always on Escape) and scroll to the bottom for a key
+/// that types, as configured. Neither redraws unless it changed the screen.
+/// What the key typed shows when the child echoes it, and that output wakes
+/// the renderer on its own; a frame of the unchanged screen drawn first
+/// takes the display's next refresh, and the echo shows one refresh later.
+///
+/// Precondition: the render_state mutex must be held.
+fn dropSelectionAndScrollForTyping(self: *Surface, escape: bool) !void {
+    if (self.config.selection_clear_on_typing or escape) {
+        try self.clearSelectionForChildInput();
+    }
+    if (self.config.scroll_to_bottom.keystroke) try self.scrollToBottom();
+}
+
+test "Surface: typing redraws only what it changed on screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Only what dropping the selection, scrolling, a mods change and queueing
+    // a render read is set; the rest is zeroed so that a new read of an unset
+    // pointer faults instead of reading garbage.
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    @memset(std.mem.asBytes(surface), 0);
+    const rt_surface = try alloc.create(apprt.runtime.Surface);
+    defer alloc.destroy(rt_surface);
+    @memset(std.mem.asBytes(rt_surface), 0);
+    surface.rt_surface = rt_surface;
+    surface.config.copy_on_select = .false;
+    surface.config.selection_clear_on_typing = true;
+    surface.config.scroll_to_bottom = .{ .keystroke = true };
+    surface.renderer_thread.wakeup = try @TypeOf(surface.renderer_thread.wakeup).init();
+    defer surface.renderer_thread.wakeup.deinit();
+    surface.io.terminal = try .init(alloc, .{ .cols = 10, .rows = 3 });
+    defer surface.io.terminal.deinit(alloc);
+    var mutex: std.Thread.Mutex = .{};
+    surface.renderer_state.mutex = &mutex;
+    surface.renderer_state.terminal = &surface.io.terminal;
+    const t = &surface.io.terminal;
+    {
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("1\r\n2\r\n3\r\n4\r\n5");
+    }
+    const Probe = struct {
+        fn rendered(s: *Surface) bool {
+            const core = rendererpkg.State.WakeSource.core_surface.bit();
+            return s.renderer_state.takeWakeSources() & core != 0;
+        }
+        fn select(s: *Surface) !void {
+            const screen = s.io.terminal.screens.active;
+            const pin = screen.pages.pin(.{ .active = .{} }).?;
+            try screen.select(terminal.Selection.init(pin, pin, false));
+        }
+    };
+
+    // At the bottom with nothing selected, a typed key changes nothing on
+    // screen and must not draw the unchanged frame ahead of its echo.
+    try surface.dropSelectionAndScrollForTyping(false);
+    try testing.expect(!Probe.rendered(surface));
+    try surface.dropSelectionAndScrollForTyping(true);
+    try testing.expect(!Probe.rendered(surface));
+
+    // Dropping a selection is shown before the echo.
+    try Probe.select(surface);
+    try surface.dropSelectionAndScrollForTyping(false);
+    try testing.expect(t.screens.active.selection == null);
+    try testing.expect(Probe.rendered(surface));
+
+    // So is the jump back to the bottom.
+    t.scrollViewport(.{ .delta = -1 });
+    try testing.expect(!t.screens.active.viewportIsBottom());
+    try surface.dropSelectionAndScrollForTyping(false);
+    try testing.expect(t.screens.active.viewportIsBottom());
+    try testing.expect(Probe.rendered(surface));
+
+    // Escape drops the selection even when typing does not; with both
+    // options off, typing leaves the screen and the renderer alone.
+    surface.config.selection_clear_on_typing = false;
+    surface.config.scroll_to_bottom = .{ .keystroke = false };
+    try Probe.select(surface);
+    t.scrollViewport(.{ .delta = -1 });
+    try surface.dropSelectionAndScrollForTyping(false);
+    try testing.expect(t.screens.active.selection != null);
+    try testing.expect(!t.screens.active.viewportIsBottom());
+    try testing.expect(!Probe.rendered(surface));
+    try surface.dropSelectionAndScrollForTyping(true);
+    try testing.expect(t.screens.active.selection == null);
+    try testing.expect(!t.screens.active.viewportIsBottom());
+    try testing.expect(Probe.rendered(surface));
+
+    // Shift around a capital letter changes nothing on screen either, and
+    // a lock key is no mouse modifier at all.
+    t.flags.dirty = .{};
+    surface.modsChanged(.{ .shift = true });
+    surface.modsChanged(.{ .shift = true, .num_lock = true });
+    surface.modsChanged(.{});
+    try testing.expect(!t.flags.dirty.clear);
+    try testing.expect(!Probe.rendered(surface));
+
+    // A modifier redraws when it can light up or turn off a link: the one
+    // under the pointer, or `always_mods` links anywhere.
+    surface.renderer_state.mouse.point = .{ .x = 0, .y = 0 };
+    surface.modsChanged(.{ .ctrl = true });
+    try testing.expect(t.flags.dirty.clear);
+    try testing.expect(Probe.rendered(surface));
+    surface.renderer_state.mouse.point = null;
+    t.flags.dirty.clear = false;
+    var links = [_]DerivedConfig.Link{.{
+        .regex = undefined,
+        .action = .{ .open = {} },
+        .highlight = .{ .always_mods = .{ .ctrl = true } },
+    }};
+    surface.config.links = &links;
+    surface.modsChanged(.{});
+    try testing.expect(t.flags.dirty.clear);
+    try testing.expect(Probe.rendered(surface));
 }
 
 /// Change the cell size for the terminal grid. This can happen as
@@ -3854,8 +3998,9 @@ pub fn keyCallback(
     }
 
     // If our mouse modifiers change we may need to change our
-    // link highlight state.
-    if (!self.mouse.mods.equal(event.mods)) mouse_mods: {
+    // link highlight state. With Num Lock on, a raw comparison took this
+    // branch for every key, ahead of its pty write (see `mouseModsChanged`).
+    if (mouseModsChanged(self.mouse.mods, event.mods)) mouse_mods: {
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
@@ -3890,7 +4035,8 @@ pub fn keyCallback(
                 .mouse_over_link,
                 .{ .url = "" },
             );
-            try self.queueRender();
+            // Nothing here changes a frame; `modsChanged` redrew if the
+            // new mods do.
         }
     }
 
@@ -3975,16 +4121,7 @@ pub fn keyCallback(
     if (keyWriteIsTyping(event)) {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-
-        if (self.config.selection_clear_on_typing or
-            event.key == .escape)
-        {
-            try self.setSelection(null);
-        }
-
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
-
-        try self.queueRender();
+        try self.dropSelectionAndScrollForTyping(event.key == .escape);
     }
 
     return .consumed;
@@ -6511,10 +6648,13 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     return .{ .x = grid.x, .y = grid.y };
 }
 
-/// Scroll to the bottom of the viewport.
+/// Scroll to the bottom of the viewport, redrawing only if it moved. Every
+/// caller sends input to the child, and what the child writes back wakes
+/// the renderer on its own.
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
+    if (self.io.terminal.screens.active.viewportIsBottom()) return;
     self.io.terminal.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
