@@ -8602,7 +8602,13 @@ pub const App = struct {
             },
 
             .open_url => {
-                try self.openUrl(value.url);
+                self.openUrl(value.url) catch |err| {
+                    // A click that does nothing reads as a broken terminal.
+                    if (err == error.OpenUrlRejected) {
+                        _ = self.showHostBanner(target, .info, labels.open_refused_banner) catch false;
+                    }
+                    return err;
+                };
                 return true;
             },
 
@@ -11853,6 +11859,60 @@ pub const App = struct {
         };
         try std.testing.expect(app.runDeferredOpens());
         try std.testing.expectEqual(@as(usize, 2), Hook.count);
+    }
+
+    test "a refused link open says so in the window's banner" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+        defer app.discardDeferredOpens();
+
+        // A missing file, a program, a share and a device path never reach the
+        // shell, and the click says so.
+        for ([_][]const u8{
+            "C:\\pkg42-missing-dir\\missing.txt",
+            "C:\\Windows\\System32\\cmd.exe",
+            "\\\\server\\share\\a.txt",
+            "\\\\.\\pipe\\x",
+            "search-ms:query=*.exe",
+        }) |target| {
+            try host.setBanner(.none, null);
+            try std.testing.expectError(error.OpenUrlRejected, app.performAction(.app, .open_url, .{
+                .kind = .unknown,
+                .url = target,
+            }));
+            try std.testing.expectEqual(HostBannerKind.info, host.banner_kind);
+            try std.testing.expectEqualStrings(labels.open_refused_banner, host.banner_text.?);
+            try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+        }
+
+        // An accepted open leaves the banner alone.
+        try host.setBanner(.none, null);
+        try std.testing.expect(try app.performAction(.app, .open_url, .{
+            .kind = .unknown,
+            .url = "https://example.com/",
+        }));
+        try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+        try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+
+        // Quick select says why nothing happened, in the same banner.
+        try host.setBanner(.none, null);
+        surface.showQuickSelectNotice(labels.quick_select_no_targets_banner);
+        try std.testing.expectEqualStrings(labels.quick_select_no_targets_banner, host.banner_text.?);
+        surface.showQuickSelectNotice(labels.quick_select_too_many_banner);
+        try std.testing.expectEqualStrings(labels.quick_select_too_many_banner, host.banner_text.?);
     }
 
     test "deferred shell requests own payloads and run after their callers return" {
@@ -37332,6 +37392,7 @@ pub const Surface = struct {
         errdefer scan.deinit(alloc);
         if (scan.matches.len == 0) {
             scan.deinit(alloc);
+            self.showQuickSelectNotice(labels.quick_select_no_targets_banner);
             return true;
         }
 
@@ -37380,6 +37441,7 @@ pub const Surface = struct {
         if (!self.ensureQuickSelectLabelRects(client, metrics, host.current_dpi)) {
             log.warn("quick select has more visible labels than fit without overlap", .{});
             self.closeQuickSelect(false);
+            self.showQuickSelectNotice(labels.quick_select_too_many_banner);
             return true;
         }
 
@@ -37395,6 +37457,15 @@ pub const Surface = struct {
         _ = sys.SetCapture(hwnd);
         _ = sys.InvalidateRect(hwnd, null, 0);
         return true;
+    }
+
+    /// Say why the key press did nothing. Call with no session open: the
+    /// banner does not touch focus, and a closed overlay has nothing to free.
+    fn showQuickSelectNotice(self: *Surface, message: []const u8) void {
+        _ = self.app.showHostBanner(.{ .surface = self.core() }, .info, message) catch |err| {
+            log.warn("quick select notice failed err={}", .{err});
+            return;
+        };
     }
 
     fn ensureQuickSelectWindow(self: *Surface) !void {
@@ -37638,11 +37709,9 @@ pub const Surface = struct {
 
         self.closeQuickSelect(true);
         if (action == .open) {
-            _ = try self.app.performAction(
-                .{ .surface = self.core() },
-                .open_url,
-                .{ .kind = .unknown, .url = payload },
-            );
+            // The same resolution a Ctrl+click gets: a relative path against
+            // the pane's directory, and no line or column in the file name.
+            try self.core().openLinkText(payload);
             return;
         }
         if (action == .paste) {
