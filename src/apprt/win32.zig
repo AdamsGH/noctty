@@ -30996,17 +30996,6 @@ fn scrollbarProc(
             _ = sys.SetCursor(sys.LoadCursorW(null, c.IDC_ARROW));
             return 1;
         },
-        // The bar is stacked above its pane, and Windows sends the wheel to
-        // the window under the pointer, so a wheel over the thumb or track
-        // lands here; `DefWindowProc` would pass it to the host, which only
-        // scrolls tabs. The pane reads the screen point in lParam against
-        // its own window.
-        c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL, c.WM_POINTERWHEEL, c.WM_POINTERHWHEEL => {
-            if (surface) |value| {
-                if (value.hwnd) |pane| return sys.SendMessageW(pane, msg, wParam, lParam);
-            }
-            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
         else => return sys.DefWindowProcW(hwnd, msg, wParam, lParam),
     }
 }
@@ -38067,7 +38056,16 @@ pub const Surface = struct {
         const host = self.host orelse return;
         const hwnd = host.hwnd orelse return;
         self.scrollbar_hwnd = sys.CreateWindowExW(
-            c.WS_EX_LAYERED,
+            // Drawn above its pane (`stackChildAbove`) but never hit: the
+            // pane keeps every mouse message over the bar, and its
+            // right-edge proxy (`scrollbarProxyPointFromSurfaceCursor`)
+            // drives the bar. A hit-testable bar would take the wheel and
+            // the right, middle and X buttons from the terminal, and the
+            // pointer crossing between bar and pane would trade
+            // `WM_MOUSELEAVE`s that clear the hover (measured with
+            // `WindowFromPoint`: the thumb and track hit the bar without
+            // this).
+            c.WS_EX_LAYERED | c.WS_EX_TRANSPARENT,
             scrollbar_class_name,
             std.unicode.utf8ToUtf16LeStringLiteral(""),
             c.WS_CHILD,
@@ -47591,48 +47589,6 @@ test "win32 chrome is raised over the panes, and a pane's own child sits directl
     try expectTestChildOrder(parent, &.{ chrome, pane, bar });
     stackChildAbove(bar, pane);
     try expectTestChildOrder(parent, &.{ chrome, bar, pane });
-}
-
-const TestWheelRecorder = struct {
-    var msg: UINT = 0;
-    var wparam: WPARAM = 0;
-    var lparam: LPARAM = 0;
-
-    fn proc(hwnd: HWND, m: UINT, w: WPARAM, l: LPARAM) callconv(.winapi) LRESULT {
-        switch (m) {
-            c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL, c.WM_POINTERWHEEL, c.WM_POINTERHWHEEL => {
-                msg = m;
-                wparam = w;
-                lparam = l;
-                return 7;
-            },
-            else => return sys.DefWindowProcW(hwnd, m, w, l),
-        }
-    }
-};
-
-test "win32 a wheel over the scrollbar scrolls its pane" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const parent = try createTestHostWindow();
-    defer _ = sys.DestroyWindow(parent);
-    const pane = try createTestChromeChild(parent, prompt_label_class);
-    const bar = try createTestChromeChild(parent, prompt_label_class);
-    _ = sys.SetWindowLongPtrW(pane, c.GWLP_WNDPROC, @as(LONG_PTR, @intCast(@intFromPtr(&TestWheelRecorder.proc))));
-    // The wheel arm reads only the pane's window.
-    var surface: Surface = undefined;
-    surface.hwnd = pane;
-    setWindowData(bar, &surface);
-    defer setWindowData(bar, null);
-
-    const screen_point: LPARAM = 300 | (200 << 16);
-    const down: WPARAM = @as(WPARAM, 0xFF88) << 16; // -120
-    for ([_]UINT{ c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL, c.WM_POINTERWHEEL, c.WM_POINTERHWHEEL }) |msg| {
-        TestWheelRecorder.msg = 0;
-        try std.testing.expectEqual(@as(LRESULT, 7), scrollbarProc(bar, msg, down, screen_point));
-        try std.testing.expectEqual(msg, TestWheelRecorder.msg);
-        try std.testing.expectEqual(down, TestWheelRecorder.wparam);
-        try std.testing.expectEqual(screen_point, TestWheelRecorder.lparam);
-    }
 }
 
 /// Assemble the state `Surface.init` has built by the time it calls
