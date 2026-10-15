@@ -106,9 +106,30 @@ Root: HKA; Subkey: "Software\Classes\Drive\shell\noctty"; ValueType: string; Val
 Root: HKA; Subkey: "Software\Classes\Drive\shell\noctty\command"; ValueType: string; ValueName: ""; ValueData: "{code:ShellMenuCommand}"; Flags: uninsdeletevalue uninsdeletekeyifempty
 
 [Run]
-Filename: "{app}\noctty.exe"; Description: "Launch noctty"; Flags: nowait postinstall skipifsilent
+; Both entries start noctty through Explorer, which runs the file as the
+; logged-on user's shell and so never elevated. runasoriginaluser would not be
+; enough on its own: the Inno Setup help says it "is the default behavior when
+; the postinstall flag is used", but also that it has no effect when Setup was
+; started with "Run as administrator" or from an already-elevated process, and
+; then "Launch noctty" would open an Administrator terminal. It is kept anyway
+; for a Setup that was started the ordinary way.
+Filename: "{win}\explorer.exe"; Parameters: """{app}\noctty.exe"""; Description: "Launch noctty"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; The in-app Install quits noctty and runs this Setup silently with
+; /RELAUNCH=1, so nothing else starts noctty again: /RESTARTAPPLICATIONS only
+; restarts what Restart Manager closed, and noctty has already exited by then.
+; Install starts Setup with ShellExecute "runas", the case where
+; runasoriginaluser does nothing, hence Explorer here too.
+Filename: "{win}\explorer.exe"; Parameters: """{app}\noctty.exe"""; Flags: nowait runasoriginaluser; Check: RelaunchAfterSilentSetup
 
 [Code]
+{ True for the silent apply that noctty starts from its update notice, which
+  passes /RELAUNCH=1. A hand-run silent install (winget, Chocolatey, a script)
+  does not pass it and so does not start the app, as before. }
+function RelaunchAfterSilentSetup(): Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:RELAUNCH|0}') = '1');
+end;
+
 function OwnsDefaultTerminalRegistration(): Boolean;
 var
   RegisteredCommand: String;

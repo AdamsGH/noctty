@@ -1046,6 +1046,90 @@ pub fn recordStagedApplyRequested(alloc: Allocator, state_path: []const u8, now:
     try saveState(state_path, &state);
 }
 
+/// Where Setup writes its log for the staged installer at `artifact_path`:
+/// beside it, in `logs\apply.log`. The apply action creates the directory and
+/// passes this path as `/LOG=`; the next start names it when the install did
+/// not finish.
+pub fn applyLogPathAlloc(alloc: Allocator, artifact_path: []const u8) ![]u8 {
+    const stage_dir = std.fs.path.dirname(artifact_path) orelse return error.InvalidStagedInstallerPath;
+    return std.fs.path.join(alloc, &.{ stage_dir, "logs", "apply.log" });
+}
+
+/// Whether a process is running from the file at `path`. Windows refuses
+/// write access to an image that is mapped, so a Setup that is still running
+/// shows up as a sharing violation on its own file, with no process id or
+/// clock to record at launch (and none to go stale). Zig reports that
+/// violation as `AccessDenied` or `SharingViolation`, depending on the path;
+/// a real permission failure on a file in the user's own profile reads the
+/// same way, and only delays the report to a later start.
+fn installerImageInUse(path: []const u8) bool {
+    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| {
+        return err == error.SharingViolation or err == error.AccessDenied;
+    };
+    file.close();
+    return false;
+}
+
+/// Called at start-up. Install quits the app right after launching Setup and
+/// nothing watches Setup's result, so this is the first chance to find out
+/// whether it worked: a recorded apply request while this build is still
+/// older than the staged version means Setup did not replace it (a file lock,
+/// an antivirus block, a failed run).
+///
+/// Returns the banner text for that case, and in every case clears the request
+/// so it is said once. The staged installer stays, so Install is offered
+/// again. While that Setup is still running the request is left alone: a
+/// start during the install must not read the old build as a failure, and the
+/// next start will. Portable applies keep their own recovery and are not
+/// touched.
+pub fn takeFailedInstallerApply(
+    alloc: Allocator,
+    state_path: []const u8,
+    running_version: std.SemanticVersion,
+) !?[]u8 {
+    {
+        var peek = try loadState(alloc, state_path);
+        defer peek.deinit(alloc);
+        if (peek.apply_requested_at == 0) return null;
+    }
+
+    const state_lock = try openStateLock(state_path);
+    defer state_lock.close();
+    var state = try loadState(alloc, state_path);
+    defer state.deinit(alloc);
+    if (state.apply_requested_at == 0) return null;
+    if (state.staged_kind != .installer or state.portable_apply_phase != null) return null;
+    if (state.staged_installer_path) |path| {
+        if (installerImageInUse(path)) return null;
+    }
+
+    state.apply_requested_at = 0;
+    try saveState(state_path, &state);
+
+    const staged_version = state.staged_version orelse return null;
+    const staged = parseVersionText(staged_version) catch return null;
+    if (running_version.order(staged) != .lt) return null;
+
+    // Install is only recorded once the elevation prompt was accepted, so no
+    // log means Setup started but could not open one, or was killed first.
+    const log_path: ?[]u8 = if (state.staged_installer_path) |path| applyLogPathAlloc(alloc, path) catch null else null;
+    defer if (log_path) |value| alloc.free(value);
+    if (log_path) |path| {
+        if (std.fs.cwd().access(path, .{})) |_| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "The update to noctty {s} did not finish installing. Setup's log: {s}",
+                .{ staged_version, path },
+            );
+        } else |_| {}
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "The update to noctty {s} did not finish installing, and Setup left no log.",
+        .{staged_version},
+    );
+}
+
 pub fn hasStagedWindowsInstall(
     alloc: Allocator,
     state_path: []const u8,
@@ -3855,6 +3939,138 @@ test "record staged apply request persists timestamp" {
     var loaded = try loadState(alloc, state_path);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1234), loaded.apply_requested_at);
+}
+
+test "a start after an install that did not replace the build reports it once, with the log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+    const installer_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.101", "setup.exe" });
+    defer alloc.free(installer_path);
+    const log_path = try applyLogPathAlloc(alloc, installer_path);
+    defer alloc.free(log_path);
+    try std.testing.expect(std.mem.endsWith(u8, log_path, "1.3.101\\logs\\apply.log"));
+
+    const old_build: std.SemanticVersion = .{ .major = 1, .minor = 3, .patch = 100 };
+    const staged_build: std.SemanticVersion = .{ .major = 1, .minor = 3, .patch = 101 };
+    var state: State = .{
+        .staged_version = try alloc.dupe(u8, "1.3.101"),
+        .staged_kind = .installer,
+        .staged_installer_path = try alloc.dupe(u8, installer_path),
+        .staged_sha256 = try alloc.dupe(u8, "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"),
+    };
+    defer state.deinit(alloc);
+    try saveState(state_path, &state);
+
+    // No request recorded: nothing to say, nothing written.
+    try std.testing.expectEqual(@as(?[]u8, null), try takeFailedInstallerApply(alloc, state_path, old_build));
+
+    // The installer ran and left no log.
+    try recordStagedApplyRequested(alloc, state_path, 1_000_000);
+    const no_log = (try takeFailedInstallerApply(alloc, state_path, old_build)).?;
+    defer alloc.free(no_log);
+    try std.testing.expect(std.mem.indexOf(u8, no_log, "noctty 1.3.101 did not finish installing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_log, "left no log") != null);
+
+    // Said once, and the staged installer stays so Install is offered again.
+    var loaded = try loadState(alloc, state_path);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 0), loaded.apply_requested_at);
+    try std.testing.expectEqualStrings("1.3.101", loaded.staged_version.?);
+    try std.testing.expectEqual(@as(?[]u8, null), try takeFailedInstallerApply(alloc, state_path, old_build));
+
+    // With a log, the message names it.
+    try tmp.dir.makePath("updates/1.3.101/logs");
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.101/logs/apply.log", .data = "setup log" });
+    try recordStagedApplyRequested(alloc, state_path, 1_000_000);
+    const with_log = (try takeFailedInstallerApply(alloc, state_path, old_build)).?;
+    defer alloc.free(with_log);
+    try std.testing.expect(std.mem.indexOf(u8, with_log, log_path) != null);
+
+    // A build that is the staged version or newer means Setup worked. The
+    // request is cleared without a message.
+    for ([_]std.SemanticVersion{ staged_build, .{ .major = 1, .minor = 4, .patch = 0 } }) |running| {
+        try recordStagedApplyRequested(alloc, state_path, 1_000_000);
+        try std.testing.expectEqual(@as(?[]u8, null), try takeFailedInstallerApply(alloc, state_path, running));
+        var after = try loadState(alloc, state_path);
+        defer after.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 0), after.apply_requested_at);
+    }
+}
+
+test "a start while Setup is still running leaves the request for a later start" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+    try tmp.dir.makePath("updates/1.3.101");
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.101/setup.exe", .data = "setup" });
+    const installer_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.101", "setup.exe" });
+    defer alloc.free(installer_path);
+    var state: State = .{
+        .staged_version = try alloc.dupe(u8, "1.3.101"),
+        .staged_kind = .installer,
+        .staged_installer_path = try alloc.dupe(u8, installer_path),
+        .staged_sha256 = try alloc.dupe(u8, "00"),
+        .apply_requested_at = 1_000_000,
+    };
+    defer state.deinit(alloc);
+    try saveState(state_path, &state);
+    const old_build: std.SemanticVersion = .{ .major = 1, .minor = 3, .patch = 100 };
+
+    // A running image refuses write access, which the updater's own locked
+    // open of the staged installer (read-only share) reproduces: the probe
+    // sees a sharing violation.
+    {
+        var running = try openLockedInstaller(installer_path);
+        defer running.close();
+        try std.testing.expect(installerImageInUse(installer_path));
+        try std.testing.expectEqual(@as(?[]u8, null), try takeFailedInstallerApply(alloc, state_path, old_build));
+        var loaded = try loadState(alloc, state_path);
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 1_000_000), loaded.apply_requested_at);
+    }
+
+    // Once it has exited, the same start reports the failure.
+    try std.testing.expect(!installerImageInUse(installer_path));
+    const message = (try takeFailedInstallerApply(alloc, state_path, old_build)).?;
+    defer alloc.free(message);
+    try std.testing.expect(std.mem.indexOf(u8, message, "did not finish installing") != null);
+}
+
+test "a start leaves a portable apply request to the portable recovery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+
+    var state: State = .{
+        .staged_version = try alloc.dupe(u8, "1.3.101"),
+        .staged_kind = .portable,
+        .staged_sha256 = try alloc.dupe(u8, "00"),
+        .apply_requested_at = 1,
+        .portable_apply_phase = .pending,
+    };
+    defer state.deinit(alloc);
+    try saveState(state_path, &state);
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try takeFailedInstallerApply(alloc, state_path, .{ .major = 1, .minor = 3, .patch = 100 }),
+    );
+    var loaded = try loadState(alloc, state_path);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), loaded.apply_requested_at);
 }
 
 test "portable update rejects persisted paths outside its stage" {

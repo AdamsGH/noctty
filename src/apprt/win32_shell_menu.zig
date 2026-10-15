@@ -51,6 +51,7 @@ extern "shell32" fn SHChangeNotify(
 ) callconv(.winapi) void;
 
 const HKEY_CURRENT_USER: HKEY = @ptrFromInt(consts.HKEY_CURRENT_USER);
+const HKEY_LOCAL_MACHINE: HKEY = @ptrFromInt(consts.HKEY_LOCAL_MACHINE);
 const KEY_WRITE: REGSAM = 0x20006;
 const KEY_READ: REGSAM = 0x20019;
 const REG_OPTION_NON_VOLATILE: DWORD = 0;
@@ -403,6 +404,23 @@ pub fn unregister(alloc: Allocator) ![unregister_key_paths.len]DeleteResult {
     }
     if (removed_any) notifyExplorerAssociationsChanged();
     return results;
+}
+
+/// Whether the installer's all-users verbs exist. Setup writes the same three
+/// verb keys under HKLM for the default all-users install; they are Setup's
+/// to remove (its uninstaller does), so this module only looks, read-only,
+/// so that `+unregister-shell-menu` can say they remain.
+pub fn machineVerbsPresent(alloc: Allocator) bool {
+    for (verb_key_paths) |path| {
+        const path_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
+        defer alloc.free(path_wide);
+        var key: HKEY = undefined;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path_wide, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+            _ = RegCloseKey(key);
+            return true;
+        }
+    }
+    return false;
 }
 
 fn notifyExplorerAssociationsChanged() void {
