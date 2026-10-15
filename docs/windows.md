@@ -1440,11 +1440,12 @@ GL_RENDERER : D3D12 (Qualcomm(R) Adreno(TM) X1-85 GPU)
 The Mesa version is whatever the installed pack ships; only the `D3D12 (...)`
 renderer prefix and a version at or above 4.3 matter.
 
-The Compatibility Pack is required for noctty's default OpenGL 4.3 backend.
+On a Snapdragon PC, or any ARM64 PC whose GPU vendor ships no desktop
+OpenGL driver, the Compatibility Pack is required for noctty's default OpenGL
+4.3 backend; an ARM64 PC with its vendor's own OpenGL driver does not need it.
 The opt-in D3D11 beta provides a separate hardware/WARP text-rendering path.
-On ARM64
-that OpenGL comes from a Microsoft mapping layer rather than a GPU vendor's
-driver, but noctty neither knows nor cares which supplied it.
+With the pack, OpenGL comes from a Microsoft mapping layer rather than a GPU
+vendor's driver, but noctty neither knows nor cares which supplied it.
 
 There is no AMD or NVIDIA driver to reinstall on ARM64 and no second GPU to
 select in Windows Graphics settings, so noctty's startup dialog leads with

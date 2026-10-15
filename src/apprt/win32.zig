@@ -11263,7 +11263,10 @@ pub const App = struct {
         return try client_size_fn(ctx, live_hwnd);
     }
 
-    fn createGLContext(self: *App, hwnd: HWND) !struct {
+    /// `owned_format` is the window's record of the pixel format it set:
+    /// filled in as soon as `SetPixelFormat` succeeds, so a later attempt on
+    /// the same window reuses it after a context that failed to be created.
+    fn createGLContext(self: *App, hwnd: HWND, owned_format: *?pixel_format.WglPixelFormatProvenance) !struct {
         hdc: HDC,
         hglrc: HGLRC,
         // Returned rather than logged-and-dropped so the caller can hand
@@ -11280,35 +11283,45 @@ pub const App = struct {
         errdefer _ = sys.ReleaseDC(hwnd, hdc);
 
         const format_before = sys.GetPixelFormat(hdc);
-        if (format_before != 0) {
-            recordOpenGLStartupError(.set_pixel_format, error.PixelFormatAlreadySet);
-            return error.PixelFormatAlreadySet;
-        }
-
-        var selection = try pixel_format.chooseRealPixelFormat(self.hinstance, hwnd, hdc);
-        log.debug(
-            "selected WGL pixel format index={} source={s} srgb_capable={} depth_bits={} stencil_bits={}",
-            .{
-                selection.provenance.index,
-                @tagName(selection.provenance.selection_source),
-                selection.provenance.srgb_capable,
-                selection.provenance.depth_bits,
-                selection.provenance.stencil_bits,
-            },
-        );
-
-        if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0) {
-            const err = windows.kernel32.GetLastError();
-            recordOpenGLStartupWin32Failure(.set_pixel_format, err);
-            return windows.unexpectedError(err);
-        }
-        pixel_format.validatePixelFormatSetTransition(
+        const plan = pixel_format.planPixelFormat(
             format_before,
-            selection.pixel_format,
-            sys.GetPixelFormat(hdc),
+            if (owned_format.*) |owned| owned.index else null,
         ) catch |err| {
             recordOpenGLStartupError(.set_pixel_format, err);
             return err;
+        };
+        const provenance = switch (plan) {
+            .reuse => owned_format.*.?,
+            .choose_and_set => set: {
+                var selection = try pixel_format.chooseRealPixelFormat(self.hinstance, hwnd, hdc);
+                log.debug(
+                    "selected WGL pixel format index={} source={s} srgb_capable={} depth_bits={} stencil_bits={}",
+                    .{
+                        selection.provenance.index,
+                        @tagName(selection.provenance.selection_source),
+                        selection.provenance.srgb_capable,
+                        selection.provenance.depth_bits,
+                        selection.provenance.stencil_bits,
+                    },
+                );
+
+                if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0) {
+                    const err = windows.kernel32.GetLastError();
+                    recordOpenGLStartupWin32Failure(.set_pixel_format, err);
+                    return windows.unexpectedError(err);
+                }
+                pixel_format.validatePixelFormatSetTransition(
+                    format_before,
+                    selection.pixel_format,
+                    sys.GetPixelFormat(hdc),
+                ) catch |err| {
+                    recordOpenGLStartupError(.set_pixel_format, err);
+                    return err;
+                };
+                // The window keeps this format whatever happens next.
+                owned_format.* = selection.provenance;
+                break :set selection.provenance;
+            },
         };
 
         const hglrc = sys.wglCreateContext(hdc) orelse {
@@ -11327,7 +11340,7 @@ pub const App = struct {
         return .{
             .hdc = hdc,
             .hglrc = hglrc,
-            .provenance = selection.provenance,
+            .provenance = provenance,
         };
     }
 
@@ -33672,6 +33685,10 @@ pub const Surface = struct {
     placement: ChildPlacement = .{},
     hdc: HDC = null,
     hglrc: HGLRC = null,
+    /// The pixel format this window took, once `SetPixelFormat` succeeded.
+    /// A window keeps its format for good, so a later OpenGL attempt (a
+    /// fallback from D3D11 after an earlier one failed) must reuse it.
+    gl_pixel_format: ?pixel_format.WglPixelFormatProvenance = null,
     core_surface: CoreSurface = undefined,
     core_initialized: bool = false,
     adopted_session: ?ptypkg.AdoptedSession = null,
@@ -35520,7 +35537,7 @@ pub const Surface = struct {
     pub fn ensureGLContext(self: *Surface) !void {
         if (self.hglrc != null) return;
         const hwnd = self.hwnd orelse return error.NoWindow;
-        const gl_context = try self.app.createGLContext(hwnd);
+        const gl_context = try self.app.createGLContext(hwnd, &self.gl_pixel_format);
         self.hdc = gl_context.hdc;
         self.hglrc = gl_context.hglrc;
         self.setBenchmarkWglPixelFormat(gl_context.provenance);
@@ -43507,6 +43524,39 @@ test "win32 runtime can initialize config" {
     defer app.terminate();
 
     try std.testing.expect(@intFromPtr(app.hinstance) != 0);
+}
+
+test "win32 an OpenGL retry on a window reuses the pixel format it set" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core = try CoreApp.create(std.testing.allocator);
+    defer core.destroy();
+    var app: App = undefined;
+    try app.init(core, .{});
+    defer app.terminate();
+
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    var owned: ?pixel_format.WglPixelFormatProvenance = null;
+    // No usable WGL format here (a hosted runner without a GL driver).
+    const first = app.createGLContext(hwnd, &owned) catch return error.SkipZigTest;
+    try std.testing.expect(owned != null);
+
+    // What a failed attempt leaves: the format set, no context.
+    _ = sys.wglMakeCurrent(null, null);
+    _ = sys.wglDeleteContext(first.hglrc);
+    _ = sys.ReleaseDC(hwnd, first.hdc);
+
+    // Its own format is reused, and the retry gets a context. (Refusing a
+    // format the window did not record is `planPixelFormat`'s table test:
+    // through here it logs an OpenGL startup error, which fails the run.)
+    const second = try app.createGLContext(hwnd, &owned);
+    defer {
+        _ = sys.wglMakeCurrent(null, null);
+        _ = sys.wglDeleteContext(second.hglrc);
+        _ = sys.ReleaseDC(hwnd, second.hdc);
+    }
+    try std.testing.expectEqual(owned.?.index, second.provenance.index);
 }
 
 test "win32 runtime leaves the real profile alone when a test starts it" {
