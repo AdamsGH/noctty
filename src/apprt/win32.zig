@@ -8433,14 +8433,117 @@ pub const App = struct {
         self: *App,
         pending: *win32_terminal_handoff.PendingSession,
     ) !void {
+        // `config.title` is the static-title setting: the core would drop
+        // every later title the console sets (cmd's `title`, a prompt, a
+        // TUI) for as long as the surface lives. The client's title is only
+        // where this one starts.
         var config = try apprt.surface.newConfig(self.core_app, &self.config, .window);
         defer config.deinit();
-        const alloc = config._arena.?.allocator();
-        config.title = try alloc.dupeZ(u8, pending.title);
         const title_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, pending.title);
         defer self.core_app.alloc.free(title_w);
-        _ = try self.createWindowSurface(&config, title_w.ptr, .{ .adopted_session = pending });
+        const surface = try self.createWindowSurface(&config, title_w.ptr, .{
+            .adopted_session = pending,
+            .show = adoptedInitialShow(pending.startup_flags, pending.show_window),
+        });
+        // Nothing has drained the surface's mailbox yet, so this cannot
+        // overwrite a title the console already set.
+        surface.setTitle(pending.title) catch |err| {
+            log.warn("adopted window startup title failed err={}", .{err});
+        };
         win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_created");
+    }
+
+    test "an adopted window starts with the client's title and show state, and pins neither" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var created: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &created, .host = &host, .register = true }},
+        });
+        defer session.deinit();
+        defer appendOwnedString(core_app.alloc, &created.title, null) catch {};
+
+        const Hook = struct {
+            var created_ref: *Surface = undefined;
+            var title_pinned: bool = true;
+            var show: InitialShow = .activate;
+
+            fn createSurface(
+                _: *App,
+                config: *const configpkg.Config,
+                _: LPCWSTR,
+                opts: SurfaceInitOptions,
+            ) anyerror!*Surface {
+                title_pinned = config.title != null;
+                show = opts.show;
+                return created_ref;
+            }
+        };
+        Hook.created_ref = &created;
+        app.test_create_window_surface = &Hook.createSurface;
+
+        var pending: win32_terminal_handoff.PendingSession = .{
+            .alloc = core_app.alloc,
+            .adopted = null,
+            .title = try core_app.alloc.dupe(u8, "C:\\Windows\\system32\\cmd.exe"),
+            .startup_flags = win32_terminal_handoff.STARTF_USESHOWWINDOW,
+            .show_window = c.SW_SHOWMINNOACTIVE,
+        };
+        defer pending.deinit();
+
+        try app.createAdoptedWindow(&pending);
+
+        // A set `config.title` is the static-title setting, which makes the
+        // core drop every title the console sets afterwards.
+        try std.testing.expect(!Hook.title_pinned);
+        try std.testing.expectEqual(InitialShow.minimized, Hook.show);
+        try std.testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", created.title.?);
+    }
+
+    test "a handed-off console's show state maps to the host's first show" {
+        const use = win32_terminal_handoff.STARTF_USESHOWWINDOW;
+        // Ignored without STARTF_USESHOWWINDOW, whatever the client left in
+        // `wShowWindow`.
+        for ([_]u16{ c.SW_HIDE, c.SW_SHOWMINNOACTIVE, c.SW_MAXIMIZE, c.SW_SHOWNOACTIVATE }) |sw| {
+            try std.testing.expectEqual(InitialShow.activate, adoptedInitialShow(0, sw));
+            try std.testing.expectEqual(InitialShow.activate, adoptedInitialShow(0x100, sw));
+        }
+        const cases = [_]struct { u16, InitialShow }{
+            .{ c.SW_SHOWNOACTIVATE, .no_activate },
+            .{ c.SW_SHOWNA, .no_activate },
+            .{ c.SW_SHOWMINIMIZED, .minimized },
+            .{ c.SW_MINIMIZE, .minimized },
+            .{ c.SW_SHOWMINNOACTIVE, .minimized },
+            .{ c.SW_FORCEMINIMIZE, .minimized },
+            .{ c.SW_HIDE, .minimized },
+            .{ c.SW_MAXIMIZE, .maximized },
+            // SW_SHOWNORMAL, SW_SHOW, SW_RESTORE, SW_SHOWDEFAULT, and a value
+            // no one defined.
+            .{ 1, .activate },
+            .{ c.SW_SHOW, .activate },
+            .{ c.SW_RESTORE, .activate },
+            .{ 10, .activate },
+            .{ 99, .activate },
+        };
+        for (cases) |case| {
+            try std.testing.expectEqual(case[1], adoptedInitialShow(use, case[0]));
+            // Other STARTF_ bits do not matter.
+            try std.testing.expectEqual(case[1], adoptedInitialShow(use | 0x100, case[0]));
+        }
+        // Only a minimized host or a passive one stays out of the foreground.
+        try std.testing.expect(InitialShow.activate.takesFocus());
+        try std.testing.expect(InitialShow.maximized.takesFocus());
+        try std.testing.expect(!InitialShow.no_activate.takesFocus());
+        try std.testing.expect(!InitialShow.minimized.takesFocus());
+        try std.testing.expectEqual(@as(?i32, null), InitialShow.activate.showCommand());
+        try std.testing.expectEqual(@as(?i32, c.SW_SHOWMINNOACTIVE), InitialShow.minimized.showCommand());
     }
 
     fn refreshSystemWheelSettings(self: *App) void {
@@ -9914,7 +10017,7 @@ pub const App = struct {
             // without taking focus. Without this, the very first toggle-on
             // with `keyboard-interactivity = none` would still activate the
             // window even though the later `present()` call is skipped.
-            .passive_show = !want_focus,
+            .show = if (want_focus) .activate else .no_activate,
         });
         try surface.setFloatWindow(.on);
         if (surface.windowHwnd()) |top_level| {
@@ -23335,15 +23438,58 @@ const SurfaceInitOptions = struct {
     tab_insert_index: ?usize = null,
     clone_state_from: ?*const Surface = null,
     split_direction: SplitTreeSurface.Split.Direction = .right,
-    /// Passive first-show: once GL and core initialization succeed, the
-    /// newly-created host HWND is shown via `SW_SHOWNOACTIVATE` instead of
-    /// being presented with focus, so it becomes visible without stealing
-    /// focus from the caller's current foreground window. Used by the
-    /// quick-terminal passive mode
-    /// (`quick-terminal-keyboard-interactivity = none`) on first toggle-on.
-    passive_show: bool = false,
+    /// How the newly-created host HWND first appears, once GL and core
+    /// initialization succeed. Used by the quick-terminal passive mode
+    /// (`quick-terminal-keyboard-interactivity = none`) on first toggle-on,
+    /// and by a handed-off console that asked not to take focus.
+    show: InitialShow = .activate,
     adopted_session: ?*win32_terminal_handoff.PendingSession = null,
 };
+
+/// The first show of a new host window.
+const InitialShow = enum {
+    /// Shown and presented with focus.
+    activate,
+    /// Visible without stealing focus from the caller's foreground window.
+    no_activate,
+    /// Minimized, without activation: the window exists but stays out of the
+    /// way, and the taskbar button is all the user sees.
+    minimized,
+    /// Maximized, with focus.
+    maximized,
+
+    /// The `ShowWindow` command that precedes presenting the window with
+    /// focus, if any.
+    fn showCommand(self: InitialShow) ?i32 {
+        return switch (self) {
+            .activate => null,
+            .no_activate => c.SW_SHOWNOACTIVATE,
+            .minimized => c.SW_SHOWMINNOACTIVE,
+            .maximized => c.SW_MAXIMIZE,
+        };
+    }
+
+    fn takesFocus(self: InitialShow) bool {
+        return self == .activate or self == .maximized;
+    }
+};
+
+/// The first show a handed-off console asked for in its `STARTUPINFO`.
+///
+/// `wShowWindow` means something only when `STARTF_USESHOWWINDOW` is set; it
+/// is whatever the client left there otherwise. Conhost hands over consoles
+/// started with `SW_HIDE` too (only `CREATE_NO_WINDOW` keeps a console
+/// windowless), and a host with no way to be shown again is worse than a
+/// minimized one, so a hide becomes a minimize that takes no focus.
+fn adoptedInitialShow(startup_flags: u32, show_window: u16) InitialShow {
+    if (startup_flags & win32_terminal_handoff.STARTF_USESHOWWINDOW == 0) return .activate;
+    return switch (show_window) {
+        c.SW_SHOWNOACTIVATE, c.SW_SHOWNA => .no_activate,
+        c.SW_HIDE, c.SW_SHOWMINIMIZED, c.SW_MINIMIZE, c.SW_SHOWMINNOACTIVE, c.SW_FORCEMINIMIZE => .minimized,
+        c.SW_MAXIMIZE => .maximized,
+        else => .activate,
+    };
+}
 
 const SplitSurfaceAttachRollback = struct {
     tab: *Tab,
@@ -31499,14 +31645,13 @@ pub const Surface = struct {
             // and core initialization have succeeded, so a startup failure
             // reaches the fatal dialog without first presenting a blank host
             // window. Same-host tabs and splits never take this path.
-            if (opts.passive_show) {
+            if (opts.show.showCommand()) |show_command| {
                 if (host.hwnd) |host_hwnd| {
-                    _ = sys.ShowWindow(host_hwnd, c.SW_SHOWNOACTIVATE);
+                    _ = sys.ShowWindow(host_hwnd, show_command);
                     _ = sys.UpdateWindow(host_hwnd);
                 }
-            } else {
-                self.presentWindow();
             }
+            if (opts.show.takesFocus()) self.presentWindow();
             if (app.update_startup_ready) app.maybeScheduleAutomaticUpdateCheck();
             try self.requestRepaint();
         }
