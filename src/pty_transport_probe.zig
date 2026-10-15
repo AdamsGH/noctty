@@ -39,6 +39,107 @@ const key_input_ready_marker = "NOCTTY-KEYS-READY";
 const key_input_begin_marker = "NOCTTY-KEYS-BEGIN";
 const key_input_end_marker = "NOCTTY-KEYS-END";
 
+/// The child writes nothing but lowercase hex digits between the key-input
+/// markers, but the in-box conhost re-renders that output and can put its
+/// own sequences among the digits: CI saw its window-title sequence (the
+/// test binary's path, `ESC ] 0 ; ... BEL`) there, failing the decode once
+/// with an odd digit count and once with a non-hex byte (FLAKY-04). Keep the
+/// digits and drop complete escape sequences and line breaks. Anything else,
+/// including a sequence the region cuts off, is an error: a stray byte after
+/// the last key is what the probe exists to catch, so nothing may swallow it.
+fn keyInputHexDigits(allocator: std.mem.Allocator, region: []const u8) ![]u8 {
+    var digits: std.ArrayList(u8) = .empty;
+    errdefer digits.deinit(allocator);
+    var i: usize = 0;
+    while (i < region.len) {
+        const c = region[i];
+        if (c != 0x1b) {
+            switch (c) {
+                '0'...'9', 'a'...'f' => try digits.append(allocator, c),
+                '\r', '\n' => {},
+                else => return error.KeyInputProbeUnexpectedByte,
+            }
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= region.len) return error.KeyInputProbeTruncatedEscape;
+        switch (region[i + 1]) {
+            // OSC, to BEL or ST. Another ESC aborts it, as in a VT parser,
+            // and is then read as the start of the next sequence.
+            ']' => {
+                i += 2;
+                while (true) : (i += 1) {
+                    if (i >= region.len) return error.KeyInputProbeTruncatedEscape;
+                    if (region[i] == 0x07) {
+                        i += 1;
+                        break;
+                    }
+                    if (region[i] == 0x1b) {
+                        if (i + 1 < region.len and region[i + 1] == '\\') i += 2;
+                        break;
+                    }
+                }
+            },
+            // CSI: parameter bytes, intermediate bytes, one final byte.
+            '[' => {
+                i += 2;
+                while (i < region.len and region[i] >= 0x30 and region[i] <= 0x3f) : (i += 1) {}
+                while (i < region.len and region[i] >= 0x20 and region[i] <= 0x2f) : (i += 1) {}
+                if (i >= region.len) return error.KeyInputProbeTruncatedEscape;
+                if (region[i] < 0x40 or region[i] > 0x7e) return error.KeyInputProbeUnexpectedByte;
+                i += 1;
+            },
+            // DCS, SOS, PM and APC carry a string this does not parse.
+            'P', 'X', '^', '_' => return error.KeyInputProbeUnexpectedByte,
+            // Any other escape: intermediate bytes, then one final byte.
+            else => {
+                i += 1;
+                while (i < region.len and region[i] >= 0x20 and region[i] <= 0x2f) : (i += 1) {}
+                if (i >= region.len) return error.KeyInputProbeTruncatedEscape;
+                if (region[i] < 0x30 or region[i] > 0x7e) return error.KeyInputProbeUnexpectedByte;
+                i += 1;
+            },
+        }
+    }
+    return digits.toOwnedSlice(allocator);
+}
+
+test "ConPTY key input probe reads the child's hex through conhost's sequences" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { raw: []const u8, digits: []const u8 }{
+        .{ .raw = "", .digits = "" },
+        .{ .raw = "1b5b41", .digits = "1b5b41" },
+        // The title, BEL-terminated, between a byte's two digits.
+        .{ .raw = "1b5\x1b]0;D:\\a\\noctty\\.zig-cache\\o\\e742\\ghostty-test.exe\x07b41", .digits = "1b5b41" },
+        // ST-terminated, then a line break and a cursor move.
+        .{ .raw = "0d\x1b]0;C:\\x\x1b\\\r\n\x1b[2;1H0a", .digits = "0d0a" },
+        .{ .raw = "\x1b[?25l7f\x1b[?25h", .digits = "7f" },
+        // An ESC inside the title aborts it and starts the next sequence.
+        .{ .raw = "1b\x1b]0;t\x1b[H5b41", .digits = "1b5b41" },
+        // An escape with an intermediate byte keeps nothing of itself.
+        .{ .raw = "1b\x1b(05b41", .digits = "1b5b41" },
+        .{ .raw = "1b\x1b#85b41", .digits = "1b5b41" },
+    };
+    for (cases) |case| {
+        const digits = try keyInputHexDigits(allocator, case.raw);
+        defer allocator.free(digits);
+        try std.testing.expectEqualStrings(case.digits, digits);
+    }
+    const refused = [_]struct { raw: []const u8, err: anyerror }{
+        .{ .raw = "1g", .err = error.KeyInputProbeUnexpectedByte },
+        .{ .raw = "1B", .err = error.KeyInputProbeUnexpectedByte },
+        // A sequence the region cuts off would swallow what follows it.
+        .{ .raw = "1b5b\x1b]0;x41", .err = error.KeyInputProbeTruncatedEscape },
+        .{ .raw = "1b5b\x1b[2;41", .err = error.KeyInputProbeTruncatedEscape },
+        .{ .raw = "1b5b\x1b", .err = error.KeyInputProbeTruncatedEscape },
+        .{ .raw = "1b\x1b(", .err = error.KeyInputProbeTruncatedEscape },
+        .{ .raw = "1b\x1bP1b\x1b\\", .err = error.KeyInputProbeUnexpectedByte },
+    };
+    for (refused) |case| {
+        try std.testing.expectError(case.err, keyInputHexDigits(allocator, case.raw));
+    }
+}
+
 /// Terminating byte the parent writes once every case has been sent. It is
 /// never part of a case payload or delimiter.
 const key_input_sentinel: u8 = 'Z';
@@ -991,14 +1092,26 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
                 10 * std.time.ns_per_s,
             );
 
-            const begin = std.mem.indexOf(u8, output.items, key_input_begin_marker).? +
-                key_input_begin_marker.len;
+            const begin = (std.mem.indexOf(u8, output.items, key_input_begin_marker) orelse
+                return error.KeyInputProbeBeginMarkerMissing) + key_input_begin_marker.len;
             const end = begin + (std.mem.indexOf(
                 u8,
                 output.items[begin..],
                 key_input_end_marker,
             ) orelse return error.KeyInputProbeEndMarkerMissing);
-            const received = try decodeHex(allocator, output.items[begin..end]);
+            const region = output.items[begin..end];
+            // A rejected region is printed whole, so the next one can be read.
+            const digits = keyInputHexDigits(allocator, region) catch |err| {
+                printHex("key-input-probe rejected_region_hex", region);
+                std.debug.print("\n", .{});
+                return err;
+            };
+            defer allocator.free(digits);
+            const received = decodeHex(allocator, digits) catch |err| {
+                printHex("key-input-probe rejected_region_hex", region);
+                std.debug.print("\n", .{});
+                return err;
+            };
             defer allocator.free(received);
 
             const info = ptypkg.conPtyInfo().?;

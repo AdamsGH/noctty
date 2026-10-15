@@ -43,16 +43,30 @@ pub const Runtime = struct {
 
     /// Allocation-free focus transition for the UI hot path.
     pub fn focusPane(self: *Runtime, pane_id: model.PaneId) !bool {
+        return self.setPaneFocus(pane_id, true);
+    }
+
+    /// `focusPane` for a pane that comes up without taking the keyboard, such
+    /// as one in a window that is not in front: its tab becomes the window's
+    /// active tab and it the tab's focused pane, but the window does not
+    /// become the focused window.
+    pub fn activatePane(self: *Runtime, pane_id: model.PaneId) !bool {
+        return self.setPaneFocus(pane_id, false);
+    }
+
+    fn setPaneFocus(self: *Runtime, pane_id: model.PaneId, take_window: bool) !bool {
         const pane = self.state.pane(pane_id) orelse return error.StaleId;
         const tab = self.state.tab(pane.tab) orelse return error.StaleId;
         const window = self.state.window(tab.window) orelse return error.StaleId;
+        // A model with windows always names one as focused (`validate`).
+        const takes_window = take_window or self.state.focused_window == null;
         const unchanged = tab.focused_pane.eql(pane_id) and
             window.active_tab != null and window.active_tab.?.eql(tab.id) and
-            self.state.focused_window != null and self.state.focused_window.?.eql(window.id);
+            (!takes_window or (self.state.focused_window != null and self.state.focused_window.?.eql(window.id)));
         if (unchanged) return false;
         tab.focused_pane = pane_id;
         window.active_tab = tab.id;
-        self.state.focused_window = window.id;
+        if (takes_window) self.state.focused_window = window.id;
         self.bumpRevision();
         return true;
     }
@@ -254,6 +268,40 @@ test "focus pane is allocation free and revisioned" {
     try std.testing.expect(try runtime.focusPane(original));
     try std.testing.expectEqual(revision + 1, runtime.revision);
     try std.testing.expect(!try runtime.focusPane(original));
+}
+
+test "activating a pane shows it without making its window the focused one" {
+    const allocator = std.testing.allocator;
+    var runtime = Runtime.init(allocator);
+    defer runtime.deinit();
+
+    var first = try runtime.prepare(.create_window);
+    defer first.deinit();
+    try first.commit(&runtime);
+    var second = try runtime.prepare(.create_window);
+    defer second.deinit();
+    try second.commit(&runtime);
+    var other_tab = try runtime.prepare(.{ .create_tab = second.created.window.? });
+    defer other_tab.deinit();
+    try other_tab.commit(&runtime);
+    const first_window = first.created.window.?;
+    const second_window = second.created.window.?;
+    try std.testing.expect(try runtime.focusPane(first.created.pane.?));
+    try std.testing.expect(runtime.state.focused_window.?.eql(first_window));
+    // The second window's first tab is behind its second.
+    try std.testing.expect(runtime.state.window(second_window).?.active_tab.?.eql(other_tab.created.tab.?));
+
+    const revision = runtime.revision;
+    try std.testing.expect(try runtime.activatePane(second.created.pane.?));
+    try std.testing.expectEqual(revision + 1, runtime.revision);
+    try std.testing.expect(runtime.state.window(second_window).?.active_tab.?.eql(second.created.tab.?));
+    try std.testing.expect(runtime.state.focused_window.?.eql(first_window));
+    try std.testing.expect(!try runtime.activatePane(second.created.pane.?));
+    try runtime.state.validate();
+
+    // Real focus is what moves the focused window.
+    try std.testing.expect(try runtime.focusPane(second.created.pane.?));
+    try std.testing.expect(runtime.state.focused_window.?.eql(second_window));
 }
 
 test "restore rollback removes only the failed window without allocation" {

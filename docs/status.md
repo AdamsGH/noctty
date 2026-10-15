@@ -128,8 +128,8 @@ Win32-validated VT protocol coverage is tracked in
 - `key-remap` applies to focused and in-app keybinds and to terminal
   encoding, but not to `global:` hotkeys, which register the literal chord.
 - Native settings window (Appearance, Terminal, Shell, Privacy, Updates,
-  Keybindings, Advanced) that stages edits until Save and patches your
-  config without rewriting unrelated text.
+  Keybindings, Advanced) that stages edits until Save or Discard changes
+  and patches your config without rewriting unrelated text.
 - Universal palette: actions, tabs, panes, profiles, named layouts, themes,
   native settings, help, and recent commands in one fuzzy-searched,
   keyboard-driven list.
@@ -138,7 +138,7 @@ Win32-validated VT protocol coverage is tracked in
   [automation.md](automation.md).
 - Quick select (`Ctrl+Shift+Space`) labels URL, path, git SHA, IP address,
   and UUID matches in the visible viewport for keyboard copy, allowed-scheme
-  open, or protected paste.
+  or local-path open, or protected paste.
 - Copy mode (`Ctrl+Shift+X`): modal vi-style selection and scrollback
   navigation, with keyboard copy/cancel and no PTY input leakage.
 - Opt-in Job Object limits for Windows-local child processes through the

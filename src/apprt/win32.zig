@@ -3005,10 +3005,54 @@ const UpdateCheckCompletion = struct {
     }
 };
 
+/// A profile discovery that ran off the UI thread (`App.startProfileDiscovery`).
+const ProfileDiscoveryCompletion = struct {
+    /// Owns everything the discovery allocated, and for the detached worker
+    /// the completion itself; its child is the page allocator there, so the
+    /// worker borrows nothing from the App.
+    arena: std.heap.ArenaAllocator,
+    result: anyerror!windows_shell.ProfileDiscovery = error.NotStarted,
+    /// `App.profiles_generation` when the discovery started.
+    generation: u64,
+    /// `App.profile_discovery_attempt` of the worker that ran it, 0 for the
+    /// synchronous path.
+    attempt: u64 = 0,
+
+    /// Frees the arena, and with it a completion that lives in it.
+    fn deinit(self: *ProfileDiscoveryCompletion) void {
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
+test "an undelivered profile discovery frees what it found" {
+    for ([_]bool{ true, false }) |found| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        const completion = try arena.allocator().create(ProfileDiscoveryCompletion);
+        completion.* = .{ .arena = arena, .result = error.WslListTimeout, .generation = 0 };
+        const alloc = completion.arena.allocator();
+        if (found) {
+            const profiles = try alloc.alloc(windows_shell.Profile, 1);
+            const argv = try alloc.alloc([:0]const u8, 1);
+            argv[0] = try alloc.dupeZ(u8, "pwsh.exe");
+            profiles[0] = .{
+                .kind = .pwsh,
+                .key = try alloc.dupe(u8, "pwsh"),
+                .label = try alloc.dupe(u8, "PowerShell"),
+                .command = .{ .direct = argv },
+            };
+            completion.result = .{ .profiles = profiles, .complete = true };
+        }
+        var payload: AppDeliveryPayload = .{ .profiles = completion };
+        payload.deinit();
+    }
+}
+
 const AppDeliveryPayload = union(enum) {
     update: *UpdateCheckCompletion,
     toast: win32_toast_activation.ActivationTarget,
     uia_disconnect: *DeferredUiaDisconnect,
+    profiles: *ProfileDiscoveryCompletion,
 
     pub fn deinit(self: *AppDeliveryPayload) void {
         switch (self.*) {
@@ -3017,6 +3061,7 @@ const AppDeliveryPayload = union(enum) {
                 completion.deinit();
                 alloc.destroy(completion);
             },
+            .profiles => |completion| completion.deinit(),
             .toast => {},
             .uia_disconnect => |pending| {
                 pending.release(pending.ctx);
@@ -3142,30 +3187,65 @@ const RecoveryLedgerLock = struct {
     }
 };
 
-/// Read and parse the ledger at `path`. Missing, unreadable and invalid
-/// ledgers all read as empty; `context` names the caller in the log line.
+const RecoveryLedgerRead = union(enum) {
+    /// Missing or invalid: reads as empty history.
+    empty,
+    /// Written by a newer build, or larger than any history this build writes
+    /// (16 attempts are under 2 KiB). It is valid, only not understood here,
+    /// and replacing it would reset that build's crash history: callers read
+    /// it as empty and write nothing. Waiting does not change that.
+    left_alone,
+    /// It exists and could not be read just now (a scanner holds it, the
+    /// allocator failed). It may be a newer build's, so nothing replaces it;
+    /// unlike `left_alone` it may be readable a moment later, and the ready
+    /// marker retries.
+    unreadable,
+    record: std.json.Parsed(win32_recovery.StartupAttemptRecord),
+
+    fn deinit(self: *RecoveryLedgerRead) void {
+        if (self.* == .record) self.record.deinit();
+    }
+};
+
+/// Read and parse the ledger at `path`; `context` names the caller in the log
+/// line.
 fn readRecoveryLedgerAlloc(
     alloc: Allocator,
     path: []const u8,
     context: []const u8,
-) ?std.json.Parsed(win32_recovery.StartupAttemptRecord) {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
-        switch (err) {
-            error.FileNotFound => {},
-            else => log.warn("win32 recovery: {s} open failed err={}", .{ context, err }),
-        }
-        return null;
+) RecoveryLedgerRead {
+    // A ledger that exists but cannot be read now (a scanner holds it, the
+    // allocator failed) may be a newer build's: reading it as empty would
+    // replace it.
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .empty,
+        else => {
+            log.warn("win32 recovery: {s} open failed err={}; leaving it untouched", .{ context, err });
+            return .unreadable;
+        },
     };
     defer file.close();
     const raw = file.readToEndAlloc(alloc, 64 * 1024) catch |err| {
-        log.warn("win32 recovery: {s} read failed err={}", .{ context, err });
-        return null;
+        if (err == error.FileTooBig) {
+            log.warn("win32 recovery: {s} history is larger than this build writes; leaving it untouched", .{context});
+            return .left_alone;
+        }
+        log.warn("win32 recovery: {s} read failed err={}; leaving it untouched", .{ context, err });
+        return .unreadable;
     };
     defer alloc.free(raw);
-    return win32_recovery.parseAlloc(alloc, raw) catch |err| {
+    return .{ .record = win32_recovery.parseAlloc(alloc, raw) catch |err| {
+        if (err == error.NewerSchema) {
+            log.warn("win32 recovery: {s} history was written by a newer noctty; leaving it untouched", .{context});
+            return .left_alone;
+        }
+        if (err == error.OutOfMemory) {
+            log.warn("win32 recovery: {s} history could not be parsed; leaving it untouched", .{context});
+            return .unreadable;
+        }
         log.warn("win32 recovery: {s} ignored invalid history err={}", .{ context, err });
-        return null;
-    };
+        return .empty;
+    } };
 }
 
 fn recoverySafeModeNotice(decision: win32_recovery.Decision) ?[]const u8 {
@@ -3753,9 +3833,13 @@ fn beginRecoveryStartupAtPath(
     }
 
     var record: win32_recovery.StartupAttemptRecord = .{};
-    var parsed_record = readRecoveryLedgerAlloc(alloc, path, "startup history");
-    defer if (parsed_record) |*parsed| parsed.deinit();
-    if (parsed_record) |*parsed| record = parsed.value;
+    var ledger = readRecoveryLedgerAlloc(alloc, path, "startup history");
+    defer ledger.deinit();
+    // A history that is not this build's to replace, or could not be read
+    // now, is neither counted nor replaced: this launch goes unrecorded, as it
+    // does when the lock is unavailable.
+    if (ledger == .left_alone or ledger == .unreadable) return result;
+    if (ledger == .record) record = ledger.record.value;
 
     var retained_paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -4163,10 +4247,11 @@ pub const App = struct {
         confirmed: bool,
     ) anyerror!void = null,
     /// Test-only interleaving seam for the focus revision race between a
-    /// structural split-close prepare and commit.
-    test_before_split_undo_shell_commit: ?*const fn (
+    /// structural prepare and commit (a split undone, a tab closed again).
+    /// `pane` is one whose focus the test moves.
+    test_before_structural_shell_commit: ?*const fn (
         app: *App,
-        source_pane: win32_shell.model.PaneId,
+        pane: win32_shell.model.PaneId,
     ) anyerror!void = null,
     /// Test-only stand-in for `ShellExecuteW` on a checked open target, so a
     /// unit test never launches a real handler.
@@ -4198,6 +4283,22 @@ pub const App = struct {
     /// Published before any producer starts; retained until producers stop.
     /// Detached update workers hold their own reference, without borrowing App.
     delivery: ?*AppDelivery = null,
+    /// Bumped whenever a Host's profiles are replaced or dropped, so a
+    /// discovery that finishes off the UI thread can tell it went stale.
+    profiles_generation: u64 = 0,
+    /// A discovery result from `startProfileDiscovery`, waiting for the top
+    /// of the outer pump.
+    pending_profile_discovery: ?*ProfileDiscoveryCompletion = null,
+    /// When the running discovery started (GetTickCount64), so one that never
+    /// finishes does not block every later attempt.
+    profile_discovery_started_ms: u64 = 0,
+    /// Fires once after a worker starts, unless its result arrived, to start
+    /// another attempt: nothing else re-arms the jump list's timer when a
+    /// worker hangs or cannot deliver.
+    profile_discovery_watchdog_id: ?UINT_PTR = null,
+    /// Numbers each worker, so a late result from an abandoned one leaves the
+    /// running state and watchdog of the attempt that replaced it alone.
+    profile_discovery_attempt: u64 = 0,
     message_hwnd: ?HWND = null,
     core_ticking: bool = false,
     quit_timer_id: ?UINT_PTR = null,
@@ -4229,6 +4330,11 @@ pub const App = struct {
     /// loaded it, so writing their own windows (or none) over it destroys the
     /// user's workspace.
     session_owner: ?SessionOwnerLock = null,
+    /// The saved session is not this build's to replace: a newer build wrote
+    /// it, or it is larger than any session this build writes. This process
+    /// neither restores it nor takes ownership, so it never saves over it or
+    /// deletes it.
+    session_state_left_alone: bool = false,
     /// Set once WM_ENDSESSION(TRUE) has saved for a sign-out, shutdown or
     /// reboot. That snapshot is final: shells the logoff kills afterwards
     /// close their panes, and the saves those closes would run must not
@@ -4687,7 +4793,10 @@ pub const App = struct {
             self.stopRecoveryRetryTimer();
             self.stopProgramStatusNotifyTimer();
             self.stopUpdateRecheckTimer();
+            self.stopProfileDiscoveryWatchdog();
             @atomicStore(DWORD, &self.ui_thread_id, 0, .release);
+            if (self.pending_profile_discovery) |pending| pending.deinit();
+            self.pending_profile_discovery = null;
             self.closeMessageWindow();
             self.running = false;
         }
@@ -4755,7 +4864,7 @@ pub const App = struct {
             errdefer if (owner_lock) |lock| lock.release();
             const restored = if (owner_lock != null) try self.restoreSessionState() else false;
             if (!restored) try self.createWindow(default_title);
-            self.session_owner = owner_lock;
+            self.adoptSessionOwner(owner_lock);
             if (!restored and self.startup_profile_picker) {
                 if (self.primarySurface()) |surface| {
                     if (surface.host) |host| _ = host.toggleProfileOverlay();
@@ -4831,6 +4940,7 @@ pub const App = struct {
             // with no window procedure on the stack.
             if (try self.drainDeferredOpens()) break;
             self.drainPendingHandoffs();
+            self.applyPendingProfileDiscovery();
 
             const result = sys.GetMessageW(&msg, null, 0, 0);
             if (result == -1) return lastError();
@@ -4873,17 +4983,10 @@ pub const App = struct {
                             jump_list.startupProfileDiscoveryPending())
                         {
                             const host = self.hosts.items[0];
-                            if (host.profiles == null or !host.profiles_complete) {
-                                _ = host.reloadProfiles() catch |err| {
-                                    log.warn("jump list deferred profile discovery failed err={}", .{err});
-                                    jump_list.retryStartupProfileDiscovery();
-                                    continue;
-                                };
-                            }
                             if (host.profiles != null and host.profiles_complete) {
                                 jump_list.completeStartupProfileDiscovery();
                             } else {
-                                jump_list.retryStartupProfileDiscovery();
+                                self.startProfileDiscovery();
                             }
                         }
                         continue;
@@ -4915,6 +5018,14 @@ pub const App = struct {
                 if (self.update_recheck_timer_id) |timer_id| {
                     if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
                         self.onUpdateRecheckTimer();
+                        continue;
+                    }
+                }
+                if (self.profile_discovery_watchdog_id) |timer_id| {
+                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
+                        self.stopProfileDiscoveryWatchdog();
+                        const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
+                        if (pending and self.hosts.items.len > 0) self.startProfileDiscovery();
                         continue;
                     }
                 }
@@ -5106,6 +5217,16 @@ pub const App = struct {
         };
     }
 
+    /// Ownership is for a session this process may replace. One it left alone
+    /// stays free, so the build that wrote it can still restore it.
+    fn adoptSessionOwner(self: *App, lock: ?SessionOwnerLock) void {
+        if (self.session_state_left_alone) {
+            if (lock) |held| held.release();
+            return;
+        }
+        self.session_owner = lock;
+    }
+
     fn releaseSessionOwnership(self: *App) void {
         if (self.session_owner) |lock| lock.release();
         self.session_owner = null;
@@ -5221,7 +5342,10 @@ pub const App = struct {
         if (!self.sessionRestoreEligible()) return null;
         const path = self.sessionStatePath() orelse return null;
         defer self.core_app.alloc.free(path);
+        return self.loadSessionStateAt(path);
+    }
 
+    fn loadSessionStateAt(self: *App, path: []const u8) !?std.json.Parsed(win32_session_state.SessionState) {
         return switch (win32_session_persistence.loadAlloc(
             self.core_app.alloc,
             path,
@@ -5229,10 +5353,22 @@ pub const App = struct {
         )) {
             .missing => null,
             .oversized => oversized: {
-                log.warn("win32 session restore: state exceeds size limit; leaving file untouched", .{});
+                log.warn("win32 session restore: state exceeds size limit; leaving file untouched and not saving over it", .{});
+                self.session_state_left_alone = true;
                 break :oversized null;
             },
-            .transient => |err| return err,
+            .transient => |err| {
+                // Unreadable now is not unwanted: a scanner may hold a newer
+                // build's file for a moment, and the next checkpoint would
+                // replace what this run never saw.
+                self.session_state_left_alone = true;
+                return err;
+            },
+            .newer_schema => newer: {
+                log.warn("win32 session restore: state was written by a newer noctty; leaving file untouched and not saving over it", .{});
+                self.session_state_left_alone = true;
+                break :newer null;
+            },
             .corrupt => |err| corrupt: {
                 self.quarantineInvalidSessionState(path, err);
                 break :corrupt null;
@@ -5278,6 +5414,11 @@ pub const App = struct {
             .transient => |err| {
                 log.warn("named layout launch read failed name={s} path={s} err={}", .{ name, path, err });
                 if (banner_host) |host| host.setBanner(.err, "Layout could not be read.") catch {};
+                return false;
+            },
+            .newer_schema => {
+                log.warn("named layout launch file was written by a newer noctty name={s} path={s}", .{ name, path });
+                if (banner_host) |host| host.setBanner(.err, "Layout was saved by a newer noctty.") catch {};
                 return false;
             },
             .corrupt => |err| {
@@ -5534,6 +5675,7 @@ pub const App = struct {
             } else payload.deinit();
         }
         delivery.update_running.store(false, .release);
+        delivery.profiles_running.store(false, .release);
         delivery.toast_pending.store(false, .release);
         if (self.message_hwnd) |hwnd| {
             setWindowData(hwnd, null);
@@ -5699,6 +5841,12 @@ pub const App = struct {
         };
         defer lock.release();
 
+        // A newer build may have written its own history since this launch
+        // recorded its attempt: that file is not ours to replace.
+        var ledger = readRecoveryLedgerAlloc(self.core_app.alloc, path, "window-created marker");
+        defer ledger.deinit();
+        if (ledger == .left_alone or ledger == .unreadable) return;
+
         var persisted: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined;
         @memcpy(persisted[0..current.len], current);
         persisted[current.len - 1].phase = .window_created;
@@ -5736,9 +5884,15 @@ pub const App = struct {
         defer lock.release();
 
         var disk_record: win32_recovery.StartupAttemptRecord = .{};
-        var parsed_record = readRecoveryLedgerAlloc(self.core_app.alloc, path, "ready merge");
-        defer if (parsed_record) |*parsed| parsed.deinit();
-        if (parsed_record) |*parsed| disk_record = parsed.value;
+        var ledger = readRecoveryLedgerAlloc(self.core_app.alloc, path, "ready merge");
+        defer ledger.deinit();
+        // Deterministic, so not an error that spends the caller's retries.
+        if (ledger == .left_alone) return;
+        // A transient failure is what that retry budget is for: dropping the
+        // marker would leave this launch unresolved on disk, which the next
+        // launch counts as a failed start.
+        if (ledger == .unreadable) return error.RecoveryLedgerUnreadable;
+        if (ledger == .record) disk_record = ledger.record.value;
 
         var merged_attempts: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined;
         const merged = win32_recovery.mergeMarkReady(
@@ -6045,16 +6199,45 @@ pub const App = struct {
         window: win32_session_state.Window,
     ) !void {
         const hwnd = host.hwnd orelse return;
-        if (try sessionStateWindowRect(window)) |rect| {
-            if (sys.SetWindowPos(
-                hwnd,
-                null,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-            ) == 0) return lastError();
+        if (try sessionStateWindowRect(window)) |saved| {
+            // The saved rect is where the window was, not where there is room
+            // for it now: its monitor may be gone.
+            const works = WorkAreas.collect();
+            const dpi_before = sys.GetDpiForWindow(hwnd);
+            var target = restoredRectOnScreen(saved, works.slice(), restore_grab);
+            // The rect is in the pixels of the monitor it was saved on, and is
+            // where the window goes: a crossing from the monitor the host was
+            // created on must not swap in the DPI suggestion's rescaled size.
+            host.restore_placing = true;
+            defer host.restore_placing = false;
+            for (0..3) |attempt| {
+                if (sys.SetWindowPos(
+                    hwnd,
+                    null,
+                    target.left,
+                    target.top,
+                    target.right - target.left,
+                    target.bottom - target.top,
+                    c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+                ) == 0) return lastError();
+                // Windows caps what it is given (a left edge to 16 bits, a
+                // width to the largest window), so whether the title bar can
+                // be reached is judged on the rect the window ended up with.
+                var actual: RECT = undefined;
+                if (sys.GetWindowRect(hwnd, &actual) == 0) return lastError();
+                const moved = restoredRectOnScreen(actual, works.slice(), restore_grab);
+                if (!rectEqual(moved, actual)) {
+                    if (attempt == 2) {
+                        log.warn("win32 session restore: window stayed off every monitor", .{});
+                        break;
+                    }
+                    target = moved;
+                    continue;
+                }
+                // The layout that follows a DPI change can resize it once
+                // more: apply the same rect again once.
+                if (sys.GetDpiForWindow(hwnd) == dpi_before or rectEqual(actual, target)) break;
+            }
         }
         if ((window.state orelse .normal) == .maximized) {
             _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
@@ -6119,14 +6302,14 @@ pub const App = struct {
     ) !win32_session_state.SessionState {
         var count: usize = 0;
         for (self.hosts.items) |host| {
-            if (hostSessionTabCount(host) > 0) count += 1;
+            if (hostSessionTabs(host).len > 0) count += 1;
         }
 
         const windows_state = try alloc.alloc(win32_session_state.Window, count);
         var remaining_scrollback_budget = win32_session_state.max_total_scrollback_bytes;
         var built: usize = 0;
         for (self.hosts.items) |host| {
-            if (hostSessionTabCount(host) == 0) continue;
+            if (hostSessionTabs(host).len == 0) continue;
             windows_state[built] = try buildSessionWindow(
                 alloc,
                 host,
@@ -6152,22 +6335,19 @@ pub const App = struct {
         scrollback_lines: usize,
         remaining_scrollback_budget: *usize,
     ) !win32_session_state.Window {
-        const tab_count = hostSessionTabCount(host);
-        if (scope == .layout and tab_count == 0) return error.EmptyTabs;
-        const tabs = try alloc.alloc(win32_session_state.Tab, tab_count);
+        const session_tabs = hostSessionTabs(host);
+        if (scope == .layout and session_tabs.len == 0) return error.EmptyTabs;
+        const tabs = try alloc.alloc(win32_session_state.Tab, session_tabs.len);
         var selected_tab: usize = 0;
-        var built: usize = 0;
-        for (host.tabs.items, 0..) |*tab, i| {
-            if (tabContainsQuickTerminal(tab)) continue;
-            if (i <= host.active_tab) selected_tab = built;
-            tabs[built] = try buildSessionTab(
+        for (session_tabs, 0..) |*tab, i| {
+            if (i <= host.active_tab) selected_tab = i;
+            tabs[i] = try buildSessionTab(
                 alloc,
                 tab,
                 scope,
                 scrollback_lines,
                 remaining_scrollback_budget,
             );
-            built += 1;
         }
 
         var window: win32_session_state.Window = .{
@@ -6176,14 +6356,14 @@ pub const App = struct {
         };
         // Geometry is restore state, not layout shape.
         if (scope == .layout) return window;
-        if (sessionWindowRect(host)) |rect| {
-            window.x = rect.left;
-            window.y = rect.top;
-            window.width = rect.right - rect.left;
-            window.height = rect.bottom - rect.top;
-        }
-        if (host.hwnd) |hwnd| {
-            window.state = if (sys.IsZoomed(hwnd) != 0) .maximized else .normal;
+        if (sessionWindowPlacement(host)) |placed| {
+            if (placed.rect) |rect| {
+                window.x = rect.left;
+                window.y = rect.top;
+                window.width = rect.right - rect.left;
+                window.height = rect.bottom - rect.top;
+            }
+            window.state = if (placed.maximized) .maximized else .normal;
         }
         return window;
     }
@@ -6312,27 +6492,10 @@ pub const App = struct {
         return null;
     }
 
-    fn hostContainsQuickTerminal(host: *const Host) bool {
-        for (host.tabs.items) |*tab| {
-            if (tabContainsQuickTerminal(tab)) return true;
-        }
-        return false;
-    }
-
-    fn hostSessionTabCount(host: *const Host) usize {
-        var count: usize = 0;
-        for (host.tabs.items) |*tab| {
-            if (!tabContainsQuickTerminal(tab)) count += 1;
-        }
-        return count;
-    }
-
-    fn tabContainsQuickTerminal(tab: *const Tab) bool {
-        var it = tab.tree.iterator();
-        while (it.next()) |entry| {
-            if (entry.view.quick_terminal) return true;
-        }
-        return false;
+    /// The tabs of `host` a session or layout file records: none for the
+    /// quick terminal, which is never restored.
+    fn hostSessionTabs(host: *const Host) []const Tab {
+        return if (host.quick_terminal) &.{} else host.tabs.items;
     }
 
     fn preferredSplitDirection(
@@ -6448,29 +6611,48 @@ pub const App = struct {
         };
     }
 
-    fn sessionWindowRect(host: *Host) ?RECT {
+    const SessionWindowPlacement = struct {
+        /// The window's normal rect in screen coordinates.
+        rect: ?RECT,
+        /// It is, or restores to, maximized.
+        maximized: bool,
+    };
+
+    fn sessionWindowPlacement(host: *Host) ?SessionWindowPlacement {
+        return sessionWindowPlacementOn(host, null);
+    }
+
+    /// `monitor` stands in for the window's monitor, so a test can give it
+    /// the taskbar this machine lacks.
+    fn sessionWindowPlacementOn(host: *Host, monitor: ?MONITORINFO) ?SessionWindowPlacement {
         const hwnd = host.hwnd orelse return null;
+        var maximized = sys.IsZoomed(hwnd) != 0;
         var rect: RECT = undefined;
-        if (sys.IsZoomed(hwnd) != 0 or sys.IsIconic(hwnd) != 0) {
-            var placement: WINDOWPLACEMENT = .{
-                .length = @sizeOf(WINDOWPLACEMENT),
-                .flags = 0,
-                .showCmd = 0,
-                .ptMinPosition = .{ .x = 0, .y = 0 },
-                .ptMaxPosition = .{ .x = 0, .y = 0 },
-                .rcNormalPosition = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-            };
+        if (maximized or sys.IsIconic(hwnd) != 0) {
+            var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            placement.length = @sizeOf(WINDOWPLACEMENT);
             if (sys.GetWindowPlacement(hwnd, &placement) != 0) {
+                maximized = restoresMaximized(hwnd, &placement);
+                // Workspace coordinates, offset from the screen's by a taskbar
+                // on the top or left. Every other state saves screen
+                // coordinates, and restore applies them as such.
                 rect = placement.rcNormalPosition;
+                if (monitor) |info| {
+                    rect = workspaceRectToScreen(rect, info);
+                } else if (sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST)) |nearest| {
+                    var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+                    info.cbSize = @sizeOf(MONITORINFO);
+                    if (sys.GetMonitorInfoW(nearest, &info) != 0) rect = workspaceRectToScreen(rect, info);
+                }
             } else if (sys.GetWindowRect(hwnd, &rect) == 0) {
-                return null;
+                return .{ .rect = null, .maximized = maximized };
             }
         } else if (sys.GetWindowRect(hwnd, &rect) == 0) {
-            return null;
+            return .{ .rect = null, .maximized = maximized };
         }
 
-        if (rect.right <= rect.left or rect.bottom <= rect.top) return null;
-        return rect;
+        if (rect.right <= rect.left or rect.bottom <= rect.top) return .{ .rect = null, .maximized = maximized };
+        return .{ .rect = rect, .maximized = maximized };
     }
 
     /// Push an action string onto the palette MRU list, dedup'd by
@@ -6996,6 +7178,109 @@ pub const App = struct {
         thread.detach();
     }
 
+    /// Run the jump list's deferred startup profile discovery off the UI
+    /// thread. Discovery starts `wsl.exe --status` and `wsl.exe -l -q` and
+    /// waits for each (up to 1.5 s apiece), which held the UI thread about
+    /// 90 ms half a second after start-up here. Like the update check, the
+    /// worker is detached and borrows nothing from the App, so quitting never
+    /// waits for it; its result arrives as WM_WINHOSTTY_PROFILES.
+    fn startProfileDiscovery(self: *App) void {
+        const delivery = self.delivery orelse return self.discoverStartupProfilesNow();
+        const now_ms = sys.GetTickCount64();
+        if (delivery.profiles_running.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            // Running, or its result is still queued. A worker can hang for
+            // good: a shell spawned at the same moment can inherit the write
+            // end of `wsl.exe -l -q`'s stdout pipe, and its drain then never
+            // ends. Give up on it then; the generation keeps a late result
+            // from doing harm.
+            if (now_ms -| self.profile_discovery_started_ms < profile_discovery_abandon_ms) return;
+            log.warn("profile discovery worker unfinished after {d} ms; starting another", .{profile_discovery_abandon_ms});
+        }
+        self.profile_discovery_started_ms = now_ms;
+        self.profile_discovery_attempt +%= 1;
+        delivery.retain();
+        const thread = std.Thread.spawn(.{}, profileDiscoveryThreadMain, .{
+            delivery,
+            self.config.@"ssh-config-hosts",
+            self.profiles_generation,
+            self.profile_discovery_attempt,
+        }) catch |err| {
+            delivery.release();
+            delivery.profiles_running.store(false, .release);
+            log.warn("profile discovery thread unavailable; discovering on the UI thread err={}", .{err});
+            return self.discoverStartupProfilesNow();
+        };
+        thread.detach();
+        self.stopProfileDiscoveryWatchdog();
+        const timer_id = sys.SetTimer(null, 0, @intCast(profile_discovery_abandon_ms + std.time.ms_per_s), null);
+        if (timer_id != 0) self.profile_discovery_watchdog_id = timer_id;
+    }
+
+    fn stopProfileDiscoveryWatchdog(self: *App) void {
+        if (self.profile_discovery_watchdog_id) |timer_id| {
+            _ = sys.KillTimer(null, timer_id);
+            self.profile_discovery_watchdog_id = null;
+        }
+    }
+
+    fn applyPendingProfileDiscovery(self: *App) void {
+        const pending = self.pending_profile_discovery orelse return;
+        self.pending_profile_discovery = null;
+        defer pending.deinit();
+        if (pending.attempt == self.profile_discovery_attempt) {
+            if (self.delivery) |delivery| delivery.profiles_running.store(false, .release);
+            self.stopProfileDiscoveryWatchdog();
+        }
+        self.handleProfileDiscovery(pending);
+    }
+
+    fn handleProfileDiscovery(self: *App, completion: *const ProfileDiscoveryCompletion) void {
+        const jump_list = if (self.jump_list) |*value| value else return;
+        // With no host, `scheduleIfStartupPending` re-arms when one appears.
+        if (self.hosts.items.len == 0) return;
+        const host = self.hosts.items[0];
+        switch (profileDiscoveryVerdict(
+            completion.generation,
+            self.profiles_generation,
+            host.profiles != null and host.profiles_complete,
+        )) {
+            .already_complete => return jump_list.completeStartupProfileDiscovery(),
+            .stale => return jump_list.retryStartupProfileDiscovery(),
+            .apply => {},
+        }
+        const discovery = completion.result catch |err| {
+            log.warn("jump list deferred profile discovery failed err={}", .{err});
+            jump_list.retryStartupProfileDiscovery();
+            return;
+        };
+        const profiles = windows_shell.cloneProfiles(self.core_app.alloc, discovery.profiles) catch |err| {
+            log.warn("jump list deferred profile discovery failed err={}", .{err});
+            jump_list.retryStartupProfileDiscovery();
+            return;
+        };
+        _ = host.applyProfileDiscovery(.{ .profiles = profiles, .complete = discovery.complete }) catch |err| {
+            log.warn("jump list deferred profile discovery failed err={}", .{err});
+            jump_list.retryStartupProfileDiscovery();
+            return;
+        };
+        if (host.profiles_complete) {
+            jump_list.completeStartupProfileDiscovery();
+        } else {
+            jump_list.retryStartupProfileDiscovery();
+        }
+    }
+
+    /// The synchronous path, for when no thread can run it.
+    fn discoverStartupProfilesNow(self: *App) void {
+        var completion: ProfileDiscoveryCompletion = .{
+            .arena = .init(self.core_app.alloc),
+            .generation = self.profiles_generation,
+        };
+        defer completion.deinit();
+        completion.result = windows_shell.discoverProfiles(completion.arena.allocator(), self.config.@"ssh-config-hosts");
+        self.handleProfileDiscovery(&completion);
+    }
+
     fn handleUpdateCheckCompletion(self: *App, completion: *UpdateCheckCompletion) void {
         if (self.delivery) |delivery| delivery.update_running.store(false, .release);
 
@@ -7496,6 +7781,13 @@ pub const App = struct {
         ) catch std.math.maxInt(u64);
     }
 
+    /// `undo-timeout = 0`: the prune timer takes every entry the moment it
+    /// fires, so nothing can be restored. Only exactly 0 counts; a nonzero
+    /// timeout leaves a window, however short.
+    fn undoOff(self: *const App) bool {
+        return self.undoTimeoutMs() == 0;
+    }
+
     fn nextUndoSequence(self: *App) u64 {
         const sequence = self.next_undo_sequence;
         self.next_undo_sequence +%= 1;
@@ -7654,7 +7946,7 @@ pub const App = struct {
                     _ = self.launchNamedLayout(name, banner_host);
                     return true;
                 }
-                const source = self.findSurfaceForTarget(target);
+                const source = self.newWindowSource(target);
                 _ = self.createWindowSurface(&config, default_title, .{
                     .clone_state_from = source,
                 }) catch |err| {
@@ -7750,15 +8042,10 @@ pub const App = struct {
                 );
                 errdefer alloc.free(parameters);
 
-                // `--working-directory` above carries the terminal path
-                // verbatim; ShellExecuteExW needs a Windows-local directory
-                // instead, or a WSL-backed surface's POSIX pwd fails the
-                // launch before the child ever parses that argument.
-                const host_cwd = try win32_elevation.resolveElevatedHostDirectory(
-                    alloc,
-                    cwd,
-                );
-                errdefer if (host_cwd) |directory| alloc.free(directory);
+                // The terminal keeps its pwd in --working-directory; the
+                // elevated host must not search that directory for programs.
+                const host_cwd = try win32_elevation.elevatedHostDirectory(alloc);
+                errdefer alloc.free(host_cwd);
 
                 try self.deferShellRequest(.{ .elevated_window = .{
                     .parameters = parameters,
@@ -7835,6 +8122,9 @@ pub const App = struct {
                         if (background_blur_newly_requested) logBackgroundBlurUnsupported();
                         self.config_revision +%= 1;
                         if (self.config_revision == 0) self.config_revision = 1;
+                        // Also with no Host open: a discovery still running
+                        // used the old setting.
+                        if (ssh_config_hosts_changed) self.profiles_generation +%= 1;
                         var jump_list_profiles_pending = ssh_config_hosts_changed and self.jump_list != null;
                         if (jump_list_profiles_pending) self.jump_list.?.updateProfiles(&.{});
                         for (self.hosts.items) |host| {
@@ -7973,17 +8263,12 @@ pub const App = struct {
             .toggle_visibility => {
                 self.windows_hidden = !self.windows_hidden;
                 if (self.windows_hidden) {
-                    for (self.hosts.items) |host| host.setVisible(false);
+                    for (self.hosts.items) |host| host.hideForToggle();
                 } else {
-                    for (self.hosts.items) |host| {
-                        host.setVisible(true);
-                        try host.layout();
-                    }
-                    if (self.findSurfaceForTarget(target)) |surface| {
-                        self.activateSurface(surface);
-                    } else if (self.primarySurface()) |surface| {
-                        self.activateSurface(surface);
-                    }
+                    for (self.hosts.items) |host| try host.showAfterToggle();
+                    // Focus goes to a window that is on screen: a quick
+                    // terminal dismissed before the hide stays dismissed.
+                    if (self.shownSurfaceForTarget(target)) |surface| self.activateSurface(surface);
                 }
                 return true;
             },
@@ -8451,7 +8736,13 @@ pub const App = struct {
             },
 
             .open_url => {
-                try self.openUrl(value.url);
+                self.openUrl(value.url) catch |err| {
+                    // A click that does nothing reads as a broken terminal.
+                    if (err == error.OpenUrlRejected) {
+                        _ = self.showHostBanner(target, .info, labels.open_refused_banner) catch false;
+                    }
+                    return err;
+                };
                 return true;
             },
 
@@ -9215,7 +9506,7 @@ pub const App = struct {
             else
                 null,
             .tab_id = tab_id,
-            .clone_state_from = source,
+            .clone_state_from = if (open_target == .window) self.newWindowSource(target) else source,
         });
         try appendOwnedString(self.core_app.alloc, &surface.launch_profile_key, profile.key);
         surface.launched_ssh = profile.kind == .ssh;
@@ -9241,16 +9532,10 @@ pub const App = struct {
         defer config.deinit();
         const title_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, pending.title);
         defer self.core_app.alloc.free(title_w);
-        const surface = try self.createWindowSurface(&config, title_w.ptr, .{
+        _ = try self.createWindowSurface(&config, title_w.ptr, .{
             .adopted_session = pending,
             .show = adoptedInitialShow(pending.startup_flags, pending.show_window),
         });
-        // Nothing has drained the surface's mailbox yet, so this cannot
-        // overwrite a title the console already set. A `title` the user
-        // configured is static and already applied by the core.
-        if (config.title == null) surface.setTitle(pending.title) catch |err| {
-            log.warn("adopted window startup title failed err={}", .{err});
-        };
         win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_created");
     }
 
@@ -9305,7 +9590,9 @@ pub const App = struct {
         // core drop every title the console sets afterwards.
         try std.testing.expect(!Hook.title_pinned);
         try std.testing.expectEqual(InitialShow.minimized, Hook.show);
-        try std.testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", created.title.?);
+        // The creation hook returns an inert surface; title installation
+        // belongs to Surface.init, before its first show (tested below).
+        try std.testing.expect(created.title == null);
 
         // A title the user configured is static and wins over the client's.
         try appendOwnedString(core_app.alloc, &created.title, null);
@@ -9314,6 +9601,104 @@ pub const App = struct {
         try app.createAdoptedWindow(&pending);
         try std.testing.expect(Hook.title_pinned);
         try std.testing.expect(created.title == null);
+    }
+
+    test "an adopted window has its startup caption at its first show" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try Host.runOnPrivateDesktop(adoptedFirstCaptionTestBody);
+    }
+
+    fn adoptedFirstCaptionTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+        const instance = app.hinstance;
+        defer {
+            _ = sys.UnregisterClassW(class_name, instance);
+            _ = sys.UnregisterClassW(host_class_name, instance);
+            _ = sys.UnregisterClassW(palette_list_class_name, instance);
+            _ = sys.UnregisterClassW(scrollbar_class_name, instance);
+        }
+        try app.ensureWindowClass();
+        const Observe = struct {
+            var previous: ?*const anyopaque = null;
+            var caption: [256]u16 = @splat(0);
+            var shows: usize = 0;
+
+            fn proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+                if (msg == c.WM_SHOWWINDOW and wp != 0) {
+                    _ = sys.GetWindowTextW(hwnd, &caption, caption.len);
+                    shows += 1;
+                }
+                return sys.CallWindowProcW(previous, hwnd, msg, wp, lp);
+            }
+
+            fn stage(surface: *Surface, at: Surface.InitStage) anyerror!void {
+                if (at == .gl_context) {
+                    // The test executable has no layered-child manifest.
+                    surface.host.?.tab_container_hwnd = try createTestChromeChild(surface.host.?.hwnd.?, prompt_label_class);
+                    return;
+                }
+                if (at != .core_surface) return;
+                if (surface.app.config.title) |title| try surface.setTitle(title);
+                previous = @ptrFromInt(@as(usize, @bitCast(sys.SetWindowLongPtrW(
+                    surface.host.?.hwnd.?,
+                    c.GWLP_WNDPROC,
+                    @bitCast(@intFromPtr(&proc)),
+                ))));
+            }
+        };
+        app.test_surface_init_stage = &Observe.stage;
+        var pending: win32_terminal_handoff.PendingSession = .{
+            .alloc = core_app.alloc,
+            .adopted = null,
+            .title = try core_app.alloc.dupe(u8, "SMALL-06 client caption"),
+            .startup_flags = win32_terminal_handoff.STARTF_USESHOWWINDOW,
+            .show_window = c.SW_SHOWNOACTIVATE,
+        };
+        defer pending.deinit();
+        for ([_]?[:0]const u8{ null, "Configured caption" }) |configured| {
+            // Real pipes and owned handles, but no process, COM or registry.
+            var signal_read: windows.HANDLE = undefined;
+            var signal_write: windows.HANDLE = undefined;
+            try std.testing.expect(internal_os.windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+            defer _ = windows.CloseHandle(signal_read);
+            const Dup = struct {
+                fn current() !windows.HANDLE {
+                    var handle: windows.HANDLE = undefined;
+                    const current_process = windows.GetCurrentProcess();
+                    if (windows.kernel32.DuplicateHandle(current_process, current_process, current_process, &handle, 0, windows.FALSE, windows.DUPLICATE_SAME_ACCESS) == 0) return lastError();
+                    return handle;
+                }
+            };
+            pending.adopted = .{
+                .pty = try ptypkg.Pty.openAdopted(.{}, signal_write, try Dup.current(), try Dup.current()),
+                .client_process = try Dup.current(),
+            };
+            app.config.title = configured;
+            Observe.caption = @splat(0);
+            Observe.shows = 0;
+            try app.createAdoptedWindow(&pending);
+            const surface = app.windows.items[app.windows.items.len - 1];
+            const host_hwnd = surface.host.?.hwnd.?;
+            defer {
+                core_app.deleteSurface(surface);
+                _ = sys.DestroyWindow(host_hwnd);
+            }
+            const caption = try std.unicode.utf16LeToUtf8Alloc(core_app.alloc, std.mem.sliceTo(&Observe.caption, 0));
+            defer core_app.alloc.free(caption);
+            try std.testing.expectEqual(@as(usize, 1), Observe.shows);
+            try std.testing.expectEqualStrings(configured orelse pending.title, caption);
+            try std.testing.expectEqualStrings(configured orelse pending.title, surface.title.?);
+            // A later console title still replaces the startup title.
+            if (configured == null) {
+                try surface.setTitle("Later console title");
+                try std.testing.expectEqualStrings("Later console title", surface.title.?);
+            }
+        }
+        app.config.title = null;
     }
 
     test "a handed-off console's show state maps to the host's first show" {
@@ -9918,21 +10303,32 @@ pub const App = struct {
         return surface;
     }
 
-    fn inheritHostWindowState(_: *App, destination: *Host, source: *Host) !void {
+    /// Whether a window on screen has its top-left corner where `rect` does,
+    /// other than `except`.
+    fn windowStartsAt(self: *App, rect: RECT, except: ?HWND) bool {
+        for (self.hosts.items) |host| {
+            const hwnd = host.hwnd orelse continue;
+            if (hwnd == except or sys.IsWindowVisible(hwnd) == 0 or sys.IsIconic(hwnd) != 0) continue;
+            var other: RECT = undefined;
+            if (sys.GetWindowRect(hwnd, &other) == 0) continue;
+            if (other.left == rect.left and other.top == rect.top) return true;
+        }
+        return false;
+    }
+
+    fn inheritHostWindowState(self: *App, destination: *Host, source: *Host) !void {
         const dst_hwnd = destination.hwnd orelse return;
         const src_hwnd = source.hwnd orelse return;
-        var rect: RECT = undefined;
-        if (sys.GetWindowRect(src_hwnd, &rect) == 0) {
-            return lastError();
-        }
+        const fullscreen = if (source.activeSurface()) |surface| surface.fullscreen else false;
+        const placed = try newWindowPlacement(self, src_hwnd, fullscreen, dst_hwnd);
         if (sys.SetWindowPos(
             dst_hwnd,
             null,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            c.SWP_NOACTIVATE,
+            placed.rect.left,
+            placed.rect.top,
+            placed.rect.right - placed.rect.left,
+            placed.rect.bottom - placed.rect.top,
+            newWindowSetPosFlags(&self.config, placed),
         ) == 0) {
             return lastError();
         }
@@ -9943,6 +10339,39 @@ pub const App = struct {
             .app => self.primarySurface(),
             .surface => |core_surface| self.findSurfaceByCore(core_surface),
         };
+    }
+
+    /// `findSurfaceForTarget`, unless its window is hidden: then the active
+    /// surface of the first window on screen.
+    fn shownSurfaceForTarget(self: *App, target: apprt.Target) ?*Surface {
+        if (self.findSurfaceForTarget(target)) |surface| {
+            if (surface.windowHwnd()) |hwnd| {
+                if (sys.IsWindowVisible(hwnd) != 0) return surface;
+            }
+        }
+        for (self.hosts.items) |host| {
+            const hwnd = host.hwnd orelse continue;
+            if (sys.IsWindowVisible(hwnd) == 0) continue;
+            if (host.activeSurface()) |surface| return surface;
+        }
+        return null;
+    }
+
+    /// The window a new one copies its state from: the target's, but never
+    /// the quick terminal's. That is a floating, undecorated strip pinned to
+    /// a screen edge, and a window copied from it would be too. From the
+    /// quick terminal a new window follows an ordinary window if there is
+    /// one, and is otherwise an ordinary new window.
+    fn newWindowSource(self: *App, target: apprt.Target) ?*Surface {
+        const surface = self.findSurfaceForTarget(target) orelse return null;
+        const host = surface.host orelse return surface;
+        if (!host.quick_terminal) return surface;
+        for (self.hosts.items) |other| {
+            if (!other.quick_terminal) {
+                if (other.activeSurface()) |ordinary| return ordinary;
+            }
+        }
+        return null;
     }
 
     fn focusedSurfaceForUndoRedo(self: *App) ?*Surface {
@@ -10207,13 +10636,23 @@ pub const App = struct {
     }
 
     fn commitShellSurfaceFocus(self: *App, surface: *Surface) void {
+        self.commitShellSurfaceFocusIn(surface, true);
+    }
+
+    /// For a surface shown without taking the keyboard: the window shows it,
+    /// but is not recorded as the focused window.
+    fn commitShellSurfaceActivation(self: *App, surface: *Surface) void {
+        self.commitShellSurfaceFocusIn(surface, false);
+    }
+
+    fn commitShellSurfaceFocusIn(self: *App, surface: *Surface, take_window: bool) void {
         if (!self.shell_runtime_initialized) return;
         // Surface creation publishes provisional generational IDs before the
         // native HWND can receive its first focus message. Ignore that early
         // message until the prepared create transaction is authoritative.
         if (!surface.shell_committed) return;
         const pane_id = surface.shell_id orelse return;
-        _ = self.shell_runtime.focusPane(pane_id) catch |err| {
+        _ = (if (take_window) self.shell_runtime.focusPane(pane_id) else self.shell_runtime.activatePane(pane_id)) catch |err| {
             log.err("shell focus transaction rejected pane={d}:{d} err={}", .{ pane_id.index, pane_id.generation, err });
             return;
         };
@@ -10336,13 +10775,13 @@ pub const App = struct {
             if (found.tab.focused != handle) found.tab.focused = handle;
             if (!needs_host_sync) {
                 surface.setVisible(true);
-                self.commitShellSurfaceFocus(surface);
+                self.commitShellSurfaceActivation(surface);
                 self.syncTaskbarProgressForHost(surface.host_id);
                 return;
             }
         }
         self.showHostSurface(surface, false);
-        self.commitShellSurfaceFocus(surface);
+        self.commitShellSurfaceActivation(surface);
         self.syncTaskbarProgressForHost(surface.host_id);
     }
 
@@ -10476,7 +10915,7 @@ pub const App = struct {
                 self.followShellFocus(host);
             }
             host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-            if (tab_removed) host.notifyTabRemovedUia();
+            if (tab_removed) host.notifyTabListUiaChanged();
 
             var shell_mapping_stable = true;
             if (host.tabs.items.len == 0) {
@@ -10646,7 +11085,7 @@ pub const App = struct {
             .this => {
                 // With `undo-timeout = 0` the close cannot be taken back, so it
                 // asks like the closes that are not undoable.
-                if (self.undoTimeoutMs() == 0) {
+                if (self.undoOff()) {
                     const count = tabsCloseConfirmCount(host.tabs.items[current_idx..][0..1]);
                     if (count != 0) {
                         host.askBeforeClosing(.this_tab, count, &closeThisTabConfirmAccept, current);
@@ -10709,7 +11148,7 @@ pub const App = struct {
             break :shell;
         }
         // Only now: a close that rolled back above left the list as it was.
-        host.notifyTabRemovedUia();
+        host.notifyTabListUiaChanged();
         if (stored_entry.payload.close_tab.tab) |*tab| tab.clearRedoHistory();
         if (host.activeSurface()) |replacement| {
             if (current_idx != previous_active) {
@@ -10730,7 +11169,11 @@ pub const App = struct {
                 "tab close banner failed",
                 host.setBanner(.info, labels.tabClosedMessage(
                     &self.config.keybind.set,
-                    .{ .has_modifier_remaps = self.config.@"key-remap".map.count() != 0, .us_layout = sys.GetKeyboardLayout(0) == 0x04090409 },
+                    .{
+                        .has_modifier_remaps = self.config.@"key-remap".map.count() != 0,
+                        .us_layout = sys.GetKeyboardLayout(0) == 0x04090409,
+                        .undo_available = !self.undoOff(),
+                    },
                     &hint_buf,
                 )),
             );
@@ -10828,25 +11271,32 @@ pub const App = struct {
         return true;
     }
 
-    fn quickTerminalSurface(self: *App) ?*Surface {
-        for (self.windows.items) |surface| {
-            if (surface.quick_terminal) return surface;
+    /// The quick terminal is its host window, whatever tabs and splits it
+    /// holds. Surfaces carry no flag of their own: one opened inside it later
+    /// is as much the quick terminal as the pane it was created with, and
+    /// that pane closing leaves it where it is.
+    fn quickTerminalHost(self: *App) ?*Host {
+        for (self.hosts.items) |host| {
+            if (host.quick_terminal) return host;
         }
         return null;
     }
 
-    fn quickTerminalSurfaceForHost(self: *App, host: *Host) ?*Surface {
-        for (self.windows.items) |surface| {
-            if (surface.quick_terminal and surface.host == host) return surface;
-        }
-        return null;
+    fn hideQuickTerminalHost(host: *Host) void {
+        host.cancelQuickTerminalAnimation();
+        host.setVisible(false);
     }
 
-    fn hideQuickTerminalSurface(surface: *Surface) void {
-        const top_level = surface.windowHwnd() orelse return;
-        if (surface.host) |host| host.cancelQuickTerminalAnimation();
-        surface.setVisible(false);
-        _ = sys.ShowWindow(top_level, c.SW_HIDE);
+    /// Puts the quick terminal window on its screen edge and shows it.
+    fn showQuickTerminalWindow(self: *App, top_level: HWND, want_focus: bool) void {
+        self.windows_hidden = false;
+        self.applyQuickTerminalGeometry(top_level, true) catch |err| {
+            std.log.warn("QT geometry failed err={}", .{err});
+        };
+        _ = sys.ShowWindow(
+            top_level,
+            if (want_focus) c.SW_SHOW else c.SW_SHOWNOACTIVATE,
+        );
     }
 
     fn quickTerminalFocusPolicy(self: *App) win32_quick_terminal.FocusPolicy {
@@ -10877,31 +11327,54 @@ pub const App = struct {
             std.log.warn("quick-terminal-keyboard-interactivity=exclusive maps to focused input on Win32; global keyboard capture is unsupported", .{});
         }
 
-        if (self.quickTerminalSurface()) |surface| {
-            // The quick terminal is a child surface inside a real
-            // top-level host window. Visibility + geometry must be
-            // applied to the HOST hwnd (the outer frame); the child
-            // surface HWND is only the GL content area. Using the
-            // child hwnd would leave an empty host window on screen
-            // when hidden, and would run `MonitorFromWindow` /
+        if (self.quickTerminalHost()) |host| {
+            // The quick terminal is its host window, an outer frame around
+            // child GL surfaces. Visibility + geometry apply to the HOST
+            // hwnd: using a child hwnd would leave an empty host window on
+            // screen when hidden, and would run `MonitorFromWindow` /
             // `SetWindowPos` against the wrong target when showing.
-            const top_level = surface.windowHwnd() orelse return;
-            const visible = sys.IsWindowVisible(top_level) != 0;
-            if (visible) {
-                hideQuickTerminalSurface(surface);
-            } else {
-                self.windows_hidden = false;
-                self.applyQuickTerminalGeometry(top_level, true) catch |err| {
-                    std.log.warn("QT geometry failed err={}", .{err});
-                };
-                _ = sys.ShowWindow(
-                    top_level,
-                    if (want_focus) c.SW_SHOW else c.SW_SHOWNOACTIVATE,
+            const visible = if (host.hwnd) |top_level| sys.IsWindowVisible(top_level) != 0 else false;
+            const surface = host.activeSurface() orelse {
+                // `close_tab:this` on its last tab keeps the host, and the
+                // surface detached from it, for undo. The detached surface
+                // is not something to show: dismiss the empty window, or
+                // open a fresh tab in it.
+                if (visible) {
+                    hideQuickTerminalHost(host);
+                    return;
+                }
+                var config = try apprt.surface.newConfig(
+                    self.core_app,
+                    &self.config,
+                    .window,
                 );
-                // Mirror the hide-side invariant: tell the surface
-                // it's visible so the renderer wakes and the
+                defer config.deinit();
+                const fresh = try self.createWindowSurface(&config, quick_terminal_title, .{
+                    .host_id = host.id,
+                });
+                // Floating is the surface's state: the window follows the
+                // active tab's.
+                try fresh.setFloatWindow(.on);
+                if (host.hwnd) |top_level| self.showQuickTerminalWindow(top_level, want_focus);
+                self.showHostSurface(fresh, want_focus);
+                return;
+            };
+            const top_level = host.hwnd orelse return;
+            if (visible) {
+                hideQuickTerminalHost(host);
+            } else {
+                self.showQuickTerminalWindow(top_level, want_focus);
+                // Mirror the hide-side invariant: tell every pane of the
+                // active tab it's visible so the renderer wakes and the
                 // occlusion callback flips back to "not occluded".
-                surface.setVisible(true);
+                // Hiding marked every pane not visible, including the ones a
+                // zoom keeps out of view.
+                if (host.activeTab()) |tab| {
+                    var it = tab.tree.iterator();
+                    while (it.next()) |entry| {
+                        entry.view.setVisible(tab.tree.zoomed == null or tab.tree.zoomed.? == entry.handle);
+                    }
+                }
                 if (want_focus) surface.present();
             }
             return;
@@ -11533,6 +12006,60 @@ pub const App = struct {
         };
         try std.testing.expect(app.runDeferredOpens());
         try std.testing.expectEqual(@as(usize, 2), Hook.count);
+    }
+
+    test "a refused link open says so in the window's banner" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+        defer app.discardDeferredOpens();
+
+        // A missing file, a program, a share and a device path never reach the
+        // shell, and the click says so.
+        for ([_][]const u8{
+            "C:\\pkg42-missing-dir\\missing.txt",
+            "C:\\Windows\\System32\\cmd.exe",
+            "\\\\server\\share\\a.txt",
+            "\\\\.\\pipe\\x",
+            "search-ms:query=*.exe",
+        }) |target| {
+            try host.setBanner(.none, null);
+            try std.testing.expectError(error.OpenUrlRejected, app.performAction(.app, .open_url, .{
+                .kind = .unknown,
+                .url = target,
+            }));
+            try std.testing.expectEqual(HostBannerKind.info, host.banner_kind);
+            try std.testing.expectEqualStrings(labels.open_refused_banner, host.banner_text.?);
+            try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+        }
+
+        // An accepted open leaves the banner alone.
+        try host.setBanner(.none, null);
+        try std.testing.expect(try app.performAction(.app, .open_url, .{
+            .kind = .unknown,
+            .url = "https://example.com/",
+        }));
+        try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+        try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+
+        // Quick select says why nothing happened, in the same banner.
+        try host.setBanner(.none, null);
+        surface.showQuickSelectNotice(labels.quick_select_no_targets_banner);
+        try std.testing.expectEqualStrings(labels.quick_select_no_targets_banner, host.banner_text.?);
+        surface.showQuickSelectNotice(labels.quick_select_too_many_banner);
+        try std.testing.expectEqualStrings(labels.quick_select_too_many_banner, host.banner_text.?);
     }
 
     test "deferred shell requests own payloads and run after their callers return" {
@@ -12504,6 +13031,53 @@ fn automationHostFocused(
     return foreground_hwnd == hwnd;
 }
 
+/// `App.startProfileDiscovery`'s detached worker. It holds a reference on
+/// the delivery channel and allocates from the page allocator, so it may
+/// outlive the App; a result nobody takes is freed by the channel. When it
+/// cannot deliver, the App's watchdog timer starts another attempt.
+fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, generation: u64, attempt: u64) void {
+    defer delivery.release();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    const completion = arena.allocator().create(ProfileDiscoveryCompletion) catch {
+        arena.deinit();
+        log.warn("profile discovery result unavailable err=OutOfMemory", .{});
+        delivery.profiles_running.store(false, .release);
+        return;
+    };
+    completion.* = .{ .arena = arena, .generation = generation, .attempt = attempt };
+    completion.result = windows_shell.discoverProfiles(completion.arena.allocator(), include_ssh_hosts);
+    var payload: AppDeliveryPayload = .{ .profiles = completion };
+    if (!delivery.post(c.WM_WINHOSTTY_PROFILES, payload)) {
+        payload.deinit();
+        delivery.profiles_running.store(false, .release);
+    }
+}
+
+/// Longer than a discovery can take when it works (two 1.5 s wsl.exe
+/// timeouts and the SSH config read budget).
+const profile_discovery_abandon_ms: u64 = 10 * std.time.ms_per_s;
+
+const ProfileDiscoveryVerdict = enum { apply, already_complete, stale };
+
+/// What to do with a discovery that finished off the UI thread. Profiles a
+/// Host already has completely win (a picker or palette discovered them
+/// meanwhile). Otherwise any replacement or drop since the start (a config
+/// reload with other `ssh-config-hosts`) makes the result stale, and a new
+/// discovery runs with the current settings.
+fn profileDiscoveryVerdict(started: u64, current: u64, host_complete: bool) ProfileDiscoveryVerdict {
+    if (host_complete) return .already_complete;
+    if (started != current) return .stale;
+    return .apply;
+}
+
+test "a profile discovery that finished off the UI thread applies only while current" {
+    const testing = std.testing;
+    try testing.expectEqual(ProfileDiscoveryVerdict.apply, profileDiscoveryVerdict(3, 3, false));
+    try testing.expectEqual(ProfileDiscoveryVerdict.stale, profileDiscoveryVerdict(3, 4, false));
+    try testing.expectEqual(ProfileDiscoveryVerdict.already_complete, profileDiscoveryVerdict(3, 3, true));
+    try testing.expectEqual(ProfileDiscoveryVerdict.already_complete, profileDiscoveryVerdict(3, 4, true));
+}
+
 fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
     const alloc = request.alloc;
     defer {
@@ -13318,7 +13892,8 @@ const ConfirmPrompt = struct {
 const program_confirm_arming_ms = 500;
 
 /// What a close that ends several terminals at once is closing. One pane
-/// keeps its own prompt in `Surface.close`.
+/// keeps its own prompt in `Surface.close`. The userdata of a `.this_tab`
+/// prompt is the Surface of the tab, which names the tab when it is behind.
 const CloseScope = enum { window, this_tab, other_tabs, right_tabs, app, update };
 
 /// The prompt for a close that would end `count` (at least 1) terminals
@@ -13570,7 +14145,15 @@ const Host = struct {
     surfaces_visible: bool = true,
     dwm_cloaked: bool = false,
     cached_decorations_visible: bool = true,
+    /// This host is the quick terminal. Its tabs and splits are all part of
+    /// it, so this, not a flag on one surface, says what the window is.
     quick_terminal: bool = false,
+    /// The window was on screen when `toggle_visibility` hid every window,
+    /// so showing them again brings it back. A window hidden before that,
+    /// such as a dismissed quick terminal, stays hidden. Anything else that
+    /// shows the window (`WM_SHOWWINDOW`) clears it: the window is not
+    /// waiting for the toggle any more.
+    hidden_by_toggle: bool = false,
     tabs: std.ArrayListUnmanaged(Tab) = .empty,
     active_tab: usize = 0,
     next_tab_id: u32 = 1,
@@ -13867,6 +14450,8 @@ const Host = struct {
     quick_terminal_animation: ?QuickTerminalAnimation = null,
     /// Programmatic QT rectangles are already in target-monitor pixels.
     quick_terminal_placing: bool = false,
+    /// A restored window's saved rect is being applied; same reason.
+    restore_placing: bool = false,
     tween_timer_active: bool = false,
     search_timer_active: bool = false,
     scrollbar_timer_active: bool = false,
@@ -13898,6 +14483,11 @@ const Host = struct {
         index: usize,
         tab_id: u32,
         shell_id: ?win32_shell.model.TabId = null,
+        /// The tab was in front when it closed. Closing a background tab
+        /// from its button leaves the front tab alone, so undoing that close
+        /// must not bring the tab to the front either, or redo would then
+        /// close the front tab and hand the front to its neighbour.
+        was_active: bool = true,
     };
 
     const SplitCreateUndo = struct {
@@ -14287,6 +14877,7 @@ const Host = struct {
             self.tabs.items[self.active_tab].id
         else
             null;
+        const was_active = index == self.active_tab;
         var removed = self.tabs.orderedRemove(index);
         const tab_id = removed.id;
         self.destroyTabButton(&removed);
@@ -14311,6 +14902,7 @@ const Host = struct {
                 .index = index,
                 .tab_id = tab_id,
                 .shell_id = removed.shell_id,
+                .was_active = was_active,
             } },
         };
     }
@@ -14318,10 +14910,16 @@ const Host = struct {
     fn restoreClosedTabEntryNative(self: *Host, value: *CloseTabUndo) Allocator.Error!bool {
         const tab = value.tab orelse return false;
         const insert_index = clampTabInsertIndex(value.index, self.tabs.items.len);
+        // A tab that closed behind the front one comes back behind it.
+        const keeps_front = !value.was_active and self.tabs.items.len > 0;
         try self.tabs.insert(self.app.core_app.alloc, insert_index, tab);
         value.tab = null;
         value.index = insert_index;
-        self.active_tab = insert_index;
+        if (!keeps_front) {
+            self.active_tab = insert_index;
+        } else if (insert_index <= self.active_tab) {
+            self.active_tab += 1;
+        }
         // Its programs may have ended while the tab waited in undo history.
         self.refreshTabStatus(insert_index);
         return self.activeSurface() != null;
@@ -14339,12 +14937,15 @@ const Host = struct {
             shell_prepared = try self.app.shell_runtime.prepare(.{ .restore_tab = .{
                 .tab = shell_id,
                 .index = insert_index,
+                .activate = value.was_active,
             } });
         }
         defer if (shell_prepared) |*prepared| prepared.deinit();
+        const previous_active = self.active_tab;
         if (!(try self.restoreClosedTabEntryNative(value))) return false;
         if (shell_prepared) |*prepared| prepared.commit(&self.app.shell_runtime) catch |err| {
             value.tab = self.tabs.orderedRemove(insert_index);
+            self.active_tab = previous_active;
             return err;
         };
         // Detaching destroys the tab button and its UIA provider. Rebuild the
@@ -14365,6 +14966,9 @@ const Host = struct {
             self.tabs.items[self.active_tab].id
         else
             null;
+        // Read before the panes are hidden: the focus message that follows
+        // can move `active_tab`.
+        const previous_active = self.active_tab;
         var shell_prepared: ?win32_shell.runtime.Prepared = null;
         if (self.app.shell_runtime_initialized) {
             const shell_id = value.shell_id orelse return error.ShellStateOutOfSync;
@@ -14384,9 +14988,16 @@ const Host = struct {
 
         value.index = index;
         value.tab = removed;
-        const previous_active = self.active_tab;
+        // What the next undo has to put back is the tab as it stands now.
+        value.was_active = index == previous_active;
         self.active_tab = activeTabAfterRemoval(previous_active, index, self.tabs.items.len);
-        if (shell_prepared) |*prepared| prepared.commit(&self.app.shell_runtime) catch |err| {
+        // Hiding the panes of a tab that was in front moves the keyboard to
+        // the next one, and that focus message commits to the model between
+        // the prepare above and this commit, as it can for a pane's close.
+        if (self.app.test_before_structural_shell_commit) |hook| {
+            if (self.activeSurface()) |next| if (next.shell_id) |pane| try hook(self.app, pane);
+        }
+        if (shell_prepared) |*prepared| prepared.commitRetryingInterleavedFocus(&self.app.shell_runtime) catch |err| {
             try self.tabs.insert(self.app.core_app.alloc, index, removed);
             value.tab = null;
             self.active_tab = previous_active;
@@ -14395,7 +15006,7 @@ const Host = struct {
             return err;
         };
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.notifyTabRemovedUia();
+        self.notifyTabListUiaChanged();
         self.app.auditShellNativeMapping("tab-redetach");
         return true;
     }
@@ -14424,7 +15035,7 @@ const Host = struct {
         value.created_surface.setVisible(false);
         value.detached = true;
         self.active_tab = found.index;
-        if (self.app.test_before_split_undo_shell_commit) |hook| {
+        if (self.app.test_before_structural_shell_commit) |hook| {
             try hook(self.app, value.source_surface.shell_id.?);
         }
         if (shell_prepared) |*prepared| prepared.commitRetryingInterleavedFocus(&self.app.shell_runtime) catch |err| {
@@ -14588,7 +15199,7 @@ const Host = struct {
             return err;
         };
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.notifyTabRemovedUia();
+        self.notifyTabListUiaChanged();
         self.prepareActiveTabVisibility(self.active_tab);
         self.layout() catch |err| log.warn("tab split transfer redo layout sync failed err={}", .{err});
         self.refreshChrome() catch |err| log.warn("tab split transfer redo chrome sync failed err={}", .{err});
@@ -17145,7 +17756,7 @@ const Host = struct {
         // a failed commit above restores the target's own panes.
         self.refreshTabStatus(self.active_tab);
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.notifyTabRemovedUia();
+        self.notifyTabListUiaChanged();
         self.tabs.items[self.active_tab].clearRedoHistory();
         while (self.structural_undo_entries.items.len > win32_undo.max_entries) {
             win32_structural_history.evictOldest(
@@ -17326,11 +17937,10 @@ const Host = struct {
         try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
         try std.testing.expectEqual(host.tabStripFocusHwnd(), sys.GetFocus());
 
-        // Undo brings A back in front; with C in front again, redo closes
-        // A in the background and the strip closes the gap again.
+        // Undo brings A back behind C, which the close left in front; redo
+        // closes A in the background again and the strip closes the gap again.
         _ = try host.applyLatestStructuralUndo();
-        try std.testing.expectEqual(@as(?*Surface, &surface_a), host.activeSurface());
-        app.activateSurface(&surface_c);
+        try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
         surface_c.window_visible = true;
         surface_c.window_focused = true;
         try std.testing.expect(host.tabs.items[0].button_placement.rect.left == first_left);
@@ -17413,6 +18023,198 @@ const Host = struct {
         try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
     }
 
+    test "a tab button that appears tells UIA the tab list changed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(tabButtonAddedUiaTestBody);
+    }
+
+    fn tabButtonAddedUiaTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var surface_c: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+                .{ .storage = &surface_c, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        // Layout repaints the active tab's panes, which need windows.
+        for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+            surface.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        }
+        defer for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+            surface.hwnd = null;
+        };
+        const root = try win32_uia.RootProvider.create(std.testing.allocator, @ptrFromInt(0x1));
+        defer _ = win32_uia.RootProvider.Release(&root.base);
+        host.root_uia_provider = root;
+        defer host.root_uia_provider = null;
+        const events = &win32_uia.events;
+
+        // The first chrome pass gives the two tabs their buttons.
+        const before = events.testing_structure_changes;
+        try host.refreshChrome();
+        try std.testing.expect(host.tabs.items[1].button_hwnd != null);
+        try std.testing.expectEqual(before + 1, events.testing_structure_changes);
+
+        // A pass that creates no button says nothing.
+        try host.refreshChrome();
+        try std.testing.expectEqual(before + 1, events.testing_structure_changes);
+
+        // A new tab, as `Surface.init` attaches one: the button that the next
+        // chrome pass creates is what a reader's tab list is missing.
+        try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 3, &surface_c));
+        try host.refreshChrome();
+        try std.testing.expect(host.tabs.items[2].button_hwnd != null);
+        try std.testing.expectEqual(before + 2, events.testing_structure_changes);
+
+        // Undo of a close builds the restored tab's button anew. Detaching it
+        // is the removal, which is told separately (CLOSE-01).
+        var entry = host.detachTabForUndo(2).?;
+        defer entry.dispose(&host, .host_destroy) catch {}; // Best-effort test teardown.
+        const detached = events.testing_structure_changes;
+        try std.testing.expect(try host.restoreClosedTabEntry(&entry.payload.close_tab));
+        try std.testing.expect(host.tabs.items[2].button_hwnd != null);
+        try std.testing.expectEqual(detached + 1, events.testing_structure_changes);
+    }
+
+    test "moving the zoom hides the old pane before it shows the new one" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(zoomMoveOrderTestBody);
+    }
+
+    /// Stand-in pane windows that note when one is about to be shown over
+    /// the other, which is on screen: for a moment both would be, on top of
+    /// each other (`WM_SHOWWINDOW` comes before the change, at the rect the
+    /// window still has).
+    const PaneShowRecorder = struct {
+        var panes: [2]?HWND = .{ null, null };
+        var previous: [2]?*const anyopaque = .{ null, null };
+        var overlapped: bool = false;
+
+        fn install(first: HWND, second: HWND) void {
+            panes = .{ first, second };
+            overlapped = false;
+            for (panes, 0..) |pane, i| {
+                const old = sys.SetWindowLongPtrW(
+                    pane.?,
+                    c.GWLP_WNDPROC,
+                    @as(LONG_PTR, @intCast(@intFromPtr(&proc))),
+                );
+                previous[i] = if (old == 0) null else @ptrFromInt(@as(usize, @intCast(old)));
+            }
+        }
+
+        fn proc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+            if (msg == c.WM_SHOWWINDOW and wParam != 0) {
+                var mine: RECT = undefined;
+                _ = sys.GetWindowRect(hwnd, &mine);
+                for (panes) |other| {
+                    if (other.? == hwnd or sys.IsWindowVisible(other.?) == 0) continue;
+                    var theirs: RECT = undefined;
+                    _ = sys.GetWindowRect(other.?, &theirs);
+                    if (mine.left < theirs.right and theirs.left < mine.right and
+                        mine.top < theirs.bottom and theirs.top < mine.bottom) overlapped = true;
+                }
+            }
+            for (panes, 0..) |pane, i| {
+                if (pane.? == hwnd) return sys.CallWindowProcW(previous[i], hwnd, msg, wParam, lParam);
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+    };
+
+    fn zoomMoveOrderTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{.{ .host = &host, .surface = &surface_a, .id = 1 }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        surface_a.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_b.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        defer for ([_]*Surface{ &surface_a, &surface_b }) |surface| {
+            surface.hwnd = null;
+        };
+
+        // [A | B], zoomed on B, which comes later in the tree than A.
+        var inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+        defer inserted.deinit();
+        const tab = &host.tabs.items[0];
+        const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+        tab.tree.deinit();
+        tab.tree = next_tree;
+        const handle_a = tab.findHandle(&surface_a).?;
+        const handle_b = tab.findHandle(&surface_b).?;
+        tab.tree.zoom(handle_b);
+        try host.layout();
+        try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) != 0);
+        try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) == 0);
+
+        // The zoom moves to A, as `goto_split` does with `split-preserve-zoom
+        // = navigation`. A is reached first, so B has to be hidden before A
+        // is shown, or two GL windows overlap for the length of the pass
+        // (the hazard `prepareActiveTabVisibility` is there for).
+        PaneShowRecorder.install(surface_a.hwnd.?, surface_b.hwnd.?);
+        tab.tree.zoom(handle_a);
+        try host.layout();
+        try std.testing.expect(!PaneShowRecorder.overlapped);
+        try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) != 0);
+        try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) == 0);
+
+        // And back: B is shown after A is hidden, as well.
+        tab.tree.zoom(handle_b);
+        try host.layout();
+        try std.testing.expect(!PaneShowRecorder.overlapped);
+        try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) != 0);
+        try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) == 0);
+
+        // Leaving the zoom, as `goto_split` does by default: the zoomed pane
+        // shrinks to its slot, and the other is placed in its own before it
+        // comes up, or it would be shown over the zoomed one. Whichever the
+        // tree visits first.
+        for ([_]SplitTreeSurface.Node.Handle{ handle_b, handle_a }) |zoomed_pane| {
+            tab.tree.zoom(zoomed_pane);
+            try host.layout();
+            tab.tree.zoom(null);
+            try host.layout();
+            try std.testing.expect(!PaneShowRecorder.overlapped);
+            try std.testing.expect(sys.IsWindowVisible(surface_a.hwnd.?) != 0);
+            try std.testing.expect(sys.IsWindowVisible(surface_b.hwnd.?) != 0);
+        }
+    }
+
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
     /// and repaint it when that changed. Assistive technology hears when
     /// what `ItemStatus` says changes other than by progress: a new state,
@@ -17447,12 +18249,13 @@ const Host = struct {
         for (0..self.tabs.items.len) |index| self.refreshTabStatus(index);
     }
 
-    /// A tab left the strip. Removing a background tab changes no selection,
-    /// so `notifyActiveTabUiaSelectionChanged` stays silent and a reader's tab
+    /// A tab joined or left the strip. Neither needs to change a selection (a
+    /// background tab closes, or is restored behind the front one), so
+    /// `notifyActiveTabUiaSelectionChanged` can stay silent and a reader's tab
     /// list would go stale. The tab buttons are child windows of the host, not
     /// children of the Selection container, so the host's root is told its
     /// children changed.
-    fn notifyTabRemovedUia(self: *Host) void {
+    fn notifyTabListUiaChanged(self: *Host) void {
         if (!self.shouldShowTabBar()) return;
         if (self.root_uia_provider) |provider| provider.raiseChildrenInvalidated();
     }
@@ -17524,11 +18327,16 @@ const Host = struct {
     }
 
     fn reloadProfiles(self: *Host) !bool {
-        const replacing = self.profiles != null;
-        const discovery = try windows_shell.discoverProfiles(
+        return try self.applyProfileDiscovery(try windows_shell.discoverProfiles(
             self.app.core_app.alloc,
             self.app.config.@"ssh-config-hosts",
-        );
+        ));
+    }
+
+    /// Takes ownership of `discovery`'s profiles, also on error.
+    fn applyProfileDiscovery(self: *Host, discovery: windows_shell.ProfileDiscovery) !bool {
+        const replacing = self.profiles != null;
+        self.app.profiles_generation +%= 1;
         const next_profiles = discovery.profiles;
         if (self.profiles) |profiles| windows_shell.deinitProfiles(self.app.core_app.alloc, profiles);
         self.profiles = next_profiles;
@@ -17563,6 +18371,7 @@ const Host = struct {
     }
 
     fn invalidateProfiles(self: *Host) void {
+        self.app.profiles_generation +%= 1;
         if (self.profiles) |profiles| {
             windows_shell.deinitProfiles(self.app.core_app.alloc, profiles);
             self.profiles = null;
@@ -18004,6 +18813,25 @@ const Host = struct {
             @ptrFromInt(@as(usize, @intCast(previous)));
     }
 
+    /// `toggle_visibility` hiding every window: remember which ones were on
+    /// screen, and hide them. A window an earlier hide took off screen, and
+    /// that nothing has shown since, stays marked.
+    fn hideForToggle(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        const was_visible = sys.IsWindowVisible(hwnd) != 0;
+        self.setVisible(false);
+        self.hidden_by_toggle = self.hidden_by_toggle or was_visible;
+    }
+
+    /// `toggle_visibility` showing them again: only a window it hid comes
+    /// back.
+    fn showAfterToggle(self: *Host) !void {
+        if (!self.hidden_by_toggle) return;
+        self.hidden_by_toggle = false;
+        self.setVisible(true);
+        try self.layout();
+    }
+
     fn setVisible(self: *Host, visible: bool) void {
         const hwnd = self.hwnd orelse return;
         if (!visible) {
@@ -18026,6 +18854,13 @@ const Host = struct {
     /// `DwmGetWindowAttribute` fails; see `win32_power.resolveCloaked`.
     fn refreshSurfaceVisibilityObserving(self: *Host, observed_cloaked: ?bool) void {
         const hwnd = self.hwnd orelse return;
+        // ConPTY tracks the owning window, including background tabs, not
+        // per-pane rendering occlusion or DWM cloaking.
+        const console_visible = sys.IsWindowVisible(hwnd) != 0 and sys.IsIconic(hwnd) == 0;
+        for (self.tabs.items) |*tab| {
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| entry.view.syncAdoptedConsoleVisibility(console_visible);
+        }
         const state = win32_power.queryHostVisibility(
             hwnd,
             self.dwm_cloaked,
@@ -22369,9 +23204,54 @@ const Host = struct {
             return;
         }
         var body: [256]u8 = undefined;
-        self.showConfirm(closeScopePrompt(scope, count, &body), on_accept, null, userdata) catch |err| {
+        var title: [32]u8 = undefined;
+        var prompt = closeScopePrompt(scope, count, &body);
+        // A tab closed from its button need not be the one in front, and
+        // "this tab" would then name the wrong one.
+        const named_body = if (scope == .this_tab)
+            self.nameBackgroundTab(&prompt, count, @ptrCast(@alignCast(userdata)), &title)
+        else
+            null;
+        defer if (named_body) |text| self.app.core_app.alloc.free(text);
+        self.showConfirm(prompt, on_accept, null, userdata) catch |err| {
             log.warn("close confirm unavailable err={}; declining close to honour confirm-close-surface", .{err});
         };
+    }
+
+    /// Words the `.this_tab` prompt for the tab holding `surface` as the
+    /// tab's number and title when another tab is in front, as the OSC 52
+    /// prompt names the tab that asked. Returns the body it allocated, which
+    /// `prompt` borrows; null leaves the prompt as it was (the tab in front,
+    /// or no memory for the words).
+    fn nameBackgroundTab(self: *Host, prompt: *ConfirmPrompt, count: usize, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
+        const found = self.app.findTabForSurface(surface) orelse return null;
+        if (found.host != self or found.index == self.active_tab) return null;
+        // The title needs no memory, so it names the tab even if the body cannot.
+        prompt.title = labels.backgroundTabClosePromptTitle(title_buf, found.index + 1);
+        const body = labels.buildBackgroundTabClosePromptBody(
+            self.app.core_app.alloc,
+            count,
+            found.index + 1,
+            surface.effectiveTitle(),
+        ) catch return null;
+        prompt.body = body;
+        return body;
+    }
+
+    /// The same for the prompt of a terminal that closes by itself, which
+    /// `Surface.close` raises whatever tab the terminal is in.
+    fn nameBackgroundTerminal(self: *Host, prompt: *ConfirmPrompt, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
+        const found = self.app.findTabForSurface(surface) orelse return null;
+        if (found.host != self or found.index == self.active_tab) return null;
+        prompt.title = labels.backgroundTerminalClosePromptTitle(title_buf, found.index + 1);
+        const body = labels.buildBackgroundTerminalClosePromptBody(
+            self.app.core_app.alloc,
+            found.index + 1,
+            surface.effectiveTitle(),
+            surface.core_initialized and surface.core_surface.child_exited,
+        ) catch return null;
+        prompt.body = body;
+        return body;
     }
 
     /// Shown on screen, minimized included; a hidden quick terminal is not.
@@ -22959,6 +23839,10 @@ const Host = struct {
         const button_width = @max(1, @divTrunc(tab_area_width, visible_count));
         const label_max_width = hostTabLabelMaxWidth(button_width);
         var tooltip_title_changed = false;
+        var button_created = false;
+        // A pass that fails after making a button has still changed the list,
+        // and the next pass has no new button to say so.
+        errdefer if (button_created) self.notifyTabListUiaChanged();
         for (self.tabs.items, 0..) |*tab, i| {
             const surface = tab.focusedSurface() orelse continue;
             const title = if (surface.effectiveTitle()) |value| value else null;
@@ -23049,6 +23933,7 @@ const Host = struct {
                     .selected = &tabItemUiaSelected,
                     .selection_container = &tabContainerUiaProvider,
                 });
+                button_created = true;
             } else if (label_changed) {
                 try appendOwnedString(self.app.core_app.alloc, &tab.cached_button_label, label);
                 const label_w = try std.unicode.utf8ToUtf16LeAllocZ(self.app.core_app.alloc, label);
@@ -23083,6 +23968,11 @@ const Host = struct {
         }
         var chrome_changed = false;
         _ = self.layoutChromeForRect(rect, &chrome_changed);
+        // Every way a tab joins the strip (a new tab or window, a restored
+        // session, an undo, a tab moved in) ends in a button made here, and
+        // none of them has to change the selection. Told once, after the
+        // layout, so the reader finds each button where it is.
+        if (button_created) self.notifyTabListUiaChanged();
         // Refresh whenever a tooltip is up, not only when its own tab's label
         // was rebuilt: a tab that scrolls out of `visibleTabRange` because
         // ANOTHER tab was activated keeps every label input and is never
@@ -23603,94 +24493,109 @@ const Host = struct {
         self.prepareActiveTabVisibility(self.active_tab);
 
         if (active_tab.tree.zoomed) |zoomed| {
-            var it = active_tab.tree.iterator();
-            while (it.next()) |entry| {
-                const visible = entry.handle == zoomed;
-                const visibility_changed = entry.view.window_visible != visible;
+            // The other panes go first, as the other tabs do above: moving the
+            // zoom shows a pane that may come before the old one in the tree,
+            // and two GL child windows must not overlap, even within this pass.
+            var hiding = active_tab.tree.iterator();
+            while (hiding.next()) |entry| {
+                if (entry.handle == zoomed) continue;
+                const visibility_changed = entry.view.window_visible;
                 content_layout_changed = content_layout_changed or visibility_changed;
-                entry.view.setVisible(visible);
-                if (visible) {
-                    const placement = win32_layout.zoomedSurfacePlacement(
-                        layout_content_rect,
-                        entry.view.search_bar.visible,
-                        search_bar_height,
-                    );
-                    if (placement.search_frame_rect) |search_frame_rect| {
-                        content_layout_changed = (try entry.view.layoutSearchBarControls(
-                            layoutRectToWin32(search_frame_rect),
-                            true,
-                        )) or content_layout_changed;
-                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                    } else {
-                        content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                    }
-                    const pane_rect = layoutRectToWin32(placement.pane_rect);
-                    var pane_rect_changed = false;
-                    if (entry.view.hwnd) |surface_hwnd| {
-                        pane_rect_changed = applyChildRect(
-                            surface_hwnd,
-                            &entry.view.placement,
-                            pane_rect,
-                        );
-                        content_layout_changed = pane_rect_changed or content_layout_changed;
-                    }
-                    const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                    if (runtime_sync.scrollbar_refresh) {
-                        try entry.view.refreshScrollbarWindow();
-                    }
-                    if (runtime_sync.core_size_sync) {
-                        entry.view.syncCoreSizeFromClientRect();
-                    }
-                    entry.view.syncContentScaleToHostDpi();
-                } else {
-                    content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                    if (visibility_changed) {
-                        try entry.view.refreshScrollbarWindow();
-                    }
+                entry.view.setVisible(false);
+                content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
+                if (visibility_changed) {
+                    try entry.view.refreshScrollbarWindow();
                 }
             }
-        } else {
-            var spatial = try active_tab.tree.spatial(self.app.core_app.alloc);
-            defer spatial.deinit(self.app.core_app.alloc);
-            const has_multi_panes = active_tab.leafCount() > 1;
             var it = active_tab.tree.iterator();
             while (it.next()) |entry| {
+                if (entry.handle != zoomed) continue;
                 const visibility_changed = !entry.view.window_visible;
                 content_layout_changed = content_layout_changed or visibility_changed;
                 entry.view.setVisible(true);
+                const placement = win32_layout.zoomedSurfacePlacement(
+                    layout_content_rect,
+                    entry.view.search_bar.visible,
+                    search_bar_height,
+                );
+                if (placement.search_frame_rect) |search_frame_rect| {
+                    content_layout_changed = (try entry.view.layoutSearchBarControls(
+                        layoutRectToWin32(search_frame_rect),
+                        true,
+                    )) or content_layout_changed;
+                    if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
+                } else {
+                    content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
+                }
+                const pane_rect = layoutRectToWin32(placement.pane_rect);
+                var pane_rect_changed = false;
                 if (entry.view.hwnd) |surface_hwnd| {
-                    const placement = self.splitPanePlacement(
-                        content_rect,
-                        spatial,
-                        entry.handle,
-                        has_multi_panes,
-                        entry.view.search_bar.visible,
-                    );
-                    if (placement.search_frame_rect) |search_frame_rect| {
-                        content_layout_changed = (try entry.view.layoutSearchBarControls(
-                            layoutRectToWin32(search_frame_rect),
-                            true,
-                        )) or content_layout_changed;
-                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                    } else {
-                        content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                    }
-                    const pane_rect = layoutRectToWin32(placement.pane_rect);
-                    const pane_rect_changed = applyChildRect(
+                    pane_rect_changed = applyChildRect(
                         surface_hwnd,
                         &entry.view.placement,
                         pane_rect,
                     );
                     content_layout_changed = pane_rect_changed or content_layout_changed;
-                    const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                    if (runtime_sync.scrollbar_refresh) {
-                        try entry.view.refreshScrollbarWindow();
-                    }
-                    if (runtime_sync.core_size_sync) {
-                        entry.view.syncCoreSizeFromClientRect();
-                    }
+                }
+                const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
+                if (runtime_sync.scrollbar_refresh) {
+                    try entry.view.refreshScrollbarWindow();
+                }
+                if (runtime_sync.core_size_sync) {
+                    entry.view.syncCoreSizeFromClientRect();
                 }
                 entry.view.syncContentScaleToHostDpi();
+            }
+        } else {
+            var spatial = try active_tab.tree.spatial(self.app.core_app.alloc);
+            defer spatial.deinit(self.app.core_app.alloc);
+            const has_multi_panes = active_tab.leafCount() > 1;
+            // Panes already on screen are placed before the hidden ones are
+            // shown: leaving a zoom, the zoomed pane shrinks to its slot first,
+            // so the others do not come up over it.
+            for ([_]bool{ true, false }) |on_screen| {
+                var it = active_tab.tree.iterator();
+                while (it.next()) |entry| {
+                    if (entry.view.window_visible != on_screen) continue;
+                    const visibility_changed = !entry.view.window_visible;
+                    content_layout_changed = content_layout_changed or visibility_changed;
+                    if (entry.view.hwnd) |surface_hwnd| {
+                        const placement = self.splitPanePlacement(
+                            content_rect,
+                            spatial,
+                            entry.handle,
+                            has_multi_panes,
+                            entry.view.search_bar.visible,
+                        );
+                        if (placement.search_frame_rect) |search_frame_rect| {
+                            content_layout_changed = (try entry.view.layoutSearchBarControls(
+                                layoutRectToWin32(search_frame_rect),
+                                true,
+                            )) or content_layout_changed;
+                            if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
+                        } else {
+                            content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
+                        }
+                        const pane_rect = layoutRectToWin32(placement.pane_rect);
+                        const pane_rect_changed = applyChildRect(
+                            surface_hwnd,
+                            &entry.view.placement,
+                            pane_rect,
+                        );
+                        content_layout_changed = pane_rect_changed or content_layout_changed;
+                        const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
+                        if (runtime_sync.scrollbar_refresh) {
+                            try entry.view.refreshScrollbarWindow();
+                        }
+                        if (runtime_sync.core_size_sync) {
+                            entry.view.syncCoreSizeFromClientRect();
+                        }
+                    }
+                    // In its slot first: shown at the rect it had before, a pane
+                    // that came out of a zoom would cover its neighbours.
+                    entry.view.setVisible(true);
+                    entry.view.syncContentScaleToHostDpi();
+                }
             }
         }
         self.layoutBanner(content_rect, banner_top);
@@ -26856,6 +27761,7 @@ fn settingsPreviewFieldThunk(
         .padding_balance => app.config.@"window-padding-balance" = value.padding_balance,
         .auto_update => app.config.@"auto-update" = value.auto_update,
         .auto_update_channel => app.config.@"auto-update-channel" = value.auto_update_channel,
+        .accent_follow_system => app.config.@"accent-follow-system" = value.accent_follow_system,
     }
     switch (win32_settings.previewEffect(field)) {
         .none => {},
@@ -26891,6 +27797,12 @@ test "settings live preview refreshes only what the field shows" {
     settingsPreviewFieldThunk(&app, .window_theme, .{ .window_theme = .light });
     try std.testing.expectEqual(baseline + 1, app.theme_rebuilds);
     try std.testing.expect(app.config.@"window-theme" == .light);
+
+    // The tab strip follows the accent only while the setting is on, so the
+    // checkbox rebuilds the theme like the window theme does.
+    settingsPreviewFieldThunk(&app, .accent_follow_system, .{ .accent_follow_system = false });
+    try std.testing.expectEqual(baseline + 2, app.theme_rebuilds);
+    try std.testing.expect(!app.config.@"accent-follow-system");
 }
 fn settingsNotifyConflictThunk(ctx: *anyopaque, field: win32_settings.SettingField) void {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -26912,11 +27824,9 @@ fn settingsReconcileDiskThunk(
 /// reports both as unknown, and argv does not change, so every reload would
 /// raise them again.
 ///
-/// Not a diagnostic of a file's line: that is a mistake in the file. The
-/// conditional state rebuilds a config through an iterator that has no place
-/// to give, so a rebuilt config's diagnostics come without one, and the
-/// command-line ones cannot be told apart by it. `safe_mode` is whether this
-/// process was started with `--safe-mode`.
+/// Not a diagnostic of a file's line: that is a mistake in the file. Filter
+/// by key and launch state even for callers that provide no location.
+/// `safe_mode` is whether this process was started with `--safe-mode`.
 fn isLaunchArgumentDiagnostic(diag: cli_diagnostics.Diagnostic, safe_mode: bool) bool {
     if (diag.location == .file) return false;
     if (safe_mode and std.mem.eql(u8, diag.key, "safe-mode")) return true;
@@ -27447,8 +28357,332 @@ test "win32 DPI suggestions preserve a quick terminal tween but resize ordinary 
     _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, param);
     try std.testing.expect(sys.GetWindowRect(hwnd, &actual) != 0);
     try std.testing.expectEqualDeep(ordinary, actual);
+    // So does a restored window's saved rect while it is being applied.
+    try std.testing.expect(sys.SetWindowPos(hwnd, null, before.left, before.top, before.right - before.left, before.bottom - before.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+    host.restore_placing = true;
+    _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, param);
+    try std.testing.expect(sys.GetWindowRect(hwnd, &actual) != 0);
+    try std.testing.expectEqualDeep(before, actual);
+    host.restore_placing = false;
     try std.testing.expect(!host.quick_terminal_placing);
     try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
+}
+
+/// Runs `body` on a thread attached to a desktop of its own, so a test can
+/// show, hide and minimize windows without touching the user's desktop.
+/// `SetThreadDesktop` fails on a thread that owns a window, so the runner's
+/// own thread cannot do it (AGENTS.md 2026-10-06).
+fn runOnHiddenDesktop(comptime body: anytype) !void {
+    const Desktop = struct {
+        extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+        extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+
+        fn run(desktop: *anyopaque, result: *anyerror!void) void {
+            if (SetThreadDesktop(desktop) == 0) {
+                result.* = lastError();
+                return;
+            }
+            body() catch |err| {
+                // The test fails at `return result` on the runner's thread;
+                // this trace shows which check failed.
+                if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+                result.* = err;
+            };
+        }
+    };
+    var name_buf: [80]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "noctty-pkg43-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+    const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+    defer std.testing.allocator.free(wide_name);
+    const desktop = Desktop.CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+    defer _ = Desktop.CloseDesktop(desktop);
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
+    thread.join();
+    return result;
+}
+
+/// A quick terminal host that a test has put on screen, with the pieces a
+/// toggle needs: a registered host, one tab, and the surface that tab shows.
+/// `other` is a second host with a window and no tab, not registered until a
+/// test appends it to `app.hosts`.
+const QuickTerminalToggleFixture = struct {
+    core_app: CoreApp = undefined,
+    app: App = undefined,
+    host: Host = undefined,
+    other: Host = undefined,
+    surface: Surface = undefined,
+    /// What `QuickTerminalFreshTab` hands back as a tab created later.
+    fresh: Surface = undefined,
+    session: TestSession = .{},
+
+    fn init(self: *QuickTerminalToggleFixture) !void {
+        try self.session.init(.{
+            .core_app = &self.core_app,
+            .app = &self.app,
+            .hosts = &.{
+                .{ .storage = &self.host, .register = true, .next_tab_id = 2 },
+                .{ .storage = &self.other, .id = 2 },
+            },
+            .surfaces = &.{
+                .{ .storage = &self.surface, .host = &self.host, .register = true },
+                .{ .storage = &self.fresh, .host = &self.host, .window_visible = false },
+            },
+            .tabs = &.{.{ .host = &self.host, .surface = &self.surface, .id = 1 }},
+        });
+        errdefer self.session.deinit();
+        // `none` shows the window without the activation machinery, which
+        // needs a real chrome the fixture does not have.
+        self.app.config.@"quick-terminal-keyboard-interactivity" = .none;
+        self.host.quick_terminal = true;
+        self.host.hwnd = try createTestHostWindow();
+        errdefer _ = sys.DestroyWindow(self.host.hwnd.?);
+        self.other.hwnd = try createTestHostWindow();
+        _ = sys.ShowWindow(self.host.hwnd.?, c.SW_SHOWNOACTIVATE);
+        _ = sys.ShowWindow(self.other.hwnd.?, c.SW_SHOWNOACTIVATE);
+    }
+
+    fn deinit(self: *QuickTerminalToggleFixture) void {
+        _ = sys.DestroyWindow(self.other.hwnd.?);
+        _ = sys.DestroyWindow(self.host.hwnd.?);
+        self.session.deinit();
+    }
+
+    fn visible(self: *const QuickTerminalToggleFixture) bool {
+        return sys.IsWindowVisible(self.host.hwnd.?) != 0;
+    }
+
+    fn otherVisible(self: *const QuickTerminalToggleFixture) bool {
+        return sys.IsWindowVisible(self.other.hwnd.?) != 0;
+    }
+};
+
+const QuickTerminalCreateCounter = struct {
+    var calls: usize = 0;
+    var host_id: ?u32 = null;
+
+    fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+        calls += 1;
+        host_id = opts.host_id;
+        return error.TestWindowCreateFailed;
+    }
+};
+
+test "win32 toggle_quick_terminal follows its host after the first pane is gone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // Only the pane the window was created with ever carried the
+            // per-surface flag. This tab was opened in the quick terminal
+            // later, so its surface is not flagged, but its host is.
+            QuickTerminalCreateCounter.calls = 0;
+            fixture.app.test_create_window_surface = &QuickTerminalCreateCounter.createSurface;
+
+            try std.testing.expect(fixture.visible());
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expect(!fixture.surface.window_visible);
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.surface.window_visible);
+            // A second quick terminal was never made.
+            try std.testing.expectEqual(@as(usize, 0), QuickTerminalCreateCounter.calls);
+            try std.testing.expectEqual(@as(usize, 1), fixture.app.hosts.items.len);
+        }
+    }.body);
+}
+
+/// Stands in for the tab `toggleQuickTerminal` opens in an empty quick
+/// terminal host: `fixture.fresh`, inserted as the host's only tab.
+const QuickTerminalFreshTab = struct {
+    var fixture: *QuickTerminalToggleFixture = undefined;
+    var calls: usize = 0;
+    var host_id: ?u32 = null;
+
+    fn createSurface(app: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+        calls += 1;
+        host_id = opts.host_id;
+        const surface = &fixture.fresh;
+        try app.windows.append(app.core_app.alloc, surface);
+        try fixture.host.tabs.insert(
+            app.core_app.alloc,
+            0,
+            try Tab.init(app.core_app.alloc, fixture.host.nextTabId(), surface),
+        );
+        return surface;
+    }
+};
+
+test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing one detached for undo" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // `close_tab:this` on the only tab keeps the host and the
+            // surface for undo, and nothing in the host shows it.
+            var detached = fixture.host.tabs.orderedRemove(0);
+            defer detached.deinit();
+            fixture.surface.window_visible = false;
+
+            QuickTerminalFreshTab.fixture = &fixture;
+            QuickTerminalFreshTab.calls = 0;
+            QuickTerminalFreshTab.host_id = null;
+            fixture.app.test_create_window_surface = &QuickTerminalFreshTab.createSurface;
+
+            // On screen and empty, the toggle dismisses it.
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expectEqual(@as(usize, 0), QuickTerminalFreshTab.calls);
+
+            // Dismissed, it opens a fresh tab and shows that, never the
+            // surface that was detached.
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expectEqual(@as(usize, 1), QuickTerminalFreshTab.calls);
+            try std.testing.expectEqual(@as(?u32, fixture.host.id), QuickTerminalFreshTab.host_id);
+            try std.testing.expect(!fixture.surface.window_visible);
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.fresh.window_visible);
+            try std.testing.expect(fixture.host.activeSurface() == &fixture.fresh);
+            // The window floats with the tab it shows, so a tab switch or
+            // undo does not drop it below other windows.
+            try std.testing.expect(fixture.fresh.topmost);
+            // Its chrome windows are not created by this fixture, so showing
+            // it logged a refresh failure that left its title behind.
+            appendOwnedString(std.testing.allocator, &fixture.host.cached_window_title, null) catch unreachable;
+        }
+    }.body);
+}
+
+test "win32 toggle_quick_terminal keeps a pane a zoom hides out of view" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // Two panes in the one tab, the first zoomed.
+            const inserted = try SplitTreeSurface.init(std.testing.allocator, &fixture.fresh);
+            defer {
+                var cleanup = inserted;
+                cleanup.deinit();
+            }
+            const tab = &fixture.host.tabs.items[0];
+            const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+            tab.tree.deinit();
+            tab.tree = next_tree;
+            tab.focused = tab.findHandle(&fixture.surface) orelse tab.focused;
+            tab.tree.zoom(tab.findHandle(&fixture.surface));
+            fixture.fresh.window_visible = false;
+
+            try fixture.app.toggleQuickTerminal();
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(fixture.surface.window_visible);
+            try std.testing.expect(!fixture.fresh.window_visible);
+        }
+    }.body);
+}
+
+test "win32 quick-terminal-autohide hides the quick terminal host, not a flagged pane" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            fixture.app.config.@"quick-terminal-autohide" = true;
+            const hwnd = fixture.host.hwnd.?;
+            setWindowData(hwnd, &fixture.host);
+            defer setWindowData(hwnd, null);
+
+            try std.testing.expect(fixture.visible());
+            _ = hostWindowProc(hwnd, c.WM_ACTIVATE, c.WA_INACTIVE, 0);
+            try std.testing.expect(!fixture.visible());
+        }
+    }.body);
+}
+
+test "win32 toggle_visibility does not show a quick terminal the user dismissed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            // An ordinary window beside it. Neither host has anything to
+            // activate once the windows are back, since `other` has no tab
+            // and the quick terminal's surface has no window.
+            try fixture.app.hosts.append(std.testing.allocator, &fixture.other);
+            // The quick terminal is dismissed by its own toggle.
+            _ = sys.ShowWindow(fixture.host.hwnd.?, c.SW_HIDE);
+
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expect(!fixture.otherVisible());
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(fixture.otherVisible());
+            try std.testing.expect(!fixture.visible());
+
+            // One that was on screen when the windows were hidden comes back
+            // with them. (Its tab is detached first: laying out a tab needs
+            // the chrome windows this fixture does not create.)
+            var detached = fixture.host.tabs.orderedRemove(0);
+            defer detached.deinit();
+            _ = sys.ShowWindow(fixture.host.hwnd.?, c.SW_SHOWNOACTIVATE);
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible());
+            try std.testing.expect(!fixture.otherVisible());
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.otherVisible());
+
+            // The windows are hidden, then something shows one of them alone
+            // and clears `windows_hidden`, as the quick terminal's own toggle
+            // does. Hiding them again must not forget the ordinary window
+            // that is still waiting to come back.
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible() and !fixture.otherVisible());
+            _ = sys.ShowWindow(fixture.host.hwnd.?, c.SW_SHOWNOACTIVATE);
+            // What `WM_SHOWWINDOW` does on the real host window.
+            fixture.host.hidden_by_toggle = false;
+            fixture.app.windows_hidden = false;
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(!fixture.visible() and !fixture.otherVisible());
+            try std.testing.expect(try fixture.app.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expect(fixture.visible());
+            try std.testing.expect(fixture.otherVisible());
+        }
+    }.body);
+}
+
+test "win32 showing a host window by any other means ends its wait for toggle_visibility" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const hwnd = fixture.other.hwnd.?;
+            setWindowData(hwnd, &fixture.other);
+            defer setWindowData(hwnd, null);
+
+            fixture.other.hideForToggle();
+            try std.testing.expect(fixture.other.hidden_by_toggle);
+            // Hiding it again keeps the mark: it is not on screen to read.
+            fixture.other.hideForToggle();
+            try std.testing.expect(fixture.other.hidden_by_toggle);
+
+            _ = hostWindowProc(hwnd, c.WM_SHOWWINDOW, 0, 0);
+            try std.testing.expect(fixture.other.hidden_by_toggle);
+            _ = hostWindowProc(hwnd, c.WM_SHOWWINDOW, 1, 0);
+            try std.testing.expect(!fixture.other.hidden_by_toggle);
+        }
+    }.body);
 }
 
 const FullscreenMonitor = struct {
@@ -27458,18 +28692,135 @@ const FullscreenMonitor = struct {
 };
 
 fn fullscreenRestoreRect(rect: RECT, old_work: RECT, new_work: RECT, old_dpi: u32, new_dpi: u32) RECT {
-    var left = rect.left + new_work.left - old_work.left;
-    var top = rect.top + new_work.top - old_work.top;
     const scaled_width = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.right - rect.left, @intCast(new_dpi), @intCast(old_dpi)) else rect.right - rect.left;
     const scaled_height = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.bottom - rect.top, @intCast(new_dpi), @intCast(old_dpi)) else rect.bottom - rect.top;
-    // Keep the logical size when it fits. An oversized rectangle can overlap
-    // a neighbour more than this monitor, causing Windows to select that
-    // neighbour's DPI again; cap it to the destination's work area.
-    const width = @min(scaled_width, new_work.right - new_work.left);
-    const height = @min(scaled_height, new_work.bottom - new_work.top);
-    left = @max(new_work.left, @min(left, new_work.right - width));
-    top = @max(new_work.top, @min(top, new_work.bottom - height));
-    return .{ .left = left, .top = top, .right = left + width, .bottom = top + height };
+    return fitRectInWork(
+        rect.left + new_work.left - old_work.left,
+        rect.top + new_work.top - old_work.top,
+        scaled_width,
+        scaled_height,
+        new_work,
+    );
+}
+
+/// The rect at (`left`, `top`) of the given size, moved to the nearest place
+/// inside `work`. Keep the logical size when it fits. An oversized rectangle
+/// can overlap a neighbour more than this monitor, causing Windows to select
+/// that neighbour's DPI again; cap it to the work area.
+fn fitRectInWork(left: i32, top: i32, width: i32, height: i32, work: RECT) RECT {
+    const fitted_width = @min(width, work.right - work.left);
+    const fitted_height = @min(height, work.bottom - work.top);
+    const fitted_left = @max(work.left, @min(left, work.right - fitted_width));
+    const fitted_top = @max(work.top, @min(top, work.bottom - fitted_height));
+    return .{
+        .left = fitted_left,
+        .top = fitted_top,
+        .right = fitted_left + fitted_width,
+        .bottom = fitted_top + fitted_height,
+    };
+}
+
+/// How far a new window sits below and right of the one it was opened from,
+/// about a caption height.
+fn cascadeStep(dpi: u32) i32 {
+    return sys.MulDiv(32, @intCast(@max(dpi, 96)), 96);
+}
+
+/// A rect in workspace coordinates (what `GetWindowPlacement` reports for a
+/// window without `WS_EX_TOOLWINDOW`) as screen coordinates, for the monitor
+/// the window is on. This is the convention `leaveFullscreen` uses.
+fn workspaceRectToScreen(rect: RECT, monitor: MONITORINFO) RECT {
+    const dx = monitor.rcWork.left - monitor.rcMonitor.left;
+    const dy = monitor.rcWork.top - monitor.rcMonitor.top;
+    return .{
+        .left = rect.left + dx,
+        .top = rect.top + dy,
+        .right = rect.right + dx,
+        .bottom = rect.bottom + dy,
+    };
+}
+
+/// `SetWindowPos` flags for a window placed like the one it was opened from.
+/// `window-position-x/y` says where every new window goes, so with it set the
+/// window keeps that place and takes only the source's size. A fullscreen
+/// window covers its monitor wherever the config would put it.
+fn newWindowSetPosFlags(config: *const configpkg.Config, placed: NewWindowPlacement) UINT {
+    var flags: UINT = c.SWP_NOACTIVATE;
+    if (!placed.copied and configuredHostWindowPosition(config) != null) flags |= c.SWP_NOMOVE;
+    return flags;
+}
+
+/// Where a window opened from another one (`new_window`, a profile in a new
+/// window) starts.
+const NewWindowPlacement = struct {
+    /// In screen coordinates: the size the source has when it is a normal
+    /// window, one cascade step down and right so the new window does not
+    /// sit exactly on it, kept inside the source's monitor. Never the rect of
+    /// a minimized source, which is not on screen, nor the monitor-sized rect
+    /// of a maximized one.
+    rect: RECT,
+    /// Set when the source is, or restores to, maximized: its placement,
+    /// for `Surface.maximizeWithPlacement`.
+    maximize: ?WINDOWPLACEMENT,
+    /// `rect` is the source's own, unchanged: it is fullscreen, so the new
+    /// window is too and covers the same monitor.
+    copied: bool = false,
+};
+
+/// `destination` is the window being placed, if it already exists: it is not
+/// one of the windows the new one steps past.
+fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?HWND) !NewWindowPlacement {
+    var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+    placement.length = @sizeOf(WINDOWPLACEMENT);
+    if (sys.GetWindowPlacement(source, &placement) == 0) return lastError();
+    // For a minimized window this is the monitor it was on, not the one its
+    // icon is on.
+    const monitor = sys.MonitorFromWindow(source, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+    var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+    info.cbSize = @sizeOf(MONITORINFO);
+    if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+
+    // The monitor, not the source's rect, which is a sliver under the
+    // taskbar once the source is minimized.
+    if (fullscreen) return .{ .rect = info.rcMonitor, .maximize = null, .copied = true };
+
+    const iconic = sys.IsIconic(source) != 0;
+    if (restoresMaximized(source, &placement)) {
+        // It is maximized again, never minimized with it.
+        placement.showCmd = c.SW_MAXIMIZE;
+        return .{
+            .rect = workspaceRectToScreen(placement.rcNormalPosition, info),
+            .maximize = placement,
+        };
+    }
+
+    var rect: RECT = undefined;
+    if (iconic) {
+        rect = workspaceRectToScreen(placement.rcNormalPosition, info);
+    } else if (sys.GetWindowRect(source, &rect) == 0) {
+        return lastError();
+    }
+    const step = cascadeStep(sys.GetDpiForWindow(source));
+    // One step off the source, and on past any window already there: every
+    // new window of a forwarded launch is opened from the same first window.
+    var placed = fitRectInWork(
+        rect.left + step,
+        rect.top + step,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        info.rcWork,
+    );
+    var steps: u8 = 0;
+    while (steps < 8 and app.windowStartsAt(placed, destination)) : (steps += 1) {
+        placed = fitRectInWork(
+            placed.left + step,
+            placed.top + step,
+            placed.right - placed.left,
+            placed.bottom - placed.top,
+            info.rcWork,
+        );
+    }
+    return .{ .rect = placed, .maximize = null };
 }
 
 test "win32 fullscreen restore translates work areas and scales size to fit" {
@@ -27596,6 +28947,78 @@ fn allMonitorsInfo() ?win32_quick_terminal.MonitorInfo {
     if (search.failed) return null;
     if (!search.found) return null;
     return search.info;
+}
+
+/// Whether the window is, or when restored becomes, maximized. A window
+/// minimized from maximized restores to maximized. The flag alone says
+/// nothing about a window that was restored since: Windows keeps it set on a
+/// normal window.
+fn restoresMaximized(hwnd: HWND, placement: *const WINDOWPLACEMENT) bool {
+    return sys.IsZoomed(hwnd) != 0 or
+        (sys.IsIconic(hwnd) != 0 and (placement.flags & c.WPF_RESTORETOMAXIMIZED) != 0);
+}
+
+/// The work areas of the monitors there are now, in screen coordinates.
+const WorkAreas = struct {
+    rects: [16]RECT = undefined,
+    count: usize = 0,
+
+    fn collect() WorkAreas {
+        var areas: WorkAreas = .{};
+        _ = sys.EnumDisplayMonitors(null, null, enumProc, @as(LPARAM, @bitCast(@intFromPtr(&areas))));
+        return areas;
+    }
+
+    fn slice(self: *const WorkAreas) []const RECT {
+        return self.rects[0..self.count];
+    }
+
+    fn enumProc(monitor: sys.HMONITOR, _: HDC, _: *RECT, data: LPARAM) callconv(.winapi) BOOL {
+        const areas: *WorkAreas = @ptrFromInt(@as(usize, @bitCast(data)));
+        if (areas.count == areas.rects.len) return 0;
+        var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+        info.cbSize = @sizeOf(MONITORINFO);
+        if (sys.GetMonitorInfoW(monitor, &info) == 0) return 1;
+        areas.rects[areas.count] = info.rcWork;
+        areas.count += 1;
+        return 1;
+    }
+};
+
+/// How much of a restored window's title bar must be on a monitor for the
+/// user to be able to grab it: this wide and half as tall, in physical
+/// pixels. The saved rect is in the pixels of a monitor this process may not
+/// have seen yet, and the host being placed is on another, so no DPI is
+/// right to scale by; a caption at 100%, still a target at 300%.
+const restore_grab: i32 = 48;
+
+/// Where a window saved at `rect` (screen coordinates) goes now that the
+/// monitors' work areas are `works`. One whose title bar can still be grabbed
+/// stays exactly where it was, whatever its other edges do: a snapped window
+/// overhangs its monitor by its invisible frame. One that cannot (its monitor
+/// was unplugged, or the layout changed) moves to the nearest work area, its
+/// size capped to it.
+fn restoredRectOnScreen(rect: RECT, works: []const RECT, grab: i32) RECT {
+    if (works.len == 0) return rect;
+    // The rect comes from a file on disk: any i32 is possible, so differences
+    // of coordinates are taken in 64 bits.
+    const grab_width = @min(grab, rect.right - rect.left);
+    var nearest = works[0];
+    var nearest_gap: i64 = std.math.maxInt(i64);
+    for (works) |work| {
+        const visible_width = @as(i64, @min(rect.right, work.right)) - @max(rect.left, work.left);
+        const visible_height = @as(i64, @min(rect.top, work.bottom - grab) + grab) - @max(rect.top, work.top);
+        if (visible_width >= grab_width and visible_height >= @divTrunc(grab, 2)) return rect;
+
+        const gap_x: i64 = @max(0, @max(@as(i64, work.left) - rect.right, @as(i64, rect.left) - work.right));
+        const gap_y: i64 = @max(0, @max(@as(i64, work.top) - rect.bottom, @as(i64, rect.top) - work.bottom));
+        const gap = gap_x + gap_y;
+        if (gap < nearest_gap) {
+            nearest = work;
+            nearest_gap = gap;
+        }
+    }
+    return fitRectInWork(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, nearest);
 }
 
 // Keep helper modules reachable from the exe's module graph. Zig prunes
@@ -28092,15 +29515,22 @@ test "win32 config problems leave out the arguments that start the process" {
     try std.testing.expect(isLaunchArgumentDiagnostic(safe_mode_complaint, true));
     try std.testing.expect(!isLaunchArgumentDiagnostic(safe_mode_complaint, false));
 
-    // A conditional theme rebuilds the config through an iterator with no
-    // place to give: the complaints come back without one, and still go.
+    // Conditional replay preserves the CLI locations and still filters
+    // launch arguments without hiding the user's mistakes.
     var rebuilt = (try config.changeConditionalState(.{ .theme = .dark })).?;
     defer rebuilt.deinit();
     var rebuilt_kept: usize = 0;
+    var rebuilt_cli: usize = 0;
     for (rebuilt._diagnostics.items()) |diag| {
-        try std.testing.expect(diag.location != .cli);
+        if (diag.location == .cli) rebuilt_cli += 1;
+        for (config._diagnostics.items()) |original| {
+            if (std.mem.eql(u8, original.key, diag.key)) {
+                try std.testing.expectEqualDeep(original.location, diag.location);
+            }
+        }
         if (!isLaunchArgumentDiagnostic(diag, true)) rebuilt_kept += 1;
     }
+    try std.testing.expectEqual(@as(usize, 4), rebuilt_cli);
     try std.testing.expectEqual(@as(usize, 3), rebuilt_kept);
 
     // A file's own line with the same text is a mistake in that file.
@@ -29231,6 +30661,41 @@ test "stripHtmlTags preserves plain text" {
     try testing.expectEqualStrings("no tags here", out);
 }
 
+test "copied terminal text keeps only web and mail links as anchors" {
+    const alloc = std.testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]8;;javascript:alert(1)\x1b\\evil\x1b]8;;\x1b\\ ");
+    stream.nextSlice("\x1b]8;;file://attacker/share/x\x1b\\unc\x1b]8;;\x1b\\ ");
+    stream.nextSlice("\x1b]8;;https://example.com\x1b\\good\x1b]8;;\x1b\\");
+
+    // The same formatter the mixed copy runs, then the CF_HTML envelope
+    // `Surface.writeClipboardHtml` hands the clipboard, with no clipboard
+    // involved.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var formatter: terminal.formatter.ScreenFormatter = .init(
+        t.screens.active,
+        .{ .emit = .html },
+    );
+    try formatter.format(&aw.writer);
+
+    const out = try win32_clipboard_html.wrapFragment(alloc, aw.writer.buffered());
+    defer alloc.free(out);
+    const range = win32_clipboard_html.fragmentRange(out).?;
+    const fragment = out[range.start..range.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "evil unc ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<a href=\"https://example.com\">good</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "javascript:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "file://") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fragment, "<a "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fragment, "</a>"));
+}
+
 test "win32 appendOwnedString replaces existing value and frees old allocation" {
     const testing = std.testing;
     var target: ?[:0]const u8 = null;
@@ -30095,12 +31560,19 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
             app.tickCoreAppModal();
             return 0;
         },
-        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT => {
+        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT, c.WM_WINHOSTTY_PROFILES => {
             var payload = delivery.take(message, @bitCast(lparam)) orelse return 0;
             switch (payload) {
                 .update => |completion| {
                     defer payload.deinit();
                     app.handleUpdateCheckCompletion(completion);
+                },
+                .profiles => |completion| {
+                    // Applied at the top of the outer pump: this can run
+                    // inside a modal loop, with a menu built from the
+                    // profiles being replaced still open.
+                    if (app.pending_profile_discovery) |pending| pending.deinit();
+                    app.pending_profile_discovery = completion;
                 },
                 .toast => |activation| {
                     defer delivery.toast_pending.store(false, .release);
@@ -31734,6 +33206,16 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
     return result;
 }
 
+fn applyConsoleWindowVisibility(hwnd: HWND, visible: bool) void {
+    if (visible) {
+        if (sys.IsIconic(hwnd) == 0) return;
+        _ = sys.DefWindowProcW(hwnd, c.WM_SYSCOMMAND, c.SC_RESTORE, 0);
+    } else {
+        if (sys.IsIconic(hwnd) != 0) return;
+        _ = sys.DefWindowProcW(hwnd, c.WM_SYSCOMMAND, c.SC_MINIMIZE, 0);
+    }
+}
+
 fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     if (msg == c.WM_NCCREATE) {
         const cs: *const CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
@@ -31744,6 +33226,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
 
     const host = getHost(hwnd);
     switch (msg) {
+        c.WM_WINHOSTTY_CONSOLE_VISIBILITY => {
+            if (host != null) applyConsoleWindowVisibility(hwnd, wParam != 0);
+            return 0;
+        },
         c.WM_WINHOSTTY_HOST_NEW_TAB => {
             if (host) |v| v.dispatchDeferredNewTab(if (wParam == 0) null else @as(u64, @intCast(wParam)));
             return 0;
@@ -31769,15 +33255,8 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     // never left the tab sends no WM_MOUSELEAVE, and the popup
                     // would sit over whatever the user switched to.
                     v.hideTabTooltip();
-                    if (v.app.config.@"quick-terminal-autohide") {
-                        if (v.app.quickTerminalSurfaceForHost(v)) |surface| {
-                            if (surface.window_visible) {
-                                const top_level = surface.windowHwnd() orelse return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
-                                if (sys.IsWindowVisible(top_level) != 0) {
-                                    App.hideQuickTerminalSurface(surface);
-                                }
-                            }
-                        }
+                    if (v.quick_terminal and v.app.config.@"quick-terminal-autohide") {
+                        if (sys.IsWindowVisible(hwnd) != 0) App.hideQuickTerminalHost(v);
                     }
                 }
             }
@@ -31978,7 +33457,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 // QT placement/tween frames own their physical-pixel rect.
                 // Keep scale and layout updates even when the OS's resized
                 // suggestion would override that rect on a DPI crossing.
-                if (!v.quick_terminal_placing and v.quick_terminal_animation == null) {
+                if (!v.quick_terminal_placing and !v.restore_placing and v.quick_terminal_animation == null) {
                     const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
                     _ = sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
                 }
@@ -32363,6 +33842,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         c.WM_SHOWWINDOW => {
             const result = sys.DefWindowProcW(hwnd, msg, wParam, lParam);
             if (host) |v| {
+                if (wParam != 0) v.hidden_by_toggle = false;
                 v.refreshSurfaceVisibility();
                 // Hiding or showing a window changes no size, so WM_SIZE
                 // never fires and this is the only notice that the caption
@@ -33692,6 +35172,8 @@ pub const Surface = struct {
     core_surface: CoreSurface = undefined,
     core_initialized: bool = false,
     adopted_session: ?ptypkg.AdoptedSession = null,
+    adopted_console: bool = false,
+    console_window_visible: ?bool = null,
     destroy_on_wm_destroy: bool = false,
     content_scale: apprt.ContentScale = .{ .x = 1, .y = 1 },
     size: apprt.SurfaceSize = .{ .width = 800, .height = 600 },
@@ -33709,7 +35191,6 @@ pub const Surface = struct {
     mouse_visible: bool = true,
     hovered_link: ?[:0]const u8 = null,
     window_focused: bool = false,
-    quick_terminal: bool = false,
     decorations_visible: bool = true,
     decorations_visible_overridden: bool = false,
     fullscreen: bool = false,
@@ -34035,7 +35516,7 @@ pub const Surface = struct {
             .app = app,
             .host = host,
             .adopted_session = if (opts.adopted_session) |pending| pending.takeAdopted() else null,
-            .quick_terminal = opts.quick_terminal,
+            .adopted_console = opts.adopted_session != null,
             .host_id = host.id,
             .host_active = true,
             .window_visible = false,
@@ -34208,8 +35689,13 @@ pub const Surface = struct {
         // in host.tabs, causing use-after-free on subsequent refreshChrome/layout.
         errdefer {
             // The chrome may have given the new tab a button and a UIA
-            // provider, which the tab must not outlive (`Tab.deinit`).
-            if (inserted_tab_index) |index| if (index < host.tabs.items.len) host.destroyTabButton(&host.tabs.items[index]);
+            // provider, which the tab must not outlive (`Tab.deinit`), and a
+            // reader was told about the button.
+            var had_button = false;
+            if (inserted_tab_index) |index| if (index < host.tabs.items.len) {
+                had_button = host.tabs.items[index].button_hwnd != null;
+                host.destroyTabButton(&host.tabs.items[index]);
+            };
             rollbackFailedSurfaceAttach(
                 &host.tabs,
                 &host.active_tab,
@@ -34218,6 +35704,7 @@ pub const Surface = struct {
                 inserted_tab_index,
                 &split_rollback,
             );
+            if (had_button) host.notifyTabListUiaChanged();
             // The core's `set_title` may have relabelled a host that stays
             // for the tabs it had; `windowDestroyed` would refresh them.
             if (!created_host) runUiActionOrLog("failed surface chrome refresh failed", host.refreshChrome());
@@ -34281,6 +35768,16 @@ pub const Surface = struct {
         // Stop the core if a later step fails. This runs first, while the GL
         // context and the window its threads draw to are still alive.
         errdefer self.deinitCore();
+
+        // Seed the dynamic title after core init's automatic command title,
+        // but before any path can show the host. No UI mailbox has drained
+        // yet, so later console title messages still win. A configured title
+        // was already applied by the core and remains authoritative.
+        if (opts.adopted_session) |pending| if (config.title == null) {
+            self.setTitle(pending.title) catch |err| {
+                log.warn("adopted window startup title failed err={}", .{err});
+            };
+        };
 
         // Same-host tabs/splits must stay hidden through init, but they still
         // need an initial occlusion sync so hidden child GL surfaces stop
@@ -34439,6 +35936,14 @@ pub const Surface = struct {
         // The owner's last window already took the session's final snapshot.
         app.session_state_saved_before_last_host_close = true;
 
+        // A reader was told about the new tab's button, so it hears that the
+        // button is gone again when init fails.
+        const root = try win32_uia.RootProvider.create(std.testing.allocator, @ptrFromInt(0x1));
+        defer _ = win32_uia.RootProvider.Release(&root.base);
+        host.root_uia_provider = root;
+        defer host.root_uia_provider = null;
+        const announced = win32_uia.events.testing_structure_changes;
+
         // Before the fix, the unwinding DestroyWindow sent WM_DESTROY, which
         // freed the Surface; the errdefers then read it and
         // `createWindowSurface` freed it a second time. The title, the tab's
@@ -34448,6 +35953,7 @@ pub const Surface = struct {
             error.StaleRevision,
             app.createWindowSurface(&app.config, default_title, .{ .host_id = host.id }),
         );
+        try std.testing.expectEqual(announced + 1, win32_uia.events.testing_structure_changes);
         app.running = false;
         try std.testing.expect(sys.IsWindow(Stage.surface_hwnd.?) == 0);
         try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
@@ -34581,15 +36087,22 @@ pub const Surface = struct {
                 _ = mutable.requestClose();
                 return;
             };
+            // Not always the key that closed a terminal in front: a read-only
+            // terminal whose program exits closes itself and asks, in
+            // whichever tab it is.
+            var title_buf: [32]u8 = undefined;
+            var prompt: ConfirmPrompt = .{
+                .title = "Close this terminal?",
+                .body = "A process is still running. Closing this surface will terminate it.",
+                .accept_label = "Close",
+                .cancel_label = "Cancel",
+                // Nothing to preview: this prompt is about a running
+                // process, not about a payload.
+            };
+            const named_body = host.nameBackgroundTerminal(&prompt, mutable, &title_buf);
+            defer if (named_body) |text| mutable.app.core_app.alloc.free(text);
             host.showConfirm(
-                .{
-                    .title = "Close this terminal?",
-                    .body = "A process is still running. Closing this surface will terminate it.",
-                    .accept_label = "Close",
-                    .cancel_label = "Cancel",
-                    // Nothing to preview: this prompt is about a running
-                    // process, not about a payload.
-                },
+                prompt,
                 &surfaceConfirmCloseAccept,
                 null,
                 @ptrCast(mutable),
@@ -35625,6 +37138,122 @@ pub const Surface = struct {
         }
     }
 
+    /// Only an adopted console controls the host through ConPTY XTWINOPS.
+    /// Match Windows Terminal: hide minimizes, show restores only an iconic
+    /// window (preserving an already maximized or snapped window).
+    pub fn requestWindowVisibility(self: *Surface, visible: bool) void {
+        if (!self.adopted_console) return;
+        const host = self.host orelse return;
+        const hwnd = host.hwnd orelse return;
+        // Check iconic state at delivery, not here: a PTY batch may queue
+        // hide then show before either message has reached the native pump.
+        _ = sys.PostMessageW(hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, @intFromBool(visible), 0);
+    }
+
+    fn syncAdoptedConsoleVisibility(self: *Surface, visible: bool) void {
+        if (!self.adopted_console or !self.core_initialized) return;
+        if (self.console_window_visible == visible) return;
+        self.console_window_visible = visible;
+        self.core_surface.ptyVisibilityCallback(visible);
+    }
+
+    test "adopted ConPTY visibility follows the host across background tabs" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try Host.runOnPrivateDesktop(adoptedVisibilityTestBody);
+    }
+
+    fn adoptedVisibilityTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var first: Surface = undefined;
+        var background: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{ .{ .storage = &first, .host = &host }, .{ .storage = &background, .host = &host } },
+            .tabs = &.{ .{ .host = &host, .surface = &first, .id = 1 }, .{ .host = &host, .surface = &background, .id = 2 } },
+        });
+        defer session.deinit();
+        const hwnd = try createTestHostWindow();
+        defer _ = sys.DestroyWindow(hwnd);
+        host.hwnd = hwnd;
+        const termio = @import("../termio.zig");
+        first.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
+        defer first.core_surface.io.mailbox.deinit(core_app.alloc);
+        background.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
+        defer background.core_surface.io.mailbox.deinit(core_app.alloc);
+        for ([_]*Surface{ &first, &background }) |surface| {
+            surface.adopted_console = true;
+            surface.core_initialized = true;
+            surface.window_visible = false;
+            surface.core_surface.readonly = false;
+            surface.core_surface.rt_surface = surface;
+        }
+        defer {
+            first.core_initialized = false;
+            background.core_initialized = false;
+        }
+        const Check = struct {
+            fn sync(owner: *Host, surfaces: []const *Surface, expected: bool) !void {
+                // Keep rendering inert: only exercise the host-to-PTY path.
+                owner.surfaces_visible = win32_power.queryHostVisibility(owner.hwnd.?, false, null).visible;
+                owner.refreshSurfaceVisibility();
+                for (surfaces) |surface| {
+                    const queue = surface.core_surface.io.mailbox.spsc.queue;
+                    const message = queue.pop() orelse return error.MissingVisibilitySignal;
+                    try std.testing.expectEqual(expected, message.pty_visibility);
+                    try std.testing.expect(queue.pop() == null);
+                }
+                owner.refreshSurfaceVisibility();
+                for (surfaces) |surface| try std.testing.expect(surface.core_surface.io.mailbox.spsc.queue.pop() == null);
+            }
+            fn request(surface: *Surface, visible: bool) !void {
+                try surface.core_surface.handleMessage(.{ .window_visibility = visible });
+                var message: MSG = undefined;
+                if (sys.PeekMessageW(&message, surface.host.?.hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0) return error.MissingVisibilityRequest;
+                applyConsoleWindowVisibility(message.hwnd, message.wParam != 0);
+            }
+        };
+        const surfaces = [_]*Surface{ &first, &background };
+        try Check.sync(&host, &surfaces, false);
+        _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+        try Check.sync(&host, &surfaces, true);
+        // Even a background tab's adopted client controls the owning host.
+        try Check.request(&background, false);
+        try std.testing.expect(sys.IsIconic(hwnd) != 0);
+        try Check.sync(&host, &surfaces, false);
+        try Check.request(&background, true);
+        try std.testing.expect(sys.IsIconic(hwnd) == 0);
+        try Check.sync(&host, &surfaces, true);
+        // One PTY batch can carry opposing requests before the UI dispatches
+        // either native command. The last request must still win.
+        try background.core_surface.handleMessage(.{ .window_visibility = false });
+        try background.core_surface.handleMessage(.{ .window_visibility = true });
+        var burst: MSG = undefined;
+        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
+            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
+        }
+        try std.testing.expect(sys.IsIconic(hwnd) == 0);
+        _ = sys.ShowWindow(hwnd, c.SW_MINIMIZE);
+        try background.core_surface.handleMessage(.{ .window_visibility = true });
+        try background.core_surface.handleMessage(.{ .window_visibility = false });
+        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
+            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
+        }
+        try std.testing.expect(sys.IsIconic(hwnd) != 0);
+        _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+        try Check.request(&background, true);
+        try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+        // An ordinary surface cannot control host visibility this way.
+        first.adopted_console = false;
+        try first.core_surface.handleMessage(.{ .window_visibility = false });
+        var message: MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&message, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0);
+    }
+
     fn setTitle(self: *Surface, title: []const u8) !void {
         const alloc = self.app.core_app.alloc;
         // Both the OSC 0/2 path and the automation IPC path
@@ -36108,6 +37737,7 @@ pub const Surface = struct {
         errdefer scan.deinit(alloc);
         if (scan.matches.len == 0) {
             scan.deinit(alloc);
+            self.showQuickSelectNotice(labels.quick_select_no_targets_banner);
             return true;
         }
 
@@ -36156,6 +37786,7 @@ pub const Surface = struct {
         if (!self.ensureQuickSelectLabelRects(client, metrics, host.current_dpi)) {
             log.warn("quick select has more visible labels than fit without overlap", .{});
             self.closeQuickSelect(false);
+            self.showQuickSelectNotice(labels.quick_select_too_many_banner);
             return true;
         }
 
@@ -36171,6 +37802,15 @@ pub const Surface = struct {
         _ = sys.SetCapture(hwnd);
         _ = sys.InvalidateRect(hwnd, null, 0);
         return true;
+    }
+
+    /// Say why the key press did nothing. Call with no session open: the
+    /// banner does not touch focus, and a closed overlay has nothing to free.
+    fn showQuickSelectNotice(self: *Surface, message: []const u8) void {
+        _ = self.app.showHostBanner(.{ .surface = self.core() }, .info, message) catch |err| {
+            log.warn("quick select notice failed err={}", .{err});
+            return;
+        };
     }
 
     fn ensureQuickSelectWindow(self: *Surface) !void {
@@ -36414,11 +38054,9 @@ pub const Surface = struct {
 
         self.closeQuickSelect(true);
         if (action == .open) {
-            _ = try self.app.performAction(
-                .{ .surface = self.core() },
-                .open_url,
-                .{ .kind = .unknown, .url = payload },
-            );
+            // The same resolution a Ctrl+click gets: a relative path against
+            // the pane's directory, and no line or column in the file name.
+            try self.core().openLinkText(payload);
             return;
         }
         if (action == .paste) {
@@ -38159,28 +39797,26 @@ pub const Surface = struct {
 
         const hwnd = self.windowHwnd() orelse return;
         const source_hwnd = source.windowHwnd() orelse return;
-        var rect: RECT = undefined;
-        var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
-        placement.length = @sizeOf(WINDOWPLACEMENT);
-        if (sys.GetWindowRect(source_hwnd, &rect) == 0 or
-            sys.GetWindowPlacement(source_hwnd, &placement) == 0) return lastError();
+        const placed = try newWindowPlacement(self.app, source_hwnd, source.fullscreen, hwnd);
+        var flags = newWindowSetPosFlags(&self.app.config, placed) | c.SWP_FRAMECHANGED;
+        // Another tab of the source's own window is already where it goes.
+        if (hwnd == source_hwnd) flags |= c.SWP_NOMOVE | c.SWP_NOSIZE;
         if (sys.SetWindowPos(
             hwnd,
             if (self.topmost) HWND_TOPMOST else HWND_NOTOPMOST,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            c.SWP_NOACTIVATE | c.SWP_FRAMECHANGED,
+            placed.rect.left,
+            placed.rect.top,
+            placed.rect.right - placed.rect.left,
+            placed.rect.bottom - placed.rect.top,
+            flags,
         ) == 0) {
             return lastError();
         }
 
         if (!self.fullscreen) {
-            if (sys.IsZoomed(source_hwnd) != 0) {
-                // The move above made the source's maximized rect this
-                // window's normal rect; it takes the source's instead.
-                try maximizeWithPlacement(hwnd, &placement);
+            if (placed.maximize) |*placement| {
+                // The source's normal rect, not the monitor-sized one.
+                try maximizeWithPlacement(hwnd, placement);
             } else {
                 _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
             }
@@ -38221,7 +39857,7 @@ pub const Surface = struct {
     /// terminal flag is the host's: a split or tab opened inside the quick
     /// terminal is an ordinary surface in the quick terminal's window.
     fn keepsFrameUndecorated(self: *const Surface) bool {
-        const quick_terminal = if (self.host) |host| host.quick_terminal else self.quick_terminal;
+        const quick_terminal = if (self.host) |host| host.quick_terminal else false;
         return undecoratedKeepsFrame(self.app.os_build, quick_terminal);
     }
 
@@ -41849,6 +43485,36 @@ test "win32 closeTab this on last tab detaches tab for undo" {
     try std.testing.expectEqual(@as(usize, 0), surface.undo_stack.redoDepth());
 }
 
+test "win32 the banner after the last tab closes offers undo only while undo is on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+
+    // Undo is on: the banner says how to use it.
+    try std.testing.expect(try app.closeTab(.app, .this));
+    try std.testing.expect(std.mem.indexOf(u8, host.banner_text.?, "undo") != null);
+
+    // Put the tab back, then close it with undo off (`undo-timeout = 0`).
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+    try host.setBanner(.none, null);
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+    try std.testing.expect(try app.closeTab(.app, .this));
+    try std.testing.expectEqualStrings("Tab closed.", host.banner_text.?);
+}
+
 test "win32 close_tab this asks first once undo is off" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -41881,7 +43547,12 @@ test "win32 close_tab this asks first once undo is off" {
     try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
     surface_a.core_initialized = false;
     try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
-    try std.testing.expectEqualStrings("Close this tab?", host.confirm_payload.?.title);
+    // Tab 2 is in front, so the prompt says which tab it is about.
+    try std.testing.expectEqualStrings("Close tab 1?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 1 (noctty). Closing that tab will terminate it, and undo is off.",
+        host.confirm_payload.?.body,
+    );
     // Nothing closed, and nothing sits in undo history: the tab was not detached.
     try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
     try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
@@ -41890,6 +43561,19 @@ test "win32 close_tab this asks first once undo is off" {
     try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
     try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
 
+    // The tab in front is "this tab", as it was.
+    surface_b.core_surface.readonly = true;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqualStrings("Close this tab?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in this tab. Closing the tab will terminate it, and undo is off.",
+        host.confirm_payload.?.body,
+    );
+    host.invokeConfirmCancel();
+    surface_b.core_surface.readonly = false;
+
     surface_a.core_initialized = true;
     try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
     surface_a.core_initialized = false;
@@ -41897,6 +43581,61 @@ test "win32 close_tab this asks first once undo is off" {
     try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
     try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
     try std.testing.expectEqual(@as(?*Surface, &surface_b), host.activeSurface());
+}
+
+test "win32 a terminal that asks to close in a tab behind the front one names that tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // A read-only terminal asks before it closes, even when its program has
+    // exited and it closes by itself, so the prompt can come from tab 1 while
+    // tab 2 is in front.
+    surface_a.close(true);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close terminal in tab 1?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in Tab 1 (noctty). Closing that terminal will terminate it.",
+        host.confirm_payload.?.body,
+    );
+    host.invokeConfirmCancel();
+
+    // That is the usual way in: the program has exited, and the prompt must
+    // not say a process is running.
+    surface_a.core_surface.child_exited = true;
+    surface_a.core_initialized = true;
+    surface_a.close(true);
+    surface_a.core_initialized = false;
+    try std.testing.expectEqualStrings(
+        "The program in Tab 1 (noctty) has exited. Read-only mode makes closing that terminal ask first.",
+        host.confirm_payload.?.body,
+    );
+    host.invokeConfirmCancel();
+
+    // The one in front keeps the plain wording.
+    surface_b.close(true);
+    try std.testing.expectEqualStrings("Close this terminal?", host.confirm_payload.?.title);
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
 }
 
 test "win32 close_tab this closes at once while undo is on or nothing would be lost" {
@@ -43271,6 +45010,161 @@ test "win32 a background tab's exit keeps the active tab" {
     try app.validateShellNativeMapping();
 }
 
+test "win32 undoing then redoing an in-place tab close leaves the same tab in front" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var surface_d: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+            .{ .storage = &surface_d, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // Tabs [A, B, C, D] with C active, natively and in the shell model.
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c, &surface_d };
+    for (surfaces, 0..) |surface, index| {
+        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = window.created.window.? });
+        defer if (created) |*prepared| prepared.deinit();
+        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
+        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
+        surface.shell_committed = true;
+        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
+        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
+        try host.tabs.append(std.testing.allocator, tab);
+    }
+    host.active_tab = 2;
+    _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
+    try app.validateShellNativeMapping();
+
+    // A closes from its button and C stays in front. Undo puts A back and
+    // redo closes it again: each leaves the tab the close left in front, not
+    // A itself and not B, the tab that ends up at A's place.
+    try std.testing.expect(host.closeTabInPlace(0));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(usize, 4), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_a), host.tabs.items[0].focusedSurface());
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+    _ = try host.applyLatestStructuralRedo();
+    try std.testing.expectEqual(@as(usize, 3), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+
+    // The tab in front closing is the other case: undo brings it back in
+    // front, redo gives the front to the tab now at its place (D).
+    try std.testing.expect(host.closeTabInPlace(1));
+    try std.testing.expectEqual(@as(?*Surface, &surface_d), host.activeSurface());
+    try app.validateShellNativeMapping();
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try app.validateShellNativeMapping();
+
+    // Hiding the front tab's panes moves the keyboard to D, and that focus
+    // message commits to the model between the redo's prepare and commit.
+    // The redo has to survive it, not fail with a stale revision.
+    const Interleave = struct {
+        fn run(target: *App, pane: win32_shell.model.PaneId) !void {
+            try std.testing.expect(try target.shell_runtime.focusPane(pane));
+        }
+    };
+    app.test_before_structural_shell_commit = &Interleave.run;
+    _ = try host.applyLatestStructuralRedo();
+    try std.testing.expectEqual(@as(?*Surface, &surface_d), host.activeSurface());
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try app.validateShellNativeMapping();
+}
+
+test "win32 a window brought up without focus is not recorded as the focused one" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b1: Surface = undefined;
+    var surface_b2: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b1, .host = &host_b, .register = true },
+            .{ .storage = &surface_b2, .host = &host_b, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // Window A with one tab, window B with two, natively and in the model.
+    var window_a = try app.shell_runtime.prepare(.create_window);
+    defer window_a.deinit();
+    try window_a.commit(&app.shell_runtime);
+    var window_b = try app.shell_runtime.prepare(.create_window);
+    defer window_b.deinit();
+    try window_b.commit(&app.shell_runtime);
+    var tab_b2 = try app.shell_runtime.prepare(.{ .create_tab = window_b.created.window.? });
+    defer tab_b2.deinit();
+    try tab_b2.commit(&app.shell_runtime);
+    host_a.shell_id = window_a.created.window;
+    host_b.shell_id = window_b.created.window;
+    surface_a.shell_id = window_a.created.pane;
+    surface_b1.shell_id = window_b.created.pane;
+    surface_b2.shell_id = tab_b2.created.pane;
+    for ([_]*Surface{ &surface_a, &surface_b1, &surface_b2 }) |surface| surface.shell_committed = true;
+    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
+    tab.shell_id = window_a.created.tab;
+    try host_a.tabs.append(std.testing.allocator, tab);
+    tab = try Tab.init(std.testing.allocator, 1, &surface_b1);
+    tab.shell_id = window_b.created.tab;
+    try host_b.tabs.append(std.testing.allocator, tab);
+    tab = try Tab.init(std.testing.allocator, 2, &surface_b2);
+    tab.shell_id = tab_b2.created.tab;
+    try host_b.tabs.append(std.testing.allocator, tab);
+
+    // The user is in A, whose pane has the keyboard.
+    _ = try app.shell_runtime.focusPane(surface_a.shell_id.?);
+    const state = &app.shell_runtime.state;
+    try std.testing.expect(state.focused_window.?.eql(window_a.created.window.?));
+
+    // B's second tab comes up without taking focus, as when a pane exits in
+    // a window that is not in front. B shows it; A is still the focused window.
+    app.activateSurfaceNoFocus(&surface_b2);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b2), host_b.activeSurface());
+    try std.testing.expect(state.windowConst(window_b.created.window.?).?.active_tab.?.eql(tab_b2.created.tab.?));
+    try std.testing.expect(state.focused_window.?.eql(window_a.created.window.?));
+
+    // A real focus message does move the focused window.
+    _ = app.noteSurfaceFocused(&surface_b2);
+    try std.testing.expect(state.focused_window.?.eql(window_b.created.window.?));
+}
+
 test "win32 terminal undo snapshot restores terminal state" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -43290,12 +45184,21 @@ test "win32 terminal undo snapshot restores terminal state" {
     stream.nextSlice("line1\r\nline2\r\nline3");
 
     const expected_scrollbar = t.screens.active.pages.scrollbar();
+    const expected_x = t.screens.active.cursor.x;
+    const expected_y = t.screens.active.cursor.y;
+    // After "line3" the cursor is at column 5, short of the last tab stop.
+    try std.testing.expectEqual(@as(@TypeOf(expected_x), 5), expected_x);
     const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
     defer alloc.free(snapshot);
 
     t.fullReset();
 
     const restored = restoreTerminalUndoState(&t, snapshot);
+
+    // The snapshot sets the tab stops after the cursor position, which used
+    // to leave the cursor on the last stop (column 8 of 12).
+    try std.testing.expectEqual(expected_x, t.screens.active.cursor.x);
+    try std.testing.expectEqual(expected_y, t.screens.active.cursor.y);
 
     const plain = try t.plainString(alloc);
     defer alloc.free(plain);
@@ -43486,7 +45389,7 @@ test "win32 split_create structural undo removes and redoes the split" {
             try std.testing.expect(try target_app.shell_runtime.focusPane(source_pane));
         }
     };
-    app.test_before_split_undo_shell_commit = &FocusInterleave.run;
+    app.test_before_structural_shell_commit = &FocusInterleave.run;
 
     try std.testing.expect(try host.undoSplitCreateEntry(&split_create));
     try std.testing.expectEqual(@as(?SplitTreeSurface.Node.Handle, null), host.tabs.items[0].findHandle(&surface_b));
@@ -44650,7 +46553,6 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                 sys.GetModuleHandleW(null),
                 null,
             ) orelse return lastError();
-            surface.quick_terminal = false;
             surface.decorations_visible = true;
             surface.fullscreen = false;
             surface.topmost = false;
@@ -44686,6 +46588,8 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             _ = sys.SetThreadDpiAwarenessContext(-4);
             var app: App = undefined;
             app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
             var surface = try window(&app, 100);
             const hwnd = surface.hwnd.?;
             defer _ = sys.DestroyWindow(hwnd);
@@ -44785,6 +46689,390 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
     const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
     thread.join();
     try result;
+}
+
+/// A hostless surface whose top-level window sits at (`left`, `top`) and is
+/// 640x480, with every field `inheritWindowStateFrom` copies set.
+fn placementTestSurface(app: *App, left: i32, top: i32) !Surface {
+    var surface: Surface = undefined;
+    surface.app = app;
+    surface.host = null;
+    surface.hwnd = sys.CreateWindowExW(
+        0,
+        prompt_label_class,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        WS_OVERLAPPEDWINDOW,
+        left,
+        top,
+        640,
+        480,
+        null,
+        null,
+        sys.GetModuleHandleW(null),
+        null,
+    ) orelse return lastError();
+    surface.decorations_visible = true;
+    surface.decorations_visible_overridden = false;
+    surface.fullscreen = false;
+    surface.topmost = false;
+    surface.restore_rect = std.mem.zeroes(RECT);
+    surface.restore_placement = std.mem.zeroes(WINDOWPLACEMENT);
+    surface.restore_monitor = null;
+    surface.default_client_size = null;
+    surface.cell_size_pixels = .{ .width = 0, .height = 0 };
+    surface.background_opacity_default = 1.0;
+    surface.background_opacity_force_opaque = false;
+    surface.size_limit = .{ .min_width = 0, .min_height = 0, .max_width = 0, .max_height = 0 };
+    return surface;
+}
+
+test "win32 a window opened from a minimized one starts on screen at its restored size" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWNOACTIVATE);
+            var restored: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(source.hwnd.?, &restored) != 0);
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(source.hwnd.?) != 0);
+
+            try clone.inheritWindowStateFrom(&source);
+
+            // The iconic rect is near (-32000, -32000); what the source
+            // restores to is its normal rect.
+            try std.testing.expect(sys.IsIconic(clone.hwnd.?) == 0);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+            try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
+            try std.testing.expectEqual(restored.bottom - restored.top, rect.bottom - rect.top);
+            // One cascade step down and right, so it does not cover the
+            // source's restored place.
+            const dx = rect.left - restored.left;
+            const dy = rect.top - restored.top;
+            try std.testing.expect(dx > 0 and dx <= 96);
+            try std.testing.expect(dy > 0 and dy <= 96);
+        }
+    }.body);
+}
+
+test "win32 a new window cascades from its source, stays on its monitor and follows its state" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            const source_hwnd = source.hwnd.?;
+            const clone_hwnd = clone.hwnd.?;
+            _ = sys.ShowWindow(source_hwnd, c.SW_SHOWNOACTIVATE);
+            var restored: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(source_hwnd, &restored) != 0);
+            const step = sys.MulDiv(32, @intCast(sys.GetDpiForWindow(source_hwnd)), 96);
+
+            // A normal source: one step down and right, same size.
+            try clone.inheritWindowStateFrom(&source);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
+            try std.testing.expectEqual(restored.left + step, rect.left);
+            try std.testing.expectEqual(restored.top + step, rect.top);
+            try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
+            try std.testing.expectEqual(restored.bottom - restored.top, rect.bottom - rect.top);
+
+            // At the corner of its monitor there is no room to step: the new
+            // window stays on the monitor, at the same size.
+            const monitor = sys.MonitorFromWindow(source_hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+            const info = monitorInfo(monitor) orelse return lastError();
+            try std.testing.expect(sys.SetWindowPos(source_hwnd, null, info.work_area.right - 640, info.work_area.bottom - 480, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
+            try std.testing.expect(rect.left >= info.work_area.left and rect.right <= info.work_area.right);
+            try std.testing.expect(rect.top >= info.work_area.top and rect.bottom <= info.work_area.bottom);
+            try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
+            try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
+
+            // `window-position-x/y` still says where it goes; only the size
+            // comes from the source.
+            try std.testing.expect(sys.SetWindowPos(source_hwnd, null, 80, 90, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            try std.testing.expect(sys.SetWindowPos(clone_hwnd, null, 300, 310, 400, 300, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            app.config.@"window-position-x" = 300;
+            app.config.@"window-position-y" = 310;
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
+            try std.testing.expectEqual(@as(i32, 300), rect.left);
+            try std.testing.expectEqual(@as(i32, 310), rect.top);
+            try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
+            try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
+            app.config.@"window-position-x" = null;
+            app.config.@"window-position-y" = null;
+
+            // A source minimized from maximized restores to maximized, so
+            // the new window is maximized, with the source's normal rect.
+            var normal_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            normal_placement.length = @sizeOf(WINDOWPLACEMENT);
+            try std.testing.expect(sys.GetWindowPlacement(source_hwnd, &normal_placement) != 0);
+            _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+            _ = sys.ShowWindow(source_hwnd, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(source_hwnd) != 0);
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.IsIconic(clone_hwnd) == 0);
+            try std.testing.expect(sys.IsZoomed(clone_hwnd) != 0);
+            var clone_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            clone_placement.length = @sizeOf(WINDOWPLACEMENT);
+            try std.testing.expect(sys.GetWindowPlacement(clone_hwnd, &clone_placement) != 0);
+            try std.testing.expectEqualDeep(normal_placement.rcNormalPosition, clone_placement.rcNormalPosition);
+        }
+    }.body);
+}
+
+test "win32 a host opened from a minimized host starts on screen" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            const core = try CoreApp.create(std.testing.allocator);
+            defer core.destroy();
+            var app: App = undefined;
+            try app.init(core, .{ .safe_mode = true });
+            const hinstance = app.hinstance;
+            defer {
+                app.terminate();
+                _ = sys.UnregisterClassW(host_class_name, hinstance);
+                _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+                _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+            }
+            const title = std.unicode.utf8ToUtf16LeStringLiteral("");
+            const source = try app.createHost(title, null, false);
+            const hwnd = source.hwnd.?;
+            try std.testing.expect(sys.SetWindowPos(hwnd, null, 60, 70, 700, 500, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            var restored: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(hwnd, &restored) != 0);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(hwnd) != 0);
+
+            // `createHost` gives the new host the source's place before
+            // anything is shown.
+            const clone = try app.createHost(title, null, false);
+            try app.inheritHostWindowState(clone, source);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+            try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
+            try std.testing.expectEqual(restored.bottom - restored.top, rect.bottom - rect.top);
+            try std.testing.expect(rect.left > restored.left and rect.left <= restored.left + 96);
+            try std.testing.expect(rect.top > restored.top and rect.top <= restored.top + 96);
+        }
+    }.body);
+}
+
+test "win32 new_window does not copy state from a quick terminal" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var quick_host: Host = undefined;
+    var host: Host = undefined;
+    var quick_surface: Surface = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        // The quick terminal comes first, so it is what the app target
+        // resolves to.
+        .hosts = &.{
+            .{ .storage = &quick_host, .id = 1, .register = true, .next_tab_id = 2 },
+            .{ .storage = &host, .id = 2, .register = true, .next_tab_id = 2 },
+        },
+        .surfaces = &.{
+            .{ .storage = &quick_surface, .host = &quick_host, .register = true },
+            .{ .storage = &surface, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &quick_host, .surface = &quick_surface, .id = 1 },
+            .{ .host = &host, .surface = &surface, .id = 1 },
+        },
+    });
+    defer session.deinit();
+    quick_host.quick_terminal = true;
+
+    const Hook = struct {
+        var calls: usize = 0;
+        var clone_state_from: ?*const Surface = null;
+
+        fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+            calls += 1;
+            clone_state_from = opts.clone_state_from;
+            return error.TestWindowCreateFailed;
+        }
+    };
+    app.test_create_window_surface = &Hook.createSurface;
+
+    // The quick terminal is a floating strip pinned to a screen edge: a
+    // window copied from it would be topmost and sit on that strip. A new
+    // window opened from it follows an ordinary one.
+    Hook.calls = 0;
+    _ = app.performAction(.app, .new_window, .{}) catch {};
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls);
+    try std.testing.expect(Hook.clone_state_from == &surface);
+
+    // With no ordinary window it is an ordinary new window.
+    _ = app.hosts.orderedRemove(1);
+    _ = app.performAction(.app, .new_window, .{}) catch {};
+    try std.testing.expectEqual(@as(usize, 2), Hook.calls);
+    try std.testing.expect(Hook.clone_state_from == null);
+
+    // An ordinary window is what a new one copies.
+    app.hosts.clearRetainingCapacity();
+    try app.hosts.append(std.testing.allocator, &host);
+    _ = app.performAction(.app, .new_window, .{}) catch {};
+    try std.testing.expectEqual(@as(usize, 3), Hook.calls);
+    try std.testing.expect(Hook.clone_state_from == &surface);
+}
+
+test "win32 a new window is not maximized by a restore-to-maximized flag left on a normal window" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            const hwnd = source.hwnd.?;
+
+            // Maximize, minimize, restore (back to maximized), restore again.
+            // Windows keeps WPF_RESTORETOMAXIMIZED in the placement of the
+            // normal window this leaves.
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expect(sys.IsZoomed(hwnd) == 0 and sys.IsIconic(hwnd) == 0);
+
+            try clone.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.IsZoomed(clone.hwnd.?) == 0);
+
+            // Another tab of the same window syncing its state does not
+            // maximize the window either.
+            var twin = source;
+            try twin.inheritWindowStateFrom(&source);
+            try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+        }
+    }.body);
+}
+
+test "win32 a new window from a fullscreen window covers the same monitor" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            const monitor = sys.MonitorFromWindow(source.hwnd.?, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+            const full = (monitorInfo(monitor) orelse return lastError()).full_rect;
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWNOACTIVATE);
+            source.fullscreen = true;
+            try std.testing.expect(sys.SetWindowPos(source.hwnd.?, null, full.left, full.top, full.width(), full.height(), c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+
+            // Not stepped down and fitted to the work area, which would show
+            // the taskbar under a window that is meant to be fullscreen, and
+            // not moved by `window-position-x/y`.
+            for ([_]bool{ false, true }) |configured| {
+                if (configured) {
+                    app.config.@"window-position-x" = 300;
+                    app.config.@"window-position-y" = 310;
+                }
+                try std.testing.expect(sys.SetWindowPos(clone.hwnd.?, null, 700, 300, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+                try clone.inheritWindowStateFrom(&source);
+                try std.testing.expect(clone.fullscreen);
+                var rect: RECT = undefined;
+                try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+                try std.testing.expectEqualDeep(RECT{ .left = full.left, .top = full.top, .right = full.right, .bottom = full.bottom }, rect);
+            }
+
+            // Minimized, the source's own rect is a sliver under the
+            // taskbar; the monitor is still where it is fullscreen.
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(source.hwnd.?) != 0);
+            try clone.inheritWindowStateFrom(&source);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+            try std.testing.expectEqualDeep(RECT{ .left = full.left, .top = full.top, .right = full.right, .bottom = full.bottom }, rect);
+        }
+    }.body);
+}
+
+test "win32 new windows from one source step past the windows already there" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            defer app.hosts.deinit(std.testing.allocator);
+            var source = try placementTestSurface(&app, 50, 50);
+            defer _ = sys.DestroyWindow(source.hwnd.?);
+            var clone = try placementTestSurface(&app, 700, 300);
+            defer _ = sys.DestroyWindow(clone.hwnd.?);
+            _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWNOACTIVATE);
+            var origin: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(source.hwnd.?, &origin) != 0);
+            const step = sys.MulDiv(32, @intCast(sys.GetDpiForWindow(source.hwnd.?)), 96);
+
+            // Every forwarded launch is opened from the same first window.
+            // The next one goes where the last one is not.
+            var rect: RECT = undefined;
+            for ([_]i32{ 1, 2, 3 }) |n| {
+                try clone.inheritWindowStateFrom(&source);
+                try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
+                try std.testing.expectEqual(origin.left + n * step, rect.left);
+                try std.testing.expectEqual(origin.top + n * step, rect.top);
+                var opened = try placementTestSurface(&app, rect.left, rect.top);
+                _ = sys.ShowWindow(opened.hwnd.?, c.SW_SHOWNOACTIVATE);
+                const host = try std.testing.allocator.create(Host);
+                host.* = .{ .app = &app, .id = @intCast(n), .hwnd = opened.hwnd };
+                try app.hosts.append(std.testing.allocator, host);
+                // Kept until the end of the body: `opened` is a copy of the
+                // window handle, destroyed with the loop's other windows.
+                _ = &opened;
+            }
+            for (app.hosts.items) |host| {
+                _ = sys.DestroyWindow(host.hwnd.?);
+                std.testing.allocator.destroy(host);
+            }
+            app.hosts.clearRetainingCapacity();
+        }
+    }.body);
 }
 
 test "win32 shouldShowSurfaceImmediately only for new hosts" {
@@ -48945,40 +51233,54 @@ test "win32 session scrollback restore refuses panes it cannot restore safely" {
     }
 }
 
-test "win32 session save skips quick terminal tabs" {
+test "win32 session save skips every tab of the quick terminal host" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var app: App = undefined;
     app.hosts = .empty;
     defer app.hosts.deinit(std.testing.allocator);
 
-    var host: Host = .{
+    var quick_host: Host = .{
         .app = &app,
         .id = 1,
+        .quick_terminal = true,
+    };
+    var host: Host = .{
+        .app = &app,
+        .id = 2,
     };
     defer {
+        for (quick_host.tabs.items) |*tab| tab.deinit();
+        quick_host.tabs.deinit(std.testing.allocator);
         for (host.tabs.items) |*tab| tab.deinit();
         host.tabs.deinit(std.testing.allocator);
     }
 
-    var surface: Surface = undefined;
-    surface.quick_terminal = true;
-    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 1, &surface));
-    try app.hosts.append(std.testing.allocator, &host);
+    // Two tabs in the quick terminal, neither the one it was created with:
+    // what is left once that first pane closes.
+    var first: Surface = undefined;
+    var second: Surface = undefined;
+    try quick_host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 1, &first));
+    try quick_host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &second));
+    try app.hosts.append(std.testing.allocator, &quick_host);
 
     const state = try app.buildSessionState(std.testing.allocator, 0);
     defer std.testing.allocator.free(state.windows);
     try std.testing.expectEqual(@as(usize, 0), state.windows.len);
-    try std.testing.expect(App.hostContainsQuickTerminal(&host));
+    try std.testing.expectEqual(@as(usize, 0), App.hostSessionTabs(&quick_host).len);
+    var no_budget: usize = 0;
+    try std.testing.expectError(
+        error.EmptyTabs,
+        App.buildSessionWindow(std.testing.allocator, &quick_host, .layout, 0, &no_budget),
+    );
 
     var normal_surface: Surface = undefined;
-    normal_surface.quick_terminal = false;
     normal_surface.pwd = null;
     normal_surface.launch_profile_key = null;
     normal_surface.title_override = null;
     normal_surface.tab_title_override = null;
-    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &normal_surface));
-    host.active_tab = 1;
+    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 3, &normal_surface));
+    try app.hosts.append(std.testing.allocator, &host);
 
     const mixed_state = try app.buildSessionState(std.testing.allocator, 0);
     defer {
@@ -49010,7 +51312,6 @@ test "security regression win32 session save drops one hostile pane field" {
     }
 
     var surface: Surface = undefined;
-    surface.quick_terminal = false;
     surface.launched_ssh = false;
     surface.pwd = "C:\\src\\noctty";
     surface.launch_profile_key = "pwsh";
@@ -49174,6 +51475,74 @@ test "win32 recovery startup leaves another instance's in-flight write temp alon
     const survivor = try std.fs.cwd().readFileAlloc(std.testing.allocator, in_flight, 64 * 1024);
     defer std.testing.allocator.free(survivor);
     try std.testing.expectEqualStrings(in_flight_json, survivor);
+}
+
+test "win32 recovery startup keeps a newer build's history and counts one with an added field" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
+    defer std.testing.allocator.free(target);
+
+    // Three unfinished launches, each with a field this build has never heard of.
+    const added_field =
+        \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"build":"9"},{"started_at_unix_ms":200,"build":"9"},{"started_at_unix_ms":300,"build":"9"}]}
+    ;
+    try win32_session_persistence.writeFileInPlace(target, added_field);
+    const counted = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.safe_mode, counted.decision);
+    try std.testing.expectEqual(@as(usize, 4), counted.count);
+
+    // A newer schema is read as empty and left byte for byte as it was.
+    const newer =
+        \\{"schema_version":2,"attempts":[{"started_at_unix_ms":100,"phase":"init","where":"x"}],"hist":{}}
+    ;
+    try win32_session_persistence.writeFileInPlace(target, newer);
+    const skipped = beginRecoveryStartupAtPath(std.testing.allocator, target, 500, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.normal, skipped.decision);
+    try std.testing.expectEqual(@as(usize, 0), skipped.count);
+    const after = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(newer, after);
+
+    // Nor is one larger than this build ever writes, whatever it says.
+    {
+        const file = try tmp.dir.createFile("startup-attempts.json", .{});
+        defer file.close();
+        try file.writeAll("{\"schema_version\":3,\"pad\":\"");
+        const chunk = [_]u8{'x'} ** 4096;
+        for (0..17) |_| try file.writeAll(&chunk);
+        try file.writeAll("\"}");
+    }
+    const big_before = try tmp.dir.statFile("startup-attempts.json");
+    const big = beginRecoveryStartupAtPath(std.testing.allocator, target, 600, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(@as(usize, 0), big.count);
+    const big_after = try tmp.dir.statFile("startup-attempts.json");
+    try std.testing.expectEqual(big_before.size, big_after.size);
+
+    // Nor is one that exists but cannot be read: a scanner holds it, and it may
+    // be a newer build's.
+    {
+        const file = try tmp.dir.createFile("startup-attempts.json", .{});
+        defer file.close();
+        try file.writeAll(newer);
+    }
+    {
+        const held = try tmp.dir.openFile("startup-attempts.json", .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close();
+        const blocked = beginRecoveryStartupAtPath(std.testing.allocator, target, 700, recovery_ledger_lock_wait_ms);
+        try std.testing.expectEqual(@as(usize, 0), blocked.count);
+    }
+    const unblocked = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
+    defer std.testing.allocator.free(unblocked);
+    try std.testing.expectEqualStrings(newer, unblocked);
+
+    var names = tmp.dir.iterate();
+    while (try names.next()) |entry| {
+        try std.testing.expect(std.mem.eql(u8, entry.name, "startup-attempts.json") or
+            std.mem.endsWith(u8, entry.name, ".lock"));
+    }
 }
 
 test "win32 recovery ledger lock excludes a second holder until released" {
@@ -49623,6 +51992,77 @@ test "win32 session state is saved only by the process that owns it" {
     try std.testing.expect(app.sessionStateEnabled());
 }
 
+test "win32 a session a newer build wrote, or one too large to be ours, is left alone and never owned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(state_path);
+
+    var core_app: CoreApp = undefined;
+    core_app.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.session_owner = null;
+    app.session_state_left_alone = false;
+
+    // A field a later build added within this version loads.
+    const added = "{\"schema_version\":1,\"added_later\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = added });
+    var loaded = (try app.loadSessionStateAt(state_path)).?;
+    loaded.deinit();
+    try std.testing.expect(!app.session_state_left_alone);
+
+    // A newer schema is neither restored, quarantined nor owned.
+    const newer = "{\"schema_version\":2,\"windows\":[{\"layout_v2\":true}]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = newer });
+    try std.testing.expect((try app.loadSessionStateAt(state_path)) == null);
+    try std.testing.expect(app.session_state_left_alone);
+    const lock = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    app.adoptSessionOwner(lock);
+    try std.testing.expect(app.session_owner == null);
+    const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 1024);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings(newer, kept);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json.corrupt", .{}));
+    // The lock was given back, so the build that wrote the file can take it.
+    const next = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    next.release();
+
+    // A file that cannot be read now is not replaced either: it may be a
+    // newer build's, held for a moment.
+    app.session_state_left_alone = false;
+    try tmp.dir.makeDir("session-state.d");
+    const unreadable = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.d" });
+    defer std.testing.allocator.free(unreadable);
+    try std.testing.expect(std.meta.isError(app.loadSessionStateAt(unreadable)));
+    try std.testing.expect(app.session_state_left_alone);
+
+    // So is a file larger than this build ever writes.
+    app.session_state_left_alone = false;
+    {
+        var file = try tmp.dir.createFile("session-state.json", .{});
+        defer file.close();
+        const chunk = [_]u8{' '} ** 4096;
+        var remaining: usize = win32_session_persistence.default_max_state_bytes + 1;
+        while (remaining > 0) {
+            const count = @min(remaining, chunk.len);
+            try file.writeAll(chunk[0..count]);
+            remaining -= count;
+        }
+    }
+    try std.testing.expect((try app.loadSessionStateAt(state_path)) == null);
+    try std.testing.expect(app.session_state_left_alone);
+
+    // Otherwise the process owns what it restored.
+    app.session_state_left_alone = false;
+    const mine = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    app.adoptSessionOwner(mine);
+    try std.testing.expect(app.session_owner != null);
+    app.releaseSessionOwnership();
+}
+
 test "win32 sign-out latches the session snapshot and a Restart Manager close does not" {
     var app: App = undefined;
     app.session_state_excluded_for_elevation = false;
@@ -49732,6 +52172,213 @@ test "win32 session state window rect requires complete geometry" {
     try std.testing.expectEqual(@as(i32, 20), rect.top);
     try std.testing.expectEqual(@as(i32, 310), rect.right);
     try std.testing.expectEqual(@as(i32, 220), rect.bottom);
+}
+
+test "win32 a saved window rect on a monitor that is gone moves to the nearest work area" {
+    const grab = restore_grab;
+    // A laptop's screen with a second monitor to its left, taskbar at the bottom.
+    const left: RECT = .{ .left = -1920, .top = 0, .right = 0, .bottom = 1040 };
+    const main_work: RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
+    const works = [_]RECT{ main_work, left };
+    const wide: RECT = .{ .left = 100, .top = 100, .right = 900, .bottom = 700 };
+
+    // Where there is a monitor, the rect is kept as saved.
+    try std.testing.expectEqualDeep(wide, restoredRectOnScreen(wide, &works, grab));
+    const straddling: RECT = .{ .left = -400, .top = 50, .right = 400, .bottom = 650 };
+    try std.testing.expectEqualDeep(straddling, restoredRectOnScreen(straddling, &works, grab));
+    // A snapped window overhangs its monitor by its invisible frame.
+    const snapped: RECT = .{ .left = -7, .top = 0, .right = 967, .bottom = 1047 };
+    try std.testing.expectEqualDeep(snapped, restoredRectOnScreen(snapped, &works, grab));
+    // The caption on a monitor and the body hanging off the bottom stays too.
+    const hanging: RECT = .{ .left = 100, .top = 900, .right = 900, .bottom = 1500 };
+    try std.testing.expectEqualDeep(hanging, restoredRectOnScreen(hanging, &works, grab));
+
+    // Saved on a monitor to the right that was unplugged.
+    const unplugged: RECT = .{ .left = 2100, .top = 200, .right = 2900, .bottom = 800 };
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 1120, .top = 200, .right = 1920, .bottom = 800 },
+        restoredRectOnScreen(unplugged, &works, grab),
+    );
+    // Below every monitor, and above them.
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 100, .top = 440, .right = 900, .bottom = 1040 },
+        restoredRectOnScreen(.{ .left = 100, .top = 3000, .right = 900, .bottom = 3600 }, &works, grab),
+    );
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 100, .top = 0, .right = 900, .bottom = 600 },
+        restoredRectOnScreen(.{ .left = 100, .top = -900, .right = 900, .bottom = -300 }, &works, grab),
+    );
+    // Only a sliver of the title bar on a monitor is not enough to grab.
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 1120, .top = 100, .right = 1920, .bottom = 700 },
+        restoredRectOnScreen(.{ .left = 1900, .top = 100, .right = 2700, .bottom = 700 }, &works, grab),
+    );
+    // The nearest is the monitor to the left when that is where it was.
+    try std.testing.expectEqualDeep(
+        RECT{ .left = -1920, .top = 100, .right = -1120, .bottom = 700 },
+        restoredRectOnScreen(.{ .left = -4000, .top = 100, .right = -3200, .bottom = 700 }, &works, grab),
+    );
+    // Larger than the monitor it lands on: capped to it.
+    try std.testing.expectEqualDeep(
+        left,
+        restoredRectOnScreen(.{ .left = -9000, .top = -50, .right = -4000, .bottom = 3000 }, &works, grab),
+    );
+    // No monitor list, no opinion.
+    try std.testing.expectEqualDeep(unplugged, restoredRectOnScreen(unplugged, &.{}, grab));
+
+    // The file can say anything an i32 holds, and a window cannot be that far
+    // away: no differences of these overflow.
+    const min: i32 = std.math.minInt(i32);
+    const max: i32 = std.math.maxInt(i32);
+    try std.testing.expectEqualDeep(
+        RECT{ .left = -1920, .top = 100, .right = -1120, .bottom = 700 },
+        restoredRectOnScreen(.{ .left = min, .top = 100, .right = min + 800, .bottom = 700 }, &works, grab),
+    );
+    try std.testing.expectEqualDeep(
+        RECT{ .left = 1120, .top = 440, .right = 1920, .bottom = 1040 },
+        restoredRectOnScreen(.{ .left = max - 800, .top = max - 600, .right = max, .bottom = max }, &works, grab),
+    );
+    try std.testing.expectEqualDeep(
+        main_work,
+        restoredRectOnScreen(.{ .left = min, .top = min, .right = -1, .bottom = -1 }, &.{main_work}, grab),
+    );
+}
+
+test "win32 session placement saves the normal rect in screen coordinates for every window state" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            const surface = try placementTestSurface(&app, 120, 140);
+            defer _ = sys.DestroyWindow(surface.hwnd.?);
+            const hwnd = surface.hwnd.?;
+            var host: Host = .{ .app = &app, .id = 1, .hwnd = hwnd };
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            var normal: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(hwnd, &normal) != 0);
+
+            var placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(!placed.maximized);
+
+            // Maximized, the rect is still the one to un-maximize to.
+            _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+            placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(placed.maximized);
+
+            // With a taskbar on the left, Windows reports that normal rect
+            // relative to the work area, which starts 48 px in: the file
+            // gets screen coordinates.
+            const left_taskbar: MONITORINFO = .{
+                .cbSize = @sizeOf(MONITORINFO),
+                .rcMonitor = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 },
+                .rcWork = .{ .left = 48, .top = 0, .right = 1920, .bottom = 1080 },
+                .dwFlags = 0,
+            };
+            placed = App.sessionWindowPlacementOn(&host, left_taskbar).?;
+            try std.testing.expectEqual(normal.left + 48, placed.rect.?.left);
+            try std.testing.expectEqual(normal.top, placed.rect.?.top);
+            try std.testing.expectEqual(normal.right - normal.left, placed.rect.?.right - placed.rect.?.left);
+
+            // Minimized from maximized, it comes back maximized, which is
+            // what the session has to say. `IsZoomed` alone said normal.
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            try std.testing.expect(sys.IsIconic(hwnd) != 0);
+            placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(placed.maximized);
+
+            // Minimized from a normal window, it comes back normal, even
+            // though Windows left the restore-to-maximized flag on it.
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expect(sys.IsZoomed(hwnd) == 0 and sys.IsIconic(hwnd) == 0);
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+            placed = App.sessionWindowPlacement(&host).?;
+            try std.testing.expectEqualDeep(normal, placed.rect.?);
+            try std.testing.expect(!placed.maximized);
+        }
+    }.body);
+}
+
+test "win32 session restore keeps a window on a monitor and brings one back from a missing monitor" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var app: App = undefined;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.config = .{};
+            app.hosts = .empty;
+            const surface = try placementTestSurface(&app, 120, 140);
+            defer _ = sys.DestroyWindow(surface.hwnd.?);
+            const hwnd = surface.hwnd.?;
+            var host: Host = .{ .app = &app, .id = 1, .hwnd = hwnd };
+            _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+            const works = WorkAreas.collect();
+            try std.testing.expect(works.count > 0);
+            const work = works.slice()[0];
+
+            // On screen: exactly where it was saved.
+            var window: win32_session_state.Window = .{
+                .x = work.left + 40,
+                .y = work.top + 50,
+                .width = 640,
+                .height = 480,
+                .state = .normal,
+                .selected_tab = 0,
+                .tabs = &.{},
+            };
+            try App.applyRestoredWindowPlacement(&host, window);
+            var rect: RECT = undefined;
+            try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+            try std.testing.expectEqualDeep(RECT{ .left = work.left + 40, .top = work.top + 50, .right = work.left + 680, .bottom = work.top + 530 }, rect);
+
+            // Saved where no monitor is: on one, at the size it had.
+            window.x = 30_000;
+            window.y = 30_000;
+            try App.applyRestoredWindowPlacement(&host, window);
+            try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+            try std.testing.expect(insideAWorkArea(rect, works.slice()));
+            try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
+            try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
+
+            // Windows caps what it is given: a left edge to 16 bits, a width to
+            // the largest window. This rect spans every monitor as saved, and
+            // is off all of them once Windows is done with it.
+            window.state = .normal;
+            window.x = -2_000_000_000;
+            window.y = work.top + 50;
+            window.width = 2_100_000_000;
+            window.height = 480;
+            try App.applyRestoredWindowPlacement(&host, window);
+            try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+            try std.testing.expect(rectEqual(restoredRectOnScreen(rect, works.slice(), restore_grab), rect));
+            try std.testing.expect(rect.right - rect.left <= work.right - work.left);
+
+            // The rect a maximized window comes back to is on a monitor too.
+            window.x = -30_000;
+            window.y = -30_000;
+            window.state = .maximized;
+            try App.applyRestoredWindowPlacement(&host, window);
+            try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+            const normal = App.sessionWindowPlacement(&host).?.rect.?;
+            try std.testing.expect(insideAWorkArea(normal, works.slice()));
+        }
+
+        fn insideAWorkArea(rect: RECT, works: []const RECT) bool {
+            for (works) |work| {
+                if (rect.left >= work.left and rect.top >= work.top and
+                    rect.right <= work.right and rect.bottom <= work.bottom) return true;
+            }
+            return false;
+        }
+    }.body);
 }
 
 test "win32 session state file write replaces through temp file" {
@@ -50732,7 +53379,7 @@ test "win32 DPI catches up on minimized restore and quick terminal show" {
     surface.syncOcclusion();
     try std.testing.expectEqual(@as(f32, 1.5), surface.content_scale.x);
 
-    surface.quick_terminal = true;
+    host.quick_terminal = true;
     surface.setVisible(false);
     host.surfaces_visible = false;
     host.current_dpi = 96;

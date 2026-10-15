@@ -59,6 +59,8 @@ pub const SW_FORCEMINIMIZE = 11;
 pub const SW_RESTORE = 9;
 pub const SW_MAXIMIZE = 3;
 pub const SW_HIDE = 0;
+/// `WINDOWPLACEMENT.flags`: a minimized window restores to maximized.
+pub const WPF_RESTORETOMAXIMIZED = 0x0002;
 const WM_APP = 0x8000;
 pub const WM_ACTIVATE = 0x0006;
 pub const WA_INACTIVE = 0;
@@ -169,6 +171,9 @@ pub const WM_WINHOSTTY_UIA_CAPTION_SYNC = WM_APP + 10;
 pub const WM_WINHOSTTY_SESSION_CHECKPOINT = WM_APP + 11;
 /// Quit from the message loop (see `App.postQuit`).
 pub const WM_WINHOSTTY_QUIT = WM_APP + 12;
+pub const WM_WINHOSTTY_CONSOLE_VISIBILITY = WM_APP + 13;
+/// A profile discovery that ran off the UI thread finished (`App.startProfileDiscovery`).
+pub const WM_WINHOSTTY_PROFILES = WM_APP + 14;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;
@@ -440,6 +445,7 @@ pub const VK_OEM_MINUS = 0xBD;
 pub const VK_OEM_PERIOD = 0xBE;
 pub const VK_OEM_2 = 0xBF;
 pub const VK_OEM_3 = 0xC0;
+pub const VK_ABNT_C1 = 0xC1;
 pub const VK_OEM_4 = 0xDB;
 pub const VK_OEM_5 = 0xDC;
 pub const VK_OEM_6 = 0xDD;

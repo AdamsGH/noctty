@@ -34,7 +34,7 @@ pub fn apply(state: *model.ShellState, intent: Intent) ReduceError!Reduction {
         .create_tab => |id| try createTab(state, &reduction, id),
         .close_tab => |id| try closeTab(state, &reduction, id),
         .detach_tab => |id| try detachTab(state, &reduction, id),
-        .restore_tab => |restore| try restoreTab(state, &reduction, restore.tab, restore.index),
+        .restore_tab => |restore| try restoreTab(state, &reduction, restore.tab, restore.index, restore.activate),
         .discard_detached_tab => |id| try discardDetachedTab(state, &reduction, id),
         .reorder_tab => |reorder| try reorderTab(state, &reduction, reorder.tab, reorder.index),
         .split_pane => |split| try splitPane(state, &reduction, split.pane, split.direction, split.ratio),
@@ -534,6 +534,7 @@ fn restoreTab(
     out: *Reduction,
     tab_id: model.TabId,
     index: usize,
+    activate: bool,
 ) !void {
     const tab = state.tab(tab_id) orelse return error.StaleId;
     const window = retainingWindowForTab(state, tab_id) orelse return error.StaleId;
@@ -545,10 +546,11 @@ fn restoreTab(
 
     _ = window.retained_tabs.orderedRemove(retained_index);
     window.tabs.insertAssumeCapacity(index, tab_id);
-    window.active_tab = tab_id;
-    state.focused_window = window.id;
-
-    out.effects.appendAssumeCapacity(.{ .focus_surface = tab.focused_pane });
+    if (activate or window.active_tab == null) {
+        window.active_tab = tab_id;
+        state.focused_window = window.id;
+        out.effects.appendAssumeCapacity(.{ .focus_surface = tab.focused_pane });
+    }
     out.effects.appendAssumeCapacity(.{ .relayout_window = window.id });
     out.effects.appendAssumeCapacity(.persist_session);
 }

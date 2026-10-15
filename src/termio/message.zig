@@ -73,6 +73,11 @@ pub const Message = union(enum) {
     /// The surface gained or lost focus.
     focused: bool,
 
+    /// The hosting window is shown/restored or hidden/minimized. This keeps
+    /// an adopted OpenConsole pseudo HWND synchronized; it is not tab or
+    /// renderer occlusion, and has no effect on ordinary spawned sessions.
+    pty_visibility: bool,
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 
