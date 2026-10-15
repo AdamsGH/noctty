@@ -86,6 +86,7 @@ const gdi = @import("win32/gdi.zig");
 const c = @import("win32/consts.zig");
 const sys = @import("win32/sys.zig");
 const app_delivery = @import("win32/app_delivery.zig");
+const save_target = @import("win32/save_target.zig");
 const focus_region = @import("win32/focus_region.zig");
 const first_frame = @import("win32/first_frame.zig");
 
@@ -3113,6 +3114,66 @@ fn settingsEditedValueMasked(
     return pending.changed(reloaded, comptime key);
 }
 
+/// Whether the file now says something else, for a setting the draft changes,
+/// than both the value this session started from (`original`) and the draft:
+/// someone else changed what the user is changing. A file that agrees with the
+/// draft lost nothing, and one that agrees with `original` holds only the
+/// user's own edit to come.
+///
+/// `original` is a clone of the app's config, which has the app's conditional
+/// state applied (a dark system picks the dark half of a `light:A,dark:B`
+/// theme, and that theme can set editable keys), so the file is judged with
+/// the same state applied. Raw, an untouched file would differ from
+/// `original` for those keys and every Save would stop.
+fn settingsDiskEditConflict(
+    original: *const configpkg.Config,
+    pending: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    state: configpkg.ConditionalState,
+    user_edited: SettingsEditedKeySet,
+) bool {
+    var applied: ?configpkg.Config = disk.changeConditionalState(state) catch |err| blk: {
+        log.warn("settings save: could not apply the conditional state to the config file err={}", .{err});
+        break :blk null;
+    };
+    defer if (applied) |*config| config.deinit();
+    const effective: *const configpkg.Config = if (applied) |*config| config else disk;
+    inline for (win32_settings.editable_keys) |key| {
+        if (user_edited.isSet(@intFromEnum(key)) and
+            settingsDiskValueDiffers(original, effective, key) and
+            settingsDiskValueDiffers(pending, effective, key)) return true;
+    }
+    return false;
+}
+
+/// `Config.load` takes a default config file it cannot open (held without read
+/// sharing, access denied, an offline share) for an absent one and loads the
+/// defaults. Judged as an edit and applied, that would drop the user's own
+/// settings from every terminal, so a target that exists but will not open
+/// stops the check, and the save with it. A file that is missing is a first
+/// save, and there is nothing on disk to conflict with.
+fn settingsTargetOpenable(path: []const u8) win32_settings.SaveError!void {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            log.warn("settings save: could not open the config file to check it for edits path={s} err={}", .{ path, err });
+            return error.ReloadFailed;
+        },
+    };
+    file.close();
+}
+
+fn settingsDiskValueDiffers(
+    known: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    comptime key: SettingsConfigKey,
+) bool {
+    // The window keeps a command nobody set as automatic (null); the load
+    // fills in the one it found.
+    if (key == .command and disk._command_defaulted and known.command == null) return false;
+    return known.changed(disk, key);
+}
+
 test "win32 bounded UTF-8 prefix never splits a codepoint" {
     const value = "123\u{1f680}tail";
     try std.testing.expectEqual(@as(usize, 3), utf8PrefixLen(value, 4));
@@ -3811,7 +3872,7 @@ pub const App = struct {
     /// Persisted taskbar destinations and their debounced shell COM commit.
     /// `null` when the app-state path cannot be resolved or initialized.
     jump_list: ?win32_jump_list.JumpList = null,
-    /// Absolute path supplied via `--config-file <path>` on the CLI.
+    /// Absolute path supplied via `--config-file=<path>` on the CLI.
     /// Resolved ONCE against the startup cwd during `App.init` — that's
     /// important because `run()` later calls `sanitizeCurrentDirectory()`,
     /// which can reset cwd to `%USERPROFILE%`. If we resolved the
@@ -4055,6 +4116,7 @@ pub const App = struct {
             .configRevision = &settingsConfigRevisionThunk,
             .previewField = &settingsPreviewFieldThunk,
             .notifyConflict = &settingsNotifyConflictThunk,
+            .reconcileDisk = &settingsReconcileDiskThunk,
             .notifySuccess = &settingsNotifySuccessThunk,
             .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
             .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
@@ -10885,11 +10947,12 @@ pub const App = struct {
         };
     }
 
-    /// Serialise `pending` into a temp file adjacent to the target,
-    /// then atomic-rename via `ReplaceFileW` (falls back to
-    /// `MoveFileExW` when the target is new). Finally re-load the
-    /// config from disk and push it through `CoreApp.updateConfig`
-    /// so every surface picks up the change on its next repaint.
+    /// Patch the edited settings into the target file (`persistSettings`:
+    /// a temp file beside the real file, then an atomic replace via
+    /// `ReplaceFileW`, with `MoveFileExW` when the target is new). Finally
+    /// re-load the config from disk and push it through
+    /// `CoreApp.updateConfig` so every surface picks up the change on its
+    /// next repaint.
     ///
     /// Returns on error; caller (settings window) is responsible for
     /// surfacing the failure. `pending` is borrowed, not consumed —
@@ -10898,7 +10961,7 @@ pub const App = struct {
         const alloc = self.core_app.alloc;
 
         // Target file selection:
-        //   1. If the process was started with `--config-file <path>`
+        //   1. If the process was started with `--config-file=<path>`
         //      on the CLI, write to THAT file. Writing to the default
         //      `ghostty.conf` when the user explicitly specified a
         //      custom config would either edit the wrong file or let
@@ -10906,22 +10969,8 @@ pub const App = struct {
         //   2. Otherwise, fall back to the per-user default path
         //      (`config_edit.openPath`), which also handles the
         //      first-run "create the file" case.
-        const target_path = blk: {
-            // Use the startup-time resolved override — never call
-            // `cliConfigFileOverride` from here, because cwd may have
-            // been reset by `sanitizeCurrentDirectory` and a relative
-            // CLI path would resolve to the wrong absolute file.
-            if (self.cli_config_override_path) |cli_path| break :blk try alloc.dupe(u8, cli_path);
-            break :blk config_edit.openPath(alloc) catch return error.PathResolveFailed;
-        };
+        const target_path = try self.settingsTargetPath(alloc);
         defer alloc.free(target_path);
-
-        const tmp_path = try std.fmt.allocPrint(
-            alloc,
-            "{s}.tmp-{x}-{x}",
-            .{ target_path, sys.GetCurrentProcessId(), unixMillis() },
-        );
-        defer alloc.free(tmp_path);
 
         // Diff pending against `original` (the snapshot from when
         // the settings window opened), NOT against the live
@@ -10947,138 +10996,12 @@ pub const App = struct {
         // mtime bump.
         if (user_edited.count() == 0) return;
 
-        // SURGICAL SAVE: read the raw target file text and patch
-        // only GUI-edited field lines in place. This preserves
-        // (a) comments, (b) relative `config-file` paths (not
-        // canonicalised), (c) the user's formatting / blank lines,
-        // (d) fields we can't round-trip through the Config type
-        // (RepeatableString, etc).
-        //
-        // For each GUI-edited field: scan the raw text for a line
-        // matching `^<key> =` at column 0 (PLUS optional leading
-        // whitespace) and replace the WHOLE line with the new
-        // serialised `key = value` emission. If no matching line
-        // exists, append to the file end.
-        //
-        // Edited fields that are not already present are appended by
-        // `patchOrAppendEdits` below. No parsed-file baseline is needed:
-        // unedited source lines remain byte-for-byte intact.
-        const raw_before: []u8 = blk: {
-            const f = std.fs.cwd().openFile(target_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :blk try alloc.dupe(u8, ""),
-                else => return error.SerializeFailed,
-            };
-            defer f.close();
-            const stat = f.stat() catch return error.SerializeFailed;
-            const slice = alloc.alloc(u8, settingsFileSize(stat.size) catch return error.SerializeFailed) catch return error.OutOfMemory;
-            errdefer alloc.free(slice);
-            const n = f.readAll(slice) catch return error.SerializeFailed;
-            break :blk try alloc.realloc(slice, n);
-        };
-        defer alloc.free(raw_before);
+        try persistSettings(alloc, target_path, pending, user_edited);
 
-        var patched: std.ArrayListUnmanaged(u8) = .{};
-        defer patched.deinit(alloc);
-        patchOrAppendEdits(
-            alloc,
-            raw_before,
-            pending,
-            user_edited,
-            &patched,
-        ) catch return error.SerializeFailed;
-
-        // Ensure target's parent directory exists. `config_edit.openPath`
-        // creates `%APPDATA%\ghostty\` for the default path, but a user
-        // launched with `--config-file D:\new-dir\custom.conf` could
-        // target a directory that has never been created. Without this
-        // step the first Save against that path would fail here with
-        // `TempCreateFailed`.
-        if (std.fs.path.dirname(target_path)) |parent| {
-            std.fs.cwd().makePath(parent) catch |err| {
-                std.log.warn("settings save: couldn't create parent dir path={s} err={}", .{ parent, err });
-                return error.TempCreateFailed;
-            };
-        }
-
-        // Write to the sibling temp file, close, then rename. Scoped
-        // block so the file is closed BEFORE ReplaceFileW — Windows
-        // blocks the replace while the temp handle is open.
-        var temp_pending = false;
-        defer if (temp_pending) std.fs.cwd().deleteFile(tmp_path) catch {}; // Best-effort temp cleanup.
-        {
-            const tmp = std.fs.cwd().createFile(tmp_path, .{}) catch return error.TempCreateFailed;
-            temp_pending = true;
-            defer tmp.close();
-            var write_buf: [4096]u8 = undefined;
-            var fw = tmp.writer(&write_buf);
-            fw.interface.writeAll(patched.items) catch return error.SerializeFailed;
-            fw.interface.flush() catch return error.SerializeFailed;
-            tmp.sync() catch return error.SerializeFailed;
-        }
-
-        const target_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, target_path) catch return error.OutOfMemory;
-        defer alloc.free(target_w);
-        const tmp_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, tmp_path) catch return error.OutOfMemory;
-        defer alloc.free(tmp_w);
-
-        if (sys.ReplaceFileW(target_w, tmp_w, null, 0, null, null) == 0) {
-            // Likely ERROR_FILE_NOT_FOUND if the user didn't have a
-            // config file yet. Fall back to MoveFileExW.
-            if (sys.MoveFileExW(tmp_w, target_w, c.MOVEFILE_REPLACE_EXISTING) == 0) {
-                std.fs.cwd().deleteFile(tmp_path) catch {}; // Preserve the primary replace failure.
-                return error.ReplaceFailed;
-            }
-        }
-        temp_pending = false;
-
-        // Mirror the `.reload_config` hard-reload path at win32.zig
-        // line ~2106: re-read from disk + push through CoreApp so
-        // every surface's next frame picks up the new values.
-        //
-        // Temporarily restore the startup cwd around `Config.load`.
-        // `loadCliArgs` resolves relative `--config-file` argv entries
-        // via realpath-against-cwd; after `sanitizeCurrentDirectory()`
-        // ran, cwd is typically `%USERPROFILE%`, and a user who
-        // launched with `--config-file custom.conf` would see the
-        // reload pick up `%USERPROFILE%\custom.conf` instead of the
-        // file we just wrote. Save lands correctly, but the live
-        // config would immediately diverge from disk — "my edits
-        // didn't take effect until restart" is exactly this bug.
-        // Capture the current (sanitized) cwd so we can restore it
-        // after the reload. Leaking a cwd change into the rest of
-        // process lifetime would change where other code resolves
-        // relative paths — for example, a subsequent surface spawn
-        // could inherit the wrong working directory.
-        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
-        defer if (cwd_before) |p| alloc.free(p);
-
-        // `defer` (NOT inline restore) for the cwd rollback so BOTH the
-        // happy path AND the `ReloadFailed` error path run it. Earlier
-        // code had `Config.load catch return error.ReloadFailed`
-        // followed by an inline restore; the return short-circuited
-        // the restore, leaving the process pinned to `startup_cwd`
-        // whenever a reload hit a broken config file. Downstream
-        // surface spawns then inherited the wrong cwd until restart.
-        var did_chdir_to_startup: bool = false;
-        if (self.startup_cwd) |cwd| {
-            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
-            if (std.process.changeCurDir(cwd)) |_| {
-                did_chdir_to_startup = true;
-            } else |err| {
-                std.log.warn("settings save: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
-            }
-        }
-        defer {
-            if (did_chdir_to_startup) {
-                if (cwd_before) |cwd| {
-                    std.process.changeCurDir(cwd) catch |err| {
-                        std.log.warn("settings save: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                    };
-                }
-            }
-        }
-
-        var reloaded = configpkg.Config.load(alloc) catch return error.ReloadFailed;
+        // Mirror the `.reload_config` hard-reload path: re-read from disk and
+        // push through CoreApp so every surface's next frame picks up the
+        // new values.
+        var reloaded = self.loadConfigAtStartupCwd() catch return error.ReloadFailed;
         defer reloaded.deinit();
 
         // Post-save validation: detect fields the user GUI-edited
@@ -11105,11 +11028,104 @@ pub const App = struct {
         if (any_masked) return error.SavedButMasked;
     }
 
+    fn settingsTargetPath(self: *App, alloc: Allocator) win32_settings.SaveError![]const u8 {
+        // Use the startup-time resolved override — never call
+        // `cliConfigFileOverride` from here, because cwd may have
+        // been reset by `sanitizeCurrentDirectory` and a relative
+        // CLI path would resolve to the wrong absolute file.
+        if (self.cli_config_override_path) |cli_path| return try alloc.dupe(u8, cli_path);
+        return config_edit.openPath(alloc) catch error.PathResolveFailed;
+    }
+
+    /// `Config.load` as the process started.
+    ///
+    /// `loadCliArgs` resolves relative `--config-file` argv entries
+    /// via realpath-against-cwd; after `sanitizeCurrentDirectory()`
+    /// ran, cwd is typically `%USERPROFILE%`, and a user who
+    /// launched with `--config-file=custom.conf` would see the
+    /// reload pick up `%USERPROFILE%\custom.conf` instead of the
+    /// file we just wrote. Save lands correctly, but the live
+    /// config would immediately diverge from disk — "my edits
+    /// didn't take effect until restart" is exactly this bug.
+    /// The sanitized cwd is put back afterwards: leaking a cwd change
+    /// into the rest of process lifetime would change where other code
+    /// resolves relative paths — for example, a subsequent surface spawn
+    /// could inherit the wrong working directory.
+    ///
+    /// The restore is a `defer` (NOT an inline step after the load) so BOTH
+    /// the happy path AND the error path run it. Earlier code had
+    /// `Config.load catch return ...` followed by an inline restore; the
+    /// return short-circuited the restore, leaving the process pinned to
+    /// `startup_cwd` whenever a reload hit a broken config file.
+    fn loadConfigAtStartupCwd(self: *App) !configpkg.Config {
+        const alloc = self.core_app.alloc;
+        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
+        defer if (cwd_before) |p| alloc.free(p);
+
+        var did_chdir_to_startup: bool = false;
+        if (self.startup_cwd) |cwd| {
+            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
+            if (std.process.changeCurDir(cwd)) |_| {
+                did_chdir_to_startup = true;
+            } else |err| {
+                std.log.warn("config load: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
+            }
+        }
+        defer {
+            if (did_chdir_to_startup) {
+                if (cwd_before) |cwd| {
+                    std.process.changeCurDir(cwd) catch |err| {
+                        std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
+                    };
+                }
+            }
+        }
+
+        return configpkg.Config.load(alloc);
+    }
+
+    /// Before a Settings save: has the config file been edited since the
+    /// window last read it, in a setting that is also being edited there? The
+    /// window only learns of an edit through a reload, so a save without one
+    /// wrote its value over the other: the file's line was replaced and the
+    /// edit was gone with no prompt.
+    ///
+    /// The file is read exactly as a reload reads it, and judged by the
+    /// effective values, which is how the window itself decides what is a
+    /// conflict (`externalConfigChanged`); an edit to an included file counts,
+    /// an edit to another setting does not. When there is one, the file is
+    /// applied as a reload applies it, which hands the window the conflict to
+    /// resolve (Keep mine or Use disk); the window then stops the save. If the
+    /// file cannot be read or applied, nothing is saved either: the save would
+    /// write blind.
+    fn settingsReconcileDisk(
+        self: *App,
+        pending: *const configpkg.Config,
+        original: *const configpkg.Config,
+    ) win32_settings.SaveError!void {
+        const user_edited = settingsUserEditedKeys(original, pending);
+        if (user_edited.count() == 0) return;
+        const target_path = try self.settingsTargetPath(self.core_app.alloc);
+        defer self.core_app.alloc.free(target_path);
+        try settingsTargetOpenable(target_path);
+        var disk = self.loadConfigAtStartupCwd() catch |err| {
+            log.warn("settings save: could not read the config file to check it for edits err={}", .{err});
+            return error.ReloadFailed;
+        };
+        defer disk.deinit();
+        if (!settingsDiskEditConflict(original, pending, &disk, self.core_app.config_conditional_state, user_edited)) return;
+        log.info("settings save: the config file changed on disk under an edited setting; offering the choice", .{});
+        self.core_app.updateConfig(self, &disk) catch |err| {
+            log.warn("settings save: applying the changed config file failed err={}", .{err});
+            return error.ReloadFailed;
+        };
+    }
+
     /// The legacy `ShellExecuteW` path. Kept alive for Advanced pane
     /// consumption and for users running `open_config` on CI / headless
     /// runs where the settings window is unreachable.
     fn openConfigInEditor(self: *App) !void {
-        // If the process was launched with `--config-file <path>`,
+        // If the process was launched with `--config-file=<path>`,
         // that file is the one we Save to from the Settings UI and
         // the one that masks the per-user default on reload. Opening
         // the per-user default from the escape-hatch would let the
@@ -25668,6 +25684,14 @@ fn settingsNotifyConflictThunk(ctx: *anyopaque, field: win32_settings.SettingFie
     const app: *App = @ptrCast(@alignCast(ctx));
     app.settings_window.promptConflict(field);
 }
+fn settingsReconcileDiskThunk(
+    ctx: *anyopaque,
+    pending: *const configpkg.Config,
+    original: *const configpkg.Config,
+) win32_settings.SaveError!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.settingsReconcileDisk(pending, original);
+}
 fn settingsSaveAndReloadThunk(
     ctx: *anyopaque,
     pending: *const configpkg.Config,
@@ -26381,31 +26405,38 @@ fn cliConfigFileOverride(alloc: std.mem.Allocator) !?[]u8 {
 
 fn cliConfigFileOverrideArgs(alloc: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
     const key = "--config-file";
-    // Pick the LAST `--config-file` occurrence, not the first:
-    // `Config.loadRecursiveFiles` applies files in argv order and
-    // later files override earlier ones. Saving into the first
-    // file when a second exists would be the wrong layer — the
-    // saved value would be masked on reload.
-    var last_path: ?[]const u8 = null;
-    var i: usize = 1; // skip argv[0]
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
-        // Config.parseManuallyHook consumes everything after -e as child argv.
-        if (std.mem.eql(u8, arg, "-e")) break;
-        if (std.mem.eql(u8, arg, key)) {
-            if (i + 1 < argv.len) {
-                last_path = argv[i + 1];
-                i += 1; // skip the path arg so we don't match it as a key
-            }
+    // Take the files exactly as the loader does: its own list type reads
+    // each value, so the optional marker, quotes, an empty value that clears
+    // the list and a bare key that has no value all mean what they mean to
+    // `Config.loadCliArgs`. A separate parser disagreed with it: `--config-file
+    // x` (a spelling the loader rejects) made Save write a file the loader
+    // never reads, and `--config-file=?x` named a file called `?x`.
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var files: configpkg.RepeatablePath = .{};
+    for (argv[@min(1, argv.len)..]) |arg| {
+        // Config.parseManuallyHook consumes everything after -e as child argv,
+        // and stops at the COM activation switch.
+        if (std.mem.eql(u8, arg, "-e") or std.ascii.eqlIgnoreCase(arg, "-Embedding")) break;
+        const value: ?[]const u8 = if (std.mem.eql(u8, arg, key))
+            null
+        else if (std.mem.startsWith(u8, arg, key ++ "="))
+            arg[key.len + 1 ..]
+        else
             continue;
-        }
-        if (std.mem.startsWith(u8, arg, key ++ "=")) {
-            last_path = arg[key.len + 1 ..];
-            continue;
-        }
+        files.parseCLI(arena.allocator(), value) catch |err| switch (err) {
+            error.ValueRequired => {},
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
-    if (last_path) |p| return try absolutizePath(alloc, p);
-    return null;
+    // The LAST file, not the first: `Config.loadRecursiveFiles` applies files
+    // in argv order and later files override earlier ones. Saving into the
+    // first file when a second exists would be the wrong layer — the saved
+    // value would be masked on reload.
+    const last = files.value.getLastOrNull() orelse return null;
+    return try absolutizePath(alloc, switch (last) {
+        .optional, .required => |name| name,
+    });
 }
 
 /// Resolve a possibly-relative path to an absolute one WITHOUT
@@ -26450,6 +26481,87 @@ fn appendSettingsPayload(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         start = i + 1;
     }
     try out.appendSlice(alloc, payload[start..]);
+}
+
+/// UTF-8 patching cannot edit UTF-16 or UTF-32 text: appending ASCII lines to
+/// it leaves a file that mixes encodings, of which the loader reads only the
+/// appended lines. A byte-order mark, or a NUL byte anywhere (UTF-16 and UTF-32
+/// without one), marks such a file; a config never contains NUL.
+fn settingsTextPatchable(raw: []const u8) bool {
+    if (std.mem.startsWith(u8, raw, "\xff\xfe") or std.mem.startsWith(u8, raw, "\xfe\xff")) return false;
+    return std.mem.indexOfScalar(u8, raw, 0) == null;
+}
+
+/// Write the settings the user edited into the config file behind
+/// `config_path`: read it, patch only the edited assignments, and put the
+/// result back where the file lives (see `save_target`).
+fn persistSettings(
+    alloc: Allocator,
+    config_path: []const u8,
+    pending: *const configpkg.Config,
+    user_edited: SettingsEditedKeySet,
+) win32_settings.SaveError!void {
+    // A config kept behind a link is edited where it lives, so the link
+    // survives and a dotfiles repository sees the change. A dangling link is
+    // refused: there is no file to patch, and writing would replace the link.
+    const target = try save_target.resolve(alloc, config_path);
+    defer target.deinit(alloc);
+
+    // SURGICAL SAVE: read the raw target file text and patch
+    // only GUI-edited field lines in place. This preserves
+    // (a) comments, (b) relative `config-file` paths (not
+    // canonicalised), (c) the user's formatting / blank lines,
+    // (d) fields we can't round-trip through the Config type
+    // (RepeatableString, etc).
+    //
+    // For each GUI-edited field: scan the raw text for a line
+    // matching `^<key> =` at column 0 (PLUS optional leading
+    // whitespace) and replace the WHOLE line with the new
+    // serialised `key = value` emission. If no matching line
+    // exists, append to the file end.
+    //
+    // Edited fields that are not already present are appended by
+    // `patchOrAppendEdits` below. No parsed-file baseline is needed:
+    // unedited source lines remain byte-for-byte intact.
+    const raw_before: []u8 = blk: {
+        const f = std.fs.cwd().openFile(target.path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk try alloc.dupe(u8, ""),
+            else => return error.SerializeFailed,
+        };
+        defer f.close();
+        const stat = f.stat() catch return error.SerializeFailed;
+        const slice = alloc.alloc(u8, settingsFileSize(stat.size) catch return error.SerializeFailed) catch return error.OutOfMemory;
+        errdefer alloc.free(slice);
+        const n = f.readAll(slice) catch return error.SerializeFailed;
+        break :blk try alloc.realloc(slice, n);
+    };
+    defer alloc.free(raw_before);
+    if (!settingsTextPatchable(raw_before)) return error.UnsupportedEncoding;
+
+    var patched: std.ArrayListUnmanaged(u8) = .{};
+    defer patched.deinit(alloc);
+    patchOrAppendEdits(
+        alloc,
+        raw_before,
+        pending,
+        user_edited,
+        &patched,
+    ) catch return error.SerializeFailed;
+
+    // Ensure target's parent directory exists. `config_edit.openPath`
+    // creates `%APPDATA%\ghostty\` for the default path, but a user
+    // launched with `--config-file=D:\new-dir\custom.conf` could
+    // target a directory that has never been created. Without this
+    // step the first Save against that path would fail here with
+    // `TempCreateFailed`.
+    if (std.fs.path.dirname(target.path)) |parent| {
+        std.fs.cwd().makePath(parent) catch |err| {
+            std.log.warn("settings save: couldn't create parent dir path={s} err={}", .{ parent, err });
+            return error.TempCreateFailed;
+        };
+    }
+
+    try save_target.write(alloc, target, patched.items);
 }
 
 /// Patch only edited assignments. Scalars keep last-wins semantics; repeatable
@@ -26548,14 +26660,205 @@ test "win32 settings automatic command is not masked by default resolution" {
     try std.testing.expect(settingsEditedValueMasked(&pending, &reloaded, .command));
 }
 
+test "win32 settings disk edit is a conflict only for an edited setting the file now says differently" {
+    const alloc = std.testing.allocator;
+    const light: configpkg.ConditionalState = .{};
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"font-size" = 14;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.@"font-size")));
+    var disk = try original.clone(alloc);
+    defer disk.deinit();
+
+    // The file is as the session found it: only the user's edit is new.
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // Someone set the same setting to something else.
+    disk.@"font-size" = 16;
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // ... unless it is the value the user is setting: nothing would be lost.
+    disk.@"font-size" = 14;
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // An edit to a setting the user is not changing is merged by the save and
+    // applied by its reload, not a conflict.
+    disk.@"font-size" = 12;
+    disk.@"copy-on-select" = .true;
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // Nothing edited, nothing to lose.
+    try std.testing.expect(!settingsDiskEditConflict(&original, &original, &disk, light, settingsUserEditedKeys(&original, &original)));
+}
+
+test "win32 settings disk edit judges the file with the app's conditional state applied" {
+    // On a dark system the app holds the dark half of `theme = light:A,dark:B`,
+    // and a theme can set editable keys. The file as loaded has the light half,
+    // so an untouched file differed from the window's snapshot, and every Save
+    // stopped at a conflict that could never be resolved.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "light.theme", .data = "cursor-style = underline\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dark.theme", .data = "cursor-style = block_hollow\n" });
+    const light_path = try tmp.dir.realpathAlloc(alloc, "light.theme");
+    defer alloc.free(light_path);
+    const dark_path = try tmp.dir.realpathAlloc(alloc, "dark.theme");
+    defer alloc.free(dark_path);
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\n", .{ light_path, dark_path });
+    defer alloc.free(text);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = text });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var disk = try configpkg.Config.default(alloc);
+    defer disk.deinit();
+    try disk.loadFile(alloc, path);
+    try disk.finalize();
+    const dark: configpkg.ConditionalState = .{ .theme = .dark };
+    var app_config = (try disk.changeConditionalState(dark)).?;
+    defer app_config.deinit();
+    try std.testing.expect(disk.@"cursor-style" != app_config.@"cursor-style");
+
+    // The window's snapshots are the app's config.
+    var original = try app_config.clone(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"cursor-style" = .bar;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.@"cursor-style")));
+
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, dark, edited));
+
+    // A real edit under the same state is still found: the file now sets the
+    // key itself, over the theme.
+    const edited_text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\ncursor-style = block\n", .{ light_path, dark_path });
+    defer alloc.free(edited_text);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = edited_text });
+    var changed = try configpkg.Config.default(alloc);
+    defer changed.deinit();
+    try changed.loadFile(alloc, path);
+    try changed.finalize();
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &changed, dark, edited));
+}
+
+test "win32 settings disk edit does not mistake the resolved default command for an edit" {
+    const alloc = std.testing.allocator;
+    const light: configpkg.ConditionalState = .{};
+    // The window keeps a command nobody set as automatic (null); the load
+    // fills in the shell it found.
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.command = .{ .shell = "pwsh" };
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.command)));
+
+    var resolved = try original.clone(alloc);
+    defer resolved.deinit();
+    try resolved.resolveWindowsDefaultCommand();
+    try std.testing.expect(resolved.command != null and resolved._command_defaulted);
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &resolved, light, edited));
+
+    // A command written in the file is another matter.
+    var written = try original.clone(alloc);
+    defer written.deinit();
+    written.command = .{ .shell = "cmd" };
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &written, light, edited));
+}
+
+test "win32 settings disk check stops at a config file it cannot open, not at a missing one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(missing);
+    const missing_path = try std.fs.path.join(std.testing.allocator, &.{ missing, "config.ghostty" });
+    defer std.testing.allocator.free(missing_path);
+
+    // A first save: nothing on disk to conflict with.
+    try settingsTargetOpenable(missing_path);
+
+    // The file exists and reads.
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 14\n" });
+    try settingsTargetOpenable(missing_path);
+
+    // Another program holds it with no sharing (std's `.lock` is a byte-range
+    // lock on Windows and does not stop an open): the load would call it
+    // absent, so the check refuses instead.
+    const wide = try std.os.windows.sliceToPrefixedFileW(null, missing_path);
+    const held = std.os.windows.kernel32.CreateFileW(
+        wide.span().ptr,
+        std.os.windows.GENERIC_READ,
+        0,
+        null,
+        std.os.windows.OPEN_EXISTING,
+        0,
+        null,
+    );
+    if (held == std.os.windows.INVALID_HANDLE_VALUE) return error.CouldNotHoldFile;
+    defer std.os.windows.CloseHandle(held);
+    try std.testing.expectError(error.ReloadFailed, settingsTargetOpenable(missing_path));
+}
+
 test "win32 settings save target stops at the child command boundary" {
     const alloc = std.testing.allocator;
-    const target = (try cliConfigFileOverrideArgs(alloc, &.{ "noctty", "--config-file=first.conf", "--config-file", "last.conf", "-e", "tool", "--config-file=tool.conf" })).?;
+    const target = (try cliConfigFileOverrideArgs(alloc, &.{ "noctty", "--config-file=first.conf", "--config-file=last.conf", "-e", "tool", "--config-file=tool.conf" })).?;
     defer alloc.free(target);
     const expected = try absolutizePath(alloc, "last.conf");
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, target);
     try std.testing.expectEqual(@as(?[]u8, null), try cliConfigFileOverrideArgs(alloc, &.{ "noctty", "-e", "tool", "--config-file=tool.conf" }));
+}
+
+test "win32 settings save target is the last config file the loader takes from the command line" {
+    // Whatever the loader reads from argv, Save writes to the same last file:
+    // a file the loader never reads, or one it reads before a later one, shows
+    // the saved value masked on the next reload. Ask the loader itself.
+    const alloc = std.testing.allocator;
+    const cases = [_][]const []const u8{
+        &.{ "noctty", "--config-file=first.conf", "--config-file=last.conf" },
+        &.{ "noctty", "--config-file=first.conf", "-e", "tool", "--config-file=tool.conf" },
+        // Not an option the loader understands: it reads no value and rejects
+        // "last.conf", so no file is loaded.
+        &.{ "noctty", "--config-file", "last.conf" },
+        &.{ "noctty", "--config-file=a.conf", "--config-file" },
+        // An empty value clears the list, a value that is only a marker or
+        // quotes is ignored, and the optional marker and quotes are not part
+        // of the name.
+        &.{ "noctty", "--config-file=a.conf", "--config-file=" },
+        &.{ "noctty", "--config-file=a.conf", "--config-file=?", "--config-file=\"\"" },
+        &.{ "noctty", "--config-file=?optional.conf" },
+        &.{ "noctty", "--config-file=\"two words.conf\"" },
+        &.{ "noctty", "--config-file=?\"two words.conf\"" },
+        // A bare "--" ends nothing for the loader.
+        &.{ "noctty", "--config-file=a.conf", "--", "--config-file=b.conf" },
+        // The COM activation switch ends the options, in any case.
+        &.{ "noctty", "--config-file=a.conf", "-Embedding", "--config-file=b.conf" },
+        &.{ "noctty", "--config-file=a.conf", "-embedding", "--config-file=b.conf" },
+        // Keys are case sensitive and exact.
+        &.{ "noctty", "--CONFIG-FILE=a.conf", "--config-file-extra=b.conf" },
+    };
+    for (cases) |argv| {
+        var loaded = try configpkg.Config.default(alloc);
+        defer loaded.deinit();
+        var it = cli_args.sliceIterator(argv[1..]);
+        try loaded.loadIter(alloc, &it);
+        const last = loaded.@"config-file".value.getLastOrNull();
+        const expected: ?[]u8 = if (last) |path| try absolutizePath(alloc, switch (path) {
+            .optional, .required => |name| name,
+        }) else null;
+        defer if (expected) |name| alloc.free(name);
+
+        const actual = try cliConfigFileOverrideArgs(alloc, argv);
+        defer if (actual) |name| alloc.free(name);
+        if (expected) |name| {
+            try std.testing.expect(actual != null);
+            try std.testing.expectEqualStrings(name, actual.?);
+        } else {
+            try std.testing.expect(actual == null);
+        }
+    }
 }
 
 fn settingsTestLoadText(config: *configpkg.Config, text: []const u8) !void {
@@ -26604,6 +26907,127 @@ test "win32 settings patch preserves CRLF including multiline and appended edits
     defer out.deinit(alloc);
     try patchOrAppendEdits(alloc, "# keep\r\nfont-size = 12\r\ncopy-on-select = false", &pending, edited, &out);
     try std.testing.expectEqualStrings("# keep\r\nfont-size = 13.25\r\ncopy-on-select = false\r\nfont-family = \r\nfont-family = A\r\nfont-family = B\r\n", out.items);
+}
+
+/// A draft that turns `copy-on-select` on, and the set naming it as the edit.
+fn settingsTestCopyOnSelectEdit(alloc: Allocator) !struct { pending: configpkg.Config, edited: SettingsEditedKeySet } {
+    var pending = try configpkg.Config.default(alloc);
+    pending.@"copy-on-select" = .true;
+    var edited: SettingsEditedKeySet = .initEmpty();
+    edited.set(@intFromEnum(SettingsConfigKey.@"copy-on-select"));
+    return .{ .pending = pending, .edited = edited };
+}
+
+test "win32 settings save follows a symbolic link and keeps it" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.makeDir("dotfiles");
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "dotfiles/config.ghostty", .data = "# kept\ncopy-on-select = false\n" });
+    try scratch.symlink("config.ghostty", "dotfiles\\config.ghostty");
+    const link = try scratch.path("config.ghostty");
+    defer alloc.free(link);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, link, &draft.pending, draft.edited);
+    // The edit landed in the file the link points at, the link is still a
+    // link, and it reads the new bytes.
+    try scratch.expectContent("dotfiles/config.ghostty", "# kept\ncopy-on-select = true\n");
+    try std.testing.expect(try scratch.isLink("config.ghostty"));
+    try scratch.expectContent("config.ghostty", "# kept\ncopy-on-select = true\n");
+}
+
+test "win32 settings save refuses a dangling link and leaves it alone" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    try scratch.symlink("config.ghostty", "gone\\config.ghostty");
+    const link = try scratch.path("config.ghostty");
+    defer alloc.free(link);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try std.testing.expectError(error.DanglingLink, persistSettings(alloc, link, &draft.pending, draft.edited));
+    try std.testing.expect(try scratch.isLink("config.ghostty"));
+    try scratch.expectNames(&.{"config.ghostty"});
+}
+
+test "win32 settings save keeps hard links together" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "copy-on-select = false\n" });
+    try scratch.hardlink("dotfile", "config.ghostty");
+    const path = try scratch.path("config.ghostty");
+    defer alloc.free(path);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, path, &draft.pending, draft.edited);
+    try scratch.expectContent("config.ghostty", "copy-on-select = true\n");
+    try scratch.expectContent("dotfile", "copy-on-select = true\n");
+    try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
+}
+
+test "win32 settings first save creates the file and its folder" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    const path = try scratch.path("new-dir\\custom.conf");
+    defer alloc.free(path);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, path, &draft.pending, draft.edited);
+    try scratch.expectContent("new-dir/custom.conf", "copy-on-select = true\n");
+}
+
+test "win32 settings save refuses UTF-16 text and leaves the file as it was" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+    const path = try scratch.path("config.ghostty");
+    defer alloc.free(path);
+
+    // What Windows PowerShell 5.1 writes for `'copy-on-select = false' > file`
+    // (UTF-16LE with a byte order mark and CRLF), the same text big-endian,
+    // a bare byte order mark, and UTF-16 and UTF-32 without one.
+    const refused = [_][]const u8{
+        "\xff\xfec\x00o\x00p\x00y\x00-\x00o\x00n\x00-\x00s\x00e\x00l\x00e\x00c\x00t\x00 \x00=\x00 \x00f\x00a\x00l\x00s\x00e\x00\r\x00\n\x00",
+        "\xfe\xff\x00c\x00o\x00p\x00y\x00-\x00o\x00n\x00-\x00s\x00e\x00l\x00e\x00c\x00t\x00 \x00=\x00 \x00f\x00a\x00l\x00s\x00e\x00\r\x00\n",
+        "\xff\xfe",
+        "\xfe\xff",
+        "c\x00o\x00p\x00y\x00-\x00o\x00n\x00",
+        "\xff\xfe\x00\x00c\x00\x00\x00",
+        "\x00\x00\xfe\xff\x00\x00\x00c",
+    };
+    for (refused) |bytes| {
+        try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = bytes });
+        try std.testing.expectError(error.UnsupportedEncoding, persistSettings(alloc, path, &draft.pending, draft.edited));
+        try scratch.expectContent("config.ghostty", bytes);
+        try scratch.expectNames(&.{"config.ghostty"});
+    }
+
+    // Text in an ASCII-compatible encoding is patched line by line, so a UTF-8
+    // byte order mark and a legacy code page (byte 0xE9 is an accented "e")
+    // survive the save.
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "\xef\xbb\xbf# caf\xe9\ncopy-on-select = false\n" });
+    try persistSettings(alloc, path, &draft.pending, draft.edited);
+    try scratch.expectContent("config.ghostty", "\xef\xbb\xbf# caf\xe9\ncopy-on-select = true\n");
+}
+
+test "win32 settings text is patchable unless a UTF-16 or UTF-32 marker or NUL says it is not" {
+    try std.testing.expect(settingsTextPatchable(""));
+    try std.testing.expect(settingsTextPatchable("font-size = 14\n"));
+    try std.testing.expect(settingsTextPatchable("\xef\xbb\xbffont-size = 14\n"));
+    try std.testing.expect(settingsTextPatchable("# caf\xe9\n"));
+    try std.testing.expect(!settingsTextPatchable("\xff\xfe"));
+    try std.testing.expect(!settingsTextPatchable("\xfe\xff"));
+    try std.testing.expect(!settingsTextPatchable("a\x00"));
+    try std.testing.expect(!settingsTextPatchable("\x00a"));
 }
 
 test "win32 settings clone does not edit include or shader paths" {
@@ -37197,6 +37621,7 @@ const TestSession = struct {
                 .configRevision = &settingsConfigRevisionThunk,
                 .previewField = &settingsPreviewFieldThunk,
                 .notifyConflict = &settingsNotifyConflictThunk,
+                .reconcileDisk = &settingsReconcileDiskThunk,
                 .notifySuccess = &settingsNotifySuccessThunk,
                 .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
                 .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
