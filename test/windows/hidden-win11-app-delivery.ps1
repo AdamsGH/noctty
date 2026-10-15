@@ -378,6 +378,9 @@ try {
     Assert-Check 'caption menu exits after cancellation' $closed $closed
     Assert-Check 'window close request posted' ([AppDeliverySmoke]::PostMessageW($hostWindow,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)) $true
     Assert-Check 'runtime exits after last window closes' ([AppDeliverySmoke]::WaitForSingleObject($runtime.process,10000) -eq 0) $runtime.pid
+    [uint32]$runtimeCode=1
+    if(-not[AppDeliverySmoke]::GetExitCodeProcess($runtime.process,[ref]$runtimeCode)){throw 'Runtime exit inspection failed.'}
+    Assert-Check 'runtime shutdown exits successfully' ($runtimeCode -eq 0) $runtimeCode
     Assert-Check 'terminal host destroyed' (-not[AppDeliverySmoke]::IsWindow($hostWindow)) $hostWindow.ToInt64()
 } catch {
     $checks.Add(@{Name='Harness execution';Passed=$false;Error=$_.Exception.Message})
