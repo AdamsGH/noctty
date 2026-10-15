@@ -3014,6 +3014,9 @@ const ProfileDiscoveryCompletion = struct {
     result: anyerror!windows_shell.ProfileDiscovery = error.NotStarted,
     /// `App.profiles_generation` when the discovery started.
     generation: u64,
+    /// `App.profile_discovery_attempt` of the worker that ran it, 0 for the
+    /// synchronous path.
+    attempt: u64 = 0,
 
     /// Frees the arena, and with it a completion that lives in it.
     fn deinit(self: *ProfileDiscoveryCompletion) void {
@@ -4254,6 +4257,9 @@ pub const App = struct {
     /// another attempt: nothing else re-arms the jump list's timer when a
     /// worker hangs or cannot deliver.
     profile_discovery_watchdog_id: ?UINT_PTR = null,
+    /// Numbers each worker, so a late result from an abandoned one leaves the
+    /// running state and watchdog of the attempt that replaced it alone.
+    profile_discovery_attempt: u64 = 0,
     message_hwnd: ?HWND = null,
     core_ticking: bool = false,
     quit_timer_id: ?UINT_PTR = null,
@@ -7057,11 +7063,13 @@ pub const App = struct {
             log.warn("profile discovery worker unfinished after {d} ms; starting another", .{profile_discovery_abandon_ms});
         }
         self.profile_discovery_started_ms = now_ms;
+        self.profile_discovery_attempt +%= 1;
         delivery.retain();
         const thread = std.Thread.spawn(.{}, profileDiscoveryThreadMain, .{
             delivery,
             self.config.@"ssh-config-hosts",
             self.profiles_generation,
+            self.profile_discovery_attempt,
         }) catch |err| {
             delivery.release();
             delivery.profiles_running.store(false, .release);
@@ -7085,8 +7093,10 @@ pub const App = struct {
         const pending = self.pending_profile_discovery orelse return;
         self.pending_profile_discovery = null;
         defer pending.deinit();
-        if (self.delivery) |delivery| delivery.profiles_running.store(false, .release);
-        self.stopProfileDiscoveryWatchdog();
+        if (pending.attempt == self.profile_discovery_attempt) {
+            if (self.delivery) |delivery| delivery.profiles_running.store(false, .release);
+            self.stopProfileDiscoveryWatchdog();
+        }
         self.handleProfileDiscovery(pending);
     }
 
@@ -12823,7 +12833,7 @@ fn automationHostFocused(
 /// the delivery channel and allocates from the page allocator, so it may
 /// outlive the App; a result nobody takes is freed by the channel. When it
 /// cannot deliver, the App's watchdog timer starts another attempt.
-fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, generation: u64) void {
+fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, generation: u64, attempt: u64) void {
     defer delivery.release();
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     const completion = arena.allocator().create(ProfileDiscoveryCompletion) catch {
@@ -12832,7 +12842,7 @@ fn profileDiscoveryThreadMain(delivery: *AppDelivery, include_ssh_hosts: bool, g
         delivery.profiles_running.store(false, .release);
         return;
     };
-    completion.* = .{ .arena = arena, .generation = generation };
+    completion.* = .{ .arena = arena, .generation = generation, .attempt = attempt };
     completion.result = windows_shell.discoverProfiles(completion.arena.allocator(), include_ssh_hosts);
     var payload: AppDeliveryPayload = .{ .profiles = completion };
     if (!delivery.post(c.WM_WINHOSTTY_PROFILES, payload)) {
