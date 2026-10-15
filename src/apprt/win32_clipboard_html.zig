@@ -231,3 +231,38 @@ test "headerOffset treats any html tag as a fallback body boundary" {
     try std.testing.expectEqual(@as(?usize, 17), headerOffset(raw, "StartFragment"));
     try std.testing.expect(headerOffset(raw, "EndFragment") == null);
 }
+
+test "copied terminal text keeps only web and mail links as anchors" {
+    const alloc = std.testing.allocator;
+    const terminal = @import("../terminal/main.zig");
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]8;;javascript:alert(1)\x1b\\evil\x1b]8;;\x1b\\ ");
+    stream.nextSlice("\x1b]8;;file://attacker/share/x\x1b\\unc\x1b]8;;\x1b\\ ");
+    stream.nextSlice("\x1b]8;;https://example.com\x1b\\good\x1b]8;;\x1b\\");
+
+    // The same formatter the mixed copy runs, then the CF_HTML envelope the
+    // clipboard gets, with no clipboard involved.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var formatter: terminal.formatter.ScreenFormatter = .init(
+        t.screens.active,
+        .{ .emit = .html },
+    );
+    try formatter.format(&aw.writer);
+
+    const out = try wrapFragment(alloc, aw.writer.buffered());
+    defer alloc.free(out);
+    const range = fragmentRange(out).?;
+    const fragment = out[range.start..range.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "evil unc ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<a href=\"https://example.com\">good</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "javascript:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "file://") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fragment, "<a "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fragment, "</a>"));
+}

@@ -44770,12 +44770,21 @@ test "win32 terminal undo snapshot restores terminal state" {
     stream.nextSlice("line1\r\nline2\r\nline3");
 
     const expected_scrollbar = t.screens.active.pages.scrollbar();
+    const expected_x = t.screens.active.cursor.x;
+    const expected_y = t.screens.active.cursor.y;
+    // After "line3" the cursor is at column 5, short of the last tab stop.
+    try std.testing.expectEqual(@as(@TypeOf(expected_x), 5), expected_x);
     const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
     defer alloc.free(snapshot);
 
     t.fullReset();
 
     const restored = restoreTerminalUndoState(&t, snapshot);
+
+    // The snapshot sets the tab stops after the cursor position, which used
+    // to leave the cursor on the last stop (column 8 of 12).
+    try std.testing.expectEqual(expected_x, t.screens.active.cursor.x);
+    try std.testing.expectEqual(expected_y, t.screens.active.cursor.y);
 
     const plain = try t.plainString(alloc);
     defer alloc.free(plain);
