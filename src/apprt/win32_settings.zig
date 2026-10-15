@@ -717,11 +717,6 @@ pub fn previewEffect(field: SettingField) PreviewEffect {
 pub const ConflictResolution = SettingsTransaction.Resolution;
 pub const ApplyId = SettingsTransaction.ApplyId;
 
-pub const SaveCompletion = union(enum) {
-    succeeded: u64,
-    failed: SaveError,
-};
-
 fn settingValue(config: *const Config, field: SettingField) SettingValue {
     return switch (field) {
         .scrollback_limit => .{ .scrollback_limit = config.@"scrollback-limit" },
@@ -1257,7 +1252,6 @@ const settings_control_specs = [_]struct { role: SettingsControlRole, name: []co
     .{ .role = .button, .name = "Keep editing" },
 };
 const settings_control_count = settings_control_specs.len;
-const settings_mutable_control_count = 25;
 // Save, conflict resolution, and dirty-close actions remain fixed in the
 // action bar; only the leading content controls are clipped to the viewport.
 const settings_header_control_count = 6;
@@ -1603,16 +1597,6 @@ pub const AppHandle = struct {
     /// Optional. The problems the config load found, as the Advanced page lists
     /// them (`config_problems.Problems.listText`), copied into `buf`.
     configProblems: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
-    /// Optional asynchronous two-phase persistence hook. The receiver must
-    /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
-    /// When absent, `saveAndReload` remains the synchronous compatibility path.
-    requestSave: ?*const fn (
-        ctx: *anyopaque,
-        pending: *const Config,
-        original: *const Config,
-        apply_id: ApplyId,
-        expected_revision: u64,
-    ) void = null,
     /// Fire-and-forget success toast for the app-level in-app stack
     /// (e.g. "Settings saved"). Borrowed title + body — caller must
     /// keep them alive only for the duration of the call; the stack
@@ -1713,7 +1697,6 @@ pub const SettingsWindow = struct {
     theme_applications: u32 = 0,
     close_prompt_measure_width: i32 = -1,
     close_prompt_measure_dpi: u32 = 0,
-    close_prompt_measure_saving: bool = false,
     close_prompt_measure_quitting: bool = false,
     close_prompt_measure_height: i32 = 0,
     edit_scrollback: ?HWND = null,
@@ -1774,7 +1757,6 @@ pub const SettingsWindow = struct {
     transaction_storage: [setting_field_count]SettingsTransaction.Entry = undefined,
     transaction: ?SettingsTransaction = null,
     local_revision: u64 = 1,
-    save_in_flight: bool = false,
     close_prompt_visible: bool = false,
     close_after_save: bool = false,
     close_posted: bool = false,
@@ -1832,11 +1814,8 @@ pub const SettingsWindow = struct {
     }
 
     fn canInitializeCustomUiaProviders(self: *const SettingsWindow) bool {
-        const enabled = if (self.handle.customUiaProvidersEnabled) |probe|
-            probe(self.handle.ctx)
-        else
-            false;
-        return confirmedStaAllowsCustomUiaProviders(enabled);
+        const probe = self.handle.customUiaProvidersEnabled orelse return false;
+        return probe(self.handle.ctx);
     }
 
     fn px(self: *const SettingsWindow, logical: i32) i32 {
@@ -1855,7 +1834,6 @@ pub const SettingsWindow = struct {
         const button_visible = if (self.btn_save) |button| sys.IsWindowVisible(button) != 0 else false;
         if (saveCommandCanDispatch(
             self.close_prompt_visible,
-            self.save_in_flight,
             self.close_posted,
             button_enabled,
             button_visible,
@@ -1978,15 +1956,9 @@ pub const SettingsWindow = struct {
             var effects: [setting_field_count]SettingsTransaction.Effect = undefined;
             if (transaction.dispatch(.revert, &effects)) |emitted| {
                 self.dispatchEffects(emitted);
-            } else |err| switch (err) {
-                // An asynchronous save owns the preview until its completion
-                // callback settles the transaction.
-                error.ApplyAlreadyPending => {},
-                else => std.log.warn("settings: preview rollback failed err={}", .{err}),
-            }
+            } else |err| std.log.warn("settings: preview rollback failed err={}", .{err});
         }
         self.transaction = null;
-        self.save_in_flight = false;
         self.validation_control = null;
         self.owned_validation_control = null;
         self.owned_validation_message = null;
@@ -2079,8 +2051,7 @@ pub const SettingsWindow = struct {
     }
 
     fn updateSaveEnabled(self: *SettingsWindow) void {
-        const enabled = !self.save_in_flight and
-            self.validation_control == null and
+        const enabled = self.validation_control == null and
             !self.hasRawScalarEdits() and
             self.conflictCount() == 0 and
             self.hasPendingChanges();
@@ -2347,84 +2318,6 @@ pub const SettingsWindow = struct {
             .font_family => self.syncFontFamilyFromEdit(),
             .theme => self.syncThemeFromEdit(),
             .command => self.syncCommandFromEdit(),
-        }
-    }
-
-    fn setSaveInFlight(self: *SettingsWindow, in_flight: bool) void {
-        if (in_flight and !self.save_in_flight) self.moveFocusBeforeDisablingMutableControls();
-        self.save_in_flight = in_flight;
-        self.setMutableControlsEnabled(!in_flight);
-        if (self.close_prompt_visible and in_flight) {
-            self.syncClosePromptText(true);
-            layoutChildren(self);
-        }
-        self.updateSaveEnabled();
-    }
-
-    fn mutableControls(self: *const SettingsWindow) [settings_mutable_control_count]?HWND {
-        return .{
-            self.edit_scrollback,
-            self.edit_font_family,
-            self.edit_font_size,
-            self.edit_theme,
-            self.edit_bg_opacity,
-            self.edit_command,
-            self.edit_pad_x,
-            self.edit_pad_y,
-            self.combo_confirm_close,
-            self.combo_copy_on_select,
-            self.combo_window_theme,
-            self.combo_shell_integ,
-            self.chk_trim_trail,
-            self.chk_desktop_notifications,
-            self.chk_app_notify_clipboard,
-            self.chk_app_notify_config,
-            self.combo_clipboard_read,
-            self.combo_clipboard_write,
-            self.combo_link_url,
-            self.combo_link_previews,
-            self.combo_cursor_style,
-            self.chk_bg_blur,
-            self.combo_pad_balance,
-            self.combo_auto_update,
-            self.combo_auto_update_channel,
-        };
-    }
-
-    fn moveFocusBeforeDisablingMutableControls(self: *SettingsWindow) void {
-        const focused = sys.GetFocus() orelse return;
-        var should_move = false;
-        for (self.mutableControls()) |control| {
-            if (control != null and (control.? == focused or sys.IsChild(control.?, focused) != 0)) {
-                should_move = true;
-                break;
-            }
-        }
-        if (!should_move) {
-            for ([_]?HWND{
-                self.btn_save,
-                self.btn_close_save,
-                self.btn_close_discard,
-            }) |control| {
-                if (control != null and control.? == focused) {
-                    should_move = true;
-                    break;
-                }
-            }
-        }
-        if (!should_move) return;
-        const target = if (self.close_prompt_visible)
-            self.btn_close_keep_editing
-        else
-            self.sectionButton(self.active_section);
-        if (target) |hwnd| _ = sys.SetFocus(hwnd);
-    }
-
-    fn setMutableControlsEnabled(self: *SettingsWindow, enabled: bool) void {
-        for (self.mutableControls()) |control| {
-            // The blur box stays disabled whatever the save is doing.
-            if (control == self.chk_bg_blur) continue;
-            if (control) |hwnd| _ = sys.EnableWindow(hwnd, @intFromBool(enabled));
         }
     }
 
@@ -4289,7 +4182,6 @@ pub const SettingsWindow = struct {
         const o = self.original orelse return;
 
         var apply_id: ?ApplyId = null;
-        var expected_revision: u64 = self.currentRevision();
         if (self.transaction) |*transaction| {
             var effects: [setting_field_count + 1]SettingsTransaction.Effect = undefined;
             const emitted = transaction.dispatch(.apply, &effects) catch |err| {
@@ -4298,22 +4190,10 @@ pub const SettingsWindow = struct {
                 return;
             };
             for (emitted) |effect| switch (effect) {
-                .apply_requested => |request| {
-                    apply_id = request.apply_id;
-                    expected_revision = request.expected_current_revision;
-                },
+                .apply_requested => |request| apply_id = request.apply_id,
                 .set_preview, .conflict_detected, .persist_field => {},
             };
         }
-
-        if (apply_id) |id| if (self.handle.requestSave) |request_save| {
-            // Config pointers are borrowed for the callback duration. An
-            // asynchronous implementation must take its own snapshots before
-            // returning, then report completion with this token.
-            self.setSaveInFlight(true);
-            request_save(self.handle.ctx, &p, &o, id, expected_revision);
-            return;
-        };
 
         switch (saveReloadOutcome(self.handle.saveAndReload(self.handle.ctx, &p, &o))) {
             .completed => self.completeSynchronousSave(apply_id, false),
@@ -4349,7 +4229,7 @@ pub const SettingsWindow = struct {
     }
 
     fn updateClosePromptActions(self: *SettingsWindow) void {
-        const actions = closePromptActions(self.close_prompt_visible, self.save_in_flight, self.close_posted);
+        const actions = closePromptActions(self.close_prompt_visible, self.close_posted);
         if (self.btn_close_save) |button| _ = sys.EnableWindow(button, @intFromBool(actions.save));
         if (self.btn_close_discard) |button| _ = sys.EnableWindow(button, @intFromBool(actions.discard));
         if (self.btn_close_keep_editing) |button| {
@@ -4359,7 +4239,7 @@ pub const SettingsWindow = struct {
 
     fn syncClosePromptText(self: *SettingsWindow, announce: bool) void {
         const text = self.text_close_prompt orelse return;
-        setWindowTextUtf8(text, closePromptText(self.save_in_flight, self.quit_after_close));
+        setWindowTextUtf8(text, closePromptText(self.quit_after_close));
         if (announce) {
             sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, text, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
         }
@@ -4371,10 +4251,6 @@ pub const SettingsWindow = struct {
             return;
         }
         self.close_prompt_visible = true;
-        // A close request made while persistence is already in flight still
-        // carries close intent. The prompt remains visible so the user can
-        // keep editing, but successful completion must honor the request.
-        self.close_after_save = self.save_in_flight;
         self.close_prior_focus = sys.GetFocus();
         if (self.text_status) |text| _ = sys.ShowWindow(text, SW_HIDE);
         if (self.btn_conflict_keep) |button| _ = sys.ShowWindow(button, SW_HIDE);
@@ -4448,10 +4324,10 @@ pub const SettingsWindow = struct {
     }
 
     fn saveAndClose(self: *SettingsWindow) void {
-        if (!self.close_prompt_visible or self.save_in_flight or self.close_posted) return;
+        if (!self.close_prompt_visible or self.close_posted) return;
         self.close_after_save = true;
         self.save();
-        if (self.save_in_flight or self.close_posted) {
+        if (self.close_posted) {
             self.updateClosePromptActions();
             return;
         }
@@ -4468,7 +4344,7 @@ pub const SettingsWindow = struct {
     }
 
     fn discardAndClose(self: *SettingsWindow) void {
-        if (!self.close_prompt_visible or self.save_in_flight or self.close_posted) return;
+        if (!self.close_prompt_visible or self.close_posted) return;
         self.close_after_save = false;
         self.postCloseNow();
     }
@@ -4576,27 +4452,6 @@ pub const SettingsWindow = struct {
             if (!self.succeedApply(id, revision)) return;
         }
         self.finishSuccessfulSave(masked);
-    }
-
-    /// Settle an asynchronous request emitted by `requestSave`. Stale or
-    /// duplicate tokens are rejected without discarding the staged draft.
-    pub fn completeSave(self: *SettingsWindow, apply_id: ApplyId, completion: SaveCompletion) void {
-        switch (completion) {
-            .succeeded => |revision| {
-                if (!self.succeedApply(apply_id, revision)) return;
-                self.setSaveInFlight(false);
-                if (self.handle.configRevision == null) self.local_revision = revision;
-                self.finishSuccessfulSave(false);
-            },
-            .failed => |err| {
-                if (!self.failApply(apply_id)) return;
-                self.setSaveInFlight(false);
-                std.log.warn("settings: asynchronous save failed err={}; draft preserved", .{err});
-                self.setNote(.save_failed);
-                self.updateSaveEnabled();
-                if (self.close_after_save) self.cancelClosePrompt();
-            },
-        }
     }
 
     fn adoptCurrentConfig(self: *SettingsWindow) !void {
@@ -5250,29 +5105,11 @@ fn annotateAccessibleControls(self: *SettingsWindow) void {
     };
     defer service.release();
 
-    setAccessibleName(service, self.edit_scrollback, "Scrollback limit");
-    setAccessibleName(service, self.combo_confirm_close, "Close confirmation");
-    setAccessibleName(service, self.combo_copy_on_select, "Copy on select");
-    setAccessibleName(service, self.edit_font_family, "Font family fallbacks");
-    setAccessibleName(service, self.edit_font_size, "Font size");
-    setAccessibleName(service, self.edit_theme, "Terminal theme");
-    setAccessibleName(service, self.edit_bg_opacity, "Background opacity");
-    setAccessibleName(service, self.combo_window_theme, "Window theme");
-    setAccessibleName(service, self.combo_cursor_style, "Cursor style");
-    setAccessibleName(service, self.edit_pad_x, "Window padding X");
-    setAccessibleName(service, self.edit_pad_y, "Window padding Y");
-    setAccessibleName(service, self.combo_pad_balance, "Window padding balance");
-    setAccessibleName(service, self.edit_command, "Default command");
-    setAccessibleName(service, self.combo_shell_integ, "Shell integration");
-    setAccessibleName(service, self.combo_clipboard_read, "OSC 52 clipboard read requests");
-    setAccessibleName(service, self.combo_clipboard_write, "OSC 52 clipboard write requests");
-    setAccessibleName(service, self.combo_link_url, "Clickable URL opening");
-    setAccessibleName(service, self.combo_link_previews, "Link preview popups");
-    setAccessibleName(service, self.combo_auto_update, "Auto-update mode");
-    setAccessibleName(service, self.combo_auto_update_channel, "Auto-update channel");
-    setAccessibleName(service, self.btn_close_save, "Save and close");
-    setAccessibleName(service, self.btn_close_discard, "Discard changes");
-    setAccessibleName(service, self.btn_close_keep_editing, "Keep editing");
+    // The names the custom UIA providers serve, so a client that falls back to
+    // MSAA (`customUiaProvidersEnabled` false) hears the same ones.
+    inline for (settings_control_specs, 0..) |spec, index| {
+        setAccessibleName(service, self.controlHwnd(index), spec.name);
+    }
 }
 
 fn populateCombo(combo_opt: ?HWND, items: []const []const u8) void {
@@ -5710,11 +5547,11 @@ fn closeRequestAction(has_pending: bool, prompt_visible: bool, close_posted: boo
     return .show_prompt;
 }
 
-fn closePromptActions(visible: bool, save_in_flight: bool, close_posted: bool) ClosePromptActions {
+fn closePromptActions(visible: bool, close_posted: bool) ClosePromptActions {
     const can_choose = visible and !close_posted;
     return .{
-        .save = can_choose and !save_in_flight,
-        .discard = can_choose and !save_in_flight,
+        .save = can_choose,
+        .discard = can_choose,
         // The button that owns IDCANCEL stays enabled while it is hidden:
         // `IsDialogMessageW` does not send Escape to a disabled cancel button,
         // and Escape without the prompt is a close request.
@@ -5726,13 +5563,8 @@ fn closePromptCanCancel(visible: bool, close_posted: bool) bool {
     return visible and !close_posted;
 }
 
-fn closePromptText(save_in_flight: bool, quitting: bool) []const u8 {
-    return if (save_in_flight)
-        "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open."
-    else if (quitting)
-        "Save changes before quitting?"
-    else
-        "Save changes before closing?";
+fn closePromptText(quitting: bool) []const u8 {
+    return if (quitting) "Save changes before quitting?" else "Save changes before closing?";
 }
 
 fn pendingCloseReopenAction(close_posted: bool, close_after_save: bool) PendingCloseReopenAction {
@@ -5746,12 +5578,11 @@ fn isSaveShortcut(vk: u32, ctrl: bool, alt: bool, shift: bool) bool {
 
 fn saveCommandCanDispatch(
     prompt_visible: bool,
-    save_in_flight: bool,
     close_posted: bool,
     button_enabled: bool,
     button_visible: bool,
 ) bool {
-    return !prompt_visible and !save_in_flight and !close_posted and button_enabled and button_visible;
+    return !prompt_visible and !close_posted and button_enabled and button_visible;
 }
 
 test "settings dirty close transition is conservative and idempotent" {
@@ -5763,32 +5594,24 @@ test "settings dirty close transition is conservative and idempotent" {
 }
 
 test "settings close prompt uses one display and measurement text source" {
-    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false, false));
-    try std.testing.expectEqualStrings("Save changes before quitting?", closePromptText(false, true));
-    try std.testing.expectEqualStrings(
-        "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open.",
-        closePromptText(true, false),
-    );
+    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false));
+    try std.testing.expectEqualStrings("Save changes before quitting?", closePromptText(true));
 }
 
-test "settings dirty close actions prevent discard during save" {
+test "settings dirty close actions stop once the close is posted" {
     try std.testing.expectEqual(
         ClosePromptActions{ .save = true, .discard = true, .keep_editing = true },
-        closePromptActions(true, false, false),
-    );
-    try std.testing.expectEqual(
-        ClosePromptActions{ .save = false, .discard = false, .keep_editing = true },
-        closePromptActions(true, true, false),
+        closePromptActions(true, false),
     );
     try std.testing.expectEqual(
         ClosePromptActions{ .save = false, .discard = false, .keep_editing = false },
-        closePromptActions(true, false, true),
+        closePromptActions(true, true),
     );
     // The hidden prompt keeps IDCANCEL's button enabled so Escape reaches it,
     // and nothing else is pressable.
     try std.testing.expectEqual(
         ClosePromptActions{ .save = false, .discard = false, .keep_editing = true },
-        closePromptActions(false, false, false),
+        closePromptActions(false, false),
     );
     try std.testing.expect(closePromptCanCancel(true, false));
     try std.testing.expect(!closePromptCanCancel(true, true));
@@ -6168,12 +5991,11 @@ test "settings Ctrl+S is the only save shortcut" {
 }
 
 test "settings save command rechecks dispatch state" {
-    try std.testing.expect(saveCommandCanDispatch(false, false, false, true, true));
-    try std.testing.expect(!saveCommandCanDispatch(true, false, false, true, true));
-    try std.testing.expect(!saveCommandCanDispatch(false, true, false, true, true));
-    try std.testing.expect(!saveCommandCanDispatch(false, false, true, true, true));
-    try std.testing.expect(!saveCommandCanDispatch(false, false, false, false, true));
-    try std.testing.expect(!saveCommandCanDispatch(false, false, false, true, false));
+    try std.testing.expect(saveCommandCanDispatch(false, false, true, true));
+    try std.testing.expect(!saveCommandCanDispatch(true, false, true, true));
+    try std.testing.expect(!saveCommandCanDispatch(false, true, true, true));
+    try std.testing.expect(!saveCommandCanDispatch(false, false, false, true));
+    try std.testing.expect(!saveCommandCanDispatch(false, false, true, false));
 }
 
 fn windowWorkArea(hwnd: HWND, work_area: *RECT) bool {
@@ -6636,10 +6458,6 @@ fn settingsScrollGeometry(content_extent: i32, viewport_height: i32) SettingsScr
     };
 }
 
-fn confirmedStaAllowsCustomUiaProviders(confirmed_sta: bool) bool {
-    return confirmed_sta;
-}
-
 /// Whether a child spanning `top`..`bottom` (viewport client coordinates) is
 /// entirely outside a viewport `height` tall. One cut by an edge is on screen.
 fn viewportHidesSpan(top: i32, bottom: i32, height: i32) bool {
@@ -6665,11 +6483,6 @@ test "settings viewport exposes partially clipped controls as onscreen" {
     try std.testing.expect(!viewportHidesSpan(0, 40, 300));
 }
 
-test "settings custom UIA providers require confirmed STA initialization" {
-    try std.testing.expect(!confirmedStaAllowsCustomUiaProviders(false));
-    try std.testing.expect(confirmedStaAllowsCustomUiaProviders(true));
-}
-
 test "settings scrollbar thumb and maximum cover real extents" {
     const rects = [_]RECT{
         .{ .left = 0, .top = 0, .right = 320, .bottom = 16 },
@@ -6693,7 +6506,6 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     if (!self.close_prompt_visible) return minimum;
     if (self.close_prompt_measure_width == pane_width and
         self.close_prompt_measure_dpi == self.dpi and
-        self.close_prompt_measure_saving == self.save_in_flight and
         self.close_prompt_measure_quitting == self.quit_after_close and
         self.close_prompt_measure_height > 0)
     {
@@ -6708,7 +6520,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     }
 
     var text_w: [256]u16 = undefined;
-    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight, self.quit_after_close)));
+    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.quit_after_close)));
     var measure = RECT{
         .left = 0,
         .top = 0,
@@ -6725,7 +6537,6 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     const height = @max(minimum, measure.bottom - measure.top);
     self.close_prompt_measure_width = pane_width;
     self.close_prompt_measure_dpi = self.dpi;
-    self.close_prompt_measure_saving = self.save_in_flight;
     self.close_prompt_measure_quitting = self.quit_after_close;
     self.close_prompt_measure_height = height;
     return height;
@@ -8762,12 +8573,6 @@ test "settings background blur is shown but cannot be changed" {
             try std.testing.expect(std.mem.indexOf(u8, background_blur_label, "not supported on Windows") != null);
             // The section blurb no longer promises it.
             try std.testing.expect(std.mem.indexOf(u8, Section.appearance.placeholderText(), "blur") == null);
-
-            // A save in flight enables and disables the other controls only.
-            settings.setMutableControlsEnabled(false);
-            settings.setMutableControlsEnabled(true);
-            try std.testing.expect(sys.IsWindowEnabled(blur) == 0);
-            try std.testing.expect(sys.IsWindowEnabled(settings.edit_font_size.?) != 0);
         }
     }.body);
 }
