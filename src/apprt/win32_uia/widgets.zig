@@ -53,6 +53,7 @@ extern "user32" fn GetParent(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
 extern "user32" fn IsWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
 extern "user32" fn IsWindowEnabled(hWnd: com.HWND) callconv(.winapi) com.BOOL;
 extern "user32" fn IsWindowVisible(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+extern "user32" fn GetWindowLongPtrW(hWnd: com.HWND, nIndex: i32) callconv(.winapi) isize;
 extern "user32" fn IsChild(hWndParent: com.HWND, hWnd: com.HWND) callconv(.winapi) com.BOOL;
 extern "user32" fn GetGUIThreadInfo(idThread: u32, pgui: *GUITHREADINFO) callconv(.winapi) com.BOOL;
 extern "user32" fn GetWindowThreadProcessId(hWnd: com.HWND, lpdwProcessId: ?*u32) callconv(.winapi) u32;
@@ -1118,6 +1119,9 @@ pub const SettingsControlProvider = struct {
     hwnd: com.HWND,
     role: Role,
     name: ?[]const u8,
+    /// The element that names this one (`UIA_LabeledByPropertyId`). Holds
+    /// a reference, released with this provider.
+    labeled_by: ?*com.IRawElementProviderSimple = null,
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
     viewport_fully_clipped: std.atomic.Value(bool),
@@ -1173,6 +1177,19 @@ pub const SettingsControlProvider = struct {
 
     pub fn detach(self: *SettingsControlProvider) void {
         self.detached.store(true, .release);
+    }
+
+    pub fn setLabeledBy(self: *SettingsControlProvider, label: *com.IRawElementProviderSimple) void {
+        _ = label.vtbl.AddRef(label);
+        if (self.labeled_by) |old| _ = old.vtbl.Release(old);
+        self.labeled_by = label;
+    }
+
+    /// An `ES_READONLY` EDIT, such as the confirm preview pane.
+    fn readOnly(self: *const SettingsControlProvider) bool {
+        const gwl_style = -16;
+        const es_readonly = 0x0800;
+        return self.role == .edit and (GetWindowLongPtrW(self.hwnd, gwl_style) & es_readonly) != 0;
     }
 
     pub fn setViewportFullyClipped(self: *SettingsControlProvider, fully_clipped: bool) void {
@@ -1266,6 +1283,7 @@ pub const SettingsControlProvider = struct {
         const self = fromBase(p);
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
+            if (self.labeled_by) |label| _ = label.vtbl.Release(label);
             self.alloc.destroy(self);
             return 0;
         }
@@ -1349,7 +1367,11 @@ pub const SettingsControlProvider = struct {
                 out.* = com.VARIANT.fromBstr(value);
             },
             constants.UIA_ValueIsReadOnlyPropertyId => if (self.role == .edit) {
-                out.* = com.VARIANT.fromBool(false);
+                out.* = com.VARIANT.fromBool(self.readOnly());
+            },
+            constants.UIA_LabeledByPropertyId => if (self.labeled_by) |label| {
+                _ = label.vtbl.AddRef(label);
+                out.* = com.VARIANT.fromUnknown(@ptrCast(label));
             },
             constants.UIA_FrameworkIdPropertyId => {
                 const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
@@ -1424,6 +1446,7 @@ pub const SettingsControlProvider = struct {
             IsWindowEnabled(self.hwnd) != 0,
         );
         if (precondition != com.S_OK) return precondition;
+        if (self.readOnly()) return com.UIA_E_INVALIDOPERATION;
         return if (com.SetWindowTextW(self.hwnd, value) != 0) com.S_OK else com.E_INVALIDARG;
     }
 
@@ -1446,7 +1469,9 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return if (self.role == .edit) com.S_OK else com.UIA_E_INVALIDOPERATION;
+        if (self.role != .edit) return com.UIA_E_INVALIDOPERATION;
+        out.* = @intFromBool(self.readOnly());
+        return com.S_OK;
     }
 
     fn getHostRawElementProvider(

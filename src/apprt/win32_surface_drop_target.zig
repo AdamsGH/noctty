@@ -362,8 +362,11 @@ pub const DropTarget = struct {
 
         if (len == 0) return null;
 
-        const utf8 = std.unicode.utf16LeToUtf8Alloc(self.alloc, locked[0..len]) catch return null;
+        // A lone surrogate becomes U+FFFD rather than refusing the drop,
+        // as on the clipboard paste path.
+        const utf8 = std.unicode.wtf16LeToWtf8Alloc(self.alloc, locked[0..len]) catch return null;
         defer self.alloc.free(utf8);
+        std.unicode.wtf8ToUtf8Lossy(utf8, utf8) catch unreachable; // WTF-16 always gives WTF-8
 
         return drop.formatTextPayload(self.alloc, utf8, mods) catch null;
     }

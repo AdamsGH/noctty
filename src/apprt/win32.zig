@@ -625,6 +625,100 @@ test "win32 clipboard text gets LF line endings" {
     try std.testing.expectEqualStrings("a\rb\nc", same);
 }
 
+/// The other direction: the core joins copied lines with LF, and classic
+/// Win32 controls (an EDIT, older apps) show an LF-only CF_UNICODETEXT on
+/// one line. Returns null when `text` has no bare LF to expand.
+fn crlfLineEndings(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
+    var bare: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) bare += 1;
+    }
+    if (bare == 0) return null;
+    const out = try alloc.alloc(u8, text.len + bare);
+    var o: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) {
+            out[o] = '\r';
+            o += 1;
+        }
+        out[o] = byte;
+        o += 1;
+    }
+    return out;
+}
+
+test "win32 clipboard writes get CRLF line endings" {
+    const alloc = std.testing.allocator;
+
+    const crlf = (try crlfLineEndings(alloc, "\na\nb\r\nc\n")).?;
+    defer alloc.free(crlf);
+    try std.testing.expectEqualStrings("\r\na\r\nb\r\nc\r\n", crlf);
+
+    // Nothing to expand: a CRLF stays one, and a lone CR is left alone.
+    try std.testing.expectEqual(@as(?[]u8, null), try crlfLineEndings(alloc, "a\r\nb\rc"));
+}
+
+/// The clipboard as UTF-8, for any UTF-16 another program put there. A
+/// strict conversion failed the whole paste on one unpaired surrogate (a
+/// cut emoji); each one becomes U+FFFD instead, which is also 3 bytes, so
+/// the lossy pass runs in place.
+fn clipboardTextToUtf8(alloc: std.mem.Allocator, text_w: []const u16) ![:0]u8 {
+    const text = try std.unicode.wtf16LeToWtf8AllocZ(alloc, text_w);
+    std.unicode.wtf8ToUtf8Lossy(text, text) catch unreachable; // WTF-16 always gives WTF-8
+    return text;
+}
+
+test "win32 clipboard text with a lone surrogate still pastes" {
+    const alloc = std.testing.allocator;
+    const text = try clipboardTextToUtf8(alloc, &.{ 'a', 0xD83D, 'b', 0xD83D, 0xDE00, 0xDE00 });
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{1F600}\u{FFFD}", text);
+}
+
+/// Another program can hold the clipboard open for a few milliseconds (a
+/// clipboard manager, RDP's clipboard sync, Office), and one failed
+/// `OpenClipboard` used to drop the whole paste or copy. Tries it 10 times
+/// with a 5 ms sleep between. A sleep rounds up to the timer tick, about
+/// 15.6 ms unless something raised the resolution, so a clipboard held
+/// throughout costs the UI thread up to about 140 ms before the paste or
+/// copy fails as it did at once before. On false, `GetLastError` still
+/// holds the last attempt's error.
+fn openClipboard(hwnd: ?HWND) bool {
+    return openClipboardWith(sys.OpenClipboard, hwnd);
+}
+
+const clipboard_open_attempts = 10;
+
+fn openClipboardWith(open: *const fn (?HWND) callconv(.winapi) BOOL, hwnd: ?HWND) bool {
+    for (0..clipboard_open_attempts) |attempt| {
+        if (open(hwnd) != 0) return true;
+        if (attempt + 1 < clipboard_open_attempts) std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "win32 clipboard open retries while another program holds it" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var fail_first: usize = 0;
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            return if (calls > fail_first) 1 else 0;
+        }
+    };
+
+    Fake.calls = 0;
+    Fake.fail_first = 3;
+    try std.testing.expect(openClipboardWith(Fake.open, null));
+    try std.testing.expectEqual(@as(usize, 4), Fake.calls);
+
+    // Held for good: gives up after the last attempt, without one more sleep.
+    Fake.calls = 0;
+    Fake.fail_first = std.math.maxInt(usize);
+    try std.testing.expect(!openClipboardWith(Fake.open, null));
+    try std.testing.expectEqual(@as(usize, clipboard_open_attempts), Fake.calls);
+}
+
 fn surfaceWindowStyle() u32 {
     // Keep the terminal child surface hidden until GL + core init complete,
     // then show it explicitly from Surface.init.
@@ -12336,7 +12430,17 @@ const ConfirmPrompt = struct {
     /// preview pane. Null for prompts with nothing to show, such as
     /// the close-surface prompt.
     contents: ?[]const u8 = null,
+    /// A program in the terminal asked (an OSC 52 clipboard read or
+    /// write), not the user. It can send the request right after a key it
+    /// read, so the user's next key lands on the prompt: such a prompt
+    /// opens on Cancel, ignores Allow for its first
+    /// `program_confirm_arming_ms`, and never replaces an open prompt.
+    program_request: bool = false,
 };
+
+/// How long a program's prompt ignores Allow after it opens: longer than
+/// the gap between two keys of someone typing, shorter than reading it.
+const program_confirm_arming_ms = 500;
 
 /// What a close that ends several terminals at once is closing. One pane
 /// keeps its own prompt in `Surface.close`.
@@ -12414,6 +12518,10 @@ const ConfirmPayload = struct {
     /// How much is being approved, stated next to the body because the
     /// pane may only show the head of a large payload.
     preview_caption: ?[]u8 = null,
+    program_request: bool = false,
+    /// `GetTickCount64` before which Allow does nothing; 0 for prompts
+    /// the user's own action raised.
+    armed_at_ms: u64 = 0,
     on_accept: *const fn (userdata: ?*anyopaque) void,
     on_cancel: ?*const fn (userdata: ?*anyopaque) void = null,
     userdata: ?*anyopaque = null,
@@ -12439,7 +12547,14 @@ fn beginConfirmOverlay(
     // initialization cannot discard the labels, body, and callbacks.
     try ensure_controls(host);
     host.confirm_payload = payload;
-    errdefer host.confirm_payload = null;
+    // The caller frees the payload on failure. `present` may already have
+    // put the host in `.confirm` mode, and a host left there declines every
+    // program request, so hide what it showed; with the payload taken back
+    // first, hideOverlay neither frees it nor runs its cancel.
+    errdefer {
+        host.confirm_payload = null;
+        host.hideOverlay();
+    }
     try present(host);
 }
 
@@ -12642,6 +12757,9 @@ const Host = struct {
     overlay_cancel_hwnd: ?HWND = null,
     overlay_accept_uia_provider: ?*win32_uia.SettingsControlProvider = null,
     overlay_cancel_uia_provider: ?*win32_uia.SettingsControlProvider = null,
+    /// The preview pane as a read-only Edit labelled by the prompt's
+    /// title; without it UIA saw a Pane named after its contents.
+    overlay_preview_uia_provider: ?*win32_uia.SettingsControlProvider = null,
     overlay_button_prev_proc: ?*const anyopaque = null,
     cached_overlay_label: ?[:0]const u8 = null,
     cached_overlay_hint: ?[:0]const u8 = null,
@@ -13270,6 +13388,10 @@ const Host = struct {
         // undo/redo; the app-level prune timer owns the timeout path
         // so hidden surfaces cannot live past `undo-timeout`.
         if (index >= self.tabs.items.len) return null;
+        // A prompt one of its terminals raised goes with the tab, while the
+        // tab is still in place for the layout this runs: its Allow would
+        // otherwise answer a terminal that is now only undo history.
+        self.cancelConfirmFromTab(&self.tabs.items[index]);
 
         const previous_tab_id = if (self.active_tab < self.tabs.items.len)
             self.tabs.items[self.active_tab].id
@@ -15370,6 +15492,16 @@ const Host = struct {
         }
         destroySubclassedWindow(&self.overlay_edit_hwnd, &self.overlay_edit_prev_proc);
         destroySubclassedWindow(&self.overlay_hint_hwnd, &self.overlay_hint_prev_proc);
+        if (self.overlay_preview_uia_provider) |provider| {
+            self.overlay_preview_uia_provider = null;
+            provider.detach();
+            scheduleDeferredUiaDisconnect(
+                self.app,
+                @ptrCast(provider),
+                &overlayButtonDisconnectThunk,
+                &overlayButtonReleaseThunk,
+            );
+        }
         destroySubclassedWindow(&self.overlay_preview_hwnd, &self.overlay_preview_prev_proc);
 
         const overlay_button_providers = takeOverlayButtonUiaProviders(
@@ -18019,6 +18151,19 @@ const Host = struct {
         if (self.preview_font) |font| {
             _ = sys.SendMessageW(preview_hwnd, c.WM_SETFONT, @intFromPtr(font), 1);
         }
+        if (self.app.com_initialized) {
+            if (win32_uia.SettingsControlProvider.create(
+                std.heap.page_allocator,
+                preview_hwnd,
+                .edit,
+                "Preview",
+            )) |provider| {
+                if (self.overlay_title_uia_provider) |title| provider.setLabeledBy(&title.base);
+                self.overlay_preview_uia_provider = provider;
+            } else |err| {
+                log.warn("overlay preview UIA provider unavailable err={}", .{err});
+            }
+        }
 
         self.overlay_accept_hwnd = sys.CreateWindowExW(
             0,
@@ -18639,10 +18784,15 @@ const Host = struct {
             // Show body as hint label. Prefer the visible Accept button,
             // then the visible Cancel button, as the keyboard-focus target.
             // The destructive action remains one explicit click/Enter away.
-            const initial_target = if (sys.IsWindowVisible(accept_hwnd) != 0)
-                accept_hwnd
-            else if (sys.IsWindowVisible(cancel_hwnd) != 0)
-                cancel_hwnd
+            // A program's prompt prefers Cancel: the key the user was
+            // typing when it opened then declines it.
+            const program = if (self.confirm_payload) |payload| payload.program_request else false;
+            const first = if (program) cancel_hwnd else accept_hwnd;
+            const second = if (program) accept_hwnd else cancel_hwnd;
+            const initial_target = if (sys.IsWindowVisible(first) != 0)
+                first
+            else if (sys.IsWindowVisible(second) != 0)
+                second
             else {
                 self.announceConfirmPrompt();
                 return;
@@ -18678,6 +18828,18 @@ const Host = struct {
         // the owned byte slices get freed. Accept/cancel callbacks
         // snapshot their callback data before reaching this point and
         // dispatch only after hideOverlay returns.
+        //
+        // A confirm closed by anything but its Allow is answered as
+        // Cancel, once the overlay is down: its Cancel and Escape, and
+        // equally a new confirm, the palette, search or a rename opening
+        // over it. Before, those dropped it without its `on_cancel`, and
+        // its clipboard op stayed parked on its Surface until that
+        // Surface's next request. Allow and an owner's teardown clear
+        // `on_cancel` first. The callers of hideOverlay go on using the
+        // Host, so an `on_cancel` must not destroy it; today's two only
+        // free that op.
+        const dropped_cancel = if (self.confirm_payload) |p| p.on_cancel else null;
+        const dropped_userdata = if (self.confirm_payload) |p| p.userdata else null;
         if (self.confirm_payload) |*p| {
             p.deinit(self.app.core_app.alloc);
             self.confirm_payload = null;
@@ -18714,6 +18876,7 @@ const Host = struct {
         // `setBanner(.none, null)` above does nothing when only the update
         // notice is up, and not every caller relayouts after this.
         self.syncBannerChild();
+        if (dropped_cancel) |cancel| cancel(dropped_userdata);
     }
 
     fn invalidateOverlayTransitionPlacementCache(self: *Host) void {
@@ -18770,7 +18933,10 @@ const Host = struct {
 
         // Close any previous overlay so we don't stack. `hideOverlay`
         // frees an existing `confirm_payload` via its own deinit
-        // branch, so we don't leak here.
+        // branch, so we don't leak here, and answers it as Cancel. That
+        // cannot undo the new request when it comes from the same
+        // Surface: a requester commits its pending op only after this
+        // returns.
         if (self.overlay_mode != .none) self.hideOverlay();
 
         try beginConfirmOverlay(self, .{
@@ -18780,6 +18946,8 @@ const Host = struct {
             .cancel_label = cancel_owned,
             .preview = preview,
             .preview_caption = caption,
+            .program_request = prompt.program_request,
+            .armed_at_ms = if (prompt.program_request) sys.GetTickCount64() + program_confirm_arming_ms else 0,
             .on_accept = on_accept,
             .on_cancel = on_cancel,
             .userdata = userdata,
@@ -18803,8 +18971,18 @@ const Host = struct {
             self.hideOverlay();
             return;
         };
+        // Every way to press Allow ends here (keys, a click, UIA Invoke,
+        // Enter in the preview pane), so this is where a program's prompt
+        // stays unarmed. A press too early is itself a key or click on
+        // the prompt, so it pushes the arming back (`holdProgramConfirm`).
+        if (sys.GetTickCount64() < captured.armed_at_ms) {
+            self.holdProgramConfirm();
+            return;
+        }
         const cb = captured.on_accept;
         const userdata = captured.userdata;
+        // Allow answers it: hideOverlay must not also run its cancel.
+        self.confirm_payload.?.on_cancel = null;
         // hideOverlay deinits the payload (frees the owned byte
         // slices) and clears `confirm_payload = null`. After this
         // point, do not touch Host state before the callback: confirm
@@ -18814,15 +18992,45 @@ const Host = struct {
         cb(userdata);
     }
 
+    /// hideOverlay runs the confirm's `on_cancel` once the overlay is down.
     fn invokeConfirmCancel(self: *Host) void {
-        const captured = self.confirm_payload orelse {
-            self.hideOverlay();
-            return;
-        };
-        const cb = captured.on_cancel;
-        const userdata = captured.userdata;
         self.hideOverlay();
-        if (cb) |f| f(userdata);
+    }
+
+    /// Cancel a confirm that a terminal in `tab` asked for.
+    fn cancelConfirmFromTab(self: *Host, tab: *Tab) void {
+        const payload = self.confirm_payload orelse return;
+        const userdata = payload.userdata orelse return;
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| {
+            if (@as(*anyopaque, @ptrCast(entry.view)) == userdata) return self.invokeConfirmCancel();
+        }
+    }
+
+    /// Any key a program's prompt receives starts its arming over, so
+    /// Allow takes a key after `program_confirm_arming_ms` of quiet: the
+    /// prompt opens on Cancel, but the Tab, Left or Enter of someone still
+    /// typing can move focus to Allow or the preview pane, and a fresh
+    /// Enter there would otherwise accept once the first half second had
+    /// passed. Prompts the user raised are not armed.
+    fn holdProgramConfirm(self: *Host) void {
+        const payload = if (self.confirm_payload) |*p| p else return;
+        if (payload.program_request) payload.armed_at_ms = sys.GetTickCount64() + program_confirm_arming_ms;
+    }
+
+    /// `holdProgramConfirm` for a key, except a modifier: a held Shift or
+    /// Ctrl repeats its keydown, which kept a Shift+click on Allow from
+    /// ever landing, and the keys typed with a modifier hold it anyway.
+    fn holdProgramConfirmForKey(self: *Host, vk: WPARAM) void {
+        switch (vk) {
+            c.VK_SHIFT, c.VK_CONTROL, c.VK_MENU, c.VK_LWIN, c.VK_RWIN => {},
+            else => self.holdProgramConfirm(),
+        }
+    }
+
+    fn programConfirmOpen(self: *const Host) bool {
+        const payload = self.confirm_payload orelse return false;
+        return payload.program_request;
     }
 
     /// If an active confirm overlay was opened with `ud` as its
@@ -18837,9 +19045,11 @@ const Host = struct {
         const payload_ud = payload.userdata orelse return;
         if (payload_ud != ud) return;
         // `hideOverlay` deinits the payload (frees owned string
-        // bytes and clears `confirm_payload = null`) without
-        // invoking on_accept/on_cancel. layout/repaint/refocus are
-        // handled inside hideOverlay for the confirm case.
+        // bytes and clears `confirm_payload = null`), and with
+        // `on_cancel` cleared it invokes neither callback.
+        // layout/repaint/refocus are handled inside hideOverlay for
+        // the confirm case.
+        self.confirm_payload.?.on_cancel = null;
         self.hideOverlay();
     }
 
@@ -28432,6 +28642,40 @@ test "bannerButtonKey presses once, closes a message on Escape and leaves the no
     try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(true, c.VK_F6, false));
 }
 
+const ConfirmKey = enum { accept, cancel, other_button, ignore };
+
+/// What a key does on a confirm prompt's Allow or Cancel button, or null to
+/// leave it to the button. Enter presses the focused button and Escape
+/// cancels from either. Space only cancels: it is the key someone typing in
+/// the terminal most often has on its way when a prompt takes focus, and it
+/// is swallowed on Allow so the BUTTON cannot click on its release either.
+/// A held key repeats into the prompt that just took focus, so a repeat
+/// presses nothing.
+fn confirmButtonKey(vk: WPARAM, repeat: bool, on_accept: bool) ?ConfirmKey {
+    return switch (vk) {
+        c.VK_ESCAPE => .cancel,
+        c.VK_TAB, c.VK_LEFT, c.VK_RIGHT => .other_button,
+        c.VK_RETURN => if (repeat) .ignore else if (on_accept) .accept else .cancel,
+        c.VK_SPACE => if (repeat or on_accept) .ignore else .cancel,
+        else => null,
+    };
+}
+
+test "confirmButtonKey accepts only a fresh Enter on Allow" {
+    try std.testing.expectEqual(@as(?ConfirmKey, .accept), confirmButtonKey(c.VK_RETURN, false, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_RETURN, true, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_SPACE, false, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_SPACE, true, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .cancel), confirmButtonKey(c.VK_RETURN, false, false));
+    try std.testing.expectEqual(@as(?ConfirmKey, .cancel), confirmButtonKey(c.VK_SPACE, false, false));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_SPACE, true, false));
+    for ([_]bool{ false, true }) |on_accept| {
+        try std.testing.expectEqual(@as(?ConfirmKey, .cancel), confirmButtonKey(c.VK_ESCAPE, true, on_accept));
+        try std.testing.expectEqual(@as(?ConfirmKey, .other_button), confirmButtonKey(c.VK_TAB, false, on_accept));
+        try std.testing.expectEqual(@as(?ConfirmKey, null), confirmButtonKey('A', false, on_accept));
+    }
+}
+
 /// How long an `.info` banner stays up, in milliseconds: the system's
 /// notification time (`SPI_GETMESSAGEDURATION`), which Settings offers from
 /// 5 seconds to 5 minutes and defaults to 5.
@@ -28767,29 +29011,28 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // two buttons; arrow keys also cycle for screen-reader
         // users who navigate via arrows.
         if (msg == c.WM_KEYDOWN and v.isOverlayButton(hwnd)) {
-            switch (wParam) {
-                c.VK_ESCAPE => {
-                    if (v.overlay_mode == .confirm) {
-                        v.invokeConfirmCancel();
-                    } else {
-                        v.hideOverlay();
+            const reverse = if (wParam == c.VK_TAB) keyPressed(c.VK_SHIFT) else wParam == c.VK_LEFT;
+            if (v.overlay_mode == .confirm) {
+                const repeat = (lParamBits(lParam) & c.KF_REPEAT) != 0;
+                const action = confirmButtonKey(wParam, repeat, hwnd == v.overlay_accept_hwnd);
+                if (action != ConfirmKey.accept) v.holdProgramConfirmForKey(wParam);
+                if (action) |key| {
+                    switch (key) {
+                        .accept => v.invokeConfirmAccept(),
+                        .cancel => v.invokeConfirmCancel(),
+                        .other_button => _ = v.focusRelativeOverlayControl(hwnd, reverse),
+                        .ignore => {},
                     }
+                    return 0;
+                }
+            } else switch (wParam) {
+                c.VK_ESCAPE => {
+                    v.hideOverlay();
                     return 0;
                 },
                 c.VK_TAB, c.VK_LEFT, c.VK_RIGHT => {
-                    const reverse = if (wParam == c.VK_TAB) keyPressed(c.VK_SHIFT) else wParam == c.VK_LEFT;
                     _ = v.focusRelativeOverlayControl(hwnd, reverse);
                     return 0;
-                },
-                c.VK_RETURN, c.VK_SPACE => {
-                    if (v.overlay_mode == .confirm) {
-                        if (hwnd == v.overlay_accept_hwnd) {
-                            v.invokeConfirmAccept();
-                        } else if (hwnd == v.overlay_cancel_hwnd) {
-                            v.invokeConfirmCancel();
-                        }
-                        return 0;
-                    }
                 },
                 else => {},
             }
@@ -29243,10 +29486,14 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
         v.overlay_edit_hwnd != null and hwnd == v.overlay_edit_hwnd.?
     else
         false;
-    if (msg == c.WM_GETOBJECT and is_query_edit) {
+    if (msg == c.WM_GETOBJECT) {
         if (host) |v| {
-            if (v.overlay_edit_uia_provider) |provider| {
-                if (win32_uia.returnTerminalProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
+            if (is_query_edit) {
+                if (v.overlay_edit_uia_provider) |provider| {
+                    if (win32_uia.returnTerminalProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
+                }
+            } else if (v.overlay_preview_uia_provider) |provider| {
+                if (win32_uia.returnSettingsControlProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
             }
         }
     }
@@ -29255,6 +29502,12 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
         c.WM_CHAR => {
             if (wParam == c.VK_ESCAPE) return 0;
             if (wParam == c.VK_RETURN) {
+                // The confirm preview pane accepts on Enter too, but not on
+                // a held one (see `confirmButtonKey`), and never a
+                // program's prompt: Tab from its Cancel lands here, and
+                // Tab then Enter is how someone finishes typing a command.
+                const repeat = (lParamBits(lParam) & c.KF_REPEAT) != 0;
+                if (v.overlay_mode == .confirm and (repeat or v.programConfirmOpen())) return 0;
                 if (v.overlay_mode != .profile) {
                     runUiActionOrLog("overlay submit failed", v.submitOverlay());
                 }
@@ -29266,6 +29519,7 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
             // Tab out of the query is how the keyboard reaches the Close
             // button; it has to show its ring when it gets there.
             v.noteChromeKeyInput(wParam);
+            if (v.overlay_mode == .confirm) v.holdProgramConfirmForKey(wParam);
             if (v.commandPaletteToggleKeyMessage(msg, wParam, lParam)) {
                 _ = v.dismissCommandPalette();
                 return 0;
@@ -32645,6 +32899,14 @@ pub const Surface = struct {
         state: apprt.ClipboardRequest,
     ) !bool {
         if (clipboard_type != .standard) return false;
+        // A program's read that would only be declined does not read the
+        // clipboard first.
+        if (state == .osc_52_read and self.core_surface.config.clipboard_read == .ask) {
+            self.declineProgramRequest() catch |err| {
+                log.info("clipboard read request declined err={}", .{err});
+                return false;
+            };
+        }
 
         // `str` is always owned by `core_app.alloc`, so one defer covers both
         // clipboard reads and the synthesized empty-string fallback.
@@ -36786,6 +37048,10 @@ pub const Surface = struct {
     ) !void {
         const host = self.host orelse return error.NoHost;
         const alloc = self.app.core_app.alloc;
+        // The user's own paste (a keybinding, a drop, a quick-select
+        // paste) or a program's OSC 52 read.
+        const program_request = request == .osc_52_read;
+        if (program_request) try self.declineProgramRequest();
 
         // Defensive: clear any leftover op before queuing a new one so
         // the destructor can't see a mixed state.
@@ -36800,16 +37066,19 @@ pub const Surface = struct {
         // committed successfully and a later setup step failed.
         errdefer alloc.free(data_copy);
 
+        const program_body = if (program_request) try self.programClipboardPromptBody(.read) else null;
+        defer if (program_body) |body| alloc.free(body);
         try host.showConfirm(
             .{
-                .title = "Allow clipboard paste?",
-                .body = "noctty needs confirmation before completing this clipboard paste or read request.",
+                .title = if (program_request) labels.programClipboardPromptTitle(.read) else "Allow clipboard paste?",
+                .body = program_body orelse "noctty needs confirmation before completing this clipboard paste.",
                 .accept_label = "Allow",
                 .cancel_label = "Cancel",
                 // Preview the exact bytes the gate stopped. `data_copy`
                 // is what Accept delivers; the preview is built from the
                 // same bytes and capped for display only.
                 .contents = data,
+                .program_request = program_request,
             },
             surfaceConfirmPasteAccept,
             surfaceConfirmPasteCancel,
@@ -36837,6 +37106,8 @@ pub const Surface = struct {
     ) !void {
         const host = self.host orelse return error.NoHost;
         const alloc = self.app.core_app.alloc;
+        // Only a program's OSC 52 write asks first (`clipboard-write = ask`).
+        try self.declineProgramRequest();
 
         if (self.pending_clipboard_op) |*old| old.deinit(alloc);
         self.pending_clipboard_op = null;
@@ -36885,13 +37156,16 @@ pub const Surface = struct {
             break :preview contents[0].data;
         };
 
+        const body = try self.programClipboardPromptBody(.write);
+        defer alloc.free(body);
         try host.showConfirm(
             .{
-                .title = "Allow clipboard write?",
-                .body = "noctty needs confirmation before allowing this application to write to the Windows clipboard.",
+                .title = labels.programClipboardPromptTitle(.write),
+                .body = body,
                 .accept_label = "Allow",
                 .cancel_label = "Cancel",
                 .contents = preview_contents,
+                .program_request = true,
             },
             surfaceConfirmWriteAccept,
             surfaceConfirmWriteCancel,
@@ -36908,10 +37182,32 @@ pub const Surface = struct {
         } };
     }
 
+    /// A program's clipboard request that gets no prompt. It never
+    /// replaces a prompt that is waiting for an answer: that hid the
+    /// user's own paste or close prompt, or another pane's, behind one the
+    /// program chose the moment of. And a terminal in no tab (one kept
+    /// alive for close-tab undo still runs) has no tab the prompt could
+    /// name. Checked before the requester touches its pending op, which
+    /// may be what the open prompt delivers.
+    fn declineProgramRequest(self: *Surface) !void {
+        const host = self.host orelse return error.NoHost;
+        if (host.overlay_mode == .confirm) return error.ConfirmPromptOpen;
+        // Nor the palette, search or a rename the user is typing in.
+        if (host.overlay_mode != .none) return error.OverlayOpen;
+        if (self.app.findTabForSurface(self) == null) return error.NotInATab;
+    }
+
+    fn programClipboardPromptBody(self: *Surface, request: labels.ProgramClipboardRequest) ![]u8 {
+        return labels.buildProgramClipboardPromptBody(
+            self.app.core_app.alloc,
+            request,
+            self.app.hostTabStatus(self).index + 1,
+            self.effectiveTitle(),
+        );
+    }
+
     fn readClipboardText(self: *Surface) !?[:0]u8 {
-        if (sys.OpenClipboard(self.hwnd) == 0) {
-            return lastError();
-        }
+        if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
         if (sys.IsClipboardFormatAvailable(c.CF_UNICODETEXT) == 0) return null;
@@ -36923,17 +37219,17 @@ pub const Surface = struct {
         const text_w: [*:0]const u16 = @ptrCast(@alignCast(locked));
         const slice_w = std.mem.sliceTo(text_w, 0);
         const alloc = self.app.core_app.alloc;
-        return try lfLineEndings(alloc, try std.unicode.utf16LeToUtf8AllocZ(alloc, slice_w));
+        return try lfLineEndings(alloc, try clipboardTextToUtf8(alloc, slice_w));
     }
 
     fn writeClipboardText(self: *const Surface, text: []const u8) !void {
         const alloc = self.app.core_app.alloc;
-        const text_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, text);
+        const crlf = try crlfLineEndings(alloc, text);
+        defer if (crlf) |owned| alloc.free(owned);
+        const text_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, crlf orelse text);
         defer alloc.free(text_w);
 
-        if (sys.OpenClipboard(self.hwnd) == 0) {
-            return lastError();
-        }
+        if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
         if (sys.EmptyClipboard() == 0) {
@@ -36991,12 +37287,14 @@ pub const Surface = struct {
             plain_owned_for_free = stripped;
             break :blk stripped;
         };
-        const plain_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, plain_src);
+        // CRLF for the plain fallback only: CF_HTML's header holds byte
+        // offsets into the wrapped fragment.
+        const plain_crlf = try crlfLineEndings(alloc, plain_src);
+        defer if (plain_crlf) |owned| alloc.free(owned);
+        const plain_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, plain_crlf orelse plain_src);
         defer alloc.free(plain_w);
 
-        if (sys.OpenClipboard(self.hwnd) == 0) {
-            return lastError();
-        }
+        if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
         if (sys.EmptyClipboard() == 0) {
@@ -38959,6 +39257,168 @@ test "win32 quit asks once on the window it came from" {
     try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
     try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
     try std.testing.expect(app.running);
+}
+
+test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_held: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_held, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // The background tab's program reads the clipboard.
+    const opened_at = sys.GetTickCount64();
+    try surface_b.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    const payload = host.confirm_payload.?;
+    try std.testing.expectEqualStrings("Let a program read your clipboard?", payload.title);
+    try std.testing.expectEqualStrings(
+        "Tab 2 (noctty) asked to read your clipboard. Allow sends it the text below.",
+        payload.body,
+    );
+    try std.testing.expect(payload.program_request);
+    try std.testing.expect(payload.armed_at_ms >= opened_at + program_confirm_arming_ms);
+
+    // Allow right after it opened is a key that was already on its way.
+    // (Pinned so a stalled test cannot reach the inert core.)
+    host.confirm_payload.?.armed_at_ms = std.math.maxInt(u64);
+    host.invokeConfirmAccept();
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expect(surface_b.pending_clipboard_op != null);
+
+    // Once armed, any other key on the prompt (the Tab or Left of someone
+    // still typing) starts the half second over.
+    host.confirm_payload.?.armed_at_ms = 0;
+    const key_at = sys.GetTickCount64();
+    host.holdProgramConfirmForKey(c.VK_TAB);
+    try std.testing.expect(host.confirm_payload.?.armed_at_ms >= key_at + program_confirm_arming_ms);
+    // A modifier alone does not: a held Shift repeats.
+    host.confirm_payload.?.armed_at_ms = 0;
+    host.holdProgramConfirmForKey(c.VK_SHIFT);
+    try std.testing.expectEqual(@as(u64, 0), host.confirm_payload.?.armed_at_ms);
+
+    // Another program's request does not take the prompt's place, and does
+    // not touch the parked read.
+    try std.testing.expectError(error.ConfirmPromptOpen, surface_a.requestWriteConfirm(
+        .standard,
+        &.{.{ .mime = "text/plain", .data = "x" }},
+    ));
+    try std.testing.expectError(error.ConfirmPromptOpen, surface_b.requestPasteConfirm(.{ .osc_52_read = .standard }, "again"));
+    try std.testing.expectEqualStrings("secret", surface_b.pending_clipboard_op.?.paste.data);
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+
+    // A write gets its own words too.
+    try surface_a.requestWriteConfirm(.standard, &.{.{ .mime = "text/plain", .data = "x" }});
+    try std.testing.expectEqualStrings("Let a program change your clipboard?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "Tab 1 (noctty) asked to replace your clipboard with the text below.",
+        host.confirm_payload.?.body,
+    );
+    try std.testing.expect(host.confirm_payload.?.program_request);
+    host.invokeConfirmCancel();
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+
+    // A terminal in no tab (one kept for close-tab undo) has no tab the
+    // prompt could name.
+    try std.testing.expectError(error.NotInATab, surface_held.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret"));
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+}
+
+test "win32 a prompt that replaces another answers it as Cancel" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    try surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    try std.testing.expect(surface_a.pending_clipboard_op != null);
+
+    // The user's own paste in the other tab replaces it: the read's payload
+    // is released, not parked until that tab's next request. The user's
+    // prompt keeps its wording, opens armed and keeps its payload.
+    try surface_b.requestPasteConfirm(.paste, "a\nb");
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+    const payload = host.confirm_payload.?;
+    try std.testing.expectEqualStrings("Allow clipboard paste?", payload.title);
+    try std.testing.expect(!payload.program_request);
+    try std.testing.expectEqual(@as(u64, 0), payload.armed_at_ms);
+    try std.testing.expectEqualStrings("a\nb", surface_b.pending_clipboard_op.?.paste.data);
+
+    // A tab replacing its own prompt keeps the new request.
+    try surface_b.requestPasteConfirm(.paste, "c\nd");
+    try std.testing.expectEqualStrings("c\nd", surface_b.pending_clipboard_op.?.paste.data);
+
+    host.invokeConfirmCancel();
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+
+    // Anything else that closes a confirm answers it as Cancel too: the
+    // palette, search and rename hide the open overlay first.
+    try surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    host.hideOverlay();
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+
+    // A user prompt has no arming to hold.
+    try surface_b.requestPasteConfirm(.paste, "e\nf");
+    host.holdProgramConfirm();
+    try std.testing.expectEqual(@as(u64, 0), host.confirm_payload.?.armed_at_ms);
+    host.invokeConfirmCancel();
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+
+    // A program does not close what the user is typing in either.
+    try host.showOverlay(.surface_title, null);
+    try std.testing.expectError(error.OverlayOpen, surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret"));
+    try std.testing.expectEqual(HostOverlayMode.surface_title, host.overlay_mode);
+    host.hideOverlay();
+
+    // Closing the requester's tab into undo history takes its prompt with
+    // it: Allow would answer a terminal that is now only history.
+    try surface_b.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    var entry = host.detachTabForUndo(1).?;
+    defer entry.dispose(&host, .host_destroy) catch {}; // Best-effort test teardown.
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+    try std.testing.expect(try host.restoreClosedTabEntry(&entry.payload.close_tab));
 }
 
 test "win32 close prompts count the terminals they would end" {
