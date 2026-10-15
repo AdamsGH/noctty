@@ -18,6 +18,22 @@
 # We need to be in interactive mode to proceed.
 if [[ "$-" != *i* ]]; then builtin return; fi
 
+# noctty hands its shell the starting directory as a Windows path, and MSYS
+# and Cygwin bash keep that as $PWD (so the first prompt shows `C:\Users/me`
+# instead of `~`) until the first cd. Let bash derive it from the real
+# directory it names in MSYS form (`/c/Users/me`), before any startup file
+# reads it. A logical cd keeps a junction or symlink in the path, and OLDPWD
+# is put back as it was.
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && [[ "$PWD" == [A-Za-z]:[\\/]* ]]; then
+  builtin declare __ghostty_drive="${PWD:0:1}" __ghostty_rest="${PWD:2}"
+  __ghostty_oldpwd=()
+  [[ -v OLDPWD ]] && __ghostty_oldpwd=("$OLDPWD")
+  if builtin cd -- "/${__ghostty_drive,,}${__ghostty_rest//\\//}" 2>/dev/null; then
+    if (( ${#__ghostty_oldpwd[@]} )); then OLDPWD="${__ghostty_oldpwd[0]}"; else builtin unset OLDPWD; fi
+  fi
+  builtin unset __ghostty_drive __ghostty_rest __ghostty_oldpwd
+fi
+
 # When automatic shell integration is active, we were started in POSIX
 # mode and need to manually recreate the bash startup sequence.
 if [ -n "$GHOSTTY_BASH_INJECT" ]; then
@@ -79,8 +95,12 @@ if [ -n "$GHOSTTY_BASH_INJECT" ]; then
   builtin unset GHOSTTY_BASH_RCFILE
 fi
 
-# Add Ghostty binary to PATH if the path feature is enabled
-if [[ "$GHOSTTY_SHELL_FEATURES" == *"path"* && -n "$GHOSTTY_BIN_DIR" ]]; then
+# Add Ghostty binary to PATH if the path feature is enabled. MSYS and Cygwin
+# split PATH on `:`, which cuts the Windows GHOSTTY_BIN_DIR (`C:\...`) into a
+# relative `C` entry and a stray tail. noctty already put its directory on the
+# Windows PATH, which Git for Windows' login shell inherits.
+if [[ "$GHOSTTY_SHELL_FEATURES" == *"path"* && -n "$GHOSTTY_BIN_DIR" &&
+  "$OSTYPE" != msys* && "$OSTYPE" != cygwin* ]]; then
   if [[ ":$PATH:" != *":$GHOSTTY_BIN_DIR:"* ]]; then
     export PATH="$PATH:$GHOSTTY_BIN_DIR"
   fi
@@ -200,7 +220,7 @@ _ghostty_executing=""
 _ghostty_last_reported_cwd=""
 
 function __ghostty_precmd() {
-  local ret="$?"
+  local ret="${1:-$?}"
   if test "$_ghostty_executing" != "0"; then
     _GHOSTTY_SAVE_PS1="$PS1"
     _GHOSTTY_SAVE_PS2="$PS2"
@@ -259,7 +279,25 @@ function __ghostty_precmd() {
   # command like cd /test && cat. PS0 is evaluated before cd is run.
   if [[ "$_ghostty_last_reported_cwd" != "$PWD" ]]; then
     _ghostty_last_reported_cwd="$PWD"
-    builtin printf "\e]7;kitty-shell-cwd://%s%s\a" "$HOSTNAME" "$PWD"
+    builtin local cwd="$PWD"
+    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+      # noctty reads a Windows directory in an OSC 7 as `/C:/Users/me`;
+      # `/c/Users/me` would be taken for a WSL path. Rewrite the drive
+      # mount here and only ask cygpath about the rest (/tmp, /home/...).
+      [[ "$cwd" == /cygdrive/* ]] && cwd="${cwd#/cygdrive}"
+      if [[ "$cwd" == /[A-Za-z] || "$cwd" == /[A-Za-z]/* ]]; then
+        builtin local drive="${cwd:1:1}"
+        cwd="/${drive^^}:/${cwd:3}"
+      elif [[ "$cwd" == [A-Za-z]:[\\/]* ]]; then
+        cwd="/${cwd//\\//}"
+      else
+        # cygpath forks, but only when the directory changes to one that is
+        # not on a drive mount.
+        cwd=$(builtin command cygpath -m -- "$cwd" 2>/dev/null)
+        [[ "$cwd" == [A-Za-z]:/* ]] && cwd="/${cwd^}" || cwd=""
+      fi
+    fi
+    [[ -n "$cwd" ]] && builtin printf "\e]7;kitty-shell-cwd://%s%s\a" "$HOSTNAME" "$cwd"
   fi
 
   _ghostty_executing=0
@@ -289,8 +327,15 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
     [[ -n "$cmd" ]] && __ghostty_preexec "$cmd"
   }
 
+  # Bash 5.1+ restores the command status for each PROMPT_COMMAND array entry.
+  # Scalar values need to save and restore it before existing commands run.
+  __ghostty_restore_status() {
+    builtin return "$1"
+  }
+
   __ghostty_hook() {
-    builtin local ret=$?
+    builtin local ret="${__ghostty_status:-$?}"
+    builtin unset __ghostty_status
     __ghostty_precmd "$ret"
 
     # Append preexec hook to PS0 if not already present.
@@ -306,24 +351,26 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
     fi
   }
 
-  # Append our hook to PROMPT_COMMAND, preserving its existing type.
+  # Append our hook to PROMPT_COMMAND, preserving its existing type. Array
+  # entries receive their command's status directly, while scalar values
+  # need a leading status capture before existing commands run.
   #
   # The 2>/dev/null suppresses "command not found" in subshells that inherit
-  # PROMPT_COMMAND without the function definition. This also silences any
-  # errors from inside __ghostty_hook itself, but those are all terminal escape
-  # sequences and non-actionable.
-  #
+  # PROMPT_COMMAND without the function definitions. This also silences any
+  # errors from inside our hooks, but those are all terminal escape sequences
+  # and non-actionable.
   # shellcheck disable=SC2128,SC2178,SC2179
-  if [[ ";${PROMPT_COMMAND[*]:-};" != *";__ghostty_hook 2>/dev/null;"* ]]; then
+  if [[ "${PROMPT_COMMAND[*]:-}" != *"__ghostty_hook 2>/dev/null"* ]]; then
     if [[ -z "${PROMPT_COMMAND[*]}" ]]; then
       if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
         PROMPT_COMMAND=("__ghostty_hook 2>/dev/null")
       else
         PROMPT_COMMAND="__ghostty_hook 2>/dev/null"
       fi
-    elif [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
+    elif [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
       PROMPT_COMMAND+=("__ghostty_hook 2>/dev/null")
     else
+      PROMPT_COMMAND='__ghostty_status=$?;if builtin declare -F __ghostty_restore_status >/dev/null;then __ghostty_restore_status "$__ghostty_status";else (exit "$__ghostty_status");fi;'"${PROMPT_COMMAND}"
       [[ "${PROMPT_COMMAND}" =~ (\;[[:space:]]*|$'\n')$ ]] || PROMPT_COMMAND+=";"
       PROMPT_COMMAND+="__ghostty_hook 2>/dev/null"
     fi
