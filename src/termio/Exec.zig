@@ -1009,7 +1009,11 @@ const Subprocess = struct {
                     else => .{ .shell = "sh" },
                 };
             const default_shell_command = if (builtin.os.tag == .windows)
-                try windows_shell.executableCommand(alloc, configured_shell_command)
+                try windows_shell.resolveShellCommand(
+                    alloc,
+                    try windows_shell.executableCommand(alloc, configured_shell_command),
+                    &env,
+                )
             else
                 configured_shell_command;
 

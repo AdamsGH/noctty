@@ -741,8 +741,9 @@ fn windowsCreateCommandLine(
     const writer = &buf.writer;
 
     if (cmd_shell) {
-        debug.assert(argv.len == 3);
-        debug.assert(mem.eql(u8, argv[1], "/C"));
+        debug.assert(argv.len == 3 or argv.len == 4);
+        if (argv.len == 4) debug.assert(mem.eql(u8, argv[1], "/D"));
+        debug.assert(mem.eql(u8, argv[argv.len - 2], "/C"));
     }
 
     for (argv, 0..) |arg, arg_i| {
@@ -751,7 +752,7 @@ fn windowsCreateCommandLine(
         // cmd.exe applies its own quote rules to the raw command after `/C`.
         // Applying MSVCRT quoting here would turn inner quotes into literal
         // `\"` bytes, which cmd.exe does not treat as escapes.
-        if (cmd_shell and arg_i == 2) {
+        if (cmd_shell and arg_i == argv.len - 1) {
             try writer.writeByte('"');
             try writer.writeAll(arg);
             try writer.writeByte('"');
@@ -950,6 +951,70 @@ test "Command: windows-cmd-shell-command-line executes quoted command" {
     const contents = try stdout.readToEndAlloc(testing.allocator, 1024);
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("QUOTED_A \r\nQUOTED_B\r\n", contents);
+}
+
+test "PKG48 shell wrapper ignores a planted cwd command and preserves the environment" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var td = try TempDir.init();
+    defer td.deinit();
+    try td.dir.makeDir("trusted tools");
+    try td.dir.makeDir("untrusted");
+    try td.dir.writeFile(.{ .sub_path = "untrusted/pkg48probe.cmd", .data = "@echo PLANTED\r\n" });
+    const trusted = try td.dir.realpathAlloc(alloc, "trusted tools");
+    const cwd = try td.dir.realpathAlloc(alloc, "untrusted");
+    var env = try std.process.getEnvMap(alloc);
+    const cmd_path = try std.fs.path.joinZ(alloc, &.{ env.get("WINDIR").?, "System32", "cmd.exe" });
+    const probe = try std.fs.path.join(alloc, &.{ trusted, "pkg48probe.exe" });
+    try std.fs.copyFileAbsolute(cmd_path, probe, .{});
+    try env.put("PATH", trusted);
+    try env.put("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    env.remove("NoDefaultCurrentDirectoryInExePath");
+    try td.dir.writeFile(.{ .sub_path = "untrusted/echo.cmd", .data = "@echo PLANTED\r\n" });
+    const dotted_probe = try std.fs.path.join(alloc, &.{ cwd, "echo.message" });
+    try std.fs.copyFileAbsolute(cmd_path, dotted_probe, .{});
+    const cases = .{
+        .{ "pkg48probe /d /c \"echo TRUSTED&&if defined NoDefaultCurrentDirectoryInExePath echo GUARD\"", "TRUSTED\r\n" },
+        .{ "pkg48missing || echo FALLBACK", "FALLBACK\r\n" },
+        .{ "if.foo || echo FALLBACK", "FALLBACK\r\n" },
+        .{ "for.foo || echo FALLBACK", "FALLBACK\r\n" },
+        .{ "\"echo\" HELLO || echo SAFE", "SAFE\r\n" },
+        .{ "echo.message /d /c echo PLANTED", "message /d /c echo PLANTED\r\n" },
+        .{ "echo[HELLO", "HELLO\r\n" },
+        .{ "echo.", "\r\n" },
+        .{ "rem. harmless", "" },
+    };
+    inline for (cases) |case| {
+        const shell = try configpkg.windows_shell.resolveShellCommand(alloc, .{ .shell = case[0] }, &env);
+        var stdout = try createTestStdout(td.dir);
+        defer stdout.close();
+        var stderr = try createTestStderr(td.dir);
+        defer stderr.close();
+        var cmd: Command = .{
+            .path = cmd_path,
+            .args = &.{ cmd_path, "/D", "/C", shell.shell },
+            .windows_cmd_shell = true,
+            .windows_create_no_window = true,
+            .cwd = cwd,
+            .env = &env,
+            .stdout = stdout,
+            .stderr = stderr,
+            .os_pre_exec = null,
+            .rt_pre_exec = null,
+            .rt_post_fork = null,
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        };
+        try cmd.testingStart();
+        const status = try cmd.wait(true);
+        if (status.Exited != 0) std.debug.print("PKG48 failed fixture: {s}\n", .{case[0]});
+        try testing.expectEqual(@as(u32, 0), status.Exited);
+        try stdout.seekTo(0);
+        const output = try stdout.readToEndAlloc(alloc, 4096);
+        try testing.expectEqualStrings(case[1], output);
+    }
 }
 
 test "createNullDelimitedEnvMap" {

@@ -261,6 +261,10 @@ pub fn executableCommand(alloc: Allocator, command: Command) !Command {
 /// Never consult the app's PATH or cwd, and never probe a network PATH entry.
 /// A batch/script match keeps the caller on its original shell launch path.
 pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.process.EnvMap) !?[:0]const u8 {
+    return lookupChildCommand(alloc, exe, env, false);
+}
+
+fn lookupChildCommand(alloc: Allocator, exe: []const u8, env: *const std.process.EnvMap, scripts: bool) !?[:0]const u8 {
     if (builtin.os.tag != .windows or exe.len == 0 or
         std.mem.indexOfAny(u8, exe, "\\/:") != null) return null;
     const path = env.get("PATH") orelse return null;
@@ -292,12 +296,114 @@ pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.
             const candidate = std.fmt.bufPrint(&buf, "{s}\\{s}{s}", .{ dir, exe, ext }) catch continue;
             if (!windowsNonDirectoryPathExists(candidate)) continue;
             const found_ext = if (extension.len > 0) extension else ext;
-            if (!std.ascii.eqlIgnoreCase(found_ext, ".exe") and
+            if (!scripts and !std.ascii.eqlIgnoreCase(found_ext, ".exe") and
                 !std.ascii.eqlIgnoreCase(found_ext, ".com")) return null;
             return try alloc.dupeZ(u8, candidate);
         }
     }
     return null;
+}
+
+/// Pin an initial bare program name to the child's local PATH, rather than
+/// cmd's implicit search of the pane's (potentially program-reported) cwd.
+/// Explicit paths and cmd grammar remain deliberate shell commands. This is
+/// not a parser for later commands in a compound expression.
+pub fn resolveShellCommand(alloc: Allocator, command: Command, env: *const std.process.EnvMap) !Command {
+    if (builtin.os.tag != .windows or command == .direct) return command;
+    const raw = command.shell;
+    var start: usize = 0;
+    while (start < raw.len and (raw[start] == ' ' or raw[start] == '\t' or raw[start] == '@')) : (start += 1) {}
+    if (start == raw.len) return command;
+    const quoted = raw[start] == '"';
+    const token_start = start + @intFromBool(quoted);
+    var end = token_start;
+    while (end < raw.len) : (end += 1) {
+        if (quoted) {
+            if (raw[end] == '"') break;
+        } else if (std.mem.indexOfScalar(u8, " \t&|<>();,=", raw[end]) != null) break;
+    }
+    if (end == token_start or (quoted and end == raw.len)) return command;
+    const token = raw[token_start..end];
+    // Paths deliberately select a program relative to the surface. Expansion
+    // and escaped syntax belong to cmd, as do compound commands and builtins.
+    if (std.mem.indexOfAny(u8, token, "\\/:%!^\"\r\n") != null) return command;
+    const builtin_name: ?[]const u8 = find_builtin: {
+        if (quoted) break :find_builtin null;
+        inline for (.{ "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "dpath", "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink", "move", "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol" }) |name| {
+            if (std.ascii.eqlIgnoreCase(token, name)) return command;
+            const dotted_builtin = !std.mem.eql(u8, name, "if") and !std.mem.eql(u8, name, "for");
+            if (dotted_builtin and token.len > name.len and token[name.len] == '.' and
+                std.ascii.eqlIgnoreCase(token[0..name.len], name)) break :find_builtin name;
+        }
+        if (token.len > 4 and std.ascii.eqlIgnoreCase(token[0..4], "echo") and
+            std.mem.indexOfScalar(u8, "+[]", token[4]) != null) break :find_builtin "echo";
+        break :find_builtin null;
+    };
+    const resolved = try lookupChildCommand(alloc, token, env, true) orelse missing: {
+        if (builtin_name) |name| {
+            // A real file named echo.foo wins over cmd's dotted echo syntax.
+            // After PATH missed, force the builtin instead of consulting cwd.
+            const echo = std.ascii.eqlIgnoreCase(name, "echo");
+            return .{ .shell = try std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}{s}", .{
+                raw[0..start],                                       name, if (echo) "(" else " ",
+                raw[token_start + name.len + @intFromBool(echo) ..],
+            }, 0) };
+        }
+        // An explicit trusted path keeps cmd's normal not-found status and
+        // conditional-command flow without falling back to the pane's cwd.
+        var system_buf: [windows.MAX_PATH:0]u16 = undefined;
+        const len = windows.kernel32.GetSystemDirectoryW(&system_buf, system_buf.len);
+        if (len == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
+        if (len >= system_buf.len) return error.NameTooLong;
+        const system_dir = try std.unicode.utf16LeToUtf8Alloc(alloc, system_buf[0..len]);
+        defer alloc.free(system_dir);
+        break :missing try std.fs.path.joinZ(alloc, &.{ system_dir, token });
+    };
+    defer alloc.free(resolved);
+    // Quoting protects spaces and operators, but not cmd variable expansion.
+    if (std.mem.indexOfAny(u8, resolved, "%!\"\r\n") != null) return error.InvalidExe;
+    return .{ .shell = try std.fmt.allocPrintSentinel(alloc, "{s}\"{s}\"{s}", .{
+        raw[0..start], resolved, raw[end + @intFromBool(quoted) ..],
+    }, 0) };
+}
+
+test "PKG48 bare shell command uses child PATH without changing environment" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("trusted tools");
+    try tmp.dir.writeFile(.{ .sub_path = "trusted tools/pkg48probe.cmd", .data = "@echo TRUSTED\r\n" });
+    const path = try tmp.dir.realpathAlloc(alloc, "trusted tools");
+    var env = std.process.EnvMap.init(alloc);
+    try env.put("PATH", path);
+    try env.put("PATHEXT", ".CMD;.EXE");
+    try env.put("NoDefaultCurrentDirectoryInExePath", "user-value");
+    const expected = try std.fmt.allocPrint(alloc, "\"{s}\\pkg48probe.CMD\" arg && echo tail", .{path});
+    const result = try resolveShellCommand(alloc, .{ .shell = "pkg48probe arg && echo tail" }, &env);
+    try testing.expectEqualStrings(expected, result.shell);
+    try testing.expectEqualStrings("user-value", env.get("NoDefaultCurrentDirectoryInExePath").?);
+    const missing = try resolveShellCommand(alloc, .{ .shell = "pkg48_missing_program || echo fallback" }, &env);
+    try testing.expect(std.mem.endsWith(u8, missing.shell, "\\pkg48_missing_program\" || echo fallback"));
+    try testing.expect(missing.shell[0] == '"' and missing.shell[2] == ':');
+    for ([_][:0]const u8{ "echo hello > out.txt", "echo;hello", "echo,hello", "echo=hello", "set VALUE=1", "if exist out.txt type out.txt", ".\\pkg48probe.cmd", "C:pkg48probe.cmd", "%COMSPEC% /d /c echo hi", "(echo hi)" }) |raw| {
+        try testing.expectEqualStrings(raw, (try resolveShellCommand(alloc, .{ .shell = raw }, &env)).shell);
+    }
+    inline for (.{
+        .{ "echo.", "echo(" },                  .{ "echo.message", "echo(message" },
+        .{ "echo[message", "echo(message" },    .{ "echo]message", "echo(message" },
+        .{ "echo+message", "echo(message" },    .{ "dir.foo", "dir .foo" },
+        .{ "rem. harmless", "rem . harmless" }, .{ "ver.", "ver ." },
+        .{ "cd.", "cd ." },
+    }) |pair| {
+        try testing.expectEqualStrings(pair[1], (try resolveShellCommand(alloc, .{ .shell = pair[0] }, &env)).shell);
+    }
+    const quoted_builtin = try resolveShellCommand(alloc, .{ .shell = "@\"echo\" HELLO" }, &env);
+    try testing.expect(std.mem.startsWith(u8, quoted_builtin.shell, "@\""));
+    try testing.expect(std.mem.endsWith(u8, quoted_builtin.shell, "\\echo\" HELLO"));
 }
 
 /// App Execution Aliases are reparse points whose target cannot be opened

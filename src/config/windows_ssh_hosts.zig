@@ -133,7 +133,10 @@ const LoadContext = struct {
         while (try paths.next(self.alloc)) |raw_path| {
             defer self.alloc.free(raw_path);
             if (raw_path.len == 0) continue;
-            if (hasGlobMetacharacter(raw_path)) continue;
+            if (hasGlobMetacharacter(raw_path)) {
+                warnReadOnce(raw_path, error.GlobIncludeUnsupported);
+                continue;
+            }
             // Reject known remote/device paths before the bounded worker opens
             // them. An uncapped include count would still multiply worker and
             // filesystem overhead on every profile refresh.
