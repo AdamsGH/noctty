@@ -554,6 +554,12 @@ const StatusNote = enum {
     unsupported_encoding,
     /// The config path is a link whose target is missing.
     dangling_link,
+    /// The config file holds NUL bytes without a byte order mark.
+    binary_config,
+    /// A config file, or a file it includes, will not open. Names it.
+    file_unopenable,
+    /// The in-place rewrite stopped part way. Names the complete copy.
+    write_incomplete,
     close_failed,
     resolve_first,
     conflict_not_resolved,
@@ -571,12 +577,33 @@ const StatusNote = enum {
             .save_failed => "Save failed. Your edits are kept. Check that the config file can be written and is not open in another program, then try again.",
             .unsupported_encoding => "Nothing was saved: the config file is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.",
             .dangling_link => "Nothing was saved: the config file is a link to a file that does not exist. Fix or remove the link, then save again. Your edits are kept.",
+            .binary_config => "Nothing was saved: the config file contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .file_unopenable => "Nothing was saved: a config file cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.",
+            .write_incomplete => "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in a temporary file beside it. Copy that over the config file, then save again. Your edits are kept.",
             .close_failed => "Could not close the settings window; your edits are kept.",
             .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
             .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
             .disk_value_not_adopted => "Could not take the value from disk; your edit is kept.",
             .previews_live => "Previewing now. Save to keep it.",
             .applies_on_save => "Applies when you save.",
+        };
+    }
+
+    /// Whether the sentence can name the file it is about (`textWithDetail`).
+    fn takesDetail(self: StatusNote) bool {
+        return switch (self) {
+            .file_unopenable, .write_incomplete => true,
+            else => false,
+        };
+    }
+
+    /// `text` with the file named: what `detail` holds is a path, or a short
+    /// phrase ending in one. Owned.
+    fn textWithDetail(self: StatusNote, alloc: std.mem.Allocator, detail: []const u8) std.mem.Allocator.Error![]u8 {
+        return switch (self) {
+            .file_unopenable => std.fmt.allocPrint(alloc, "Nothing was saved: {s} cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.", .{detail}),
+            .write_incomplete => std.fmt.allocPrint(alloc, "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in {s}. Copy that over the config file, then save again. Your edits are kept.", .{detail}),
+            else => alloc.dupe(u8, self.text()),
         };
     }
 };
@@ -1317,6 +1344,18 @@ pub const SaveError = error{
     /// The config file is UTF-16 or UTF-32 text. Patching it with UTF-8 lines
     /// would leave a file that mixes encodings, so nothing is written.
     UnsupportedEncoding,
+    /// The config file holds NUL bytes but no byte order mark: a binary file,
+    /// or UTF-16 or UTF-32 text without one.
+    BinaryConfig,
+    /// A config file, or a file it includes, exists but will not open. The
+    /// load would skip it and apply the rest, so nothing is saved.
+    FileUnopenable,
+    /// The in-place rewrite of a hard-linked file stopped after its first
+    /// byte: the file may hold new bytes followed by old ones.
+    IncompleteWrite,
+    /// The palette's theme pick found the theme changed in the config file.
+    /// There is no conflict prompt there, so the pick is refused.
+    DiskChanged,
     /// Write + reload both succeeded, but at least one GUI-edited
     /// field is masked by a later layer (included `config-file`,
     /// subsequent `--config-file`, `--config-default-files=false`
@@ -1333,13 +1372,33 @@ pub const SaveReloadOutcome = union(enum) {
     failed: SaveError,
 };
 
-/// What the status line says about a save that wrote nothing. Most failures
-/// share one hint (the file cannot be written); a file in the wrong encoding
-/// and a link to nowhere are something the user can fix, so they are named.
+/// The file a failed save is about, when the status line should name it: an
+/// include that will not open, or the complete copy of a half-written config.
+/// Owned by whoever runs the save (`AppHandle.failureDetail` lends it).
+pub const FailureDetail = struct {
+    text: ?[]u8 = null,
+
+    pub fn set(self: *FailureDetail, alloc: std.mem.Allocator, text: []const u8) void {
+        self.clear(alloc);
+        self.text = alloc.dupe(u8, text) catch null;
+    }
+
+    pub fn clear(self: *FailureDetail, alloc: std.mem.Allocator) void {
+        if (self.text) |text| alloc.free(text);
+        self.text = null;
+    }
+};
+
+/// What the status line says about a save that wrote nothing (or, for
+/// `IncompleteWrite`, too little). Most failures share one hint (the file
+/// cannot be written); the ones the user can act on are named.
 fn saveFailureNote(err: SaveError) StatusNote {
     return switch (err) {
         error.UnsupportedEncoding => .unsupported_encoding,
+        error.BinaryConfig => .binary_config,
         error.DanglingLink => .dangling_link,
+        error.FileUnopenable => .file_unopenable,
+        error.IncompleteWrite => .write_incomplete,
         else => .save_failed,
     };
 }
@@ -1510,6 +1569,10 @@ pub const AppHandle = struct {
     /// an edit would lose it without a word. An error means the file could not
     /// be checked, and nothing is saved.
     reconcileDisk: ?*const fn (ctx: *anyopaque, pending: *const Config, original: *const Config) SaveError!void = null,
+    /// Optional. The file a save that just failed was about, for the errors
+    /// whose status sentence names one (`StatusNote.takesDetail`). Borrowed
+    /// until the next save.
+    failureDetail: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     /// Optional asynchronous two-phase persistence hook. The receiver must
     /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
     /// When absent, `saveAndReload` remains the synchronous compatibility path.
@@ -1589,6 +1652,9 @@ pub const SettingsWindow = struct {
     text_summary: ?HWND = null,
     text_status: ?HWND = null,
     status_note: StatusNote = .none,
+    /// The sentence for `status_note` when it names a file (`takesDetail`).
+    /// Owned; only meaningful while `status_note` takes a detail.
+    note_text: ?[]u8 = null,
     /// The status text measured for `status_measure_width` / `status_measure_dpi`:
     /// how wide it is on one line, and how tall it is wrapped to that width.
     /// `-1` means it has to be measured again.
@@ -1808,6 +1874,7 @@ pub const SettingsWindow = struct {
     }
 
     pub fn deinit(self: *SettingsWindow) void {
+        self.freeNoteText();
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) _ = sys.DestroyWindow(h);
         }
@@ -1998,8 +2065,31 @@ pub const SettingsWindow = struct {
     /// even while a conflict or a validation error holds the line, as the
     /// ad-hoc messages it replaces did.
     fn setNote(self: *SettingsWindow, note: StatusNote) void {
+        self.freeNoteText();
         self.status_note = note;
         self.setStatus(note.text());
+    }
+
+    /// `setNote` for a failed save: when the sentence names a file, the app
+    /// says which.
+    fn setSaveFailureNote(self: *SettingsWindow, err: SaveError) void {
+        const note = saveFailureNote(err);
+        self.setNote(note);
+        if (!note.takesDetail()) return;
+        const lend = self.handle.failureDetail orelse return;
+        const detail = lend(self.handle.ctx) orelse return;
+        self.note_text = note.textWithDetail(self.handle.alloc, detail) catch return;
+        self.setStatus(self.noteText());
+    }
+
+    fn freeNoteText(self: *SettingsWindow) void {
+        if (self.note_text) |text| self.handle.alloc.free(text);
+        self.note_text = null;
+    }
+
+    fn noteText(self: *const SettingsWindow) []const u8 {
+        if (self.note_text) |text| if (self.status_note.takesDetail()) return text;
+        return self.status_note.text();
     }
 
     /// What the status line says when no validation error or conflict holds it.
@@ -2010,16 +2100,19 @@ pub const SettingsWindow = struct {
             // These are about edits that are still there to be saved.
             .save_failed,
             .unsupported_encoding,
+            .binary_config,
             .dangling_link,
+            .file_unopenable,
+            .write_incomplete,
             .close_failed,
             .resolve_first,
             .conflict_not_resolved,
             .disk_value_not_adopted,
-            => if (self.hasPendingChanges()) return self.status_note.text(),
+            => if (self.hasPendingChanges()) return self.noteText(),
             .none, .previews_live, .applies_on_save => {},
         }
         if (!self.hasPendingChanges()) return nothing_to_save_text;
-        const text = self.status_note.text();
+        const text = self.noteText();
         return if (text.len != 0) text else unsaved_changes_text;
     }
 
@@ -4116,7 +4209,7 @@ pub const SettingsWindow = struct {
         if (self.conflictCount() == 0) if (self.handle.reconcileDisk) |reconcile| {
             if (self.pending) |*draft| if (self.original) |*baseline| reconcile(self.handle.ctx, draft, baseline) catch |err| {
                 std.log.warn("settings: could not check the config file before saving err={}; draft preserved", .{err});
-                self.setNote(saveFailureNote(err));
+                self.setSaveFailureNote(err);
                 self.updateSaveEnabled();
                 return;
             };
@@ -4175,7 +4268,7 @@ pub const SettingsWindow = struct {
                 // is fixed, or close the window to discard.
                 if (apply_id) |id| if (!self.failApply(id)) return;
                 std.log.warn("settings: save failed err={}; draft preserved", .{err});
-                self.setNote(saveFailureNote(err));
+                self.setSaveFailureNote(err);
                 self.updateSaveEnabled();
             },
         }
@@ -5860,6 +5953,15 @@ test "settings status line names an unusable encoding and a dangling link, and a
     try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.PathResolveFailed));
     try std.testing.expectEqual(StatusNote.unsupported_encoding, saveFailureNote(error.UnsupportedEncoding));
     try std.testing.expectEqual(StatusNote.dangling_link, saveFailureNote(error.DanglingLink));
+    try std.testing.expectEqual(StatusNote.binary_config, saveFailureNote(error.BinaryConfig));
+    try std.testing.expectEqual(StatusNote.file_unopenable, saveFailureNote(error.FileUnopenable));
+    try std.testing.expectEqual(StatusNote.write_incomplete, saveFailureNote(error.IncompleteWrite));
+    // The causes are told apart in words: a mark says UTF-16, NUL bytes say
+    // binary or unmarked UTF-16/32, and the others do not claim an encoding.
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.unsupported_encoding.text(), "UTF-16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.binary_config.text(), "NUL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.file_unopenable.text(), "UTF") == null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.write_incomplete.text(), "incomplete") != null);
     // Each note tells the person what to do, in words.
     const encoding = StatusNote.unsupported_encoding.text();
     try std.testing.expect(std.mem.indexOf(u8, encoding, "UTF-8") != null);
@@ -5867,6 +5969,41 @@ test "settings status line names an unusable encoding and a dangling link, and a
     const link = StatusNote.dangling_link.text();
     try std.testing.expect(std.mem.indexOf(u8, link, "link") != null);
     try expectNoInternalSyntax(link);
+}
+
+test "settings status line names the file a failed save is about" {
+    const Lender = struct {
+        text: ?[]const u8,
+        fn lend(ctx: *anyopaque) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.text;
+        }
+    };
+    var lender: Lender = .{ .text = "the included file C:\\dotfiles\\inc.conf" };
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &lender, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = undefined, .notifySuccess = undefined, .onClosed = undefined, .failureDetail = Lender.lend },
+    };
+    defer settings.freeNoteText();
+
+    // An include that will not open is named, with the way out.
+    settings.setSaveFailureNote(error.FileUnopenable);
+    try std.testing.expectEqual(StatusNote.file_unopenable, settings.status_note);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the included file C:\\dotfiles\\inc.conf cannot be opened") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "Nothing was saved") != null);
+
+    // A half-written config says it may be incomplete and where the whole text is.
+    lender.text = "C:\\dotfiles\\config.ghostty.tmp-1-2";
+    settings.setSaveFailureNote(error.IncompleteWrite);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "may now be incomplete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "kept in C:\\dotfiles\\config.ghostty.tmp-1-2") != null);
+
+    // Nothing lent, or an error with no file to name: the plain sentence.
+    lender.text = null;
+    settings.setSaveFailureNote(error.FileUnopenable);
+    try std.testing.expectEqualStrings(StatusNote.file_unopenable.text(), settings.noteText());
+    lender.text = "C:\\ignored";
+    settings.setSaveFailureNote(error.SerializeFailed);
+    try std.testing.expectEqualStrings(StatusNote.save_failed.text(), settings.noteText());
 }
 
 fn stubChromeBg(_: *anyopaque) COLORREF {

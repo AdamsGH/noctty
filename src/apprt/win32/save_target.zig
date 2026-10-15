@@ -50,6 +50,9 @@ pub const WriteError = error{
     TempCreateFailed,
     SerializeFailed,
     ReplaceFailed,
+    /// The in-place rewrite failed after its first byte: the file may hold new
+    /// bytes followed by old ones, and the complete text is in the kept copy.
+    IncompleteWrite,
 } || Allocator.Error;
 
 /// Follow `path` to the file it names. A name with no file behind it is the
@@ -180,8 +183,9 @@ fn isDeviceName(component: []const u8) bool {
 /// link is then replaced atomically, so a crash never leaves a half-written
 /// config; a hard-linked file is rewritten in place, because a replacement
 /// would leave the other names on the old bytes. That rewrite is not atomic:
-/// the temporary file stays if it fails, as the only complete copy.
-pub fn write(alloc: Allocator, target: Target, bytes: []const u8) WriteError!void {
+/// the temporary file stays if it fails, as the only complete copy, and
+/// `kept_copy` (when given) receives its path: owned by the caller.
+pub fn write(alloc: Allocator, target: Target, bytes: []const u8, kept_copy: ?*?[]u8) WriteError!void {
     const tmp_path = try std.fmt.allocPrint(
         alloc,
         "{s}.tmp-{x}-{x}",
@@ -211,10 +215,7 @@ pub fn write(alloc: Allocator, target: Target, bytes: []const u8) WriteError!voi
         const file = std.fs.cwd().openFile(target.path, .{ .mode = .write_only }) catch return error.ReplaceFailed;
         defer file.close();
         temp_pending = false;
-        errdefer log.warn("rewriting {s} in place failed; the complete new text is in {s}", .{ target.path, tmp_path });
-        file.writeAll(bytes) catch return error.SerializeFailed;
-        file.setEndPos(bytes.len) catch return error.SerializeFailed;
-        file.sync() catch return error.SerializeFailed;
+        try rewriteOpened(alloc, file, target.path, tmp_path, bytes, kept_copy);
         std.fs.cwd().deleteFile(tmp_path) catch {}; // The rewrite finished: the copy is no longer needed.
         return;
     }
@@ -231,6 +232,28 @@ pub fn write(alloc: Allocator, target: Target, bytes: []const u8) WriteError!voi
         }
     }
     temp_pending = false;
+}
+
+/// Put `bytes` into the opened `file`. From the first byte on the file may be
+/// half old and half new, so a failure is `IncompleteWrite`: logged, with the
+/// complete copy's path handed to `kept_copy`.
+fn rewriteOpened(
+    alloc: Allocator,
+    file: std.fs.File,
+    target_path: []const u8,
+    tmp_path: []const u8,
+    bytes: []const u8,
+    kept_copy: ?*?[]u8,
+) WriteError!void {
+    file.writeAll(bytes) catch return incompleteRewrite(alloc, target_path, tmp_path, kept_copy);
+    file.setEndPos(bytes.len) catch return incompleteRewrite(alloc, target_path, tmp_path, kept_copy);
+    file.sync() catch return incompleteRewrite(alloc, target_path, tmp_path, kept_copy);
+}
+
+fn incompleteRewrite(alloc: Allocator, target_path: []const u8, tmp_path: []const u8, kept_copy: ?*?[]u8) error{IncompleteWrite} {
+    log.warn("rewriting {s} in place failed; the complete new text is in {s}", .{ target_path, tmp_path });
+    if (kept_copy) |out| out.* = alloc.dupe(u8, tmp_path) catch null;
+    return error.IncompleteWrite;
 }
 
 const testing = std.testing;
@@ -334,7 +357,7 @@ test "save target of a missing file is the name itself, and the first save creat
     try testing.expectEqualStrings(path, target.path);
     try testing.expect(!target.hard_linked);
 
-    try write(testing.allocator, target, "font-size = 14\n");
+    try write(testing.allocator, target, "font-size = 14\n", null);
     try scratch.expectContent("config.ghostty", "font-size = 14\n");
     try scratch.expectNames(&.{"config.ghostty"});
 }
@@ -350,7 +373,7 @@ test "save target of a plain file is replaced atomically and leaves no temporary
     defer target.deinit(testing.allocator);
     try testing.expect(std.ascii.eqlIgnoreCase(path, target.path));
     try testing.expect(!target.hard_linked);
-    try write(testing.allocator, target, "new\n");
+    try write(testing.allocator, target, "new\n", null);
     try scratch.expectContent("config.ghostty", "new\n");
     try scratch.expectNames(&.{"config.ghostty"});
 }
@@ -373,7 +396,7 @@ test "save target follows a symbolic link and keeps it" {
     try testing.expect(std.ascii.eqlIgnoreCase(real, target.path));
     try testing.expect(!target.hard_linked);
 
-    try write(testing.allocator, target, "new\n");
+    try write(testing.allocator, target, "new\n", null);
     // The link is still a link, both names read the new bytes, and the
     // temporary file was made beside the real file, not beside the link.
     try testing.expect(try scratch.isLink("config.ghostty"));
@@ -402,7 +425,7 @@ test "save target follows a chain of links" {
     const target = try resolve(testing.allocator, link);
     defer target.deinit(testing.allocator);
     try testing.expect(std.ascii.eqlIgnoreCase(real, target.path));
-    try write(testing.allocator, target, "new\n");
+    try write(testing.allocator, target, "new\n", null);
     try testing.expect(try scratch.isLink("config.ghostty"));
     try testing.expect(try scratch.isLink("middle.conf"));
     try scratch.expectContent("real.conf", "new\n");
@@ -431,11 +454,11 @@ test "save target writes through hard links so every name sees the bytes" {
     defer target.deinit(testing.allocator);
     try testing.expect(target.hard_linked);
 
-    try write(testing.allocator, target, "new, and longer than before\n");
+    try write(testing.allocator, target, "new, and longer than before\n", null);
     try scratch.expectContent("config.ghostty", "new, and longer than before\n");
     try scratch.expectContent("dotfile", "new, and longer than before\n");
     // A shorter rewrite truncates: nothing of the old bytes is left behind.
-    try write(testing.allocator, target, "x\n");
+    try write(testing.allocator, target, "x\n", null);
     try scratch.expectContent("dotfile", "x\n");
     try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
 }
@@ -458,7 +481,7 @@ test "save target keeps a hard-linked file that cannot be opened as it was, with
     const target = try resolve(testing.allocator, path);
     defer target.deinit(testing.allocator);
     try testing.expect(target.hard_linked);
-    try testing.expectError(error.ReplaceFailed, write(testing.allocator, target, "new\n"));
+    try testing.expectError(error.ReplaceFailed, write(testing.allocator, target, "new\n", null));
     try scratch.expectContent("config.ghostty", "old\n");
     try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
 }
@@ -479,10 +502,33 @@ test "save target rewrites a hidden hard-linked file in place" {
     const target = try resolve(testing.allocator, path);
     defer target.deinit(testing.allocator);
     try testing.expect(target.hard_linked);
-    try write(testing.allocator, target, "new\n");
+    try write(testing.allocator, target, "new\n", null);
     try scratch.expectContent("config.ghostty", "new\n");
     try scratch.expectContent("dotfile", "new\n");
     try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
+}
+
+test "an in-place rewrite that fails after it started reports where the complete copy is" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "old\n" });
+    // A handle that cannot write stands in for a disk that fills up part way.
+    const file = try scratch.tmp.dir.openFile("config.ghostty", .{ .mode = .read_only });
+    defer file.close();
+
+    var kept: ?[]u8 = null;
+    defer if (kept) |path| testing.allocator.free(path);
+    try testing.expectError(
+        error.IncompleteWrite,
+        rewriteOpened(testing.allocator, file, "C:\\x\\config.ghostty", "C:\\x\\config.ghostty.tmp-1-2", "new\n", &kept),
+    );
+    try testing.expectEqualStrings("C:\\x\\config.ghostty.tmp-1-2", kept.?);
+
+    // Nobody listening is fine too.
+    try testing.expectError(
+        error.IncompleteWrite,
+        rewriteOpened(testing.allocator, file, "C:\\x\\config.ghostty", "C:\\x\\config.ghostty.tmp-1-2", "new\n", null),
+    );
 }
 
 test "save target keeps the extended form for a name with a trailing dot and writes that file" {
@@ -499,7 +545,7 @@ test "save target keeps the extended form for a name with a trailing dot and wri
     const target = try resolve(testing.allocator, dotted);
     defer target.deinit(testing.allocator);
     try testing.expectEqualStrings(dotted, target.path);
-    try write(testing.allocator, target, "new\n");
+    try write(testing.allocator, target, "new\n", null);
 
     const written = try std.fs.cwd().readFileAlloc(testing.allocator, dotted, 1024);
     defer testing.allocator.free(written);
