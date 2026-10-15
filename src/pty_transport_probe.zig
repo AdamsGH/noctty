@@ -39,6 +39,71 @@ const key_input_ready_marker = "NOCTTY-KEYS-READY";
 const key_input_begin_marker = "NOCTTY-KEYS-BEGIN";
 const key_input_end_marker = "NOCTTY-KEYS-END";
 
+/// The child writes nothing but lowercase hex digits between the key-input
+/// markers, but the in-box conhost re-renders that output: it can wrap the
+/// line, move the cursor, and put its window-title sequence (the test
+/// binary's path, `ESC ] 0 ; ... BEL`) in the middle of the digits. CI saw
+/// both an odd digit count and a non-hex byte that way (FLAKY-04), and the
+/// path carries a build hash, so one binary could fail every run. Keep the
+/// digits; drop escape sequences and line breaks; refuse anything else.
+fn keyInputHexDigits(allocator: std.mem.Allocator, region: []const u8) ![]u8 {
+    var digits: std.ArrayList(u8) = .empty;
+    errdefer digits.deinit(allocator);
+    var i: usize = 0;
+    while (i < region.len) {
+        const c = region[i];
+        if (c == 0x1b and i + 1 < region.len) {
+            switch (region[i + 1]) {
+                ']' => { // OSC, to BEL or ST
+                    i += 2;
+                    while (i < region.len) : (i += 1) {
+                        if (region[i] == 0x07) {
+                            i += 1;
+                            break;
+                        }
+                        if (region[i] == 0x1b and i + 1 < region.len and region[i + 1] == '\\') {
+                            i += 2;
+                            break;
+                        }
+                    }
+                },
+                '[' => { // CSI, to its final byte
+                    i += 2;
+                    while (i < region.len and (region[i] < 0x40 or region[i] > 0x7e)) : (i += 1) {}
+                    i += 1;
+                },
+                else => i += 2,
+            }
+            continue;
+        }
+        switch (c) {
+            '0'...'9', 'a'...'f' => try digits.append(allocator, c),
+            '\r', '\n' => {},
+            else => return error.KeyInputProbeUnexpectedByte,
+        }
+        i += 1;
+    }
+    return digits.toOwnedSlice(allocator);
+}
+
+test "key input probe reads the child's hex through conhost's re-rendering" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { raw: []const u8, digits: []const u8 }{
+        .{ .raw = "1b5b41", .digits = "1b5b41" },
+        // The title, BEL-terminated, splits a byte's two digits.
+        .{ .raw = "1b5\x1b]0;D:\\a\\noctty\\.zig-cache\\o\\e742\\ghostty-test.exe\x07b41", .digits = "1b5b41" },
+        // ST-terminated, then a wrap and a cursor move.
+        .{ .raw = "0d\x1b]0;C:\\x\x1b\\\r\n\x1b[2;1H0a", .digits = "0d0a" },
+        .{ .raw = "\x1b[?25l7f\x1b[?25h", .digits = "7f" },
+    };
+    for (cases) |case| {
+        const digits = try keyInputHexDigits(allocator, case.raw);
+        defer allocator.free(digits);
+        try std.testing.expectEqualStrings(case.digits, digits);
+    }
+    try std.testing.expectError(error.KeyInputProbeUnexpectedByte, keyInputHexDigits(allocator, "1g"));
+}
+
 /// Terminating byte the parent writes once every case has been sent. It is
 /// never part of a case payload or delimiter.
 const key_input_sentinel: u8 = 'Z';
@@ -998,7 +1063,9 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
                 output.items[begin..],
                 key_input_end_marker,
             ) orelse return error.KeyInputProbeEndMarkerMissing);
-            const received = try decodeHex(allocator, output.items[begin..end]);
+            const digits = try keyInputHexDigits(allocator, output.items[begin..end]);
+            defer allocator.free(digits);
+            const received = try decodeHex(allocator, digits);
             defer allocator.free(received);
 
             const info = ptypkg.conPtyInfo().?;
