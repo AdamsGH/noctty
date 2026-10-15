@@ -9809,6 +9809,10 @@ pub const App = struct {
     fn rollbackTabClose(self: *App, host: *Host, entry: *Host.CloseTabUndo, previous_active: usize) !void {
         _ = try host.restoreClosedTabEntryNative(entry);
         if (previous_active < host.tabs.items.len) host.active_tab = previous_active;
+        // The detach destroyed the tab's button, and activating an active
+        // tab that did not change rebuilds no strip.
+        runUiActionOrLog("tab close rollback chrome refresh failed", host.refreshChrome());
+        runUiActionOrLog("tab close rollback layout failed", host.layout());
         if (host.activeSurface()) |restored| self.activateSurface(restored);
     }
 
@@ -16037,6 +16041,51 @@ const Host = struct {
             log.warn("tab close failed err={}", .{err});
             return false;
         };
+    }
+
+    test "a background tab close that fails puts the tab back with its button" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(backgroundCloseRollbackTestBody);
+    }
+
+    fn backgroundCloseRollbackTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+            // The tabs have no shell IDs, so the shell detach fails after
+            // the native detach, as a real shell-side failure would.
+            .shell_runtime_initialized = true,
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        try host.refreshChrome();
+        try std.testing.expect(host.tabs.items[0].button_hwnd != null);
+        // B is in front with focus, so activating it again changes nothing.
+        surface_b.window_visible = true;
+        surface_b.window_focused = true;
+
+        try std.testing.expect(!host.closeTabInPlace(0));
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), host.active_tab);
+        try std.testing.expect(host.tabs.items[0].button_hwnd != null);
     }
 
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
