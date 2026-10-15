@@ -20,7 +20,7 @@ right thing.
 | Docked search                  | Query edit with Text/Text2/Value; named previous/next/close buttons; regex, case, and whole-word toggles carrying their pressed state; result count as a polite live region                                                                                                 | custom Text/Text2/Value provider on the query Edit plus noctty chrome providers on the buttons and the count                                                                                                                                                                                                    |
 | Universal Palette              | Stable list identity, navigable result rows, one selected-result announcement, query-edit focus                                                                                                                                                                             | noctty selection/list-item fragments plus a custom Text/Text2/Value provider on the native query Edit                                                                                                                                                                                                           |
 | Confirm prompt                 | Prompt heading and body announced when the prompt opens, and reachable afterwards; named accept / cancel buttons that can be invoked                                                                                                                                        | noctty chrome providers as polite live regions on the owner-drawn title and body children, plus the overlay `SettingsControlProvider` pair on the accept / cancel buttons (Button + Invoke)                                                                                                                     |
-| Host banners                   | Banner text announced when it appears or changes                                                                                                                                                                                                                            | noctty chrome provider as a live region                                                                                                                                                                                                                                                                         |
+| Host banners                   | Banner text announced when it appears or changes; named close, Open Release, Install and Dismiss buttons that can be invoked                                                                                                                                                | noctty chrome provider as a live region on the banner, plus noctty chrome providers on its buttons (Button + Invoke)                                                                                                                                                                                            |
 | Settings window                | Section name/role/selection and per-control name, role, and value                                                                                                                                                                                                           | `SettingsSectionGroupProvider`, `SettingsSectionProvider`, and `SettingsControlProvider`; native providers compose underneath and are the fallback when STA cannot be confirmed                                                                                                                                 |
 
 Terminal selection offsets are resolved against the plain-text formatter's
@@ -35,21 +35,21 @@ rows, context menus, WinRT toasts, the tab drag preview, and
 quick-terminal chrome.
 
 Keyboard reachability is a focus-region cycle: `cycle_focus_region`
-(F6 / Shift+F6 by default) moves real Win32 focus between the terminal
+(Ctrl+F6 / Ctrl+Shift+F6 by default) moves real Win32 focus between the terminal
 pane, the tab strip, the docked search query, and the host banner,
 skipping regions that are not on screen; Escape returns to the terminal.
 The order and the skip rule live in `src/apprt/win32/focus_region.zig`
 as a pure model with unit tests; `win32.zig` maps a region to the HWND
 that takes focus. Real focus is the contract, because each landing HWND
-raises its own UIA focus-changed event from `WM_SETFOCUS`. The host
-banner is not interactive but is a landing site, so its provider
-declares `IsKeyboardFocusable` explicitly rather than inheriting the
-role default. The cycle does not reach the individual docked-search
-buttons, the caption buttons, or overlay rows. The caption buttons sit in
-the UIA tree and are invokable, but they declare
-`IsKeyboardFocusable = false` for the same reason in the other direction:
-nothing moves real Win32 focus to them, so the tree must not say
-otherwise.
+raises its own UIA focus-changed event from `WM_SETFOCUS`. In the host
+banner, focus lands on its first button (Open Release or Install on the
+update notice, the close button on a message); the buttons are real
+BUTTON children with their own providers, and the banner text stays a
+live region that does not take focus. The cycle does not reach the
+individual docked-search buttons, the caption buttons, or overlay rows.
+The caption buttons sit in the UIA tree and are invokable, but they
+declare `IsKeyboardFocusable = false`: nothing moves real Win32 focus to
+them, so the tree must not say otherwise.
 
 Automated acceptance is `test/windows/interactive-win11-accessibility.ps1`.
 It emits exact-source/binary provenance with the UIA tree and requires

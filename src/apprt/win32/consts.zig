@@ -52,6 +52,10 @@ pub const MA_NOACTIVATE: LRESULT = 3;
 pub const SW_SHOW = 5;
 pub const SW_SHOWNOACTIVATE = 4;
 pub const SW_SHOWMINNOACTIVE = 7;
+pub const SW_SHOWMINIMIZED = 2;
+pub const SW_MINIMIZE = 6;
+pub const SW_SHOWNA = 8;
+pub const SW_FORCEMINIMIZE = 11;
 pub const SW_RESTORE = 9;
 pub const SW_MAXIMIZE = 3;
 pub const SW_HIDE = 0;
@@ -114,6 +118,9 @@ pub const SC_RESTORE: WPARAM = 0xF120;
 pub const SC_SIZE: WPARAM = 0xF000;
 pub const SC_MOVE: WPARAM = 0xF010;
 pub const WM_PAINT = 0x000F;
+pub const WM_PRINTCLIENT = 0x0318;
+pub const PRF_CLIENT: LPARAM = 0x0004;
+pub const GW_CHILD: UINT = 5;
 pub const WM_QUIT = 0x0012;
 pub const WM_TIMER = 0x0113;
 pub const WM_CTLCOLOREDIT = 0x0133;
@@ -129,6 +136,9 @@ pub const WM_RBUTTONUP = 0x0205;
 pub const WM_SETCURSOR = 0x0020;
 pub const WM_SETFOCUS = 0x0007;
 pub const WM_SETTINGCHANGE = 0x001A;
+pub const ENDSESSION_CLOSEAPP: usize = 0x00000001;
+pub const WM_ENDSESSION = 0x0016;
+pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_SIZE = 0x0005;
 pub const WM_SHOWWINDOW = 0x0018;
 pub const WM_WINDOWPOSCHANGED = 0x0047;
@@ -155,6 +165,10 @@ pub const WM_WINHOSTTY_RENDER_TRACE_TARGET = WM_APP + 9;
 /// Posted, never sent: the events must not be raised from inside the
 /// handler that changed the state.
 pub const WM_WINHOSTTY_UIA_CAPTION_SYNC = WM_APP + 10;
+/// Save the session from the message loop (see WM_DISPLAYCHANGE).
+pub const WM_WINHOSTTY_SESSION_CHECKPOINT = WM_APP + 11;
+/// Quit from the message loop (see `App.postQuit`).
+pub const WM_WINHOSTTY_QUIT = WM_APP + 12;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;
@@ -232,6 +246,7 @@ pub const ES_MULTILINE = 0x0004;
 pub const ES_AUTOVSCROLL = 0x0040;
 pub const ES_READONLY = 0x0800;
 pub const BN_CLICKED = 0;
+pub const BM_SETSTATE: UINT = 0x00F3;
 pub const BN_SETFOCUS = 6;
 pub const BN_KILLFOCUS = 7;
 pub const EM_SETSEL = 0x00B1;
@@ -248,6 +263,7 @@ pub const ODS_DISABLED = 0x0004;
 pub const ODS_FOCUS = 0x0010;
 pub const TME_HOVER = 0x00000001;
 pub const TME_LEAVE = 0x00000002;
+pub const TME_CANCEL = 0x80000000;
 pub const TME_NONCLIENT = 0x00000010;
 /// Sentinel `dwHoverTime`: use the system hover delay (SPI_GETMOUSEHOVERTIME).
 pub const HOVER_DEFAULT: u32 = 0xFFFFFFFF;
@@ -277,6 +293,7 @@ pub const DC_PEN: i32 = 19;
 pub const SPI_GETHIGHCONTRAST: UINT = 0x0042;
 pub const SPI_GETNONCLIENTMETRICS: UINT = 0x0029;
 pub const SPI_GETCLIENTAREAANIMATION: UINT = 0x1042;
+pub const SPI_GETMESSAGEDURATION: UINT = 0x2016;
 
 /// See src/apprt/win32_tween.zig for the scheduler contract.
 pub const TWEEN_TIMER_ID: UINT_PTR = 0x77684701; // "whgT1" in 32-bit hex
@@ -288,6 +305,8 @@ pub const SCROLLBAR_TIMER_INTERVAL_MS: UINT = 16;
 pub const RESIZE_SETTLE_TIMER_ID: UINT_PTR = 0x77684704; // "whgT4" in 32-bit hex
 pub const RESIZE_SETTLE_TIMER_INTERVAL_MS: UINT = 16;
 pub const TERMINAL_UIA_TIMER_ID: UINT_PTR = 0x77684705; // "whgT5" in 32-bit hex
+/// One-shot expiry of an `.info` host banner; see `Host.syncBannerExpiry`.
+pub const BANNER_TIMER_ID: UINT_PTR = 0x77684706; // "whgT6" in 32-bit hex
 pub const RESIZE_SETTLE_REPAINT_TICKS: u8 = 12;
 pub const FW_NORMAL: i32 = 400;
 pub const DEFAULT_CHARSET: u8 = 1;
@@ -424,6 +443,7 @@ pub const VK_OEM_4 = 0xDB;
 pub const VK_OEM_5 = 0xDC;
 pub const VK_OEM_6 = 0xDD;
 pub const VK_OEM_7 = 0xDE;
+pub const VK_PROCESSKEY = 0xE5;
 pub const VK_OEM_102 = 0xE2;
 pub const VK_PACKET = 0xE7;
 

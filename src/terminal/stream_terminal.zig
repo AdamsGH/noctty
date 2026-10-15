@@ -252,6 +252,7 @@ pub const Handler = struct {
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.terminal.semanticPrompt(value),
             .mouse_shape => self.terminal.mouse_shape = value,
+            .mouse_shape_reset => self.terminal.mouse_shape = .text,
             .color_operation => try self.colorOperation(value.op, &value.requests),
             .kitty_color_report => try self.kittyColorOperation(value),
 
@@ -741,6 +742,29 @@ test "basic print" {
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("Hello", str);
+}
+
+test "SUB in the ground state takes no cell" {
+    // A legacy text file ends in ^Z (SUB, 0x1A); typing it out must not
+    // print a glyph for it.
+    for ([_]bool{ false, true }) |bytewise| {
+        var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+        defer t.deinit(testing.allocator);
+
+        var s: Stream = .initAlloc(testing.allocator, .init(&t));
+        defer s.deinit();
+
+        if (bytewise) {
+            for ("a\x1ab") |c| s.next(c);
+        } else {
+            s.nextSlice("a\x1ab");
+        }
+        try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("ab", str);
+    }
 }
 
 test "cursor movement" {
@@ -2280,6 +2304,86 @@ test "window_title effect with empty title" {
     s.nextSlice("\x1b]2;\x1b\\");
     try testing.expect(t.getTitle() == null);
     try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+}
+
+test "window_title not changed by cancelled OSC" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var title_changed_count: usize = 0;
+        fn titleChanged(_: *Handler) void {
+            title_changed_count += 1;
+        }
+    };
+    S.title_changed_count = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.title_changed = &S.titleChanged;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    s.nextSlice("\x1b]2;before\x07");
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+
+    // Cancelled with CAN and SUB, fed in one slice.
+    s.nextSlice("\x1b]2;can\x18");
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+    s.nextSlice("\x1b]2;sub\x1a");
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+
+    // Cancelled with CAN and SUB, fed one byte at a time.
+    for ("\x1b]2;can\x18") |c| s.next(c);
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+    for ("\x1b]2;sub\x1a") |c| s.next(c);
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+
+    // An OSC that ends normally after a cancel still takes effect.
+    s.nextSlice("\x1b]2;after\x1b\\");
+    try testing.expectEqualStrings("after", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 2), S.title_changed_count);
+}
+
+test "OSC 22 with an empty shape resets the mouse shape" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    s.nextSlice("\x1b]22;crosshair\x07");
+    try testing.expectEqual(.crosshair, t.mouse_shape);
+
+    // An unknown name is still ignored.
+    s.nextSlice("\x1b]22;not-a-pointer-shape\x07");
+    try testing.expectEqual(.crosshair, t.mouse_shape);
+
+    // An empty name gives the pointer back.
+    s.nextSlice("\x1b]22;\x1b\\");
+    try testing.expectEqual(.text, t.mouse_shape);
+}
+
+test "RIS resets a palette entry set by OSC 4" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    s.nextSlice("\x1b]4;1;rgb:12/34/56\x1b\\");
+    try testing.expect(t.colors.palette.mask.isSet(1));
+    t.flags.dirty.palette = false;
+
+    s.nextSlice("\x1bc");
+    try testing.expectEqual(t.colors.palette.original[1], t.colors.palette.current[1]);
+    try testing.expect(!t.colors.palette.mask.isSet(1));
+    try testing.expect(t.flags.dirty.palette);
 }
 
 test "kitty_keyboard_query" {

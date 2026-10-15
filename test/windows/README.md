@@ -138,8 +138,9 @@ pwsh -NoProfile -File .\assert-interactive-runner.ps1 -OutputPath .\runner-evide
 
 ## powershell-shell-integration.ps1
 
-Manual check for PowerShell shell-integration prompt hooks, OSC output, URI
-escaping, feature flags, and cleanup. It is not wired into an automated runner.
+Behavioural check for PowerShell shell-integration prompt hooks, OSC output, URI
+escaping, feature flags, and cleanup. CI runs it under PowerShell 7 and Windows
+PowerShell 5.1 with isolated PSReadLine history.
 
 ```powershell
 pwsh -NoProfile -File .\powershell-shell-integration.ps1
@@ -303,6 +304,28 @@ Run with:
 powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-resize.ps1 -ResetState -TimeoutSeconds 15
 ```
 
+## interactive-win11-conpty-sync.ps1
+
+Differential check that noctty's screen agrees with ConPTY's own buffer after
+resizes, the search bar, splits, maximize, minimize and full-screen programs.
+Each scenario starts a portable copy of noctty on a hidden desktop, puts cmd,
+Windows PowerShell or pwsh into a known state, applies the trigger, and
+compares noctty's visible rows (UIA `TextPattern`) with ConPTY's (a helper that
+attaches to the shell's console and reads it with `ReadConsoleOutputW`), then
+types a marker and compares again. It never takes the foreground or touches
+the real profile, and it redirects PSReadLine's history (which ignores
+`APPDATA`) into the sandbox.
+
+Scenarios marked `Expect = 'desync'` are known bugs: they pass while they
+still differ and fail once they stop, so the fix removes the mark. `-Scenario`
+runs a subset and `-ListScenarios` lists them. Missing optional programs
+(`pwsh.exe`, Git for Windows' `vim.exe`) skip their scenarios. The headless
+counterpart is `src/terminal/resize_replay.zig`.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-conpty-sync.ps1 -ResetState
+```
+
 ## interactive-win11-ime-candidate.ps1
 
 Interactive Win11 validation for IME candidate anchoring. It launches
@@ -412,33 +435,32 @@ powershell.exe -ExecutionPolicy Bypass -File ..\..\scripts\interactive-win11.ps1
 
 ## test_dll_init.c
 
-Regression test for the DLL CRT initialization fix. Loads ghostty.dll
-at runtime and calls ghostty_info + ghostty_init to verify the MSVC C
-runtime is properly initialized.
+Packaged libghostty-vt smoke. Loads an explicit ghostty-vt.dll path and calls
+ghostty_build_info, ghostty_osc_new, and ghostty_osc_free to verify export and
+allocator initialization. The portable package CLI smoke compiles and runs it.
 
 ### Build
 
-First build ghostty.dll, then compile the test:
+From the repository root, build libghostty-vt and compile the test:
 
 ```powershell
-zig build -Dapp-runtime=none -Demit-exe=false
-zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
+zig build -Demit-lib-vt=true
+zig cc test/windows/test_dll_init.c -I include -lshell32 -o test_dll_init.exe
 ```
 
 ### Run
 
-From this directory:
+Pass the absolute path of the built or packaged DLL:
 
 ```powershell
-copy ..\..\zig-out\lib\ghostty.dll . && test_dll_init.exe
+.\test_dll_init.exe (Resolve-Path .\zig-out\bin\ghostty-vt.dll).Path
 ```
 
-Expected output (after the CRT fix):
+Expected output:
 
 ```text
-ghostty_info: <version string>
+libghostty-vt DLL smoke: 3/3 checks passed (version=<version string>)
 ```
 
-The ghostty_info call verifies the DLL loads and the CRT is initialized.
-Before the fix, loading the DLL would crash with "access violation writing
-0x0000000000000024".
+The OSC parser allocation and free exercise the DLL's C runtime. Missing
+exports, failed allocation, or an empty version fail the smoke.

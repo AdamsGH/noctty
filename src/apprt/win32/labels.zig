@@ -259,8 +259,8 @@ pub fn searchButtonKeyAction(vk: WPARAM, shift_pressed: bool) ?SearchButtonKeyAc
 
 pub fn dockedSearchCoreDirectionFromKeyAction(action: SearchButtonKeyAction) ?input.Binding.Action.NavigateSearch {
     return switch (action) {
-        .previous => .previous,
-        .next => .next,
+        .previous => dockedSearchButtonDirection(c.SEARCH_PREV_ID),
+        .next => dockedSearchButtonDirection(c.SEARCH_NEXT_ID),
         .dismiss => null,
     };
 }
@@ -287,6 +287,55 @@ pub fn dockedSearchArrowDirection(vk: WPARAM) ?input.Binding.Action.NavigateSear
         c.VK_DOWN => dockedSearchButtonDirection(c.SEARCH_NEXT_ID),
         else => null,
     };
+}
+
+/// The banner for the last tab of a window being closed. It names the key bound
+/// to `undo` (the first one found, in the way a hint is written: `Ctrl+Shift+Z`)
+/// and falls back when `undo` is unbound or customization makes dispatch ambiguous.
+pub fn tabClosedMessage(set: *const input.Binding.Set, options: struct { has_modifier_remaps: bool = false, us_layout: bool = false }, buf: []u8) []const u8 {
+    const fallback = "Tab closed. Use undo to restore it.";
+    if (options.has_modifier_remaps) return fallback;
+    var it = set.bindings.iterator();
+    const trigger = while (it.next()) |entry| {
+        switch (entry.value_ptr.*) {
+            .leaf => |leaf| if (leaf.action == .undo) break entry.key_ptr.*,
+            else => {},
+        }
+    } else return fallback;
+
+    switch (trigger.key) {
+        .unicode => |cp| {
+            // Only the exact US layout establishes these physical/text
+            // identities. Other layouts (including US-International and
+            // Turkish Q) can produce this letter from a different key or
+            // different shifted text, so use generic wording there.
+            if (!options.us_layout) return fallback;
+            if (cp < 'a' or cp > 'z') return fallback;
+            var overrides = set.bindings.iterator();
+            while (overrides.next()) |entry| {
+                if (!entry.key_ptr.mods.binding().equal(trigger.mods.binding())) continue;
+                switch (entry.key_ptr.key) {
+                    .physical => |key| if (key == input.Key.fromASCII(@intCast(cp)).?) return fallback,
+                    .unicode => |other| if (other == std.ascii.toUpper(@intCast(cp)) or
+                        (trigger.mods.ctrl and other == (cp & 0x1f))) return fallback,
+                    .catch_all => {},
+                }
+            }
+        },
+        .physical => |key| if (key.printable()) return fallback,
+        .catch_all => return fallback,
+    }
+
+    var writer: std.Io.Writer = .fixed(buf);
+    writer.writeAll("Tab closed. Press ") catch return fallback;
+    const key_start = writer.end;
+    writer.print("{f}", .{trigger}) catch return fallback;
+    // `Trigger.format` writes the config spelling, `ctrl+shift+z`.
+    for (buf[key_start..writer.end], key_start..) |*byte, i| {
+        if (i == key_start or buf[i - 1] == '+') byte.* = std.ascii.toUpper(byte.*);
+    }
+    writer.writeAll(" to undo.") catch return fallback;
+    return writer.buffered();
 }
 
 fn searchDirectionFromWheelDelta(delta: i16) input.Binding.Action.NavigateSearch {
@@ -1546,6 +1595,103 @@ fn appendCodepoint(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cp: u21) 
     try out.appendSlice(alloc, buf[0..len]);
 }
 
+/// What a program in the terminal asked to do with the clipboard (OSC 52).
+pub const ProgramClipboardRequest = enum { read, write };
+
+/// Its own wording, so the prompt cannot be taken for the one the user's
+/// own unsafe paste raises.
+pub fn programClipboardPromptTitle(request: ProgramClipboardRequest) []const u8 {
+    return switch (request) {
+        .read => "Let a program read your clipboard?",
+        .write => "Let a program change your clipboard?",
+    };
+}
+
+/// Cells, and code points, of the tab title a program's clipboard prompt
+/// quotes.
+const program_prompt_title_width = 24;
+
+/// The body of a program's clipboard prompt, which names the tab that asked
+/// by its number and title, as the tab strip shows them. The title is the
+/// program's own text, so it may not crowd out or disguise the words
+/// around it: it is cut to `program_prompt_title_width` cells and as many
+/// code points (zero-width marks take no cell, and stacked they draw over
+/// the line), and controls, line and paragraph separators, and
+/// bidirectional formatting characters (which would reorder the words
+/// after it; see `isBidiFormatting`) become U+FFFD.
+pub fn buildProgramClipboardPromptBody(
+    alloc: Allocator,
+    request: ProgramClipboardRequest,
+    tab_number: usize,
+    tab_title: ?[]const u8,
+) ![]u8 {
+    const raw = tab_title orelse "noctty";
+    const limit = program_prompt_title_width;
+    var title: std.ArrayListUnmanaged(u8) = .empty;
+    defer title.deinit(alloc);
+    var cells: usize = 0;
+    var count: usize = 0;
+    // Where "..." goes if the title turns out not to fit.
+    var cut: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) {
+        const decoded = decodeCodepoint(raw, i) orelse DecodedCodepoint{ .cp = 0xFFFD, .len = 1 };
+        i += decoded.len;
+        const cp = switch (decoded.cp) {
+            0...0x1F, 0x7F...0x9F, 0x2028, 0x2029 => 0xFFFD, // controls, line and paragraph separators
+            else => if (isBidiFormatting(decoded.cp)) 0xFFFD else decoded.cp,
+        };
+        cells += codepointWidth(cp);
+        count += 1;
+        if (cells > limit or count > limit) {
+            title.shrinkRetainingCapacity(cut);
+            try title.appendSlice(alloc, "...");
+            break;
+        }
+        try appendCodepoint(alloc, &title, cp);
+        if (cells <= limit - 3 and count <= limit - 3) cut = title.items.len;
+    }
+    return switch (request) {
+        .read => std.fmt.allocPrint(alloc, "Tab {d} ({s}) asked to read your clipboard. Allow sends it the text below.", .{ tab_number, title.items }),
+        .write => std.fmt.allocPrint(alloc, "Tab {d} ({s}) asked to replace your clipboard with the text below.", .{ tab_number, title.items }),
+    };
+}
+
+test "a program's clipboard prompt names its tab and cannot be reordered by its title" {
+    const alloc = std.testing.allocator;
+
+    const read = try buildProgramClipboardPromptBody(alloc, .read, 2, "vim");
+    defer alloc.free(read);
+    try std.testing.expectEqualStrings("Tab 2 (vim) asked to read your clipboard. Allow sends it the text below.", read);
+
+    const write = try buildProgramClipboardPromptBody(alloc, .write, 1, null);
+    defer alloc.free(write);
+    try std.testing.expectEqualStrings("Tab 1 (noctty) asked to replace your clipboard with the text below.", write);
+
+    const long = try buildProgramClipboardPromptBody(alloc, .read, 3, "\u{202E}abcdefghijklmnopqrstuvwxyz0123456789");
+    defer alloc.free(long);
+    try std.testing.expectEqualStrings(
+        "Tab 3 (\u{FFFD}abcdefghijklmnopqrst...) asked to read your clipboard. Allow sends it the text below.",
+        long,
+    );
+
+    // Marks that take no cell are cut by count.
+    const marks = "x" ++ "\u{0301}" ** 50;
+    const stacked = try buildProgramClipboardPromptBody(alloc, .write, 4, marks);
+    defer alloc.free(stacked);
+    try std.testing.expectEqualStrings(
+        "Tab 4 (x" ++ "\u{0301}" ** 20 ++ "...) asked to replace your clipboard with the text below.",
+        stacked,
+    );
+
+    const control = try buildProgramClipboardPromptBody(alloc, .read, 5, "a\x1b[2Jb\u{9B}c\u{2028}d");
+    defer alloc.free(control);
+    try std.testing.expectEqualStrings(
+        "Tab 5 (a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d) asked to read your clipboard. Allow sends it the text below.",
+        control,
+    );
+}
+
 /// Render `data` for the confirm preview pane.
 ///
 /// The payload is shown as it is, matching upstream Ghostty's GTK and
@@ -2133,10 +2279,11 @@ pub fn paletteCompletionText(descriptor: win32_palette.catalog.Descriptor) []con
         .action => |payload| payload.action,
         .recent_command => |payload| payload.action,
         .profile => |key| key,
-        .setting => |key| key,
         .theme => |name| name,
         .layout => |name| name,
-        .tab, .pane, .help => descriptor.item.title,
+        // A setting's payload is its internal tag; the title is what the row
+        // says and what the query has to match.
+        .tab, .pane, .help, .setting => descriptor.item.title,
     };
 }
 
@@ -4886,11 +5033,11 @@ test "win32 docked search key actions preserve semantic next and previous naviga
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     try std.testing.expectEqual(
-        input.Binding.Action.NavigateSearch.next,
+        input.Binding.Action.NavigateSearch.previous,
         dockedSearchCoreDirectionFromKeyAction(.next).?,
     );
     try std.testing.expectEqual(
-        input.Binding.Action.NavigateSearch.previous,
+        input.Binding.Action.NavigateSearch.next,
         dockedSearchCoreDirectionFromKeyAction(.previous).?,
     );
     try std.testing.expect(dockedSearchCoreDirectionFromKeyAction(.dismiss) == null);
@@ -5546,3 +5693,122 @@ test "win32 commandPaletteBannerText suggests tab overview action" {
 }
 
 // End of labels declarations.
+
+test "tabClosedMessage names the key bound to undo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [96]u8 = undefined;
+
+    var set: input.Binding.Set = .{};
+    try std.testing.expectEqualStrings(
+        "Tab closed. Use undo to restore it.",
+        tabClosedMessage(&set, .{ .us_layout = true }, &buf),
+    );
+
+    try set.put(arena.allocator(), .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true } }, .{ .new_tab = {} });
+    try std.testing.expectEqualStrings(
+        "Tab closed. Use undo to restore it.",
+        tabClosedMessage(&set, .{ .us_layout = true }, &buf),
+    );
+
+    try set.putFlags(
+        arena.allocator(),
+        .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } },
+        .{ .undo = {} },
+        .{ .performable = true },
+    );
+    try std.testing.expectEqualStrings(
+        "Tab closed. Press Ctrl+Shift+Z to undo.",
+        tabClosedMessage(&set, .{ .us_layout = true }, &buf),
+    );
+
+    // A physical key, and a buffer too small for the hint.
+    var other: input.Binding.Set = .{};
+    try other.put(arena.allocator(), .{ .key = .{ .physical = .f9 }, .mods = .{ .alt = true } }, .{ .undo = {} });
+    try std.testing.expectEqualStrings(
+        "Tab closed. Press Alt+F9 to undo.",
+        tabClosedMessage(&other, .{ .us_layout = true }, &buf),
+    );
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Tab closed. Use undo to restore it.",
+        tabClosedMessage(&other, .{ .us_layout = true }, &tiny),
+    );
+}
+
+test "PKG32 tabClosedMessage does not advertise a shadowed or remapped undo chord" {
+    var cfg = try @import("../../config.zig").Config.default(std.testing.allocator);
+    defer cfg.deinit();
+    var buf: [96]u8 = undefined;
+    const fallback = "Tab closed. Use undo to restore it.";
+    const set = &cfg.keybind.set;
+    try set.put(cfg._arena.?.allocator(), .{
+        .key = .{ .physical = .key_z },
+        .mods = .{ .ctrl = true, .shift = true },
+    }, .ignore);
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, .{ .us_layout = true }, &buf));
+
+    // Restore an unambiguous default, then introduce an actual modifier map.
+    set.remove(cfg._arena.?.allocator(), .{ .key = .{ .physical = .key_z }, .mods = .{ .ctrl = true, .shift = true } });
+    try std.testing.expectEqualStrings("Tab closed. Press Ctrl+Shift+Z to undo.", tabClosedMessage(set, .{ .us_layout = true }, &buf));
+    for ([_]u21{ 'Z', 0x1a }) |cp| {
+        const trigger: input.Binding.Trigger = .{ .key = .{ .unicode = cp }, .mods = .{ .ctrl = true, .shift = true } };
+        try set.put(cfg._arena.?.allocator(), trigger, .ignore);
+        try std.testing.expectEqualStrings(fallback, tabClosedMessage(set, .{ .us_layout = true }, &buf));
+        set.remove(cfg._arena.?.allocator(), trigger);
+    }
+    try cfg.@"key-remap".parse(cfg._arena.?.allocator(), "ctrl=alt");
+    try std.testing.expectEqualStrings(
+        fallback,
+        tabClosedMessage(set, .{ .us_layout = true, .has_modifier_remaps = cfg.@"key-remap".map.count() != 0 }, &buf),
+    );
+}
+
+test "PKG32 tabClosedMessage falls back for layout-dependent physical and text overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var set: input.Binding.Set = .{};
+    const mods: input.Mods = .{ .ctrl = true, .shift = true };
+    try set.put(alloc, .{ .key = .{ .unicode = 'i' }, .mods = mods }, .undo);
+    const physical: input.Binding.Trigger = .{ .key = .{ .physical = .quote }, .mods = mods };
+    try set.put(alloc, physical, .ignore);
+    // Turkish Q: the dotted i is VK_OEM_7 and its shifted text is U+0130.
+    const event: input.KeyEvent = .{
+        .action = .press,
+        .key = .quote,
+        .mods = mods,
+        .unshifted_codepoint = 'i',
+        .utf8 = "İ",
+    };
+    var buf: [96]u8 = undefined;
+    const fallback = "Tab closed. Use undo to restore it.";
+    try std.testing.expectEqual(input.Binding.Action.ignore, set.getEvent(event).?.value_ptr.leaf.action);
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(&set, .{}, &buf));
+    set.remove(alloc, physical);
+    try set.put(alloc, .{ .key = .{ .unicode = 'İ' }, .mods = mods }, .ignore);
+    try std.testing.expectEqual(input.Binding.Action.ignore, set.getEvent(event).?.value_ptr.leaf.action);
+    try std.testing.expectEqualStrings(fallback, tabClosedMessage(&set, .{}, &buf));
+}
+
+test "PKG32 default F3 and Shift+F3 match the docked search F3 and Enter directions" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var cfg = try @import("../../config.zig").Config.default(std.testing.allocator);
+    defer cfg.deinit();
+    const set = &cfg.keybind.set;
+
+    const f3 = set.get(.{ .key = .{ .physical = .f3 } }) orelse return error.F3Unbound;
+    const shift_f3 = set.get(.{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } }) orelse
+        return error.ShiftF3Unbound;
+    try std.testing.expectEqual(dockedSearchEnterDirection(false), f3.value_ptr.leaf.action.navigate_search);
+    try std.testing.expectEqual(dockedSearchEnterDirection(true), shift_f3.value_ptr.leaf.action.navigate_search);
+    try std.testing.expectEqual(
+        f3.value_ptr.leaf.action.navigate_search,
+        dockedSearchCoreDirectionFromKeyAction(searchButtonKeyAction(c.VK_F3, false).?).?,
+    );
+    try std.testing.expectEqual(
+        shift_f3.value_ptr.leaf.action.navigate_search,
+        dockedSearchCoreDirectionFromKeyAction(searchButtonKeyAction(c.VK_F3, true).?).?,
+    );
+}

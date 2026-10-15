@@ -2,6 +2,7 @@
 //! store temporary data and is destroyed on deinit.
 const TempDir = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 const Dir = std.fs.Dir;
@@ -29,12 +30,18 @@ pub fn init() !TempDir {
     var tmp_path_buf: [TMP_PATH_LEN:0]u8 = undefined;
     var rand_buf: [RANDOM_BYTES]u8 = undefined;
 
-    const dir = dir: {
+    // The parent is always a handle of our own, so `close` can close it.
+    // Without a temp directory it is the current directory opened again,
+    // never `std.fs.cwd()` itself, which on Windows is the process's own
+    // current-directory handle.
+    var dir = dir: {
         const cwd = std.fs.cwd();
-        const tmp_dir = allocTmpDir(std.heap.page_allocator) orelse break :dir cwd;
+        const tmp_dir = allocTmpDir(std.heap.page_allocator) orelse
+            break :dir try cwd.openDir(".", .{});
         defer freeTmpDir(std.heap.page_allocator, tmp_dir);
         break :dir try cwd.openDir(tmp_dir, .{});
     };
+    errdefer dir.close();
 
     // We now loop forever until we can find a directory that we can create.
     while (true) {
@@ -64,9 +71,21 @@ pub fn name(self: *TempDir) []const u8 {
 /// Finish with the temporary directory. This deletes all contents in the
 /// directory.
 pub fn deinit(self: *TempDir) void {
+    self.close(.delete);
+}
+
+pub const CloseMode = enum { delete, retain };
+
+/// Close the directory handles, optionally retaining the temporary directory
+/// and its contents on disk.
+pub fn close(self: *TempDir, mode: CloseMode) void {
     self.dir.close();
-    self.parent.deleteTree(self.name()) catch |err|
-        log.err("error deleting temp dir err={}", .{err});
+    switch (mode) {
+        .delete => self.parent.deleteTree(self.name()) catch |err|
+            log.err("error deleting temp dir err={}", .{err}),
+        .retain => {},
+    }
+    self.parent.close();
 }
 
 // The amount of random bytes to get to determine our filename.
@@ -79,17 +98,96 @@ const b64_encoder = std.base64.Base64Encoder.init(b64_alphabet, null);
 const b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".*;
 
 test {
-    var td = try init();
-    errdefer td.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path: []const u8 = undefined;
+    var handles: Handles = undefined;
+    {
+        var td = try init();
+        errdefer td.deinit();
 
-    const nameval = td.name();
-    try testing.expect(nameval.len > 0);
+        const nameval = td.name();
+        try testing.expect(nameval.len > 0);
 
-    // Can open a new handle to it proves it exists.
-    var dir = try td.parent.openDir(nameval, .{});
-    dir.close();
+        // Can open a new handle to it proves it exists.
+        var dir = try td.parent.openDir(nameval, .{});
+        dir.close();
 
-    // Should be deleted after we deinit
-    td.deinit();
-    try testing.expectError(error.FileNotFound, td.parent.openDir(nameval, .{}));
+        path = try td.parent.realpath(nameval, &path_buf);
+        handles = try .capture(&td);
+
+        // Should be deleted after we deinit.
+        td.deinit();
+    }
+
+    try handles.expectClosed();
+    try testing.expectError(error.FileNotFound, std.fs.openDirAbsolute(path, .{}));
 }
+
+test "close retains the temporary directory" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path: []const u8 = undefined;
+    var handles: Handles = undefined;
+    {
+        var td = try init();
+        errdefer td.deinit();
+
+        path = try td.parent.realpath(td.name(), &path_buf);
+        handles = try .capture(&td);
+
+        td.close(.retain);
+    }
+    defer std.fs.deleteDirAbsolute(path) catch {};
+
+    try handles.expectClosed();
+    var dir = try std.fs.openDirAbsolute(path, .{});
+    dir.close();
+}
+
+/// A TempDir's two handles and the directories they named.
+const Handles = struct {
+    values: [2]Dir.Handle,
+    ids: [2]?FileId,
+
+    fn capture(td: *const TempDir) !Handles {
+        const values: [2]Dir.Handle = .{ td.dir.fd, td.parent.fd };
+        var ids: [2]?FileId = undefined;
+        for (values, &ids) |value, *id| {
+            id.* = fileId(value);
+            if (builtin.os.tag == .windows) try testing.expect(id.* != null);
+        }
+        return .{ .values = values, .ids = ids };
+    }
+
+    /// Fails if a handle still names the directory it named before it was
+    /// closed. Any thread can be handed a closed handle value again at once,
+    /// so a handle value that is open again proves nothing.
+    fn expectClosed(self: Handles) !void {
+        for (self.values, self.ids) |value, id| {
+            const now = fileId(value) orelse continue;
+            try testing.expect(!std.meta.eql(now, id.?));
+        }
+    }
+};
+
+const FileId = struct { volume: u32, index_high: u32, index_low: u32 };
+
+/// The file `handle` refers to, or null if it is not an open file handle.
+fn fileId(handle: Dir.Handle) ?FileId {
+    switch (builtin.os.tag) {
+        .windows => {
+            var info: std.os.windows.BY_HANDLE_FILE_INFORMATION = undefined;
+            if (GetFileInformationByHandle(handle, &info) == 0) return null;
+            return .{
+                .volume = info.dwVolumeSerialNumber,
+                .index_high = info.nFileIndexHigh,
+                .index_low = info.nFileIndexLow,
+            };
+        },
+        else => return null,
+    }
+}
+
+extern "kernel32" fn GetFileInformationByHandle(
+    hFile: std.os.windows.HANDLE,
+    lpFileInformation: *std.os.windows.BY_HANDLE_FILE_INFORMATION,
+) callconv(.winapi) std.os.windows.BOOL;

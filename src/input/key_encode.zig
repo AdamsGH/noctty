@@ -31,6 +31,15 @@ pub const Options = struct {
     /// Kitty keyboard protocol flags.
     kitty_flags: KittyFlags = .disabled,
 
+    /// Use ConPTY-compatible encodings when no keyboard extension is requested.
+    /// The Windows application enables this; library callers retain the
+    /// traditional fixterms table unless they explicitly opt in.
+    windows_legacy: bool = false,
+
+    /// Terminal DEC mode 9001 (Win32 input mode). ConPTY requests it at
+    /// the start of every session. See `win32InputRecords`.
+    win32_input_mode: bool = false,
+
     /// Determines whether the "option" key on macOS is treated
     /// as "alt" or not. See the Ghostty `macos_option-as-alt` config
     /// docs for a more detailed description of why this is needed.
@@ -58,10 +67,31 @@ pub const Options = struct {
             .ignore_keypad_with_numlock = t.modes.get(.ignore_keypad_with_numlock),
             .modify_other_keys_state_2 = t.flags.modify_other_keys_2,
             .kitty_flags = t.screens.active.kitty_keyboard.current(),
+            .win32_input_mode = t.modes.get(.win32_input),
 
             // These can't be known from the terminal state.
             .macos_option_as_alt = .false,
         };
+    }
+
+    /// Whether key events are sent as Win32 input records: mode 9001 is
+    /// set and no application has asked for the Kitty keyboard protocol.
+    /// Windows Terminal applies the same rule (terminalInput.cpp,
+    /// `HandleKey`: "We have to prefer the kitty keyboard protocol, because
+    /// otherwise it would never be used"): an application that reads VT
+    /// bytes through ConPTY and asked for Kitty gets the encoding it asked
+    /// for, which passes through ConPTY unchanged, while a record would be
+    /// re-encoded by conhost without the protocol. modifyOtherKeys is no
+    /// exception, as it is none in Windows Terminal: conhost does not
+    /// implement it, so its re-encoding of the record is what such an
+    /// application receives there too; and once conhost has seen a record
+    /// it holds a lone ESC, or ESC plus one byte, back until more input
+    /// arrives (stateMachine.cpp, `EncounteredWin32InputModeSequence`), so
+    /// switching back to VT bytes would delay every Escape by a keystroke.
+    /// The kitty flags are the active screen's, so a TUI that popped them
+    /// on exit restores records.
+    pub fn win32InputRecords(self: Options) bool {
+        return self.win32_input_mode and self.kitty_flags.int() == 0;
     }
 };
 
@@ -78,6 +108,9 @@ pub fn encode(
     opts: Options,
 ) std.Io.Writer.Error!void {
     //std.log.warn("KEYENCODER event={} opts={}", .{ event, opts });
+    if (event.win32) |record| if (opts.win32InputRecords()) {
+        return try win32InputRecord(writer, event, record);
+    };
     return if (opts.kitty_flags.int() != 0) try kitty(
         writer,
         event,
@@ -87,6 +120,104 @@ pub fn encode(
         event,
         opts,
     );
+}
+
+/// Encode the key event as Win32 input mode records,
+/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, the sequence ConPTY turns back
+/// into `KEY_EVENT_RECORD`s (microsoft/terminal InputStateMachineEngine.cpp,
+/// `_GenerateWin32Key`). The fields follow the console host's own records
+/// (windowio.cpp, `HandleKeyEvent`): one record per UTF-16 unit the key
+/// translates to, each carrying the key's virtual key and scan code, or a
+/// single record with Uc 0 when it translates to nothing (function keys,
+/// modifiers, a dead key, Ctrl+comma). Releases get the same treatment: the
+/// console host translates key breaks too (`TranslateMessageEx` with
+/// `TM_POSTCHARBREAKS`), so its key-up record for Shift+Enter carries 13,
+/// measured against a real console window. Repeats are key downs. Every
+/// field is written, as Windows Terminal does (terminalInput.cpp,
+/// `_makeWin32Output`); the receiver's defaults are not relied on.
+fn win32InputRecord(
+    writer: *std.Io.Writer,
+    event: key.KeyEvent,
+    record: key.KeyEvent.Win32Record,
+) std.Io.Writer.Error!void {
+    const key_down: u8 = if (event.action == .release) 0 else 1;
+    const units = record.typed();
+    if (units.len == 0) return try writeWin32Record(writer, record, 0, key_down);
+    for (units) |unit| try writeWin32Record(writer, record, unit, key_down);
+}
+
+fn writeWin32Record(
+    writer: *std.Io.Writer,
+    record: key.KeyEvent.Win32Record,
+    unit: u16,
+    key_down: u8,
+) std.Io.Writer.Error!void {
+    try writer.print("\x1b[{};{};{};{};{};{}_", .{
+        record.vk,
+        record.scan_code,
+        unit,
+        key_down,
+        record.control_key_state,
+        record.repeat_count,
+    });
+}
+
+/// The line submissions in `data` when it is a run of Win32 input records
+/// as `win32InputRecord` writes them: one per key-down record of an
+/// unmodified Enter (character CR, none of the Shift, Ctrl and Alt bits),
+/// times its repeat count. Null when `data` is anything else, so the caller
+/// counts the CR bytes of a VT encoding instead. The records are what let a
+/// line editor tell a modified Enter apart: PSReadLine adds a continuation
+/// line on Shift+Enter and a line above on Ctrl+Enter, neither of which
+/// submits, so counting them would consume the shell's input mark while the
+/// user is still editing. A cooked console read does end the line on
+/// Shift+Enter's CR record; that submission goes uncounted on purpose, since
+/// the terminal cannot tell the reader apart and the line editor is the
+/// common one. Ctrl+Enter carries 10, which neither reader runs, like a bare
+/// LF. The lock bits (Caps, Num, Scroll Lock) and ENHANCED_KEY (the numpad
+/// Enter) do not modify.
+pub fn win32RecordSubmissions(data: []const u8) ?u32 {
+    if (data.len == 0) return null;
+    const modifiers = key.KeyEvent.Win32Record.ControlKeyState.modifiers;
+    var submissions: u32 = 0;
+    var rest = data;
+    while (rest.len > 0) {
+        if (!std.mem.startsWith(u8, rest, "\x1b[")) return null;
+        const end = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
+        var fields = std.mem.splitScalar(u8, rest[2..end], ';');
+        var values: [6]u32 = undefined;
+        for (&values) |*value| {
+            const field = fields.next() orelse return null;
+            value.* = std.fmt.parseInt(u32, field, 10) catch return null;
+        }
+        if (fields.next() != null) return null;
+        const unit, const key_down, const state, const repeat = .{ values[2], values[3], values[4], values[5] };
+        if (unit == '\r' and key_down == 1 and (state & modifiers) == 0) submissions +|= repeat;
+        rest = rest[end + 1 ..];
+    }
+    return submissions;
+}
+
+test "win32 input mode: line submissions are counted from the records" {
+    // An unmodified Enter submits, once per repeat, with the lock bits and
+    // ENHANCED_KEY (numpad Enter) set or not. Shift+Enter (PSReadLine's
+    // continuation line), Ctrl+Enter (10), a release and a key that is not
+    // Enter do not.
+    try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_"));
+    try testing.expectEqual(@as(?u32, 1), win32RecordSubmissions("\x1b[13;28;13;1;416;1_"));
+    try testing.expectEqual(@as(?u32, 3), win32RecordSubmissions("\x1b[13;28;13;1;0;3_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;13;1;2;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[13;28;10;1;8;1_\x1b[13;28;10;0;8;1_"));
+    try testing.expectEqual(@as(?u32, 0), win32RecordSubmissions("\x1b[65;30;97;1;0;1_\x1b[16;42;0;0;0;1_"));
+    // Anything that is not a whole run of records is left to the CR count.
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions(""));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\r"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0;1_\r"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0_"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0;1;2_"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;x;1;0;1_"));
+    try testing.expectEqual(@as(?u32, null), win32RecordSubmissions("\x1b[13;28;13;1;0;1"));
 }
 
 /// Perform Kitty keyboard protocol encoding of the key event.
@@ -332,10 +463,38 @@ fn legacy(
     // If we're in a dead key state then we never emit a sequence.
     if (event.composing) return;
 
+    const windows_legacy = builtin.os.tag == .windows and
+        opts.windows_legacy and opts.kitty_flags.int() == 0 and
+        !opts.modify_other_keys_state_2;
+
+    // ConPTY's console-record parser drops the distinct F13-F24 tilde
+    // codes. Its supported shifted F1-F12 forms carry these keys in legacy
+    // mode, at the cost of aliasing a physical Shift+F1-F12 chord.
+    const function_key, const function_mods = function: {
+        const value = @intFromEnum(event.key);
+        if (windows_legacy and value >= @intFromEnum(key.Key.f13) and value <= @intFromEnum(key.Key.f24)) {
+            const mapped: key.Key = @enumFromInt(value - 12);
+            var mods = all_mods;
+            mods.shift = true;
+            break :function .{ mapped, mods };
+        }
+        break :function .{ event.key, all_mods };
+    };
+
+    // ConPTY accepts modified F3 as CSI 1;<modifier>R, but drops the
+    // shared table's CSI 13;<modifier>~ form (including the F15 alias).
+    if (windows_legacy and function_key == .f3) {
+        for (function_keys.modifiers, 2..) |mods, modifier| {
+            if (mods.int() == function_mods.binding().int()) {
+                return try writer.print("\x1b[1;{}R", .{modifier});
+            }
+        }
+    }
+
     // If we match a PC style function key then that is our result.
     if (pcStyleFunctionKey(
-        event.key,
-        all_mods,
+        function_key,
+        function_mods,
         opts.cursor_key_application,
         opts.keypad_key_application,
         opts.ignore_keypad_with_numlock,
@@ -368,6 +527,26 @@ fn legacy(
             }
         }
 
+        // ConPTY cannot decode the CSI 27 modifier forms for these keys.
+        // Keep committed IME text above and negotiated keyboard modes intact.
+        if (windows_legacy) {
+            const byte: ?u8 = switch (event.key) {
+                .enter => '\r',
+                .escape => 0x1b,
+                .tab => if (all_mods.shift) null else '\t',
+                .backspace => if (all_mods.ctrl) 0x08 else 0x7f,
+                else => null,
+            };
+            if (byte) |char| {
+                if (all_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeByte(char);
+            }
+            if (event.key == .tab) {
+                if (all_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeAll("\x1b[Z");
+            }
+        }
+
         return try writer.writeAll(sequence);
     }
 
@@ -391,16 +570,35 @@ fn legacy(
         return;
     }
 
+    // Complete the Windows C0 table after the shared Ctrl mappings. Shift
+    // does not request fixterms in a console client; unsupported punctuation
+    // falls through to its text instead of an undecodable CSI sequence.
+    if (windows_legacy and all_mods.ctrl) {
+        const cp: ?u21 = if (event.utf8.len == 1)
+            event.utf8[0]
+        else if (event.utf8.len == 0)
+            event.key.codepoint()
+        else
+            null;
+        if (cp) |char| {
+            if (char >= '@' and char <= '~') {
+                if (binding_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeByte(@intCast(char & 0x1f));
+            }
+        }
+    }
+
     // If we have no UTF8 text then the only possibility is the
     // alt-prefix handling of unshifted codepoints... so we process that.
     const utf8 = event.utf8;
     if (utf8.len == 0) {
         if (try legacyAltPrefix(
+            writer,
             event,
             binding_mods,
             all_mods,
             opts,
-        )) |byte| try writer.print("\x1B{c}", .{byte});
+        )) return;
         return;
     }
 
@@ -471,7 +669,7 @@ fn legacy(
     // Let's see if we should apply fixterms to this codepoint.
     // At this stage of key processing, we only need to apply fixterms
     // to unicode codepoints if we have ctrl set.
-    if (event.mods.ctrl) csiu: {
+    if (event.mods.ctrl and !windows_legacy) csiu: {
         // Important: we want to use the original mods here, not the
         // effective mods. The fixterms spec states the shifted chars
         // should be sent uppercase but Kitty changes that behavior
@@ -517,13 +715,12 @@ fn legacy(
     // If we have alt-pressed and alt-esc-prefix is enabled, then
     // we need to prefix the utf8 sequence with an esc.
     if (try legacyAltPrefix(
+        writer,
         event,
         binding_mods,
         all_mods,
         opts,
-    )) |byte| {
-        return try writer.print("\x1B{c}", .{byte});
-    }
+    )) return;
 
     // If we are on macOS, command+keys do not encode text. It isn't
     // typical for command+keys on macOS to ever encode text. They
@@ -542,47 +739,41 @@ fn legacy(
 }
 
 fn legacyAltPrefix(
+    writer: *std.Io.Writer,
     event: key.KeyEvent,
     binding_mods: key.Mods,
     mods: key.Mods,
     opts: Options,
-) !?u8 {
+) std.Io.Writer.Error!bool {
     // This only takes effect with alt pressed
-    if (!binding_mods.alt or !opts.alt_esc_prefix) return null;
+    if (!binding_mods.alt or !opts.alt_esc_prefix) return false;
 
     // On macOS, we only handle option like alt in certain
     // circumstances. Otherwise, macOS does a unicode translation
     // and we allow that to happen.
     if (comptime builtin.os.tag == .macos) {
         switch (opts.macos_option_as_alt) {
-            .false => return null,
-            .left => if (mods.sides.alt == .right) return null,
-            .right => if (mods.sides.alt == .left) return null,
+            .false => return false,
+            .left => if (mods.sides.alt == .right) return false,
+            .right => if (mods.sides.alt == .left) return false,
             .true => {},
         }
     }
 
-    // Otherwise, we require utf8 to already have the byte represented.
-    const utf8 = event.utf8;
-    if (utf8.len == 1) {
-        if (std.math.cast(u8, utf8[0])) |byte| {
-            return byte;
-        }
-    }
-
-    // If UTF8 isn't set, we will allow unshifted codepoints through.
-    if (event.unshifted_codepoint > 0) {
-        if (std.math.cast(
-            u8,
-            event.unshifted_codepoint,
-        )) |byte| {
-            return byte;
-        }
-    }
-
-    // Else, we can't figure out the byte to alt-prefix so we
-    // exit this handling.
-    return null;
+    // Option-as-Alt on macOS uses the unshifted key when Option translated
+    // it into non-ASCII text. Single-byte text still wins (shifted punctuation).
+    const use_text = event.utf8.len > 0 and
+        (event.utf8.len == 1 or builtin.os.tag != .macos or event.unshifted_codepoint == 0);
+    var buf: [4]u8 = undefined;
+    const utf8 = if (use_text)
+        event.utf8
+    else if (event.unshifted_codepoint > 0) blk: {
+        const len = std.unicode.utf8Encode(event.unshifted_codepoint, &buf) catch return false;
+        break :blk buf[0..len];
+    } else return false;
+    try writer.writeByte(0x1b);
+    try writer.writeAll(utf8);
+    return true;
 }
 
 /// Determines whether the key should be encoded in the xterm
@@ -1948,6 +2139,268 @@ test "legacy: esc with utf8 (dead key state)" {
     try testing.expectEqualStrings("A", writer.buffered());
 }
 
+test "legacy: Windows console control table" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const cases = [_]struct { input: key.Key, text: []const u8, output: []const u8 }{
+        .{ .input = .bracket_left, .text = "[", .output = "\x1b" },
+        .{ .input = .key_i, .text = "i", .output = "\t" },
+        .{ .input = .key_m, .text = "m", .output = "\r" },
+        .{ .input = .period, .text = ".", .output = "." },
+        .{ .input = .semicolon, .text = ";", .output = ";" },
+        .{ .input = .quote, .text = "'", .output = "'" },
+        .{ .input = .backquote, .text = "`", .output = "\x00" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = case.input, .utf8 = case.text, .mods = .{ .ctrl = true } }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+}
+
+test "legacy: Windows console modified Enter and Escape" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for ([_]key.Key{ .enter, .escape }) |input| {
+        for (function_keys.modifiers) |mods| {
+            var buf: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try encode(&writer, .{ .key = input, .mods = mods }, .{ .windows_legacy = true });
+            const byte: u8 = if (input == .enter) '\r' else 0x1b;
+            const expected = [_]u8{ 0x1b, byte };
+            try testing.expectEqualStrings(if (mods.alt) &expected else expected[1..], writer.buffered());
+        }
+    }
+}
+
+test "legacy: Windows console Tab and Backspace modifiers" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for (function_keys.modifiers) |mods| {
+        var buf: [128]u8 = undefined;
+        var expected_buf: [8]u8 = undefined;
+        for ([_]key.Key{ .tab, .backspace }) |input| {
+            var writer: std.Io.Writer = .fixed(&buf);
+            var expected: std.Io.Writer = .fixed(&expected_buf);
+            if (mods.alt) try expected.writeByte(0x1b);
+            if (input == .tab) {
+                try expected.writeAll(if (mods.shift) "\x1b[Z" else "\t");
+            } else try expected.writeByte(if (mods.ctrl) 0x08 else 0x7f);
+            try encode(&writer, .{ .key = input, .mods = mods }, .{ .windows_legacy = true });
+            try testing.expectEqualStrings(expected.buffered(), writer.buffered());
+        }
+    }
+}
+
+test "legacy: Windows console shifted Ctrl and committed IME text" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const cases = [_]struct { input: key.Key, text: []const u8, output: []const u8 }{
+        .{ .input = .key_i, .text = "I", .output = "\t" },
+        .{ .input = .key_m, .text = "M", .output = "\r" },
+        .{ .input = .digit_2, .text = "@", .output = "\x00" },
+        .{ .input = .bracket_left, .text = "ő", .output = "ő" },
+        .{ .input = .enter, .text = "日", .output = "日" },
+        .{ .input = .escape, .text = "日", .output = "日" },
+        .{ .input = .backspace, .text = "日", .output = "" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = case.input, .utf8 = case.text, .mods = .{ .ctrl = true, .shift = true } }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+}
+
+test "legacy: Windows console option preserves requested keyboard protocols" {
+    const cases = [_]struct { event: key.KeyEvent, mok: []const u8, kitty: []const u8 }{
+        .{ .event = .{ .key = .bracket_left, .utf8 = "[", .unshifted_codepoint = '[', .mods = .{ .ctrl = true } }, .mok = "\x1b[27;5;91~", .kitty = "\x1b[91;5u" },
+        .{ .event = .{ .key = .enter, .mods = .{ .shift = true } }, .mok = "\x1b[27;2;13~", .kitty = "\x1b[13;2u" },
+        .{ .event = .{ .key = .escape, .mods = .{ .ctrl = true } }, .mok = "\x1b[27;5;27~", .kitty = "\x1b[27;5u" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .modify_other_keys_state_2 = true });
+        try testing.expectEqualStrings(case.mok, writer.buffered());
+        writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .kitty_flags = .{ .disambiguate = true } });
+        try testing.expectEqualStrings(case.kitty, writer.buffered());
+    }
+}
+
+fn win32Record(vk: u16, scan_code: u16, cs: u16, units: []const u16) key.KeyEvent.Win32Record {
+    var record: key.KeyEvent.Win32Record = .{
+        .vk = vk,
+        .scan_code = scan_code,
+        .control_key_state = cs,
+        .repeat_count = 1,
+    };
+    @memcpy(record.units[0..units.len], units);
+    record.units_len = @intCast(units.len);
+    return record;
+}
+
+test "win32 input mode: one record per translated unit, releases included" {
+    const shift_enter = win32Record(13, 28, 0x10, &.{13});
+    const cases = [_]struct { event: key.KeyEvent, output: []const u8 }{
+        // Shift+Enter: the record keeps the Shift that legacy CR loses. The
+        // release carries the unit the apprt translated the key break to, as
+        // the console host's own key-up record does.
+        .{ .event = .{ .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;1;16;1_" },
+        .{ .event = .{ .action = .repeat, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;1;16;1_" },
+        .{ .event = .{ .action = .release, .key = .enter, .mods = .{ .shift = true }, .win32 = shift_enter }, .output = "\x1b[13;28;13;0;16;1_" },
+        .{ .event = .{ .action = .release, .key = .f13, .win32 = win32Record(0x7C, 100, 0, &.{}) }, .output = "\x1b[124;100;0;0;0;1_" },
+        // Ctrl+[ carries the ESC Windows produced, with the real key.
+        .{ .event = .{ .key = .bracket_left, .utf8 = "[", .mods = .{ .ctrl = true }, .win32 = win32Record(0xDB, 26, 0x08, &.{0x1b}) }, .output = "\x1b[219;26;27;1;8;1_" },
+        // F13 is its own key, not a Shift+F1 alias; an enhanced key sets bit 8.
+        .{ .event = .{ .key = .f13, .win32 = win32Record(0x7C, 100, 0, &.{}) }, .output = "\x1b[124;100;0;1;0;1_" },
+        .{ .event = .{ .key = .arrow_left, .win32 = win32Record(0x25, 75, 0x100, &.{}) }, .output = "\x1b[37;75;0;1;256;1_" },
+        // Modifiers and dead keys are reported; legacy sends nothing for them.
+        .{ .event = .{ .key = .shift_left, .mods = .{ .shift = true }, .win32 = win32Record(0x10, 42, 0x10, &.{}) }, .output = "\x1b[16;42;0;1;16;1_" },
+        .{ .event = .{ .key = .quote, .composing = true, .win32 = win32Record(0xDE, 40, 0, &.{}) }, .output = "\x1b[222;40;0;1;0;1_" },
+        // A surrogate pair is two records with the same key, as two WM_CHARs are.
+        .{ .event = .{ .key = .unidentified, .utf8 = "\u{1F600}", .win32 = win32Record(0xE7, 0, 0, &.{ 0xD83D, 0xDE00 }) }, .output = "\x1b[231;0;55357;1;0;1_\x1b[231;0;56832;1;0;1_" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .win32_input_mode = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+}
+
+test "win32 input mode: repeat count and lock bits pass through" {
+    var record = win32Record(0x41, 30, 0x20 | 0x80, &.{'A'});
+    record.repeat_count = 3;
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .key_a, .utf8 = "A", .win32 = record }, .{ .win32_input_mode = true });
+    try testing.expectEqualStrings("\x1b[65;30;65;1;160;3_", writer.buffered());
+}
+
+test "win32 input mode: yields to requested protocols and to events without a record" {
+    const record = win32Record(13, 28, 0x10, &.{13});
+    const event: key.KeyEvent = .{ .key = .enter, .mods = .{ .shift = true }, .win32 = record };
+    const cases = [_]struct { opts: Options, output: []const u8 }{
+        .{ .opts = .{ .windows_legacy = true, .win32_input_mode = true, .kitty_flags = .{ .disambiguate = true } }, .output = "\x1b[13;2u" },
+        .{ .opts = .{ .windows_legacy = true, .win32_input_mode = false }, .output = if (builtin.os.tag == .windows) "\r" else "\x1b[27;2;13~" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, event, case.opts);
+        try testing.expectEqualStrings(case.output, writer.buffered());
+        try testing.expect(!case.opts.win32InputRecords());
+    }
+    try testing.expect((Options{ .win32_input_mode = true }).win32InputRecords());
+    // modifyOtherKeys is no exception (see `win32InputRecords`): the record
+    // still goes, and conhost re-encodes it for the application.
+    {
+        const opts: Options = .{ .windows_legacy = true, .win32_input_mode = true, .modify_other_keys_state_2 = true };
+        try testing.expect(opts.win32InputRecords());
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, event, opts);
+        try testing.expectEqualStrings("\x1b[13;28;13;1;16;1_", writer.buffered());
+    }
+
+    // Text with no physical key (an IME commit) is written as text; conhost
+    // synthesizes its own records for it.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .unidentified, .utf8 = "日" }, .{ .win32_input_mode = true });
+    try testing.expectEqualStrings("日", writer.buffered());
+    // Releases of such events, and of events without a record, send nothing.
+    writer = .fixed(&buf);
+    try encode(&writer, .{ .action = .release, .key = .enter }, .{ .win32_input_mode = true });
+    try testing.expectEqualStrings("", writer.buffered());
+}
+
+test "legacy: Alt UTF-8 text and codepoint fallback" {
+    const cases = [_]struct { text: []const u8, cp: u21 }{
+        .{ .text = "ö", .cp = 0xf6 },
+        .{ .text = "ß", .cp = 0xdf },
+        .{ .text = "ж", .cp = 0x436 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |empty| {
+            var buf: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try encode(&writer, .{
+                .key = .unidentified,
+                .utf8 = if (empty) "" else case.text,
+                .unshifted_codepoint = case.cp,
+                .mods = .{ .alt = true },
+            }, .{ .alt_esc_prefix = true, .macos_option_as_alt = .true });
+            try testing.expectEqual(@as(u8, 0x1b), writer.buffered()[0]);
+            try testing.expectEqualStrings(case.text, writer.buffered()[1..]);
+        }
+    }
+}
+
+test "legacy: Alt UTF-8 shifted text and disabled prefix" {
+    for ([_]bool{ false, true }) |prefix| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{
+            .utf8 = "Ö",
+            .unshifted_codepoint = 0xf6,
+            .mods = .{ .alt = true, .shift = true },
+        }, .{ .alt_esc_prefix = prefix, .macos_option_as_alt = .true });
+        const expected = if (!prefix) "Ö" else if (builtin.os.tag == .macos) "\x1bö" else "\x1bÖ";
+        try testing.expectEqualStrings(expected, writer.buffered());
+    }
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .unshifted_codepoint = 0xd800, .mods = .{ .alt = true } }, .{ .alt_esc_prefix = true, .macos_option_as_alt = .true });
+    try testing.expectEqualStrings("", writer.buffered());
+}
+
+test "legacy: F13 through F24" {
+    const inputs = [_]key.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
+    const outputs = [_][]const u8{ "\x1b[25~", "\x1b[26~", "\x1b[28~", "\x1b[29~", "\x1b[31~", "\x1b[32~", "\x1b[33~", "\x1b[34~", "\x1b[42~", "\x1b[43~", "\x1b[44~", "\x1b[45~" };
+    for (inputs, outputs) |input, output| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{});
+        try testing.expectEqualStrings(output, writer.buffered());
+    }
+    const codes = [_]u8{ 25, 26, 28, 29, 31, 32, 33, 34, 42, 43, 44, 45 };
+    for (inputs, codes, 57376..) |input, code, kitty_code| {
+        for (function_keys.modifiers, 2..) |mods, modifier| {
+            var buf: [128]u8 = undefined;
+            var expected_buf: [32]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try encode(&writer, .{ .key = input, .mods = mods }, .{});
+            const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{};{}~", .{ code, modifier });
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+        var buf: [128]u8 = undefined;
+        var expected_buf: [32]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{ .kitty_flags = .{ .report_all = true } });
+        const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{}u", .{kitty_code});
+        try testing.expectEqualStrings(expected, writer.buffered());
+    }
+}
+
+test "legacy: Windows console F13 through F24 aliases shifted function keys" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const inputs = [_]key.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
+    const outputs = [_][]const u8{ "\x1b[1;2P", "\x1b[1;2Q", "\x1b[1;2R", "\x1b[1;2S", "\x1b[15;2~", "\x1b[17;2~", "\x1b[18;2~", "\x1b[19;2~", "\x1b[20;2~", "\x1b[21;2~", "\x1b[23;2~", "\x1b[24;2~" };
+    for (inputs, outputs) |input, output| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = input }, .{ .windows_legacy = true });
+        try testing.expectEqualStrings(output, writer.buffered());
+    }
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .f13, .mods = .{ .ctrl = true } }, .{ .windows_legacy = true });
+    try testing.expectEqualStrings("\x1b[1;6P", writer.buffered());
+    writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .f24, .mods = .{ .ctrl = true, .alt = true } }, .{ .windows_legacy = true });
+    try testing.expectEqualStrings("\x1b[24;8~", writer.buffered());
+}
+
 test "legacy: ctrl+shift+minus (underscore on US)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2042,7 +2495,7 @@ test "legacy: alt+ф" {
     }, .{
         .alt_esc_prefix = true,
     });
-    try testing.expectEqualStrings("ф", writer.buffered());
+    try testing.expectEqualStrings(if (builtin.os.tag == .macos) "ф" else "\x1bф", writer.buffered());
 }
 
 test "legacy: ctrl+c" {

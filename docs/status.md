@@ -162,8 +162,10 @@ Win32-validated VT protocol coverage is tracked in
 ### Renderer
 
 - Terminal content renders with OpenGL 4.3+ via WGL.
-- Window chrome uses a separate D3D11/DirectComposition + DirectWrite
-  pipeline with GDI fallback; it never touches the terminal renderer.
+- Window chrome is painted with GDI. The D3D11/DirectComposition +
+  DirectWrite shell pipeline is not started at launch (its device graph cost
+  about 156 ms to first swap and 79 driver threads for banner text alone); it
+  never touches the terminal renderer.
 - Presentation is power- and visibility-aware: focused non-saver cadence is
   unchanged, unfocused and saver pacing is capped, and minimized or
   DWM-cloaked windows stop presenting. Details and measurement fields are in
@@ -173,7 +175,8 @@ Win32-validated VT protocol coverage is tracked in
 
 - Checks the stable release feed (GitHub Releases by default, overridable
   with `auto-update-feed-url`) on launch, unless a check succeeded in the
-  last 24 hours, and never replaces binaries silently.
+  last 24 hours, and never replaces binaries silently. A copy left open checks
+  again every six hours (the 24 hour limit still applies).
 - `auto-update = download` stages only releases whose checksum metadata and
   Authenticode signatures both verify. Portable ZIPs additionally require a
   publisher-signed manifest covering every payload file; releases without it

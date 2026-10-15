@@ -53,6 +53,7 @@ extern "user32" fn GetParent(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
 extern "user32" fn IsWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
 extern "user32" fn IsWindowEnabled(hWnd: com.HWND) callconv(.winapi) com.BOOL;
 extern "user32" fn IsWindowVisible(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+extern "user32" fn GetWindowLongPtrW(hWnd: com.HWND, nIndex: i32) callconv(.winapi) isize;
 extern "user32" fn IsChild(hWndParent: com.HWND, hWnd: com.HWND) callconv(.winapi) com.BOOL;
 extern "user32" fn GetGUIThreadInfo(idThread: u32, pgui: *GUITHREADINFO) callconv(.winapi) com.BOOL;
 extern "user32" fn GetWindowThreadProcessId(hWnd: com.HWND, lpdwProcessId: ?*u32) callconv(.winapi) u32;
@@ -1103,6 +1104,11 @@ pub const SettingsControlProvider = struct {
         combo_box,
         check_box,
         button,
+        /// A window that only clips and scrolls its children (the Settings
+        /// form viewport). It stays out of the control and content views,
+        /// so its children read as children of the window, as they did
+        /// before the viewport existed.
+        layout_pane,
     };
 
     base: com.IRawElementProviderSimple,
@@ -1113,6 +1119,9 @@ pub const SettingsControlProvider = struct {
     hwnd: com.HWND,
     role: Role,
     name: ?[]const u8,
+    /// The element that names this one (`UIA_LabeledByPropertyId`). Holds
+    /// a reference, released with this provider.
+    labeled_by: ?*com.IRawElementProviderSimple = null,
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
     viewport_fully_clipped: std.atomic.Value(bool),
@@ -1168,6 +1177,19 @@ pub const SettingsControlProvider = struct {
 
     pub fn detach(self: *SettingsControlProvider) void {
         self.detached.store(true, .release);
+    }
+
+    pub fn setLabeledBy(self: *SettingsControlProvider, label: *com.IRawElementProviderSimple) void {
+        _ = label.vtbl.AddRef(label);
+        if (self.labeled_by) |old| _ = old.vtbl.Release(old);
+        self.labeled_by = label;
+    }
+
+    /// An `ES_READONLY` EDIT, such as the confirm preview pane.
+    fn readOnly(self: *const SettingsControlProvider) bool {
+        const gwl_style = -16;
+        const es_readonly = 0x0800;
+        return self.role == .edit and (GetWindowLongPtrW(self.hwnd, gwl_style) & es_readonly) != 0;
     }
 
     pub fn setViewportFullyClipped(self: *SettingsControlProvider, fully_clipped: bool) void {
@@ -1261,6 +1283,7 @@ pub const SettingsControlProvider = struct {
         const self = fromBase(p);
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
+            if (self.labeled_by) |label| _ = label.vtbl.Release(label);
             self.alloc.destroy(self);
             return 0;
         }
@@ -1324,6 +1347,7 @@ pub const SettingsControlProvider = struct {
                 .combo_box => constants.UIA_ComboBoxControlTypeId,
                 .check_box => constants.UIA_CheckBoxControlTypeId,
                 .button => constants.UIA_ButtonControlTypeId,
+                .layout_pane => constants.UIA_PaneControlTypeId,
             }),
             constants.UIA_NamePropertyId => {
                 if (self.name) |name| {
@@ -1343,7 +1367,11 @@ pub const SettingsControlProvider = struct {
                 out.* = com.VARIANT.fromBstr(value);
             },
             constants.UIA_ValueIsReadOnlyPropertyId => if (self.role == .edit) {
-                out.* = com.VARIANT.fromBool(false);
+                out.* = com.VARIANT.fromBool(self.readOnly());
+            },
+            constants.UIA_LabeledByPropertyId => if (self.labeled_by) |label| {
+                _ = label.vtbl.AddRef(label);
+                out.* = com.VARIANT.fromUnknown(@ptrCast(label));
             },
             constants.UIA_FrameworkIdPropertyId => {
                 const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
@@ -1352,11 +1380,13 @@ pub const SettingsControlProvider = struct {
             },
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
-            => out.* = com.VARIANT.fromBool(true),
+            => out.* = com.VARIANT.fromBool(self.role != .layout_pane),
             constants.UIA_IsEnabledPropertyId => out.* = com.VARIANT.fromBool(IsWindowEnabled(self.hwnd) != 0),
-            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(self.role != .text),
+            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(
+                self.role != .text and self.role != .layout_pane,
+            ),
             constants.UIA_HasKeyboardFocusPropertyId => out.* = com.VARIANT.fromBool(
-                self.role != .text and hwndHasKeyboardFocus(self.hwnd),
+                self.role != .text and self.role != .layout_pane and hwndHasKeyboardFocus(self.hwnd),
             ),
             constants.UIA_IsOffscreenPropertyId => out.* = com.VARIANT.fromBool(settingsControlIsOffscreen(
                 IsWindowVisible(self.hwnd),
@@ -1416,6 +1446,7 @@ pub const SettingsControlProvider = struct {
             IsWindowEnabled(self.hwnd) != 0,
         );
         if (precondition != com.S_OK) return precondition;
+        if (self.readOnly()) return com.UIA_E_INVALIDOPERATION;
         return if (com.SetWindowTextW(self.hwnd, value) != 0) com.S_OK else com.E_INVALIDARG;
     }
 
@@ -1438,7 +1469,9 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return if (self.role == .edit) com.S_OK else com.UIA_E_INVALIDOPERATION;
+        if (self.role != .edit) return com.UIA_E_INVALIDOPERATION;
+        out.* = @intFromBool(self.readOnly());
+        return com.S_OK;
     }
 
     fn getHostRawElementProvider(
@@ -2046,10 +2079,9 @@ pub const ChromeControlState = struct {
     selection_container: ?*const fn (*anyopaque) ?*ChromeControlProvider = null,
     toggled: ?*const fn (*anyopaque, usize) bool = null,
     range_value: ?*const fn (*anyopaque) ChromeRangeValue = null,
-    /// Overrides the role's default keyboard focusability. The host
-    /// banner opts in: it is not interactive, but the window's
-    /// focus-region cycle can land real Win32 focus on it, and
-    /// `IsKeyboardFocusable` must say so rather than contradict the
+    /// Overrides the role's default keyboard focusability, for a control
+    /// that real Win32 focus reaches although its role is not interactive
+    /// (or the reverse): `IsKeyboardFocusable` must not contradict the
     /// focus-changed event a reader just received.
     keyboard_focusable: ?bool = null,
     use_com_threading: bool = false,
@@ -6800,9 +6832,8 @@ test "ChromeControlProvider keyboard focusability follows the role unless overri
     defer _ = ChromeControlProvider.Release(&notice.base);
     defer notice.detach();
 
-    // The host banner is the same role but is a focus-region landing
-    // site, so it must not claim to be unfocusable while the cycle
-    // parks real keyboard focus on it.
+    // The same role on a focus-region landing site must not claim to be
+    // unfocusable while the cycle parks real keyboard focus on it.
     const banner = try ChromeControlProvider.create(std.testing.allocator, hwnd, .{
         .ctx = context_ptr,
         .role = .live_text,
@@ -7068,6 +7099,82 @@ test "SettingsControlProvider exposes ValueProvider only for edit controls" {
         SettingsControlProvider.QueryInterface(&text.base, &com.IID_IValueProvider, &value),
     );
     try std.testing.expect(value == null);
+}
+
+test "SettingsControlProvider layout pane stays out of the control and content views" {
+    const win32 = struct {
+        extern "user32" fn CreateWindowExW(
+            dwExStyle: u32,
+            lpClassName: [*:0]const u16,
+            lpWindowName: [*:0]const u16,
+            dwStyle: u32,
+            x: i32,
+            y: i32,
+            nWidth: i32,
+            nHeight: i32,
+            hWndParent: ?com.HWND,
+            hMenu: ?*anyopaque,
+            hInstance: ?*anyopaque,
+            lpParam: ?*anyopaque,
+        ) callconv(.winapi) ?com.HWND;
+        extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+        extern "user32" fn SetFocus(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
+    };
+    const empty_title = std.unicode.utf8ToUtf16LeStringLiteral("");
+    const hwnd = win32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        empty_title,
+        0,
+        0,
+        0,
+        100,
+        100,
+        null,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+    // A field inside the pane has the focus; the pane must not claim it.
+    const child = win32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+        empty_title,
+        0x40000000,
+        0,
+        0,
+        80,
+        24,
+        hwnd,
+        @ptrFromInt(44),
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(child);
+    _ = win32.SetFocus(child);
+    try std.testing.expect(hwndHasKeyboardFocus(hwnd));
+
+    const pane = try SettingsControlProvider.create(std.testing.allocator, hwnd, .layout_pane, null);
+    defer _ = SettingsControlProvider.Release(&pane.base);
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&pane.base, constants.UIA_ControlTypePropertyId, &value));
+    try std.testing.expectEqual(constants.UIA_PaneControlTypeId, value.value.i4);
+    for ([_]i32{
+        constants.UIA_IsControlElementPropertyId,
+        constants.UIA_IsContentElementPropertyId,
+        constants.UIA_IsKeyboardFocusablePropertyId,
+        constants.UIA_HasKeyboardFocusPropertyId,
+    }) |property| {
+        try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&pane.base, property, &value));
+        try std.testing.expectEqual(com.VT_BOOL, value.vt);
+        try std.testing.expectEqual(@as(i16, 0), value.value.bool_val);
+    }
+    // A field keeps reading as a control.
+    const field = try SettingsControlProvider.create(std.testing.allocator, hwnd, .edit, "Font size");
+    defer _ = SettingsControlProvider.Release(&field.base);
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&field.base, constants.UIA_IsControlElementPropertyId, &value));
+    try std.testing.expect(value.value.bool_val != 0);
 }
 
 test "SettingsControlProvider exposes InvokeProvider only for buttons" {

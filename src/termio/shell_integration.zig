@@ -112,6 +112,16 @@ pub fn setup(
                 shell_fallback = shell != .powershell;
             }
         }
+
+        // WSL's bash.exe launcher starts a Linux distribution, which neither
+        // sees the ENV and GHOSTTY_* variables injection relies on (WSLENV
+        // does not list them) nor leaves the `--posix` it would be given.
+        if (shell == .bash) {
+            var bash_iter = try command.argIterator(alloc_arena);
+            defer bash_iter.deinit();
+            const bash = bash_iter.next() orelse return null;
+            if (try windows_shell.isWslBashLauncherPath(alloc_arena, bash)) return null;
+        }
     }
 
     const new_command: config.Command = switch (shell) {
@@ -582,6 +592,8 @@ test detectShell {
     try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "\"/a b/bash\"" }));
 }
 
+const expected_powershell_bootstrap_suffix = "'; try { if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Microsoft.PowerShell.Utility\\Write-Warning 'noctty PowerShell integration skipped: unsupported language mode.' -WarningAction Continue } else { $__ghostty_load_error_head = $null; if ($Error.Count) { $__ghostty_load_error_head = $Error[0] }; Microsoft.PowerShell.Core\\Import-Module ([Reflection.Assembly]::Load('Microsoft.PowerShell.Security').Location) -ErrorAction Stop; if ((Microsoft.PowerShell.Security\\Get-ExecutionPolicy -ErrorAction Stop) -eq 'AllSigned') { . $__ghostty_integration_path } else { . ([scriptblock]::Create([IO.File]::ReadAllText($__ghostty_integration_path))) } } } catch { while ($Error.Count -gt 0 -and -not [object]::ReferenceEquals($Error[0], $__ghostty_load_error_head)) { $Error.RemoveAt(0) }; Microsoft.PowerShell.Utility\\Write-Warning 'noctty PowerShell integration could not load (execution policy or script error).' -WarningAction Continue } }";
+
 test "setup powershell: interactive direct command auto injects" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -604,8 +616,8 @@ test "setup powershell: interactive direct command auto injects" {
     defer alloc.free(expected_path);
     const expected_command = try std.fmt.allocPrint(
         alloc,
-        "& {{ $__ghostty_utf8_console = $false; . '{s}' }}",
-        .{expected_path},
+        "& {{ $__ghostty_utf8_console = $false; $__ghostty_integration_path = '{s}{s}",
+        .{ expected_path, expected_powershell_bootstrap_suffix },
     );
     defer alloc.free(expected_command);
 
@@ -645,8 +657,8 @@ test "setup powershell: interactive shell command auto injects" {
     defer alloc.free(expected_path);
     const expected_command = try std.fmt.allocPrint(
         alloc,
-        "& {{ $__ghostty_utf8_console = $false; . '{s}' }}",
-        .{expected_path},
+        "& {{ $__ghostty_utf8_console = $false; $__ghostty_integration_path = '{s}{s}",
+        .{ expected_path, expected_powershell_bootstrap_suffix },
     );
     defer alloc.free(expected_command);
 
@@ -682,8 +694,8 @@ test "setup powershell: interactive shell command with quoted exe path auto inje
     defer alloc.free(expected_path);
     const expected_command = try std.fmt.allocPrint(
         alloc,
-        "& {{ $__ghostty_utf8_console = $false; . '{s}' }}",
-        .{expected_path},
+        "& {{ $__ghostty_utf8_console = $false; $__ghostty_integration_path = '{s}{s}",
+        .{ expected_path, expected_powershell_bootstrap_suffix },
     );
     defer alloc.free(expected_command);
 
@@ -807,8 +819,8 @@ test "setup powershell: slash-prefixed interactive launch auto injects" {
     defer alloc.free(expected_path);
     const expected_command = try std.fmt.allocPrint(
         alloc,
-        "& {{ $__ghostty_utf8_console = $false; . '{s}' }}",
-        .{expected_path},
+        "& {{ $__ghostty_utf8_console = $false; $__ghostty_integration_path = '{s}{s}",
+        .{ expected_path, expected_powershell_bootstrap_suffix },
     );
     defer alloc.free(expected_command);
 
@@ -899,7 +911,11 @@ const cmd_prompt_user_osc_a = "$E]133;A$E\\";
 // OSC 9;9 feeds the same cwd handler as OSC 7, so use its accepted URI form.
 // The kitty scheme keeps cmd's unescaped `$P` Windows path intact.
 const cmd_prompt_cwd = "$E]9;9;kitty-shell-cwd://localhost/$P$E\\";
-const cmd_prompt_prefix = cmd_prompt_osc_a ++ cmd_prompt_cwd;
+const cmd_prompt_mark_prefix = cmd_prompt_osc_a ++ cmd_prompt_cwd;
+// cmd never requests Kitty keys or modifyOtherKeys. Recover modes left by
+// an abnormally exited TUI when the shell next owns the terminal. Do not
+// reset on generic OSC 133 A: Kitty-aware shells use it too.
+const cmd_prompt_prefix = "$E[<99u$E[>4;0m" ++ cmd_prompt_mark_prefix;
 // What releases before `redraw=0` put in front of the prompt. A cmd started
 // from one of them inherits it through PROMPT, and gets today's prefix in its
 // place rather than a second wrapping.
@@ -946,12 +962,14 @@ fn buildCmdPrompt(alloc: Allocator, existing: ?[]const u8) ![]u8 {
         if (std.mem.indexOf(u8, current, cmd_prompt_prefix) != null) {
             return try alloc.dupe(u8, current);
         }
-        if (std.mem.indexOf(u8, current, cmd_prompt_legacy_prefix)) |at| {
-            return try std.mem.concat(alloc, u8, &.{
-                current[0..at],
-                cmd_prompt_prefix,
-                current[at + cmd_prompt_legacy_prefix.len ..],
-            });
+        for ([_][]const u8{ cmd_prompt_mark_prefix, cmd_prompt_legacy_prefix }) |old_prefix| {
+            if (std.mem.indexOf(u8, current, old_prefix)) |at| {
+                return try std.mem.concat(alloc, u8, &.{
+                    current[0..at],
+                    cmd_prompt_prefix,
+                    current[at + old_prefix.len ..],
+                });
+            }
         }
         if (std.mem.indexOf(u8, current, cmd_prompt_user_osc_a) != null) {
             return try alloc.dupe(u8, current);
@@ -1187,7 +1205,7 @@ test "cmd prompt construction defaults and preserves escapes" {
     defer testing.allocator.free(prompt);
 
     try testing.expectEqualStrings(
-        "$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\$P$G$E]133;B$E\\",
+        "$E[<99u$E[>4;0m$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\$P$G$E]133;B$E\\",
         prompt,
     );
 }
@@ -1199,7 +1217,7 @@ test "cmd prompt construction preserves user prompt" {
     defer testing.allocator.free(prompt);
 
     try testing.expectEqualStrings(
-        "$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\[$T] $P$_$$ $E]133;B$E\\",
+        "$E[<99u$E[>4;0m$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\[$T] $P$_$$ $E]133;B$E\\",
         prompt,
     );
 }
@@ -1221,7 +1239,7 @@ test "cmd prompt construction separates a dangling trailing dollar" {
     const dangling = try buildCmdPrompt(testing.allocator, "$P$G$");
     defer testing.allocator.free(dangling);
     try testing.expectEqualStrings(
-        "$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\$P$G$S$E]133;B$E\\",
+        "$E[<99u$E[>4;0m$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\$P$G$S$E]133;B$E\\",
         dangling,
     );
 
@@ -1229,7 +1247,7 @@ test "cmd prompt construction separates a dangling trailing dollar" {
     const balanced = try buildCmdPrompt(testing.allocator, "$P$G$$");
     defer testing.allocator.free(balanced);
     try testing.expectEqualStrings(
-        "$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\$P$G$$$E]133;B$E\\",
+        "$E[<99u$E[>4;0m$E]133;A;redraw=0$E\\$E]9;9;kitty-shell-cwd://localhost/$P$E\\$P$G$$$E]133;B$E\\",
         balanced,
     );
 
@@ -1260,6 +1278,18 @@ test "cmd prompt construction is idempotent" {
 
     try testing.expectEqualStrings(prompt, repeated);
     try testing.expectEqualStrings(clink_prefixed, prefixed_repeated);
+}
+
+test "PKG16 cmd prompt upgrades inherited marks without duplicating them" {
+    const alloc = std.testing.allocator;
+    const old = "clink:" ++ cmd_prompt_mark_prefix ++ "$P$G" ++ cmd_prompt_suffix;
+    const upgraded = try buildCmdPrompt(alloc, old);
+    defer alloc.free(upgraded);
+    const expected = "clink:" ++ cmd_prompt_prefix ++ "$P$G" ++ cmd_prompt_suffix;
+    try std.testing.expectEqualStrings(expected, upgraded);
+    const repeated = try buildCmdPrompt(alloc, upgraded);
+    defer alloc.free(repeated);
+    try std.testing.expectEqualStrings(expected, repeated);
 }
 
 test "cmd prompt construction upgrades a prompt wrapped before redraw=0" {
@@ -1920,6 +1950,37 @@ fn setupBashWithLaunchForm(
     return launch_command;
 }
 
+test "PKG17 WSL's bash.exe launcher gets no bash injection" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var res: TmpResourcesDir = try .init(alloc, .bash);
+    defer res.deinit();
+    const system_root = try std.process.getEnvVarOwned(alloc, "SystemRoot");
+    const launchers = [_][]const u8{
+        try std.fs.path.join(alloc, &.{ system_root, "System32", "bash.exe" }),
+        "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe",
+    };
+    for (launchers) |launcher| {
+        var env = EnvMap.init(alloc);
+        const result = try setup(alloc, res.path, .{
+            .direct = &.{ try alloc.dupeZ(u8, launcher), "--login", "-i" },
+        }, &env, null, false);
+        try std.testing.expect(result == null);
+        // Nothing was injected, so the launcher's environment is untouched.
+        try std.testing.expectEqual(@as(usize, 0), env.count());
+    }
+
+    // The same launch of Git's bash is integrated.
+    var env = EnvMap.init(alloc);
+    const result = (try setup(alloc, res.path, .{
+        .direct = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "--login", "-i" },
+    }, &env, null, false)).?;
+    try std.testing.expectEqual(Shell.bash, result.shell);
+    try std.testing.expect(env.get("ENV") != null);
+}
+
 test "PKG08 bash direct argv preserves Program Files and quoted arguments" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     var arena = ArenaAllocator.init(std.testing.allocator);
@@ -2576,6 +2637,28 @@ test "zsh: missing resources" {
 
     try testing.expect(try setupZsh(alloc, .{ .shell = "zsh" }, resources_dir, &env) == null);
     try testing.expectEqual(0, env.count());
+}
+
+test "the shell-integration scripts have LF line endings in every checkout" {
+    // The release package ships these files as they are. `.gitattributes`
+    // pins them to LF; without that pin, a checkout with `core.autocrlf=true`
+    // (Git for Windows' default) ships CRLF, as v1.3.131 did, and a strict
+    // bash rejects the CR. The PowerShell script is pinned by `*.ps1`.
+    const scripts = .{
+        .{ "bash/ghostty.bash", @embedFile("../shell-integration/bash/ghostty.bash") },
+        .{ "cmd/clink.lua", @embedFile("../shell-integration/cmd/clink.lua") },
+        .{ "elvish/lib/ghostty-integration.elv", @embedFile("../shell-integration/elvish/lib/ghostty-integration.elv") },
+        .{ "fish/vendor_conf.d/ghostty-shell-integration.fish", @embedFile("../shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish") },
+        .{ "nushell/vendor/autoload/ghostty.nu", @embedFile("../shell-integration/nushell/vendor/autoload/ghostty.nu") },
+        .{ "zsh/.zshenv", @embedFile("../shell-integration/zsh/.zshenv") },
+        .{ "zsh/ghostty-integration", @embedFile("../shell-integration/zsh/ghostty-integration") },
+    };
+    inline for (scripts) |script| {
+        std.testing.expect(std.mem.indexOfScalar(u8, script[1], '\r') == null) catch |err| {
+            std.debug.print("CR in shell-integration/{s}\n", .{script[0]});
+            return err;
+        };
+    }
 }
 
 /// Test helper that creates a temporary resources directory with shell integration paths.

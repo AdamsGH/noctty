@@ -19,6 +19,7 @@ pub const UIA_TabItemControlTypeId: i32 = 50019;
 pub const UIA_TextControlTypeId: i32 = 50020;
 pub const UIA_DocumentControlTypeId: i32 = 50030;
 pub const UIA_WindowControlTypeId: i32 = 50032;
+pub const UIA_PaneControlTypeId: i32 = 50033;
 pub const UIA_ToolTipControlTypeId: i32 = 50042;
 
 // ── Pattern IDs ────────────────────────────────────────────────────────
@@ -40,6 +41,7 @@ pub const UIA_LocalizedControlTypePropertyId: i32 = 30004;
 pub const UIA_NamePropertyId: i32 = 30005;
 pub const UIA_IsKeyboardFocusablePropertyId: i32 = 30009;
 pub const UIA_IsOffscreenPropertyId: i32 = 30022;
+pub const UIA_LabeledByPropertyId: i32 = 30018;
 pub const UIA_HasKeyboardFocusPropertyId: i32 = 30008;
 pub const UIA_IsEnabledPropertyId: i32 = 30010;
 pub const UIA_HelpTextPropertyId: i32 = 30013;

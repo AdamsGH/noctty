@@ -4,6 +4,7 @@ const std = @import("std");
 const windows = std.os.windows;
 const win32_types = @import("../win32_types.zig");
 const c = @import("consts.zig");
+const ole = @import("../win32_ole.zig");
 
 const ATOM = win32_types.ATOM;
 const LPCWSTR = win32_types.LPCWSTR;
@@ -439,6 +440,13 @@ pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) cal
 
 pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 
+pub extern "ole32" fn OleInitialize(pvReserved: ?*anyopaque) callconv(.winapi) i32;
+pub extern "ole32" fn OleUninitialize() callconv(.winapi) void;
+pub extern "ole32" fn RegisterDragDrop(hwnd: HWND, target: *anyopaque) callconv(.winapi) i32;
+pub extern "ole32" fn RevokeDragDrop(hwnd: HWND) callconv(.winapi) i32;
+pub extern "ole32" fn DoDragDrop(data: *anyopaque, source: *anyopaque, effects: DWORD, effect: *DWORD) callconv(.winapi) i32;
+pub extern "ole32" fn ReleaseStgMedium(medium: *ole.STGMEDIUM) callconv(.winapi) void;
+
 pub extern "ntdll" fn RtlGetVersion(lpVersionInformation: *RTL_OSVERSIONINFOW) callconv(.winapi) i32;
 
 /// Atomic replace of an existing file. Used by the settings save path
@@ -465,6 +473,8 @@ pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
 pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
 
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+pub extern "kernel32" fn SetProcessShutdownParameters(dwLevel: DWORD, dwFlags: DWORD) callconv(.winapi) BOOL;
 
 pub extern "kernel32" fn SetThreadErrorMode(dwNewMode: DWORD, lpOldMode: ?*DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn SetDefaultDllDirectories(directory_flags: DWORD) callconv(.winapi) BOOL;
@@ -595,6 +605,8 @@ pub extern "kernel32" fn GlobalLock(hMem: ?*anyopaque) callconv(.winapi) ?*anyop
 
 pub extern "kernel32" fn GlobalUnlock(hMem: ?*anyopaque) callconv(.winapi) BOOL;
 
+pub extern "kernel32" fn GlobalSize(hMem: ?*anyopaque) callconv(.winapi) usize;
+
 pub extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
 
 pub extern "gdi32" fn DescribePixelFormat(hdc: HDC, format: i32, size: UINT, ppfd: *PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
@@ -676,6 +688,8 @@ pub extern "shell32" fn ShellExecuteW(
 
 pub extern "shell32" fn DragAcceptFiles(hWnd: HWND, fAccept: BOOL) callconv(.winapi) void;
 
+pub extern "shlwapi" fn AssocIsDangerous(pszAssoc: LPCWSTR) callconv(.winapi) BOOL;
+
 pub extern "shell32" fn DragQueryFileW(hDrop: *anyopaque, iFile: UINT, lpszFile: ?[*]u16, cch: UINT) callconv(.winapi) UINT;
 
 pub extern "shell32" fn DragFinish(hDrop: *anyopaque) callconv(.winapi) void;
@@ -683,6 +697,7 @@ pub extern "shell32" fn DragFinish(hDrop: *anyopaque) callconv(.winapi) void;
 pub extern "user32" fn EnableWindow(hWnd: HWND, bEnable: BOOL) callconv(.winapi) BOOL;
 
 pub extern "user32" fn GetParent(hWnd: HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn GetWindow(hWnd: HWND, uCmd: UINT) callconv(.winapi) ?HWND;
 
 pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 

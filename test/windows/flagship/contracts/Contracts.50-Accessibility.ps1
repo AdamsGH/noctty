@@ -1585,11 +1585,11 @@ $settingsSourcePins = @(
         Description = 'settings clipped-control traversal uses the named count'
     },
     @{
-        Pattern = '(?s)fn syncClosePromptText\(self: \*SettingsWindow.*?setWindowTextUtf8\(text, closePromptText\(self\.save_in_flight\)\).*?fn closePromptText\(save_in_flight: bool\) \[\]const u8.*?fn closePromptMeasuredHeight\(self: \*SettingsWindow.*?utf8ToW\(&text_w, closePromptText\(self\.save_in_flight\)\)'
+        Pattern = '(?s)fn syncClosePromptText\(self: \*SettingsWindow.*?setWindowTextUtf8\(text, closePromptText\(self\.save_in_flight, self\.quit_after_close\)\).*?fn closePromptText\(save_in_flight: bool, quitting: bool\) \[\]const u8.*?fn closePromptMeasuredHeight\(self: \*SettingsWindow.*?utf8ToW\(&text_w, closePromptText\(self\.save_in_flight, self\.quit_after_close\)\)'
         Description = 'close prompt display and measurement share closePromptText'
     },
     @{
-        Pattern = '(?s)clickedButton\(id, notify, BTN_SAVE\).*?IsWindowEnabled\(button\).*?IsWindowVisible\(button\).*?saveCommandCanDispatch\(\s*o\.close_prompt_visible,\s*o\.save_in_flight,\s*o\.close_posted,\s*button_enabled,\s*button_visible,\s*\).*?o\.save\(\)'
+        Pattern = '(?s)fn saveIfAllowed\(self: \*SettingsWindow\).*?IsWindowEnabled\(button\).*?IsWindowVisible\(button\).*?saveCommandCanDispatch\(\s*self\.close_prompt_visible,\s*self\.save_in_flight,\s*self\.close_posted,\s*button_enabled,\s*button_visible,\s*\).*?self\.save\(\).*?clickedButton\(id, notify, BTN_SAVE\).*?o\.saveIfAllowed\(\)'
         Description = 'save dispatch revalidates the live prompt and button state'
     },
     @{
@@ -1632,7 +1632,7 @@ $focusProviderPins = @(
         Description = 'SettingsSectionProvider focus-event publishing'
     },
     @{
-        Pattern = '(?s)const SettingsControlProvider = struct.*?constants\.UIA_HasKeyboardFocusPropertyId => out\.\* = com\.VARIANT\.fromBool\(\s*self\.role != \.text and hwndHasKeyboardFocus\(self\.hwnd\)'
+        Pattern = '(?s)const SettingsControlProvider = struct.*?constants\.UIA_HasKeyboardFocusPropertyId => out\.\* = com\.VARIANT\.fromBool\(\s*self\.role != \.text and self\.role != \.layout_pane and hwndHasKeyboardFocus\(self\.hwnd\)'
         Description = 'SettingsControlProvider HasKeyboardFocus property reporting'
     },
     @{

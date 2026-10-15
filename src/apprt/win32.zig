@@ -10,6 +10,8 @@ const CoreSurface = @import("../Surface.zig");
 const cli_args = @import("../cli/args.zig");
 const configpkg = @import("../config.zig");
 const config_edit = @import("../config/edit.zig");
+const config_file_load = @import("../config/file_load.zig");
+const cli_diagnostics = @import("../cli/diagnostics.zig");
 const themepkg = @import("../config/theme.zig");
 const windows_shell = @import("../config/windows_shell.zig");
 const windows_ssh_hosts = @import("../config/windows_ssh_hosts.zig");
@@ -46,6 +48,7 @@ const win32_link_preview = @import("win32_link_preview.zig");
 const win32_quick_terminal = @import("win32_quick_terminal.zig");
 const win32_surface_drop = @import("win32_surface_drop.zig");
 const win32_surface_drop_target = @import("win32_surface_drop_target.zig");
+const win32_ole = @import("win32_ole.zig");
 const win32_toast_activation = @import("win32_toast_activation.zig");
 const win32_tab_drag = @import("win32_tab_drag.zig");
 const win32_tab_drag_ole = @import("win32_tab_drag_ole.zig");
@@ -78,15 +81,20 @@ const gl_startup = @import("win32/gl_startup.zig");
 const pixel_format = @import("win32/pixel_format.zig");
 const bench_trace = @import("win32/bench_trace.zig");
 const labels = @import("win32/labels.zig");
+const paint_text = @import("win32/text.zig");
 const win32_input = @import("win32/input.zig");
 const chrome_layout = @import("win32/chrome_layout.zig");
 const gdi = @import("win32/gdi.zig");
 const c = @import("win32/consts.zig");
 const sys = @import("win32/sys.zig");
+const app_delivery = @import("win32/app_delivery.zig");
+const save_target = @import("win32/save_target.zig");
 const focus_region = @import("win32/focus_region.zig");
 const first_frame = @import("win32/first_frame.zig");
+const win32_config_problems = @import("win32/config_problems.zig");
 
 test {
+    _ = @import("win32/config_problems.zig");
     _ = @import("win32/render_trace.zig");
     _ = @import("win32/gl_startup.zig");
     _ = @import("win32/pixel_format.zig");
@@ -159,8 +167,6 @@ const ThemeSurface = enum {
     search_frame_bg,
     search_frame_border,
     search_frame_underline,
-    update_open_bg,
-    update_dismiss_bg,
     launcher_lane_bg,
     launcher_lane_border,
 };
@@ -196,14 +202,6 @@ fn themeSurface(theme: *const ThemeColors, surface: ThemeSurface) u32 {
             adjustColor(theme.overlay_border, -10, -10, -8)
         else
             adjustColor(theme.overlay_border, 10, 10, 10),
-        .update_open_bg => if (theme.is_dark)
-            adjustColor(theme.overlay_bg, 10, 10, 12)
-        else
-            adjustColor(theme.overlay_bg, -4, -4, -4),
-        .update_dismiss_bg => if (theme.is_dark)
-            adjustColor(theme.status_bg, 10, 10, 12)
-        else
-            adjustColor(theme.status_bg, -4, -4, -4),
         .launcher_lane_bg => if (theme.is_dark)
             adjustColor(theme.status_bg, 8, 8, 10)
         else
@@ -279,10 +277,6 @@ const DeferredUiaDisconnect = struct {
     retries: u8 = 0,
 };
 const WS_OVERLAPPEDWINDOW = c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU | c.WS_THICKFRAME | c.WS_MINIMIZEBOX | c.WS_MAXIMIZEBOX;
-/// CF_HTML: registered clipboard format name is the literal string
-/// "HTML Format". The ID is process-local — we cache it on App.
-const CF_HTML_NAME = std.unicode.utf8ToUtf16LeStringLiteral("HTML Format");
-
 fn hostCompositionRedrawFlags() UINT {
     return c.RDW_INVALIDATE | c.RDW_ERASE | c.RDW_FRAME | c.RDW_NOCHILDREN | c.RDW_UPDATENOW;
 }
@@ -634,6 +628,100 @@ test "win32 clipboard text gets LF line endings" {
     defer alloc.free(same);
     try std.testing.expectEqual(plain.ptr, same.ptr);
     try std.testing.expectEqualStrings("a\rb\nc", same);
+}
+
+/// The other direction: the core joins copied lines with LF, and classic
+/// Win32 controls (an EDIT, older apps) show an LF-only CF_UNICODETEXT on
+/// one line. Returns null when `text` has no bare LF to expand.
+fn crlfLineEndings(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
+    var bare: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) bare += 1;
+    }
+    if (bare == 0) return null;
+    const out = try alloc.alloc(u8, text.len + bare);
+    var o: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) {
+            out[o] = '\r';
+            o += 1;
+        }
+        out[o] = byte;
+        o += 1;
+    }
+    return out;
+}
+
+test "win32 clipboard writes get CRLF line endings" {
+    const alloc = std.testing.allocator;
+
+    const crlf = (try crlfLineEndings(alloc, "\na\nb\r\nc\n")).?;
+    defer alloc.free(crlf);
+    try std.testing.expectEqualStrings("\r\na\r\nb\r\nc\r\n", crlf);
+
+    // Nothing to expand: a CRLF stays one, and a lone CR is left alone.
+    try std.testing.expectEqual(@as(?[]u8, null), try crlfLineEndings(alloc, "a\r\nb\rc"));
+}
+
+/// The clipboard as UTF-8, for any UTF-16 another program put there. A
+/// strict conversion failed the whole paste on one unpaired surrogate (a
+/// cut emoji); each one becomes U+FFFD instead, which is also 3 bytes, so
+/// the lossy pass runs in place.
+fn clipboardTextToUtf8(alloc: std.mem.Allocator, text_w: []const u16) ![:0]u8 {
+    const text = try std.unicode.wtf16LeToWtf8AllocZ(alloc, text_w);
+    std.unicode.wtf8ToUtf8Lossy(text, text) catch unreachable; // WTF-16 always gives WTF-8
+    return text;
+}
+
+test "win32 clipboard text with a lone surrogate still pastes" {
+    const alloc = std.testing.allocator;
+    const text = try clipboardTextToUtf8(alloc, &.{ 'a', 0xD83D, 'b', 0xD83D, 0xDE00, 0xDE00 });
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{1F600}\u{FFFD}", text);
+}
+
+/// Another program can hold the clipboard open for a few milliseconds (a
+/// clipboard manager, RDP's clipboard sync, Office), and one failed
+/// `OpenClipboard` used to drop the whole paste or copy. Tries it 10 times
+/// with a 5 ms sleep between. A sleep rounds up to the timer tick, about
+/// 15.6 ms unless something raised the resolution, so a clipboard held
+/// throughout costs the UI thread up to about 140 ms before the paste or
+/// copy fails as it did at once before. On false, `GetLastError` still
+/// holds the last attempt's error.
+fn openClipboard(hwnd: ?HWND) bool {
+    return openClipboardWith(sys.OpenClipboard, hwnd);
+}
+
+const clipboard_open_attempts = 10;
+
+fn openClipboardWith(open: *const fn (?HWND) callconv(.winapi) BOOL, hwnd: ?HWND) bool {
+    for (0..clipboard_open_attempts) |attempt| {
+        if (open(hwnd) != 0) return true;
+        if (attempt + 1 < clipboard_open_attempts) std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "win32 clipboard open retries while another program holds it" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var fail_first: usize = 0;
+        fn open(_: ?HWND) callconv(.winapi) BOOL {
+            calls += 1;
+            return if (calls > fail_first) 1 else 0;
+        }
+    };
+
+    Fake.calls = 0;
+    Fake.fail_first = 3;
+    try std.testing.expect(openClipboardWith(Fake.open, null));
+    try std.testing.expectEqual(@as(usize, 4), Fake.calls);
+
+    // Held for good: gives up after the last attempt, without one more sleep.
+    Fake.calls = 0;
+    Fake.fail_first = std.math.maxInt(usize);
+    try std.testing.expect(!openClipboardWith(Fake.open, null));
+    try std.testing.expectEqual(@as(usize, clipboard_open_attempts), Fake.calls);
 }
 
 fn surfaceWindowStyle() u32 {
@@ -2739,9 +2827,16 @@ const UpdateNotice = struct {
     }
 };
 
+/// How often a running process asks the automatic check to run again. The
+/// check's 24 hour throttle (`updatepkg.throttle_seconds`) decides whether a
+/// request is actually made, so this only has to be shorter than the throttle
+/// by a margin: six hours means a release is noticed within a day of the
+/// throttle expiring, and an early tick just reads the saved state.
+const update_recheck_interval_ms: u32 = 6 * 60 * 60 * 1000;
+
 const UpdateCheckRequest = struct {
     alloc: Allocator,
-    ui_thread_id: DWORD,
+    delivery: *AppDelivery,
     state_path: []u8,
     current_version: std.SemanticVersion,
     current_version_string: []u8,
@@ -2778,6 +2873,28 @@ const UpdateCheckCompletion = struct {
         self.* = undefined;
     }
 };
+
+const AppDeliveryPayload = union(enum) {
+    update: *UpdateCheckCompletion,
+    toast: win32_toast_activation.ActivationTarget,
+    uia_disconnect: *DeferredUiaDisconnect,
+
+    pub fn deinit(self: *AppDeliveryPayload) void {
+        switch (self.*) {
+            .update => |completion| {
+                const alloc = completion.alloc;
+                completion.deinit();
+                alloc.destroy(completion);
+            },
+            .toast => {},
+            .uia_disconnect => |pending| {
+                pending.release(pending.ctx);
+                std.heap.page_allocator.destroy(pending);
+            },
+        }
+    }
+};
+const AppDelivery = app_delivery.Channel(AppDeliveryPayload);
 
 const RecoveryStartup = struct {
     attempts: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined,
@@ -3026,9 +3143,9 @@ const RecoverySafeModeNotice = struct {
 /// UI thread sends messages that thread must pump. `App.run` starts this
 /// notice at the `showRecoverySafeModeNotice` call site *before* it enters its
 /// `GetMessageW` loop, so there is a window where the UI thread is not
-/// pumping. (Calling `MessageBoxW` on the UI thread itself is worse still: its
-/// nested modal loop dispatches `WM_WINHOSTTY_WAKE` to a wndproc that returns
-/// 0 without ticking, stalling the app mailbox.)
+/// pumping. The App's message-only window now keeps safe mailbox work moving
+/// inside native modal loops, but lifetime-changing work still waits for the
+/// outer loop; this informational notice must not delay that work.
 ///
 /// Finally, `initial-window = false` means there is no host HWND at all, so an
 /// ownerless path has to exist regardless. Safe mode is a usable session; the
@@ -3102,6 +3219,226 @@ fn settingsEditedValueMasked(
     return pending.changed(reloaded, comptime key);
 }
 
+/// The most bytes `settingsMaskedKeyNames` writes: every editable key, and a
+/// separator after each.
+const settings_masked_keys_capacity = capacity: {
+    var total: usize = 0;
+    for (win32_settings.editable_keys) |key| total += @tagName(key).len + 2;
+    break :capacity total;
+};
+
+/// The config keys among the user's edits whose saved value `reloaded` does
+/// not hold, because a later config file or a command-line option sets them
+/// again: comma separated, in the order the settings are listed, written to
+/// `buf`. Empty when the reload holds everything that was saved. It allocates
+/// nothing, so it cannot fail after the file was written.
+fn settingsMaskedKeyNames(
+    buf: *[settings_masked_keys_capacity]u8,
+    user_edited: SettingsEditedKeySet,
+    pending: *const configpkg.Config,
+    reloaded: *const configpkg.Config,
+) []const u8 {
+    var len: usize = 0;
+    inline for (win32_settings.editable_keys) |key| {
+        if (user_edited.isSet(@intFromEnum(key)) and settingsEditedValueMasked(pending, reloaded, key)) {
+            if (len > 0) {
+                @memcpy(buf[len..][0..2], ", ");
+                len += 2;
+            }
+            const name = @tagName(key);
+            @memcpy(buf[len..][0..name.len], name);
+            len += name.len;
+        }
+    }
+    return buf[0..len];
+}
+
+/// Whether the file now says something else, for a setting the draft changes,
+/// than both the value this session started from (`original`) and the draft:
+/// someone else changed what the user is changing. A file that agrees with the
+/// draft lost nothing, and one that agrees with `original` holds only the
+/// user's own edit to come.
+///
+/// `original` is a clone of the app's config, which has the app's conditional
+/// state applied (a dark system picks the dark half of a `light:A,dark:B`
+/// theme, and that theme can set editable keys), so the file is judged with
+/// the same state applied. Raw, an untouched file would differ from
+/// `original` for those keys and every Save would stop.
+fn settingsDiskEditConflict(
+    original: *const configpkg.Config,
+    pending: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    state: configpkg.ConditionalState,
+    user_edited: SettingsEditedKeySet,
+) bool {
+    var applied: ?configpkg.Config = disk.changeConditionalState(state) catch |err| blk: {
+        log.warn("settings save: could not apply the conditional state to the config file err={}", .{err});
+        break :blk null;
+    };
+    defer if (applied) |*config| config.deinit();
+    const effective: *const configpkg.Config = if (applied) |*config| config else disk;
+    inline for (win32_settings.editable_keys) |key| {
+        if (user_edited.isSet(@intFromEnum(key)) and
+            settingsDiskValueDiffers(original, effective, key) and
+            settingsDiskValueDiffers(pending, effective, key)) return true;
+    }
+    return false;
+}
+
+/// `Config.load` takes a config file it cannot open (held without read
+/// sharing, access denied, an offline share) for an absent one, or for one that
+/// set nothing, and loads the rest. Judged as an edit and applied, that would
+/// drop the user's own settings from every terminal, so a file that exists but
+/// will not open stops the check, and the save with it. A file that is missing
+/// is a first save (or an include the loader reports itself), and there is
+/// nothing on disk to conflict with; a directory is not read by the loader
+/// either.
+///
+/// The error is `FileUnopenable`, and `detail` (when given) is told which file
+/// and why it is the one: `what` is "the config file" or "the included file",
+/// so the status line can name it.
+fn settingsFileOpenable(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    what: []const u8,
+    path: []const u8,
+) win32_settings.SaveError!void {
+    _ = try settingsFileProbe(alloc, detail, what, path);
+}
+
+/// `settingsFileOpenable`, saying whether something is there: false for a
+/// missing file, true for one that opens and for a directory.
+fn settingsFileProbe(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    what: []const u8,
+    path: []const u8,
+) win32_settings.SaveError!bool {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.IsDir => return true,
+        else => {
+            log.warn("settings save: could not open {s} to check it for edits path={s} err={}", .{ what, path, err });
+            if (detail) |d| {
+                const text = std.fmt.allocPrint(alloc, "{s} {s}", .{ what, path }) catch return error.OutOfMemory;
+                defer alloc.free(text);
+                d.set(alloc, text);
+            }
+            return error.FileUnopenable;
+        },
+    };
+    file.close();
+    return true;
+}
+
+/// `settingsFileOpenable` for every file the loaded config pulled in: the
+/// list holds the nested ones too, as absolute paths.
+fn settingsIncludesOpenable(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    disk: *const configpkg.Config,
+) win32_settings.SaveError!void {
+    for (disk.@"config-file".value.items) |entry| switch (entry) {
+        .optional, .required => |path| if (path.len > 0) try settingsFileOpenable(alloc, detail, "the included file", path),
+    };
+}
+
+/// The theme files the loaded config selects, by the loader's own search
+/// (`themepkg.open`: an absolute path, or the name in each theme directory),
+/// held to the same rule as an include. A theme that is not there is the
+/// loader's to report, and the running config lacks it too; one that is there
+/// and will not open is skipped by the load, and the settings it supplies
+/// come back as defaults. Both the light and the dark name are checked, since
+/// which one the load used depends on the system state.
+fn settingsThemeOpenable(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    disk: *const configpkg.Config,
+) win32_settings.SaveError!void {
+    const theme = disk.theme orelse return;
+    for ([_][]const u8{ theme.light, theme.dark }) |name| {
+        if (std.fs.path.isAbsolute(name)) {
+            try settingsFileOpenable(alloc, detail, "the theme file", name);
+            continue;
+        }
+        // A name with a separator is rejected by the loader without a look.
+        if (!std.mem.eql(u8, name, std.fs.path.basename(name))) continue;
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        var dirs: std.ArrayListUnmanaged([]const u8) = .{};
+        var it: themepkg.LocationIterator = .{ .arena_alloc = arena.allocator() };
+        while (it.next() catch return error.OutOfMemory) |location| {
+            dirs.append(arena.allocator(), location.dir) catch return error.OutOfMemory;
+        }
+        try settingsThemeNameOpenable(alloc, detail, name, dirs.items);
+    }
+}
+
+/// The loader uses the first directory that has `name` and never looks at the
+/// rest, so a later copy that is locked does not matter.
+fn settingsThemeNameOpenable(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    name: []const u8,
+    dirs: []const []const u8,
+) win32_settings.SaveError!void {
+    for (dirs) |dir| {
+        const path = std.fs.path.join(alloc, &.{ dir, name }) catch return error.OutOfMemory;
+        defer alloc.free(path);
+        if (try settingsFileProbe(alloc, detail, "the theme file", path)) return;
+    }
+}
+
+/// Whether the loaded `disk` config holds an edit that conflicts with the
+/// draft, or an error when it is not the whole config: the save's own reload
+/// would apply the same partial load, so a locked include stops the save
+/// whether or not an edited setting conflicts.
+fn settingsDiskVerdict(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    original: *const configpkg.Config,
+    pending: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    state: configpkg.ConditionalState,
+    user_edited: SettingsEditedKeySet,
+) win32_settings.SaveError!bool {
+    try settingsIncludesOpenable(alloc, detail, disk);
+    try settingsThemeOpenable(alloc, detail, disk);
+    // A UTF-16 file that does not decode is skipped whole, with a diagnostic
+    // and everything it set missing: as incomplete as one that will not open.
+    if (disk._undecodable_file) |path| {
+        if (detail) |d| {
+            const text = std.fmt.allocPrint(alloc, "the file {s}", .{path}) catch return error.OutOfMemory;
+            defer alloc.free(text);
+            d.set(alloc, text);
+        }
+        return error.UnsupportedEncoding;
+    }
+    return settingsDiskEditConflict(original, pending, disk, state, user_edited);
+}
+
+/// What the palette says when a theme pick could not be saved. Two causes are
+/// something the person can act on; the rest share one line.
+fn paletteThemeSaveFailureMessage(err: win32_settings.SaveError) []const u8 {
+    return switch (err) {
+        error.DiskChanged => "The theme changed in the config file. Reload the configuration, then pick again; reverted preview.",
+        error.FileUnopenable => "A config file cannot be opened, so the theme was not saved; reverted preview.",
+        error.UnsupportedEncoding, error.BinaryConfig => "The config file is not UTF-8 text, so the theme was not saved; reverted preview.",
+        else => "Theme save failed; reverted preview.",
+    };
+}
+
+fn settingsDiskValueDiffers(
+    known: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    comptime key: SettingsConfigKey,
+) bool {
+    // The window keeps a command nobody set as automatic (null); the load
+    // fills in the one it found.
+    if (key == .command and disk._command_defaulted and known.command == null) return false;
+    return known.changed(disk, key);
+}
+
 test "win32 bounded UTF-8 prefix never splits a codepoint" {
     const value = "123\u{1f680}tail";
     try std.testing.expectEqual(@as(usize, 3), utf8PrefixLen(value, 4));
@@ -3130,6 +3467,51 @@ fn isPortableModeActive(alloc: Allocator) bool {
     alloc.free(root);
     return true;
 }
+
+/// How this copy of noctty gets updated. A setup-managed copy applies a
+/// staged installer and a portable-marker copy a staged ZIP. Anything else
+/// (Scoop, a ZIP extracted without its marker) was put there by someone else
+/// and cannot apply either, so downloading a staged update for it is wasted
+/// and its "ready to install" notice would be untrue.
+const InstallKind = enum {
+    installer,
+    portable,
+    other,
+
+    fn classify(portable_marker: bool, installer_managed: bool) InstallKind {
+        if (portable_marker) return .portable;
+        return if (installer_managed) .installer else .other;
+    }
+
+    /// What to stage for this copy, or null when nothing can be applied.
+    fn stagedKind(self: InstallKind) ?updatepkg.portable_apply.StagedKind {
+        return switch (self) {
+            .installer => .installer,
+            .portable => .portable,
+            .other => null,
+        };
+    }
+
+    /// A failed probe is `.other`: refusing to stage is the safe answer.
+    fn detect(alloc: Allocator) InstallKind {
+        if (isPortableModeActive(alloc)) return .portable;
+        const install_dir = currentInstallDir(alloc) catch return .other;
+        defer alloc.free(install_dir);
+        return classify(false, internal_os.windows.isInstallerManagedInstallDir(install_dir));
+    }
+
+    test "only setup-managed and portable-marker copies stage an update" {
+        try std.testing.expectEqual(InstallKind.installer, classify(false, true));
+        try std.testing.expectEqual(InstallKind.portable, classify(true, false));
+        // A portable marker beside a setup-managed layout is still portable.
+        try std.testing.expectEqual(InstallKind.portable, classify(true, true));
+        try std.testing.expectEqual(InstallKind.other, classify(false, false));
+
+        try std.testing.expectEqual(@as(?updatepkg.portable_apply.StagedKind, .installer), InstallKind.installer.stagedKind());
+        try std.testing.expectEqual(@as(?updatepkg.portable_apply.StagedKind, .portable), InstallKind.portable.stagedKind());
+        try std.testing.expectEqual(@as(?updatepkg.portable_apply.StagedKind, null), InstallKind.other.stagedKind());
+    }
+};
 
 fn installTerminfo(alloc: Allocator, term: []const u8) void {
     const names = terminfo.compiled.fileNames(terminfo.ghostty) catch return;
@@ -3520,22 +3902,51 @@ fn sessionRestorePolicyAllows(
         !explicit_startup_working_directory;
 }
 
-fn sessionSavePolicyAllows(
-    safe_mode: bool,
-    policy: configpkg.Config.WindowSaveState,
-    initial_window: bool,
-    has_initial_command: bool,
-    startup_profile_picker: bool,
-) bool {
-    return sessionRestorePolicyAllows(
-        safe_mode,
-        policy,
-        initial_window,
-        has_initial_command,
-        startup_profile_picker,
-        false,
-    );
+const SessionSaveKind = enum { final, checkpoint };
+
+/// An empty snapshot ends the saved session only on the owner's final save;
+/// a checkpoint keeps the file. True when the file was removed.
+fn removeEmptySessionState(path: []const u8, kind: SessionSaveKind) bool {
+    if (kind == .checkpoint) return false;
+    win32_session_persistence.deleteFileIfPresent(path) catch |err| {
+        log.warn("win32 session save: delete stale state failed path={s} err={}", .{ path, err });
+        return false;
+    };
+    return true;
 }
+
+/// Held for the life of the one process that owns `session-state.json`.
+/// An exclusive byte-range lock on the `.lock` sibling, so the kernel drops
+/// it when the owner exits or crashes and the next launch can take over.
+const SessionOwnerLock = struct {
+    file: std.fs.File,
+
+    /// Null when another live process holds it.
+    fn acquire(alloc: Allocator, state_path: []const u8) !?SessionOwnerLock {
+        if (std.fs.path.dirname(state_path)) |dir| {
+            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+        const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{state_path});
+        defer alloc.free(lock_path);
+        const file = std.fs.createFileAbsolute(lock_path, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            else => return err,
+        };
+        return .{ .file = file };
+    }
+
+    fn release(self: SessionOwnerLock) void {
+        self.file.close();
+    }
+};
 
 fn writeOpenUrlTrace(file: std.fs.File, url: []const u8) !void {
     var buffer: [1024]u8 = undefined;
@@ -3581,6 +3992,9 @@ pub const App = struct {
     session_state_excluded_for_elevation: bool = false,
     config_revision: u64 = 1,
     resolved_theme: ThemeColors = darkTheme(),
+    /// Completed `reconfigureTheme` passes; a test reads it to prove that a
+    /// settings preview which cannot change the theme does not run one.
+    theme_rebuilds: u32 = 0,
     hinstance: HINSTANCE,
     class_atom: ATOM = 0,
     host_class_atom: ATOM = 0,
@@ -3590,6 +4004,10 @@ pub const App = struct {
     quick_select_class_atom: ATOM = 0,
     hosts: std.ArrayListUnmanaged(*Host) = .empty,
     windows: std.ArrayListUnmanaged(*Surface) = .empty,
+    /// Owned shell requests waiting for the top of the message loop;
+    /// see `runDeferredOpens`.
+    deferred_opens: std.ArrayListUnmanaged(DeferredOpen) = .empty,
+
     /// Internal test seam so action-path tests can drive real
     /// `performAction(.new_tab, ...)` logic without requiring HWND/GL
     /// surface bring-up.
@@ -3619,6 +4037,12 @@ pub const App = struct {
         app: *App,
         source_pane: win32_shell.model.PaneId,
     ) anyerror!void = null,
+    /// Test-only stand-in for `ShellExecuteW` on a checked open target, so a
+    /// unit test never launches a real handler.
+    test_open_target: ?*const fn (app: *App, target: []const u8) anyerror!void = null,
+    /// Stand-in for the remaining shell launchers; tests never launch OSK,
+    /// elevated windows or installers.
+    test_shell_request: ?*const fn (app: *App, request: *const DeferredOpen) anyerror!void = null,
     next_host_id: u32 = 1,
     launcher_profile_key: ?[:0]const u8 = null,
     launcher_profile_hint: ?[:0]const u8 = null,
@@ -3640,6 +4064,11 @@ pub const App = struct {
     global_hotkeys: std.ArrayListUnmanaged(RegisteredGlobalHotkey) = .empty,
     global_hotkeys_dirty: bool = false,
     ui_thread_id: DWORD = 0,
+    /// Published before any producer starts; retained until producers stop.
+    /// Detached update workers hold their own reference, without borrowing App.
+    delivery: ?*AppDelivery = null,
+    message_hwnd: ?HWND = null,
+    core_ticking: bool = false,
     quit_timer_id: ?UINT_PTR = null,
     terminal_handoff_idle_timer_id: ?UINT_PTR = null,
     terminal_handoff_server: ?*win32_terminal_handoff.Server = null,
@@ -3653,11 +4082,29 @@ pub const App = struct {
     /// the deadline was waiting for.
     recovery_retry_not_before_ms: ?u64 = null,
     next_undo_sequence: u64 = 1,
+    // App-scoped bindings from an empty host must retain their origin even
+    // when pruning expires (and destroys) that host during dispatch.
+    empty_host_key_id: ?u32 = null,
     running: bool = false,
     /// A normal last-host close destroys the native/session model before
     /// `terminate` runs. Preserve the successful pre-close snapshot instead
     /// of replacing it with an empty snapshot during final teardown.
     session_state_saved_before_last_host_close: bool = false,
+    /// Set only in the process that restored the saved session, or was
+    /// eligible to and started with its first window instead. Only that
+    /// process saves or deletes `session-state.json`: a launch that forwarded
+    /// to the primary, an Explorer "Open noctty here" window, an `-Embedding`
+    /// handoff server or a second `single-instance = false` instance never
+    /// loaded it, so writing their own windows (or none) over it destroys the
+    /// user's workspace.
+    session_owner: ?SessionOwnerLock = null,
+    /// Set once WM_ENDSESSION(TRUE) has saved for a sign-out, shutdown or
+    /// reboot. That snapshot is final: shells the logoff kills afterwards
+    /// close their panes, and the saves those closes would run must not
+    /// shrink or delete it.
+    session_ending: bool = false,
+    /// `GetTickCount64` of the last `checkpointSessionState`.
+    session_checkpoint_ms: ?u64 = null,
     /// True only while the app is synchronously draining every host during
     /// shutdown. Child HWND teardown still repairs native split trees, but it
     /// must not diagnose the intentionally absent per-pane close preflight as
@@ -3669,9 +4116,18 @@ pub const App = struct {
     session_restore_rollback_host: ?*Host = null,
     windows_hidden: bool = false,
     quick_terminal_keyboard_diagnostic_logged: bool = false,
-    update_check_running: std.atomic.Value(bool) = .init(false),
     update_notice: ?UpdateNotice = null,
+    /// The host whose banner button started the running update action, so
+    /// its feedback lands in the window the user is looking at. Set only for
+    /// the length of that synchronous call (`Host.activateBannerButton`).
+    update_action_host: ?*Host = null,
     update_auto_check_started: bool = false,
+    /// Repeating thread timer that re-runs the automatic check in a process
+    /// that stays open for days. See `update_recheck_interval_ms`.
+    update_recheck_timer_id: ?UINT_PTR = null,
+    /// Detected on first use: the install directory cannot change under a
+    /// running process.
+    install_kind: ?InstallKind = null,
     update_startup_ready: bool = false,
     /// Most-recently-used command palette actions; newest first. Strings
     /// are owned by `core_app.alloc` and freed in `App.deinit`. Surfaced
@@ -3684,8 +4140,8 @@ pub const App = struct {
     /// Stable core surface id that owned focus when Settings opened. Settings
     /// itself clears terminal focus flags, so close must not guess host zero.
     settings_restore_surface_id: ?u64 = null,
-    /// Whether `CoInitializeEx` actually took responsibility for the
-    /// apartment on this thread. `CoUninitialize` only pairs with a
+    /// Whether `OleInitialize` actually took responsibility for the
+    /// apartment on this thread. `OleUninitialize` only pairs with a
     /// successful init (`S_OK` / `S_FALSE`) — `RPC_E_CHANGED_MODE`
     /// means another component already set up COM and we must not
     /// touch it on the way down.
@@ -3714,11 +4170,6 @@ pub const App = struct {
     /// Whether the current core-app tick already spent its one synchronous
     /// renderer paint. See `rendererTickRepaintMode`.
     renderer_sync_paint_spent: bool = false,
-    /// Cached CF_HTML clipboard format ID — lazy-registered on
-    /// first HTML copy. Process-local so one cache per App is
-    /// enough; re-registering on every copy is documented as
-    /// cheap by MS but still pointless work.
-    cf_html_format: UINT = 0,
     /// Hyperlink hover-dwell tracker. Reset via `dismiss()` whenever
     /// focus leaves a surface or a click arrives.
     link_hover_tracker: win32_link_preview.HoverTracker = undefined,
@@ -3737,14 +4188,25 @@ pub const App = struct {
     /// Persisted taskbar destinations and their debounced shell COM commit.
     /// `null` when the app-state path cannot be resolved or initialized.
     jump_list: ?win32_jump_list.JumpList = null,
-    toast_activation_post_pending: std.atomic.Value(bool) = .init(false),
-    /// Absolute path supplied via `--config-file <path>` on the CLI.
+    /// Absolute path supplied via `--config-file=<path>` on the CLI.
     /// Resolved ONCE against the startup cwd during `App.init` — that's
     /// important because `run()` later calls `sanitizeCurrentDirectory()`,
     /// which can reset cwd to `%USERPROFILE%`. If we resolved the
     /// relative path at save time, we'd end up writing to a different
     /// file than the one `Config.load()` used at launch.
     cli_config_override_path: ?[]u8 = null,
+    /// The file the last failed Settings save names in its status line.
+    settings_failure_detail: win32_settings.FailureDetail = .{},
+    /// The config keys the last Settings save wrote that a later layer
+    /// overrides, comma separated, for its status line and notification.
+    settings_masked_keys: win32_settings.FailureDetail = .{},
+    /// What the config last loaded (startup, reload, Settings save) found
+    /// wrong, and the fonts it names that no installed font matches. Copies:
+    /// the config that held the diagnostics is gone after a reload.
+    config_problems: win32_config_problems.Problems = .{},
+    /// The text of the banner raised for `config_problems`, so a reload that
+    /// finds none can take that banner down, and only that one.
+    config_problems_banner: ?[]u8 = null,
     /// Startup-time cwd snapshot. `Config.load()` resolves relative
     /// `--config-file` argv entries via realpath-against-cwd, so any
     /// reload that happens after `sanitizeCurrentDirectory()` would
@@ -3778,6 +4240,23 @@ pub const App = struct {
     shell_compositor_initialized: bool = false,
     shell_runtime: win32_shell.runtime.Runtime = undefined,
     shell_runtime_initialized: bool = false,
+
+    const DeferredOpen = union(enum) {
+        target: []u8,
+        on_screen_keyboard,
+        elevated_window: struct { parameters: [:0]u8, cwd: ?[]const u8 },
+
+        fn deinit(self: DeferredOpen, alloc: Allocator) void {
+            switch (self) {
+                .target => |target| alloc.free(target),
+                .elevated_window => |launch| {
+                    alloc.free(launch.parameters);
+                    if (launch.cwd) |cwd| alloc.free(cwd);
+                },
+                .on_screen_keyboard => {},
+            }
+        }
+    };
 
     pub fn init(
         self: *App,
@@ -3865,6 +4344,16 @@ pub const App = struct {
         win32_aumid.setProcessAumid();
         win32_aumid.registerAumidDisplayName(core_app.alloc);
 
+        // Be asked to end before the shells under it. Every process starts at
+        // the default level 0x280, and Windows ends processes on one level
+        // in no set order, so a sign-out could otherwise end the shells
+        // first: each pane closes, the last window goes, and `terminate`
+        // would delete the saved session before WM_ENDSESSION could save
+        // it. A higher level is ended first.
+        if (sys.SetProcessShutdownParameters(0x2FF, 0) == 0) {
+            log.warn("win32 SetProcessShutdownParameters failed err={}", .{windows.GetLastError()});
+        }
+
         // Boot the WinRT toast notifier. Failure falls back to the
         // host banner/log path in `showDesktopNotificationWithLaunch`.
         // MUST run AFTER `setProcessAumid` so `CreateToastNotifierWithId`
@@ -3874,9 +4363,6 @@ pub const App = struct {
             std.log.warn("winrt toast init failed err={}; falling back to host notifications", .{err});
             break :blk null;
         };
-        if (self.winrt_toast) |*toast| {
-            toast.setActivationCallback(self, winrtToastActivationCallback);
-        }
 
         // Install the PowerShell shell-integration script into
         // %LOCALAPPDATA%\noctty\shell-integration\powershell\
@@ -3947,6 +4433,7 @@ pub const App = struct {
             .alloc = core_app.alloc,
             .hinstance = self.hinstance,
             .ownerWindow = &settingsOwnerWindowThunk,
+            .appIcon = &settingsAppIconThunk,
             .chromeBg = &settingsChromeBgThunk,
             .textPrimary = &settingsTextPrimaryThunk,
             .themeColors = &settingsThemeColorsThunk,
@@ -3957,27 +4444,30 @@ pub const App = struct {
             .configRevision = &settingsConfigRevisionThunk,
             .previewField = &settingsPreviewFieldThunk,
             .notifyConflict = &settingsNotifyConflictThunk,
+            .reconcileDisk = &settingsReconcileDiskThunk,
+            .failureDetail = &settingsFailureDetailThunk,
+            .maskedKeys = &settingsMaskedKeysThunk,
+            .saveTarget = &settingsSaveTargetThunk,
+            .configProblems = &settingsConfigProblemsThunk,
             .notifySuccess = &settingsNotifySuccessThunk,
             .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
             .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
             .onClosed = &settingsOnClosedThunk,
         });
         self.link_hover_tracker = win32_link_preview.HoverTracker.init();
-        // The driver interface retains a pointer to its App-owned field, so
-        // construct it only after `self.*` has established the final address.
+        // The D3D11/DirectComposition/DirectWrite shell compositor is not
+        // started: the backend gets no driver and no capability probe, so it
+        // stays in its fallback state and the attach, resize and render
+        // helpers below are no-ops. Building its device graph here put a
+        // hardware D3D11 device on the UI thread before the first window,
+        // and kept about 80 driver threads and tens of MB alive, for
+        // explicit banner text only (PKG-33). The device-graph code stays
+        // until the D3D11 renderer decision settles whether it is reused.
         self.shell_compositor_driver = win32_compositor_native.NativeDriver.init(core_app.alloc);
-        self.shell_compositor = win32_compositor.Backend.init(
-            win32_compositor.probeNativeCapability(),
-            self.shell_compositor_driver.interface(),
-        );
+        self.shell_compositor = win32_compositor.Backend.init(.{}, null);
         self.shell_compositor_initialized = true;
         self.shell_runtime = win32_shell.runtime.Runtime.init(core_app.alloc);
         self.shell_runtime_initialized = true;
-        const compositor_status = self.shell_compositor.status();
-        log.info("shell compositor state={s} fallback={?s}", .{
-            @tagName(compositor_status.state),
-            if (compositor_status.fallback_reason) |reason| @tagName(reason) else null,
-        });
 
         // Core conditional configuration defaults to light. Synchronize it
         // with Windows before the first surface is created so conditional
@@ -3989,21 +4479,21 @@ pub const App = struct {
         };
     }
 
-    /// Bring the STA apartment online for in-process COM consumers
+    /// Bring OLE and its STA apartment online for in-process COM consumers
     /// (settings path picker via `IFileOpenDialog`, WinRT toast setup,
-    /// OLE drag-drop). Safe to call multiple times —
+    /// OLE drag-drop). Pair each successful call with OleUninitialize —
     /// `S_FALSE` means "already initialised in this mode", and
     /// `RPC_E_CHANGED_MODE` means "already initialised in a different
     /// mode" and leaves STA-only consumers disabled.
     fn initComApartment(self: *App) void {
-        const hr = sys.CoInitializeEx(null, c.COINIT_APARTMENTTHREADED);
+        const hr = sys.OleInitialize(null);
         switch (hr) {
             0, 1 => self.com_initialized = true, // S_OK, S_FALSE
             c.RPC_E_CHANGED_MODE => {
                 std.log.warn("COM apartment: already MTA on this thread; STA consumers may fail", .{});
             },
             else => {
-                std.log.warn("COM apartment: CoInitializeEx failed hr=0x{x:0>8}", .{@as(u32, @bitCast(hr))});
+                std.log.warn("COM apartment: OleInitialize failed hr=0x{x:0>8}", .{@as(u32, @bitCast(hr))});
             },
         }
     }
@@ -4044,16 +4534,18 @@ pub const App = struct {
 
         self.running = true;
         const ui_thread_id = sys.GetCurrentThreadId();
-        @atomicStore(DWORD, &self.ui_thread_id, ui_thread_id, .release);
         ensureMessageQueue();
+        try self.createMessageWindow();
+        @atomicStore(DWORD, &self.ui_thread_id, ui_thread_id, .release);
         defer {
             self.stopUndoPruneTimer();
             self.stopQuitTimer();
             self.stopTerminalHandoffIdleTimer();
             self.stopRecoveryRetryTimer();
             self.stopProgramStatusNotifyTimer();
-            drainDeferredUiaDisconnects(ui_thread_id);
+            self.stopUpdateRecheckTimer();
             @atomicStore(DWORD, &self.ui_thread_id, 0, .release);
+            self.closeMessageWindow();
             self.running = false;
         }
 
@@ -4112,8 +4604,15 @@ pub const App = struct {
                 };
             }
         } else if (!self.embedding_mode and self.config.@"initial-window") {
-            const restored = if (self.sessionRestoreEligible()) try self.restoreSessionState() else false;
+            // Ownership starts only once the first window exists: a launch
+            // that fails here must not delete, on its way out, the session
+            // it could not bring back, and a save while restore is half done
+            // would keep only the windows restored so far.
+            const owner_lock = if (self.sessionRestoreEligible()) self.acquireSessionOwnerLock() else null;
+            errdefer if (owner_lock) |lock| lock.release();
+            const restored = if (owner_lock != null) try self.restoreSessionState() else false;
             if (!restored) try self.createWindow(default_title);
+            self.session_owner = owner_lock;
             if (!restored and self.startup_profile_picker) {
                 if (self.primarySurface()) |surface| {
                     if (surface.host) |host| _ = host.toggleProfileOverlay();
@@ -4124,6 +4623,14 @@ pub const App = struct {
         }
 
         if (self.windows.items.len > 0) self.markRecoveryWindowCreated();
+        // With a window up, the fonts the config names have been looked for
+        // and the problems have somewhere to show. Without one they wait in
+        // Settings and the palette.
+        if (self.windows.items.len > 0) {
+            _ = self.reportConfigProblems(&self.config);
+        } else {
+            self.recordConfigProblems(&self.config);
+        }
 
         // Armed here, released by `resolveRecoveryStartup` once the ready
         // marker is on disk. Spawning it here would let thread scheduling put
@@ -4166,7 +4673,7 @@ pub const App = struct {
         };
         if (portable_failure) |message| {
             defer self.core_app.alloc.free(message);
-            self.showUpdateInfo(message) catch |err| {
+            self.showUpdateInfo(.err, message) catch |err| {
                 log.warn("failed to surface portable update failure err={}", .{err});
             };
         }
@@ -4179,97 +4686,15 @@ pub const App = struct {
 
         var msg: MSG = undefined;
         while (true) {
+            // Opens queued while the previous message was handled run here,
+            // with no window procedure on the stack.
+            if (try self.drainDeferredOpens()) break;
+            self.drainPendingHandoffs();
+
             const result = sys.GetMessageW(&msg, null, 0, 0);
             if (result == -1) return lastError();
             if (result == 0) break;
             self.showPendingConPtyFallbackBanner();
-
-            if (msg.message == c.WM_WINHOSTTY_WAKE) {
-                if (self.global_hotkeys_dirty) {
-                    self.global_hotkeys_dirty = false;
-                    self.syncGlobalHotkeys() catch |err| {
-                        log.err("failed to sync win32 global hotkeys err={}", .{err});
-                    };
-                }
-                try self.tickCoreApp();
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_UPDATE) {
-                const completion: *UpdateCheckCompletion = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-                defer {
-                    completion.deinit();
-                    self.core_app.alloc.destroy(completion);
-                }
-                self.handleUpdateCheckCompletion(completion);
-                try self.tickCoreApp();
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_TOAST_ACTIVATION) {
-                const activation: *win32_toast_activation.ActivationTarget = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-                defer std.heap.page_allocator.destroy(activation);
-                defer self.toast_activation_post_pending.store(false, .release);
-                if (!self.handleToastActivation(activation.*)) {
-                    self.pending_toast_activation = activation.*;
-                }
-                try self.tickCoreApp();
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_TERMINAL_HANDOFF) {
-                // The message carries an opaque identifier, never a pointer.
-                // Any process on this desktop at our integrity level can post
-                // into this loop, and a pointer taken from the message would be
-                // an address of the sender's choosing that we dereference,
-                // deinitialize and free. Identifiers are resolved against the
-                // server's own table and anything unrecognized is dropped.
-                const server = self.terminal_handoff_server orelse {
-                    log.warn("terminal handoff message arrived without a handoff server", .{});
-                    continue;
-                };
-                const pending = server.takePending(terminalHandoffId(msg.lParam)) orelse {
-                    log.warn("ignoring terminal handoff message with an unknown session id", .{});
-                    continue;
-                };
-                defer {
-                    pending.deinit();
-                    self.core_app.alloc.destroy(pending);
-                }
-                self.stopTerminalHandoffIdleTimer();
-                // Nothing to close here: `EstablishPtyHandoff` already released
-                // the two OpenConsole-side pipe ends, because returning S_OK
-                // transfers them to the RPC stub. See
-                // `Pty.releaseHandoffPipeCopies`.
-                self.createAdoptedWindow(pending) catch |err| {
-                    win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_failed");
-                    log.err("terminal handoff surface creation failed err={}", .{err});
-                    if (self.embedding_mode and self.windows.items.len == 0) {
-                        if (self.exitEmbeddingServerIfIdle()) {
-                            self.running = false;
-                            sys.PostQuitMessage(1);
-                        } else {
-                            self.startTerminalHandoffIdleTimer();
-                        }
-                    }
-                };
-                try self.core_app.tick(self);
-                if (!self.running and self.windows.items.len == 0) break;
-                continue;
-            }
-
-            if (msg.message == c.WM_WINHOSTTY_UIA_DISCONNECT) {
-                if (msg.lParam == 0) {
-                    log.warn("win32 UIA deferred disconnect message had no context", .{});
-                    continue;
-                }
-                const pending: *DeferredUiaDisconnect = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-                processDeferredUiaDisconnect(self.ui_thread_id, pending);
-                continue;
-            }
 
             if (msg.message == c.WM_TIMER) {
                 if (self.recovery_retry_timer_id) |timer_id| {
@@ -4281,6 +4706,7 @@ pub const App = struct {
                 if (self.terminal_handoff_idle_timer_id) |timer_id| {
                     if (msg.wParam == timer_id) {
                         self.stopTerminalHandoffIdleTimer();
+                        self.drainPendingHandoffs();
                         if (self.embedding_mode and self.windows.items.len == 0) {
                             if (self.exitEmbeddingServerIfIdle()) {
                                 log.info("terminal handoff server idle timeout", .{});
@@ -4345,6 +4771,12 @@ pub const App = struct {
                         continue;
                     }
                 }
+                if (self.update_recheck_timer_id) |timer_id| {
+                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
+                        self.onUpdateRecheckTimer();
+                        continue;
+                    }
+                }
             }
 
             if (msg.message == c.WM_HOTKEY) {
@@ -4362,6 +4794,12 @@ pub const App = struct {
                 // the settings window learns about keyboard navigation from
                 // the pump, not from its controls.
                 self.settings_window.noteInputMessage(msg.hwnd, msg.message, msg.wParam);
+                // Ctrl+S is not a dialog-manager key; take it before the
+                // manager sees it. Tab and the arrows still go to the manager.
+                if (self.settings_window.handleAccelerator(msg.hwnd, msg.message, msg.wParam, msg.lParam)) {
+                    try self.tickCoreApp();
+                    continue;
+                }
                 if (sys.IsDialogMessageW(settings_hwnd, &msg) != 0) {
                     try self.tickCoreApp();
                     continue;
@@ -4371,13 +4809,7 @@ pub const App = struct {
             _ = sys.TranslateMessage(&msg);
             _ = sys.DispatchMessageW(&msg);
 
-            if (self.global_hotkeys_dirty) {
-                self.global_hotkeys_dirty = false;
-                self.syncGlobalHotkeys() catch |err| {
-                    log.err("failed to sync win32 global hotkeys err={}", .{err});
-                };
-            }
-
+            self.syncDirtyGlobalHotkeys();
             try self.tickCoreApp();
 
             if (!self.running and self.windows.items.len == 0) break;
@@ -4390,7 +4822,7 @@ pub const App = struct {
         self.stopTerminalHandoffIdleTimer();
         self.stopRecoveryRetryTimer();
         self.stopProgramStatusNotifyTimer();
-        self.update_check_running.store(false, .release);
+        self.stopUpdateRecheckTimer();
         if (self.update_notice) |*notice| {
             notice.deinit(self.core_app.alloc);
             self.update_notice = null;
@@ -4398,8 +4830,9 @@ pub const App = struct {
         self.unregisterGlobalHotkeys();
         self.stopIpcServer();
         if (!self.session_state_saved_before_last_host_close or self.hosts.items.len > 0) {
-            _ = self.saveSessionState();
+            _ = self.saveSessionState(.final);
         }
+        self.releaseSessionOwnership();
         self.destroyAllWindows();
         if (self.shell_runtime_initialized) {
             self.shell_runtime.deinit();
@@ -4415,6 +4848,7 @@ pub const App = struct {
         cloak_event_app = null;
         self.hosts.deinit(self.core_app.alloc);
         self.windows.deinit(self.core_app.alloc);
+        self.discardDeferredOpens();
         self.global_hotkeys.deinit(self.core_app.alloc);
         if (self.launcher_profile_key) |value| self.core_app.alloc.free(value);
         if (self.launcher_profile_hint) |value| self.core_app.alloc.free(value);
@@ -4448,6 +4882,13 @@ pub const App = struct {
             self.core_app.alloc.free(path);
             self.cli_config_override_path = null;
         }
+        self.settings_failure_detail.clear(self.core_app.alloc);
+        self.settings_masked_keys.clear(self.core_app.alloc);
+        self.config_problems.deinit(self.core_app.alloc);
+        if (self.config_problems_banner) |text| {
+            self.core_app.alloc.free(text);
+            self.config_problems_banner = null;
+        }
         if (self.startup_cwd) |path| {
             self.core_app.alloc.free(path);
             self.startup_cwd = null;
@@ -4455,8 +4896,12 @@ pub const App = struct {
         deinitImeWindowFormsTracePath(self.core_app.alloc);
         self.config.deinit();
         if (self.com_initialized) {
-            sys.CoUninitialize();
+            sys.OleUninitialize();
             self.com_initialized = false;
+        }
+        if (self.delivery) |delivery| {
+            delivery.release();
+            self.delivery = null;
         }
     }
 
@@ -4495,16 +4940,63 @@ pub const App = struct {
     }
 
     fn sessionStateEnabled(self: *const App) bool {
-        // Safe mode is deliberately non-destructive. It starts without
-        // restoring the saved session and must not replace or delete that
-        // session when the diagnostic run exits.
-        return sessionSavePolicyAllows(
-            self.safe_mode,
-            self.config.@"window-save-state",
-            self.config.@"initial-window",
-            self.config.@"initial-command" != null,
-            self.startup_profile_picker,
-        );
+        // Only the owner, the process that was eligible to restore the saved
+        // session and then got its first window, may replace or delete it.
+        // The restore policy is re-checked so a config reload
+        // (window-save-state = never) still stops it.
+        return self.session_owner != null and self.sessionRestoreEligible();
+    }
+
+    /// Take the saved session for this process, on the restore-eligible
+    /// startup path only. One live process owns it (decision D10): with
+    /// `single-instance = false`, or when forwarding failed, a second
+    /// instance starts with a fresh window instead of restoring the same
+    /// workspace a second time, and never saves over it.
+    fn acquireSessionOwnerLock(self: *App) ?SessionOwnerLock {
+        if (self.session_state_excluded_for_elevation) return null;
+        const path = self.sessionStatePath() orelse return null;
+        defer self.core_app.alloc.free(path);
+        return SessionOwnerLock.acquire(self.core_app.alloc, path) catch |err| {
+            log.warn("win32 session: ownership lock unavailable; not restoring or saving err={}", .{err});
+            return null;
+        } orelse {
+            log.info("win32 session: another instance owns the saved session; starting without it", .{});
+            return null;
+        };
+    }
+
+    fn releaseSessionOwnership(self: *App) void {
+        if (self.session_owner) |lock| lock.release();
+        self.session_owner = null;
+    }
+
+    /// WM_ENDSESSION(TRUE): Windows may end the process once every window
+    /// has returned, without `GetMessage` returning, so `terminate` never
+    /// runs at sign-out, shutdown or reboot. Tear nothing down. A Restart
+    /// Manager close (an installer replacing files) may leave noctty
+    /// running, so only a real end of session latches the snapshot.
+    fn saveForEndSession(self: *App, close_app: bool) void {
+        if (self.session_ending) return;
+        self.savePaletteMru();
+        if (close_app) return self.checkpointSessionState();
+        // A checkpoint, never `.final`: the sign-out also ends the shells, so
+        // an empty window list here says nothing about what the user closed.
+        // Latched even when the save fails: any later save would come from
+        // panes closing as their shells die, and could only shrink the
+        // previous snapshot or, from `terminate` with no hosts, delete it.
+        _ = self.saveSessionState(.checkpoint);
+        self.session_ending = true;
+    }
+
+    /// Crash insurance on a display-topology change, the moment a GPU
+    /// driver is most likely to fault (#299), and the save for a Restart
+    /// Manager close. Every host receives the same message, so one save per
+    /// second is plenty.
+    fn checkpointSessionState(self: *App) void {
+        const now = sys.GetTickCount64();
+        if (self.session_checkpoint_ms) |last| if (now -% last < 1000) return;
+        self.session_checkpoint_ms = now;
+        _ = self.saveSessionState(.checkpoint);
     }
 
     fn sessionRestoreEligible(self: *const App) bool {
@@ -4585,7 +5077,7 @@ pub const App = struct {
 
     fn loadSessionState(self: *App) !?std.json.Parsed(win32_session_state.SessionState) {
         if (self.session_state_excluded_for_elevation) return null;
-        if (!self.sessionStateEnabled()) return null;
+        if (!self.sessionRestoreEligible()) return null;
         const path = self.sessionStatePath() orelse return null;
         defer self.core_app.alloc.free(path);
 
@@ -4833,6 +5325,105 @@ pub const App = struct {
         self.renderer_sync_paint_spent = false;
         try self.core_app.tick(self);
         self.resolveRecoveryStartup();
+    }
+
+    fn tickCoreAppModal(self: *App) void {
+        if (self.core_ticking) return;
+        self.core_ticking = true;
+        defer self.core_ticking = false;
+        self.renderer_sync_paint_spent = false;
+        self.core_app.tickModal(self) catch |err| {
+            log.warn("modal mailbox tick failed err={}", .{err});
+        };
+    }
+
+    fn createMessageWindow(self: *App) !void {
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.app");
+        var wc: WNDCLASSEXW = .{
+            .cbSize = @sizeOf(WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = &appMessageWindowProc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = self.hinstance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = name,
+            .hIconSm = null,
+        };
+        if (sys.RegisterClassExW(&wc) == 0 and windows.kernel32.GetLastError() != .CLASS_ALREADY_EXISTS)
+            return lastError(); // ERROR_CLASS_ALREADY_EXISTS is expected in tests.
+        const delivery = try AppDelivery.create();
+        errdefer delivery.release();
+        const hwnd = sys.CreateWindowExW(
+            0,
+            name,
+            name,
+            0,
+            0,
+            0,
+            0,
+            0,
+            @ptrFromInt(@as(usize, @bitCast(@as(isize, -3)))), // HWND_MESSAGE
+            null,
+            self.hinstance,
+            null,
+        ) orelse return lastError();
+        setWindowData(hwnd, self);
+        self.message_hwnd = hwnd;
+        self.delivery = delivery;
+        if (self.winrt_toast) |*toast| {
+            toast.setActivationCallback(delivery, winrtToastActivationCallback, .{
+                .retain = retainToastDelivery,
+                .release = releaseToastDelivery,
+            });
+        }
+        delivery.publish(hwnd);
+    }
+
+    fn closeMessageWindow(self: *App) void {
+        const delivery = self.delivery orelse return;
+        delivery.close();
+        while (delivery.pop()) |value| {
+            var payload = value;
+            if (payload == .uia_disconnect) {
+                processDeferredUiaDisconnect(null, payload.uia_disconnect);
+            } else payload.deinit();
+        }
+        delivery.update_running.store(false, .release);
+        delivery.toast_pending.store(false, .release);
+        if (self.message_hwnd) |hwnd| {
+            setWindowData(hwnd, null);
+            _ = sys.DestroyWindow(hwnd);
+            self.message_hwnd = null;
+        }
+    }
+
+    /// Called only by the outer pump, never while an owner WndProc is under
+    /// a native modal loop. Taking oldest also recovers a lost notification.
+    fn drainPendingHandoffs(self: *App) void {
+        const server = self.terminal_handoff_server orelse return;
+        while (server.pending.takeOldest()) |pending| {
+            defer {
+                pending.deinit();
+                self.core_app.alloc.destroy(pending);
+            }
+            self.createAdoptedWindow(pending) catch |err| {
+                win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_failed");
+                log.err("terminal handoff surface creation failed err={}", .{err});
+            };
+            if (self.windows.items.len == 0) self.startTerminalHandoffIdleTimer();
+        }
+    }
+
+    fn syncDirtyGlobalHotkeys(self: *App) void {
+        if (!self.global_hotkeys_dirty) return;
+        self.global_hotkeys_dirty = false;
+        self.syncGlobalHotkeys() catch |err| {
+            log.err("failed to sync win32 global hotkeys err={}", .{err});
+        };
     }
 
     fn rendererRepaintModeThisTick(self: *App, host: ?*const Host) SurfaceRepaintRequestMode {
@@ -5329,9 +5920,16 @@ pub const App = struct {
         }
     }
 
-    fn saveSessionState(self: *const App) bool {
+    /// `.final` is the owner's save as its windows close: closing every
+    /// one ends the session, so an empty snapshot deletes the file. A
+    /// `.checkpoint` taken while the app keeps running never deletes, and
+    /// leaves alone the snapshot a last-host close already took.
+    fn saveSessionState(self: *const App, kind: SessionSaveKind) bool {
         if (self.session_state_excluded_for_elevation) return false;
         if (!self.sessionStateEnabled()) return false;
+        // A sign-out's snapshot is final; see `session_ending`.
+        if (self.session_ending) return false;
+        if (kind == .checkpoint and self.session_state_saved_before_last_host_close) return false;
         const path = self.sessionStatePath() orelse return false;
         defer self.core_app.alloc.free(path);
 
@@ -5349,13 +5947,7 @@ pub const App = struct {
                 log.warn("win32 session save: snapshot failed scrollback_lines={d} err={}", .{ attempt_lines, err });
                 continue;
             };
-            if (state.windows.len == 0) {
-                win32_session_persistence.deleteFileIfPresent(path) catch |err| {
-                    log.warn("win32 session save: delete stale state failed path={s} err={}", .{ path, err });
-                    return false;
-                };
-                return true;
-            }
+            if (state.windows.len == 0) return removeEmptySessionState(path, kind);
 
             const encoded = win32_session_state.encodeAlloc(self.core_app.alloc, state) catch |err| {
                 log.warn("win32 session save: encode failed scrollback_lines={d} err={}", .{ attempt_lines, err });
@@ -6014,24 +6606,27 @@ pub const App = struct {
     }
 
     pub fn wakeup(self: *App) void {
-        if (self.windows.items.len > 0) {
-            const hwnd = self.windows.items[0].hwnd orelse return;
-            _ = sys.PostMessageW(hwnd, c.WM_WINHOSTTY_WAKE, 0, 0);
-            return;
-        }
+        if (@atomicLoad(DWORD, &self.ui_thread_id, .acquire) == 0) return;
+        const delivery = self.delivery orelse return;
+        _ = delivery.wake(c.WM_WINHOSTTY_WAKE);
+    }
 
-        if (self.ui_thread_id != 0) {
-            _ = sys.PostThreadMessageW(self.ui_thread_id, c.WM_WINHOSTTY_WAKE, 0, 0);
-        }
+    fn automaticUpdateChecksEnabled(self: *const App) bool {
+        return self.config.@"auto-update" != .off and
+            self.config.@"auto-update-channel" == .stable and
+            self.ui_thread_id != 0;
     }
 
     fn maybeScheduleAutomaticUpdateCheck(self: *App) void {
         if (self.update_auto_check_started) return;
-        if (self.config.@"auto-update" == .off) return;
-        if (self.config.@"auto-update-channel" != .stable) return;
-        if (self.ui_thread_id == 0) return;
+        if (!self.automaticUpdateChecksEnabled()) return;
 
         self.update_auto_check_started = true;
+        self.runAutomaticUpdateCheck();
+        self.startUpdateRecheckTimer();
+    }
+
+    fn runAutomaticUpdateCheck(self: *App) void {
         self.scheduleUpdateCheck(.{
             .force = false,
             .manual = false,
@@ -6039,6 +6634,161 @@ pub const App = struct {
         }) catch |err| {
             log.warn("failed to start automatic update check err={}", .{err});
         };
+    }
+
+    /// A terminal that stays open for weeks would otherwise learn about a
+    /// release only after a restart. The tick is cheap: the check's own
+    /// 24 hour throttle answers from the saved state (no request, no
+    /// download) until a day has passed, and a dismissed version stays
+    /// dismissed because the check respects it. With no window open the tick
+    /// does nothing, so an idle background process makes no request.
+    fn startUpdateRecheckTimer(self: *App) void {
+        if (self.update_recheck_timer_id != null) return;
+        const timer_id = sys.SetTimer(null, 0, update_recheck_interval_ms, null);
+        if (timer_id == 0) {
+            log.warn("failed to start win32 update recheck timer err={}", .{windows.kernel32.GetLastError()});
+            return;
+        }
+        self.update_recheck_timer_id = timer_id;
+    }
+
+    fn stopUpdateRecheckTimer(self: *App) void {
+        if (self.update_recheck_timer_id) |timer_id| {
+            _ = sys.KillTimer(null, timer_id);
+            self.update_recheck_timer_id = null;
+        }
+    }
+
+    /// Applying a staged update sets `running = false` first; nothing is left
+    /// to tell about a release then. A staged notice that is already up is
+    /// left alone: the check would only re-verify it (and for a portable ZIP
+    /// re-extract it) while the user may be about to press Install.
+    fn updateRecheckWanted(self: *const App) bool {
+        if (self.update_notice) |notice| if (notice.staged) return false;
+        return self.running and self.windows.items.len > 0 and self.automaticUpdateChecksEnabled();
+    }
+
+    test "the update recheck timer is armed once, stopped on request, and ticks only with a window" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .surfaces = &.{.{ .storage = &surface }},
+        });
+        defer session.deinit();
+
+        app.startUpdateRecheckTimer();
+        defer app.stopUpdateRecheckTimer();
+        const timer_id = app.update_recheck_timer_id.?;
+        app.startUpdateRecheckTimer();
+        try std.testing.expectEqual(timer_id, app.update_recheck_timer_id.?);
+        app.stopUpdateRecheckTimer();
+        try std.testing.expectEqual(@as(?UINT_PTR, null), app.update_recheck_timer_id);
+
+        // A tick asks for a check only while the app runs with a window and
+        // automatic checks are on for the stable channel.
+        app.config.@"auto-update" = .check;
+        app.config.@"auto-update-channel" = .stable;
+        app.ui_thread_id = 1;
+        defer app.ui_thread_id = 0;
+        app.running = true;
+        try std.testing.expect(!app.updateRecheckWanted());
+        try app.windows.append(std.testing.allocator, &surface);
+        defer app.windows.clearAndFree(std.testing.allocator);
+        try std.testing.expect(app.updateRecheckWanted());
+        // A staged notice that is already up is left alone; an unstaged one
+        // is not, since a newer release should replace it.
+        app.update_notice = try UpdateNotice.init(std.testing.allocator, "1.3.200", "https://example.invalid/release", true);
+        try std.testing.expect(!app.updateRecheckWanted());
+        app.update_notice.?.staged = false;
+        try std.testing.expect(app.updateRecheckWanted());
+        app.update_notice.?.deinit(std.testing.allocator);
+        app.update_notice = null;
+        app.config.@"auto-update" = .off;
+        try std.testing.expect(!app.updateRecheckWanted());
+        app.config.@"auto-update" = .check;
+        app.config.@"auto-update-channel" = .tip;
+        try std.testing.expect(!app.updateRecheckWanted());
+        app.config.@"auto-update-channel" = .stable;
+        app.running = false;
+        try std.testing.expect(!app.updateRecheckWanted());
+    }
+
+    fn onUpdateRecheckTimer(self: *App) void {
+        if (self.updateRecheckWanted()) self.runAutomaticUpdateCheck();
+    }
+
+    fn installKind(self: *App) InstallKind {
+        if (self.install_kind) |kind| return kind;
+        const kind = InstallKind.detect(self.core_app.alloc);
+        self.install_kind = kind;
+        return kind;
+    }
+
+    /// What a check should download and stage, or null for a notice only:
+    /// `auto-update = download` on a copy that can apply what it stages.
+    fn updateStageKind(self: *App) ?updatepkg.portable_apply.StagedKind {
+        if (self.config.@"auto-update" != .download) return null;
+        return self.installKind().stagedKind();
+    }
+
+    test "a check stages only when auto-update is download and this copy can apply the result" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const Staged = updatepkg.portable_apply.StagedKind;
+        const cases = [_]struct { mode: configpkg.Config.AutoUpdate, kind: InstallKind, stages: ?Staged }{
+            .{ .mode = .download, .kind = .installer, .stages = .installer },
+            .{ .mode = .download, .kind = .portable, .stages = .portable },
+            .{ .mode = .download, .kind = .other, .stages = null },
+            .{ .mode = .check, .kind = .installer, .stages = null },
+            .{ .mode = .off, .kind = .portable, .stages = null },
+        };
+        for (cases) |case| {
+            app.config.@"auto-update" = case.mode;
+            app.install_kind = case.kind;
+            try std.testing.expectEqual(case.stages, app.updateStageKind());
+        }
+    }
+
+    test "the first automatic check arms the recheck timer once" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        // The session has no delivery channel, so no check thread starts.
+        app.config.@"auto-update" = .check;
+        app.config.@"auto-update-channel" = .stable;
+        app.ui_thread_id = 1;
+        defer app.ui_thread_id = 0;
+        defer app.stopUpdateRecheckTimer();
+        app.maybeScheduleAutomaticUpdateCheck();
+        try std.testing.expect(app.update_auto_check_started);
+        const timer_id = app.update_recheck_timer_id.?;
+        app.maybeScheduleAutomaticUpdateCheck();
+        try std.testing.expectEqual(timer_id, app.update_recheck_timer_id.?);
+
+        // Automatic checks off: no timer for a process that never checks.
+        app.stopUpdateRecheckTimer();
+        app.update_auto_check_started = false;
+        app.config.@"auto-update" = .off;
+        app.maybeScheduleAutomaticUpdateCheck();
+        try std.testing.expect(!app.update_auto_check_started);
+        try std.testing.expectEqual(@as(?UINT_PTR, null), app.update_recheck_timer_id);
     }
 
     fn scheduleUpdateCheck(
@@ -6051,15 +6801,16 @@ pub const App = struct {
     ) !void {
         if (self.ui_thread_id == 0) return;
 
-        const current = self.update_check_running.cmpxchgStrong(false, true, .acq_rel, .acquire);
+        const delivery = self.delivery orelse return;
+        const current = delivery.update_running.cmpxchgStrong(false, true, .acq_rel, .acquire);
         if (current != null) {
-            if (opts.manual) try self.showUpdateInfo("Update check already running.");
+            if (opts.manual) try self.showUpdateInfo(.info, "Update check already running.");
             return;
         }
-        errdefer self.update_check_running.store(false, .release);
+        errdefer delivery.update_running.store(false, .release);
 
-        const request = try self.core_app.alloc.create(UpdateCheckRequest);
-        errdefer self.core_app.alloc.destroy(request);
+        const request = try std.heap.page_allocator.create(UpdateCheckRequest);
+        errdefer std.heap.page_allocator.destroy(request);
 
         // The ignored-feed note has to come from the resolver, not from the
         // config value alone: NOCTTY_UPDATE_FEED_URL is also a feed source
@@ -6069,31 +6820,43 @@ pub const App = struct {
             self.config.@"auto-update-feed-url",
         );
         const release_feed_url = resolved_feed.url;
-        errdefer self.core_app.alloc.free(release_feed_url);
-        const staged_kind: updatepkg.portable_apply.StagedKind =
-            if (isPortableModeActive(self.core_app.alloc)) .portable else .installer;
+        defer self.core_app.alloc.free(release_feed_url);
+        // Only a copy that can apply a staged update gets one downloaded.
+        // The notice for any other falls back to "Open Release".
+        const stage_kind = self.updateStageKind();
+
+        // The detached worker must not borrow the core allocator's lifetime.
+        // Page allocator storage and a retained channel remain valid after UI exit.
+        const state_path = try updatepkg.defaultStatePath(std.heap.page_allocator);
+        errdefer std.heap.page_allocator.free(state_path);
+        const current_version_string = try std.heap.page_allocator.dupe(u8, build_config.version_string);
+        errdefer std.heap.page_allocator.free(current_version_string);
+        const worker_feed = try std.heap.page_allocator.dupe(u8, release_feed_url);
+        errdefer std.heap.page_allocator.free(worker_feed);
 
         request.* = .{
-            .alloc = self.core_app.alloc,
-            .ui_thread_id = self.ui_thread_id,
-            .state_path = try updatepkg.defaultStatePath(self.core_app.alloc),
+            .alloc = std.heap.page_allocator,
+            .delivery = delivery,
+            .state_path = state_path,
             .current_version = build_config.version,
-            .current_version_string = try self.core_app.alloc.dupe(u8, build_config.version_string),
-            .release_feed_url = release_feed_url,
+            .current_version_string = current_version_string,
+            .release_feed_url = worker_feed,
             .force = opts.force,
             .manual = opts.manual,
             .ignored_feed_source = resolved_feed.ignored_non_https,
             .respect_dismissal = opts.respect_dismissal,
-            .download = self.config.@"auto-update" == .download,
-            .staged_kind = staged_kind,
+            .download = stage_kind != null,
+            .staged_kind = stage_kind orelse .installer,
         };
 
+        delivery.retain();
+        errdefer delivery.release();
         const thread = try std.Thread.spawn(.{}, updateCheckThreadMain, .{request});
         thread.detach();
     }
 
     fn handleUpdateCheckCompletion(self: *App, completion: *UpdateCheckCompletion) void {
-        self.update_check_running.store(false, .release);
+        if (self.delivery) |delivery| delivery.update_running.store(false, .release);
 
         // The old notice offers Install (staged installer from the old feed)
         // or Open Release (release URL from the old feed). Once the check
@@ -6106,7 +6869,7 @@ pub const App = struct {
                 log.warn("failed to surface update notice err={}", .{err});
             };
             if (completion.manual_message) |message| {
-                self.showUpdateInfo(message) catch |err| {
+                self.showUpdateInfo(.info, message) catch |err| {
                     log.warn("failed to show updater status message err={}", .{err});
                 };
             }
@@ -6114,7 +6877,7 @@ pub const App = struct {
         }
 
         if (completion.manual_message) |message| {
-            self.showUpdateInfo(message) catch |err| {
+            self.showUpdateInfo(.info, message) catch |err| {
                 log.warn("failed to show updater status message err={}", .{err});
             };
         }
@@ -6133,14 +6896,20 @@ pub const App = struct {
         }
 
         self.update_notice = try UpdateNotice.init(self.core_app.alloc, version_text, release_url, staged);
-        for (self.hosts.items) |host| host.invalidateBannerText();
+        // Announce it once: in the window the user is in, else the first.
+        const foreground = sys.GetForegroundWindow();
+        var announcer: ?*Host = if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        for (self.hosts.items) |host| {
+            if (host.hwnd != null and host.hwnd == foreground) announcer = host;
+        }
+        for (self.hosts.items) |host| host.updateNoticeChanged(host == announcer);
     }
 
     fn clearUpdateNotice(self: *App) void {
         if (self.update_notice) |*notice| {
             notice.deinit(self.core_app.alloc);
             self.update_notice = null;
-            for (self.hosts.items) |host| host.invalidateBannerText();
+            for (self.hosts.items) |host| host.updateNoticeChanged(false);
         }
     }
 
@@ -6149,7 +6918,7 @@ pub const App = struct {
         if (notice.staged) {
             if (!self.canApplyStagedUpdate()) {
                 if (isPortableModeActive(self.core_app.alloc)) {
-                    try self.showUpdateInfo(updateApplyFailureMessage(error.NoStagedPortableInstall));
+                    try self.showUpdateInfo(.err, updateApplyFailureMessage(error.NoStagedPortableInstall));
                     return;
                 }
                 if (notice.release_url) |url| {
@@ -6163,29 +6932,66 @@ pub const App = struct {
         try self.openUrl(notice.release_url.?);
     }
 
+    /// A staged notice is recorded too, or it would come back at every launch.
+    /// Only the dismissal is written: the staged install stays on disk, so a
+    /// manual check can offer it again without downloading.
     fn dismissUpdateNotice(self: *App) void {
-        const notice = self.update_notice orelse return;
-        if (notice.staged) {
-            self.clearUpdateNotice();
-            return;
-        }
-
-        const version_text = notice.version_text orelse {
-            self.clearUpdateNotice();
-            return;
-        };
-
+        if (self.update_notice == null) return;
         const state_path = updatepkg.defaultStatePath(self.core_app.alloc) catch |err| {
             log.warn("failed to resolve updater state path err={}", .{err});
             self.clearUpdateNotice();
             return;
         };
         defer self.core_app.alloc.free(state_path);
+        self.dismissUpdateNoticeAt(state_path);
+    }
 
-        updatepkg.recordDismissal(self.core_app.alloc, state_path, version_text) catch |err| {
-            log.warn("failed to record updater dismissal err={}", .{err});
-        };
+    fn dismissUpdateNoticeAt(self: *App, state_path: []const u8) void {
+        const notice = self.update_notice orelse return;
+        if (notice.version_text) |version_text| {
+            updatepkg.recordDismissal(self.core_app.alloc, state_path, version_text) catch |err| {
+                log.warn("failed to record updater dismissal err={}", .{err});
+            };
+        }
         self.clearUpdateNotice();
+    }
+
+    test "dismissing a staged update notice records the dismissal and keeps the staged install" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(root);
+        const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+        defer alloc.free(state_path);
+        var staged: updatepkg.State = .{
+            .staged_version = try alloc.dupe(u8, "1.3.200"),
+            .staged_kind = .installer,
+            .staged_installer_path = try alloc.dupe(u8, "setup.exe"),
+            .staged_sha256 = try alloc.dupe(u8, "00"),
+        };
+        defer staged.deinit(alloc);
+        try updatepkg.saveState(state_path, &staged);
+
+        for ([_]bool{ true, false }) |is_staged| {
+            app.update_notice = try UpdateNotice.init(alloc, "1.3.200", "https://example.invalid/release", is_staged);
+            app.dismissUpdateNoticeAt(state_path);
+            try std.testing.expectEqual(@as(?UpdateNotice, null), app.update_notice);
+
+            var after = try updatepkg.loadState(alloc, state_path);
+            defer after.deinit(alloc);
+            try std.testing.expectEqualStrings("1.3.200", after.dismissed_version.?);
+            try std.testing.expectEqualStrings("1.3.200", after.staged_version.?);
+            try updatepkg.clearDismissal(alloc, state_path);
+        }
     }
 
     fn applyStagedUpdate(self: *App) !void {
@@ -6210,7 +7016,7 @@ pub const App = struct {
             release_feed_url,
             expected_kind,
         ) catch |err| {
-            self.showUpdateInfo(updateApplyFailureMessage(err)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return err;
@@ -6218,7 +7024,7 @@ pub const App = struct {
         defer staged.deinit(self.core_app.alloc);
 
         const install_dir = currentInstallDir(self.core_app.alloc) catch |err| {
-            self.showUpdateInfo(updateApplyFailureMessage(err)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return err;
@@ -6227,7 +7033,7 @@ pub const App = struct {
 
         if (staged.kind == .portable) {
             updatepkg.recordPortableApplyPending(self.core_app.alloc, state_path, 0) catch |err| {
-                self.showUpdateInfo(updateApplyFailureMessage(err)) catch |banner_err| {
+                self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
                     log.warn("failed to show updater apply failure err={}", .{banner_err});
                 };
                 return err;
@@ -6240,7 +7046,7 @@ pub const App = struct {
         }
 
         if (!internal_os.windows.isInstallerManagedInstallDir(install_dir)) {
-            self.showUpdateInfo(updateApplyFailureMessage(error.InvalidInstallPath)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(error.InvalidInstallPath)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return error.InvalidInstallPath;
@@ -6264,6 +7070,7 @@ pub const App = struct {
         const stage_dir_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, stage_dir);
         defer self.core_app.alloc.free(stage_dir_w);
 
+        // Only App-owned state follows this call; the click handler returns without touching Host.
         const result = sys.ShellExecuteW(
             null,
             shell_runas,
@@ -6273,7 +7080,7 @@ pub const App = struct {
             c.SW_SHOW,
         );
         if (@intFromPtr(result) <= 32) {
-            self.showUpdateInfo(updateApplyFailureMessage(error.UpdateApplyLaunchFailed)) catch |banner_err| {
+            self.showUpdateInfo(.err, updateApplyFailureMessage(error.UpdateApplyLaunchFailed)) catch |banner_err| {
                 log.warn("failed to show updater apply failure err={}", .{banner_err});
             };
             return error.UpdateApplyLaunchFailed;
@@ -6301,14 +7108,57 @@ pub const App = struct {
             updatepkg.hasStagedWindowsInstall(self.core_app.alloc, state_path, .installer);
     }
 
-    fn showUpdateInfo(self: *App, message: []const u8) !void {
-        if (self.primarySurface()) |surface| {
-            if (surface.host) |host| {
-                try host.setBanner(.info, message);
-                return;
-            }
-        }
+    /// Updater feedback in the banner. A failure is `.err`, so it stays
+    /// until dismissed instead of counting down like an `.info` message.
+    fn showUpdateInfo(self: *App, kind: HostBannerKind, message: []const u8) !void {
+        // The window whose button was pressed, else the primary one. A host
+        // with no tab (its last one detached for undo) still shows a banner.
+        // Opening the release can pump messages, so check that the pressing
+        // window is still open before using it.
+        const pressed_in: ?*Host = if (self.update_action_host) |pressed| for (self.hosts.items) |live| {
+            if (live == pressed) break pressed;
+        } else null else null;
+        const host: ?*Host = pressed_in orelse blk: {
+            if (self.primarySurface()) |surface| if (surface.host) |value| break :blk value;
+            break :blk if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        };
+        if (host) |value| return value.setBanner(kind, message);
         try showInfoMessage(.app, "noctty", message);
+    }
+
+    test "showUpdateInfo answers in the window whose banner button was pressed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var first: Host = undefined;
+        var second: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{
+                .{ .storage = &first, .id = 1, .register = true },
+                .{ .storage = &second, .id = 2, .register = true },
+            },
+        });
+        defer session.deinit();
+
+        app.update_action_host = &second;
+        try app.showUpdateInfo(.err, "Install failed.");
+        try std.testing.expectEqual(@as(?[:0]const u8, null), first.banner_text);
+        try std.testing.expectEqualStrings("Install failed.", second.banner_text.?);
+
+        // A pressing window that has since closed is not used.
+        _ = app.hosts.swapRemove(1);
+        try app.showUpdateInfo(.err, "Still failed.");
+        try std.testing.expectEqualStrings("Still failed.", first.banner_text.?);
+
+        // With no pressed window and no surface to find the primary window
+        // by, the first window answers rather than only the log.
+        app.update_action_host = null;
+        try app.showUpdateInfo(.info, "Up to date.");
+        try std.testing.expectEqualStrings("Up to date.", first.banner_text.?);
     }
 
     fn showRecoverySafeModeNotice(_: *App, _: []const u8) void {
@@ -6573,10 +7423,7 @@ pub const App = struct {
     ) !bool {
         switch (action) {
             .quit => {
-                self.stopQuitTimer();
-                self.running = false;
-                self.destroyAllWindows();
-                if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+                self.postQuit(target);
                 return true;
             },
 
@@ -6732,7 +7579,7 @@ pub const App = struct {
                     self.startup_cwd orelse cwd,
                     command,
                 );
-                defer alloc.free(parameters);
+                errdefer alloc.free(parameters);
 
                 // `--working-directory` above carries the terminal path
                 // verbatim; ShellExecuteExW needs a Windows-local directory
@@ -6742,12 +7589,12 @@ pub const App = struct {
                     alloc,
                     cwd,
                 );
-                defer if (host_cwd) |directory| alloc.free(directory);
+                errdefer if (host_cwd) |directory| alloc.free(directory);
 
-                switch (try win32_elevation.launchElevated(alloc, parameters, host_cwd)) {
-                    .launched => {},
-                    .cancelled => log.info("win32 elevated launch cancelled by user", .{}),
-                }
+                try self.deferShellRequest(.{ .elevated_window = .{
+                    .parameters = parameters,
+                    .cwd = host_cwd,
+                } });
                 return true;
             },
 
@@ -6768,10 +7615,8 @@ pub const App = struct {
             },
 
             .close_all_windows => {
-                self.stopQuitTimer();
-                self.running = false;
-                self.destroyAllWindows();
-                if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+                // Closing every window quits, as `quit` does.
+                self.postQuit(target);
                 return true;
             },
 
@@ -6846,7 +7691,11 @@ pub const App = struct {
                         for (self.windows.items) |surface| {
                             try surface.applyRuntimeConfig(&self.config);
                         }
+                        // A reload that turns automatic checks on in a process
+                        // that started with them off (or on another channel).
+                        if (self.windows.items.len > 0 and self.update_startup_ready) self.maybeScheduleAutomaticUpdateCheck();
                         self.settings_window.externalConfigChanged(&self.config, self.config_revision);
+                        self.refreshConfigProblems();
                         if (self.windows.items.len == 0) {
                             self.startQuitTimer();
                         } else {
@@ -6913,6 +7762,12 @@ pub const App = struct {
                 var config = try configpkg.Config.load(self.core_app.alloc);
                 defer config.deinit();
                 try self.core_app.updateConfig(self, &config);
+                // A reload that found problems says so, whatever
+                // `app-notifications` allows: "reloaded" would be false.
+                // The config in effect, not the one just read: the app
+                // applies its conditional state (dark system, `theme =
+                // light:A,dark:B`) before it installs it.
+                if (self.reportConfigProblems(&self.config)) return true;
                 if (self.config.@"app-notifications".@"config-reload") {
                     try self.showDesktopNotification(.app, "noctty", "Configuration reloaded");
                 }
@@ -7354,6 +8209,12 @@ pub const App = struct {
                     return true;
                 }
 
+                // A key press on the pane and the palette both target the
+                // surface. The default binding is performable, so report that
+                // nothing was undone and the chord goes on to the program in
+                // the pane (the palette says so itself, see invokePaletteRow).
+                // An app-level request gets the banner.
+                if (target == .surface) return false;
                 _ = try self.showHostBanner(.{ .surface = surface.core() }, .info, "Nothing to undo.");
                 return true;
             },
@@ -7396,6 +8257,9 @@ pub const App = struct {
                     return true;
                 }
 
+                // See undo: a surface-targeted request with nothing to redo
+                // is not performed, so a performable binding lets the key through.
+                if (target == .surface) return false;
                 _ = try self.showHostBanner(.{ .surface = surface.core() }, .info, "Nothing to redo.");
                 return true;
             },
@@ -8198,14 +9062,126 @@ pub const App = struct {
         self: *App,
         pending: *win32_terminal_handoff.PendingSession,
     ) !void {
+        // `config.title` is the static-title setting: the core would drop
+        // every later title the console sets (cmd's `title`, a prompt, a
+        // TUI) for as long as the surface lives. The client's title is only
+        // where this one starts.
         var config = try apprt.surface.newConfig(self.core_app, &self.config, .window);
         defer config.deinit();
-        const alloc = config._arena.?.allocator();
-        config.title = try alloc.dupeZ(u8, pending.title);
         const title_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, pending.title);
         defer self.core_app.alloc.free(title_w);
-        _ = try self.createWindowSurface(&config, title_w.ptr, .{ .adopted_session = pending });
+        const surface = try self.createWindowSurface(&config, title_w.ptr, .{
+            .adopted_session = pending,
+            .show = adoptedInitialShow(pending.startup_flags, pending.show_window),
+        });
+        // Nothing has drained the surface's mailbox yet, so this cannot
+        // overwrite a title the console already set. A `title` the user
+        // configured is static and already applied by the core.
+        if (config.title == null) surface.setTitle(pending.title) catch |err| {
+            log.warn("adopted window startup title failed err={}", .{err});
+        };
         win32_terminal_handoff.appendHandoffMilestone(self.core_app.alloc, "adopted_window_created");
+    }
+
+    test "an adopted window starts with the client's title and show state, and pins neither" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var created: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &created, .host = &host, .register = true }},
+        });
+        defer session.deinit();
+        defer appendOwnedString(core_app.alloc, &created.title, null) catch {};
+
+        const Hook = struct {
+            var created_ref: *Surface = undefined;
+            var title_pinned: bool = true;
+            var show: InitialShow = .activate;
+
+            fn createSurface(
+                _: *App,
+                config: *const configpkg.Config,
+                _: LPCWSTR,
+                opts: SurfaceInitOptions,
+            ) anyerror!*Surface {
+                title_pinned = config.title != null;
+                show = opts.show;
+                return created_ref;
+            }
+        };
+        Hook.created_ref = &created;
+        app.test_create_window_surface = &Hook.createSurface;
+
+        var pending: win32_terminal_handoff.PendingSession = .{
+            .alloc = core_app.alloc,
+            .adopted = null,
+            .title = try core_app.alloc.dupe(u8, "C:\\Windows\\system32\\cmd.exe"),
+            .startup_flags = win32_terminal_handoff.STARTF_USESHOWWINDOW,
+            .show_window = c.SW_SHOWMINNOACTIVE,
+        };
+        defer pending.deinit();
+
+        try app.createAdoptedWindow(&pending);
+
+        // A set `config.title` is the static-title setting, which makes the
+        // core drop every title the console sets afterwards.
+        try std.testing.expect(!Hook.title_pinned);
+        try std.testing.expectEqual(InitialShow.minimized, Hook.show);
+        try std.testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", created.title.?);
+
+        // A title the user configured is static and wins over the client's.
+        try appendOwnedString(core_app.alloc, &created.title, null);
+        app.config.title = "My Term";
+        defer app.config.title = null;
+        try app.createAdoptedWindow(&pending);
+        try std.testing.expect(Hook.title_pinned);
+        try std.testing.expect(created.title == null);
+    }
+
+    test "a handed-off console's show state maps to the host's first show" {
+        const use = win32_terminal_handoff.STARTF_USESHOWWINDOW;
+        // Ignored without STARTF_USESHOWWINDOW, whatever the client left in
+        // `wShowWindow`.
+        for ([_]u16{ c.SW_HIDE, c.SW_SHOWMINNOACTIVE, c.SW_MAXIMIZE, c.SW_SHOWNOACTIVATE }) |sw| {
+            try std.testing.expectEqual(InitialShow.activate, adoptedInitialShow(0, sw));
+            try std.testing.expectEqual(InitialShow.activate, adoptedInitialShow(0x100, sw));
+        }
+        const cases = [_]struct { u16, InitialShow }{
+            .{ c.SW_SHOWNOACTIVATE, .no_activate },
+            .{ c.SW_SHOWNA, .no_activate },
+            .{ c.SW_SHOWMINIMIZED, .minimized },
+            .{ c.SW_MINIMIZE, .minimized },
+            .{ c.SW_SHOWMINNOACTIVE, .minimized },
+            .{ c.SW_FORCEMINIMIZE, .minimized },
+            .{ c.SW_HIDE, .minimized },
+            .{ c.SW_MAXIMIZE, .maximized },
+            // SW_SHOWNORMAL, SW_SHOW, SW_RESTORE, SW_SHOWDEFAULT, and a value
+            // no one defined.
+            .{ 1, .activate },
+            .{ c.SW_SHOW, .activate },
+            .{ c.SW_RESTORE, .activate },
+            .{ 10, .activate },
+            .{ 99, .activate },
+        };
+        for (cases) |case| {
+            try std.testing.expectEqual(case[1], adoptedInitialShow(use, case[0]));
+            // Other STARTF_ bits do not matter.
+            try std.testing.expectEqual(case[1], adoptedInitialShow(use | 0x100, case[0]));
+        }
+        // Only a minimized host or a passive one stays out of the foreground.
+        try std.testing.expect(InitialShow.activate.takesFocus());
+        try std.testing.expect(InitialShow.maximized.takesFocus());
+        try std.testing.expect(!InitialShow.no_activate.takesFocus());
+        try std.testing.expect(!InitialShow.minimized.takesFocus());
+        try std.testing.expectEqual(@as(?i32, null), InitialShow.activate.showCommand());
+        try std.testing.expectEqual(@as(?i32, c.SW_SHOWMINNOACTIVE), InitialShow.minimized.showCommand());
     }
 
     fn refreshSystemWheelSettings(self: *App) void {
@@ -8293,6 +9269,7 @@ pub const App = struct {
             }
         }
         for (self.windows.items) |surface| surface.invalidateScrollbarWindow();
+        self.theme_rebuilds +%= 1;
         self.settings_window.themeChanged();
     }
 
@@ -8324,8 +9301,7 @@ pub const App = struct {
         if (duplicate_slot) |index| {
             if (index != slot_ordinal) {
                 if (self.launcher_quick_slot_keys[slot_ordinal]) |current| {
-                    if (self.launcher_quick_slot_keys[index]) |dupe| self.core_app.alloc.free(dupe);
-                    self.launcher_quick_slot_keys[index] = try self.core_app.alloc.dupeZ(u8, current);
+                    try appendOwnedString(self.core_app.alloc, &self.launcher_quick_slot_keys[index], current);
                 } else {
                     runUiActionOrLog(
                         "quick slot deduplication failed",
@@ -8341,6 +9317,28 @@ pub const App = struct {
             runUiActionOrLog("quick slot profile refresh failed", host.reapplyLauncherProfilePreferences());
             host.refreshProfileChrome();
         }
+    }
+
+    test "setLauncherQuickSlotPreference keeps the other slot's key when the copy fails" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        core_app.alloc = failing.allocator();
+        defer core_app.alloc = std.testing.allocator;
+        app.launcher_quick_slot_keys[0] = try std.testing.allocator.dupeZ(u8, "pwsh");
+        app.launcher_quick_slot_keys[1] = try std.testing.allocator.dupeZ(u8, "cmd");
+        defer for (app.launcher_quick_slot_keys) |value| {
+            if (value) |key| std.testing.allocator.free(key);
+        };
+        // Slot 0 takes "cmd", so slot 1 is to receive a copy of "pwsh".
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, app.setLauncherQuickSlotPreference(0, "cmd"));
+        try std.testing.expectEqualStrings("pwsh", app.launcher_quick_slot_keys[0].?);
+        try std.testing.expectEqualStrings("cmd", app.launcher_quick_slot_keys[1].?);
     }
 
     fn clearLauncherQuickSlotPreferences(self: *App) void {
@@ -8505,8 +9503,8 @@ pub const App = struct {
         // `CreateWindowEx` with a caption it did not ask for. Take it off
         // while the host is still hidden and has no tabs. This goes after the
         // compositor attach because the frame change resizes the client area,
-        // and the host's WM_SIZE resizes its compositor target, which must
-        // exist by then.
+        // and the host's WM_SIZE resizes its compositor target (when a
+        // compositor is running), which must exist by then.
         restoreRequestedHostWindowStyle(hwnd, startup_style);
 
         try self.hosts.append(self.core_app.alloc, host);
@@ -8537,6 +9535,8 @@ pub const App = struct {
     fn attachShellCompositorWindow(self: *App, hwnd: HWND) void {
         if (!self.shell_compositor_initialized) return;
         self.shell_compositor.attachWindow(@intFromPtr(hwnd)) catch |err| switch (err) {
+            // The normal state: no driver was started, so no host has a target.
+            error.FallbackOnly => return,
             error.DeviceLost => {
                 self.shell_compositor.recover() catch |recover_err| {
                     log.warn("shell compositor recovery after attach failed err={}", .{recover_err});
@@ -8674,6 +9674,39 @@ pub const App = struct {
         };
     }
 
+    test "App.init leaves the shell compositor stopped so banners fall back to GDI" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core = try CoreApp.create(std.testing.allocator);
+        defer core.destroy();
+
+        var app: App = undefined;
+        try app.init(core, .{});
+        defer app.terminate();
+
+        // Starting the native driver builds a hardware D3D11 device on the UI
+        // thread and attaches a DirectComposition target to every host.
+        try std.testing.expect(app.shell_compositor_initialized);
+        try std.testing.expect(!app.shell_compositor_driver.isStarted());
+        try std.testing.expectEqual(win32_compositor.State.fallback, app.shell_compositor.status().state);
+
+        // A host that appears now gets no target, and DirectWrite chrome
+        // text reports nothing drawn. Banners do not use it any more: the
+        // banner child paints itself with GDI (`Host.paintBanner`).
+        const hwnd: HWND = @ptrFromInt(0x1000);
+        app.attachShellCompositorWindow(hwnd);
+        try std.testing.expect(!app.shell_compositor.status().compositionActive());
+        try std.testing.expectEqual(@as(u32, 0), app.shell_compositor.status().active_target_count);
+        try std.testing.expect(!app.renderShellChromeText(hwnd, .{
+            .text = std.unicode.utf8ToUtf16LeStringLiteral("Nothing to undo."),
+            .left_px = 0,
+            .top_px = 0,
+            .right_px = 100,
+            .bottom_px = 24,
+            .color_ref = 0,
+        }));
+    }
+
     fn findHostById(self: *App, id: u32) ?*Host {
         for (self.hosts.items) |host| {
             if (host.id == id) return host;
@@ -8760,14 +9793,27 @@ pub const App = struct {
         return self.focusedSurfaceForUndoRedo() orelse self.primarySurface();
     }
 
+    fn emptyHostKeyEvent(self: *App, host_id: u32, event: input.KeyEvent) bool {
+        const previous = self.empty_host_key_id;
+        self.empty_host_key_id = host_id;
+        defer self.empty_host_key_id = previous;
+        return self.core_app.keyEvent(self, event);
+    }
+
     fn undoRedoSurfaceForTarget(self: *App, target: apprt.Target) ?*Surface {
         return switch (target) {
-            .app => self.focusedSurfaceForUndoRedo() orelse self.primarySurface(),
+            .app => if (self.empty_host_key_id) |id|
+                if (self.findHostById(id)) |host| host.activeSurface() else null
+            else
+                self.focusedSurfaceForUndoRedo() orelse self.primarySurface(),
             .surface => |core_surface| self.findSurfaceByCore(core_surface),
         };
     }
 
     fn structuralUndoHostForTarget(self: *App, target: apprt.Target) ?*Host {
+        if (target == .app) {
+            if (self.empty_host_key_id) |id| return self.findHostById(id);
+        }
         if (self.undoRedoSurfaceForTarget(target)) |surface| {
             if (surface.host) |host| return host;
         }
@@ -8779,6 +9825,9 @@ pub const App = struct {
     }
 
     fn structuralRedoHostForTarget(self: *App, target: apprt.Target) ?*Host {
+        if (target == .app) {
+            if (self.empty_host_key_id) |id| return self.findHostById(id);
+        }
         if (self.undoRedoSurfaceForTarget(target)) |surface| {
             if (surface.host) |host| return host;
         }
@@ -8799,7 +9848,9 @@ pub const App = struct {
         const surface = self.primarySurface() orelse return;
         const host = surface.host orelse return;
         const text = ptypkg.takeConPtyFallbackBanner() orelse return;
-        host.setBanner(.info, text) catch |err| {
+        // Shown once per process and naming why output may be degraded, so
+        // it stays until dismissed.
+        host.setBanner(.err, text) catch |err| {
             log.warn("failed to show ConPTY fallback banner err={}", .{err});
         };
     }
@@ -8996,6 +10047,30 @@ pub const App = struct {
         self.auditShellNativeMapping("focus");
     }
 
+    /// After a close the shell model has chosen what is focused: the pane
+    /// and tab that were survive, and when one of them closed, the first
+    /// pane of the closed pane's sibling or the tab now at the closed tab's
+    /// place takes over. Native focus follows that choice (decision D7),
+    /// matched by stable ID, since a close renumbers split-tree handles and
+    /// shifts tab indices.
+    fn followShellFocus(self: *App, host: *Host) void {
+        if (!self.shell_runtime_initialized) return;
+        const state = &self.shell_runtime.state;
+        const window = state.windowConst(host.shell_id orelse return) orelse return;
+        for (host.tabs.items, 0..) |*tab, index| {
+            const tab_id = tab.shell_id orelse continue;
+            if (window.active_tab) |active| {
+                if (active.eql(tab_id)) host.active_tab = index;
+            }
+            const focused_pane = (state.tabConst(tab_id) orelse continue).focused_pane;
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                const pane_id = entry.view.shell_id orelse continue;
+                if (pane_id.eql(focused_pane)) tab.focused = entry.handle;
+            }
+        }
+    }
+
     fn syncTaskbarProgressForHost(self: *App, host_id: u32) void {
         const taskbar = if (self.taskbar_progress) |*value| value else return;
         const host = self.findHostById(host_id) orelse return;
@@ -9067,9 +10142,11 @@ pub const App = struct {
         }
     }
 
+    /// Like `activateSurface`, but neither shows, raises nor focuses the
+    /// window, so windows hidden by `toggle_visibility` stay hidden and
+    /// `windows_hidden` stays true.
     fn activateSurfaceNoFocus(self: *App, surface: *Surface) void {
         const was_windows_hidden = self.windows_hidden;
-        self.windows_hidden = false;
         if (self.findTabForSurface(surface)) |found| {
             const handle = found.tab.findHandle(surface) orelse found.tab.focused;
             const host_window_visible = if (found.host.hwnd) |hwnd|
@@ -9149,6 +10226,8 @@ pub const App = struct {
                 host.tabs.items[host.active_tab].id
             else
                 null;
+            // Only closing the pane the window shows as focused moves focus.
+            const was_active_surface = host.activeSurface() == surface;
             surface.invalidateStructuralHistoryForDestroy();
             host.discardStructuralEntriesReferencing(surface);
 
@@ -9160,6 +10239,7 @@ pub const App = struct {
                 host.hideTabDropPreview();
             }
 
+            var tab_removed = false;
             for (host.tabs.items, 0..) |*tab, i| {
                 if (tab.findHandle(surface)) |handle| {
                     if (tab.tree.nodes.len == 1) {
@@ -9169,9 +10249,8 @@ pub const App = struct {
                         var removed = host.tabs.orderedRemove(i);
                         host.destroyTabButton(&removed);
                         removed.deinit();
-                        if (host.active_tab >= host.tabs.items.len and host.tabs.items.len > 0) {
-                            host.active_tab = host.tabs.items.len - 1;
-                        }
+                        host.active_tab = activeTabAfterRemoval(host.active_tab, i, host.tabs.items.len);
+                        tab_removed = true;
                     } else {
                         const next_tree = if (surface.pending_close_tree) |prepared_tree| prepared: {
                             surface.pending_close_tree = null;
@@ -9185,10 +10264,17 @@ pub const App = struct {
                                 break;
                             };
                         };
+                        const focused = tab.focusedSurface();
                         tab.tree.deinit();
                         tab.tree = next_tree;
-                        var it = tab.tree.iterator();
-                        tab.focused = it.next().?.handle;
+                        // Focus stays on a pane that survives; the handles
+                        // are renumbered, so find it again. When the focused
+                        // pane itself closed, the shell model picks the next
+                        // one (`followShellFocus`) and the first pane stands
+                        // in until then.
+                        var first = tab.tree.iterator();
+                        tab.focused = (if (focused) |kept| tab.findHandle(kept) else null) orelse
+                            first.next().?.handle;
                         // The closed split may have been what the tab's
                         // status badge was showing.
                         host.refreshTabStatus(i);
@@ -9196,7 +10282,6 @@ pub const App = struct {
                     break;
                 }
             }
-            host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
 
             if (surface.pending_close_tree) |*unused_tree| {
                 unused_tree.deinit();
@@ -9215,7 +10300,10 @@ pub const App = struct {
                 prepared.deinit();
                 surface.pending_shell_close = null;
                 shell_mapping_changed = true;
+                self.followShellFocus(host);
             }
+            host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
+            if (tab_removed) host.notifyTabRemovedUia();
 
             var shell_mapping_stable = true;
             if (host.tabs.items.len == 0) {
@@ -9227,7 +10315,15 @@ pub const App = struct {
                     self.removeHost(host);
                 }
             } else if (self.running) {
-                if (activeTab(host)) |tab| if (tab.focusedSurface()) |replacement| self.activateSurface(replacement);
+                // A close never restores, raises or takes focus from a
+                // window the user is not looking at, and moves focus only
+                // when the pane that had it closed.
+                if (activeTab(host)) |tab| if (tab.focusedSurface()) |replacement| {
+                    if (was_active_surface and tabSeenByUser(host, host.active_tab))
+                        self.activateSurface(replacement)
+                    else
+                        self.activateSurfaceNoFocus(replacement);
+                };
                 // Relayout after tab removal because the chrome
                 // reservation may have changed. In this fork,
                 // `.auto` still shows the row since it carries the
@@ -9290,6 +10386,18 @@ pub const App = struct {
         };
         const next_handle = (try found.tab.tree.goto(self.core_app.alloc, from, goto)) orelse return false;
         found.tab.focused = next_handle;
+        // A zoomed tab shows only the zoomed pane, so moving away unzooms,
+        // or with `split-preserve-zoom = navigation` zooms the pane moved
+        // to. Lay out before focusing it, so it is visible when it gets focus.
+        if (found.tab.tree.zoomed) |zoomed| {
+            const next_zoom: ?SplitTreeSurface.Node.Handle =
+                if (self.config.@"split-preserve-zoom".navigation) next_handle else null;
+            if (next_zoom != zoomed) {
+                found.tab.tree.zoom(next_zoom);
+                current.invalidateRedoForUnsupportedTabStructuralAction();
+                runUiActionOrLog("goto_split zoom layout failed", found.host.layout());
+            }
+        }
         const next_surface = found.tab.focusedSurface() orelse return false;
         self.activateSurface(next_surface);
         return true;
@@ -9363,88 +10471,141 @@ pub const App = struct {
 
         switch (mode) {
             .this => {
-                const entry = host.detachTabForUndo(current_idx) orelse return false;
-                const stored_entry = host.pushStructuralUndo(entry) catch |err| {
-                    log.warn("close_tab undo snapshot failed err={}", .{err});
-                    var failed = entry;
-                    errdefer runUiActionOrLog("close tab rollback dispose failed", failed.dispose(host, .normal));
-                    _ = try host.restoreClosedTabEntryNative(&failed.payload.close_tab);
-                    if (host.activeSurface()) |restored| self.activateSurface(restored);
-                    return err;
-                };
-                if (self.shell_runtime_initialized) shell: {
-                    const shell_tab_id = stored_entry.payload.close_tab.shell_id orelse {
-                        var failed = host.structural_undo_entries.pop().?;
-                        _ = try host.restoreClosedTabEntryNative(&failed.payload.close_tab);
-                        if (host.activeSurface()) |restored| self.activateSurface(restored);
-                        return error.ShellStateOutOfSync;
-                    };
-                    var prepared = self.shell_runtime.prepare(.{ .detach_tab = shell_tab_id }) catch |err| {
-                        var failed = host.structural_undo_entries.pop().?;
-                        _ = try host.restoreClosedTabEntryNative(&failed.payload.close_tab);
-                        if (host.activeSurface()) |restored| self.activateSurface(restored);
-                        return err;
-                    };
-                    defer prepared.deinit();
-                    prepared.commit(&self.shell_runtime) catch |err| {
-                        var failed = host.structural_undo_entries.pop().?;
-                        _ = try host.restoreClosedTabEntryNative(&failed.payload.close_tab);
-                        if (host.activeSurface()) |restored| self.activateSurface(restored);
-                        return err;
-                    };
-                    self.auditShellNativeMapping("tab-detach");
-                    break :shell;
+                // With `undo-timeout = 0` the close cannot be taken back, so it
+                // asks like the closes that are not undoable.
+                if (self.undoTimeoutMs() == 0) {
+                    const count = tabsCloseConfirmCount(host.tabs.items[current_idx..][0..1]);
+                    if (count != 0) {
+                        host.askBeforeClosing(.this_tab, count, &closeThisTabConfirmAccept, current);
+                        return true;
+                    }
                 }
-                if (stored_entry.payload.close_tab.tab) |*tab| tab.clearRedoHistory();
-                if (host.activeSurface()) |replacement| {
-                    self.activateSurface(replacement);
-                } else {
-                    host.refocusHostWindow();
-                    runUiActionOrLog("tab close layout failed", host.layout());
-                    runUiActionOrLog("tab close chrome refresh failed", host.refreshChrome());
-                    runUiActionOrLog(
-                        "tab close banner failed",
-                        host.setBanner(.info, "Tab closed. Use undo to restore it."),
-                    );
-                }
+                return try self.closeTabUndoable(host, current_idx);
+            },
+
+            // Not undoable, unlike `.this`: ask first when a terminal in
+            // the closing tabs would lose a running process.
+            inline .other, .right => |beside| {
+                const tabs = host.tabs.items;
+                if (beside == .other and tabs.len <= 1) return false;
+                if (beside == .right and current_idx + 1 >= tabs.len) return false;
+                const count = if (beside == .other)
+                    tabsCloseConfirmCount(tabs[0..current_idx]) + tabsCloseConfirmCount(tabs[current_idx + 1 ..])
+                else
+                    tabsCloseConfirmCount(tabs[current_idx + 1 ..]);
+                if (count == 0) return try self.closeTabsBeside(current, beside);
+                if (beside == .other)
+                    host.askBeforeClosing(.other_tabs, count, &closeOtherTabsConfirmAccept, current)
+                else
+                    host.askBeforeClosing(.right_tabs, count, &closeRightTabsConfirmAccept, current);
                 return true;
             },
-
-            .other => {
-                if (host.tabs.items.len <= 1) return false;
-                if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
-                found.tab.clearRedoHistory();
-                var closed = false;
-                var i = host.tabs.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (i == current_idx) continue;
-                    host.tabs.items[i].clearRedoHistory();
-                    var it = host.tabs.items[i].tree.iterator();
-                    while (it.next()) |entry| entry.view.close(false);
-                    closed = true;
-                }
-                if (closed) self.activateSurface(current);
-                return closed;
-            },
-
-            .right => {
-                if (current_idx + 1 >= host.tabs.items.len) return false;
-                if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
-                found.tab.clearRedoHistory();
-                var closed = false;
-                var i = host.tabs.items.len;
-                while (i > current_idx + 1) {
-                    i -= 1;
-                    host.tabs.items[i].clearRedoHistory();
-                    var it = host.tabs.items[i].tree.iterator();
-                    while (it.next()) |entry| entry.view.close(false);
-                    closed = true;
-                }
-                if (closed) self.activateSurface(current);
-                return closed;
-            },
         }
+    }
+
+    /// Detach tab `current_idx` into undo history and show what is left. Asks
+    /// nothing: `closeTab` decides whether the close needs a prompt first.
+    fn closeTabUndoable(self: *App, host: *Host, current_idx: usize) !bool {
+        const previous_active = host.active_tab;
+        const entry = host.detachTabForUndo(current_idx) orelse return false;
+        const stored_entry = host.pushStructuralUndo(entry) catch |err| {
+            log.warn("close_tab undo snapshot failed err={}", .{err});
+            var failed = entry;
+            errdefer runUiActionOrLog("close tab rollback dispose failed", failed.dispose(host, .normal));
+            try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
+            return err;
+        };
+        if (self.shell_runtime_initialized) shell: {
+            const shell_tab_id = stored_entry.payload.close_tab.shell_id orelse {
+                var failed = host.structural_undo_entries.pop().?;
+                try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
+                return error.ShellStateOutOfSync;
+            };
+            var prepared = self.shell_runtime.prepare(.{ .detach_tab = shell_tab_id }) catch |err| {
+                var failed = host.structural_undo_entries.pop().?;
+                try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
+                return err;
+            };
+            defer prepared.deinit();
+            prepared.commit(&self.shell_runtime) catch |err| {
+                var failed = host.structural_undo_entries.pop().?;
+                try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
+                return err;
+            };
+            self.auditShellNativeMapping("tab-detach");
+            break :shell;
+        }
+        // Only now: a close that rolled back above left the list as it was.
+        host.notifyTabRemovedUia();
+        if (stored_entry.payload.close_tab.tab) |*tab| tab.clearRedoHistory();
+        if (host.activeSurface()) |replacement| {
+            if (current_idx != previous_active) {
+                // A background tab closed from its button leaves
+                // the active tab as it was: close the gap in the
+                // strip here, since activation skips layout then,
+                // and leave focus and window visibility alone.
+                runUiActionOrLog("tab close layout failed", host.layout());
+                runUiActionOrLog("tab close chrome refresh failed", host.refreshChrome());
+                self.activateSurfaceNoFocus(replacement);
+            } else self.activateSurface(replacement);
+        } else {
+            host.refocusHostWindow();
+            runUiActionOrLog("tab close layout failed", host.layout());
+            runUiActionOrLog("tab close chrome refresh failed", host.refreshChrome());
+            var hint_buf: [96]u8 = undefined;
+            runUiActionOrLog(
+                "tab close banner failed",
+                host.setBanner(.info, labels.tabClosedMessage(
+                    &self.config.keybind.set,
+                    .{ .has_modifier_remaps = self.config.@"key-remap".map.count() != 0, .us_layout = sys.GetKeyboardLayout(0) == 0x04090409 },
+                    &hint_buf,
+                )),
+            );
+        }
+        return true;
+    }
+
+    /// Puts back a tab that `close_tab:this` detached when the close cannot
+    /// finish, with the tab that was active before it in front again: a
+    /// background tab closed from its button must not end up selected.
+    fn rollbackTabClose(self: *App, host: *Host, entry: *Host.CloseTabUndo, previous_active: usize) !void {
+        _ = try host.restoreClosedTabEntryNative(entry);
+        if (previous_active < host.tabs.items.len) host.active_tab = previous_active;
+        // The detach destroyed the tab's button, and activating an active
+        // tab that did not change rebuilds no strip.
+        runUiActionOrLog("tab close rollback chrome refresh failed", host.refreshChrome());
+        runUiActionOrLog("tab close rollback layout failed", host.layout());
+        if (host.activeSurface()) |restored| self.activateSurface(restored);
+    }
+
+    /// Close every tab beside `current`'s (`.other`), or the tabs to its
+    /// right, without asking. Not undoable: the history goes first. The
+    /// panes are listed before any of them closes, because each close
+    /// replaces or removes its tab's split tree.
+    fn closeTabsBeside(self: *App, current: *Surface, comptime beside: apprt.action.CloseTabMode) !bool {
+        comptime std.debug.assert(beside != .this);
+        const found = self.findTabForSurface(current) orelse return false;
+        const host = found.host;
+        const keep = found.index;
+        const alloc = self.core_app.alloc;
+        var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer surfaces.deinit(alloc);
+        var i = host.tabs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (i == keep or (beside == .right and i < keep)) continue;
+            var it = host.tabs.items[i].tree.iterator();
+            while (it.next()) |entry| try surfaces.append(alloc, entry.view);
+        }
+        if (surfaces.items.len == 0) return false;
+        if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
+        for (host.tabs.items, 0..) |*tab, index| {
+            if (beside == .right and index < keep) continue;
+            tab.clearRedoHistory();
+        }
+        for (surfaces.items) |surface| surface.close(false);
+        self.activateSurface(current);
+        return true;
     }
 
     fn gotoTab(self: *App, target: apprt.Target, goto: apprt.action.GotoTab) !bool {
@@ -9586,7 +10747,7 @@ pub const App = struct {
             // without taking focus. Without this, the very first toggle-on
             // with `keyboard-interactivity = none` would still activate the
             // window even though the later `present()` call is skipped.
-            .passive_show = !want_focus,
+            .show = if (want_focus) .activate else .no_activate,
         });
         try surface.setFloatWindow(.on);
         if (surface.windowHwnd()) |top_level| {
@@ -9674,59 +10835,26 @@ pub const App = struct {
         const end = win32_quick_terminal.computeEndRect(qt_cfg, mi);
         const start = win32_quick_terminal.computeStartRect(qt_cfg, mi);
         const duration_ms = win32_quick_terminal.animationDurationMs(qt_cfg.animation_duration_s);
-        const flags = c.SWP_NOACTIVATE;
         if (!animate or duration_ms == 0 or rectEqual(start, end)) {
             if (getHost(hwnd)) |host| host.cancelQuickTerminalAnimation();
-            _ = sys.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                end.left,
-                end.top,
-                end.right - end.left,
-                end.bottom - end.top,
-                flags,
-            );
+            setQuickTerminalRect(hwnd, end);
             return;
         }
 
         const host = getHost(hwnd) orelse {
-            _ = sys.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                end.left,
-                end.top,
-                end.right - end.left,
-                end.bottom - end.top,
-                flags,
-            );
+            setQuickTerminalRect(hwnd, end);
             return;
         };
 
         const effective_duration_ms = host.effectiveTweenDuration(duration_ms);
         if (effective_duration_ms == 0) {
             host.cancelQuickTerminalAnimation();
-            _ = sys.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                end.left,
-                end.top,
-                end.right - end.left,
-                end.bottom - end.top,
-                flags,
-            );
+            setQuickTerminalRect(hwnd, end);
             return;
         }
 
         host.cancelQuickTerminalAnimation();
-        _ = sys.SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            start.left,
-            start.top,
-            start.right - start.left,
-            start.bottom - start.top,
-            flags,
-        );
+        setQuickTerminalRect(hwnd, start);
         if (host.addTween(
             0.0,
             1.0,
@@ -9740,23 +10868,86 @@ pub const App = struct {
             };
         } else {
             host.cancelQuickTerminalAnimation();
-            _ = sys.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                end.left,
-                end.top,
-                end.right - end.left,
-                end.bottom - end.top,
-                flags,
-            );
+            setQuickTerminalRect(hwnd, end);
         }
     }
 
     fn showOnScreenKeyboard(self: *App) !void {
+        try self.deferShellRequest(.on_screen_keyboard);
+    }
+
+    fn launchOnScreenKeyboard(self: *App) !void {
         const osk_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, "osk.exe");
         defer self.core_app.alloc.free(osk_w);
         const result = sys.ShellExecuteW(null, shell_open, osk_w.ptr, null, null, c.SW_SHOW);
         if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+    }
+
+    /// `quit` and `close_all_windows` run from the message loop, through the
+    /// target's window. Core does not count either as a closing action
+    /// (`closingAction`) and goes on using the terminal whose key binding
+    /// asked for it, so destroying the windows from inside that call freed
+    /// the terminal under its own key handler: an access violation in
+    /// `endKeySequence` in Debug builds.
+    fn postQuit(self: *App, target: apprt.Target) void {
+        // A quit from a terminal asks on its window. One from the app as a
+        // whole (a global key, automation) asks on the focused window, if
+        // any, else on a window with a running process.
+        const near: ?*Surface = switch (target) {
+            .app => self.focusedSurfaceForUndoRedo(),
+            .surface => |core_surface| self.findSurfaceByCore(core_surface),
+        };
+        const post_host = (if (near) |surface| surface.host else null) orelse
+            if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        // A failed post declines the quit: running it here instead is the
+        // teardown under the key handler that this function exists to avoid.
+        if (post_host) |host| if (host.hwnd) |hwnd| {
+            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, @intFromBool(near != null), 0) == 0) {
+                log.warn("quit declined: could not post it to the message loop err={}", .{
+                    windows.kernel32.GetLastError(),
+                });
+            }
+            return;
+        };
+        self.requestQuit(near);
+    }
+
+    /// `quit` and `close_all_windows`. Unsaved Settings edits ask first, in
+    /// the Settings window, which resumes the quit once they are saved or
+    /// discarded (`settingsOnClosedThunk`). Then terminals that
+    /// `confirm-close-surface` asks about get one prompt: the one already
+    /// open, or on `near`'s window, or on a shown window with one of those
+    /// terminals. Closed tabs kept for undo are not asked about.
+    fn requestQuit(self: *App, near: ?*Surface) void {
+        if (!self.session_ending) {
+            if (self.settings_window.holdQuitForUnsavedChanges()) return;
+            var count: usize = 0;
+            var open: ?*Host = null;
+            var busy: ?*Host = null;
+            for (self.hosts.items) |host| {
+                if (host.showsConfirm(&appQuitConfirmAccept, self)) open = host;
+                const host_count = tabsCloseConfirmCount(host.tabs.items);
+                if (host_count == 0) continue;
+                count += host_count;
+                if (busy == null or (!busy.?.isShown() and host.isShown())) busy = host;
+            }
+            if (count > 0) {
+                var prompt_host = open orelse busy.?;
+                if (open == null) if (near) |surface| if (surface.host) |near_host| {
+                    if (near_host.tabs.items.len > 0) prompt_host = near_host;
+                };
+                prompt_host.askBeforeClosing(.app, count, &appQuitConfirmAccept, self);
+                return;
+            }
+        }
+        self.quitConfirmed();
+    }
+
+    fn quitConfirmed(self: *App) void {
+        self.stopQuitTimer();
+        self.running = false;
+        self.destroyAllWindows();
+        if (self.windows.items.len == 0) sys.PostQuitMessage(0);
     }
 
     fn destroyAllWindows(self: *App) void {
@@ -9914,8 +11105,82 @@ pub const App = struct {
         };
     }
 
+    /// Checks the target now, so a refused one still fails at the caller,
+    /// and leaves the open itself to `runDeferredOpens`.
     fn openUrl(self: *App, url: []const u8) !void {
-        return openWin32Target(self.core_app.alloc, self, url, dispatchOpenTarget);
+        return openWin32Target(self.core_app.alloc, self, url, deferOpenTarget);
+    }
+
+    fn deferOpenTarget(self: *App, target: []const u8) !void {
+        const alloc = self.core_app.alloc;
+        const owned = try alloc.dupe(u8, target);
+        errdefer alloc.free(owned);
+        try self.deferShellRequest(.{ .target = owned });
+    }
+
+    /// Ownership transfers only after append succeeds; callers retain their
+    /// errdefer cleanup on allocation failure.
+    fn deferShellRequest(self: *App, request: DeferredOpen) !void {
+        try self.deferred_opens.append(self.core_app.alloc, request);
+    }
+
+    fn dispatchDeferredOpen(self: *App, request: *const DeferredOpen) !void {
+        // Checked again just before dispatch, as when URL opens ran in place.
+        switch (request.*) {
+            .target => |target| return openWin32Target(self.core_app.alloc, self, target, dispatchOpenTarget),
+            else => {},
+        }
+        if (self.test_shell_request) |hook| return hook(self, request);
+        switch (request.*) {
+            .target => unreachable,
+            .on_screen_keyboard => try self.launchOnScreenKeyboard(),
+            .elevated_window => |launch| switch (try win32_elevation.launchElevated(self.core_app.alloc, launch.parameters, launch.cwd)) {
+                .launched => {},
+                .cancelled => log.info("win32 elevated launch cancelled by user", .{}),
+            },
+        }
+    }
+
+    /// Runs the queued opens, oldest first, including any queued while one
+    /// runs. Returns whether any ran. Call only from the top of the message
+    /// loop (`drainDeferredOpens`): `ShellExecuteW` dispatches window messages while it works
+    /// (measured: a URL scheme open delivered posted WM_CLOSE and WM_KEYDOWN
+    /// messages, and a cross-thread sent message, to a window on the calling
+    /// thread), and one of them can destroy the Surface or Host whose window
+    /// procedure asked for the open. Run from the loop, no such frame is left
+    /// below the open to use the freed memory.
+    fn runDeferredOpens(self: *App) bool {
+        if (self.deferred_opens.items.len == 0) return false;
+        const alloc = self.core_app.alloc;
+        while (self.deferred_opens.items.len > 0) {
+            const request = self.deferred_opens.orderedRemove(0);
+            defer request.deinit(alloc);
+            self.dispatchDeferredOpen(&request) catch |err| {
+                log.warn("deferred shell request failed kind={s} err={}", .{ @tagName(request), err });
+            };
+        }
+        return true;
+    }
+
+    /// The message loop's step for deferred opens: run them, then do what the
+    /// loop does after a dispatched message, because the messages
+    /// ShellExecuteW dispatched can include our own wake, which the window
+    /// procedures swallow. Repeats while that tick queued more opens. Returns
+    /// whether the loop should exit.
+    fn drainDeferredOpens(self: *App) !bool {
+        while (self.runDeferredOpens()) {
+            self.syncDirtyGlobalHotkeys();
+            try self.tickCoreApp();
+            if (!self.running and self.windows.items.len == 0) return true;
+        }
+        return false;
+    }
+
+    fn discardDeferredOpens(self: *App) void {
+        const alloc = self.core_app.alloc;
+        for (self.deferred_opens.items) |request| request.deinit(alloc);
+        self.deferred_opens.deinit(alloc);
+        self.deferred_opens = .empty;
     }
 
     fn openWin32Target(
@@ -9927,15 +11192,18 @@ pub const App = struct {
         // Noctty fork hardening: the upstream Windows fallback dispatches any
         // target through FileProtocolHandler. ShellExecuteW must instead stay
         // inside the schemes and non-executable local files noctty produces.
-        if (!try isAllowedWin32OpenTarget(alloc, target)) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const checked = try prepareWin32OpenTarget(arena.allocator(), target) orelse {
             log.warn("refusing unsafe Win32 open target len={}", .{target.len});
             return error.OpenUrlRejected;
-        }
+        };
 
-        try dispatch(context, target);
+        try dispatch(context, checked);
     }
 
     fn dispatchOpenTarget(self: *App, target: []const u8) !void {
+        if (self.test_open_target) |hook| return hook(self, target);
         if (builtin.mode == .Debug and
             try recordOpenUrlForTest(self.core_app.alloc, target)) return;
 
@@ -9950,14 +11218,199 @@ pub const App = struct {
         if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
     }
 
-    fn isAllowedWin32OpenTarget(alloc: Allocator, target: []const u8) !bool {
-        if (!windows_shell.isSafeWindowsPath(target)) return false;
-        if (windows_shell.isDriveAbsolutePath(target)) return isAllowedWin32LocalFile(target);
-        if (isWin32UncOrDevicePath(target)) return false;
+    test "a link open runs from the message loop, not inside the caller that asked for it" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-        const uri = std.Uri.parse(target) catch return false;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const Hook = struct {
+            // Stands in for the window procedure that handled the click.
+            var in_caller = false;
+            var opened_in_caller: ?bool = null;
+            var opened: [2][64]u8 = undefined;
+            var opened_len: [2]usize = undefined;
+            var count: usize = 0;
+
+            fn open(app_: *App, target: []const u8) anyerror!void {
+                opened_in_caller = in_caller;
+                if (count >= opened.len) return error.TestUnexpectedOpen;
+                @memcpy(opened[count][0..target.len], target);
+                opened_len[count] = target.len;
+                count += 1;
+                // ShellExecuteW dispatches messages; one of them may be
+                // another click on a link.
+                if (count == 1) _ = try app_.performAction(.app, .open_url, .{
+                    .kind = .unknown,
+                    .url = "https://example.com/second",
+                });
+            }
+        };
+        Hook.in_caller = false;
+        Hook.opened_in_caller = null;
+        Hook.count = 0;
+        app.test_open_target = &Hook.open;
+
+        // Surface.processLinks reaches the opener through this action.
+        Hook.in_caller = true;
+        try std.testing.expect(try app.performAction(.app, .open_url, .{
+            .kind = .unknown,
+            .url = "https://example.com/first",
+        }));
+        Hook.in_caller = false;
+        try std.testing.expectEqual(@as(?bool, null), Hook.opened_in_caller);
+
+        // The message loop runs it, and the open it pumped, in order.
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(?bool, false), Hook.opened_in_caller);
+        try std.testing.expectEqual(@as(usize, 2), Hook.count);
+        try std.testing.expectEqualStrings("https://example.com/first", Hook.opened[0][0..Hook.opened_len[0]]);
+        try std.testing.expectEqualStrings("https://example.com/second", Hook.opened[1][0..Hook.opened_len[1]]);
+        try std.testing.expect(!app.runDeferredOpens());
+
+        // A refused target still fails at the caller and queues nothing.
+        try std.testing.expectError(error.OpenUrlRejected, app.performAction(.app, .open_url, .{
+            .kind = .unknown,
+            .url = "search-ms:query=*.exe",
+        }));
+        try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+
+        // The queued target is checked again right before dispatch.
+        const unchecked = try std.testing.allocator.dupe(u8, "search-ms:query=*.exe");
+        app.deferred_opens.append(std.testing.allocator, .{ .target = unchecked }) catch |err| {
+            std.testing.allocator.free(unchecked);
+            return err;
+        };
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 2), Hook.count);
+    }
+
+    test "deferred shell requests own payloads and run after their callers return" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const Hook = struct {
+            var in_caller = false;
+            var launched_in_caller = false;
+            var count: usize = 0;
+            var kinds: [3]std.meta.Tag(DeferredOpen) = undefined;
+            var saw_elevation_payload = false;
+            fn launch(app_: *App, request: *const DeferredOpen) anyerror!void {
+                launched_in_caller = launched_in_caller or in_caller;
+                if (count >= kinds.len) return error.TestUnexpectedLaunch;
+                kinds[count] = std.meta.activeTag(request.*);
+                count += 1;
+                if (request.* == .elevated_window) {
+                    saw_elevation_payload = request.elevated_window.parameters.len > 0;
+                    if (request.elevated_window.cwd) |cwd| try std.testing.expect(cwd.len > 0);
+                }
+                // Stand in for a message pumped by the shell launcher.
+                if (count == 1) try app_.showOnScreenKeyboard();
+            }
+        };
+        Hook.in_caller = true;
+        Hook.launched_in_caller = false;
+        Hook.count = 0;
+        Hook.saw_elevation_payload = false;
+        app.test_shell_request = &Hook.launch;
+        try std.testing.expect(try app.performAction(.app, .show_on_screen_keyboard, {}));
+        try std.testing.expect(try app.performAction(.app, .new_window_elevated, .{ .profile_key = "" }));
+        Hook.in_caller = false;
+        try std.testing.expectEqual(@as(usize, 0), Hook.count);
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expect(!Hook.launched_in_caller);
+        try std.testing.expect(Hook.saw_elevation_payload);
+        try std.testing.expectEqual(@as(usize, 3), Hook.count);
+        try std.testing.expectEqualSlices(std.meta.Tag(DeferredOpen), &.{ .on_screen_keyboard, .elevated_window, .on_screen_keyboard }, &Hook.kinds);
+        try std.testing.expect(!app.runDeferredOpens());
+
+        // Teardown owns pending payloads too; the testing allocator checks
+        // both the successful dispatch and undispatched cleanup for leaks.
+        {
+            const parameters = try std.testing.allocator.dupeZ(u8, "--test-pending");
+            errdefer std.testing.allocator.free(parameters);
+            const cwd = try std.testing.allocator.dupe(u8, "C:\\pending");
+            errdefer std.testing.allocator.free(cwd);
+            try app.deferShellRequest(.{ .elevated_window = .{ .parameters = parameters, .cwd = cwd } });
+        }
+        app.discardDeferredOpens();
+        try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+    }
+
+    test "the message loop ticks the core after the opens it ran" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+
+        const Hook = struct {
+            var opens: usize = 0;
+            var new_windows: usize = 0;
+
+            fn open(_: *App, _: []const u8) anyerror!void {
+                opens += 1;
+            }
+
+            fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, _: SurfaceInitOptions) anyerror!*Surface {
+                new_windows += 1;
+                return error.TestWindowCreateFailed;
+            }
+        };
+        Hook.opens = 0;
+        Hook.new_windows = 0;
+        app.test_open_target = &Hook.open;
+        app.test_create_window_surface = &Hook.createSurface;
+        app.running = true;
+        app.recovery_ready_resolved = true;
+
+        // Nothing queued: no tick, so the mailbox message waits.
+        try std.testing.expect(core_app.mailbox.push(.{ .new_window = .{} }, .instant) != 0);
+        try std.testing.expect(!try app.drainDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 0), Hook.new_windows);
+
+        // A wake the open swallowed would have left that message waiting too.
+        _ = try app.performAction(.app, .open_url, .{ .kind = .unknown, .url = "https://example.com/" });
+        try std.testing.expect(!try app.drainDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 1), Hook.opens);
+        try std.testing.expectEqual(@as(usize, 1), Hook.new_windows);
+    }
+
+    fn isAllowedWin32OpenTarget(alloc: Allocator, target: []const u8) !bool {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        return try prepareWin32OpenTarget(arena.allocator(), target) != null;
+    }
+
+    /// The returned local path is both checked and dispatched. In particular,
+    /// never check a decoded file URI and then hand its raw spelling to ShellExecute.
+    fn prepareWin32OpenTarget(alloc: Allocator, target: []const u8) !?[]const u8 {
+        if (!windows_shell.isSafeWindowsPath(target)) return null;
+        if (windows_shell.isDriveAbsolutePath(target)) {
+            return try prepareWin32LocalFile(alloc, target);
+        }
+        if (isWin32UncOrDevicePath(target)) return null;
+
+        const uri = std.Uri.parse(target) catch return null;
         if (std.ascii.eqlIgnoreCase(uri.scheme, "file")) {
-            return try isAllowedWin32FileUri(alloc, uri);
+            return try prepareWin32FileUri(alloc, uri);
         }
 
         for ([_][]const u8{
@@ -9975,55 +11428,89 @@ pub const App = struct {
             "gopher",
             "news",
         }) |scheme| {
-            if (std.ascii.eqlIgnoreCase(uri.scheme, scheme)) return true;
+            if (std.ascii.eqlIgnoreCase(uri.scheme, scheme)) return target;
         }
-        return false;
+        return null;
     }
 
-    fn isAllowedWin32FileUri(alloc: Allocator, uri: std.Uri) !bool {
+    fn prepareWin32FileUri(alloc: Allocator, uri: std.Uri) !?[]const u8 {
         if (uri.user != null or uri.password != null or uri.port != null or
-            uri.query != null or uri.fragment != null) return false;
+            uri.query != null or uri.fragment != null) return null;
 
         if (uri.host) |_| {
             var host_buf: [std.Uri.host_name_max]u8 = undefined;
-            const host = uri.getHost(&host_buf) catch return false;
-            if (host.len != 0 and !std.ascii.eqlIgnoreCase(host, "localhost")) return false;
+            const host = uri.getHost(&host_buf) catch return null;
+            if (host.len != 0 and !std.ascii.eqlIgnoreCase(host, "localhost")) return null;
         }
 
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const decoded_path = try uri.path.toRawMaybeAlloc(arena.allocator());
+        const decoded_path = try uri.path.toRawMaybeAlloc(alloc);
         const local_path = if (decoded_path.len >= 4 and
             decoded_path[0] == '/' and
             windows_shell.isDriveAbsolutePath(decoded_path[1..]))
             decoded_path[1..]
         else
             decoded_path;
-        return isAllowedWin32LocalFile(local_path);
+        return try prepareWin32LocalFile(alloc, local_path);
     }
 
-    fn isAllowedWin32LocalFile(path: []const u8) bool {
+    fn prepareWin32LocalFile(alloc: Allocator, path: []const u8) !?[]const u8 {
         if (!windows_shell.isSafeWindowsPath(path) or
             !windows_shell.isDriveAbsolutePath(path) or
-            isWin32UncOrDevicePath(path)) return false;
+            isWin32UncOrDevicePath(path)) return null;
 
         // Reject NTFS alternate streams as another extension-dispatch bypass.
-        if (std.mem.indexOfScalar(u8, path[2..], ':') != null) return false;
+        if (std.mem.indexOfScalar(u8, path[2..], ':') != null) return null;
 
-        const normalized = std.mem.trimRight(u8, path, " .");
-        const extension = std.fs.path.extension(normalized);
-        if (extension.len <= 1) return true;
+        // Win32 strips trailing dots/spaces from every component. Refuse those
+        // aliases rather than inspect one filename and dispatch another.
+        var components = std.mem.tokenizeAny(u8, path[3..], "/\\");
+        while (components.next()) |component| {
+            if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) continue;
+            if (component[component.len - 1] == '.' or component[component.len - 1] == ' ') return null;
+        }
+        // Resolve navigation only after rejecting ordinary component aliases.
+        // Screen and dispatch the same basename, even for a terminal ".".
+        const normalized = try std.fs.path.resolve(alloc, &.{path});
+        if (!windows_shell.isDriveAbsolutePath(normalized) or
+            isWin32UncOrDevicePath(normalized)) return null;
+        const os_windows = @import("../os/windows.zig");
+        if (os_windows.driveTypeForLetter(normalized[0]) == os_windows.DRIVE_REMOTE) return null;
+
+        // Windows associates even a leading-dot basename (".cmd"). Zig's
+        // extension helper treats those as Unix dotfiles with no extension.
+        const basename = std.fs.path.basename(normalized);
+        const extension = if (std.mem.lastIndexOfScalar(u8, basename, '.')) |dot| basename[dot..] else "";
+        // Open local reparse targets through a bounded, handle-relative walk;
+        // no unchecked ancestor or symlink target may reach a share or device.
+        const file = @import("win32/local_target.zig").open(alloc, normalized, extension.len == 0) orelse return null;
+        defer file.close();
+        // The exact dispatched path had to exist for that open. Query its
+        // handle: reopening the path here could follow a swapped junction.
+        const stat = file.stat() catch return null;
+        if (stat.kind == .directory) return normalized;
+        if (extension.len == 0) {
+            // Fail closed for DOS/PE executable signatures, including renamed
+            // binaries; short/empty extensionless documents remain viewable.
+            var magic: [2]u8 = undefined;
+            const count = file.readAll(&magic) catch return null;
+            return if (count < 2 or !std.mem.eql(u8, &magic, "MZ")) normalized else null;
+        }
+        const extension_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, extension);
+        defer alloc.free(extension_w);
+        if (sys.AssocIsDangerous(extension_w.ptr) != 0) return null;
         const name = extension[1..];
         for ([_][]const u8{
-            "exe",  "com",  "bat",         "cmd",       "ps1", "psm1", "psd1", "ps1xml",
-            "psc1", "psc2", "vbs",         "vbe",       "js",  "jse",  "wsf",  "wsh",
-            "hta",  "scr",  "cpl",         "msc",       "msi", "msp",  "mst",  "pif",
-            "lnk",  "url",  "application", "appref-ms", "scf", "sct",  "reg",  "inf",
-            "jar",  "py",   "pyw",         "rb",        "pl",  "chm",
+            "exe",                "com",               "bat",         "cmd",       "ps1", "psm1",    "psd1",         "ps1xml",
+            "psc1",               "psc2",              "vbs",         "vbe",       "js",  "jse",     "wsf",          "wsh",
+            "hta",                "scr",               "cpl",         "msc",       "msi", "msp",     "mst",          "pif",
+            "lnk",                "url",               "application", "appref-ms", "scf", "sct",     "reg",          "inf",
+            "jar",                "py",                "pyw",         "rb",        "pl",  "chm",     "rdp",          "library-ms",
+            "searchConnector-ms", "diagcab",           "iso",         "img",       "vhd", "vhdx",    "appinstaller", "msix",
+            "appx",               "settingcontent-ms", "theme",       "themepack", "xll", "website", "jnlp",         "wsc",
         }) |blocked| {
-            if (std.ascii.eqlIgnoreCase(name, blocked)) return false;
+            if (std.ascii.eqlIgnoreCase(name, blocked)) return null;
         }
-        return true;
+        return normalized;
     }
 
     fn isWin32UncOrDevicePath(path: []const u8) bool {
@@ -10047,11 +11534,12 @@ pub const App = struct {
         };
     }
 
-    /// Serialise `pending` into a temp file adjacent to the target,
-    /// then atomic-rename via `ReplaceFileW` (falls back to
-    /// `MoveFileExW` when the target is new). Finally re-load the
-    /// config from disk and push it through `CoreApp.updateConfig`
-    /// so every surface picks up the change on its next repaint.
+    /// Patch the edited settings into the target file (`persistSettings`:
+    /// a temp file beside the real file, then an atomic replace via
+    /// `ReplaceFileW`, with `MoveFileExW` when the target is new). Finally
+    /// re-load the config from disk and push it through
+    /// `CoreApp.updateConfig` so every surface picks up the change on its
+    /// next repaint.
     ///
     /// Returns on error; caller (settings window) is responsible for
     /// surfacing the failure. `pending` is borrowed, not consumed —
@@ -10060,7 +11548,7 @@ pub const App = struct {
         const alloc = self.core_app.alloc;
 
         // Target file selection:
-        //   1. If the process was started with `--config-file <path>`
+        //   1. If the process was started with `--config-file=<path>`
         //      on the CLI, write to THAT file. Writing to the default
         //      `ghostty.conf` when the user explicitly specified a
         //      custom config would either edit the wrong file or let
@@ -10068,22 +11556,8 @@ pub const App = struct {
         //   2. Otherwise, fall back to the per-user default path
         //      (`config_edit.openPath`), which also handles the
         //      first-run "create the file" case.
-        const target_path = blk: {
-            // Use the startup-time resolved override — never call
-            // `cliConfigFileOverride` from here, because cwd may have
-            // been reset by `sanitizeCurrentDirectory` and a relative
-            // CLI path would resolve to the wrong absolute file.
-            if (self.cli_config_override_path) |cli_path| break :blk try alloc.dupe(u8, cli_path);
-            break :blk config_edit.openPath(alloc) catch return error.PathResolveFailed;
-        };
+        const target_path = try self.settingsTargetPath(alloc);
         defer alloc.free(target_path);
-
-        const tmp_path = try std.fmt.allocPrint(
-            alloc,
-            "{s}.tmp-{x}-{x}",
-            .{ target_path, sys.GetCurrentProcessId(), unixMillis() },
-        );
-        defer alloc.free(tmp_path);
 
         // Diff pending against `original` (the snapshot from when
         // the settings window opened), NOT against the live
@@ -10109,138 +11583,13 @@ pub const App = struct {
         // mtime bump.
         if (user_edited.count() == 0) return;
 
-        // SURGICAL SAVE: read the raw target file text and patch
-        // only GUI-edited field lines in place. This preserves
-        // (a) comments, (b) relative `config-file` paths (not
-        // canonicalised), (c) the user's formatting / blank lines,
-        // (d) fields we can't round-trip through the Config type
-        // (RepeatableString, etc).
-        //
-        // For each GUI-edited field: scan the raw text for a line
-        // matching `^<key> =` at column 0 (PLUS optional leading
-        // whitespace) and replace the WHOLE line with the new
-        // serialised `key = value` emission. If no matching line
-        // exists, append to the file end.
-        //
-        // Edited fields that are not already present are appended by
-        // `patchOrAppendEdits` below. No parsed-file baseline is needed:
-        // unedited source lines remain byte-for-byte intact.
-        const raw_before: []u8 = blk: {
-            const f = std.fs.cwd().openFile(target_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :blk try alloc.dupe(u8, ""),
-                else => return error.SerializeFailed,
-            };
-            defer f.close();
-            const stat = f.stat() catch return error.SerializeFailed;
-            const slice = alloc.alloc(u8, settingsFileSize(stat.size) catch return error.SerializeFailed) catch return error.OutOfMemory;
-            errdefer alloc.free(slice);
-            const n = f.readAll(slice) catch return error.SerializeFailed;
-            break :blk try alloc.realloc(slice, n);
-        };
-        defer alloc.free(raw_before);
+        self.settings_failure_detail.clear(alloc);
+        try persistSettings(alloc, target_path, pending, user_edited, &self.settings_failure_detail);
 
-        var patched: std.ArrayListUnmanaged(u8) = .{};
-        defer patched.deinit(alloc);
-        patchOrAppendEdits(
-            alloc,
-            raw_before,
-            pending,
-            user_edited,
-            &patched,
-        ) catch return error.SerializeFailed;
-
-        // Ensure target's parent directory exists. `config_edit.openPath`
-        // creates `%APPDATA%\ghostty\` for the default path, but a user
-        // launched with `--config-file D:\new-dir\custom.conf` could
-        // target a directory that has never been created. Without this
-        // step the first Save against that path would fail here with
-        // `TempCreateFailed`.
-        if (std.fs.path.dirname(target_path)) |parent| {
-            std.fs.cwd().makePath(parent) catch |err| {
-                std.log.warn("settings save: couldn't create parent dir path={s} err={}", .{ parent, err });
-                return error.TempCreateFailed;
-            };
-        }
-
-        // Write to the sibling temp file, close, then rename. Scoped
-        // block so the file is closed BEFORE ReplaceFileW — Windows
-        // blocks the replace while the temp handle is open.
-        var temp_pending = false;
-        defer if (temp_pending) std.fs.cwd().deleteFile(tmp_path) catch {}; // Best-effort temp cleanup.
-        {
-            const tmp = std.fs.cwd().createFile(tmp_path, .{}) catch return error.TempCreateFailed;
-            temp_pending = true;
-            defer tmp.close();
-            var write_buf: [4096]u8 = undefined;
-            var fw = tmp.writer(&write_buf);
-            fw.interface.writeAll(patched.items) catch return error.SerializeFailed;
-            fw.interface.flush() catch return error.SerializeFailed;
-            tmp.sync() catch return error.SerializeFailed;
-        }
-
-        const target_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, target_path) catch return error.OutOfMemory;
-        defer alloc.free(target_w);
-        const tmp_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, tmp_path) catch return error.OutOfMemory;
-        defer alloc.free(tmp_w);
-
-        if (sys.ReplaceFileW(target_w, tmp_w, null, 0, null, null) == 0) {
-            // Likely ERROR_FILE_NOT_FOUND if the user didn't have a
-            // config file yet. Fall back to MoveFileExW.
-            if (sys.MoveFileExW(tmp_w, target_w, c.MOVEFILE_REPLACE_EXISTING) == 0) {
-                std.fs.cwd().deleteFile(tmp_path) catch {}; // Preserve the primary replace failure.
-                return error.ReplaceFailed;
-            }
-        }
-        temp_pending = false;
-
-        // Mirror the `.reload_config` hard-reload path at win32.zig
-        // line ~2106: re-read from disk + push through CoreApp so
-        // every surface's next frame picks up the new values.
-        //
-        // Temporarily restore the startup cwd around `Config.load`.
-        // `loadCliArgs` resolves relative `--config-file` argv entries
-        // via realpath-against-cwd; after `sanitizeCurrentDirectory()`
-        // ran, cwd is typically `%USERPROFILE%`, and a user who
-        // launched with `--config-file custom.conf` would see the
-        // reload pick up `%USERPROFILE%\custom.conf` instead of the
-        // file we just wrote. Save lands correctly, but the live
-        // config would immediately diverge from disk — "my edits
-        // didn't take effect until restart" is exactly this bug.
-        // Capture the current (sanitized) cwd so we can restore it
-        // after the reload. Leaking a cwd change into the rest of
-        // process lifetime would change where other code resolves
-        // relative paths — for example, a subsequent surface spawn
-        // could inherit the wrong working directory.
-        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
-        defer if (cwd_before) |p| alloc.free(p);
-
-        // `defer` (NOT inline restore) for the cwd rollback so BOTH the
-        // happy path AND the `ReloadFailed` error path run it. Earlier
-        // code had `Config.load catch return error.ReloadFailed`
-        // followed by an inline restore; the return short-circuited
-        // the restore, leaving the process pinned to `startup_cwd`
-        // whenever a reload hit a broken config file. Downstream
-        // surface spawns then inherited the wrong cwd until restart.
-        var did_chdir_to_startup: bool = false;
-        if (self.startup_cwd) |cwd| {
-            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
-            if (std.process.changeCurDir(cwd)) |_| {
-                did_chdir_to_startup = true;
-            } else |err| {
-                std.log.warn("settings save: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
-            }
-        }
-        defer {
-            if (did_chdir_to_startup) {
-                if (cwd_before) |cwd| {
-                    std.process.changeCurDir(cwd) catch |err| {
-                        std.log.warn("settings save: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                    };
-                }
-            }
-        }
-
-        var reloaded = configpkg.Config.load(alloc) catch return error.ReloadFailed;
+        // Mirror the `.reload_config` hard-reload path: re-read from disk and
+        // push through CoreApp so every surface's next frame picks up the
+        // new values.
+        var reloaded = self.loadConfigAtStartupCwd() catch return error.ReloadFailed;
         defer reloaded.deinit();
 
         // Post-save validation: detect fields the user GUI-edited
@@ -10251,27 +11600,135 @@ pub const App = struct {
         // runtime value doesn't match. Track whether ANY field is
         // masked so we can return a distinct error variant; the
         // settings-window caller surfaces this differently from a
-        // generic write failure.
-        var any_masked = false;
-        inline for (win32_settings.editable_keys) |key| {
-            if (user_edited.isSet(@intFromEnum(key)) and settingsEditedValueMasked(pending, &reloaded, key)) {
-                std.log.warn(
-                    "settings save: field '{s}' was saved but is masked by a later config-file layer",
-                    .{@tagName(key)},
-                );
-                any_masked = true;
-            }
+        // generic write failure. The status line names the fields.
+        self.settings_masked_keys.clear(alloc);
+        var masked_buf: [settings_masked_keys_capacity]u8 = undefined;
+        const masked = settingsMaskedKeyNames(&masked_buf, user_edited, pending, &reloaded);
+        if (masked.len > 0) {
+            std.log.warn("settings save: saved but masked by a later config-file layer: {s}", .{masked});
+            self.settings_masked_keys.set(alloc, masked);
         }
 
         self.core_app.updateConfig(self, &reloaded) catch return error.ReloadFailed;
-        if (any_masked) return error.SavedButMasked;
+        // The reload read the file again, so what is wrong in it is news.
+        _ = self.reportConfigProblems(&self.config);
+        if (masked.len > 0) return error.SavedButMasked;
+    }
+
+    fn settingsTargetPath(self: *App, alloc: Allocator) win32_settings.SaveError![]const u8 {
+        // Use the startup-time resolved override — never call
+        // `cliConfigFileOverride` from here, because cwd may have
+        // been reset by `sanitizeCurrentDirectory` and a relative
+        // CLI path would resolve to the wrong absolute file.
+        if (self.cli_config_override_path) |cli_path| return try alloc.dupe(u8, cli_path);
+        return config_edit.openPath(alloc) catch error.PathResolveFailed;
+    }
+
+    /// The file a Save writes (`settingsTargetPath`), to show in Settings:
+    /// looking must not create the file or its folder. Owned.
+    fn settingsTargetPathForDisplay(self: *App, alloc: Allocator) ![]const u8 {
+        if (self.cli_config_override_path) |cli_path| return try alloc.dupe(u8, cli_path);
+        return config_file_load.preferredDefaultFilePath(alloc);
+    }
+
+    /// `Config.load` as the process started.
+    ///
+    /// `loadCliArgs` resolves relative `--config-file` argv entries
+    /// via realpath-against-cwd; after `sanitizeCurrentDirectory()`
+    /// ran, cwd is typically `%USERPROFILE%`, and a user who
+    /// launched with `--config-file=custom.conf` would see the
+    /// reload pick up `%USERPROFILE%\custom.conf` instead of the
+    /// file we just wrote. Save lands correctly, but the live
+    /// config would immediately diverge from disk — "my edits
+    /// didn't take effect until restart" is exactly this bug.
+    /// The sanitized cwd is put back afterwards: leaking a cwd change
+    /// into the rest of process lifetime would change where other code
+    /// resolves relative paths — for example, a subsequent surface spawn
+    /// could inherit the wrong working directory.
+    ///
+    /// The restore is a `defer` (NOT an inline step after the load) so BOTH
+    /// the happy path AND the error path run it. Earlier code had
+    /// `Config.load catch return ...` followed by an inline restore; the
+    /// return short-circuited the restore, leaving the process pinned to
+    /// `startup_cwd` whenever a reload hit a broken config file.
+    fn loadConfigAtStartupCwd(self: *App) !configpkg.Config {
+        const alloc = self.core_app.alloc;
+        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
+        defer if (cwd_before) |p| alloc.free(p);
+
+        var did_chdir_to_startup: bool = false;
+        if (self.startup_cwd) |cwd| {
+            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
+            if (std.process.changeCurDir(cwd)) |_| {
+                did_chdir_to_startup = true;
+            } else |err| {
+                std.log.warn("config load: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
+            }
+        }
+        defer {
+            if (did_chdir_to_startup) {
+                if (cwd_before) |cwd| {
+                    std.process.changeCurDir(cwd) catch |err| {
+                        std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
+                    };
+                }
+            }
+        }
+
+        return configpkg.Config.load(alloc);
+    }
+
+    /// Before a Settings save: has the config file been edited since the
+    /// window last read it, in a setting that is also being edited there? The
+    /// window only learns of an edit through a reload, so a save without one
+    /// wrote its value over the other: the file's line was replaced and the
+    /// edit was gone with no prompt.
+    ///
+    /// The file is read exactly as a reload reads it, and judged by the
+    /// effective values, which is how the window itself decides what is a
+    /// conflict (`externalConfigChanged`); an edit to an included file counts,
+    /// an edit to another setting does not. When there is one, the file is
+    /// applied as a reload applies it, which hands the window the conflict to
+    /// resolve (Keep mine or Use disk); the window then stops the save. If the
+    /// file cannot be read or applied, nothing is saved either: the save would
+    /// write blind.
+    ///
+    /// `apply` is false for a caller with no conflict prompt of its own (the
+    /// palette's theme pick): a conflict then comes back as `DiskChanged` and
+    /// the file is not applied, since swapping the running config under a
+    /// pick the person is making would be a surprise of its own.
+    fn settingsReconcileDisk(
+        self: *App,
+        pending: *const configpkg.Config,
+        original: *const configpkg.Config,
+        apply: bool,
+    ) win32_settings.SaveError!void {
+        const alloc = self.core_app.alloc;
+        self.settings_failure_detail.clear(alloc);
+        const user_edited = settingsUserEditedKeys(original, pending);
+        if (user_edited.count() == 0) return;
+        const target_path = try self.settingsTargetPath(alloc);
+        defer alloc.free(target_path);
+        try settingsFileOpenable(alloc, &self.settings_failure_detail, "the config file", target_path);
+        var disk = self.loadConfigAtStartupCwd() catch |err| {
+            log.warn("settings save: could not read the config file to check it for edits err={}", .{err});
+            return error.ReloadFailed;
+        };
+        defer disk.deinit();
+        if (!try settingsDiskVerdict(alloc, &self.settings_failure_detail, original, pending, &disk, self.core_app.config_conditional_state, user_edited)) return;
+        if (!apply) return error.DiskChanged;
+        log.info("settings save: the config file changed on disk under an edited setting; offering the choice", .{});
+        self.core_app.updateConfig(self, &disk) catch |err| {
+            log.warn("settings save: applying the changed config file failed err={}", .{err});
+            return error.ReloadFailed;
+        };
     }
 
     /// The legacy `ShellExecuteW` path. Kept alive for Advanced pane
     /// consumption and for users running `open_config` on CI / headless
     /// runs where the settings window is unreachable.
     fn openConfigInEditor(self: *App) !void {
-        // If the process was launched with `--config-file <path>`,
+        // If the process was launched with `--config-file=<path>`,
         // that file is the one we Save to from the Settings UI and
         // the one that masks the per-user default on reload. Opening
         // the per-user default from the escape-hatch would let the
@@ -10680,6 +12137,90 @@ pub const App = struct {
         try host.setBanner(kind, message);
         return true;
     }
+
+    /// Keep a copy of what a config load found wrong, with the fonts the open
+    /// terminals could not find, for the banner, the Settings page and the
+    /// palette. The config's own diagnostics are freed with the config.
+    fn recordConfigProblems(self: *App, config: *const configpkg.Config) void {
+        const alloc = self.core_app.alloc;
+        self.config_problems.clear(alloc);
+        for (config._diagnostics.items()) |diag| {
+            if (isLaunchArgumentDiagnostic(diag, self.safe_mode)) continue;
+            self.config_problems.addDiagnostics(alloc, &.{diag}) catch |err| {
+                log.warn("config problems: could not keep a diagnostic err={}", .{err});
+            };
+        }
+        // A family is listed once, however many tabs and windows use it.
+        for (self.windows.items) |surface| {
+            if (!surface.core_initialized) continue;
+            for (surface.core().missingFontFamilies()) |family| {
+                self.config_problems.addMissingFont(alloc, family) catch |err| {
+                    log.warn("config problems: could not keep a missing font err={}", .{err});
+                };
+            }
+        }
+        self.settings_window.configProblemsChanged();
+    }
+
+    /// The config in effect changed, whoever asked: a reload, a Save, or the
+    /// system switching between light and dark under `theme =
+    /// light:A,dark:B`, which installs the other half's problems. Keep the
+    /// list current, and raise the banner only when what it says is news, so
+    /// a banner the user closed does not come back at every switch.
+    fn refreshConfigProblems(self: *App) void {
+        const before = self.config_problems.fingerprint();
+        self.recordConfigProblems(&self.config);
+        if (self.config_problems.count() == 0) return self.clearConfigProblemsBanner();
+        if (self.config_problems.fingerprint() != before) _ = self.showConfigProblemsBanner();
+    }
+
+    /// `recordConfigProblems`, then say so: an error banner with the count
+    /// and the first problem, which stays until dismissed. A load that found
+    /// none takes down the banner an earlier one raised. Returns whether
+    /// there are problems.
+    fn reportConfigProblems(self: *App, config: *const configpkg.Config) bool {
+        self.recordConfigProblems(config);
+        if (self.config_problems.count() == 0) {
+            self.clearConfigProblemsBanner();
+            return false;
+        }
+        _ = self.showConfigProblemsBanner();
+        return true;
+    }
+
+    /// Raise the banner for `config_problems`. False when there is nothing to
+    /// say or no window to say it on.
+    fn showConfigProblemsBanner(self: *App) bool {
+        const alloc = self.core_app.alloc;
+        // First, and on every host: the primary window can change between
+        // loads, an old banner on another window would no longer match the
+        // text below, and one that cannot be replaced must not stay up stale.
+        self.clearConfigProblemsBanner();
+        const text = (self.config_problems.bannerText(alloc) catch null) orelse return false;
+        // Kept so a later load that finds nothing can take down this banner,
+        // and no other.
+        self.config_problems_banner = text;
+        return self.showHostBanner(.app, .err, text) catch |err| {
+            log.warn("config problems: banner failed err={}", .{err});
+            return false;
+        };
+    }
+
+    fn clearConfigProblemsBanner(self: *App) void {
+        const alloc = self.core_app.alloc;
+        const ours = self.config_problems_banner orelse return;
+        defer {
+            alloc.free(ours);
+            self.config_problems_banner = null;
+        }
+        for (self.hosts.items) |host| {
+            const shown = host.banner_text orelse continue;
+            if (host.banner_kind != .err or !std.mem.eql(u8, shown, ours)) continue;
+            host.setBanner(.none, null) catch |err| {
+                log.warn("config problems: could not take down the banner err={}", .{err});
+            };
+        }
+    }
 };
 
 fn detachHostReference(hosts: *std.ArrayListUnmanaged(*Host), host: *Host) bool {
@@ -10707,14 +12248,12 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
         alloc.destroy(request);
     }
 
+    defer request.delivery.release();
     const completion = alloc.create(UpdateCheckCompletion) catch {
+        request.delivery.update_running.store(false, .release);
         return;
     };
     completion.* = .{ .alloc = alloc };
-    errdefer {
-        completion.deinit();
-        alloc.destroy(completion);
-    }
 
     const outcome = updatepkg.checkLatestStableRelease(alloc, request.state_path, .{
         .current_version = request.current_version,
@@ -10730,7 +12269,7 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
             ) catch null;
         }
         appendConfiguredFeedIgnoredNote(request, completion);
-        postUpdateCheckCompletion(request.ui_thread_id, completion);
+        postUpdateCheckCompletion(request.delivery, completion);
         return;
     };
     defer {
@@ -10761,7 +12300,7 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
                     if (request.manual) {
                         completion.manual_message = std.fmt.allocPrint(
                             alloc,
-                            "noctty {s} was downloaded, verified, and staged.",
+                            "noctty {s} is downloaded, verified, and staged.",
                             .{release.version_text},
                         ) catch null;
                     }
@@ -10800,7 +12339,48 @@ fn updateCheckThreadMain(request: *UpdateCheckRequest) void {
     }
 
     appendConfiguredFeedIgnoredNote(request, completion);
-    postUpdateCheckCompletion(request.ui_thread_id, completion);
+    postUpdateCheckCompletion(request.delivery, completion);
+}
+
+test "update worker OOM clears running and releases its detached lifetime" {
+    const delivery = try AppDelivery.create();
+    defer delivery.release();
+    delivery.update_running.store(true, .release);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    // Allocate request storage and strings through the backing allocator;
+    // the failing wrapper delegates frees, but its first allocation (the
+    // worker's completion) fails before any network or state-file access.
+    const request = try std.testing.allocator.create(UpdateCheckRequest);
+    request.* = .{
+        .alloc = alloc,
+        .delivery = delivery,
+        .state_path = try std.testing.allocator.dupe(u8, "unused"),
+        .current_version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .current_version_string = try std.testing.allocator.dupe(u8, "1.0.0"),
+        .release_feed_url = try std.testing.allocator.dupe(u8, "https://example.invalid"),
+        .force = false,
+        .manual = false,
+        .ignored_feed_source = null,
+        .respect_dismissal = true,
+        .download = false,
+        .staged_kind = .portable,
+    };
+    delivery.retain();
+    updateCheckThreadMain(request);
+    try std.testing.expect(!delivery.update_running.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), delivery.refs.load(.acquire));
+}
+
+test "update completion post failure clears running and frees its payload" {
+    const delivery = try AppDelivery.create();
+    defer delivery.release();
+    delivery.update_running.store(true, .release);
+    const completion = try std.testing.allocator.create(UpdateCheckCompletion);
+    completion.* = .{ .alloc = std.testing.allocator, .manual_message = try std.testing.allocator.dupe(u8, "status") };
+    postUpdateCheckCompletion(delivery, completion);
+    try std.testing.expect(!delivery.update_running.load(.acquire));
+    try std.testing.expect(delivery.pop() == null);
 }
 
 fn tryOrNull(alloc: Allocator, text: []const u8) ?[]u8 {
@@ -10935,83 +12515,70 @@ fn appendInnoQuotedArg(
     try buf.append(alloc, '"');
 }
 
-fn postUpdateCheckCompletion(ui_thread_id: DWORD, completion: *UpdateCheckCompletion) void {
-    if (sys.PostThreadMessageW(
-        ui_thread_id,
-        c.WM_WINHOSTTY_UPDATE,
-        0,
-        @as(LPARAM, @bitCast(@as(usize, @intFromPtr(completion)))),
-    ) == 0) {
-        completion.deinit();
-        completion.alloc.destroy(completion);
-    }
-}
-
-/// Read a handoff session identifier out of a message parameter. The value is
-/// attacker-controlled, so it is only ever used as a lookup key.
-fn terminalHandoffId(lparam: LPARAM) win32_terminal_handoff.PendingId {
-    return @bitCast(lparam);
+fn postUpdateCheckCompletion(delivery: *AppDelivery, completion: *UpdateCheckCompletion) void {
+    if (delivery.post(c.WM_WINHOSTTY_UPDATE, .{ .update = completion })) return;
+    delivery.update_running.store(false, .release);
+    var payload: AppDeliveryPayload = .{ .update = completion };
+    payload.deinit();
 }
 
 fn queueTerminalHandoff(ctx: *anyopaque, pending: *win32_terminal_handoff.PendingSession) bool {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const ui_thread_id = @atomicLoad(DWORD, &self.ui_thread_id, .acquire);
-    if (ui_thread_id == 0) return false;
+    const delivery = self.delivery orelse return false;
     const server = self.terminal_handoff_server orelse return false;
-
-    // The session stays in process-owned state; the message carries only the
-    // identifier that stands for it.
     const id = server.queuePending(pending) catch return false;
-    if (sys.PostThreadMessageW(
-        ui_thread_id,
-        c.WM_WINHOSTTY_TERMINAL_HANDOFF,
-        0,
-        @as(LPARAM, @bitCast(id)),
-    ) != 0) return true;
+    return finishTerminalHandoffNotification(server, id, delivery.notify(c.WM_WINHOSTTY_TERMINAL_HANDOFF, id));
+}
 
-    // Nothing will ever claim the identifier, so hand ownership back to the
-    // caller rather than leaking the session into the table.
-    _ = server.takePending(id);
-    return false;
+fn finishTerminalHandoffNotification(server: *win32_terminal_handoff.Server, id: win32_terminal_handoff.PendingId, notified: bool) bool {
+    if (notified) return true;
+    // The UI backstop can claim ownership before notification fails. Only
+    // return it to the RPC caller if rollback actually recovers the session.
+    return server.takePending(id) == null;
+}
+
+test "win32 handoff notification failure returns ownership only when rollback claims it" {
+    const Queue = struct {
+        fn call(_: *anyopaque, _: *win32_terminal_handoff.PendingSession) bool {
+            return false;
+        }
+    };
+    var context: u8 = 0;
+    var server = win32_terminal_handoff.Server.init(std.testing.allocator, &context, Queue.call);
+    defer server.pending.entries.deinit(std.testing.allocator);
+
+    inline for (.{ false, true }) |claimed| {
+        var session: win32_terminal_handoff.PendingSession = undefined;
+        const id = try server.queuePending(&session);
+        if (claimed) try std.testing.expectEqual(&session, server.pending.takeOldest().?);
+        try std.testing.expectEqual(claimed, finishTerminalHandoffNotification(&server, id, false));
+        try std.testing.expect(server.takePending(id) == null);
+    }
+
+    var session: win32_terminal_handoff.PendingSession = undefined;
+    const id = try server.queuePending(&session);
+    try std.testing.expect(finishTerminalHandoffNotification(&server, id, true));
+    try std.testing.expectEqual(&session, server.takePending(id).?);
 }
 
 fn winrtToastActivationCallback(ctx: *anyopaque, launch: []const u8) void {
-    const self: *App = @ptrCast(@alignCast(ctx));
-    const ui_thread_id = @atomicLoad(DWORD, &self.ui_thread_id, .acquire);
-    if (ui_thread_id == 0) {
-        std.log.warn("dropping winrt toast activation before ui thread id is available", .{});
-        return;
+    // The agile WinRT handler owns a reference to this channel, never App.
+    const delivery: *AppDelivery = @ptrCast(@alignCast(ctx));
+    const parsed = win32_toast_activation.parseLaunchArg(launch) catch return;
+    if (delivery.toast_pending.swap(true, .acq_rel)) return;
+    if (!delivery.post(c.WM_WINHOSTTY_TOAST_ACTIVATION, .{ .toast = parsed })) {
+        delivery.toast_pending.store(false, .release);
     }
+}
 
-    const parsed = win32_toast_activation.parseLaunchArg(launch) catch |err| {
-        std.log.warn("dropping malformed winrt toast activation launch err={}", .{err});
-        return;
-    };
+fn retainToastDelivery(ctx: *anyopaque) void {
+    const delivery: *AppDelivery = @ptrCast(@alignCast(ctx));
+    delivery.retain();
+}
 
-    if (self.toast_activation_post_pending.swap(true, .acq_rel)) {
-        std.log.warn("dropping winrt toast activation while another activation is queued", .{});
-        return;
-    }
-
-    const activation = std.heap.page_allocator.create(win32_toast_activation.ActivationTarget) catch |err| {
-        std.log.warn("dropping winrt toast activation allocation failed err={}", .{err});
-        self.toast_activation_post_pending.store(false, .release);
-        return;
-    };
-    activation.* = parsed;
-
-    if (sys.PostThreadMessageW(
-        ui_thread_id,
-        c.WM_WINHOSTTY_TOAST_ACTIVATION,
-        0,
-        @as(LPARAM, @bitCast(@as(usize, @intFromPtr(activation)))),
-    ) == 0) {
-        std.log.warn("dropping winrt toast activation post failed err={}", .{
-            windows.kernel32.GetLastError(),
-        });
-        std.heap.page_allocator.destroy(activation);
-        self.toast_activation_post_pending.store(false, .release);
-    }
+fn releaseToastDelivery(ctx: *anyopaque) void {
+    const delivery: *AppDelivery = @ptrCast(@alignCast(ctx));
+    delivery.release();
 }
 
 const SearchStatus = labels.SearchStatus;
@@ -11472,7 +13039,80 @@ const ConfirmPrompt = struct {
     /// preview pane. Null for prompts with nothing to show, such as
     /// the close-surface prompt.
     contents: ?[]const u8 = null,
+    /// A program in the terminal asked (an OSC 52 clipboard read or
+    /// write), not the user. It can send the request right after a key it
+    /// read, so the user's next key lands on the prompt: such a prompt
+    /// opens on Cancel, ignores Allow for its first
+    /// `program_confirm_arming_ms`, and never replaces an open prompt.
+    program_request: bool = false,
 };
+
+/// How long a program's prompt ignores Allow after it opens: longer than
+/// the gap between two keys of someone typing, shorter than reading it.
+const program_confirm_arming_ms = 500;
+
+/// What a close that ends several terminals at once is closing. One pane
+/// keeps its own prompt in `Surface.close`.
+const CloseScope = enum { window, this_tab, other_tabs, right_tabs, app };
+
+/// The prompt for a close that would end `count` (at least 1) terminals
+/// that `confirm-close-surface` asks about. The body may live in `body_buf`.
+fn closeScopePrompt(scope: CloseScope, count: usize, body_buf: *[256]u8) ConfirmPrompt {
+    switch (scope) {
+        inline else => |comptime_scope| {
+            const text: struct { title: []const u8, accept: []const u8, one: []const u8, many: []const u8 } = comptime switch (comptime_scope) {
+                .window => .{
+                    .title = "Close this window?",
+                    .accept = "Close",
+                    .one = "A process is still running in this window. Closing the window will terminate it.",
+                    .many = "Processes are still running in {d} terminals in this window. Closing the window will terminate them.",
+                },
+                .this_tab => .{
+                    .title = "Close this tab?",
+                    .accept = "Close tab",
+                    .one = "A process is still running in this tab. Closing the tab will terminate it, and undo is off.",
+                    .many = "Processes are still running in {d} terminals in this tab. Closing the tab will terminate them, and undo is off.",
+                },
+                .other_tabs => .{
+                    .title = "Close the other tabs?",
+                    .accept = "Close tabs",
+                    .one = "A process is still running in another tab. Closing the other tabs will terminate it.",
+                    .many = "Processes are still running in {d} terminals in the other tabs. Closing those tabs will terminate them.",
+                },
+                .right_tabs => .{
+                    .title = "Close the tabs to the right?",
+                    .accept = "Close tabs",
+                    .one = "A process is still running in a tab to the right. Closing those tabs will terminate it.",
+                    .many = "Processes are still running in {d} terminals in the tabs to the right. Closing those tabs will terminate them.",
+                },
+                .app => .{
+                    .title = "Quit noctty?",
+                    .accept = "Quit",
+                    .one = "A process is still running. Quitting noctty will terminate it.",
+                    .many = "Processes are still running in {d} terminals. Quitting noctty will terminate them.",
+                },
+            };
+            return .{
+                .title = text.title,
+                .body = if (count <= 1) text.one else std.fmt.bufPrint(body_buf, text.many, .{count}) catch text.one,
+                .accept_label = text.accept,
+                .cancel_label = "Cancel",
+            };
+        },
+    }
+}
+
+/// How many panes in `tabs` `confirm-close-surface` asks about.
+fn tabsCloseConfirmCount(tabs: []Tab) usize {
+    var count: usize = 0;
+    for (tabs) |*tab| {
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| {
+            if (entry.view.needsCloseConfirm()) count += 1;
+        }
+    }
+    return count;
+}
 
 /// Payload for a non-modal confirm overlay. The callbacks receive the
 /// `userdata` pointer passed at construction time so the issuer can
@@ -11493,6 +13133,10 @@ const ConfirmPayload = struct {
     /// How much is being approved, stated next to the body because the
     /// pane may only show the head of a large payload.
     preview_caption: ?[]u8 = null,
+    program_request: bool = false,
+    /// `GetTickCount64` before which Allow does nothing; 0 for prompts
+    /// the user's own action raised.
+    armed_at_ms: u64 = 0,
     on_accept: *const fn (userdata: ?*anyopaque) void,
     on_cancel: ?*const fn (userdata: ?*anyopaque) void = null,
     userdata: ?*anyopaque = null,
@@ -11518,7 +13162,14 @@ fn beginConfirmOverlay(
     // initialization cannot discard the labels, body, and callbacks.
     try ensure_controls(host);
     host.confirm_payload = payload;
-    errdefer host.confirm_payload = null;
+    // The caller frees the payload on failure. `present` may already have
+    // put the host in `.confirm` mode, and a host left there declines every
+    // program request, so hide what it showed; with the payload taken back
+    // first, hideOverlay neither frees it nor runs its cancel.
+    errdefer {
+        host.confirm_payload = null;
+        host.hideOverlay();
+    }
     try present(host);
 }
 
@@ -11721,6 +13372,9 @@ const Host = struct {
     overlay_cancel_hwnd: ?HWND = null,
     overlay_accept_uia_provider: ?*win32_uia.SettingsControlProvider = null,
     overlay_cancel_uia_provider: ?*win32_uia.SettingsControlProvider = null,
+    /// The preview pane as a read-only Edit labelled by the prompt's
+    /// title; without it UIA saw a Pane named after its contents.
+    overlay_preview_uia_provider: ?*win32_uia.SettingsControlProvider = null,
     overlay_button_prev_proc: ?*const anyopaque = null,
     cached_overlay_label: ?[:0]const u8 = null,
     cached_overlay_hint: ?[:0]const u8 = null,
@@ -11764,7 +13418,6 @@ const Host = struct {
     chrome_text_dirty: ChromeTextDirty = .{},
     cached_status_w: ?[:0]const u16 = null,
     cached_detail_w: ?[:0]const u16 = null,
-    cached_banner_w: ?[:0]const u16 = null,
     cached_inspector_title_w: ?[:0]const u16 = null,
     cached_inspector_hint_w: ?[:0]const u16 = null,
     cached_overlay_paint_badge_w: ?[:0]const u16 = null,
@@ -11855,8 +13508,25 @@ const Host = struct {
     banner_placement: ChildPlacement = .{},
     banner_prev_proc: ?*const anyopaque = null,
     banner_uia_provider: ?*win32_uia.ChromeControlProvider = null,
-    update_open_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-    update_dismiss_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    /// Open Release or Install (control 1914) and the close button or
+    /// Dismiss (1915): BUTTON children of the banner, indexed by
+    /// `BannerButton`.
+    banner_buttons: [2]?HWND = .{ null, null },
+    banner_button_placements: [2]ChildPlacement = .{ .{}, .{} },
+    banner_button_uia_providers: [2]?*win32_uia.ChromeControlProvider = .{ null, null },
+    /// The content area and top `layout` last gave the banner;
+    /// `placeBanner` sizes it within that.
+    banner_area: ?struct { content: RECT, top: i32 } = null,
+    /// The pointer is over the banner; `TME_LEAVE` is armed while it is.
+    banner_pointer_inside: bool = false,
+    /// A banner button holds keyboard focus (tracked from `WM_SETFOCUS`
+    /// and `WM_KILLFOCUS`).
+    banner_focused: bool = false,
+    /// A new update notice to announce once the banner is on screen.
+    banner_announce_pending: bool = false,
+    /// When the running `.info` countdown ends (`GetTickCount64`), null
+    /// while none runs. See `syncBannerExpiry`.
+    banner_expires_at: ?u64 = null,
     tab_drag_index: ?usize = null,
     tab_drag_start_x: i32 = 0,
     tab_drag_start_y: i32 = 0,
@@ -11920,6 +13590,8 @@ const Host = struct {
     // in the method section. Matches Win32's main-thread-paint model.
     tween_sched: win32_tween.Scheduler = .{},
     quick_terminal_animation: ?QuickTerminalAnimation = null,
+    /// Programmatic QT rectangles are already in target-monitor pixels.
+    quick_terminal_placing: bool = false,
     tween_timer_active: bool = false,
     search_timer_active: bool = false,
     scrollbar_timer_active: bool = false,
@@ -12331,6 +14003,10 @@ const Host = struct {
         // undo/redo; the app-level prune timer owns the timeout path
         // so hidden surfaces cannot live past `undo-timeout`.
         if (index >= self.tabs.items.len) return null;
+        // A prompt one of its terminals raised goes with the tab, while the
+        // tab is still in place for the layout this runs: its Allow would
+        // otherwise answer a terminal that is now only undo history.
+        self.cancelConfirmFromTab(&self.tabs.items[index]);
 
         const previous_tab_id = if (self.active_tab < self.tabs.items.len)
             self.tabs.items[self.active_tab].id
@@ -12348,12 +14024,7 @@ const Host = struct {
             entry.view.setVisible(false);
         }
 
-        self.active_tab = if (self.tabs.items.len == 0)
-            0
-        else if (index >= self.tabs.items.len)
-            self.tabs.items.len - 1
-        else
-            index;
+        self.active_tab = activeTabAfterRemoval(self.active_tab, index, self.tabs.items.len);
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
 
         return .{
@@ -12438,21 +14109,18 @@ const Host = struct {
 
         value.index = index;
         value.tab = removed;
-        self.active_tab = if (self.tabs.items.len == 0)
-            0
-        else if (index >= self.tabs.items.len)
-            self.tabs.items.len - 1
-        else
-            index;
+        const previous_active = self.active_tab;
+        self.active_tab = activeTabAfterRemoval(previous_active, index, self.tabs.items.len);
         if (shell_prepared) |*prepared| prepared.commit(&self.app.shell_runtime) catch |err| {
             try self.tabs.insert(self.app.core_app.alloc, index, removed);
             value.tab = null;
-            self.active_tab = index;
+            self.active_tab = previous_active;
             var restored_it = self.tabs.items[index].tree.iterator();
             while (restored_it.next()) |entry| entry.view.host_active = true;
             return err;
         };
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
+        self.notifyTabRemovedUia();
         self.app.auditShellNativeMapping("tab-redetach");
         return true;
     }
@@ -12645,6 +14313,7 @@ const Host = struct {
             return err;
         };
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
+        self.notifyTabRemovedUia();
         self.prepareActiveTabVisibility(self.active_tab);
         self.layout() catch |err| log.warn("tab split transfer redo layout sync failed err={}", .{err});
         self.refreshChrome() catch |err| log.warn("tab split transfer redo chrome sync failed err={}", .{err});
@@ -12706,11 +14375,18 @@ const Host = struct {
 
         switch (entry.payload) {
             .close_tab => |*value| {
+                const shown = self.activeSurface();
                 if (!(try self.redoClosedTabEntry(value))) {
                     _ = self.discardNewestStructuralUndo();
                     return null;
                 }
                 if (self.activeSurface()) |surface| {
+                    // A background tab closed again leaves the active tab
+                    // as it was, whose activation skips layout.
+                    if (surface == shown) {
+                        runUiActionOrLog("redo close layout failed", self.layout());
+                        runUiActionOrLog("redo close chrome refresh failed", self.refreshChrome());
+                    }
                     self.app.activateSurface(surface);
                 } else {
                     self.refocusHostWindow();
@@ -12825,15 +14501,7 @@ const Host = struct {
             if (self.tween_sched.value(anim.id, now)) |value| {
                 const rect = win32_quick_terminal.lerpRect(anim.start, anim.end, value);
                 if (self.hwnd) |hwnd| {
-                    _ = sys.SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        rect.left,
-                        rect.top,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                        c.SWP_NOACTIVATE,
-                    );
+                    setQuickTerminalRect(hwnd, rect);
                 }
                 quick_terminal_finished = value >= 1.0;
             } else {
@@ -12844,15 +14512,7 @@ const Host = struct {
         if (quick_terminal_finished) {
             if (self.quick_terminal_animation) |anim| {
                 if (self.hwnd) |hwnd| {
-                    _ = sys.SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        anim.end.left,
-                        anim.end.top,
-                        anim.end.right - anim.end.left,
-                        anim.end.bottom - anim.end.top,
-                        c.SWP_NOACTIVATE,
-                    );
+                    setQuickTerminalRect(hwnd, anim.end);
                 }
                 self.quick_terminal_animation = null;
             }
@@ -13387,16 +15047,7 @@ const Host = struct {
         }
 
         for (std.enums.values(win32_settings.SettingField)) |field| {
-            const key = @tagName(field);
-            _ = self.appendPaletteDescriptor(.{
-                .item = .{
-                    .id = win32_palette.catalog.stableStringId(.setting, key),
-                    .title = key,
-                    .subtitle = "Setting",
-                    .keywords = "settings preferences configuration",
-                },
-                .payload = .{ .setting = key },
-            });
+            _ = self.appendPaletteDescriptor(win32_settings.paletteDescriptor(field));
         }
 
         self.appendInstalledThemesToPalette(catalog);
@@ -13776,6 +15427,14 @@ const Host = struct {
                         return;
                     };
                 },
+                .config_problems => {
+                    self.hideOverlay();
+                    self.app.settings_window.openSection(.advanced) catch |err| {
+                        log.warn("palette config problems open failed err={}", .{err});
+                        self.abortPaletteAction("Settings could not be opened.");
+                        return;
+                    };
+                },
                 .keyboard_shortcuts => self.showPaletteHelp("Keyboard shortcuts are configured in Settings > Keybindings."),
                 .configuration => self.showPaletteHelp("Open Settings, then Advanced, to edit the configuration file."),
                 .troubleshooting => self.showPaletteHelp("Run noctty +diagnostic-bundle when reporting a problem."),
@@ -14073,9 +15732,14 @@ const Host = struct {
             self.palette_theme_preview_original = null;
         }
 
-        const save_outcome = win32_settings.saveReloadOutcome(
-            self.app.settingsSaveAndReload(&pending, &original),
-        );
+        // The Settings window offers Keep mine / Use disk when the file now
+        // says something else for a setting being edited; a palette pick has no
+        // such prompt, so a theme that changed on disk is refused instead of
+        // overwritten, and the running config is left as it is.
+        const save_outcome = win32_settings.saveReloadOutcome(blk: {
+            self.app.settingsReconcileDisk(&pending, &original, false) catch |err| break :blk err;
+            break :blk self.app.settingsSaveAndReload(&pending, &original);
+        });
         switch (save_outcome) {
             .completed, .completed_masked => {},
             .failed => |err| {
@@ -14085,7 +15749,7 @@ const Host = struct {
                 // into the runtime config and suppress the local deferred deinit.
                 self.replaceRuntimeConfigFromPalette(original);
                 original_owned = false;
-                self.abortPaletteAction("Theme save failed; reverted preview.");
+                self.abortPaletteAction(paletteThemeSaveFailureMessage(err));
                 return;
             },
         }
@@ -14106,7 +15770,7 @@ const Host = struct {
             log.warn("palette theme saved but masked by a later config layer theme={s}", .{theme_name});
             runUiActionOrLog(
                 "palette masked theme banner failed",
-                self.setBanner(.info, "Theme saved, but a later config layer masks it."),
+                self.setBanner(.err, "Theme saved, but a later config layer masks it."),
             );
         }
         self.layout() catch |err| {
@@ -14185,7 +15849,7 @@ const Host = struct {
             self.postDeferredNewTab();
             return;
         }
-        _ = surface.core_surface.performBindingAction(action) catch |err| {
+        const performed = surface.core_surface.performBindingAction(action) catch |err| {
             if (outcome_provider) |provider| {
                 win32_uia.events.raiseNotification(
                     provider,
@@ -14195,7 +15859,15 @@ const Host = struct {
             }
             return err;
         };
-        // Do NOT touch `self` after dispatch — the host may be freed.
+        // Do NOT touch `self` after dispatch — the host may be freed. The one
+        // exception is an undo or redo that did nothing: nothing was freed, and
+        // a palette request, unlike the performable key, owes an answer.
+        if (!performed and (action == .undo or action == .redo)) {
+            runUiActionOrLog(
+                "palette undo banner failed",
+                self.setBanner(.info, if (action == .undo) "Nothing to undo." else "Nothing to redo."),
+            );
+        }
     }
 
     fn postDeferredNewTab(self: *Host) void {
@@ -14374,6 +16046,10 @@ const Host = struct {
             if (self.hwnd) |h| _ = sys.KillTimer(h, c.RESIZE_SETTLE_TIMER_ID);
             self.resize_settle_timer_active = false;
         }
+        if (self.banner_expires_at != null) {
+            if (self.hwnd) |h| _ = sys.KillTimer(h, c.BANNER_TIMER_ID);
+            self.banner_expires_at = null;
+        }
         self.tween_sched.deinit();
 
         self.revertPaletteThemePreview();
@@ -14384,6 +16060,9 @@ const Host = struct {
         self.destroyChildControls();
 
         if (self.banner_text) |value| self.app.core_app.alloc.free(value);
+        // A prompt still open when its window goes, such as a window-close
+        // prompt whose last terminal exited meanwhile.
+        if (self.confirm_payload) |*payload| payload.deinit(self.app.core_app.alloc);
         if (self.overlay_completion_seed) |value| self.app.core_app.alloc.free(value);
         if (self.overlay_completion_value) |value| self.app.core_app.alloc.free(value);
         if (self.cached_overlay_edit) |value| self.app.core_app.alloc.free(value);
@@ -14425,6 +16104,7 @@ const Host = struct {
         detachChromeControlProvider(self.app, &self.new_tab_uia_provider);
         detachChromeControlProvider(self.app, &self.overflow_uia_provider);
         detachChromeControlProvider(self.app, &self.banner_uia_provider);
+        for (&self.banner_button_uia_providers) |*provider| detachChromeControlProvider(self.app, provider);
 
         detachChromeControlProvider(self.app, &self.overlay_title_uia_provider);
         detachChromeControlProvider(self.app, &self.overlay_body_uia_provider);
@@ -14442,6 +16122,16 @@ const Host = struct {
         }
         destroySubclassedWindow(&self.overlay_edit_hwnd, &self.overlay_edit_prev_proc);
         destroySubclassedWindow(&self.overlay_hint_hwnd, &self.overlay_hint_prev_proc);
+        if (self.overlay_preview_uia_provider) |provider| {
+            self.overlay_preview_uia_provider = null;
+            provider.detach();
+            scheduleDeferredUiaDisconnect(
+                self.app,
+                @ptrCast(provider),
+                &overlayButtonDisconnectThunk,
+                &overlayButtonReleaseThunk,
+            );
+        }
         destroySubclassedWindow(&self.overlay_preview_hwnd, &self.overlay_preview_prev_proc);
 
         const overlay_button_providers = takeOverlayButtonUiaProviders(
@@ -14468,6 +16158,7 @@ const Host = struct {
         self.chrome_button_prev_proc = null;
         destroySubclassedWindowWithPrev(&self.new_tab_hwnd, chrome_prev);
         destroySubclassedWindowWithPrev(&self.overflow_hwnd, chrome_prev);
+        for (&self.banner_buttons) |*button| destroySubclassedWindowWithPrev(button, chrome_prev);
         destroySubclassedWindow(&self.banner_hwnd, &self.banner_prev_proc);
         destroySubclassedWindow(&self.tab_container_hwnd, &self.tab_container_prev_proc);
 
@@ -14531,7 +16222,7 @@ const Host = struct {
         // `App.keyEvent` does not apply `key-remap` itself; only
         // `Surface.keyCallback` does, and there is no surface here.
         const event = remapWin32KeyEvent(message.event, &self.app.config.@"key-remap");
-        return self.app.core_app.keyEvent(self.app, event);
+        return self.app.emptyHostKeyEvent(self.id, event);
     }
 
     fn prepareActiveTabVisibility(self: *Host, active_index: usize) void {
@@ -15125,6 +16816,10 @@ const Host = struct {
             log.err("tab split transfer history disposal deferred", .{});
             return false;
         }
+        // A prompt one of the dragged tab's terminals raised is about to lose
+        // its tab: a close prompt would find the target tab through the same
+        // terminal and close all of it.
+        self.cancelConfirmFromTab(&self.tabs.items[source_index]);
 
         const target_node_count = self.tabs.items[self.active_tab].tree.nodes.len;
         const source_focus = self.tabs.items[source_index].focused;
@@ -15174,6 +16869,7 @@ const Host = struct {
         // a failed commit above restores the target's own panes.
         self.refreshTabStatus(self.active_tab);
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
+        self.notifyTabRemovedUia();
         self.tabs.items[self.active_tab].clearRedoHistory();
         while (self.structural_undo_entries.items.len > win32_undo.max_entries) {
             win32_structural_history.evictOldest(
@@ -15221,6 +16917,226 @@ const Host = struct {
         return false;
     }
 
+    /// Close tab `index` from its own button (its X, a middle click, Delete)
+    /// where it is, without selecting it first, so closing a background tab
+    /// leaves the active tab in front. `close_tab:this` keeps the tab for
+    /// undo, and asks only where undo is off (`undo-timeout = 0`).
+    fn closeTabInPlace(self: *Host, index: usize) bool {
+        if (index >= self.tabs.items.len) return false;
+        const tab = &self.tabs.items[index];
+        const surface = tab.focusedSurface() orelse return false;
+        // Delete on a focused background tab destroys the focused button;
+        // the keyboard stays in the tab strip rather than jumping away.
+        const button_focused = index != self.active_tab and
+            tab.button_hwnd != null and sys.GetFocus() == tab.button_hwnd;
+        const tab_count = self.tabs.items.len;
+        const closed = self.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
+            log.warn("tab close failed err={}", .{err});
+            return false;
+        };
+        // A close that asked first has closed nothing, and the keys belong to
+        // its prompt.
+        if (closed and button_focused and self.tabs.items.len < tab_count) {
+            if (self.tabStripFocusHwnd()) |next| _ = sys.SetFocus(next);
+        }
+        return closed;
+    }
+
+    test "a background tab close that fails puts the tab back with its button" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(backgroundCloseRollbackTestBody);
+    }
+
+    fn backgroundCloseRollbackTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+            // The tabs have no shell IDs, so the shell detach fails after
+            // the native detach, as a real shell-side failure would.
+            .shell_runtime_initialized = true,
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        try host.refreshChrome();
+        try std.testing.expect(host.tabs.items[0].button_hwnd != null);
+        // B is in front with focus, so activating it again changes nothing.
+        surface_b.window_visible = true;
+        surface_b.window_focused = true;
+
+        try std.testing.expect(!host.closeTabInPlace(0));
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), host.active_tab);
+        try std.testing.expect(host.tabs.items[0].button_hwnd != null);
+    }
+
+    test "a background tab close or its redo lays out the strip and leaves focus and hidden windows alone" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(backgroundCloseStripTestBody);
+    }
+
+    fn backgroundCloseStripTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var surface_c: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 2 }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+                .{ .storage = &surface_c, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+                .{ .host = &host, .surface = &surface_c, .id = 3 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        // Wide enough to show all three tab buttons side by side.
+        _ = sys.MoveWindow(window.parent, 0, 0, 1200, 300, 0);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        try host.refreshChrome();
+        try host.layout();
+        const first_left = host.tabs.items[0].button_placement.rect.left;
+        try std.testing.expect(host.tabs.items[1].button_placement.visible);
+        try std.testing.expect(host.tabs.items[1].button_placement.rect.left > first_left);
+        // C is in front with focus, so activating it again changes nothing.
+        // Layout repaints the active tab's panes, which need windows.
+        surface_a.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_b.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_c.hwnd = window.pane;
+        defer for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+            surface.hwnd = null;
+        };
+        surface_c.window_visible = true;
+        surface_c.window_focused = true;
+
+        // Delete on A's focused button while the windows are hidden: the
+        // strip closes the gap, the keyboard stays in the strip, and
+        // nothing shows the windows.
+        _ = sys.SetFocus(host.tabs.items[0].button_hwnd.?);
+        app.windows_hidden = true;
+        try std.testing.expect(host.closeTabInPlace(0));
+        try std.testing.expect(app.windows_hidden);
+        app.windows_hidden = false;
+        try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+        try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
+        try std.testing.expectEqual(host.tabStripFocusHwnd(), sys.GetFocus());
+
+        // Undo brings A back in front; with C in front again, redo closes
+        // A in the background and the strip closes the gap again.
+        _ = try host.applyLatestStructuralUndo();
+        try std.testing.expectEqual(@as(?*Surface, &surface_a), host.activeSurface());
+        app.activateSurface(&surface_c);
+        surface_c.window_visible = true;
+        surface_c.window_focused = true;
+        try std.testing.expect(host.tabs.items[0].button_placement.rect.left == first_left);
+        try std.testing.expect(host.tabs.items[1].button_placement.rect.left != first_left);
+        _ = try host.applyLatestStructuralRedo();
+        try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+        try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
+    }
+
+    test "a background tab close that asks leaves the keyboard on its prompt" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(backgroundCloseAskTestBody);
+    }
+
+    fn backgroundCloseAskTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        app.config.@"undo-timeout" = .{ .duration = 0 };
+        // The prompt's controls need the palette list's window class.
+        try app.ensurePaletteListClass();
+        defer _ = sys.UnregisterClassW(palette_list_class_name, app.hinstance);
+        // The host is not deinitialized here, so free what the prompt cached.
+        defer for ([_]*?[:0]const u8{
+            &host.cached_overlay_edit,
+            &host.cached_overlay_label,
+            &host.cached_overlay_hint,
+            &host.cached_overlay_preview,
+            &host.cached_overlay_accept,
+            &host.cached_overlay_cancel,
+        }) |slot| {
+            if (slot.*) |value| std.testing.allocator.free(value);
+            slot.* = null;
+        };
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.MoveWindow(window.parent, 0, 0, 1200, 300, 0);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        try host.refreshChrome();
+        try host.layout();
+        surface_a.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_b.hwnd = window.pane;
+        defer for ([_]*Surface{ &surface_a, &surface_b }) |surface| {
+            surface.hwnd = null;
+        };
+        surface_b.window_visible = true;
+        surface_b.window_focused = true;
+
+        // Delete on the focused button of A, a busy tab behind B. Nothing
+        // closes yet, so the keys stay with the prompt it opened instead of
+        // moving to the strip as they do once a button is destroyed.
+        surface_a.core_surface.readonly = true;
+        _ = sys.SetFocus(host.tabs.items[0].button_hwnd.?);
+        surface_a.core_initialized = true;
+        try std.testing.expect(host.closeTabInPlace(0));
+        surface_a.core_initialized = false;
+        try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        try std.testing.expect(host.overlay_accept_hwnd != null);
+        try std.testing.expectEqual(host.overlay_accept_hwnd, sys.GetFocus());
+        host.invokeConfirmCancel();
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    }
+
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
     /// and repaint it when that changed. Assistive technology hears when
     /// what `ItemStatus` says changes other than by progress: a new state,
@@ -15253,6 +17169,16 @@ const Host = struct {
 
     fn refreshAllTabStatus(self: *Host) void {
         for (0..self.tabs.items.len) |index| self.refreshTabStatus(index);
+    }
+
+    /// A tab left the strip. Removing a background tab changes no selection,
+    /// so `notifyActiveTabUiaSelectionChanged` stays silent and a reader's tab
+    /// list would go stale. The tab buttons are child windows of the host, not
+    /// children of the Selection container, so the host's root is told its
+    /// children changed.
+    fn notifyTabRemovedUia(self: *Host) void {
+        if (!self.shouldShowTabBar()) return;
+        if (self.root_uia_provider) |provider| provider.raiseChildrenInvalidated();
     }
 
     fn notifyActiveTabUiaSelectionChanged(self: *Host, previous_tab_id: ?u32) void {
@@ -15701,6 +17627,7 @@ const Host = struct {
         self.hovered_button_hwnd = child;
         if (previous) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
         if (child) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
+        if (self.bannerButtonOf(previous) != null or self.bannerButtonOf(child) != null) self.syncBannerExpiry();
 
         const previous_titlebar_role = if (previous) |h| self.titlebarActionButtonRole(h) else .none;
         if (previous_titlebar_role != .none) self.startTitlebarHoverFade(previous_titlebar_role);
@@ -15836,6 +17763,11 @@ const Host = struct {
                 while (it.next()) |entry| entry.view.syncOcclusion();
             }
         }
+        // An info banner nobody can see waits, and starts over when the
+        // window comes back. Outside the transition branch: a window first
+        // shown while the flag still holds its initial `true` makes no
+        // transition.
+        self.syncBannerExpiry();
 
         // Deliberately outside the transition branch, and deliberately here
         // rather than at the message handlers. "The window is on screen" is
@@ -15886,7 +17818,13 @@ const Host = struct {
         const next_kind: HostBannerKind = if (text == null) .none else kind;
         if (self.banner_kind == next_kind) {
             if (text) |value| {
-                if (ownedStringEquals(self.banner_text, value)) return;
+                if (ownedStringEquals(self.banner_text, value)) {
+                    // The same message again (undo pressed twice): a full
+                    // countdown again, without announcing it twice.
+                    self.stopBannerExpiry();
+                    self.syncBannerExpiry();
+                    return;
+                }
             } else if (self.banner_text == null) {
                 return;
             }
@@ -15894,15 +17832,12 @@ const Host = struct {
 
         self.banner_kind = next_kind;
         try appendOwnedString(self.app.core_app.alloc, &self.banner_text, text);
-        if (self.banner_hwnd) |banner_hwnd| {
-            _ = applyChildVisibility(
-                banner_hwnd,
-                &self.banner_placement,
-                self.banner_text != null and self.overlay_mode == .none,
-            );
-        }
+        // This announces the banner itself, below.
+        self.banner_announce_pending = false;
+        // A new message gets a full countdown of its own.
+        self.stopBannerExpiry();
+        self.placeBanner(true);
         if (self.banner_uia_provider) |provider| provider.raiseLiveRegionChanged();
-        self.invalidateBannerText();
         // While an overlay is open, banner text is rendered inside the
         // overlay feedback lane rather than the ordinary host banner lane.
         if (self.overlay_mode != .none) self.invalidateOverlayText();
@@ -15920,24 +17855,869 @@ const Host = struct {
         }
     }
 
-    fn clearUpdateActionRects(self: *Host) void {
-        self.update_open_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        self.update_dismiss_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    /// The app's update notice appeared, changed or went away. `announce`
+    /// is true on one host only, so a reader hears a new notice once.
+    fn updateNoticeChanged(self: *Host, announce: bool) void {
+        // A message set with `setBanner` takes the banner's place, and stays
+        // what the banner says and announces. A notice that an overlay keeps
+        // off screen is announced when it comes on (`syncBannerChild`).
+        self.banner_announce_pending = announce and self.app.update_notice != null and self.banner_text == null;
+        self.placeBanner(true);
     }
 
-    fn handleUpdateNoticeClick(self: *Host, point: POINT) bool {
-        if (self.app.update_notice == null) return false;
-        if (pointInRect(point, self.update_open_rect)) {
-            self.app.openUpdateNotice() catch |err| {
-                log.warn("failed to open update notice err={}", .{err});
+    /// Whether the banner child belongs on screen: there is a message or an
+    /// update notice to show, and no overlay is open (an overlay shows banner
+    /// text in its own feedback lane).
+    fn bannerShown(self: *const Host) bool {
+        if (self.overlay_mode != .none) return false;
+        return self.banner_text != null or self.app.update_notice != null;
+    }
+
+    /// The buttons the banner offers: a message set with `setBanner` takes
+    /// precedence over the update notice, and has a close button.
+    fn bannerActions(self: *const Host) chrome_layout.BannerActions {
+        if (self.banner_text == null) {
+            if (self.app.update_notice) |notice| return if (notice.staged) .update_staged else .update;
+        }
+        return .close;
+    }
+
+    fn bannerButtonOf(self: *const Host, hwnd: ?HWND) ?BannerButton {
+        const value = hwnd orelse return null;
+        for (self.banner_buttons, 0..) |button, i| {
+            if (button == value) return @enumFromInt(i);
+        }
+        return null;
+    }
+
+    /// Where F6 lands in the banner: its first button on screen.
+    fn bannerFocusHwnd(self: *const Host) ?HWND {
+        for (self.banner_buttons) |button| {
+            if (focusableHwnd(button)) |hwnd| return hwnd;
+        }
+        return null;
+    }
+
+    /// Lay the banner out over the content area at `top`, which is below
+    /// any docked search frame that starts there.
+    ///
+    /// The banner overlays the terminal's top rows rather than reserving a
+    /// row of its own: a reserved row resizes the terminal every time a
+    /// banner comes or goes, and every resize makes ConPTY and the shell
+    /// redraw (#328).
+    fn layoutBanner(self: *Host, content_rect: RECT, top: i32) void {
+        self.banner_area = .{ .content = content_rect, .top = top };
+        self.placeBanner(false);
+    }
+
+    /// Size the banner to what it shows now, at the right end of the area
+    /// `layoutBanner` last gave it, so a short message leaves the start of
+    /// the top rows (where a fresh prompt is) uncovered. Then sync it.
+    /// `repaint` is for a change of text, label or kind, which can leave the
+    /// rects as they were.
+    fn placeBanner(self: *Host, repaint: bool) void {
+        const hwnd = self.banner_hwnd orelse return;
+        if (self.banner_area) |area| {
+            const actions = self.bannerActions();
+            const width = chrome_layout.hostBannerWidth(self.bannerTextWidth(hwnd), actions, self.current_dpi);
+            const rect = chrome_layout.hostBannerRect(area.content, area.top, width, self.current_dpi);
+            const old_rect = self.banner_placement.rect;
+            const was_on_screen = self.banner_placement.visible and self.banner_placement.rect_known;
+            if (applyChromeChildRect(hwnd, &self.banner_placement, rect) and was_on_screen) {
+                // `MoveWindow` without repaint leaves the banner's old image
+                // on the terminal it no longer covers (a shorter message, a
+                // relayout); have everything under the old rect repaint.
+                if (self.hwnd) |parent| _ = sys.RedrawWindow(parent, &old_rect, null, c.RDW_INVALIDATE | c.RDW_ALLCHILDREN);
+            }
+            const parts = chrome_layout.hostBannerParts(rect.right - rect.left, rect.bottom - rect.top, actions, self.current_dpi);
+            const button_rects = [_]?RECT{ parts.primary, parts.dismiss };
+            for (self.banner_buttons, &self.banner_button_placements, button_rects) |maybe_button, *placement, maybe_rect| {
+                const button = maybe_button orelse continue;
+                if (maybe_rect) |button_rect| {
+                    _ = applyChromeChildRect(button, placement, button_rect);
+                } else if (sys.GetFocus() == button) {
+                    // A message replacing the notice takes Install away
+                    // from under the keyboard; hiding the focused button
+                    // would leave focus on the banner, where no key works.
+                    self.focusTerminalOrHost();
+                }
+                _ = applyChildVisibility(button, placement, maybe_rect != null);
+            }
+        }
+        if (repaint) {
+            _ = sys.InvalidateRect(hwnd, null, 0);
+            for (self.banner_buttons, self.banner_button_uia_providers) |button, provider| {
+                if (button) |value| _ = sys.InvalidateRect(value, null, 0);
+                // Their names carry the banner's text.
+                if (provider) |value| value.raiseNameChanged();
+            }
+        }
+        self.syncBannerChild();
+    }
+
+    /// The width of the banner's line in the chrome font, in pixels.
+    fn bannerTextWidth(self: *const Host, hwnd: HWND) i32 {
+        var buf: [512]u16 = undefined;
+        const text = self.bannerDisplayText(&buf);
+        if (text.len == 0) return 0;
+        const hdc = sys.GetDC(hwnd) orelse return 0;
+        defer _ = sys.ReleaseDC(hwnd, hdc);
+        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
+        defer if (prev_font) |pf| {
+            _ = sys.SelectObject(hdc, pf);
+        };
+        var rect = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = sys.DrawTextW(hdc, text.ptr, @intCast(text.len), &rect, c.DT_CALCRECT | c.DT_SINGLELINE | c.DT_NOPREFIX);
+        return rect.right - rect.left;
+    }
+
+    /// Show the banner child exactly while there is something to show, keep
+    /// it above the terminal, and run or stop the `.info` countdown to match.
+    fn syncBannerChild(self: *Host) void {
+        const hwnd = self.banner_hwnd orelse return;
+        const shown = self.bannerShown();
+        const focus = sys.GetFocus();
+        const had_focus = focus != null and (focus == hwnd or self.bannerButtonOf(focus) != null);
+        // Keyboard focus must not stay on a hidden window, where keys would
+        // go nowhere visible; move it before the hide, not after.
+        if (!shown and had_focus) self.focusTerminalOrHost();
+        _ = applyChildVisibility(hwnd, &self.banner_placement, shown);
+        if (shown) {
+            // The terminal is a sibling that can sit above the banner
+            // (AGENTS.md 2026-09-10: the first surface is the topmost child),
+            // and `WS_CLIPSIBLINGS` on it only spares siblings above it, so
+            // a banner below it would be painted over by the next present.
+            if (self.hwnd) |parent| {
+                if (sys.GetWindow(parent, c.GW_CHILD) != hwnd) {
+                    _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
+                }
+            }
+        } else {
+            if (self.banner_pointer_inside) {
+                // A leave armed before the hide could otherwise arrive after
+                // the next show and start a countdown under a resting pointer.
+                var track: TRACKMOUSEEVENT = .{
+                    .cbSize = @sizeOf(TRACKMOUSEEVENT),
+                    .dwFlags = c.TME_LEAVE | c.TME_CANCEL,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                _ = sys.TrackMouseEvent(&track);
+                self.banner_pointer_inside = false;
+            }
+            // A leave for a hidden button may never come; a stale hover
+            // would hold the next message's countdown.
+            if (self.bannerButtonOf(self.hovered_button_hwnd) != null) self.setHoveredButton(null);
+        }
+        if (shown and self.banner_announce_pending) {
+            self.banner_announce_pending = false;
+            if (self.banner_uia_provider) |provider| provider.raiseLiveRegionChanged();
+        }
+        self.syncBannerExpiry();
+    }
+
+    fn focusTerminalOrHost(self: *Host) void {
+        if (!self.moveFocusToRegion(.terminal)) self.refocusHostWindow();
+    }
+
+    /// Count an `.info` message down only while it is on screen and nobody
+    /// is reading it: the window is shown, not minimized and not cloaked,
+    /// the pointer is not over the banner and it does not hold keyboard
+    /// focus. Errors and the update notice stay until
+    /// dismissed. When any of that ends, the countdown restarts in full.
+    ///
+    /// The duration is the system's own notification time, Settings >
+    /// Accessibility > Visual effects > "Dismiss notifications after this
+    /// amount of time" (`SPI_GETMESSAGEDURATION`, 5 s by default), which
+    /// Windows uses for its notification pop-ups and users lengthen when
+    /// they need longer to read.
+    fn syncBannerExpiry(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        // `surfaces_visible` adds DWM cloaking, but it starts out true and is
+        // only refreshed by window messages, so the window itself is asked
+        // whether it is shown and not minimized.
+        const run = self.banner_kind == .info and
+            self.banner_text != null and
+            self.banner_placement.visible and
+            self.surfaces_visible and
+            sys.IsWindowVisible(hwnd) != 0 and
+            sys.IsIconic(hwnd) == 0 and
+            !self.banner_pointer_inside and
+            self.bannerButtonOf(self.hovered_button_hwnd) == null and
+            !self.banner_focused;
+        if (!run) return self.stopBannerExpiry();
+        if (self.banner_expires_at != null) return;
+        const duration_ms = bannerMessageDurationMs();
+        self.banner_expires_at = sys.GetTickCount64() + duration_ms;
+        _ = sys.SetTimer(hwnd, c.BANNER_TIMER_ID, duration_ms, null);
+    }
+
+    fn stopBannerExpiry(self: *Host) void {
+        if (self.banner_expires_at == null) return;
+        self.banner_expires_at = null;
+        if (self.hwnd) |hwnd| _ = sys.KillTimer(hwnd, c.BANNER_TIMER_ID);
+    }
+
+    /// `BANNER_TIMER_ID` fired. Honoured only once the current deadline has
+    /// passed: every new message, and every end of a hover or focus, writes
+    /// a new deadline, so a tick left over from an older countdown finds it
+    /// in the future and only re-arms for the rest, and a tick after the
+    /// countdown stopped finds none.
+    fn bannerExpiryTick(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        _ = sys.KillTimer(hwnd, c.BANNER_TIMER_ID);
+        const deadline = self.banner_expires_at orelse return;
+        const now = sys.GetTickCount64();
+        if (now < deadline) {
+            _ = sys.SetTimer(hwnd, c.BANNER_TIMER_ID, @intCast(@min(deadline - now, std.math.maxInt(u31))), null);
+            return;
+        }
+        self.banner_expires_at = null;
+        runUiActionOrLog("banner expiry failed", self.setBanner(.none, null));
+    }
+
+    fn bannerPointerMoved(self: *Host) void {
+        if (self.banner_pointer_inside) return;
+        const hwnd = self.banner_hwnd orelse return;
+        var track: TRACKMOUSEEVENT = .{
+            .cbSize = @sizeOf(TRACKMOUSEEVENT),
+            .dwFlags = c.TME_LEAVE,
+            .hwndTrack = hwnd,
+            .dwHoverTime = 0,
+        };
+        _ = sys.TrackMouseEvent(&track);
+        self.banner_pointer_inside = true;
+        self.syncBannerExpiry();
+    }
+
+    fn bannerPointerLeft(self: *Host) void {
+        self.banner_pointer_inside = false;
+        self.syncBannerExpiry();
+    }
+
+    /// A banner button was pressed (click, Enter or Space, or UIA Invoke).
+    /// Install applies a staged update and destroys every window, this
+    /// banner included, so callers must not touch the host after this.
+    fn activateBannerButton(self: *Host, button: BannerButton) void {
+        // UIA Invoke is posted, so it can arrive after the button went away
+        // (an overlay opened, the notice changed): a hidden button does
+        // nothing.
+        if (!self.bannerShown() or !self.banner_button_placements[@intFromEnum(button)].visible) return;
+        if (self.banner_text != null) {
+            if (button != .dismiss) return;
+            const had_focus = self.banner_focused;
+            runUiActionOrLog("banner dismiss failed", self.setBanner(.none, null));
+            // The update notice can be behind the message, on the same
+            // buttons. Without this, the Enter that closed the message is
+            // one repeat away from pressing Dismiss or Install.
+            if (had_focus and self.banner_focused) self.focusTerminalOrHost();
+            return;
+        }
+        if (self.app.update_notice == null) return;
+        switch (button) {
+            .primary => {
+                // Install can destroy this host; only the app is used after.
+                const app = self.app;
+                app.update_action_host = self;
+                defer app.update_action_host = null;
+                app.openUpdateNotice() catch |err| {
+                    log.warn("failed to open update notice err={}", .{err});
+                };
+            },
+            .dismiss => self.app.dismissUpdateNotice(),
+        }
+    }
+
+    /// Keys on a focused banner button; true when consumed. Never touch the
+    /// host after a press: see `activateBannerButton`.
+    fn handleBannerButtonKey(self: *Host, hwnd: HWND, button: BannerButton, vk: WPARAM, lParam: LPARAM) bool {
+        const repeat = (lParamBits(lParam) & (1 << 30)) != 0;
+        const key = bannerButtonKey(self.banner_text != null, vk, repeat) orelse return false;
+        switch (key) {
+            .ignore => {},
+            .press => self.activateBannerButton(button),
+            .dismiss => self.activateBannerButton(.dismiss),
+            .other_button => {
+                const other: BannerButton = if (button == .primary) .dismiss else .primary;
+                if (focusableHwnd(self.banner_buttons[@intFromEnum(other)])) |target| {
+                    if (target != hwnd) _ = sys.SetFocus(target);
+                }
+            },
+        }
+        return true;
+    }
+
+    /// The banner's line as drawn: the message with the same "Info: " or
+    /// "Error: " prefix the overlay lane shows, or the update notice.
+    /// Bounded by `buf`, so a long message is cut, never overflowed.
+    fn bannerDisplayText(self: *const Host, buf: []u16) [:0]const u16 {
+        var bytes: [1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        const text: []const u8 = if (self.banner_text) |message|
+            buildHostBannerText(fixed.allocator(), self.banner_kind, message) catch message
+        else if (self.app.update_notice) |notice|
+            notice.message_text orelse ""
+        else
+            "";
+        return buf[0..paint_text.utf8ToUtf16LeBounded(buf, text) :0];
+    }
+
+    fn bannerBackground(theme: *const ThemeColors, high_contrast: bool) u32 {
+        // High Contrast keeps the system colors as they are; the adjusted
+        // panel surface would step off them.
+        return if (high_contrast) theme.overlay_bg else themeSurface(theme, .overlay_panel_bg);
+    }
+
+    /// Paint the banner child (its buttons paint themselves). Serves
+    /// `WM_PAINT` and `WM_PRINTCLIENT`, so `PrintWindow` sees what the
+    /// screen does. The child fills its whole rect itself: the host's
+    /// `WS_CLIPCHILDREN` keeps the parent's paint out of it (AGENTS.md
+    /// 2026-09-14).
+    fn paintBanner(self: *Host, hdc: HDC, client: RECT, high_contrast: bool) void {
+        if (client.right <= client.left or client.bottom <= client.top) return;
+        const theme = &self.app.resolved_theme;
+        const parts = chrome_layout.hostBannerParts(client.right - client.left, client.bottom - client.top, self.bannerActions(), self.current_dpi);
+        fillSolidRect(hdc, client, bannerBackground(theme, high_contrast));
+        fillSolidRect(hdc, .{
+            .left = client.left,
+            .top = client.bottom - 1,
+            .right = client.right,
+            .bottom = client.bottom,
+        }, if (high_contrast) theme.overlay_border else themeSurface(theme, .overlay_panel_border));
+        const accent = if (self.banner_text != null and self.banner_kind == .err) theme.error_fg else theme.info_fg;
+        fillSolidRect(hdc, parts.stripe, accent);
+
+        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
+        defer if (prev_font) |pf| {
+            _ = sys.SelectObject(hdc, pf);
+        };
+        const prev_bk_mode = sys.SetBkMode(hdc, c.TRANSPARENT);
+        defer _ = sys.SetBkMode(hdc, prev_bk_mode);
+        const prev_color = sys.SetTextColor(hdc, accent);
+        defer _ = sys.SetTextColor(hdc, prev_color);
+
+        var buf: [512]u16 = undefined;
+        const text = self.bannerDisplayText(&buf);
+        var text_rect = parts.text;
+        _ = sys.DrawTextW(
+            hdc,
+            text.ptr,
+            @intCast(text.len),
+            &text_rect,
+            c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX | c.DT_END_ELLIPSIS,
+        );
+    }
+
+    /// `WM_DRAWITEM` for a banner button, sent to the banner, its parent.
+    fn drawBannerButton(self: *Host, draw: *const DRAWITEMSTRUCT) bool {
+        const button = self.bannerButtonOf(draw.hwndItem) orelse return false;
+        const theme = &self.app.resolved_theme;
+        const hovered = self.isHoveredButton(draw.hwndItem);
+        const pressed = (draw.itemState & c.ODS_SELECTED) != 0;
+        const focused = (draw.itemState & c.ODS_FOCUS) != 0 or sys.GetFocus() == draw.hwndItem;
+        const ring = self.chromeFocusRingVisible(focused, false);
+        const primary = button == .primary;
+        const colors = buttonColorsFromTheme(theme, false, true, hovered, pressed, false, primary);
+        fillSolidRect(draw.hDC, draw.rcItem, bannerBackground(theme, isHighContrastActive()));
+        // A message's close glyph sits bare until it is pointed at or
+        // focused, the way a tab's close button does.
+        const bare = self.banner_text != null and !hovered and !pressed and !ring;
+        if (!bare) drawRoundedRect(draw.hDC, draw.rcItem, colors.bg, colors.border, self.scaled(4));
+        if (ring) {
+            const inset = self.scaled(2);
+            drawRoundedRect(draw.hDC, .{
+                .left = draw.rcItem.left + inset,
+                .top = draw.rcItem.top + inset,
+                .right = draw.rcItem.right - inset,
+                .bottom = draw.rcItem.bottom - inset,
+            }, colors.bg, if (primary) theme.button_accept_focus_ring else theme.button_overlay_focus_ring, self.scaled(3));
+        }
+        const prev_font = if (self.chrome_font) |font| sys.SelectObject(draw.hDC, font) else null;
+        defer if (prev_font) |pf| {
+            _ = sys.SelectObject(draw.hDC, pf);
+        };
+        _ = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
+        _ = sys.SetTextColor(draw.hDC, if (bare) theme.text_secondary else colors.fg);
+        const label = self.bannerButtonLabel(button);
+        var label_rect = draw.rcItem;
+        _ = sys.DrawTextW(
+            draw.hDC,
+            label.ptr,
+            @intCast(label.len),
+            &label_rect,
+            c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
+        );
+        return true;
+    }
+
+    fn bannerButtonLabel(self: *const Host, button: BannerButton) [:0]const u16 {
+        if (self.banner_text != null) return std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
+        const staged = if (self.app.update_notice) |notice| notice.staged else false;
+        return switch (button) {
+            .primary => if (staged)
+                std.unicode.utf8ToUtf16LeStringLiteral("Install")
+            else
+                std.unicode.utf8ToUtf16LeStringLiteral("Open Release"),
+            .dismiss => std.unicode.utf8ToUtf16LeStringLiteral("Dismiss"),
+        };
+    }
+
+    /// A button's UIA name. F6 lands on a button, not on the banner's text,
+    /// so the name that is read on landing says what the button is for.
+    fn bannerButtonUiaName(ctx: *anyopaque, tag: usize, buf: []u8) []const u8 {
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        if (self.banner_text) |text| {
+            return std.fmt.bufPrint(buf, "Close: {s}", .{utf8BoundedPrefix(text, buf.len -| 7)}) catch "Close";
+        }
+        const notice = self.app.update_notice orelse return "";
+        const label = if (notice.staged) "Install" else "Open Release";
+        return switch (@as(BannerButton, @enumFromInt(tag))) {
+            .primary => if (notice.message_text) |text|
+                std.fmt.bufPrint(buf, "{s}: {s}", .{ label, utf8BoundedPrefix(text, buf.len -| label.len -| 2) }) catch label
+            else
+                label,
+            .dismiss => "Dismiss update notice",
+        };
+    }
+
+    /// A hidden top-level window standing in for the host window, with the
+    /// real chrome children `ensureChromeButtons` creates and a plain child
+    /// over the content rect standing in for the terminal pane, raised to
+    /// the top as the first surface is (AGENTS.md 2026-09-10). Nothing is
+    /// shown on the desktop.
+    const BannerTestWindow = struct {
+        parent: HWND,
+        pane: HWND,
+        content: RECT,
+
+        fn init(host: *Host) !BannerTestWindow {
+            const parent = try createTestHostWindow();
+            errdefer _ = sys.DestroyWindow(parent);
+            host.hwnd = parent;
+            errdefer host.hwnd = null;
+            // The tab-strip container is a layered child, which this
+            // manifest-less test binary cannot create (AGENTS.md
+            // 2026-10-01); a plain one takes its slot.
+            host.tab_container_hwnd = try createTestChromeChild(parent, prompt_label_class);
+            try host.ensureChromeButtons();
+            const content = RECT{ .left = 0, .top = 32, .right = 320, .bottom = 240 };
+            const pane = try createTestChromeChild(parent, prompt_label_class);
+            _ = sys.MoveWindow(pane, content.left, content.top, content.right - content.left, content.bottom - content.top, 0);
+            _ = sys.SetWindowPos(pane, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE);
+            return .{ .parent = parent, .pane = pane, .content = content };
+        }
+
+        /// Destroys the children with the parent; the host keeps no handle.
+        fn deinit(self: BannerTestWindow, host: *Host) void {
+            host.stopBannerExpiry();
+            host.hovered_button_hwnd = null;
+            _ = sys.DestroyWindow(self.parent);
+            host.hwnd = null;
+            host.banner_hwnd = null;
+            host.banner_prev_proc = null;
+            host.banner_buttons = .{ null, null };
+            host.tab_container_hwnd = null;
+            host.tab_container_prev_proc = null;
+            host.new_tab_hwnd = null;
+            host.overflow_hwnd = null;
+            host.chrome_button_prev_proc = null;
+        }
+    };
+
+    /// A 32-bit DIB to print a window into through `WM_PRINTCLIENT`, the path
+    /// `PrintWindow` takes, after filling it with a colour the banner never
+    /// uses, so untouched pixels show.
+    const BannerTestCanvas = struct {
+        const untouched: u32 = 0x00FF00FF;
+        const BITMAPINFOHEADER = extern struct {
+            biSize: u32 = @sizeOf(@This()),
+            biWidth: i32,
+            biHeight: i32,
+            biPlanes: u16 = 1,
+            biBitCount: u16 = 32,
+            biCompression: u32 = 0,
+            biSizeImage: u32 = 0,
+            biXPelsPerMeter: i32 = 0,
+            biYPelsPerMeter: i32 = 0,
+            biClrUsed: u32 = 0,
+            biClrImportant: u32 = 0,
+        };
+        const raw = struct {
+            extern "gdi32" fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFOHEADER, usage: u32, bits: *?[*]u32, section: ?*anyopaque, offset: u32) callconv(.winapi) HGDIOBJ;
+            extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
+        };
+
+        dc: HDC,
+        bitmap: HGDIOBJ,
+        previous: HGDIOBJ,
+        bits: [*]u32,
+        width: i32,
+        height: i32,
+
+        fn init(width: i32, height: i32) !BannerTestCanvas {
+            const dc = sys.CreateCompatibleDC(null) orelse return error.SkipZigTest;
+            errdefer _ = sys.DeleteDC(dc);
+            var bits: ?[*]u32 = null;
+            // Top-down, so row 0 is the top of the window.
+            const bitmap = raw.CreateDIBSection(dc, &.{ .biWidth = width, .biHeight = -height }, 0, &bits, null, 0) orelse return error.SkipZigTest;
+            return .{
+                .dc = dc,
+                .bitmap = bitmap,
+                .previous = sys.SelectObject(dc, bitmap),
+                .bits = bits orelse return error.SkipZigTest,
+                .width = width,
+                .height = height,
             };
-            return true;
         }
-        if (pointInRect(point, self.update_dismiss_rect)) {
-            self.app.dismissUpdateNotice();
-            return true;
+
+        fn deinit(self: BannerTestCanvas) void {
+            _ = sys.SelectObject(self.dc, self.previous);
+            _ = sys.DeleteObject(self.bitmap);
+            _ = sys.DeleteDC(self.dc);
         }
-        return false;
+
+        fn print(self: BannerTestCanvas, hwnd: HWND) void {
+            fillSolidRect(self.dc, .{ .left = 0, .top = 0, .right = self.width, .bottom = self.height }, untouched);
+            _ = sys.SendMessageW(hwnd, c.WM_PRINTCLIENT, @intFromPtr(self.dc), c.PRF_CLIENT);
+            _ = raw.GdiFlush();
+        }
+
+        /// The pixel at (x, y) as a COLORREF.
+        fn pixel(self: BannerTestCanvas, x: i32, y: i32) u32 {
+            const bgrx = self.bits[@intCast(y * self.width + x)];
+            return ((bgrx & 0xFF) << 16) | (bgrx & 0xFF00) | ((bgrx >> 16) & 0xFF);
+        }
+
+        /// Pixels in `rect` that are neither `background` nor untouched.
+        fn inked(self: BannerTestCanvas, rect: RECT, background: u32) usize {
+            var count: usize = 0;
+            var y = @max(0, rect.top);
+            while (y < @min(self.height, rect.bottom)) : (y += 1) {
+                var x = @max(0, rect.left);
+                while (x < @min(self.width, rect.right)) : (x += 1) {
+                    const value = self.pixel(x, y);
+                    if (value != background and value != untouched) count += 1;
+                }
+            }
+            return count;
+        }
+
+        fn untouchedCount(self: BannerTestCanvas) usize {
+            var count: usize = 0;
+            for (self.bits[0..@intCast(self.width * self.height)]) |value| {
+                if (value & 0xFFFFFF == 0xFF00FF) count += 1;
+            }
+            return count;
+        }
+    };
+
+    fn bannerTestVisible(hwnd: HWND) bool {
+        return (sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE) & c.WS_VISIBLE) != 0;
+    }
+
+    fn bannerTestClientRect(hwnd: HWND) !RECT {
+        var rect: RECT = undefined;
+        if (sys.GetClientRect(hwnd, &rect) == 0) return error.TestUnexpectedResult;
+        return rect;
+    }
+
+    fn bannerTestPress(host: *Host, button: BannerButton) void {
+        const banner = host.banner_hwnd.?;
+        const child = host.banner_buttons[@intFromEnum(button)].?;
+        const id: usize = 1914 + @as(usize, @intFromEnum(button));
+        _ = sys.SendMessageW(banner, c.WM_COMMAND, (c.BN_CLICKED << 16) | id, @bitCast(@intFromPtr(child)));
+    }
+
+    test "a banner shows above the terminal, at the right of its top rows, and paints itself" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        const banner = host.banner_hwnd.?;
+        const close_button = host.banner_buttons[@intFromEnum(BannerButton.dismiss)].?;
+
+        // Nothing to show: hidden, so F6 skips it.
+        host.layoutBanner(window.content, window.content.top);
+        try std.testing.expect(!bannerTestVisible(banner));
+        try std.testing.expectEqual(@as(?HWND, window.pane), sys.GetWindow(window.parent, c.GW_CHILD));
+
+        try host.setBanner(.err, "Not found.");
+        try std.testing.expect(bannerTestVisible(banner));
+        // Above the terminal, which would otherwise paint over it.
+        try std.testing.expectEqual(@as(?HWND, banner), sys.GetWindow(window.parent, c.GW_CHILD));
+        // Over the terminal's top rows, at their right end, so the start of
+        // the rows stays uncovered; the terminal keeps its size.
+        var banner_rect: RECT = undefined;
+        var pane_rect: RECT = undefined;
+        try std.testing.expect(sys.GetWindowRect(banner, &banner_rect) != 0);
+        try std.testing.expect(sys.GetWindowRect(window.pane, &pane_rect) != 0);
+        try std.testing.expectEqual(pane_rect.top, banner_rect.top);
+        try std.testing.expectEqual(pane_rect.right, banner_rect.right);
+        try std.testing.expect(banner_rect.left > pane_rect.left);
+        try std.testing.expectEqual(@as(i32, 32), banner_rect.bottom - banner_rect.top);
+        // A close button, nothing else.
+        try std.testing.expect(bannerTestVisible(close_button));
+        try std.testing.expect(!bannerTestVisible(host.banner_buttons[@intFromEnum(BannerButton.primary)].?));
+        // Opaque to the pointer, unlike the hit-transparent child it was.
+        const center_x: LPARAM = @divTrunc(banner_rect.left + banner_rect.right, 2);
+        const center_y: LPARAM = @divTrunc(banner_rect.top + banner_rect.bottom, 2);
+        try std.testing.expectEqual(@as(LRESULT, c.HTCLIENT), sys.SendMessageW(banner, c.WM_NCHITTEST, 0, (center_x & 0xFFFF) | ((center_y & 0xFFFF) << 16)));
+
+        const theme = &app.resolved_theme;
+        const background = bannerBackground(theme, isHighContrastActive());
+        for ([_]u32{ 96, 144, 192 }) |dpi| {
+            host.current_dpi = dpi;
+            host.layoutBanner(window.content, window.content.top);
+            const client = try bannerTestClientRect(banner);
+            try std.testing.expectEqual(host.scaled(chrome_layout.banner_height_base), client.bottom);
+            const parts = chrome_layout.hostBannerParts(client.right, client.bottom, .close, dpi);
+            const canvas = try BannerTestCanvas.init(client.right, client.bottom);
+            defer canvas.deinit();
+            canvas.print(banner);
+            // The banner owns every pixel of its rect.
+            try std.testing.expectEqual(@as(usize, 0), canvas.untouchedCount());
+            try std.testing.expectEqual(background, canvas.pixel(@divTrunc(client.right, 2), 0));
+            try std.testing.expectEqual(theme.error_fg, canvas.pixel(0, @divTrunc(client.bottom, 2)));
+            try std.testing.expect(canvas.inked(parts.text, background) > 0);
+            // The close button paints its glyph.
+            const close_client = try bannerTestClientRect(close_button);
+            const button_canvas = try BannerTestCanvas.init(close_client.right, close_client.bottom);
+            defer button_canvas.deinit();
+            button_canvas.print(close_button);
+            try std.testing.expectEqual(@as(usize, 0), button_canvas.untouchedCount());
+            try std.testing.expect(button_canvas.inked(close_client, background) > 0);
+        }
+
+        // High Contrast paints on the system colours themselves.
+        const saved_theme = app.resolved_theme;
+        defer app.resolved_theme = saved_theme;
+        app.resolved_theme = highContrastThemeFromSysColors();
+        const client = try bannerTestClientRect(banner);
+        const canvas = try BannerTestCanvas.init(client.right, client.bottom);
+        defer canvas.deinit();
+        host.paintBanner(canvas.dc, client, true);
+        const window_bg = sys.GetSysColor(c.COLOR_WINDOW);
+        try std.testing.expectEqual(window_bg, canvas.pixel(@divTrunc(client.right, 2), 0));
+        try std.testing.expectEqual(sys.GetSysColor(c.COLOR_WINDOWTEXT), canvas.pixel(0, @divTrunc(client.bottom, 2)));
+        try std.testing.expect(canvas.inked(chrome_layout.hostBannerParts(client.right, client.bottom, .close, host.current_dpi).text, window_bg) > 0);
+
+        // The close button dismisses the message and hides the banner.
+        bannerTestPress(&host, .dismiss);
+        try std.testing.expectEqual(@as(?[:0]const u8, null), host.banner_text);
+        try std.testing.expect(!bannerTestVisible(banner));
+    }
+
+    test "the update notice shows in the banner with its two buttons" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        const banner = host.banner_hwnd.?;
+        const primary = host.banner_buttons[@intFromEnum(BannerButton.primary)].?;
+        const dismiss = host.banner_buttons[@intFromEnum(BannerButton.dismiss)].?;
+        host.layoutBanner(window.content, window.content.top);
+
+        // Never press these here: Dismiss writes the real update state and
+        // Open Release starts a browser.
+        app.update_notice = try UpdateNotice.init(std.testing.allocator, "1.3.200", "https://example.invalid/release", false);
+        defer {
+            app.update_notice.?.deinit(std.testing.allocator);
+            app.update_notice = null;
+        }
+        host.updateNoticeChanged(true);
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(bannerTestVisible(primary));
+        try std.testing.expect(bannerTestVisible(dismiss));
+        var name_buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "Update available: noctty 1.3.200 is ready on GitHub Releases.",
+            bannerUiaName(@ptrCast(&host), 0, &name_buf),
+        );
+        try std.testing.expectEqualStrings(
+            "Open Release: Update available: noctty 1.3.200 is ready on GitHub Releases.",
+            bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.primary), &name_buf),
+        );
+        try std.testing.expectEqualStrings("Dismiss update notice", bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.dismiss), &name_buf));
+        // A staged update offers Install instead, in the label and the name.
+        app.update_notice.?.staged = true;
+        try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Install"), host.bannerButtonLabel(.primary));
+        try std.testing.expect(std.mem.startsWith(u8, bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.primary), &name_buf), "Install: "));
+        try std.testing.expectEqual(chrome_layout.BannerActions.update_staged, host.bannerActions());
+        app.update_notice.?.staged = false;
+        // Updates never count down.
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+
+        const background = bannerBackground(&app.resolved_theme, isHighContrastActive());
+        for ([_]HWND{ banner, primary, dismiss }) |hwnd| {
+            const client = try bannerTestClientRect(hwnd);
+            const canvas = try BannerTestCanvas.init(client.right, client.bottom);
+            defer canvas.deinit();
+            canvas.print(hwnd);
+            try std.testing.expect(canvas.inked(client, background) > 0);
+        }
+
+        // A message takes the banner's place while it is up, with a close
+        // button only, and closing it brings the notice back.
+        try host.setBanner(.info, "Layout saved.");
+        try std.testing.expectEqual(chrome_layout.BannerActions.close, host.bannerActions());
+        try std.testing.expect(!bannerTestVisible(primary));
+        try std.testing.expectEqualStrings("Close: Layout saved.", bannerButtonUiaName(@ptrCast(&host), @intFromEnum(BannerButton.dismiss), &name_buf));
+        // UIA Invoke is posted: one that lands while an overlay hides the
+        // banner does nothing.
+        host.overlay_mode = .tab_title;
+        bannerTestPress(&host, .dismiss);
+        try std.testing.expectEqualStrings("Layout saved.", host.banner_text.?);
+        host.overlay_mode = .none;
+        bannerTestPress(&host, .dismiss);
+        try std.testing.expectEqual(chrome_layout.BannerActions.update, host.bannerActions());
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(bannerTestVisible(primary));
+
+        // A notice an overlay keeps off screen is announced when it comes on.
+        host.overlay_mode = .tab_title;
+        host.updateNoticeChanged(true);
+        try std.testing.expect(!bannerTestVisible(banner));
+        try std.testing.expect(host.banner_announce_pending);
+        host.overlay_mode = .none;
+        host.syncBannerChild();
+        try std.testing.expect(bannerTestVisible(banner));
+        try std.testing.expect(!host.banner_announce_pending);
+    }
+
+    /// Run `body` on a thread attached to a desktop of its own, where it can
+    /// show and minimize windows without touching the user's desktop
+    /// (AGENTS.md 2026-10-06; `SetThreadDesktop` needs a thread that owns
+    /// no window yet).
+    fn runOnPrivateDesktop(comptime body: anytype) !void {
+        const Desktop = struct {
+            extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+            extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+            extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+            fn run(desktop: *anyopaque, result: *anyerror!void) void {
+                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
+            }
+        };
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "noctty-banner-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+        defer std.testing.allocator.free(wide_name);
+        const desktop = Desktop.CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+        defer _ = Desktop.CloseDesktop(desktop);
+        var result: anyerror!void = {};
+        const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
+        thread.join();
+        return result;
+    }
+
+    test "an info banner counts down only while it is unread; errors stay" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(bannerCountdownTestBody);
+    }
+
+    fn bannerCountdownTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        host.layoutBanner(window.content, window.content.top);
+
+        // A window that is not shown yet: nothing counts down, whatever the
+        // cached `surfaces_visible` says.
+        try host.setBanner(.info, "Nothing to undo.");
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        host.refreshSurfaceVisibility();
+        const first = host.banner_expires_at orelse return error.TestExpectedCountdown;
+        try std.testing.expect(first >= sys.GetTickCount64() + 4000);
+        // The same message again starts it over.
+        host.banner_expires_at = 1;
+        try host.setBanner(.info, "Nothing to undo.");
+        try std.testing.expect(host.banner_expires_at.? >= first);
+
+        // Pointed at (the banner or its button) or focused, it waits; when
+        // that ends, it starts over.
+        host.bannerPointerMoved();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.bannerPointerLeft();
+        try std.testing.expect(host.banner_expires_at != null);
+        host.setHoveredButton(host.banner_buttons[@intFromEnum(BannerButton.dismiss)]);
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.setHoveredButton(null);
+        try std.testing.expect(host.banner_expires_at != null);
+        host.banner_focused = true;
+        host.syncBannerExpiry();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.banner_focused = false;
+        host.syncBannerExpiry();
+        try std.testing.expect(host.banner_expires_at != null);
+        // Minimized, hidden or cloaked, it waits too, and starts over when
+        // the window is back.
+        for ([_]i32{ c.SW_SHOWMINNOACTIVE, c.SW_HIDE }) |away| {
+            _ = sys.ShowWindow(window.parent, away);
+            host.refreshSurfaceVisibility();
+            try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+            _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+            if (sys.IsIconic(window.parent) != 0) _ = sys.ShowWindow(window.parent, c.SW_RESTORE);
+            host.refreshSurfaceVisibility();
+            try std.testing.expect(host.banner_expires_at != null);
+        }
+        host.surfaces_visible = false;
+        host.syncBannerExpiry();
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        host.surfaces_visible = true;
+        host.syncBannerExpiry();
+        try std.testing.expect(host.banner_expires_at != null);
+
+        // A tick before the deadline (left over from an older countdown,
+        // or early) only re-arms.
+        host.bannerExpiryTick();
+        try std.testing.expectEqualStrings("Nothing to undo.", host.banner_text.?);
+        try std.testing.expect(host.banner_expires_at != null);
+        // A tick after the countdown stopped does nothing.
+        host.stopBannerExpiry();
+        host.bannerExpiryTick();
+        try std.testing.expect(host.banner_text != null);
+        // A tick at the deadline clears the message.
+        host.syncBannerExpiry();
+        host.banner_expires_at = 1;
+        host.bannerExpiryTick();
+        try std.testing.expectEqual(@as(?[:0]const u8, null), host.banner_text);
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+
+        // Errors stay until dismissed, and a later info message is not
+        // cleared by the error's (absent) countdown.
+        try host.setBanner(.err, "Layout could not be saved.");
+        try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+        try host.setBanner(.info, "Layout saved.");
+        try std.testing.expect(host.banner_expires_at != null);
     }
 
     fn setOverlayDefaultBanner(self: *Host, mode: HostOverlayMode) !void {
@@ -16091,6 +18871,19 @@ const Host = struct {
             @ptrFromInt(@as(usize, @intCast(preview_previous)));
         if (self.preview_font) |font| {
             _ = sys.SendMessageW(preview_hwnd, c.WM_SETFONT, @intFromPtr(font), 1);
+        }
+        if (self.app.com_initialized) {
+            if (win32_uia.SettingsControlProvider.create(
+                std.heap.page_allocator,
+                preview_hwnd,
+                .edit,
+                "Preview",
+            )) |provider| {
+                if (self.overlay_title_uia_provider) |title| provider.setLabeledBy(&title.base);
+                self.overlay_preview_uia_provider = provider;
+            } else |err| {
+                log.warn("overlay preview UIA provider unavailable err={}", .{err});
+            }
         }
 
         self.overlay_accept_hwnd = sys.CreateWindowExW(
@@ -16269,10 +19062,10 @@ const Host = struct {
 
     fn bannerUiaName(ctx: *anyopaque, _: usize, buf: []u8) []const u8 {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        return if (self.banner_text) |text|
-            std.fmt.bufPrint(buf, "{s}", .{text}) catch "Notification"
-        else
-            "";
+        if (self.banner_text) |text| return std.fmt.bufPrint(buf, "{s}", .{text}) catch "Notification";
+        const notice = self.app.update_notice orelse return "";
+        const message = notice.message_text orelse return "";
+        return std.fmt.bufPrint(buf, "{s}", .{message}) catch "Update available";
     }
 
     /// UIA name for the confirm title. Reports the text the control was
@@ -16567,11 +19360,13 @@ const Host = struct {
         }
 
         if (self.banner_hwnd == null) {
+            // Painted by `paintBanner` from `hostBannerProc`; shown, placed
+            // and raised above the terminal by `layoutBanner`.
             self.banner_hwnd = sys.CreateWindowExW(
-                c.WS_EX_LAYERED | c.WS_EX_TRANSPARENT,
+                0,
                 prompt_label_class,
                 std.unicode.utf8ToUtf16LeStringLiteral(""),
-                c.WS_CHILD | c.SS_OWNERDRAW,
+                c.WS_CHILD | c.WS_CLIPSIBLINGS | c.WS_CLIPCHILDREN | c.SS_OWNERDRAW,
                 0,
                 0,
                 1,
@@ -16581,7 +19376,6 @@ const Host = struct {
                 self.app.hinstance,
                 null,
             ) orelse return lastError();
-            _ = sys.SetLayeredWindowAttributes(self.banner_hwnd.?, 0, 0, c.LWA_ALPHA);
             _ = sys.SetWindowLongPtrW(
                 self.banner_hwnd.?,
                 c.GWLP_USERDATA,
@@ -16597,10 +19391,37 @@ const Host = struct {
                 .ctx = @ptrCast(self),
                 .role = .live_text,
                 .name = &bannerUiaName,
-                // The focus-region cycle can land on the banner, so it is
-                // keyboard focusable even though it is not interactive.
-                .keyboard_focusable = true,
             });
+        }
+        // Real buttons, so the keyboard, UIA Invoke and voice control reach
+        // them like any other; F6 lands on the first one shown. Outside the
+        // banner's own guard, so one that failed to be created is retried.
+        if (self.banner_hwnd) |banner| {
+            for (&self.banner_buttons, &self.banner_button_uia_providers, 0..) |*slot, *provider, i| {
+                if (slot.* != null) continue;
+                const button = sys.CreateWindowExW(
+                    0,
+                    prompt_button_class,
+                    std.unicode.utf8ToUtf16LeStringLiteral(""),
+                    c.WS_CHILD | c.WS_TABSTOP | c.BS_OWNERDRAW,
+                    0,
+                    0,
+                    1,
+                    1,
+                    banner,
+                    @ptrFromInt(1914 + i),
+                    self.app.hinstance,
+                    null,
+                ) orelse return lastError();
+                slot.* = button;
+                self.subclassButton(button, &hostButtonProc, &self.chrome_button_prev_proc);
+                provider.* = self.createChromeUiaProvider(button, .{
+                    .ctx = @ptrCast(self),
+                    .role = .button,
+                    .tag = i,
+                    .name = &bannerButtonUiaName,
+                });
+            }
         }
     }
 
@@ -16684,10 +19505,15 @@ const Host = struct {
             // Show body as hint label. Prefer the visible Accept button,
             // then the visible Cancel button, as the keyboard-focus target.
             // The destructive action remains one explicit click/Enter away.
-            const initial_target = if (sys.IsWindowVisible(accept_hwnd) != 0)
-                accept_hwnd
-            else if (sys.IsWindowVisible(cancel_hwnd) != 0)
-                cancel_hwnd
+            // A program's prompt prefers Cancel: the key the user was
+            // typing when it opened then declines it.
+            const program = if (self.confirm_payload) |payload| payload.program_request else false;
+            const first = if (program) cancel_hwnd else accept_hwnd;
+            const second = if (program) accept_hwnd else cancel_hwnd;
+            const initial_target = if (sys.IsWindowVisible(first) != 0)
+                first
+            else if (sys.IsWindowVisible(second) != 0)
+                second
             else {
                 self.announceConfirmPrompt();
                 return;
@@ -16723,6 +19549,18 @@ const Host = struct {
         // the owned byte slices get freed. Accept/cancel callbacks
         // snapshot their callback data before reaching this point and
         // dispatch only after hideOverlay returns.
+        //
+        // A confirm closed by anything but its Allow is answered as
+        // Cancel, once the overlay is down: its Cancel and Escape, and
+        // equally a new confirm, the palette, search or a rename opening
+        // over it. Before, those dropped it without its `on_cancel`, and
+        // its clipboard op stayed parked on its Surface until that
+        // Surface's next request. Allow and an owner's teardown clear
+        // `on_cancel` first. The callers of hideOverlay go on using the
+        // Host, so an `on_cancel` must not destroy it; today's two only
+        // free that op.
+        const dropped_cancel = if (self.confirm_payload) |p| p.on_cancel else null;
+        const dropped_userdata = if (self.confirm_payload) |p| p.userdata else null;
         if (self.confirm_payload) |*p| {
             p.deinit(self.app.core_app.alloc);
             self.confirm_payload = null;
@@ -16756,6 +19594,10 @@ const Host = struct {
         if (restore_terminal_focus) {
             refocusActiveSurface(self);
         }
+        // `setBanner(.none, null)` above does nothing when only the update
+        // notice is up, and not every caller relayouts after this.
+        self.syncBannerChild();
+        if (dropped_cancel) |cancel| cancel(dropped_userdata);
     }
 
     fn invalidateOverlayTransitionPlacementCache(self: *Host) void {
@@ -16812,7 +19654,10 @@ const Host = struct {
 
         // Close any previous overlay so we don't stack. `hideOverlay`
         // frees an existing `confirm_payload` via its own deinit
-        // branch, so we don't leak here.
+        // branch, so we don't leak here, and answers it as Cancel. That
+        // cannot undo the new request when it comes from the same
+        // Surface: a requester commits its pending op only after this
+        // returns.
         if (self.overlay_mode != .none) self.hideOverlay();
 
         try beginConfirmOverlay(self, .{
@@ -16822,6 +19667,8 @@ const Host = struct {
             .cancel_label = cancel_owned,
             .preview = preview,
             .preview_caption = caption,
+            .program_request = prompt.program_request,
+            .armed_at_ms = if (prompt.program_request) sys.GetTickCount64() + program_confirm_arming_ms else 0,
             .on_accept = on_accept,
             .on_cancel = on_cancel,
             .userdata = userdata,
@@ -16845,8 +19692,18 @@ const Host = struct {
             self.hideOverlay();
             return;
         };
+        // Every way to press Allow ends here (keys, a click, UIA Invoke,
+        // Enter in the preview pane), so this is where a program's prompt
+        // stays unarmed. A press too early is itself a key or click on
+        // the prompt, so it pushes the arming back (`holdProgramConfirm`).
+        if (sys.GetTickCount64() < captured.armed_at_ms) {
+            self.holdProgramConfirm();
+            return;
+        }
         const cb = captured.on_accept;
         const userdata = captured.userdata;
+        // Allow answers it: hideOverlay must not also run its cancel.
+        self.confirm_payload.?.on_cancel = null;
         // hideOverlay deinits the payload (frees the owned byte
         // slices) and clears `confirm_payload = null`. After this
         // point, do not touch Host state before the callback: confirm
@@ -16856,15 +19713,45 @@ const Host = struct {
         cb(userdata);
     }
 
+    /// hideOverlay runs the confirm's `on_cancel` once the overlay is down.
     fn invokeConfirmCancel(self: *Host) void {
-        const captured = self.confirm_payload orelse {
-            self.hideOverlay();
-            return;
-        };
-        const cb = captured.on_cancel;
-        const userdata = captured.userdata;
         self.hideOverlay();
-        if (cb) |f| f(userdata);
+    }
+
+    /// Cancel a confirm that a terminal in `tab` asked for.
+    fn cancelConfirmFromTab(self: *Host, tab: *Tab) void {
+        const payload = self.confirm_payload orelse return;
+        const userdata = payload.userdata orelse return;
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| {
+            if (@as(*anyopaque, @ptrCast(entry.view)) == userdata) return self.invokeConfirmCancel();
+        }
+    }
+
+    /// Any key a program's prompt receives starts its arming over, so
+    /// Allow takes a key after `program_confirm_arming_ms` of quiet: the
+    /// prompt opens on Cancel, but the Tab, Left or Enter of someone still
+    /// typing can move focus to Allow or the preview pane, and a fresh
+    /// Enter there would otherwise accept once the first half second had
+    /// passed. Prompts the user raised are not armed.
+    fn holdProgramConfirm(self: *Host) void {
+        const payload = if (self.confirm_payload) |*p| p else return;
+        if (payload.program_request) payload.armed_at_ms = sys.GetTickCount64() + program_confirm_arming_ms;
+    }
+
+    /// `holdProgramConfirm` for a key, except a modifier: a held Shift or
+    /// Ctrl repeats its keydown, which kept a Shift+click on Allow from
+    /// ever landing, and the keys typed with a modifier hold it anyway.
+    fn holdProgramConfirmForKey(self: *Host, vk: WPARAM) void {
+        switch (vk) {
+            c.VK_SHIFT, c.VK_CONTROL, c.VK_MENU, c.VK_LWIN, c.VK_RWIN => {},
+            else => self.holdProgramConfirm(),
+        }
+    }
+
+    fn programConfirmOpen(self: *const Host) bool {
+        const payload = self.confirm_payload orelse return false;
+        return payload.program_request;
     }
 
     /// If an active confirm overlay was opened with `ud` as its
@@ -16879,9 +19766,11 @@ const Host = struct {
         const payload_ud = payload.userdata orelse return;
         if (payload_ud != ud) return;
         // `hideOverlay` deinits the payload (frees owned string
-        // bytes and clears `confirm_payload = null`) without
-        // invoking on_accept/on_cancel. layout/repaint/refocus are
-        // handled inside hideOverlay for the confirm case.
+        // bytes and clears `confirm_payload = null`), and with
+        // `on_cancel` cleared it invokes neither callback.
+        // layout/repaint/refocus are handled inside hideOverlay for
+        // the confirm case.
+        self.confirm_payload.?.on_cancel = null;
         self.hideOverlay();
     }
 
@@ -17358,6 +20247,8 @@ const Host = struct {
                 surface.applySearchBarFont(font);
             }
         }
+        // The banner is sized to its line in this font.
+        self.placeBanner(true);
     }
 
     fn ensureSearchTimer(self: *Host) void {
@@ -17637,7 +20528,7 @@ const Host = struct {
         // A chosen command moves focus itself (new tab, palette, find), so
         // only the dismissed case needs the terminal restored, and only
         // when the pointer opened the menu. A keyboard user who reached
-        // the chevron with F6 and opened it with Space expects Escape to
+        // the chevron with Ctrl+F6 and opened it with Space expects Escape to
         // put them back on the chevron, as every menu does.
         if (cmd <= 0 and self.focus_input_mode == .pointer and sys.GetFocus() == button) {
             refocusHostAfterActivation(self);
@@ -17728,7 +20619,7 @@ const Host = struct {
             .terminal = terminal_available,
             .tab_strip = self.tabStripFocusHwnd() != null,
             .search = self.searchFocusHwnd() != null,
-            .banner = focusableHwnd(self.banner_hwnd) != null,
+            .banner = self.bannerFocusHwnd() != null,
         };
     }
 
@@ -17756,14 +20647,14 @@ const Host = struct {
             .terminal => if (self.activeSurface()) |surface| surface.hwnd else null,
             .tab_strip => self.tabStripFocusHwnd(),
             .search => self.searchFocusHwnd(),
-            .banner => focusableHwnd(self.banner_hwnd),
+            .banner => self.bannerFocusHwnd(),
         };
     }
 
     /// The region a focused HWND belongs to, or null when focus is
     /// somewhere this cycle does not own (an overlay, the palette, a
     /// settings window). The tab-strip action buttons count as the tab
-    /// strip so F6 from them continues the cycle instead of dead-ending.
+    /// strip so Ctrl+F6 from them continues the cycle instead of dead-ending.
     fn focusRegionForHwnd(self: *Host, child: HWND) ?focus_region.Region {
         for (self.app.windows.items) |surface| {
             if (surface.host != self) continue;
@@ -17774,7 +20665,7 @@ const Host = struct {
         if (self.tabIndexForButton(child) != null) return .tab_strip;
         if (self.new_tab_hwnd) |hwnd| if (hwnd == child) return .tab_strip;
         if (self.overflow_hwnd) |hwnd| if (hwnd == child) return .tab_strip;
-        if (self.banner_hwnd) |hwnd| if (hwnd == child) return .banner;
+        if (self.bannerButtonOf(child) != null) return .banner;
         if (self.searchControlSurface(child) != null) return .search;
         return null;
     }
@@ -17807,7 +20698,7 @@ const Host = struct {
     /// resolved from live focus rather than assumed, so a binding invoked
     /// through automation while chrome holds focus still moves correctly.
     fn cycleFocusRegionFromCurrentFocus(self: *Host, direction: focus_region.Direction) bool {
-        // This is the keybind path (F6 from the terminal). The key never
+        // This is the keybind path (Ctrl+F6 from the terminal). The key never
         // reaches a chrome control's own WM_KEYDOWN, but the control it
         // lands on is being reached by keyboard and must show its ring.
         self.focus_input_mode = .keyboard;
@@ -17815,7 +20706,7 @@ const Host = struct {
         return self.cycleFocusRegion(direction, current);
     }
 
-    /// F6 / Shift+F6 and Escape while a chrome region holds focus.
+    /// Ctrl+F6 / Ctrl+Shift+F6 and Escape while a chrome region holds focus.
     ///
     /// Chrome controls are native HWNDs that never reach the core keybind
     /// path, so these keys are fixed here rather than rebindable; the
@@ -17825,10 +20716,13 @@ const Host = struct {
     fn handleFocusRegionKey(self: *Host, child: HWND, vk: WPARAM, allow_escape: bool) bool {
         const current = self.focusRegionForHwnd(child) orelse return false;
         switch (vk) {
-            c.VK_F6 => return self.cycleFocusRegion(
-                if (keyPressed(c.VK_SHIFT)) .previous else .next,
-                current,
-            ),
+            c.VK_F6 => {
+                const direction = focus_region.chordDirection(
+                    keyPressed(c.VK_CONTROL),
+                    keyPressed(c.VK_SHIFT),
+                ) orelse return false;
+                return self.cycleFocusRegion(direction, current);
+            },
             c.VK_ESCAPE => {
                 if (!allow_escape) return false;
                 const target = focus_region.escapeTarget(
@@ -17879,6 +20773,7 @@ const Host = struct {
     fn chromeUiaProviderForHwnd(self: *Host, child: HWND) ?*win32_uia.ChromeControlProvider {
         if (self.new_tab_hwnd == child) return self.new_tab_uia_provider;
         if (self.overflow_hwnd == child) return self.overflow_uia_provider;
+        if (self.bannerButtonOf(child)) |button| return self.banner_button_uia_providers[@intFromEnum(button)];
         const surface = self.searchControlSurface(child) orelse return null;
         const role = surface.searchBarButtonRole(child) orelse return null;
         return surface.search_bar_button_uia_providers[@intFromEnum(role)];
@@ -19145,7 +22040,66 @@ const Host = struct {
         return rect;
     }
 
+    /// WM_CLOSE (the caption button, Alt+F4, the taskbar) and
+    /// `close_window`. When a terminal in the window would lose a running
+    /// process (`confirm-close-surface`), ask once for the whole window;
+    /// its Close runs `closeConfirmed`. A sign-out never asks.
     fn close(self: *Host) void {
+        const count = tabsCloseConfirmCount(self.tabs.items);
+        if (count == 0 or self.app.session_ending) return self.closeConfirmed();
+        self.askBeforeClosing(.window, count, &hostCloseConfirmAccept, self);
+    }
+
+    /// One prompt for a close that ends `count` terminals which
+    /// `confirm-close-surface` asks about. The window comes up first, so a
+    /// close from the taskbar or a quit never waits on a prompt nobody can
+    /// see, and asking again keeps the prompt already open. If the prompt
+    /// cannot open, nothing closes, as in `Surface.close`: closing anyway
+    /// would defeat the setting, and the user can retry.
+    fn askBeforeClosing(
+        self: *Host,
+        scope: CloseScope,
+        count: usize,
+        on_accept: *const fn (userdata: ?*anyopaque) void,
+        userdata: *anyopaque,
+    ) void {
+        const raised = self.presentForPrompt();
+        if (self.showsConfirm(on_accept, userdata)) {
+            // Raising the window focused its terminal; the prompt keeps the keys.
+            if (raised) if (self.overlay_accept_hwnd) |accept| {
+                _ = sys.SetFocus(accept);
+            };
+            return;
+        }
+        var body: [256]u8 = undefined;
+        self.showConfirm(closeScopePrompt(scope, count, &body), on_accept, null, userdata) catch |err| {
+            log.warn("close confirm unavailable err={}; declining close to honour confirm-close-surface", .{err});
+        };
+    }
+
+    /// Shown on screen, minimized included; a hidden quick terminal is not.
+    fn isShown(self: *const Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        return sys.IsWindowVisible(hwnd) != 0;
+    }
+
+    fn showsConfirm(self: *const Host, on_accept: *const fn (userdata: ?*anyopaque) void, userdata: *anyopaque) bool {
+        const payload = self.confirm_payload orelse return false;
+        return payload.on_accept == on_accept and payload.userdata == userdata;
+    }
+
+    /// Restore and raise the window for a prompt unless it is already the
+    /// foreground window. Returns whether it did.
+    fn presentForPrompt(self: *Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        if (sys.GetForegroundWindow() == hwnd and sys.IsIconic(hwnd) == 0) return false;
+        const surface = self.activeSurface() orelse return false;
+        self.app.activateSurface(surface);
+        return true;
+    }
+
+    /// Close every terminal in the window without asking.
+    fn closeConfirmed(self: *Host) void {
         const alloc = self.app.core_app.alloc;
         const fallback_hwnd = self.hwnd;
         var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
@@ -19170,7 +22124,7 @@ const Host = struct {
             return;
         }
         if (self.app.hosts.items.len == 1) {
-            self.app.session_state_saved_before_last_host_close = self.app.saveSessionState();
+            self.app.session_state_saved_before_last_host_close = self.app.saveSessionState(.final);
         }
         for (surfaces.items) |surface| surface.close(false);
     }
@@ -19439,11 +22393,6 @@ const Host = struct {
         self.repaintStatusBar();
     }
 
-    fn invalidateBannerText(self: *Host) void {
-        self.chrome_text_dirty.banner = true;
-        self.repaintTopChrome();
-    }
-
     fn invalidateOverlayText(self: *Host) void {
         self.chrome_text_dirty.overlay = true;
         self.repaintTopChrome();
@@ -19615,7 +22564,6 @@ const Host = struct {
         self.chrome_text_dirty.markAll();
         if (self.cached_status_w) |w| alloc.free(w);
         if (self.cached_detail_w) |w| alloc.free(w);
-        if (self.cached_banner_w) |w| alloc.free(w);
         if (self.cached_inspector_title_w) |w| alloc.free(w);
         if (self.cached_inspector_hint_w) |w| alloc.free(w);
         if (self.cached_overlay_paint_badge_w) |w| alloc.free(w);
@@ -19628,13 +22576,50 @@ const Host = struct {
         }
         self.cached_status_w = null;
         self.cached_detail_w = null;
-        self.cached_banner_w = null;
         self.cached_inspector_title_w = null;
         self.cached_inspector_hint_w = null;
         self.cached_overlay_paint_badge_w = null;
         self.cached_overlay_paint_label_w = null;
         self.cached_overlay_paint_feedback_w = null;
         self.cached_launcher_selected_chip_w = null;
+    }
+
+    test "EXT-03 overlay cache OOM remains retryable and chrome teardown frees once" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        core_app.alloc = failing.allocator();
+        defer core_app.alloc = std.testing.allocator;
+        defer host.freeCachedChromeStrings();
+        inline for (.{
+            "cached_overlay_paint_label_w",
+            "cached_overlay_paint_feedback_w",
+            "cached_overlay_paint_badge_w",
+        }) |field| {
+            const slot = &@field(host, field);
+            try paint_text.replaceCachedUtf16(core_app.alloc, slot, "previous");
+            const old = slot.*.?.ptr;
+            failing.fail_index = failing.alloc_index;
+            try std.testing.expectError(error.OutOfMemory, paint_text.replaceCachedUtf16(core_app.alloc, slot, "replacement"));
+            try std.testing.expectEqual(old, slot.*.?.ptr);
+            try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("previous"), slot.*.?);
+            failing.fail_index = std.math.maxInt(usize);
+            try paint_text.replaceCachedUtf16(core_app.alloc, slot, "replacement");
+        }
+        host.freeCachedChromeStrings();
+        try std.testing.expect(host.cached_overlay_paint_label_w == null);
+        try std.testing.expect(host.cached_overlay_paint_feedback_w == null);
+        try std.testing.expect(host.cached_overlay_paint_badge_w == null);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 
     fn syncWindowTitle(self: *Host) !bool {
@@ -19903,28 +22888,6 @@ const Host = struct {
             } else {
                 changed.* = applyChildVisibility(container_hwnd, &self.tab_container_placement, false) or changed.*;
             }
-        }
-
-        // The banner is painted text with no control of its own, so its
-        // provider lives on an invisible child. Track the painted row (same
-        // offsets `paintChrome` uses) so position and touch navigation land
-        // on the banner instead of at the window origin. Visibility stays
-        // owned by `setBanner`.
-        if (self.banner_hwnd) |banner_hwnd| {
-            const overlay_offset: i32 = if (self.overlay_mode == .none) 0 else self.scaled(host_overlay_height);
-            const inspector_offset: i32 = if (self.inspectorPanelVisible()) self.scaled(host_inspector_panel_height) else 0;
-            const banner_y: i32 = self.tabBarHeight() + overlay_offset + inspector_offset + self.scaled(2);
-            const banner_x = self.scaled(16);
-            changed.* = applyChromeChildRect(
-                banner_hwnd,
-                &self.banner_placement,
-                childRect(
-                    banner_x,
-                    banner_y,
-                    @max(1, width - banner_x),
-                    self.scaled(24),
-                ),
-            ) or changed.*;
         }
 
         // Right-side cluster: [+][▾] — new tab and dropdown chevron.
@@ -20330,8 +23293,12 @@ const Host = struct {
             .bottom = content_rect.bottom,
         };
         const search_bar_height = self.scaled(host_search_bar_height);
-        const active_tab = self.activeTab() orelse return;
+        // A host whose last tab is detached for undo still shows its banner.
+        const active_tab = self.activeTab() orelse return self.layoutBanner(content_rect, content_rect.top);
         var content_layout_changed = false;
+        // The banner goes below a docked search frame at the top of the
+        // content area rather than over the search field.
+        var banner_top = content_rect.top;
 
         // Hide non-active child GL surfaces before showing the active tab.
         // Briefly overlapping multiple WGL child windows under one host can
@@ -20356,6 +23323,7 @@ const Host = struct {
                             layoutRectToWin32(search_frame_rect),
                             true,
                         )) or content_layout_changed;
+                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
                     } else {
                         content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
                     }
@@ -20406,6 +23374,7 @@ const Host = struct {
                             layoutRectToWin32(search_frame_rect),
                             true,
                         )) or content_layout_changed;
+                        if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
                     } else {
                         content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
                     }
@@ -20427,6 +23396,7 @@ const Host = struct {
                 entry.view.syncContentScaleToHostDpi();
             }
         }
+        self.layoutBanner(content_rect, banner_top);
 
         if (chrome_layout_changed or content_layout_changed) {
             // Batch-invalidate after actual positioning/visibility changes.
@@ -20753,8 +23723,7 @@ const Host = struct {
                         self.confirmText(),
                     ) catch return false;
                 defer alloc.free(overlay_label);
-                if (self.cached_overlay_paint_label_w) |old| alloc.free(old);
-                self.cached_overlay_paint_label_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, overlay_label) catch return false;
+                paint_text.replaceCachedUtf16(alloc, &self.cached_overlay_paint_label_w, overlay_label) catch return false;
 
                 const overlay_feedback = if (self.overlay_mode == .profile)
                     if (self.banner_text) |value|
@@ -20793,15 +23762,13 @@ const Host = struct {
                     ) catch return false;
                 };
                 defer alloc.free(overlay_feedback);
-                if (self.cached_overlay_paint_feedback_w) |old| alloc.free(old);
-                self.cached_overlay_paint_feedback_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, overlay_feedback) catch return false;
+                paint_text.replaceCachedUtf16(alloc, &self.cached_overlay_paint_feedback_w, overlay_feedback) catch return false;
 
                 if (self.overlay_mode == .profile) {
                     if (self.selectedProfile()) |profile| {
                         const badge = buildProfileChromeBadgeText(alloc, profile.kind) catch return false;
                         defer alloc.free(badge);
-                        if (self.cached_overlay_paint_badge_w) |old| alloc.free(old);
-                        self.cached_overlay_paint_badge_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, badge) catch return false;
+                        paint_text.replaceCachedUtf16(alloc, &self.cached_overlay_paint_badge_w, badge) catch return false;
                     } else {
                         if (self.cached_overlay_paint_badge_w) |old| alloc.free(old);
                         self.cached_overlay_paint_badge_w = null;
@@ -21232,196 +24199,6 @@ const Host = struct {
         _ = sys.SetTextColor(hdc, theme.text_primary);
     }
 
-    fn paintChromeBanner(
-        self: *Host,
-        hwnd: HWND,
-        hdc: HDC,
-        alloc: Allocator,
-        client_rect: RECT,
-        banner_y: i32,
-        inspector_panel_visible: bool,
-        paint_top: bool,
-        theme: *const ThemeColors,
-    ) bool {
-        const explicit_banner_text: ?[]const u8 = if (self.overlay_mode == .none)
-            self.banner_text
-        else
-            null;
-        const paint_inspector_banner = blk: {
-            if (!paint_top) break :blk false;
-            if (self.overlay_mode != .none) break :blk false;
-            if (self.banner_text != null) break :blk false;
-            if (inspector_panel_visible) break :blk false;
-            break :blk self.activeTabHasInspector();
-        };
-        const banner_kind: HostBannerKind = if (explicit_banner_text != null)
-            self.banner_kind
-        else if (paint_inspector_banner)
-            .info
-        else
-            .none;
-        const paint_update_notice = paint_top and
-            self.overlay_mode == .none and
-            !inspector_panel_visible and
-            self.banner_text == null and
-            self.app.update_notice != null;
-        if (paint_top and self.chrome_text_dirty.banner) {
-            if (self.cached_banner_w) |old| alloc.free(old);
-            self.cached_banner_w = null;
-
-            if (paint_update_notice) {
-                if (self.app.update_notice) |notice| {
-                    if (notice.message_text) |message| {
-                        self.cached_banner_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, message) catch return false;
-                    }
-                }
-            } else if (explicit_banner_text) |value| {
-                const full = buildHostBannerText(alloc, banner_kind, value) catch return false;
-                defer alloc.free(full);
-                self.cached_banner_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, full) catch return false;
-            } else if (paint_inspector_banner) {
-                if (self.activeSurface()) |surface| {
-                    const host_status = self.app.hostTabStatus(surface);
-                    const pane_count = if (self.activeTab()) |tab| tab.leafCount() else 1;
-                    const value = buildInspectorBannerText(
-                        alloc,
-                        host_status,
-                        pane_count,
-                        if (self.activeTab()) |tab| tab.tree.zoomed != null else false,
-                    ) catch return false;
-                    defer alloc.free(value);
-                    const full = buildHostBannerText(alloc, banner_kind, value) catch return false;
-                    defer alloc.free(full);
-                    self.cached_banner_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, full) catch return false;
-                }
-            }
-            self.chrome_text_dirty.banner = false;
-        }
-        const dwrite_banner_painted = if (paint_top) blk: {
-            const text: []const u16 = if (explicit_banner_text != null)
-                if (self.cached_banner_w) |value| value else &.{}
-            else
-                &.{};
-            const color = switch (banner_kind) {
-                .none => theme.text_primary,
-                .info => theme.info_fg,
-                .err => theme.error_fg,
-            };
-            const rendered = self.app.renderShellChromeText(hwnd, .{
-                .text = text,
-                .left_px = self.scaled(16),
-                .top_px = banner_y,
-                .right_px = @max(self.scaled(16), client_rect.right - self.scaled(16)),
-                .bottom_px = banner_y + self.scaled(24),
-                .color_ref = color,
-            });
-            break :blk rendered and text.len > 0;
-        } else false;
-        if (paint_top) self.clearUpdateActionRects();
-        if (paint_top and self.overlay_mode == .none and !inspector_panel_visible and self.banner_text == null) {
-            if (self.app.update_notice) |notice| {
-                const open_label = if (notice.staged)
-                    std.unicode.utf8ToUtf16LeStringLiteral("Install")
-                else
-                    std.unicode.utf8ToUtf16LeStringLiteral("Open Release");
-                const dismiss_label = std.unicode.utf8ToUtf16LeStringLiteral("Dismiss");
-                const button_height = self.scaled(22);
-                const dismiss_width = self.scaled(72);
-                const open_width = if (notice.staged) self.scaled(86) else self.scaled(102);
-                const button_gap = self.scaled(8);
-                const dismiss_rect = RECT{
-                    .left = client_rect.right - dismiss_width - self.scaled(16),
-                    .top = banner_y - self.scaled(4),
-                    .right = client_rect.right - self.scaled(16),
-                    .bottom = banner_y - self.scaled(4) + button_height,
-                };
-                const open_rect = RECT{
-                    .left = dismiss_rect.left - open_width - button_gap,
-                    .top = dismiss_rect.top,
-                    .right = dismiss_rect.left - button_gap,
-                    .bottom = dismiss_rect.bottom,
-                };
-                self.update_open_rect = open_rect;
-                self.update_dismiss_rect = dismiss_rect;
-
-                const text_right = @max(self.scaled(120), open_rect.left - self.scaled(10));
-                var text_rect = RECT{
-                    .left = self.scaled(16),
-                    .top = banner_y - self.scaled(2),
-                    .right = text_right,
-                    .bottom = banner_y + button_height,
-                };
-
-                _ = sys.SetTextColor(hdc, theme.info_fg);
-                if (self.cached_banner_w) |banner_w| {
-                    drawTextWz(
-                        hdc,
-                        banner_w,
-                        &text_rect,
-                        c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX | c.DT_END_ELLIPSIS,
-                    );
-                }
-
-                drawRoundedRect(
-                    hdc,
-                    open_rect,
-                    themeSurface(theme, .update_open_bg),
-                    theme.info_fg,
-                    self.scaled(5),
-                );
-                drawRoundedRect(
-                    hdc,
-                    dismiss_rect,
-                    themeSurface(theme, .update_dismiss_bg),
-                    theme.chrome_border,
-                    self.scaled(5),
-                );
-
-                _ = sys.SetTextColor(hdc, theme.text_primary);
-                var open_text_rect = open_rect;
-                open_text_rect.left += self.scaled(6);
-                open_text_rect.right -= self.scaled(6);
-                var dismiss_text_rect = dismiss_rect;
-                dismiss_text_rect.left += self.scaled(6);
-                dismiss_text_rect.right -= self.scaled(6);
-                _ = sys.DrawTextW(
-                    hdc,
-                    open_label,
-                    @intCast(std.mem.sliceTo(open_label, 0).len),
-                    &open_text_rect,
-                    c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
-                );
-                _ = sys.DrawTextW(
-                    hdc,
-                    dismiss_label,
-                    @intCast(std.mem.sliceTo(dismiss_label, 0).len),
-                    &dismiss_text_rect,
-                    c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
-                );
-            } else if (paint_inspector_banner) {
-                _ = sys.SetTextColor(hdc, switch (banner_kind) {
-                    .none => theme.text_primary,
-                    .info => theme.info_fg,
-                    .err => theme.error_fg,
-                });
-                if (self.cached_banner_w) |banner_w| {
-                    textOutWz(hdc, self.scaled(16), banner_y, banner_w);
-                }
-            }
-        } else if (explicit_banner_text != null and !dwrite_banner_painted) {
-            _ = sys.SetTextColor(hdc, switch (banner_kind) {
-                .none => theme.text_primary,
-                .info => theme.info_fg,
-                .err => theme.error_fg,
-            });
-            if (self.cached_banner_w) |banner_w| {
-                textOutWz(hdc, self.scaled(16), banner_y, banner_w);
-            }
-        }
-        _ = sys.SetTextColor(hdc, theme.text_primary);
-        return true;
-    }
-
     fn paintChromeStatusBar(
         self: *Host,
         hdc: HDC,
@@ -21724,7 +24501,6 @@ const Host = struct {
         const paint_top = paintRectVisible(hdc, ps.rcPaint, top_rect);
         const paint_content = paintRectVisible(hdc, ps.rcPaint, content_rect);
         const paint_status = paintRectVisible(hdc, ps.rcPaint, status_rect);
-        const banner_y: i32 = bands.content_top + self.scaled(2);
 
         self.paintChromeTabBar(hdc, client_rect, tab_h, bands.overlay_top, paint_top, theme);
         if (!self.paintChromeOverlay(hdc, alloc, client_rect, tab_h, bands, paint_top, theme)) return;
@@ -21748,16 +24524,6 @@ const Host = struct {
             paint_status,
             theme,
         );
-        if (!self.paintChromeBanner(
-            hwnd,
-            hdc,
-            alloc,
-            client_rect,
-            banner_y,
-            inspector_panel_visible,
-            paint_top,
-            theme,
-        )) return;
         if (status_h <= 0) {
             self.chrome_repaint_dirty = false;
             return;
@@ -21826,15 +24592,58 @@ const SurfaceInitOptions = struct {
     tab_insert_index: ?usize = null,
     clone_state_from: ?*const Surface = null,
     split_direction: SplitTreeSurface.Split.Direction = .right,
-    /// Passive first-show: once GL and core initialization succeed, the
-    /// newly-created host HWND is shown via `SW_SHOWNOACTIVATE` instead of
-    /// being presented with focus, so it becomes visible without stealing
-    /// focus from the caller's current foreground window. Used by the
-    /// quick-terminal passive mode
-    /// (`quick-terminal-keyboard-interactivity = none`) on first toggle-on.
-    passive_show: bool = false,
+    /// How the newly-created host HWND first appears, once GL and core
+    /// initialization succeed. Used by the quick-terminal passive mode
+    /// (`quick-terminal-keyboard-interactivity = none`) on first toggle-on,
+    /// and by a handed-off console that asked not to take focus.
+    show: InitialShow = .activate,
     adopted_session: ?*win32_terminal_handoff.PendingSession = null,
 };
+
+/// The first show of a new host window.
+const InitialShow = enum {
+    /// Shown and presented with focus.
+    activate,
+    /// Visible without stealing focus from the caller's foreground window.
+    no_activate,
+    /// Minimized, without activation: the window exists but stays out of the
+    /// way, and the taskbar button is all the user sees.
+    minimized,
+    /// Maximized, with focus.
+    maximized,
+
+    /// The `ShowWindow` command for the first show, if it is not left to
+    /// `presentWindow`. A maximize is followed by `presentWindow` for focus.
+    fn showCommand(self: InitialShow) ?i32 {
+        return switch (self) {
+            .activate => null,
+            .no_activate => c.SW_SHOWNOACTIVATE,
+            .minimized => c.SW_SHOWMINNOACTIVE,
+            .maximized => c.SW_MAXIMIZE,
+        };
+    }
+
+    fn takesFocus(self: InitialShow) bool {
+        return self == .activate or self == .maximized;
+    }
+};
+
+/// The first show a handed-off console asked for in its `STARTUPINFO`.
+///
+/// `wShowWindow` means something only when `STARTF_USESHOWWINDOW` is set; it
+/// is whatever the client left there otherwise. Conhost hands over consoles
+/// started with `SW_HIDE` too (only `CREATE_NO_WINDOW` keeps a console
+/// windowless), and a host with no way to be shown again is worse than a
+/// minimized one, so a hide becomes a minimize that takes no focus.
+fn adoptedInitialShow(startup_flags: u32, show_window: u16) InitialShow {
+    if (startup_flags & win32_terminal_handoff.STARTF_USESHOWWINDOW == 0) return .activate;
+    return switch (show_window) {
+        c.SW_SHOWNOACTIVATE, c.SW_SHOWNA => .no_activate,
+        c.SW_HIDE, c.SW_SHOWMINIMIZED, c.SW_MINIMIZE, c.SW_SHOWMINNOACTIVE, c.SW_FORCEMINIMIZE => .minimized,
+        c.SW_MAXIMIZE => .maximized,
+        else => .activate,
+    };
+}
 
 const SplitSurfaceAttachRollback = struct {
     tab: *Tab,
@@ -22241,6 +25050,11 @@ fn restoreTerminalUndoState(
 }
 
 const HostBannerKind = labels.HostBannerKind;
+
+/// A button of the host banner: `primary` is Open Release or Install on the
+/// update notice; `dismiss` is Dismiss there and the close button otherwise.
+const BannerButton = enum(u1) { primary, dismiss };
+
 const LaunchTargetButtonKeyAction = labels.LaunchTargetButtonKeyAction;
 const ProfileOpenTarget = labels.ProfileOpenTarget;
 
@@ -23238,15 +26052,10 @@ fn applyDwmThemeWithBuild(hwnd: HWND, theme: *const ThemeColors, config: *const 
 /// string into the rect. Used by the palette list row painter.
 fn drawPaletteRowText(hdc: HDC, text: []const u8, rect: RECT, color: u32) void {
     if (text.len == 0) return;
-    // UTF-16 on the stack — palette titles / actions are short (well
-    // under 256 chars); anything longer gets truncated rather than
-    // allocating per paint.
+    // Configured titles and descriptions can be arbitrarily long. Bound
+    // the conversion before writing and avoid allocation on every paint.
     var buf: [256]u16 = undefined;
-    // On invalid UTF-8 only a prefix was written, so falling back to `buf.len`
-    // would render uninitialized stack. Draw nothing instead.
-    const copied = std.unicode.utf8ToUtf16Le(&buf, text) catch 0;
-    const n: usize = @min(copied, buf.len - 1);
-    buf[n] = 0;
+    const n = paint_text.utf8ToUtf16LeBounded(&buf, text);
 
     _ = sys.SetTextColor(hdc, color);
     var r = rect;
@@ -23641,6 +26450,11 @@ fn paletteListGeometryThunk(ctx: *anyopaque) ?win32_uia.PaletteListGeometry {
 /// Thunks adapting `*App` into the `AppHandle` callback shape used by
 /// `win32_settings.SettingsWindow`. Kept inline so a theme swap is
 /// picked up on the next paint without cache invalidation.
+fn settingsAppIconThunk(ctx: *anyopaque, small: bool) HICON {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return loadAppIcon(app.hinstance, small);
+}
+
 fn settingsOwnerWindowThunk(ctx: *anyopaque) ?HWND {
     const app: *App = @ptrCast(@alignCast(ctx));
     const focused = app.focusedSurfaceForUndoRedo();
@@ -23746,17 +26560,97 @@ fn settingsPreviewFieldThunk(
         .auto_update => app.config.@"auto-update" = value.auto_update,
         .auto_update_channel => app.config.@"auto-update-channel" = value.auto_update_channel,
     }
-    app.reconfigureTheme();
-    for (app.windows.items) |surface| {
-        surface.applyRuntimeConfig(&app.config) catch |err| {
-            log.warn("settings live preview apply failed field={} err={}", .{ field, err });
-        };
+    switch (win32_settings.previewEffect(field)) {
+        .none => {},
+        .theme => app.reconfigureTheme(),
+        .opacity => for (app.windows.items) |surface| {
+            surface.applyRuntimeConfig(&app.config) catch |err| {
+                log.warn("settings live preview apply failed field={} err={}", .{ field, err });
+            };
+        },
     }
+}
+
+test "settings live preview refreshes only what the field shows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core = try CoreApp.create(std.testing.allocator);
+    defer core.destroy();
+    var app: App = undefined;
+    try app.init(core, .{});
+    defer app.terminate();
+
+    const baseline = app.theme_rebuilds;
+    settingsPreviewFieldThunk(&app, .font_size, .{ .font_size = 14 });
+    settingsPreviewFieldThunk(&app, .window_padding_x, .{ .window_padding_x = .{ .top_left = 4, .bottom_right = 4 } });
+    settingsPreviewFieldThunk(&app, .window_padding_y, .{ .window_padding_y = .{ .top_left = 4, .bottom_right = 4 } });
+    settingsPreviewFieldThunk(&app, .cursor_style, .{ .cursor_style = .underline });
+    settingsPreviewFieldThunk(&app, .background_opacity, .{ .background_opacity = 0.5 });
+    try std.testing.expectEqual(baseline, app.theme_rebuilds);
+    // The write itself still happens: it is what a new terminal inherits.
+    try std.testing.expectEqual(@as(f32, 14), app.config.@"font-size");
+    try std.testing.expectEqual(@as(f64, 0.5), app.config.@"background-opacity");
+
+    settingsPreviewFieldThunk(&app, .window_theme, .{ .window_theme = .light });
+    try std.testing.expectEqual(baseline + 1, app.theme_rebuilds);
+    try std.testing.expect(app.config.@"window-theme" == .light);
 }
 fn settingsNotifyConflictThunk(ctx: *anyopaque, field: win32_settings.SettingField) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     app.settings_window.promptConflict(field);
 }
+fn settingsReconcileDiskThunk(
+    ctx: *anyopaque,
+    pending: *const configpkg.Config,
+    original: *const configpkg.Config,
+) win32_settings.SaveError!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.settingsReconcileDisk(pending, original, true);
+}
+
+/// Whether `diag` is the loader's complaint about an argument that starts this
+/// process instead of configuring it: the `--safe-mode` switch (`global.zig`
+/// reads it, it is no config key) and the positional `wgh://activate?...` URI
+/// of an Action Center launch (`scanToastActivationArg` reads it). The loader
+/// reports both as unknown, and argv does not change, so every reload would
+/// raise them again.
+///
+/// Not a diagnostic of a file's line: that is a mistake in the file. The
+/// conditional state rebuilds a config through an iterator that has no place
+/// to give, so a rebuilt config's diagnostics come without one, and the
+/// command-line ones cannot be told apart by it. `safe_mode` is whether this
+/// process was started with `--safe-mode`.
+fn isLaunchArgumentDiagnostic(diag: cli_diagnostics.Diagnostic, safe_mode: bool) bool {
+    if (diag.location == .file) return false;
+    if (safe_mode and std.mem.eql(u8, diag.key, "safe-mode")) return true;
+    _ = win32_toast_activation.parseLaunchArg(diag.key) catch return false;
+    return true;
+}
+
+fn settingsFailureDetailThunk(ctx: *anyopaque) ?[]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.settings_failure_detail.text;
+}
+fn settingsMaskedKeysThunk(ctx: *anyopaque) ?[]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.settings_masked_keys.text;
+}
+fn settingsSaveTargetThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const alloc = app.core_app.alloc;
+    if (buf.len < settings_save_target_bytes + 3) return null;
+    const path = app.settingsTargetPathForDisplay(alloc) catch return null;
+    defer alloc.free(path);
+    return win32_config_problems.pathTail(buf, path, settings_save_target_bytes);
+}
+fn settingsConfigProblemsThunk(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.config_problems.listText(buf);
+}
+
+/// The most of the save target's path Settings shows; a longer path keeps
+/// its end, which is what tells files apart.
+const settings_save_target_bytes = 240;
 fn settingsSaveAndReloadThunk(
     ctx: *anyopaque,
     pending: *const configpkg.Config,
@@ -23769,9 +26663,10 @@ fn settingsOnClosedThunk(ctx: *anyopaque) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const restore_id = app.settings_restore_surface_id;
     app.settings_restore_surface_id = null;
-    if (settingsRestoreSurface(app, restore_id)) |surface| {
-        app.activateSurface(surface);
-    }
+    const restored = settingsRestoreSurface(app, restore_id);
+    if (restored) |surface| app.activateSurface(surface);
+    // Saved or discarded from the prompt a quit raised: carry on quitting.
+    if (app.settings_window.takeQuitAfterClose()) return app.requestQuit(restored);
     // Mirrors the kick after the last terminal window closes; the
     // quit timer observes `hasLiveUiWindows()` so this is a no-op
     // when any terminal HWND is still alive.
@@ -23792,6 +26687,11 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
     // Always show local chrome feedback for the Save button, even
     // when system/reload notifications are disabled.
     const alloc = app.core_app.alloc;
+    // Problems the save's reload found are an error that stays until
+    // dismissed. An info banner would replace it and then expire, and so
+    // would the banner a refused system toast falls back to, so neither is
+    // raised: the Settings status line already says the save went through.
+    if (app.config_problems.count() > 0 and app.showConfigProblemsBanner()) return;
     const banner_text = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
         title,
         if (body.len > 0) ": " else "",
@@ -23846,13 +26746,55 @@ fn buildToastLaunchForSurface(
     });
 }
 
+/// The active tab's index once tab `removed` is gone and `remaining` tabs
+/// are left: the same tab when another one closed; when the active tab
+/// itself closed, the tab now at its place, or the last one. The shell
+/// model's `closeTab` and `detachTab` choose the same way.
+fn activeTabAfterRemoval(active: usize, removed: usize, remaining: usize) usize {
+    if (remaining == 0) return 0;
+    if (removed < active) return @min(active - 1, remaining - 1);
+    return @min(active, remaining - 1);
+}
+
+test "win32 closing a tab keeps the active tab active" {
+    // [A, B, C] with B active.
+    try std.testing.expectEqual(@as(usize, 0), activeTabAfterRemoval(1, 0, 2)); // A closes: B
+    try std.testing.expectEqual(@as(usize, 1), activeTabAfterRemoval(1, 2, 2)); // C closes: B
+    try std.testing.expectEqual(@as(usize, 1), activeTabAfterRemoval(1, 1, 2)); // B closes: C
+    try std.testing.expectEqual(@as(usize, 1), activeTabAfterRemoval(2, 2, 2)); // last closes: new last
+    try std.testing.expectEqual(@as(usize, 0), activeTabAfterRemoval(0, 0, 0));
+}
+
 /// Whether the user can see tab `index` of `host` right now: it is the
 /// window's active tab, and the window is the foreground window and not
 /// minimized.
 fn tabSeenByUser(host: *const Host, index: usize) bool {
+    return tabSeenWithForeground(host, index, sys.GetForegroundWindow());
+}
+
+fn tabSeenWithForeground(host: *const Host, index: usize, foreground: ?HWND) bool {
     if (index != host.active_tab) return false;
     const hwnd = host.hwnd orelse return false;
-    return sys.GetForegroundWindow() == hwnd and sys.IsIconic(hwnd) == 0;
+    return foreground == hwnd and sys.IsIconic(hwnd) == 0;
+}
+
+test "win32 only a close in the window in front takes focus" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var host: Host = undefined;
+    host.active_tab = 1;
+    host.hwnd = null;
+    try std.testing.expect(!tabSeenWithForeground(&host, 1, null));
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    host.hwnd = hwnd;
+    try std.testing.expect(tabSeenWithForeground(&host, 1, hwnd));
+    // A background tab, or a window that is not in front.
+    try std.testing.expect(!tabSeenWithForeground(&host, 0, hwnd));
+    try std.testing.expect(!tabSeenWithForeground(&host, 1, null));
+    // A minimized window, even one Windows still calls the foreground
+    // (the style bit is what IsIconic reads; the window is never shown).
+    _ = sys.SetWindowLongPtrW(hwnd, c.GWL_STYLE, @bitCast(@as(usize, c.WS_POPUP | c.WS_MINIMIZE)));
+    try std.testing.expect(!tabSeenWithForeground(&host, 1, hwnd));
 }
 
 const TabProgramStatus = struct {
@@ -23893,6 +26835,54 @@ fn surfaceConfirmCloseAccept(userdata: ?*anyopaque) void {
     const ud = userdata orelse return;
     const surface: *Surface = @ptrCast(@alignCast(ud));
     _ = surface.requestClose();
+}
+
+/// Close for the window-close prompt. `userdata` is the Host that shows
+/// the prompt, so it is alive whenever the prompt can be answered.
+fn hostCloseConfirmAccept(userdata: ?*anyopaque) void {
+    const host: *Host = @ptrCast(@alignCast(userdata orelse return));
+    host.closeConfirmed();
+}
+
+/// Quit for the quit prompt. `userdata` is the App, which outlives every
+/// window the quit destroys, including the one showing the prompt.
+fn appQuitConfirmAccept(userdata: ?*anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(userdata orelse return));
+    // Settings may have gained unsaved edits while this prompt waited.
+    if (app.settings_window.holdQuitForUnsavedChanges()) return;
+    app.quitConfirmed();
+}
+
+/// Close tabs for the other-tabs prompt. `userdata` is the Surface the
+/// tabs are kept beside: its destruction cancels the prompt
+/// (`cancelConfirmIfOwnedBy`), and the tabs are found again here because
+/// they may have changed while the prompt was open.
+fn closeOtherTabsConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    _ = surface.app.closeTabsBeside(surface, .other) catch |err| {
+        log.warn("close other tabs after confirm failed err={}", .{err});
+    };
+}
+
+/// Close the tab for the undo-is-off prompt. `userdata` is the Surface the
+/// close was asked on: its destruction cancels the prompt
+/// (`cancelConfirmIfOwnedBy`), and its tab is found again here because it
+/// may have moved while the prompt was open.
+fn closeThisTabConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    const app = surface.app;
+    const found = app.findTabForSurface(surface) orelse return;
+    _ = app.closeTabUndoable(found.host, found.index) catch |err| {
+        log.warn("close tab after confirm failed err={}", .{err});
+    };
+}
+
+/// Close tabs for the tabs-to-the-right prompt; see `closeOtherTabsConfirmAccept`.
+fn closeRightTabsConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    _ = surface.app.closeTabsBeside(surface, .right) catch |err| {
+        log.warn("close tabs to the right after confirm failed err={}", .{err});
+    };
 }
 
 /// Accept callback for a deferred paste confirm. Ownership of the
@@ -24084,6 +27074,113 @@ fn rectEqual(a: RECT, b: RECT) bool {
         a.top == b.top and
         a.right == b.right and
         a.bottom == b.bottom;
+}
+
+/// A QT rect is computed in physical pixels. WM_DPICHANGED still updates
+/// fonts/layout during this call, but must not substitute its suggested size.
+fn setQuickTerminalRect(hwnd: HWND, rect: RECT) void {
+    const host = getHost(hwnd);
+    const was_placing = if (host) |v| v.quick_terminal_placing else false;
+    if (host) |v| v.quick_terminal_placing = true;
+    defer if (host) |v| {
+        v.quick_terminal_placing = was_placing;
+    };
+    const dpi_before = sys.GetDpiForWindow(hwnd);
+    _ = sys.SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, c.SWP_NOACTIVATE);
+    // Settle the computed rectangle after nested DPI scale/layout updates.
+    if (sys.GetDpiForWindow(hwnd) != dpi_before) {
+        _ = sys.SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, c.SWP_NOACTIVATE);
+    }
+}
+
+test "win32 DPI suggestions preserve a quick terminal tween but resize ordinary moves" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const previous_dpi_context = sys.SetThreadDpiAwarenessContext(-4);
+    defer _ = sys.SetThreadDpiAwarenessContext(previous_dpi_context);
+    const core = try CoreApp.create(std.testing.allocator);
+    defer core.destroy();
+    var app: App = undefined;
+    try app.init(core, .{ .safe_mode = true });
+    const hinstance = app.hinstance;
+    defer {
+        app.terminate();
+        _ = sys.UnregisterClassW(host_class_name, hinstance);
+        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+    }
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, true);
+    const hwnd = host.hwnd.?;
+    var before: RECT = undefined;
+    try std.testing.expect(sys.GetWindowRect(hwnd, &before) != 0);
+    const suggested: RECT = .{ .left = before.left + 40, .top = before.top + 30, .right = before.left + 40 + 1600, .bottom = before.top + 30 + 1000 };
+    // DefWindowProc caps the tracking size on small/headless displays. Use
+    // a direct native placement as the ordinary-move oracle, rather than
+    // assuming this monitor permits the requested physical dimensions.
+    try std.testing.expect(sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+    var ordinary: RECT = undefined;
+    try std.testing.expect(sys.GetWindowRect(hwnd, &ordinary) != 0);
+    // Creation can also permit an oversized rect that a subsequent move
+    // would cap. Establish and read back a smaller native starting rect.
+    try std.testing.expect(sys.SetWindowPos(hwnd, null, before.left, before.top, @divTrunc(ordinary.right - ordinary.left, 2), @divTrunc(ordinary.bottom - ordinary.top, 2), c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+    try std.testing.expect(sys.GetWindowRect(hwnd, &before) != 0);
+    try std.testing.expect(!rectEqual(before, ordinary));
+    const param: LPARAM = @bitCast(@intFromPtr(&suggested));
+    // A delivered DPI message between tween frames must not override the
+    // physical dimensions. This reaches the native handler even when the
+    // OS disables animation on a hidden desktop.
+    host.quick_terminal_animation = .{ .id = 1, .start = before, .end = before };
+    _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, param);
+    var actual: RECT = undefined;
+    try std.testing.expect(sys.GetWindowRect(hwnd, &actual) != 0);
+    try std.testing.expectEqualDeep(before, actual);
+    host.quick_terminal_animation = null;
+    // A user move of that same QT still follows the ordinary DPI policy.
+    _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, param);
+    try std.testing.expect(sys.GetWindowRect(hwnd, &actual) != 0);
+    try std.testing.expectEqualDeep(ordinary, actual);
+    try std.testing.expect(!host.quick_terminal_placing);
+    try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
+}
+
+const FullscreenMonitor = struct {
+    monitor: sys.HMONITOR,
+    info: MONITORINFO,
+    dpi: u32,
+};
+
+fn fullscreenRestoreRect(rect: RECT, old_work: RECT, new_work: RECT, old_dpi: u32, new_dpi: u32) RECT {
+    var left = rect.left + new_work.left - old_work.left;
+    var top = rect.top + new_work.top - old_work.top;
+    const scaled_width = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.right - rect.left, @intCast(new_dpi), @intCast(old_dpi)) else rect.right - rect.left;
+    const scaled_height = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.bottom - rect.top, @intCast(new_dpi), @intCast(old_dpi)) else rect.bottom - rect.top;
+    // Keep the logical size when it fits. An oversized rectangle can overlap
+    // a neighbour more than this monitor, causing Windows to select that
+    // neighbour's DPI again; cap it to the destination's work area.
+    const width = @min(scaled_width, new_work.right - new_work.left);
+    const height = @min(scaled_height, new_work.bottom - new_work.top);
+    left = @max(new_work.left, @min(left, new_work.right - width));
+    top = @max(new_work.top, @min(top, new_work.bottom - height));
+    return .{ .left = left, .top = top, .right = left + width, .bottom = top + height };
+}
+
+test "win32 fullscreen restore translates work areas and scales size to fit" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const old_work: RECT = .{ .left = 0, .top = 40, .right = 3840, .bottom = 2160 };
+    const new_work: RECT = .{ .left = -1920, .top = -1080, .right = 0, .bottom = 0 };
+    const rect: RECT = .{ .left = 100, .top = 140, .right = 1500, .bottom = 1040 };
+    try std.testing.expectEqualDeep(rect, fullscreenRestoreRect(rect, old_work, old_work, 144, 144));
+    const moved = fullscreenRestoreRect(rect, old_work, new_work, 144, 96);
+    try std.testing.expectEqualDeep(RECT{ .left = -1820, .top = -980, .right = -887, .bottom = -380 }, moved);
+    // MulDiv rounds the fractional width. Returning to the old scale is
+    // within one physical pixel and never scales absolute desktop origins.
+    const back = fullscreenRestoreRect(moved, new_work, old_work, 96, 144);
+    try std.testing.expectEqualDeep(rect, back);
+    const portrait: RECT = .{ .left = -1080, .top = 0, .right = 0, .bottom = 1872 };
+    const edge: RECT = .{ .left = 3000, .top = 1700, .right = 3800, .bottom = 2100 };
+    const clamped = fullscreenRestoreRect(edge, old_work, portrait, 144, 96);
+    try std.testing.expectEqualDeep(RECT{ .left = -533, .top = 1605, .right = 0, .bottom = 1872 }, clamped);
+    const oversized: RECT = .{ .left = 150, .top = 190, .right = 3950, .bottom = 1390 };
+    try std.testing.expectEqualDeep(RECT{ .left = -1080, .top = 150, .right = 0, .bottom = 950 }, fullscreenRestoreRect(oversized, old_work, portrait, 144, 96));
 }
 
 fn monitorInfo(monitor: sys.HMONITOR) ?win32_quick_terminal.MonitorInfo {
@@ -24285,31 +27382,38 @@ fn cliConfigFileOverride(alloc: std.mem.Allocator) !?[]u8 {
 
 fn cliConfigFileOverrideArgs(alloc: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
     const key = "--config-file";
-    // Pick the LAST `--config-file` occurrence, not the first:
-    // `Config.loadRecursiveFiles` applies files in argv order and
-    // later files override earlier ones. Saving into the first
-    // file when a second exists would be the wrong layer — the
-    // saved value would be masked on reload.
-    var last_path: ?[]const u8 = null;
-    var i: usize = 1; // skip argv[0]
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
-        // Config.parseManuallyHook consumes everything after -e as child argv.
-        if (std.mem.eql(u8, arg, "-e")) break;
-        if (std.mem.eql(u8, arg, key)) {
-            if (i + 1 < argv.len) {
-                last_path = argv[i + 1];
-                i += 1; // skip the path arg so we don't match it as a key
-            }
+    // Take the files exactly as the loader does: its own list type reads
+    // each value, so the optional marker, quotes, an empty value that clears
+    // the list and a bare key that has no value all mean what they mean to
+    // `Config.loadCliArgs`. A separate parser disagreed with it: `--config-file
+    // x` (a spelling the loader rejects) made Save write a file the loader
+    // never reads, and `--config-file=?x` named a file called `?x`.
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var files: configpkg.RepeatablePath = .{};
+    for (argv[@min(1, argv.len)..]) |arg| {
+        // Config.parseManuallyHook consumes everything after -e as child argv,
+        // and stops at the COM activation switch.
+        if (std.mem.eql(u8, arg, "-e") or std.ascii.eqlIgnoreCase(arg, "-Embedding")) break;
+        const value: ?[]const u8 = if (std.mem.eql(u8, arg, key))
+            null
+        else if (std.mem.startsWith(u8, arg, key ++ "="))
+            arg[key.len + 1 ..]
+        else
             continue;
-        }
-        if (std.mem.startsWith(u8, arg, key ++ "=")) {
-            last_path = arg[key.len + 1 ..];
-            continue;
-        }
+        files.parseCLI(arena.allocator(), value) catch |err| switch (err) {
+            error.ValueRequired => {},
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
-    if (last_path) |p| return try absolutizePath(alloc, p);
-    return null;
+    // The LAST file, not the first: `Config.loadRecursiveFiles` applies files
+    // in argv order and later files override earlier ones. Saving into the
+    // first file when a second exists would be the wrong layer — the saved
+    // value would be masked on reload.
+    const last = files.value.getLastOrNull() orelse return null;
+    return try absolutizePath(alloc, switch (last) {
+        .optional, .required => |name| name,
+    });
 }
 
 /// Resolve a possibly-relative path to an absolute one WITHOUT
@@ -24354,6 +27458,119 @@ fn appendSettingsPayload(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         start = i + 1;
     }
     try out.appendSlice(alloc, payload[start..]);
+}
+
+/// UTF-8 patching cannot edit UTF-16 or UTF-32 text: appending ASCII lines to
+/// it leaves a file that mixes encodings, of which the loader reads only the
+/// appended lines. A byte-order mark, or a NUL byte anywhere (UTF-16 and UTF-32
+/// without one), marks such a file; a config never contains NUL.
+fn settingsTextPatchable(raw: []const u8) bool {
+    return settingsTextProblem(raw) == null;
+}
+
+/// Why `raw` cannot be patched, named for the status line: a byte order mark
+/// says UTF-16 (what Windows PowerShell 5.1 writes), bare NUL bytes say a
+/// binary file or UTF-16/UTF-32 without a mark.
+fn settingsTextProblem(raw: []const u8) ?win32_settings.SaveError {
+    if (std.mem.startsWith(u8, raw, "\xff\xfe") or std.mem.startsWith(u8, raw, "\xfe\xff")) return error.UnsupportedEncoding;
+    if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.BinaryConfig;
+    return null;
+}
+
+/// Write the settings the user edited into the config file behind
+/// `config_path`: read it, patch only the edited assignments, and put the
+/// result back where the file lives (see `save_target`).
+fn persistSettings(
+    alloc: Allocator,
+    config_path: []const u8,
+    pending: *const configpkg.Config,
+    user_edited: SettingsEditedKeySet,
+    detail: ?*win32_settings.FailureDetail,
+) win32_settings.SaveError!void {
+    // A config kept behind a link is edited where it lives, so the link
+    // survives and a dotfiles repository sees the change. A dangling link is
+    // refused: there is no file to patch, and writing would replace the link.
+    const target = try save_target.resolve(alloc, config_path);
+    defer target.deinit(alloc);
+
+    // SURGICAL SAVE: read the raw target file text and patch
+    // only GUI-edited field lines in place. This preserves
+    // (a) comments, (b) relative `config-file` paths (not
+    // canonicalised), (c) the user's formatting / blank lines,
+    // (d) fields we can't round-trip through the Config type
+    // (RepeatableString, etc).
+    //
+    // For each GUI-edited field: scan the raw text for a line
+    // matching `^<key> =` at column 0 (PLUS optional leading
+    // whitespace) and replace the WHOLE line with the new
+    // serialised `key = value` emission. If no matching line
+    // exists, append to the file end.
+    //
+    // Edited fields that are not already present are appended by
+    // `patchOrAppendEdits` below. No parsed-file baseline is needed:
+    // unedited source lines remain byte-for-byte intact.
+    const raw_before: []u8 = blk: {
+        const f = std.fs.cwd().openFile(target.path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk try alloc.dupe(u8, ""),
+            else => return error.SerializeFailed,
+        };
+        defer f.close();
+        const stat = f.stat() catch return error.SerializeFailed;
+        const slice = alloc.alloc(u8, settingsFileSize(stat.size) catch return error.SerializeFailed) catch return error.OutOfMemory;
+        errdefer alloc.free(slice);
+        const n = f.readAll(slice) catch return error.SerializeFailed;
+        break :blk try alloc.realloc(slice, n);
+    };
+    defer alloc.free(raw_before);
+    if (settingsTextProblem(raw_before)) |problem| {
+        if (detail) |d| {
+            const text = std.fmt.allocPrint(alloc, "the config file {s}", .{target.path}) catch return error.OutOfMemory;
+            defer alloc.free(text);
+            d.set(alloc, text);
+        }
+        return problem;
+    }
+
+    var patched: std.ArrayListUnmanaged(u8) = .{};
+    defer patched.deinit(alloc);
+    patchOrAppendEdits(
+        alloc,
+        raw_before,
+        pending,
+        user_edited,
+        &patched,
+    ) catch return error.SerializeFailed;
+
+    // Ensure target's parent directory exists. `config_edit.openPath`
+    // creates `%APPDATA%\ghostty\` for the default path, but a user
+    // launched with `--config-file=D:\new-dir\custom.conf` could
+    // target a directory that has never been created. Without this
+    // step the first Save against that path would fail here with
+    // `TempCreateFailed`.
+    //
+    // A parent that already opens is left alone: `makePath` rejects the
+    // extended `\\?\` form that `save_target` keeps for long paths and for
+    // names Win32 normalization would change, and a drive root, so a config
+    // that exists there could otherwise never be saved.
+    if (std.fs.path.dirname(target.path)) |parent| {
+        if (std.fs.cwd().openDir(parent, .{})) |opened| {
+            var dir = opened;
+            dir.close();
+        } else |_| std.fs.cwd().makePath(parent) catch |err| {
+            std.log.warn("settings save: couldn't create parent dir path={s} err={}", .{ parent, err });
+            return error.TempCreateFailed;
+        };
+    }
+
+    var kept_copy: ?[]u8 = null;
+    defer if (kept_copy) |path| alloc.free(path);
+    save_target.write(alloc, target, patched.items, &kept_copy) catch |err| {
+        if (err == error.IncompleteWrite) if (detail) |d| {
+            // The complete text is in the kept copy; the status line says where.
+            if (kept_copy) |path| d.set(alloc, path);
+        };
+        return err;
+    };
 }
 
 /// Patch only edited assignments. Scalars keep last-wins semantics; repeatable
@@ -24452,14 +27669,622 @@ test "win32 settings automatic command is not masked by default resolution" {
     try std.testing.expect(settingsEditedValueMasked(&pending, &reloaded, .command));
 }
 
+test "win32 settings save names the edited keys a later config layer overrides" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The file holds both edits; an included file loaded after the font size
+    // sets it again, which is what a save reports as masked.
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.ghostty",
+        .data = "font-size = 14\ncopy-on-select = true\nconfig-file = later.conf\n",
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "later.conf", .data = "font-size = 18\n" });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"font-size" = 14;
+    pending.@"copy-on-select" = .true;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expectEqual(@as(usize, 2), edited.count());
+
+    var reloaded = try configpkg.Config.default(alloc);
+    defer reloaded.deinit();
+    try reloaded.loadFile(alloc, path);
+    try reloaded.loadRecursiveFiles(alloc);
+    var names_buf: [settings_masked_keys_capacity]u8 = undefined;
+    try std.testing.expectEqualStrings("font-size", settingsMaskedKeyNames(&names_buf, edited, &pending, &reloaded));
+
+    // Two keys masked are both named, in the order Settings lists them.
+    try tmp.dir.writeFile(.{ .sub_path = "later.conf", .data = "copy-on-select = false\nfont-size = 18\n" });
+    var both = try configpkg.Config.default(alloc);
+    defer both.deinit();
+    try both.loadFile(alloc, path);
+    try both.loadRecursiveFiles(alloc);
+    try std.testing.expectEqualStrings("font-size, copy-on-select", settingsMaskedKeyNames(&names_buf, edited, &pending, &both));
+
+    // A reload that holds what was saved names nothing.
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 14\ncopy-on-select = true\n" });
+    var clean = try configpkg.Config.default(alloc);
+    defer clean.deinit();
+    try clean.loadFile(alloc, path);
+    try std.testing.expectEqual(@as(usize, 0), settingsMaskedKeyNames(&names_buf, edited, &pending, &clean).len);
+
+    // Nearly every editable key masked at once still fits the buffer.
+    var everything = try configpkg.Config.default(alloc);
+    defer everything.deinit();
+    try settingsTestLoadText(&everything,
+        \\scrollback-limit = 123456
+        \\font-size = 13.25
+        \\background-opacity = 0.875
+        \\window-padding-x = 5,7
+        \\window-padding-y = 9,11
+        \\clipboard-trim-trailing-spaces = false
+        \\desktop-notifications = false
+        \\app-notifications = no-clipboard-copy,no-config-reload
+        \\confirm-close-surface = always
+        \\copy-on-select = clipboard
+        \\clipboard-read = deny
+        \\clipboard-write = deny
+        \\window-theme = dark
+        \\shell-integration = none
+        \\cursor-style = bar
+        \\window-padding-balance = true
+        \\auto-update = off
+        \\auto-update-channel = tip
+        \\font-family = Second Font
+        \\theme = light:Light,dark:Dark
+        \\command = direct:pwsh.exe -NoLogo
+    );
+    var all: SettingsEditedKeySet = .initEmpty();
+    inline for (win32_settings.editable_keys) |key| all.set(@intFromEnum(key));
+    var defaults = try configpkg.Config.default(alloc);
+    defer defaults.deinit();
+    const crowded = settingsMaskedKeyNames(&names_buf, all, &everything, &defaults);
+    try std.testing.expect(std.mem.count(u8, crowded, ", ") >= 15);
+    try std.testing.expect(std.mem.startsWith(u8, crowded, "scrollback-limit, font-size, "));
+}
+
+test "win32 config problems leave out the arguments that start the process" {
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    // What a launch from an Action Center toast and a safe-mode launch leave in
+    // argv for every later load, and two real mistakes among them.
+    // The wrapper is what the loader reads argv through; it gives each
+    // diagnostic its place on the command line.
+    var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{ .iterator = cli_args.sliceIterator(&.{
+        "--safe-mode",
+        "wgh://activate?surface=12&tab=3",
+        "--font-szie=14",
+        "stray-word",
+        "--theme=light:No1pkg22,dark:No2pkg22",
+    }) };
+    try config.loadIter(alloc, &args);
+    try config.finalize();
+    // The two launch arguments, the two mistakes and the missing light theme.
+    try std.testing.expectEqual(@as(usize, 5), config._diagnostics.items().len);
+
+    var kept: usize = 0;
+    for (config._diagnostics.items()) |diag| {
+        if (isLaunchArgumentDiagnostic(diag, true)) continue;
+        kept += 1;
+        // The mistakes, the stray word and the theme are still the user's to hear about.
+        try std.testing.expect(!std.mem.eql(u8, diag.key, "safe-mode") and !std.mem.startsWith(u8, diag.key, "wgh:"));
+    }
+    try std.testing.expectEqual(@as(usize, 3), kept);
+
+    // A process that was not started with --safe-mode has no such argument.
+    const safe_mode_complaint: cli_diagnostics.Diagnostic = .{ .location = .{ .cli = 1 }, .key = "safe-mode", .message = "unknown field" };
+    try std.testing.expect(isLaunchArgumentDiagnostic(safe_mode_complaint, true));
+    try std.testing.expect(!isLaunchArgumentDiagnostic(safe_mode_complaint, false));
+
+    // A conditional theme rebuilds the config through an iterator with no
+    // place to give: the complaints come back without one, and still go.
+    var rebuilt = (try config.changeConditionalState(.{ .theme = .dark })).?;
+    defer rebuilt.deinit();
+    var rebuilt_kept: usize = 0;
+    for (rebuilt._diagnostics.items()) |diag| {
+        try std.testing.expect(diag.location != .cli);
+        if (!isLaunchArgumentDiagnostic(diag, true)) rebuilt_kept += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), rebuilt_kept);
+
+    // A file's own line with the same text is a mistake in that file.
+    try std.testing.expect(!isLaunchArgumentDiagnostic(.{
+        .location = .{ .file = .{ .path = "C:\\c", .line = 1 } },
+        .key = "safe-mode",
+        .message = "unknown field",
+    }, true));
+}
+
+test "win32 a config with an unknown key, a bad value, a missing include and a missing theme has four problems" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.ghostty",
+        .data = "font-szie = 14\nfont-size = big\nconfig-file = missing-include.conf\ntheme = No-Such-Theme-pkg22\n",
+    });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    try config.loadFile(alloc, path);
+    try config.loadRecursiveFiles(alloc);
+    try config.finalize();
+
+    var problems: win32_config_problems.Problems = .{};
+    defer problems.deinit(alloc);
+    try problems.addDiagnostics(alloc, config._diagnostics.items());
+    var buf: [2048]u8 = undefined;
+    const list = problems.listText(&buf);
+    // The banner counts them, and the list names each with its file and line.
+    try std.testing.expectEqual(@as(usize, 4), problems.count());
+    try std.testing.expect(std.mem.indexOf(u8, list, "font-szie") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "font-size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "missing-include.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "No-Such-Theme-pkg22") != null);
+    const banner = (try problems.bannerText(alloc)).?;
+    defer alloc.free(banner);
+    try std.testing.expect(std.mem.startsWith(u8, banner, "4 config problems: "));
+}
+
+test "win32 config problems raise an error banner that only a clean load takes down" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-szie = 14\nfont-size = big\n" });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+    var broken = try configpkg.Config.default(alloc);
+    defer broken.deinit();
+    try broken.loadFile(alloc, path);
+    var clean = try configpkg.Config.default(alloc);
+    defer clean.deinit();
+
+    try std.testing.expect(app.reportConfigProblems(&broken));
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "2 config problems: font-szie: "));
+
+    // A load that finds nothing takes down this banner...
+    try std.testing.expect(!app.reportConfigProblems(&clean));
+    try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+    try std.testing.expect(host.banner_text == null);
+    try std.testing.expectEqual(@as(usize, 0), app.config_problems.count());
+
+    // ... and not another message that took its place.
+    try std.testing.expect(app.reportConfigProblems(&broken));
+    try host.setBanner(.err, "New window could not be opened.");
+    try std.testing.expect(!app.reportConfigProblems(&clean));
+    try std.testing.expectEqualStrings("New window could not be opened.", host.banner_text.?);
+    try host.setBanner(.none, null);
+}
+
+test "win32 a config change that brings other problems refreshes the list and speaks only when it is news" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+
+    // The system switched to dark under `theme = light:Installed,dark:Missing`:
+    // the config now in effect carries the other half's problem.
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "theme \"Missing\" not found" });
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(@as(usize, 1), app.config_problems.count());
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "Config problem: theme \"Missing\" not found"));
+
+    // The user closes the banner; a change that finds the same problem does
+    // not bring it back.
+    try host.setBanner(.none, null);
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+
+    // Back to light: no problem, and nothing of the old one is left.
+    app.config._diagnostics = .{};
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(@as(usize, 0), app.config_problems.count());
+    try std.testing.expectEqual(HostBannerKind.none, host.banner_kind);
+
+    // A different problem is news again.
+    try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "theme \"Other\" not found" });
+    app.refreshConfigProblems();
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try host.setBanner(.none, null);
+}
+
+test "win32 a Settings save does not replace the config problems banner with its own" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    defer app.config_problems.deinit(alloc);
+    defer if (app.config_problems_banner) |text| alloc.free(text);
+
+    // No problems: the save says so, as an info banner.
+    settingsNotifySuccessThunk(&app, "Settings saved", "");
+    try std.testing.expectEqual(HostBannerKind.info, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "Settings saved"));
+
+    // Problems in the file the save reloaded: the error stays, and the
+    // desktop-notification fallback (no WinRT toast here) does not take its place.
+    try app.config_problems.addDiagnostics(alloc, &.{.{ .key = "font-szie", .message = "unknown field" }});
+    settingsNotifySuccessThunk(&app, "Settings saved", "");
+    try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+    try std.testing.expect(std.mem.startsWith(u8, host.banner_text.?, "Config problem: font-szie: unknown field"));
+    try host.setBanner(.none, null);
+}
+
+test "win32 settings disk edit is a conflict only for an edited setting the file now says differently" {
+    const alloc = std.testing.allocator;
+    const light: configpkg.ConditionalState = .{};
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"font-size" = 14;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.@"font-size")));
+    var disk = try original.clone(alloc);
+    defer disk.deinit();
+
+    // The file is as the session found it: only the user's edit is new.
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // Someone set the same setting to something else.
+    disk.@"font-size" = 16;
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // ... unless it is the value the user is setting: nothing would be lost.
+    disk.@"font-size" = 14;
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // An edit to a setting the user is not changing is merged by the save and
+    // applied by its reload, not a conflict.
+    disk.@"font-size" = 12;
+    disk.@"copy-on-select" = .true;
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
+    // Nothing edited, nothing to lose.
+    try std.testing.expect(!settingsDiskEditConflict(&original, &original, &disk, light, settingsUserEditedKeys(&original, &original)));
+}
+
+test "win32 settings disk edit judges the file with the app's conditional state applied" {
+    // On a dark system the app holds the dark half of `theme = light:A,dark:B`,
+    // and a theme can set editable keys. The file as loaded has the light half,
+    // so an untouched file differed from the window's snapshot, and every Save
+    // stopped at a conflict that could never be resolved.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "light.theme", .data = "cursor-style = underline\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dark.theme", .data = "cursor-style = block_hollow\n" });
+    const light_path = try tmp.dir.realpathAlloc(alloc, "light.theme");
+    defer alloc.free(light_path);
+    const dark_path = try tmp.dir.realpathAlloc(alloc, "dark.theme");
+    defer alloc.free(dark_path);
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\n", .{ light_path, dark_path });
+    defer alloc.free(text);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = text });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var disk = try configpkg.Config.default(alloc);
+    defer disk.deinit();
+    try disk.loadFile(alloc, path);
+    try disk.finalize();
+    const dark: configpkg.ConditionalState = .{ .theme = .dark };
+    var app_config = (try disk.changeConditionalState(dark)).?;
+    defer app_config.deinit();
+    try std.testing.expect(disk.@"cursor-style" != app_config.@"cursor-style");
+
+    // The window's snapshots are the app's config.
+    var original = try app_config.clone(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"cursor-style" = .bar;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.@"cursor-style")));
+
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, dark, edited));
+
+    // A real edit under the same state is still found: the file now sets the
+    // key itself, over the theme.
+    const edited_text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\ncursor-style = block\n", .{ light_path, dark_path });
+    defer alloc.free(edited_text);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = edited_text });
+    var changed = try configpkg.Config.default(alloc);
+    defer changed.deinit();
+    try changed.loadFile(alloc, path);
+    try changed.finalize();
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &changed, dark, edited));
+}
+
+test "win32 settings disk edit does not mistake the resolved default command for an edit" {
+    const alloc = std.testing.allocator;
+    const light: configpkg.ConditionalState = .{};
+    // The window keeps a command nobody set as automatic (null); the load
+    // fills in the shell it found.
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.command = .{ .shell = "pwsh" };
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.command)));
+
+    var resolved = try original.clone(alloc);
+    defer resolved.deinit();
+    try resolved.resolveWindowsDefaultCommand();
+    try std.testing.expect(resolved.command != null and resolved._command_defaulted);
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &resolved, light, edited));
+
+    // A command written in the file is another matter.
+    var written = try original.clone(alloc);
+    defer written.deinit();
+    written.command = .{ .shell = "cmd" };
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &written, light, edited));
+}
+
+test "win32 settings disk check stops at a config file it cannot open, not at a missing one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(missing);
+    const missing_path = try std.fs.path.join(std.testing.allocator, &.{ missing, "config.ghostty" });
+    defer std.testing.allocator.free(missing_path);
+
+    // A first save: nothing on disk to conflict with.
+    const alloc = std.testing.allocator;
+    var detail: win32_settings.FailureDetail = .{};
+    defer detail.clear(alloc);
+    try settingsFileOpenable(alloc, &detail, "the config file", missing_path);
+
+    // The file exists and reads.
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 14\n" });
+    try settingsFileOpenable(alloc, &detail, "the config file", missing_path);
+    try std.testing.expect(detail.text == null);
+
+    // Another program holds it with no sharing (std's `.lock` is a byte-range
+    // lock on Windows and does not stop an open): the load would call it
+    // absent, so the check refuses instead.
+    const wide = try std.os.windows.sliceToPrefixedFileW(null, missing_path);
+    const held = std.os.windows.kernel32.CreateFileW(
+        wide.span().ptr,
+        std.os.windows.GENERIC_READ,
+        0,
+        null,
+        std.os.windows.OPEN_EXISTING,
+        0,
+        null,
+    );
+    if (held == std.os.windows.INVALID_HANDLE_VALUE) return error.CouldNotHoldFile;
+    defer std.os.windows.CloseHandle(held);
+    try std.testing.expectError(error.FileUnopenable, settingsFileOpenable(alloc, &detail, "the config file", missing_path));
+    // The status line is told which file, in words that read in a sentence.
+    const expected = try std.fmt.allocPrint(alloc, "the config file {s}", .{missing_path});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, detail.text.?);
+
+    // The same holds for a file the config includes: the load would skip it
+    // and leave out everything it set. A missing include and a directory are
+    // the loader's to report, and do not stop the check.
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    const arena = config._arena.?.allocator();
+    try tmp.dir.makeDir("dir");
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ missing, "dir" });
+    defer std.testing.allocator.free(dir_path);
+    const gone_path = try std.fs.path.join(std.testing.allocator, &.{ missing, "gone.conf" });
+    defer std.testing.allocator.free(gone_path);
+    try config.@"config-file".parseCLI(arena, dir_path);
+    try config.@"config-file".parseCLI(arena, gone_path);
+    detail.clear(alloc);
+    try settingsIncludesOpenable(alloc, &detail, &config);
+    try std.testing.expect(detail.text == null);
+    try config.@"config-file".parseCLI(arena, missing_path);
+    try std.testing.expectError(error.FileUnopenable, settingsIncludesOpenable(alloc, &detail, &config));
+    // An include is called one, with its path.
+    const expected_include = try std.fmt.allocPrint(alloc, "the included file {s}", .{missing_path});
+    defer alloc.free(expected_include);
+    try std.testing.expectEqualStrings(expected_include, detail.text.?);
+
+    // The verdict asks for it even when no edited setting conflicts: the
+    // save's own reload would apply the partial load too.
+    var same = try configpkg.Config.default(std.testing.allocator);
+    defer same.deinit();
+    const edited: SettingsEditedKeySet = .initEmpty();
+    const state: configpkg.ConditionalState = .{};
+    try std.testing.expectError(error.FileUnopenable, settingsDiskVerdict(alloc, null, &same, &same, &config, state, edited));
+    try std.testing.expect(!try settingsDiskVerdict(alloc, null, &same, &same, &same, state, edited));
+
+    // And the theme file the config selects: a theme that will not open is
+    // skipped by the load, and what it sets comes back as defaults. A theme
+    // that is not there at all is the loader's to report.
+    var themed = try configpkg.Config.default(alloc);
+    defer themed.deinit();
+    themed.theme = .{ .light = missing_path, .dark = missing_path };
+    detail.clear(alloc);
+    try std.testing.expectError(error.FileUnopenable, settingsDiskVerdict(alloc, &detail, &same, &same, &themed, state, edited));
+    const expected_theme = try std.fmt.allocPrint(alloc, "the theme file {s}", .{missing_path});
+    defer alloc.free(expected_theme);
+    try std.testing.expectEqualStrings(expected_theme, detail.text.?);
+    themed.theme = .{ .light = gone_path, .dark = "no-such-theme-for-pkg21" };
+    try std.testing.expect(!try settingsDiskVerdict(alloc, null, &same, &same, &themed, state, edited));
+
+    // So is a UTF-16 file that does not decode (a lone surrogate): the load
+    // skips it whole, and the defaults it leaves must not pass for an edit.
+    try tmp.dir.writeFile(.{ .sub_path = "bad16.conf", .data = "\xff\xfe\x00\xd8f\x00o\x00" });
+    const bad_path = try std.fs.path.join(alloc, &.{ missing, "bad16.conf" });
+    defer alloc.free(bad_path);
+    var skipped = try configpkg.Config.default(alloc);
+    defer skipped.deinit();
+    try skipped.loadFile(alloc, bad_path);
+    detail.clear(alloc);
+    try std.testing.expectError(error.UnsupportedEncoding, settingsDiskVerdict(alloc, &detail, &same, &same, &skipped, state, edited));
+    const expected_skipped = try std.fmt.allocPrint(alloc, "the file {s}", .{bad_path});
+    defer alloc.free(expected_skipped);
+    try std.testing.expectEqualStrings(expected_skipped, detail.text.?);
+}
+
+test "win32 settings disk check looks only at the theme copy the loader would use" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("user");
+    try tmp.dir.makeDir("bundled");
+    try tmp.dir.makeDir("empty");
+    try tmp.dir.writeFile(.{ .sub_path = "user/Mine", .data = "cursor-style = bar\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "bundled/Mine", .data = "cursor-style = block\n" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const user = try std.fs.path.join(alloc, &.{ root, "user" });
+    defer alloc.free(user);
+    const bundled = try std.fs.path.join(alloc, &.{ root, "bundled" });
+    defer alloc.free(bundled);
+    const empty = try std.fs.path.join(alloc, &.{ root, "empty" });
+    defer alloc.free(empty);
+    const user_copy = try std.fs.path.join(alloc, &.{ user, "Mine" });
+    defer alloc.free(user_copy);
+    const bundled_copy = try std.fs.path.join(alloc, &.{ bundled, "Mine" });
+    defer alloc.free(bundled_copy);
+
+    try settingsThemeNameOpenable(alloc, null, "Mine", &.{ user, bundled });
+
+    // Hold the bundled copy with no sharing. The user copy wins the search, so
+    // the load never opens it: no refusal.
+    const wide = try std.os.windows.sliceToPrefixedFileW(null, bundled_copy);
+    const held = std.os.windows.kernel32.CreateFileW(wide.span().ptr, std.os.windows.GENERIC_READ, 0, null, std.os.windows.OPEN_EXISTING, 0, null);
+    if (held == std.os.windows.INVALID_HANDLE_VALUE) return error.CouldNotHoldFile;
+    defer std.os.windows.CloseHandle(held);
+    try settingsThemeNameOpenable(alloc, null, "Mine", &.{ user, bundled });
+    // Where the locked copy is the first one that exists, it is the one the
+    // load needs; a directory without the name is passed over.
+    var detail: win32_settings.FailureDetail = .{};
+    defer detail.clear(alloc);
+    try std.testing.expectError(error.FileUnopenable, settingsThemeNameOpenable(alloc, &detail, "Mine", &.{ empty, bundled, user }));
+    const expected = try std.fmt.allocPrint(alloc, "the theme file {s}", .{bundled_copy});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, detail.text.?);
+    // A name that is nowhere is the loader's to report.
+    try settingsThemeNameOpenable(alloc, null, "Nowhere", &.{ empty, user, bundled });
+}
+
+test "win32 palette theme save failures say what the person can do about them" {
+    const changed = paletteThemeSaveFailureMessage(error.DiskChanged);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "changed in the config file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed, "Reload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paletteThemeSaveFailureMessage(error.FileUnopenable), "cannot be opened") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paletteThemeSaveFailureMessage(error.BinaryConfig), "not UTF-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paletteThemeSaveFailureMessage(error.UnsupportedEncoding), "not UTF-8") != null);
+    try std.testing.expectEqualStrings("Theme save failed; reverted preview.", paletteThemeSaveFailureMessage(error.ReplaceFailed));
+}
+
 test "win32 settings save target stops at the child command boundary" {
     const alloc = std.testing.allocator;
-    const target = (try cliConfigFileOverrideArgs(alloc, &.{ "noctty", "--config-file=first.conf", "--config-file", "last.conf", "-e", "tool", "--config-file=tool.conf" })).?;
+    const target = (try cliConfigFileOverrideArgs(alloc, &.{ "noctty", "--config-file=first.conf", "--config-file=last.conf", "-e", "tool", "--config-file=tool.conf" })).?;
     defer alloc.free(target);
     const expected = try absolutizePath(alloc, "last.conf");
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, target);
     try std.testing.expectEqual(@as(?[]u8, null), try cliConfigFileOverrideArgs(alloc, &.{ "noctty", "-e", "tool", "--config-file=tool.conf" }));
+}
+
+test "win32 settings save target is the last config file the loader takes from the command line" {
+    // Whatever the loader reads from argv, Save writes to the same last file:
+    // a file the loader never reads, or one it reads before a later one, shows
+    // the saved value masked on the next reload. Ask the loader itself.
+    const alloc = std.testing.allocator;
+    const cases = [_][]const []const u8{
+        &.{ "noctty", "--config-file=first.conf", "--config-file=last.conf" },
+        &.{ "noctty", "--config-file=first.conf", "-e", "tool", "--config-file=tool.conf" },
+        // Not an option the loader understands: it reads no value and rejects
+        // "last.conf", so no file is loaded.
+        &.{ "noctty", "--config-file", "last.conf" },
+        &.{ "noctty", "--config-file=a.conf", "--config-file" },
+        // An empty value clears the list, a value that is only a marker or
+        // quotes is ignored, and the optional marker and quotes are not part
+        // of the name.
+        &.{ "noctty", "--config-file=a.conf", "--config-file=" },
+        &.{ "noctty", "--config-file=a.conf", "--config-file=?", "--config-file=\"\"" },
+        &.{ "noctty", "--config-file=?optional.conf" },
+        &.{ "noctty", "--config-file=\"two words.conf\"" },
+        &.{ "noctty", "--config-file=?\"two words.conf\"" },
+        // A bare "--" ends nothing for the loader.
+        &.{ "noctty", "--config-file=a.conf", "--", "--config-file=b.conf" },
+        // The COM activation switch ends the options, in any case.
+        &.{ "noctty", "--config-file=a.conf", "-Embedding", "--config-file=b.conf" },
+        &.{ "noctty", "--config-file=a.conf", "-embedding", "--config-file=b.conf" },
+        // Keys are case sensitive and exact.
+        &.{ "noctty", "--CONFIG-FILE=a.conf", "--config-file-extra=b.conf" },
+    };
+    for (cases) |argv| {
+        var loaded = try configpkg.Config.default(alloc);
+        defer loaded.deinit();
+        var it = cli_args.sliceIterator(argv[1..]);
+        try loaded.loadIter(alloc, &it);
+        const last = loaded.@"config-file".value.getLastOrNull();
+        const expected: ?[]u8 = if (last) |path| try absolutizePath(alloc, switch (path) {
+            .optional, .required => |name| name,
+        }) else null;
+        defer if (expected) |name| alloc.free(name);
+
+        const actual = try cliConfigFileOverrideArgs(alloc, argv);
+        defer if (actual) |name| alloc.free(name);
+        if (expected) |name| {
+            try std.testing.expect(actual != null);
+            try std.testing.expectEqualStrings(name, actual.?);
+        } else {
+            try std.testing.expect(actual == null);
+        }
+    }
 }
 
 fn settingsTestLoadText(config: *configpkg.Config, text: []const u8) !void {
@@ -24508,6 +28333,157 @@ test "win32 settings patch preserves CRLF including multiline and appended edits
     defer out.deinit(alloc);
     try patchOrAppendEdits(alloc, "# keep\r\nfont-size = 12\r\ncopy-on-select = false", &pending, edited, &out);
     try std.testing.expectEqualStrings("# keep\r\nfont-size = 13.25\r\ncopy-on-select = false\r\nfont-family = \r\nfont-family = A\r\nfont-family = B\r\n", out.items);
+}
+
+/// A draft that turns `copy-on-select` on, and the set naming it as the edit.
+fn settingsTestCopyOnSelectEdit(alloc: Allocator) !struct { pending: configpkg.Config, edited: SettingsEditedKeySet } {
+    var pending = try configpkg.Config.default(alloc);
+    pending.@"copy-on-select" = .true;
+    var edited: SettingsEditedKeySet = .initEmpty();
+    edited.set(@intFromEnum(SettingsConfigKey.@"copy-on-select"));
+    return .{ .pending = pending, .edited = edited };
+}
+
+test "win32 settings save follows a symbolic link and keeps it" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.makeDir("dotfiles");
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "dotfiles/config.ghostty", .data = "# kept\ncopy-on-select = false\n" });
+    try scratch.symlink("config.ghostty", "dotfiles\\config.ghostty");
+    const link = try scratch.path("config.ghostty");
+    defer alloc.free(link);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, link, &draft.pending, draft.edited, null);
+    // The edit landed in the file the link points at, the link is still a
+    // link, and it reads the new bytes.
+    try scratch.expectContent("dotfiles/config.ghostty", "# kept\ncopy-on-select = true\n");
+    try std.testing.expect(try scratch.isLink("config.ghostty"));
+    try scratch.expectContent("config.ghostty", "# kept\ncopy-on-select = true\n");
+}
+
+test "win32 settings save refuses a dangling link and leaves it alone" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    try scratch.symlink("config.ghostty", "gone\\config.ghostty");
+    const link = try scratch.path("config.ghostty");
+    defer alloc.free(link);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try std.testing.expectError(error.DanglingLink, persistSettings(alloc, link, &draft.pending, draft.edited, null));
+    try std.testing.expect(try scratch.isLink("config.ghostty"));
+    try scratch.expectNames(&.{"config.ghostty"});
+}
+
+test "win32 settings save keeps hard links together" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "copy-on-select = false\n" });
+    try scratch.hardlink("dotfile", "config.ghostty");
+    const path = try scratch.path("config.ghostty");
+    defer alloc.free(path);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, path, &draft.pending, draft.edited, null);
+    try scratch.expectContent("config.ghostty", "copy-on-select = true\n");
+    try scratch.expectContent("dotfile", "copy-on-select = true\n");
+    try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
+}
+
+test "win32 settings save writes a config only the extended path form reaches" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    // `config.` is a different file from `config`, and `makePath` refuses the
+    // `\\?\` spelling that keeps them apart: the parent must not be made again
+    // when it is already there.
+    const dotted = try std.fmt.allocPrint(alloc, "\\\\?\\{s}\\config.", .{scratch.root});
+    defer alloc.free(dotted);
+    try std.fs.cwd().writeFile(.{ .sub_path = dotted, .data = "# kept\ncopy-on-select = false\n" });
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config", .data = "sibling\n" });
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, dotted, &draft.pending, draft.edited, null);
+    const written = try std.fs.cwd().readFileAlloc(alloc, dotted, 1024);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("# kept\ncopy-on-select = true\n", written);
+    try scratch.expectContent("config", "sibling\n");
+    try scratch.expectNames(&.{ "config", "config." });
+}
+
+test "win32 settings first save creates the file and its folder" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    const path = try scratch.path("new-dir\\custom.conf");
+    defer alloc.free(path);
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+
+    try persistSettings(alloc, path, &draft.pending, draft.edited, null);
+    try scratch.expectContent("new-dir/custom.conf", "copy-on-select = true\n");
+}
+
+test "win32 settings save refuses UTF-16 text and leaves the file as it was" {
+    const alloc = std.testing.allocator;
+    var scratch = try save_target.Scratch.init();
+    defer scratch.deinit();
+    var draft = try settingsTestCopyOnSelectEdit(alloc);
+    defer draft.pending.deinit();
+    const path = try scratch.path("config.ghostty");
+    defer alloc.free(path);
+
+    // What Windows PowerShell 5.1 writes for `'copy-on-select = false' > file`
+    // (UTF-16LE with a byte order mark and CRLF), the same text big-endian,
+    // a bare byte order mark, and UTF-16 and UTF-32 without one.
+    var detail: win32_settings.FailureDetail = .{};
+    defer detail.clear(alloc);
+    // A byte order mark is named as such (UTF-16 is what PowerShell writes);
+    // NUL bytes without one are named for what they are.
+    const refused = [_]struct { bytes: []const u8, err: win32_settings.SaveError }{
+        .{ .bytes = "\xff\xfec\x00o\x00p\x00y\x00-\x00o\x00n\x00-\x00s\x00e\x00l\x00e\x00c\x00t\x00 \x00=\x00 \x00f\x00a\x00l\x00s\x00e\x00\r\x00\n\x00", .err = error.UnsupportedEncoding },
+        .{ .bytes = "\xfe\xff\x00c\x00o\x00p\x00y\x00-\x00o\x00n\x00-\x00s\x00e\x00l\x00e\x00c\x00t\x00 \x00=\x00 \x00f\x00a\x00l\x00s\x00e\x00\r\x00\n", .err = error.UnsupportedEncoding },
+        .{ .bytes = "\xff\xfe", .err = error.UnsupportedEncoding },
+        .{ .bytes = "\xfe\xff", .err = error.UnsupportedEncoding },
+        .{ .bytes = "c\x00o\x00p\x00y\x00-\x00o\x00n\x00", .err = error.BinaryConfig },
+        .{ .bytes = "\xff\xfe\x00\x00c\x00\x00\x00", .err = error.UnsupportedEncoding },
+        .{ .bytes = "\x00\x00\xfe\xff\x00\x00\x00c", .err = error.BinaryConfig },
+    };
+    for (refused) |case| {
+        const bytes = case.bytes;
+        try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = bytes });
+        detail.clear(alloc);
+        try std.testing.expectError(case.err, persistSettings(alloc, path, &draft.pending, draft.edited, &detail));
+        // The status line is told which file.
+        try std.testing.expect(std.mem.startsWith(u8, detail.text.?, "the config file "));
+        try scratch.expectContent("config.ghostty", bytes);
+        try scratch.expectNames(&.{"config.ghostty"});
+    }
+
+    // Text in an ASCII-compatible encoding is patched line by line, so a UTF-8
+    // byte order mark and a legacy code page (byte 0xE9 is an accented "e")
+    // survive the save.
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "\xef\xbb\xbf# caf\xe9\ncopy-on-select = false\n" });
+    try persistSettings(alloc, path, &draft.pending, draft.edited, null);
+    try scratch.expectContent("config.ghostty", "\xef\xbb\xbf# caf\xe9\ncopy-on-select = true\n");
+}
+
+test "win32 settings text is patchable unless a UTF-16 or UTF-32 marker or NUL says it is not" {
+    try std.testing.expect(settingsTextPatchable(""));
+    try std.testing.expect(settingsTextPatchable("font-size = 14\n"));
+    try std.testing.expect(settingsTextPatchable("\xef\xbb\xbffont-size = 14\n"));
+    try std.testing.expect(settingsTextPatchable("# caf\xe9\n"));
+    try std.testing.expect(!settingsTextPatchable("\xff\xfe"));
+    try std.testing.expect(!settingsTextPatchable("\xfe\xff"));
+    try std.testing.expect(!settingsTextPatchable("a\x00"));
+    try std.testing.expect(!settingsTextPatchable("\x00a"));
 }
 
 test "win32 settings clone does not edit include or shader paths" {
@@ -25414,8 +29390,6 @@ const buildHostBannerText = labels.buildHostBannerText;
 
 const overlayPaintCacheDirty = labels.overlayPaintCacheDirty;
 
-const buildInspectorBannerText = labels.buildInspectorBannerText;
-
 const buildInspectorPanelTitleText = labels.buildInspectorPanelTitleText;
 
 const buildInspectorPanelHintText = labels.buildInspectorPanelHintText;
@@ -25676,21 +29650,373 @@ fn refocusHostAfterActivation(host: *Host) void {
     }
 }
 
-fn postDeferredUiaDisconnect(thread_id: DWORD, pending: *DeferredUiaDisconnect) bool {
-    if (thread_id == 0) return false;
-    return sys.PostThreadMessageW(
-        thread_id,
-        c.WM_WINHOSTTY_UIA_DISCONNECT,
-        0,
-        @as(LPARAM, @bitCast(@as(usize, @intFromPtr(pending)))),
-    ) != 0;
+/// Window messages are dispatched by native menu/size/dialog pumps too. The
+/// only receiver with completion authority is this message-only App window.
+fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    const app = windowData(App, hwnd) orelse return sys.DefWindowProcW(hwnd, message, wparam, lparam);
+    const delivery = app.delivery orelse return 0;
+    switch (message) {
+        c.WM_WINHOSTTY_WAKE => {
+            app.tickCoreAppModal();
+            return 0;
+        },
+        c.WM_WINHOSTTY_UPDATE, c.WM_WINHOSTTY_TOAST_ACTIVATION, c.WM_WINHOSTTY_UIA_DISCONNECT => {
+            var payload = delivery.take(message, @bitCast(lparam)) orelse return 0;
+            switch (payload) {
+                .update => |completion| {
+                    defer payload.deinit();
+                    app.handleUpdateCheckCompletion(completion);
+                },
+                .toast => |activation| {
+                    defer delivery.toast_pending.store(false, .release);
+                    if (!app.handleToastActivation(activation)) app.pending_toast_activation = activation;
+                },
+                .uia_disconnect => |pending| processDeferredUiaDisconnect(delivery, pending),
+            }
+            app.tickCoreAppModal();
+            return 0;
+        },
+        c.WM_WINHOSTTY_TERMINAL_HANDOFF => {
+            // Adoption is done at the top of the outer pump, where no owner
+            // window procedure or COM call has a borrowed Host on its stack.
+            return 0;
+        },
+        else => return sys.DefWindowProcW(hwnd, message, wparam, lparam),
+    }
 }
 
-fn processDeferredUiaDisconnect(thread_id: DWORD, pending: *DeferredUiaDisconnect) void {
+/// Native modal delivery tests run on a private desktop without a shell,
+/// renderer, clipboard operation, or COM initialization.
+const Pkg19NativeDeliveryTest = struct {
+    extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn EndMenu() callconv(.winapi) BOOL;
+
+    const FakeUia = struct {
+        disconnects: usize = 0,
+        releases: usize = 0,
+        fn disconnect(raw: *anyopaque) win32_uia.HRESULT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disconnects += 1;
+            return win32_uia.S_OK;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+
+    const Popup = struct {
+        app: *App,
+        title_surface: *Surface,
+        closing_surface: *Surface,
+        fake: *FakeUia,
+        entered: bool = false,
+        open: bool = false,
+        exited: bool = false,
+        observed_inside: bool = false,
+        timed_out: bool = false,
+        completions_posted: bool = false,
+        ticks: usize = 0,
+
+        fn proc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+            if (windowData(@This(), hwnd)) |self| switch (message) {
+                0x0211 => { // WM_ENTERMENULOOP
+                    self.entered = true;
+                    self.open = true;
+                },
+                0x0212 => { // WM_EXITMENULOOP
+                    self.open = false;
+                    self.exited = true;
+                },
+                else => {},
+            };
+            return sys.DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+
+        fn timer(hwnd: ?HWND, _: UINT, _: UINT_PTR, _: DWORD) callconv(.winapi) void {
+            const self = windowData(@This(), hwnd orelse return) orelse return;
+            self.ticks += 1;
+            // First require wake alone to apply the title. Only then post
+            // completions, whose own modal tick cannot mask a broken wake.
+            // Never tick the core, dispatch delivery, or remove messages here.
+            if (!self.completions_posted and self.open and
+                self.title_surface.title != null and
+                std.mem.eql(u8, self.title_surface.title.?, "modal-delivered"))
+            {
+                self.completions_posted = true;
+                self.app.delivery.?.update_running.store(true, .release);
+                postUpdate(self.app.delivery.?) catch {
+                    self.timed_out = true;
+                    _ = EndMenu();
+                    return;
+                };
+                postUia(self.app.delivery.?, self.fake) catch {
+                    self.timed_out = true;
+                    _ = EndMenu();
+                    return;
+                };
+            }
+            if (self.open and self.title_surface.title != null and
+                std.mem.eql(u8, self.title_surface.title.?, "modal-delivered") and
+                self.fake.disconnects == 1 and self.fake.releases == 1 and
+                !self.app.delivery.?.update_running.load(.acquire) and
+                self.app.running and sys.IsWindow(self.closing_surface.hwnd.?) != 0)
+            {
+                self.observed_inside = true;
+                _ = EndMenu();
+            } else if (self.ticks >= 100) {
+                self.timed_out = true;
+                _ = EndMenu();
+            }
+        }
+    };
+
+    fn run(comptime body: anytype) !void {
+        const Thread = struct {
+            fn entry(desktop: *anyopaque, result: *anyerror!void) void {
+                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
+            }
+        };
+        var name_buf: [80]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "noctty-pkg19-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
+        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+        defer std.testing.allocator.free(wide_name);
+        const desktop = CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
+        defer _ = CloseDesktop(desktop);
+        var result: anyerror!void = {};
+        const thread = try std.Thread.spawn(.{}, Thread.entry, .{ desktop, &result });
+        thread.join();
+        try result;
+    }
+
+    fn pending(fake: *FakeUia) !*DeferredUiaDisconnect {
+        const value = try std.heap.page_allocator.create(DeferredUiaDisconnect);
+        value.* = .{ .ctx = fake, .disconnect = &FakeUia.disconnect, .release = &FakeUia.release };
+        return value;
+    }
+
+    fn postUia(delivery: *AppDelivery, fake: *FakeUia) !void {
+        const value = try pending(fake);
+        if (!postDeferredUiaDisconnect(delivery, value)) {
+            std.heap.page_allocator.destroy(value);
+            return error.TestPostFailed;
+        }
+    }
+
+    fn postUpdate(delivery: *AppDelivery) !void {
+        const value = try std.testing.allocator.create(UpdateCheckCompletion);
+        value.* = .{ .alloc = std.testing.allocator };
+        if (!delivery.post(c.WM_WINHOSTTY_UPDATE, .{ .update = value })) {
+            std.testing.allocator.destroy(value);
+            return error.TestPostFailed;
+        }
+    }
+
+    fn closeAppWindow(app: *App) void {
+        const delivery = app.delivery orelse return;
+        app.closeMessageWindow();
+        app.delivery = null;
+        delivery.release();
+    }
+
+    fn popupBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var title_surface: Surface = undefined;
+        var closing_surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            // Host is deliberately not in App.hosts: this dummy native owner
+            // does not run the production Host destruction procedure.
+            .hosts = &.{.{ .storage = &host }},
+            .surfaces = &.{
+                .{ .storage = &title_surface, .register = true },
+                .{ .storage = &closing_surface, .host = &host, .register = true },
+            },
+            .tabs = &.{.{ .host = &host, .surface = &closing_surface, .id = 1 }},
+        });
+        defer session.deinit();
+        try app.createMessageWindow();
+        defer closeAppWindow(&app);
+        app.running = true;
+        @atomicStore(DWORD, &app.ui_thread_id, sys.GetCurrentThreadId(), .release);
+
+        // A partial CoreSurface fixture, never initialized/deinitialized as a
+        // complete CoreSurface. These are exactly the fields read by the two
+        // dispatched core methods: set_title and close/needsConfirmQuit.
+        title_surface.core_surface.rt_app = &app;
+        title_surface.core_surface.config.title = null;
+        closing_surface.core_surface.rt_surface = &closing_surface;
+        closing_surface.core_surface.readonly = false;
+        closing_surface.core_surface.child_exited = true;
+        try core_app.surfaces.append(std.testing.allocator, &title_surface);
+        // TestSession owns the runtime fixtures; CoreApp must never call
+        // Surface.deinit on these partial core fixtures at teardown.
+        defer core_app.surfaces.clearRetainingCapacity();
+        try core_app.surfaces.append(std.testing.allocator, &closing_surface);
+        defer if (title_surface.title) |value| std.testing.allocator.free(value);
+
+        var fake: FakeUia = .{};
+        var popup: Popup = .{ .app = &app, .title_surface = &title_surface, .closing_surface = &closing_surface, .fake = &fake };
+        const popup_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.pkg19.popup-test");
+        var wc: WNDCLASSEXW = .{
+            .cbSize = @sizeOf(WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = &Popup.proc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = app.hinstance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = popup_class_name,
+            .hIconSm = null,
+        };
+        if (sys.RegisterClassExW(&wc) == 0 and windows.kernel32.GetLastError() != .CLASS_ALREADY_EXISTS) return lastError();
+        const owner = sys.CreateWindowExW(0, popup_class_name, popup_class_name, WS_OVERLAPPEDWINDOW, 100, 100, 300, 200, null, null, app.hinstance, null) orelse return lastError();
+        defer _ = sys.DestroyWindow(owner);
+        setWindowData(owner, &popup);
+        defer setWindowData(owner, null);
+        _ = sys.ShowWindow(owner, c.SW_SHOWNOACTIVATE);
+        const closing_hwnd = sys.CreateWindowExW(0, prompt_label_class, default_title, c.WS_CHILD, 0, 0, 10, 10, owner, null, app.hinstance, null) orelse return lastError();
+        closing_surface.hwnd = closing_hwnd;
+        defer if (sys.IsWindow(closing_hwnd) != 0) {
+            _ = sys.DestroyWindow(closing_hwnd);
+        };
+
+        // Unsafe work precedes safe work, so failing to defer it would close
+        // the child / quit before the observable title reaches the fixture.
+        try std.testing.expect(core_app.mailbox.push(.{ .close = &closing_surface.core_surface }, .instant) != 0);
+        try std.testing.expect(core_app.mailbox.push(.quit, .instant) != 0);
+        var title: [256]u8 = @splat(0);
+        @memcpy(title[0.."modal-delivered".len], "modal-delivered");
+        try std.testing.expect(core_app.mailbox.push(.{ .surface_message = .{ .surface = &title_surface.core_surface, .message = .{ .set_title = title } } }, .instant) != 0);
+        try std.testing.expect(app.delivery.?.wake(c.WM_WINHOSTTY_WAKE));
+        try std.testing.expect(title_surface.title == null);
+        try std.testing.expectEqual(@as(usize, 0), fake.disconnects);
+
+        const menu = sys.CreatePopupMenu();
+        defer _ = sys.DestroyMenu(menu);
+        try std.testing.expect(sys.AppendMenuW(menu, c.MF_STRING, 1, default_title) != 0);
+        const timer = sys.SetTimer(owner, 0x1919, 20, @ptrCast(&Popup.timer));
+        if (timer == 0) return lastError();
+        defer _ = sys.KillTimer(owner, timer);
+        _ = sys.TrackPopupMenu(menu, c.TPM_RETURNCMD | c.TPM_RIGHTBUTTON, 120, 120, 0, owner, null);
+        try std.testing.expect(popup.entered and popup.exited and !popup.open);
+        try std.testing.expect(!popup.timed_out);
+        try std.testing.expect(popup.observed_inside);
+        try std.testing.expect(app.running);
+        try std.testing.expect(sys.IsWindow(closing_hwnd) != 0);
+
+        // Only the outer tick may execute lifetime operations.
+        try core_app.tick(&app);
+        try std.testing.expect(sys.IsWindow(closing_hwnd) == 0);
+        try std.testing.expect(!app.running);
+    }
+
+    fn queued(hwnd: HWND, message: UINT) !MSG {
+        var msg: MSG = undefined;
+        if (sys.PeekMessageW(&msg, hwnd, message, message, c.PM_REMOVE) == 0) return error.TestMissingDeliveryMessage;
+        return msg;
+    }
+
+    fn capabilitiesBody() !void {
+        var core_a: CoreApp = undefined;
+        var app_a: App = undefined;
+        var core_b: CoreApp = undefined;
+        var app_b: App = undefined;
+        var session_a: TestSession = .{};
+        var session_b: TestSession = .{};
+        try session_a.init(.{ .core_app = &core_a, .app = &app_a });
+        defer session_a.deinit();
+        try session_b.init(.{ .core_app = &core_b, .app = &app_b });
+        defer session_b.deinit();
+        try app_a.createMessageWindow();
+        defer closeAppWindow(&app_a);
+        try app_b.createMessageWindow();
+        defer closeAppWindow(&app_b);
+        const a = app_a.message_hwnd.?;
+        const b = app_b.message_hwnd.?;
+        var fake: FakeUia = .{};
+        try postUia(app_a.delivery.?, &fake);
+        const uia = try queued(a, c.WM_WINHOSTTY_UIA_DISCONNECT);
+        // Null, arbitrary pointer-shaped input, a real token at another App
+        // HWND, and a real token with another message kind do nothing.
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UIA_DISCONNECT, 0, 0);
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UIA_DISCONNECT, 0, @bitCast(@intFromPtr(&fake)));
+        _ = sys.SendMessageW(b, uia.message, uia.wParam, uia.lParam);
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UPDATE, 0, uia.lParam);
+        try std.testing.expectEqual(@as(usize, 0), fake.disconnects);
+        try std.testing.expectEqual(@as(usize, 0), fake.releases);
+        _ = sys.SendMessageW(a, uia.message, uia.wParam, uia.lParam);
+        try std.testing.expectEqual(@as(usize, 1), fake.disconnects);
+        try std.testing.expectEqual(@as(usize, 1), fake.releases);
+        _ = sys.SendMessageW(a, uia.message, uia.wParam, uia.lParam);
+        try std.testing.expectEqual(@as(usize, 1), fake.disconnects);
+        try std.testing.expectEqual(@as(usize, 1), fake.releases);
+
+        app_a.delivery.?.update_running.store(true, .release);
+        try postUpdate(app_a.delivery.?);
+        const update = try queued(a, c.WM_WINHOSTTY_UPDATE);
+        _ = sys.SendMessageW(a, c.WM_WINHOSTTY_UPDATE, 0, 0);
+        _ = sys.SendMessageW(b, update.message, 0, update.lParam);
+        try std.testing.expect(app_a.delivery.?.update_running.load(.acquire));
+        _ = sys.SendMessageW(a, update.message, 0, update.lParam);
+        try std.testing.expect(!app_a.delivery.?.update_running.load(.acquire));
+        // Replaying a consumed update must not clear a subsequent check.
+        app_a.delivery.?.update_running.store(true, .release);
+        _ = sys.SendMessageW(a, update.message, 0, update.lParam);
+        try std.testing.expect(app_a.delivery.?.update_running.load(.acquire));
+
+        const activation: win32_toast_activation.ActivationTarget = .{ .window_id = 19, .tab_id = 7 };
+        app_a.delivery.?.toast_pending.store(true, .release);
+        try std.testing.expect(app_a.delivery.?.post(c.WM_WINHOSTTY_TOAST_ACTIVATION, .{ .toast = activation }));
+        const toast = try queued(a, c.WM_WINHOSTTY_TOAST_ACTIVATION);
+        _ = sys.SendMessageW(a, toast.message, 0, 0);
+        _ = sys.SendMessageW(b, toast.message, 0, toast.lParam);
+        try std.testing.expect(app_a.pending_toast_activation == null);
+        try std.testing.expect(app_b.pending_toast_activation == null);
+        try std.testing.expect(app_a.delivery.?.toast_pending.load(.acquire));
+        _ = sys.SendMessageW(a, toast.message, 0, toast.lParam);
+        try std.testing.expect(activation.eql(app_a.pending_toast_activation.?));
+        try std.testing.expect(!app_a.delivery.?.toast_pending.load(.acquire));
+        app_a.pending_toast_activation = null;
+        app_a.delivery.?.toast_pending.store(true, .release);
+        _ = sys.SendMessageW(a, toast.message, 0, toast.lParam);
+        try std.testing.expect(app_a.pending_toast_activation == null);
+        try std.testing.expect(app_a.delivery.?.toast_pending.load(.acquire));
+    }
+};
+
+test "win32 App delivery drains title and UIA in native popup while close and quit wait" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.popupBody);
+}
+
+test "win32 App delivery validates owned tokens by kind HWND and single consumption" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.capabilitiesBody);
+}
+
+fn postDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) bool {
+    const target = delivery orelse return false;
+    return target.post(c.WM_WINHOSTTY_UIA_DISCONNECT, .{ .uia_disconnect = pending });
+}
+
+fn processDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) void {
     const hr = pending.disconnect(pending.ctx);
     if (hr == win32_uia.RPC_E_CANTCALLOUT_ININPUTSYNCCALL and pending.retries < 3) {
         pending.retries += 1;
-        if (postDeferredUiaDisconnect(thread_id, pending)) return;
+        if (postDeferredUiaDisconnect(delivery, pending)) return;
+        // During shutdown no message target remains. Finish bounded retries
+        // in place before releasing the provider's final reference.
+        if (delivery == null) return processDeferredUiaDisconnect(null, pending);
     }
     if (hr != win32_uia.S_OK) {
         log.warn("win32 UIA deferred disconnect failed hr=0x{x} retries={d}", .{
@@ -25700,28 +30026,6 @@ fn processDeferredUiaDisconnect(thread_id: DWORD, pending: *DeferredUiaDisconnec
     }
     pending.release(pending.ctx);
     std.heap.page_allocator.destroy(pending);
-}
-
-fn drainDeferredUiaDisconnects(thread_id: DWORD) void {
-    var msg: MSG = undefined;
-    while (sys.PeekMessageW(
-        &msg,
-        null,
-        c.WM_WINHOSTTY_UIA_DISCONNECT,
-        c.WM_WINHOSTTY_UIA_DISCONNECT,
-        c.PM_REMOVE,
-    ) != 0) {
-        // PeekMessage always returns WM_QUIT regardless of the filter.
-        // Consume it during shutdown, but never interpret its lParam as a
-        // deferred-disconnect pointer.
-        if (msg.message != c.WM_WINHOSTTY_UIA_DISCONNECT) continue;
-        if (msg.lParam == 0) {
-            log.warn("win32 UIA deferred disconnect message had no context", .{});
-            continue;
-        }
-        const pending: *DeferredUiaDisconnect = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-        processDeferredUiaDisconnect(thread_id, pending);
-    }
 }
 
 fn scheduleDeferredUiaDisconnect(
@@ -25740,9 +30044,9 @@ fn scheduleDeferredUiaDisconnect(
         return;
     };
     pending.* = .{ .ctx = ctx, .disconnect = disconnect, .release = release };
-    if (!postDeferredUiaDisconnect(app.ui_thread_id, pending)) {
+    if (!postDeferredUiaDisconnect(app.delivery, pending)) {
         log.warn("win32 UIA deferred disconnect post failed", .{});
-        processDeferredUiaDisconnect(0, pending);
+        processDeferredUiaDisconnect(null, pending);
     }
 }
 
@@ -25768,30 +30072,16 @@ test "win32 deferred UIA disconnect drain retries and releases once" {
     };
 
     var fake: Fake = .{};
-    var queue_probe: MSG = undefined;
-    _ = sys.PeekMessageW(&queue_probe, null, 0, 0, c.PM_NOREMOVE);
     const pending = try std.heap.page_allocator.create(DeferredUiaDisconnect);
-    pending.* = .{
-        .ctx = @ptrCast(&fake),
-        .disconnect = &Fake.disconnect,
-        .release = &Fake.release,
-    };
-    const thread_id = sys.GetCurrentThreadId();
-    sys.PostQuitMessage(0);
-    try std.testing.expect(postDeferredUiaDisconnect(thread_id, pending));
-    drainDeferredUiaDisconnects(thread_id);
+    pending.* = .{ .ctx = @ptrCast(&fake), .disconnect = &Fake.disconnect, .release = &Fake.release };
+    processDeferredUiaDisconnect(null, pending);
     try std.testing.expectEqual(@as(usize, 2), fake.disconnects);
     try std.testing.expectEqual(@as(usize, 1), fake.releases);
 
     var exhausted: Fake = .{ .always_rpc = true };
     const retry_pending = try std.heap.page_allocator.create(DeferredUiaDisconnect);
-    retry_pending.* = .{
-        .ctx = @ptrCast(&exhausted),
-        .disconnect = &Fake.disconnect,
-        .release = &Fake.release,
-    };
-    try std.testing.expect(postDeferredUiaDisconnect(thread_id, retry_pending));
-    drainDeferredUiaDisconnects(thread_id);
+    retry_pending.* = .{ .ctx = @ptrCast(&exhausted), .disconnect = &Fake.disconnect, .release = &Fake.release };
+    processDeferredUiaDisconnect(null, retry_pending);
     try std.testing.expectEqual(@as(usize, 4), exhausted.disconnects);
     try std.testing.expectEqual(@as(usize, 1), exhausted.releases);
 }
@@ -25991,22 +30281,171 @@ fn tabContainerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callc
     return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+const BannerKey = enum { ignore, press, dismiss, other_button };
+
+/// What a key does on a focused banner button, or null when the button
+/// leaves it to the focus-region keys (F6, and Escape on the update notice,
+/// which goes back to the terminal: Dismiss records that version as
+/// dismissed, so it takes a deliberate press). Space is the BUTTON's own:
+/// it clicks on release. A held Enter or Escape repeats, and a repeat must
+/// not press whatever button the first press left focused.
+fn bannerButtonKey(has_message: bool, vk: WPARAM, repeat: bool) ?BannerKey {
+    return switch (vk) {
+        c.VK_RETURN => if (repeat) .ignore else .press,
+        c.VK_ESCAPE => if (!has_message) null else if (repeat) .ignore else .dismiss,
+        c.VK_TAB, c.VK_LEFT, c.VK_RIGHT => .other_button,
+        else => null,
+    };
+}
+
+test "bannerButtonKey presses once, closes a message on Escape and leaves the notice's Escape alone" {
+    try std.testing.expectEqual(@as(?BannerKey, .press), bannerButtonKey(true, c.VK_RETURN, false));
+    try std.testing.expectEqual(@as(?BannerKey, .press), bannerButtonKey(false, c.VK_RETURN, false));
+    try std.testing.expectEqual(@as(?BannerKey, .ignore), bannerButtonKey(false, c.VK_RETURN, true));
+    try std.testing.expectEqual(@as(?BannerKey, .dismiss), bannerButtonKey(true, c.VK_ESCAPE, false));
+    try std.testing.expectEqual(@as(?BannerKey, .ignore), bannerButtonKey(true, c.VK_ESCAPE, true));
+    try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(false, c.VK_ESCAPE, false));
+    for ([_]WPARAM{ c.VK_TAB, c.VK_LEFT, c.VK_RIGHT }) |vk| {
+        try std.testing.expectEqual(@as(?BannerKey, .other_button), bannerButtonKey(false, vk, false));
+    }
+    try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(true, c.VK_SPACE, false));
+    try std.testing.expectEqual(@as(?BannerKey, null), bannerButtonKey(true, c.VK_F6, false));
+}
+
+const ConfirmKey = enum { accept, cancel, other_button, ignore };
+
+/// What a key does on a confirm prompt's Allow or Cancel button, or null to
+/// leave it to the button. Enter presses the focused button and Escape
+/// cancels from either. Space only cancels: it is the key someone typing in
+/// the terminal most often has on its way when a prompt takes focus, and it
+/// is swallowed on Allow so the BUTTON cannot click on its release either.
+/// A held key repeats into the prompt that just took focus, so a repeat
+/// presses nothing.
+fn confirmButtonKey(vk: WPARAM, repeat: bool, on_accept: bool) ?ConfirmKey {
+    return switch (vk) {
+        c.VK_ESCAPE => .cancel,
+        c.VK_TAB, c.VK_LEFT, c.VK_RIGHT => .other_button,
+        c.VK_RETURN => if (repeat) .ignore else if (on_accept) .accept else .cancel,
+        c.VK_SPACE => if (repeat or on_accept) .ignore else .cancel,
+        else => null,
+    };
+}
+
+test "confirmButtonKey accepts only a fresh Enter on Allow" {
+    try std.testing.expectEqual(@as(?ConfirmKey, .accept), confirmButtonKey(c.VK_RETURN, false, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_RETURN, true, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_SPACE, false, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_SPACE, true, true));
+    try std.testing.expectEqual(@as(?ConfirmKey, .cancel), confirmButtonKey(c.VK_RETURN, false, false));
+    try std.testing.expectEqual(@as(?ConfirmKey, .cancel), confirmButtonKey(c.VK_SPACE, false, false));
+    try std.testing.expectEqual(@as(?ConfirmKey, .ignore), confirmButtonKey(c.VK_SPACE, true, false));
+    for ([_]bool{ false, true }) |on_accept| {
+        try std.testing.expectEqual(@as(?ConfirmKey, .cancel), confirmButtonKey(c.VK_ESCAPE, true, on_accept));
+        try std.testing.expectEqual(@as(?ConfirmKey, .other_button), confirmButtonKey(c.VK_TAB, false, on_accept));
+        try std.testing.expectEqual(@as(?ConfirmKey, null), confirmButtonKey('A', false, on_accept));
+    }
+}
+
+/// How long an `.info` banner stays up, in milliseconds: the system's
+/// notification time (`SPI_GETMESSAGEDURATION`), which Settings offers from
+/// 5 seconds to 5 minutes and defaults to 5.
+fn bannerMessageDurationMs() UINT {
+    var seconds: u32 = 0;
+    if (sys.SystemParametersInfoW(c.SPI_GETMESSAGEDURATION, 0, @ptrCast(&seconds), 0) == 0) seconds = 0;
+    return std.math.clamp(seconds, 5, 300) * std.time.ms_per_s;
+}
+
+/// Mouse on a banner button, or null for a message it leaves alone. The
+/// BUTTON class takes keyboard focus on a press. A banner button must not:
+/// every click would pull focus, and the focus reports a program asked for,
+/// off the terminal, and a press dragged off before the release would leave
+/// focus on the button. So the press, capture and click are done here.
+fn bannerButtonMouse(host: *Host, hwnd: HWND, button: BannerButton, msg: UINT, lParam: LPARAM) ?LRESULT {
+    switch (msg) {
+        c.WM_LBUTTONDOWN, c.WM_LBUTTONDBLCLK => {
+            _ = sys.SetCapture(hwnd);
+            _ = sys.SendMessageW(hwnd, c.BM_SETSTATE, 1, 0);
+            return 0;
+        },
+        c.WM_LBUTTONUP => {
+            if (sys.GetCapture() != hwnd) return 0;
+            var client: RECT = undefined;
+            const inside = sys.GetClientRect(hwnd, &client) != 0 and pointInRect(.{
+                .x = signedLowWord(lParamBits(lParam)),
+                .y = signedHighWord(lParamBits(lParam)),
+            }, client);
+            // `WM_CAPTURECHANGED` clears the pressed look.
+            _ = sys.ReleaseCapture();
+            // May destroy every window (Install): touch nothing after.
+            if (inside) host.activateBannerButton(button);
+            return 0;
+        },
+        c.WM_CAPTURECHANGED => {
+            _ = sys.SendMessageW(hwnd, c.BM_SETSTATE, 0, 0);
+            return 0;
+        },
+        else => return null,
+    }
+}
+
 fn hostBannerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     if (getHost(hwnd)) |host| {
-        if (msg == c.WM_GETOBJECT) {
-            if (host.banner_uia_provider) |provider| {
-                if (win32_uia.returnChromeControlProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
-            }
-        }
-        if (msg == c.WM_NCHITTEST) return c.HTTRANSPARENT;
-        // The banner is hit-transparent and painted by the host, so it
-        // only ever receives keys through the focus-region cycle.
-        if (msg == c.WM_SETFOCUS) {
-            if (host.banner_uia_provider) |provider| provider.raiseFocusChanged();
-        }
-        if (msg == c.WM_KEYDOWN) {
-            host.noteChromeKeyInput(wParam);
-            if (host.handleFocusRegionKey(hwnd, wParam, true)) return 0;
+        switch (msg) {
+            c.WM_GETOBJECT => {
+                if (host.banner_uia_provider) |provider| {
+                    if (win32_uia.returnChromeControlProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
+                }
+            },
+            // Opaque, so it answers for its own rect, except where the
+            // resize edges of a frameless window reach into it, as the
+            // terminal pane does.
+            c.WM_NCHITTEST => return if (host.resizesFrom(lParam)) c.HTTRANSPARENT else c.HTCLIENT,
+            c.WM_SETCURSOR => {
+                if ((lParamBits(lParam) & 0xFFFF) == c.HTCLIENT) {
+                    _ = sys.SetCursor(sys.LoadCursorW(null, c.IDC_ARROW));
+                    return 1;
+                }
+            },
+            c.WM_ERASEBKGND => return 1,
+            c.WM_PAINT => {
+                var ps: PAINTSTRUCT = undefined;
+                const hdc = sys.BeginPaint(hwnd, &ps) orelse return 0;
+                defer _ = sys.EndPaint(hwnd, &ps);
+                var client: RECT = undefined;
+                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                return 0;
+            },
+            c.WM_PRINTCLIENT => {
+                const hdc: HDC = @ptrFromInt(wParam);
+                var client: RECT = undefined;
+                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                return 0;
+            },
+            c.WM_MOUSEMOVE => {
+                host.bannerPointerMoved();
+                return 0;
+            },
+            c.WM_MOUSELEAVE => {
+                host.bannerPointerLeft();
+                return 0;
+            },
+            // The banner's buttons are its own children, so their owner
+            // draw and their clicks (and UIA Invoke, which posts the same
+            // command) come here.
+            c.WM_DRAWITEM => {
+                const draw: *const DRAWITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (host.drawBannerButton(draw)) return 1;
+            },
+            c.WM_COMMAND => {
+                const child: ?HWND = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (((wParam >> 16) & 0xFFFF) == c.BN_CLICKED) {
+                    if (host.bannerButtonOf(child)) |button| {
+                        host.activateBannerButton(button);
+                        return 0;
+                    }
+                }
+            },
+            else => {},
         }
         if (host.banner_prev_proc) |previous| return sys.CallWindowProcW(previous, hwnd, msg, wParam, lParam);
     }
@@ -26209,6 +30648,10 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         if (msg == c.WM_LBUTTONDOWN or msg == c.WM_RBUTTONDOWN or msg == c.WM_MBUTTONDOWN) {
             v.noteChromePointerInput();
         }
+        if (v.bannerButtonOf(hwnd)) |button| {
+            // May destroy every window (Install): touch nothing after.
+            if (bannerButtonMouse(v, hwnd, button, msg, lParam)) |result| return result;
+        }
         switch (v.button_tooltip.apply(buttonTooltipAction(msg, wParam), hwnd)) {
             .none => {},
             .present => v.showSearchButtonTooltip(hwnd),
@@ -26218,9 +30661,15 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // docked search controls. Overlay buttons are deliberately
         // excluded: they belong to a modal overlay, not to the window's
         // focus-region cycle.
+        if (msg == c.WM_KEYDOWN) {
+            if (v.bannerButtonOf(hwnd)) |button| {
+                // May destroy every window (Install): touch nothing after.
+                if (v.handleBannerButtonKey(hwnd, button, wParam, lParam)) return 0;
+            }
+        }
         if (msg == c.WM_KEYDOWN and !v.isOverlayButton(hwnd)) {
             // The docked search buttons already own Escape (it dismisses
-            // the search), so only F6 is taken from them here.
+            // the search), so only Ctrl+F6 is taken from them here.
             const allow_escape = v.searchControlSurface(hwnd) == null;
             if (v.handleFocusRegionKey(hwnd, wParam, allow_escape)) return 0;
         }
@@ -26232,29 +30681,28 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // two buttons; arrow keys also cycle for screen-reader
         // users who navigate via arrows.
         if (msg == c.WM_KEYDOWN and v.isOverlayButton(hwnd)) {
-            switch (wParam) {
-                c.VK_ESCAPE => {
-                    if (v.overlay_mode == .confirm) {
-                        v.invokeConfirmCancel();
-                    } else {
-                        v.hideOverlay();
+            const reverse = if (wParam == c.VK_TAB) keyPressed(c.VK_SHIFT) else wParam == c.VK_LEFT;
+            if (v.overlay_mode == .confirm) {
+                const repeat = (lParamBits(lParam) & c.KF_REPEAT) != 0;
+                const action = confirmButtonKey(wParam, repeat, hwnd == v.overlay_accept_hwnd);
+                if (action != ConfirmKey.accept) v.holdProgramConfirmForKey(wParam);
+                if (action) |key| {
+                    switch (key) {
+                        .accept => v.invokeConfirmAccept(),
+                        .cancel => v.invokeConfirmCancel(),
+                        .other_button => _ = v.focusRelativeOverlayControl(hwnd, reverse),
+                        .ignore => {},
                     }
+                    return 0;
+                }
+            } else switch (wParam) {
+                c.VK_ESCAPE => {
+                    v.hideOverlay();
                     return 0;
                 },
                 c.VK_TAB, c.VK_LEFT, c.VK_RIGHT => {
-                    const reverse = if (wParam == c.VK_TAB) keyPressed(c.VK_SHIFT) else wParam == c.VK_LEFT;
                     _ = v.focusRelativeOverlayControl(hwnd, reverse);
                     return 0;
-                },
-                c.VK_RETURN, c.VK_SPACE => {
-                    if (v.overlay_mode == .confirm) {
-                        if (hwnd == v.overlay_accept_hwnd) {
-                            v.invokeConfirmAccept();
-                        } else if (hwnd == v.overlay_cancel_hwnd) {
-                            v.invokeConfirmCancel();
-                        }
-                        return 0;
-                    }
                 },
                 else => {},
             }
@@ -26280,6 +30728,10 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         }
         switch (msg) {
             c.WM_SETFOCUS => {
+                if (v.bannerButtonOf(hwnd) != null) {
+                    v.banner_focused = true;
+                    v.syncBannerExpiry();
+                }
                 if (v.searchControlSurface(hwnd)) |surface| {
                     v.app.activateSurfaceNoFocus(surface);
                 }
@@ -26289,6 +30741,10 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             },
             c.WM_KILLFOCUS => {
                 v.setFocusedQuickSlot(null);
+                if (v.bannerButtonOf(hwnd) != null) {
+                    v.banner_focused = false;
+                    v.syncBannerExpiry();
+                }
             },
             c.WM_MOUSEMOVE => {
                 // The search bar's icon buttons also arm TME_HOVER, as the tab
@@ -26402,15 +30858,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                         .activate => {
                             _ = v.activateTabIndex(index);
                         },
-                        .close => {
-                            if (v.activateTabIndex(index)) {
-                                if (v.activeSurface()) |surface| {
-                                    _ = v.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
-                                        log.warn("tab close button action failed err={}", .{err});
-                                    };
-                                }
-                            }
-                        },
+                        .close => _ = v.closeTabInPlace(index),
                         .none => {},
                     }
                     return 0;
@@ -26561,14 +31009,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                                 }
                             },
                             .close => {
-                                if (v.tabs.items.len > 1 and v.activateTabIndex(index)) {
-                                    if (v.activeSurface()) |surface| {
-                                        _ = v.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
-                                            log.warn("tab close key action failed err={}", .{err});
-                                        };
-                                        return 0;
-                                    }
-                                }
+                                if (v.tabs.items.len > 1 and v.closeTabInPlace(index)) return 0;
                             },
                             .overview => {
                                 if (v.activateTabIndex(index)) {
@@ -26582,14 +31023,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                     }
                 },
                 c.WM_MBUTTONUP => {
-                    if (v.tabs.items.len > 1 and v.activateTabIndex(index)) {
-                        if (v.activeSurface()) |surface| {
-                            _ = v.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
-                                log.warn("tab middle-click close action failed err={}", .{err});
-                            };
-                            return 0;
-                        }
-                    }
+                    if (v.tabs.items.len > 1 and v.closeTabInPlace(index)) return 0;
                 },
                 c.WM_LBUTTONDBLCLK => {
                     if (v.activateTabIndex(index)) {
@@ -26655,7 +31089,7 @@ fn searchEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
                 v.noteChromeKeyInput(wParam);
                 // Escape stays with the search bar, which dismisses
-                // itself and returns focus to the terminal; only F6
+                // itself and returns focus to the terminal; only Ctrl+F6
                 // is taken for the focus-region cycle.
                 if (v.handleFocusRegionKey(hwnd, wParam, false)) return 0;
                 if (wParam == c.VK_RETURN) {
@@ -26722,10 +31156,14 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
         v.overlay_edit_hwnd != null and hwnd == v.overlay_edit_hwnd.?
     else
         false;
-    if (msg == c.WM_GETOBJECT and is_query_edit) {
+    if (msg == c.WM_GETOBJECT) {
         if (host) |v| {
-            if (v.overlay_edit_uia_provider) |provider| {
-                if (win32_uia.returnTerminalProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
+            if (is_query_edit) {
+                if (v.overlay_edit_uia_provider) |provider| {
+                    if (win32_uia.returnTerminalProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
+                }
+            } else if (v.overlay_preview_uia_provider) |provider| {
+                if (win32_uia.returnSettingsControlProvider(hwnd, wParam, lParam, provider)) |lr| return lr;
             }
         }
     }
@@ -26734,6 +31172,12 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
         c.WM_CHAR => {
             if (wParam == c.VK_ESCAPE) return 0;
             if (wParam == c.VK_RETURN) {
+                // The confirm preview pane accepts on Enter too, but not on
+                // a held one (see `confirmButtonKey`), and never a
+                // program's prompt: Tab from its Cancel lands here, and
+                // Tab then Enter is how someone finishes typing a command.
+                const repeat = (lParamBits(lParam) & c.KF_REPEAT) != 0;
+                if (v.overlay_mode == .confirm and (repeat or v.programConfirmOpen())) return 0;
                 if (v.overlay_mode != .profile) {
                     runUiActionOrLog("overlay submit failed", v.submitOverlay());
                 }
@@ -26745,6 +31189,7 @@ fn overlayEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callco
             // Tab out of the query is how the keyboard reaches the Close
             // button; it has to show its ring when it gets there.
             v.noteChromeKeyInput(wParam);
+            if (v.overlay_mode == .confirm) v.holdProgramConfirmForKey(wParam);
             if (v.commandPaletteToggleKeyMessage(msg, wParam, lParam)) {
                 _ = v.dismissCommandPalette();
                 return 0;
@@ -26924,6 +31369,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 if (host) |v| v.tickResizeSettleRepaint();
                 return 0;
             }
+            if (wParam == c.BANNER_TIMER_ID) {
+                if (host) |v| v.bannerExpiryTick();
+                return 0;
+            }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         c.WM_DRAWITEM => {
@@ -27089,12 +31538,15 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             if (host) |v| {
                 const new_dpi = sys.GetDpiForWindow(hwnd);
                 if (new_dpi > 0) v.current_dpi = new_dpi;
-
-                // Resize window to the suggested rectangle from lParam
-                const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
-                _ = sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
-
                 v.recreateChromeFont();
+
+                // QT placement/tween frames own their physical-pixel rect.
+                // Keep scale and layout updates even when the OS's resized
+                // suggestion would override that rect on a DPI crossing.
+                if (!v.quick_terminal_placing and v.quick_terminal_animation == null) {
+                    const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                    _ = sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+                }
 
                 // Relayout and repaint
                 runUiActionOrLog("DPI update layout failed", v.layout());
@@ -27447,6 +31899,32 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             return 1;
         },
 
+        // Sign-out, shutdown, reboot and Restart Manager closes. The save
+        // waits for WM_ENDSESSION, after which the process may be ended
+        // without `terminate` running; WM_QUERYENDSESSION is left to
+        // DefWindowProcW, which answers TRUE.
+        c.WM_ENDSESSION => {
+            if (wParam != 0) if (host) |v| v.app.saveForEndSession((@as(usize, @bitCast(lParam)) & c.ENDSESSION_CLOSEAPP) != 0);
+            return 0;
+        },
+        // Saved from the message loop rather than inside this sent message,
+        // which can arrive while the thread waits in the middle of other
+        // work.
+        c.WM_DISPLAYCHANGE => {
+            _ = sys.PostMessageW(hwnd, c.WM_WINHOSTTY_SESSION_CHECKPOINT, 0, 0);
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        c.WM_WINHOSTTY_SESSION_CHECKPOINT => {
+            if (host) |v| v.app.checkpointSessionState();
+            return 0;
+        },
+        c.WM_WINHOSTTY_QUIT => {
+            // wParam: whether the quit came from this window. May destroy
+            // this window: nothing after the call reads `v`.
+            if (host) |v| v.app.requestQuit(if (wParam != 0) v.activeSurface() else null);
+            return 0;
+        },
+
         c.WM_SHOWWINDOW => {
             const result = sys.DefWindowProcW(hwnd, msg, wParam, lParam);
             if (host) |v| {
@@ -27548,9 +32026,6 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     .x = signedLowWord(lParamBits(lParam)),
                     .y = signedHighWord(lParamBits(lParam)),
                 };
-                if (msg == c.WM_LBUTTONUP and v.handleUpdateNoticeClick(point)) {
-                    return 0;
-                }
                 if (v.quickSlotProfileIndexAtPoint(point)) |profile_index| {
                     _ = v.setSelectedProfileIndex(profile_index) catch return 0;
                     const open_target = switch (msg) {
@@ -27994,6 +32469,20 @@ fn mouseButtonStateFromMessage(msg: UINT) ?input.MouseButtonState {
     };
 }
 
+fn rightClickShowsMenu(action: configpkg.Config.RightClickAction, press_consumed: bool) bool {
+    return action == .@"context-menu" and !press_consumed;
+}
+
+test "win32 right click menu honors consumed presses and every configured action" {
+    const expect = std.testing.expect;
+    try expect(rightClickShowsMenu(.@"context-menu", false));
+    try expect(!rightClickShowsMenu(.@"context-menu", true));
+    inline for (.{ .ignore, .paste, .copy, .@"copy-or-paste" }) |action| {
+        try expect(!rightClickShowsMenu(action, false));
+        try expect(!rightClickShowsMenu(action, true));
+    }
+}
+
 fn mouseModsFromWParam(wParam: WPARAM) input.Mods {
     const bits = @as(usize, @intCast(wParam));
     var mods = currentMods();
@@ -28239,6 +32728,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSEMOVE => {
             if (surface) |v| {
+                v.armScrollbarLeaveTracking(hwnd);
                 if (v.handleScrollbarProxyMouseMove(hwnd, lParam)) return 0;
                 v.handleMouseMove(lParam, mouseModsFromWParam(wParam));
                 return 0;
@@ -28248,7 +32738,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSELEAVE => {
             if (surface) |v| {
-                v.handleScrollbarMouseLeave();
+                v.handleMouseLeave();
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -28256,16 +32746,17 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_RBUTTONUP => {
             if (surface) |v| {
-                // If terminal has mouse reporting active and Shift is not held,
-                // pass through as a mouse event. Shift+Right-Click always opens
-                // the context menu (standard terminal behavior).
-                const mods = mouseModsFromWParam(wParam);
-                if (v.core_initialized and v.core_surface.io.terminal.flags.mouse_event != .none and !mods.shift) {
-                    v.handleMouseButton(msg, wParam, lParam);
-                    return 0;
-                }
-                // Otherwise show context menu
-                _ = sys.ReleaseCapture();
+                // Balance the core's press even when the click opens a menu.
+                // Snapshot and clear before releasing capture, which can send
+                // synchronous window messages. A reporting TUI consumes the
+                // press; Shift bypasses it unless the TUI captures Shift too.
+                const show_menu = v.core_initialized and rightClickShowsMenu(
+                    v.core_surface.config.right_click_action,
+                    v.right_press_consumed,
+                );
+                v.right_press_consumed = false;
+                _ = v.handleMouseButton(msg, wParam, lParam);
+                if (!show_menu) return 0;
                 if (v.host) |h| {
                     var pt: POINT = .{
                         .x = signedLowWord(lParamBits(lParam)),
@@ -28282,15 +32773,23 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
         c.WM_LBUTTONDOWN, c.WM_LBUTTONUP => {
             if (surface) |v| {
                 if (v.handleScrollbarProxyButton(hwnd, msg, lParam)) return 0;
-                v.handleMouseButton(msg, wParam, lParam);
+                _ = v.handleMouseButton(msg, wParam, lParam);
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
-        c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_MBUTTONUP => {
+        c.WM_RBUTTONDOWN => {
             if (surface) |v| {
-                v.handleMouseButton(msg, wParam, lParam);
+                v.right_press_consumed = v.handleMouseButton(msg, wParam, lParam);
+                return 0;
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        c.WM_MBUTTONDOWN, c.WM_MBUTTONUP => {
+            if (surface) |v| {
+                _ = v.handleMouseButton(msg, wParam, lParam);
                 return 0;
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -28313,6 +32812,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSEWHEEL, c.WM_POINTERWHEEL => {
             if (surface) |v| {
+                v.updateWheelCursorPos(hwnd, lParam);
                 v.handleMouseWheel(normalizeWheelDelta(
                     v.wheelNormalizationContext(),
                     .vertical,
@@ -28325,6 +32825,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
         c.WM_MOUSEHWHEEL, c.WM_POINTERHWHEEL => {
             if (surface) |v| {
+                v.updateWheelCursorPos(hwnd, lParam);
                 v.handleMouseWheel(normalizeWheelDelta(
                     v.wheelNormalizationContext(),
                     .horizontal,
@@ -28755,6 +33256,7 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale = .{ .x = 1, .y = 1 },
     size: apprt.SurfaceSize = .{ .width = 800, .height = 600 },
     cursor_pos: apprt.CursorPos = .{ .x = -1, .y = -1 },
+    right_press_consumed: bool = false,
     title: ?[:0]const u8 = null,
     title_override: ?[:0]const u8 = null,
     tab_title_override: ?[:0]const u8 = null,
@@ -28777,6 +33279,7 @@ pub const Surface = struct {
     /// that was maximized.
     restore_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     restore_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT),
+    restore_monitor: ?FullscreenMonitor = null,
     default_client_size: ?apprt.SurfaceSize = null,
     cell_size_pixels: apprt.action.CellSize = .{ .width = 0, .height = 0 },
     background_opacity_default: f64 = 1.0,
@@ -28881,14 +33384,10 @@ pub const Surface = struct {
     search_bar_label_prev_procs: [2]?*const anyopaque = .{ null, null },
     search_bar_results_placement: ChildPlacement = .{},
     search_bar_results_cache: ?[:0]const u8 = null,
-    /// OLE drop target registered on the surface HWND. `null` when
-    /// the module's `ensureCustomFormats` fails or Ole32 is absent
-    /// (extremely unlikely on Win10+). Lifetime: created in
-    /// `Surface.init` after the HWND is ready, revoked + deinited
-    /// in `Surface.destroyWindow`. Storage is INLINE on Surface so
-    /// the COM v-table pointer stays stable — Surface itself is
-    /// heap-allocated via core_app.alloc and never moves.
-    drop_target: win32_surface_drop_target.DropTarget = undefined,
+    /// Surface's initial reference to an independently allocated OLE
+    /// drop target. Detached and released during native-window teardown;
+    /// retained COM references keep only the target alive after that.
+    drop_target: ?*win32_surface_drop_target.DropTarget = null,
     drop_target_registered: bool = false,
     /// Clipboard operation parked on `HostOverlayMode.confirm` — the
     /// owning `Surface` holds deep-copied payload bytes so the async
@@ -29110,11 +33609,6 @@ pub const Surface = struct {
             .memory_stage_trace = MemoryStageTrace.init(app.core_app.alloc),
             .undo_stack = win32_undo.UndoStack.init(app.core_app.alloc),
             .search_bar = win32_search_bar.SearchBar.init(app.core_app.alloc),
-            .drop_target = win32_surface_drop_target.DropTarget.init(
-                app.core_app.alloc,
-                undefined, // surface_ctx — fixed up below after the address stabilises
-                &surfaceDropPayloadCallback,
-            ),
         };
         // `destroy` never runs for a Surface whose init fails, so free here
         // what it would: the strings, among them the launch command cloned
@@ -29134,12 +33628,15 @@ pub const Surface = struct {
         else
             config.command;
         if (launch_command) |command| self.launch_command = try command.clone(app.core_app.alloc);
-        // The DropTarget's surface_ctx must be `self`, but we can't
-        // initialise it until `self.*` has been fully assigned above
-        // (taking the address of an in-progress struct literal is
-        // undefined). Patch it in now, before the HWND is created so
-        // the first COM callback has a valid context.
-        self.drop_target.surface_ctx = @ptrCast(self);
+        self.drop_target = try win32_surface_drop_target.DropTarget.create(
+            app.core_app.alloc,
+            @ptrCast(self),
+            &surfaceDropPayloadCallback,
+        );
+        errdefer {
+            self.drop_target.?.deinit();
+            self.drop_target = null;
+        }
         self.background_opacity_default = normalizedBackgroundOpacity(config.@"background-opacity");
         // First memory-stage sample. Every later stage's private-bytes delta
         // is measured against this one, so it has to be the first thing that
@@ -29168,15 +33665,14 @@ pub const Surface = struct {
         // land as typed input in the terminal. Failure is non-fatal:
         // the user loses the feature but the terminal still works.
         // Requires the STA apartment that `App.init` brought up via
-        // `CoInitializeEx`.
-        self.drop_target.register(hwnd) catch |err| {
+        // `OleInitialize`.
+        if (self.drop_target.?.register(hwnd)) {
+            self.drop_target_registered = true;
+        } else |err| {
             std.log.warn("drop target register failed hwnd={*} err={}", .{ hwnd, err });
-        };
-        self.drop_target_registered = true;
-        // `errdefer` below revokes on failure.  Explicit revoke also
-        // happens in `destroyWindow` via the same helper.
+        }
         errdefer if (self.drop_target_registered) {
-            self.drop_target.revoke(hwnd);
+            self.drop_target.?.revoke(hwnd);
             self.drop_target_registered = false;
         };
 
@@ -29374,14 +33870,13 @@ pub const Surface = struct {
             // and core initialization have succeeded, so a startup failure
             // reaches the fatal dialog without first presenting a blank host
             // window. Same-host tabs and splits never take this path.
-            if (opts.passive_show) {
+            if (opts.show.showCommand()) |show_command| {
                 if (host.hwnd) |host_hwnd| {
-                    _ = sys.ShowWindow(host_hwnd, c.SW_SHOWNOACTIVATE);
+                    _ = sys.ShowWindow(host_hwnd, show_command);
                     _ = sys.UpdateWindow(host_hwnd);
                 }
-            } else {
-                self.presentWindow();
             }
+            if (opts.show.takesFocus()) self.presentWindow();
             if (app.update_startup_ready) app.maybeScheduleAutomaticUpdateCheck();
             try self.requestRepaint();
         }
@@ -29405,6 +33900,11 @@ pub const Surface = struct {
         // DestroyWindow free the Surface under these errdefers, and then
         // `createWindowSurface` frees it again.
         self.destroy_on_wm_destroy = true;
+        // A terminal opened after a last-host close (quit-after-last-window-
+        // closed = false, or inside its delay) is part of the session again.
+        // Not before init commits: a failed one leaves no window, and the
+        // last-host-close snapshot must still stand.
+        app.session_state_saved_before_last_host_close = false;
     }
 
     test "Surface.init that fails after the core starts is unwound once, by init" {
@@ -29426,7 +33926,7 @@ pub const Surface = struct {
         defer session.deinit();
         // With COM, a tab button gets a UIA provider, as in the app.
         app.initComApartment();
-        defer if (app.com_initialized) sys.CoUninitialize();
+        defer if (app.com_initialized) sys.OleUninitialize();
         try app.ensureWindowClass();
         defer _ = sys.UnregisterClassW(class_name, app.hinstance);
         const host_hwnd = try createTestHostWindow();
@@ -29491,6 +33991,8 @@ pub const Surface = struct {
         app.startQuitTimer();
         defer app.stopQuitTimer();
         try std.testing.expect(app.quit_timer_id != null);
+        // The owner's last window already took the session's final snapshot.
+        app.session_state_saved_before_last_host_close = true;
 
         // Before the fix, the unwinding DestroyWindow sent WM_DESTROY, which
         // freed the Surface; the errdefers then read it and
@@ -29508,12 +34010,17 @@ pub const Surface = struct {
         try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
         try std.testing.expectEqual(@as(usize, 0), core_app.surfaces.items.len);
         try std.testing.expect(app.quit_timer_id != null);
+        // No terminal opened, so `terminate` must still keep that snapshot
+        // rather than save the empty app over it.
+        try std.testing.expect(app.session_state_saved_before_last_host_close);
 
         // Once init returns, the window owns the Surface: destroying it frees
         // the Surface once, and its tab and button with it.
         Stage.stale = false;
         const created = try app.createWindowSurface(&app.config, default_title, .{ .host_id = host.id });
         try std.testing.expect(created.destroy_on_wm_destroy);
+        // A terminal that did open is part of the session again.
+        try std.testing.expect(!app.session_state_saved_before_last_host_close);
         try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
         // `destroy` unregisters the surfaces whose core it stops, and the
         // stub started none.
@@ -29553,11 +34060,17 @@ pub const Surface = struct {
         };
         Stage.host_hwnd = null;
         app.test_surface_init_stage = &Stage.run;
+        // A new window forwarded in after the owner's last window closed
+        // and took the session's final snapshot.
+        app.session_state_saved_before_last_host_close = true;
 
         try std.testing.expectError(
             error.TestGLContextFailed,
             app.createWindowSurface(&app.config, default_title, .{}),
         );
+        // No window opened, so `terminate` must keep that snapshot rather
+        // than delete the session for an app with no windows.
+        try std.testing.expect(app.session_state_saved_before_last_host_close);
         const host_hwnd = Stage.host_hwnd.?;
         defer if (sys.IsWindow(host_hwnd) != 0) {
             _ = sys.DestroyWindow(host_hwnd);
@@ -29650,6 +34163,14 @@ pub const Surface = struct {
         }
         const mutable: *Surface = @constCast(self);
         _ = mutable.requestClose();
+    }
+
+    /// Core's `confirm-close-surface` answer for this pane (a running
+    /// process, `always`, or read-only mode), for a close that ends more
+    /// than this pane. A pane whose core is not up has no process to lose.
+    fn needsCloseConfirm(self: *Surface) bool {
+        if (!self.core_initialized) return false;
+        return self.core_surface.needsConfirmQuit();
     }
 
     fn requestClose(self: *Surface) bool {
@@ -29807,7 +34328,13 @@ pub const Surface = struct {
         remaining_budget: *usize,
     ) !?win32_session_state.ScrollbackSnapshot {
         if (max_lines == 0 or self.secure_input_ever_engaged) return null;
-        self.core_surface.renderer_state.mutex.lock();
+        // An end-session save is a sent message. It can arrive while this
+        // surface is mid-init or mid-teardown, still in its tab tree but
+        // without a live core, or while this thread waits inside a call made
+        // under the renderer mutex (the core's copy path holds it across
+        // `EmptyClipboard`, which sends to the previous clipboard owner).
+        if (!self.core_initialized) return null;
+        if (!self.core_surface.renderer_state.mutex.tryLock()) return null;
         defer self.core_surface.renderer_state.mutex.unlock();
         return captureTerminalScrollbackSnapshotAlloc(
             alloc,
@@ -30100,6 +34627,14 @@ pub const Surface = struct {
         state: apprt.ClipboardRequest,
     ) !bool {
         if (clipboard_type != .standard) return false;
+        // A program's read that would only be declined does not read the
+        // clipboard first.
+        if (state == .osc_52_read and self.core_surface.config.clipboard_read == .ask) {
+            self.declineProgramRequest() catch |err| {
+                log.info("clipboard read request declined err={}", .{err});
+                return false;
+            };
+        }
 
         // `str` is always owned by `core_app.alloc`, so one defer covers both
         // clipboard reads and the synthesized empty-string fallback.
@@ -31601,7 +36136,7 @@ pub const Surface = struct {
             .hwndTrack = hwnd,
             .dwHoverTime = 0,
         };
-        _ = sys.TrackMouseEvent(&track);
+        if (sys.TrackMouseEvent(&track) == 0) return;
         self.scrollbar_leave_armed = true;
         self.scrollbar_leave_hwnd = hwnd;
     }
@@ -32903,9 +37438,6 @@ pub const Surface = struct {
         self.restore_placement.length = @sizeOf(WINDOWPLACEMENT);
         if (sys.GetWindowPlacement(hwnd, &self.restore_placement) == 0 or
             sys.GetWindowRect(hwnd, &self.restore_rect) == 0) return lastError();
-        self.fullscreen = true;
-        try self.applyWindowStyle();
-
         const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse
             return lastError();
         var info: MONITORINFO = .{
@@ -32917,6 +37449,9 @@ pub const Surface = struct {
         if (sys.GetMonitorInfoW(monitor, &info) == 0) {
             return lastError();
         }
+        self.restore_monitor = .{ .monitor = monitor, .info = info, .dpi = sys.GetDpiForWindow(hwnd) };
+        self.fullscreen = true;
+        try self.applyWindowStyle();
 
         if (sys.SetWindowPos(
             hwnd,
@@ -32933,6 +37468,36 @@ pub const Surface = struct {
 
     fn leaveFullscreen(self: *Surface) !void {
         const hwnd = self.windowHwnd() orelse return;
+        var rect = self.restore_rect;
+        var placement = self.restore_placement;
+        if (self.restore_monitor) |source| {
+            const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+            var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+            info.cbSize = @sizeOf(MONITORINFO);
+            if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+            const dpi = sys.GetDpiForWindow(hwnd);
+            if (monitor != source.monitor or dpi != source.dpi) {
+                rect = fullscreenRestoreRect(rect, source.info.rcWork, info.rcWork, source.dpi, dpi);
+                // WINDOWPLACEMENT uses workspace coordinates for a normal
+                // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
+                // before the work-area translation, and back afterwards.
+                var normal = placement.rcNormalPosition;
+                const old_dx = source.info.rcWork.left - source.info.rcMonitor.left;
+                const old_dy = source.info.rcWork.top - source.info.rcMonitor.top;
+                normal.left += old_dx;
+                normal.right += old_dx;
+                normal.top += old_dy;
+                normal.bottom += old_dy;
+                normal = fullscreenRestoreRect(normal, source.info.rcWork, info.rcWork, source.dpi, dpi);
+                const new_dx = info.rcWork.left - info.rcMonitor.left;
+                const new_dy = info.rcWork.top - info.rcMonitor.top;
+                normal.left -= new_dx;
+                normal.right -= new_dx;
+                normal.top -= new_dy;
+                normal.bottom -= new_dy;
+                placement.rcNormalPosition = normal;
+            }
+        }
         self.fullscreen = false;
         try self.applyWindowStyle();
 
@@ -32942,16 +37507,16 @@ pub const Surface = struct {
         // later restore kept it maximized-size. Any other window returns to
         // its exact rect: the placement of a snapped window holds its
         // pre-snap rect.
-        if (self.restore_placement.showCmd == c.SW_MAXIMIZE) {
-            return maximizeWithPlacement(hwnd, &self.restore_placement);
+        if (placement.showCmd == c.SW_MAXIMIZE) {
+            return maximizeWithPlacement(hwnd, &placement);
         }
         if (sys.SetWindowPos(
             hwnd,
             if (self.topmost) HWND_TOPMOST else HWND_NOTOPMOST,
-            self.restore_rect.left,
-            self.restore_rect.top,
-            self.restore_rect.right - self.restore_rect.left,
-            self.restore_rect.bottom - self.restore_rect.top,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
             c.SWP_FRAMECHANGED | c.SWP_NOACTIVATE,
         ) == 0) {
             return lastError();
@@ -33082,6 +37647,7 @@ pub const Surface = struct {
         self.topmost = source.topmost;
         self.restore_rect = source.restore_rect;
         self.restore_placement = source.restore_placement;
+        self.restore_monitor = source.restore_monitor;
         self.default_client_size = source.default_client_size;
         self.cell_size_pixels = source.cell_size_pixels;
         self.background_opacity_default = source.background_opacity_default;
@@ -33417,21 +37983,32 @@ pub const Surface = struct {
         if (!self.core_initialized) return;
 
         // Under Kitty `report_all` the text must ride on the physical key
-        // event so press and release keep one identity; see
-        // `win32_input.deferPlainTextToCharMessage`.
-        const kitty_report_all = kitty_report_all: {
+        // event so press and release keep one identity, and under Win32
+        // input mode the key record carries the characters it typed; see
+        // `win32_input.deferPlainTextToCharMessage`. Read at every key, as
+        // the encoder does: the mode and the Kitty flags are the terminal's
+        // live state.
+        const encode_opts = encode_opts: {
             self.core_surface.renderer_state.mutex.lock();
             defer self.core_surface.renderer_state.mutex.unlock();
-            break :kitty_report_all self.core_surface.renderer_state.terminal.screens.active.kitty_keyboard.current().report_all;
+            break :encode_opts input.key_encode.Options.fromTerminal(
+                self.core_surface.renderer_state.terminal,
+            );
         };
+        // An IME owns the keys it composes with; its result arrives as text.
+        const win32_records = encode_opts.win32InputRecords() and !self.ime_composing;
         win32_input.dispatchKeyMessage(
             KeyTarget{ .surface = self },
             &self.deferred_char,
             msg,
             wParam,
             lParam,
-            win32_input.deferPlainTextToCharMessage(kitty_report_all, self.ime_composing),
+            win32_input.deferPlainTextToCharMessage(
+                encode_opts.kitty_flags.report_all or win32_records,
+                self.ime_composing,
+            ),
             self.ime_composing,
+            win32_records,
             typed,
         );
     }
@@ -33552,39 +38129,15 @@ pub const Surface = struct {
 
         if (!self.core_initialized) return;
 
-        const file_count = sys.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
-        if (file_count == 0) return;
-
         const alloc = self.app.core_app.alloc;
-        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer {
-            for (paths.items) |path| alloc.free(path);
-            paths.deinit(alloc);
-        }
-
-        var i: UINT = 0;
-        while (i < file_count) : (i += 1) {
-            // Get required buffer length (not counting null terminator)
-            const wchar_len = sys.DragQueryFileW(hDrop, i, null, 0);
-            if (wchar_len == 0) continue;
-
-            // Allocate UTF-16 buffer (+1 for null)
-            const buf = alloc.alloc(u16, wchar_len + 1) catch continue;
-            defer alloc.free(buf);
-            _ = sys.DragQueryFileW(hDrop, i, buf.ptr, wchar_len + 1);
-
-            const path = std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..wchar_len]) catch continue;
-            paths.append(alloc, path) catch {
-                alloc.free(path);
-                continue;
-            };
-        }
-
-        if (paths.items.len == 0) return;
-        const payload = win32_surface_drop.formatFilePayload(alloc, paths.items, .{}) catch |err| {
+        const payload = win32_ole.extractHdrop(alloc, hDrop, .{}) catch |err| {
             log.warn("win32 drop files format failed err={}", .{err});
             return;
         };
+        if (payload.len == 0) {
+            alloc.free(payload);
+            return;
+        }
         defer alloc.free(payload);
 
         surfaceDropPayloadCallback(self, payload);
@@ -33598,11 +38151,94 @@ pub const Surface = struct {
         };
     }
 
-    fn handleMouseButton(self: *Surface, msg: UINT, wParam: WPARAM, lParam: LPARAM) void {
+    fn handleMouseLeave(self: *Surface) void {
+        self.handleScrollbarMouseLeave();
         if (!self.core_initialized) return;
+        // Captured drags keep reporting their real out-of-pane coordinates
+        // for selection auto-scroll. The scrollbar child shares tracking.
+        if (self.hwnd != null and sys.GetCapture() == self.hwnd) return;
+        self.cursor_pos = .{ .x = -1, .y = -1 };
+        self.core_surface.cursorPosCallback(self.cursor_pos, null) catch |err| {
+            log.err("win32 cursor leave callback failed err={}", .{err});
+        };
+    }
 
-        const button = mouseButtonFromMessage(msg) orelse return;
-        const state = mouseButtonStateFromMessage(msg) orelse return;
+    test "win32 pointer leave clears core link and renderer positions" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var mutex: std.Thread.Mutex = .{};
+        var surface: Surface = .{ .app = undefined, .core_initialized = true };
+        surface.core_surface.io.terminal = try terminal.Terminal.init(std.testing.allocator, .{ .cols = 10, .rows = 10 });
+        defer surface.core_surface.io.terminal.deinit(std.testing.allocator);
+        surface.core_surface.mouse = .{ .link_point = .{ .x = 4, .y = 4 } };
+        surface.core_surface.renderer_state = .{
+            .mutex = &mutex,
+            .terminal = &surface.core_surface.io.terminal,
+            .mouse = .{ .point = .{ .x = 4, .y = 4 } },
+        };
+        surface.core_surface.config.mouse_reporting = false;
+        surface.core_surface.size = .{
+            .screen = .{ .width = 100, .height = 100 },
+            .cell = .{ .width = 10, .height = 10 },
+            .padding = .{},
+        };
+        surface.core_surface.inspector = null;
+        surface.core_surface.selection_scroll_active = false;
+        surface.scrollbar_leave_armed = true;
+        surface.handleMouseLeave();
+        try std.testing.expect(!surface.scrollbar_leave_armed);
+        try std.testing.expect(surface.core_surface.mouse.link_point == null);
+        try std.testing.expect(surface.core_surface.renderer_state.mouse.point == null);
+        try std.testing.expect(surface.core_surface.io.terminal.screens.active.dirty.hyperlink_hover);
+        try std.testing.expectEqual(@as(f32, -1), surface.cursor_pos.x);
+    }
+
+    fn updateWheelCursorPos(self: *Surface, hwnd: HWND, lParam: LPARAM) void {
+        // Wheel messages carry screen coordinates, including precision
+        // pointer wheels. Updating only the cache avoids a spurious motion
+        // report or hover/selection action before the wheel report.
+        var point: POINT = .{
+            .x = signedLowWord(lParamBits(lParam)),
+            .y = signedHighWord(lParamBits(lParam)),
+        };
+        if (sys.ScreenToClient(hwnd, &point) == 0) return;
+        self.cursor_pos = .{ .x = @floatFromInt(point.x), .y = @floatFromInt(point.y) };
+    }
+
+    test "win32 wheel position uses signed screen coordinates without mouse motion" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        // An unshown stock window needs no Surface/core setup and cannot
+        // touch the clipboard. Use a negative origin to catch unsigned words.
+        const hwnd = sys.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            0,
+            -300,
+            -200,
+            500,
+            400,
+            null,
+            null,
+            sys.GetModuleHandleW(null),
+            null,
+        ) orelse return error.CreateWindowFailed;
+        defer _ = sys.DestroyWindow(hwnd);
+        var surface: Surface = .{ .app = undefined };
+        var point: POINT = .{ .x = 40, .y = 60 };
+        try std.testing.expect(sys.ClientToScreen(hwnd, &point) != 0);
+        const bits: u32 = @as(u32, @as(u16, @bitCast(@as(i16, @intCast(point.x))))) |
+            (@as(u32, @as(u16, @bitCast(@as(i16, @intCast(point.y))))) << 16);
+        surface.updateWheelCursorPos(hwnd, @intCast(bits));
+        try std.testing.expectEqual(@as(f32, 40), surface.cursor_pos.x);
+        try std.testing.expectEqual(@as(f32, 60), surface.cursor_pos.y);
+        try std.testing.expect(!surface.scrollbar_leave_armed);
+    }
+
+    fn handleMouseButton(self: *Surface, msg: UINT, wParam: WPARAM, lParam: LPARAM) bool {
+        if (!self.core_initialized) return true;
+
+        const button = mouseButtonFromMessage(msg) orelse return true;
+        const state = mouseButtonStateFromMessage(msg) orelse return true;
         const mods = mouseModsFromWParam(wParam);
 
         self.cursor_pos = cursorPosFromLParam(lParam);
@@ -33621,13 +38257,13 @@ pub const Surface = struct {
         self.core_surface.cursorPosCallback(self.cursor_pos, mods) catch |err| {
             log.err("win32 cursor pos callback failed before button err={}", .{err});
         };
-        _ = self.core_surface.mouseButtonCallback(state, button, mods) catch |err| {
+        return self.core_surface.mouseButtonCallback(state, button, mods) catch |err| {
             log.err("win32 mouse button callback failed err={} button={} state={}", .{
                 err,
                 button,
                 state,
             });
-            return;
+            return true;
         };
     }
 
@@ -33694,6 +38330,7 @@ pub const Surface = struct {
 
     fn destroy(self: *Surface) void {
         const alloc = self.app.core_app.alloc;
+        const own_hwnd = self.hwnd;
         self.noteBenchmarkMemoryStage(.destroy_begin, null);
         self.destroy_on_wm_destroy = false;
         self.deferred_char.clear();
@@ -33708,11 +38345,15 @@ pub const Surface = struct {
         // Revoke the drop target BEFORE destroying the HWND — Ole
         // would otherwise hold a dangling HWND reference until the
         // process exits. Idempotent on already-revoked targets.
-        if (self.drop_target_registered) {
-            if (self.hwnd) |hwnd| self.drop_target.revoke(hwnd);
-            self.drop_target_registered = false;
+        if (self.drop_target) |target| {
+            self.drop_target = null;
+            target.detach();
+            if (self.drop_target_registered) {
+                if (self.hwnd) |hwnd| target.revoke(hwnd);
+                self.drop_target_registered = false;
+            }
+            target.deinit();
         }
-        self.drop_target.deinit();
 
         self.deinitCore();
         self.noteBenchmarkMemoryStage(.core_deinit_complete, null);
@@ -33768,6 +38409,10 @@ pub const Surface = struct {
         // includes one trace-path allocation per traced surface.
         self.noteBenchmarkMemoryStage(.surface_destroy_complete, null);
         self.memory_stage_trace.deinit(alloc);
+        // DestroyWindow still has messages to send after WM_DESTROY: a pane
+        // that kept the keyboard focus gets its WM_KILLFOCUS only then, once
+        // focus leaves the dying window. Those must not find this Surface.
+        if (own_hwnd) |handle| setWindowData(handle, null);
         alloc.destroy(self);
     }
 
@@ -34154,6 +38799,10 @@ pub const Surface = struct {
     ) !void {
         const host = self.host orelse return error.NoHost;
         const alloc = self.app.core_app.alloc;
+        // The user's own paste (a keybinding, a drop, a quick-select
+        // paste) or a program's OSC 52 read.
+        const program_request = request == .osc_52_read;
+        if (program_request) try self.declineProgramRequest();
 
         // Defensive: clear any leftover op before queuing a new one so
         // the destructor can't see a mixed state.
@@ -34168,16 +38817,19 @@ pub const Surface = struct {
         // committed successfully and a later setup step failed.
         errdefer alloc.free(data_copy);
 
+        const program_body = if (program_request) try self.programClipboardPromptBody(.read) else null;
+        defer if (program_body) |body| alloc.free(body);
         try host.showConfirm(
             .{
-                .title = "Allow clipboard paste?",
-                .body = "noctty needs confirmation before completing this clipboard paste or read request.",
+                .title = if (program_request) labels.programClipboardPromptTitle(.read) else "Allow clipboard paste?",
+                .body = program_body orelse "noctty needs confirmation before completing this clipboard paste.",
                 .accept_label = "Allow",
                 .cancel_label = "Cancel",
                 // Preview the exact bytes the gate stopped. `data_copy`
                 // is what Accept delivers; the preview is built from the
                 // same bytes and capped for display only.
                 .contents = data,
+                .program_request = program_request,
             },
             surfaceConfirmPasteAccept,
             surfaceConfirmPasteCancel,
@@ -34205,6 +38857,8 @@ pub const Surface = struct {
     ) !void {
         const host = self.host orelse return error.NoHost;
         const alloc = self.app.core_app.alloc;
+        // Only a program's OSC 52 write asks first (`clipboard-write = ask`).
+        try self.declineProgramRequest();
 
         if (self.pending_clipboard_op) |*old| old.deinit(alloc);
         self.pending_clipboard_op = null;
@@ -34253,13 +38907,16 @@ pub const Surface = struct {
             break :preview contents[0].data;
         };
 
+        const body = try self.programClipboardPromptBody(.write);
+        defer alloc.free(body);
         try host.showConfirm(
             .{
-                .title = "Allow clipboard write?",
-                .body = "noctty needs confirmation before allowing this application to write to the Windows clipboard.",
+                .title = labels.programClipboardPromptTitle(.write),
+                .body = body,
                 .accept_label = "Allow",
                 .cancel_label = "Cancel",
                 .contents = preview_contents,
+                .program_request = true,
             },
             surfaceConfirmWriteAccept,
             surfaceConfirmWriteCancel,
@@ -34276,10 +38933,32 @@ pub const Surface = struct {
         } };
     }
 
+    /// A program's clipboard request that gets no prompt. It never
+    /// replaces a prompt that is waiting for an answer: that hid the
+    /// user's own paste or close prompt, or another pane's, behind one the
+    /// program chose the moment of. And a terminal in no tab (one kept
+    /// alive for close-tab undo still runs) has no tab the prompt could
+    /// name. Checked before the requester touches its pending op, which
+    /// may be what the open prompt delivers.
+    fn declineProgramRequest(self: *Surface) !void {
+        const host = self.host orelse return error.NoHost;
+        if (host.overlay_mode == .confirm) return error.ConfirmPromptOpen;
+        // Nor the palette, search or a rename the user is typing in.
+        if (host.overlay_mode != .none) return error.OverlayOpen;
+        if (self.app.findTabForSurface(self) == null) return error.NotInATab;
+    }
+
+    fn programClipboardPromptBody(self: *Surface, request: labels.ProgramClipboardRequest) ![]u8 {
+        return labels.buildProgramClipboardPromptBody(
+            self.app.core_app.alloc,
+            request,
+            self.app.hostTabStatus(self).index + 1,
+            self.effectiveTitle(),
+        );
+    }
+
     fn readClipboardText(self: *Surface) !?[:0]u8 {
-        if (sys.OpenClipboard(self.hwnd) == 0) {
-            return lastError();
-        }
+        if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
         if (sys.IsClipboardFormatAvailable(c.CF_UNICODETEXT) == 0) return null;
@@ -34291,17 +38970,17 @@ pub const Surface = struct {
         const text_w: [*:0]const u16 = @ptrCast(@alignCast(locked));
         const slice_w = std.mem.sliceTo(text_w, 0);
         const alloc = self.app.core_app.alloc;
-        return try lfLineEndings(alloc, try std.unicode.utf16LeToUtf8AllocZ(alloc, slice_w));
+        return try lfLineEndings(alloc, try clipboardTextToUtf8(alloc, slice_w));
     }
 
     fn writeClipboardText(self: *const Surface, text: []const u8) !void {
         const alloc = self.app.core_app.alloc;
-        const text_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, text);
+        const crlf = try crlfLineEndings(alloc, text);
+        defer if (crlf) |owned| alloc.free(owned);
+        const text_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, crlf orelse text);
         defer alloc.free(text_w);
 
-        if (sys.OpenClipboard(self.hwnd) == 0) {
-            return lastError();
-        }
+        if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
         if (sys.EmptyClipboard() == 0) {
@@ -34340,16 +39019,8 @@ pub const Surface = struct {
     fn writeClipboardHtml(self: *const Surface, html: []const u8, plain: ?[]const u8) !void {
         const alloc = self.app.core_app.alloc;
 
-        // Lazily register CF_HTML once per App. The ID is process-
-        // local and stable.
-        if (self.app.cf_html_format == 0) {
-            const id = sys.RegisterClipboardFormatW(CF_HTML_NAME);
-            if (id == 0) {
-                return lastError();
-            }
-            self.app.cf_html_format = id;
-        }
-        const cf_html = self.app.cf_html_format;
+        const cf_html = win32_ole.htmlFormat();
+        if (cf_html == 0) return lastError();
 
         const wrapped = try win32_clipboard_html.wrapFragment(alloc, html);
         defer alloc.free(wrapped);
@@ -34367,12 +39038,14 @@ pub const Surface = struct {
             plain_owned_for_free = stripped;
             break :blk stripped;
         };
-        const plain_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, plain_src);
+        // CRLF for the plain fallback only: CF_HTML's header holds byte
+        // offsets into the wrapped fragment.
+        const plain_crlf = try crlfLineEndings(alloc, plain_src);
+        defer if (plain_crlf) |owned| alloc.free(owned);
+        const plain_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, plain_crlf orelse plain_src);
         defer alloc.free(plain_w);
 
-        if (sys.OpenClipboard(self.hwnd) == 0) {
-            return lastError();
-        }
+        if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
         if (sys.EmptyClipboard() == 0) {
@@ -34562,6 +39235,7 @@ const TestSession = struct {
                 .alloc = self.allocator,
                 .hinstance = sys.GetModuleHandleW(null),
                 .ownerWindow = &settingsOwnerWindowThunk,
+                .appIcon = &settingsAppIconThunk,
                 .chromeBg = &settingsChromeBgThunk,
                 .textPrimary = &settingsTextPrimaryThunk,
                 .themeColors = &settingsThemeColorsThunk,
@@ -34572,6 +39246,11 @@ const TestSession = struct {
                 .configRevision = &settingsConfigRevisionThunk,
                 .previewField = &settingsPreviewFieldThunk,
                 .notifyConflict = &settingsNotifyConflictThunk,
+                .reconcileDisk = &settingsReconcileDiskThunk,
+                .failureDetail = &settingsFailureDetailThunk,
+                .maskedKeys = &settingsMaskedKeysThunk,
+                .saveTarget = &settingsSaveTargetThunk,
+                .configProblems = &settingsConfigProblemsThunk,
                 .notifySuccess = &settingsNotifySuccessThunk,
                 .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
                 .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
@@ -34624,7 +39303,7 @@ const TestSession = struct {
                 .core_surface = uninitializedInertStorage(CoreSurface),
                 .undo_stack = win32_undo.UndoStack.init(undo_allocator),
                 .search_bar = win32_search_bar.SearchBar.init(self.allocator),
-                .drop_target = win32_surface_drop_target.DropTarget.init(
+                .drop_target = try win32_surface_drop_target.DropTarget.create(
                     self.allocator,
                     @ptrCast(surface),
                     &surfaceDropPayloadCallback,
@@ -34668,7 +39347,8 @@ const TestSession = struct {
                 }
                 if (record.undo_initialized) record.surface.undo_stack.deinit();
                 record.surface.search_bar.deinit();
-                record.surface.drop_target.deinit();
+                if (record.surface.drop_target) |target| target.deinit();
+                record.surface.drop_target = null;
             }
         }
 
@@ -34693,6 +39373,7 @@ const TestSession = struct {
             app.config.deinit();
             app.hosts.deinit(self.allocator);
             app.windows.deinit(self.allocator);
+            app.discardDeferredOpens();
         }
         if (self.core_app_initialized) self.core_app.?.deinit();
         self.* = .{};
@@ -34860,6 +39541,35 @@ test "win32 undo redo actions prune expired empty-host structural history before
     try std.testing.expect(try app.performAction(.app, .redo, {}));
     try std.testing.expectEqual(@as(usize, 0), host.structural_redo_entries.items.len);
     try std.testing.expectEqualStrings("Nothing to redo.", host.banner_text.?);
+}
+
+test "win32 undo and redo aimed at a surface with nothing to do are not performed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+
+    // A key press on the pane and the palette aim at the surface. The default
+    // bindings are performable, so nothing to undo or redo must report false
+    // and say nothing: the chord then goes on to the program in the pane.
+    try std.testing.expect(!try app.performAction(.{ .surface = surface.core() }, .undo, {}));
+    try std.testing.expect(!try app.performAction(.{ .surface = surface.core() }, .redo, {}));
+    try std.testing.expect(host.banner_text == null);
+
+    // An app-level request has no key to hand back, so it answers.
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    try std.testing.expectEqualStrings("Nothing to undo.", host.banner_text.?);
 }
 
 test "win32 local undo capture invalidates host structural redo only" {
@@ -36091,6 +40801,406 @@ test "win32 closeTab right no-op preserves redo and structural history" {
     try std.testing.expectEqual(@as(usize, 1), surface_b.undo_stack.redoDepth());
 }
 
+test "win32 window close asks first when a terminal would lose its process" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // A read-only core answers `needsConfirmQuit` before it reads the
+    // terminal, so the inert fixture core can stand in for a busy one.
+    surface_b.core_surface.readonly = true;
+    surface_b.core_initialized = true;
+    host.close();
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close this window?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in this window. Closing the window will terminate it.",
+        host.confirm_payload.?.body,
+    );
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    // Cancel leaves the window as it was.
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    // Nothing to lose, or a sign-out: no prompt.
+    host.close();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    app.session_ending = true;
+    surface_b.core_initialized = true;
+    host.close();
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+}
+
+test "win32 close other tabs asks first and keeps history until Close" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+        },
+    });
+    defer session.deinit();
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .close_tab,
+        .timestamp_ms = 10,
+        .payload = .{ .close_tab = .{ .tab = null, .index = 3, .tab_id = 4 } },
+    });
+
+    // Only the tab to the left is busy: closing the tabs to the right of
+    // tab 2 has nothing to ask about.
+    surface_a.core_surface.readonly = true;
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.app, .right));
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .close_tab,
+        .timestamp_ms = 20,
+        .payload = .{ .close_tab = .{ .tab = null, .index = 3, .tab_id = 4 } },
+    });
+    try std.testing.expect(try app.closeTab(.app, .other));
+    surface_a.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close the other tabs?", host.confirm_payload.?.title);
+    // Not closed yet, so not cleared yet: Cancel must leave undo intact.
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), host.tabs.items.len);
+
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.app, .other));
+    surface_a.core_initialized = false;
+    host.invokeConfirmAccept();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+}
+
+test "win32 quit asks once on the window it came from" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b, .host = &host_b, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &surface_a, .id = 1 },
+            .{ .host = &host_b, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    app.running = true;
+    // Ids for the lookups Settings makes when it closes. The inert fixture
+    // cores are otherwise only read for `readonly`, which `needsConfirmQuit`
+    // checks before anything else and which stands in for a busy terminal.
+    surface_a.core_surface.id = 1;
+    surface_b.core_surface.id = 2;
+    surface_b.core_surface.readonly = true;
+
+    // The busy terminal is in the other window; the prompt still shows
+    // where the quit came from.
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expectEqualStrings("Quit noctty?", host_a.confirm_payload.?.title);
+    try std.testing.expect(app.running);
+    // Asking again from the other window keeps the one prompt.
+    try std.testing.expect(try app.performAction(.{ .surface = surface_b.core() }, .quit, {}));
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    host_a.invokeConfirmCancel();
+
+    // `close_all_windows` quits too, and asks the same way. With no window
+    // named and none focused, the window with the running process asks.
+    try std.testing.expect(try app.performAction(.app, .close_all_windows, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_b.overlay_mode);
+    try std.testing.expect(app.running);
+    try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+    host_b.invokeConfirmCancel();
+
+    // Save or Discard in a Settings prompt that a quit raised resumes it,
+    // on the window Settings hands focus back to.
+    app.settings_window.quit_after_close = true;
+    surface_b.core_initialized = true;
+    settingsOnClosedThunk(@ptrCast(&app));
+    surface_b.core_initialized = false;
+    try std.testing.expect(!app.settings_window.quit_after_close);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    host_a.invokeConfirmCancel();
+    try std.testing.expect(app.running);
+
+    // With a window to post to, the quit waits for the message loop: core
+    // keeps using the terminal whose key asked for it after this returns.
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    host_a.hwnd = hwnd;
+    defer host_a.hwnd = null;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    var msg: sys.MSG = undefined;
+    try std.testing.expect(sys.PeekMessageW(&msg, hwnd, c.WM_WINHOSTTY_QUIT, c.WM_WINHOSTTY_QUIT, c.PM_REMOVE) != 0);
+    try std.testing.expectEqual(@as(WPARAM, 1), msg.wParam);
+
+    // A post that fails declines the quit rather than running it under
+    // the key handler. The non-null edit handle stands in for the overlay
+    // controls, so a quit run in place would open its prompt here.
+    const dead_hwnd = try createTestHostWindow();
+    _ = sys.DestroyWindow(dead_hwnd);
+    host_a.hwnd = dead_hwnd;
+    host_a.overlay_edit_hwnd = dead_hwnd;
+    defer host_a.overlay_edit_hwnd = null;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expect(app.running);
+}
+
+test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_held: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_held, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // The background tab's program reads the clipboard.
+    const opened_at = sys.GetTickCount64();
+    try surface_b.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    const payload = host.confirm_payload.?;
+    try std.testing.expectEqualStrings("Let a program read your clipboard?", payload.title);
+    try std.testing.expectEqualStrings(
+        "Tab 2 (noctty) asked to read your clipboard. Allow sends it the text below.",
+        payload.body,
+    );
+    try std.testing.expect(payload.program_request);
+    try std.testing.expect(payload.armed_at_ms >= opened_at + program_confirm_arming_ms);
+
+    // Allow right after it opened is a key that was already on its way.
+    // (Pinned so a stalled test cannot reach the inert core.)
+    host.confirm_payload.?.armed_at_ms = std.math.maxInt(u64);
+    host.invokeConfirmAccept();
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expect(surface_b.pending_clipboard_op != null);
+
+    // Once armed, any other key on the prompt (the Tab or Left of someone
+    // still typing) starts the half second over.
+    host.confirm_payload.?.armed_at_ms = 0;
+    const key_at = sys.GetTickCount64();
+    host.holdProgramConfirmForKey(c.VK_TAB);
+    try std.testing.expect(host.confirm_payload.?.armed_at_ms >= key_at + program_confirm_arming_ms);
+    // A modifier alone does not: a held Shift repeats.
+    host.confirm_payload.?.armed_at_ms = 0;
+    host.holdProgramConfirmForKey(c.VK_SHIFT);
+    try std.testing.expectEqual(@as(u64, 0), host.confirm_payload.?.armed_at_ms);
+
+    // Another program's request does not take the prompt's place, and does
+    // not touch the parked read.
+    try std.testing.expectError(error.ConfirmPromptOpen, surface_a.requestWriteConfirm(
+        .standard,
+        &.{.{ .mime = "text/plain", .data = "x" }},
+    ));
+    try std.testing.expectError(error.ConfirmPromptOpen, surface_b.requestPasteConfirm(.{ .osc_52_read = .standard }, "again"));
+    try std.testing.expectEqualStrings("secret", surface_b.pending_clipboard_op.?.paste.data);
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+
+    // A write gets its own words too.
+    try surface_a.requestWriteConfirm(.standard, &.{.{ .mime = "text/plain", .data = "x" }});
+    try std.testing.expectEqualStrings("Let a program change your clipboard?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "Tab 1 (noctty) asked to replace your clipboard with the text below.",
+        host.confirm_payload.?.body,
+    );
+    try std.testing.expect(host.confirm_payload.?.program_request);
+    host.invokeConfirmCancel();
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+
+    // A terminal in no tab (one kept for close-tab undo) has no tab the
+    // prompt could name.
+    try std.testing.expectError(error.NotInATab, surface_held.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret"));
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+}
+
+test "win32 a prompt that replaces another answers it as Cancel" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    try surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    try std.testing.expect(surface_a.pending_clipboard_op != null);
+
+    // The user's own paste in the other tab replaces it: the read's payload
+    // is released, not parked until that tab's next request. The user's
+    // prompt keeps its wording, opens armed and keeps its payload.
+    try surface_b.requestPasteConfirm(.paste, "a\nb");
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+    const payload = host.confirm_payload.?;
+    try std.testing.expectEqualStrings("Allow clipboard paste?", payload.title);
+    try std.testing.expect(!payload.program_request);
+    try std.testing.expectEqual(@as(u64, 0), payload.armed_at_ms);
+    try std.testing.expectEqualStrings("a\nb", surface_b.pending_clipboard_op.?.paste.data);
+
+    // A tab replacing its own prompt keeps the new request.
+    try surface_b.requestPasteConfirm(.paste, "c\nd");
+    try std.testing.expectEqualStrings("c\nd", surface_b.pending_clipboard_op.?.paste.data);
+
+    host.invokeConfirmCancel();
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+
+    // Anything else that closes a confirm answers it as Cancel too: the
+    // palette, search and rename hide the open overlay first.
+    try surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    host.hideOverlay();
+    try std.testing.expect(surface_a.pending_clipboard_op == null);
+
+    // A user prompt has no arming to hold.
+    try surface_b.requestPasteConfirm(.paste, "e\nf");
+    host.holdProgramConfirm();
+    try std.testing.expectEqual(@as(u64, 0), host.confirm_payload.?.armed_at_ms);
+    host.invokeConfirmCancel();
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+
+    // A program does not close what the user is typing in either.
+    try host.showOverlay(.surface_title, null);
+    try std.testing.expectError(error.OverlayOpen, surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret"));
+    try std.testing.expectEqual(HostOverlayMode.surface_title, host.overlay_mode);
+    host.hideOverlay();
+
+    // Closing the requester's tab into undo history takes its prompt with
+    // it: Allow would answer a terminal that is now only history.
+    try surface_b.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    var entry = host.detachTabForUndo(1).?;
+    defer entry.dispose(&host, .host_destroy) catch {}; // Best-effort test teardown.
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expect(surface_b.pending_clipboard_op == null);
+    try std.testing.expect(try host.restoreClosedTabEntry(&entry.payload.close_tab));
+}
+
+test "win32 close prompts count the terminals they would end" {
+    var buf: [256]u8 = undefined;
+    const one = closeScopePrompt(.right_tabs, 1, &buf);
+    try std.testing.expectEqualStrings("Close the tabs to the right?", one.title);
+    try std.testing.expectEqualStrings("Close tabs", one.accept_label);
+    try std.testing.expectEqualStrings(
+        "A process is still running in a tab to the right. Closing those tabs will terminate it.",
+        one.body,
+    );
+    const tab = closeScopePrompt(.this_tab, 2, &buf);
+    try std.testing.expectEqualStrings("Close this tab?", tab.title);
+    try std.testing.expectEqualStrings("Close tab", tab.accept_label);
+    try std.testing.expectEqualStrings(
+        "Processes are still running in 2 terminals in this tab. Closing the tab will terminate them, and undo is off.",
+        tab.body,
+    );
+    const many = closeScopePrompt(.app, 3, &buf);
+    try std.testing.expectEqualStrings("Quit", many.accept_label);
+    try std.testing.expectEqualStrings(
+        "Processes are still running in 3 terminals. Quitting noctty will terminate them.",
+        many.body,
+    );
+}
+
 test "win32 closeTab this on last tab detaches tab for undo" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -36118,6 +41228,231 @@ test "win32 closeTab this on last tab detaches tab for undo" {
     try std.testing.expect(!surface.window_visible);
     try std.testing.expectEqual(@as(usize, 0), surface.undo_stack.undoDepth());
     try std.testing.expectEqual(@as(usize, 0), surface.undo_stack.redoDepth());
+}
+
+test "win32 close_tab this asks first once undo is off" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+
+    // Tab 1 is behind tab 2 and busy: read-only mode stands in for a running
+    // program, as in the close-prompt tests above.
+    surface_a.core_surface.readonly = true;
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
+    surface_a.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close this tab?", host.confirm_payload.?.title);
+    // Nothing closed, and nothing sits in undo history: the tab was not detached.
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
+    surface_a.core_initialized = false;
+    host.invokeConfirmAccept();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), host.activeSurface());
+}
+
+test "win32 close_tab this closes at once while undo is on or nothing would be lost" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 2 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+        },
+    });
+    defer session.deinit();
+
+    // Undo is on (the default): a busy tab closes without a prompt, because
+    // the tab can come back.
+    surface_a.core_surface.readonly = true;
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
+    surface_a.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+
+    // Undo is off but the tab holds nothing that is running: no prompt either.
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+}
+
+test "win32 removing a background tab tells UIA the tab list changed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 2 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+        },
+    });
+    defer session.deinit();
+
+    // The root a screen reader reaches the host window through; the tab
+    // buttons are child windows of that window.
+    const root = try win32_uia.RootProvider.create(std.testing.allocator, @ptrFromInt(0x1));
+    defer _ = win32_uia.RootProvider.Release(&root.base);
+    host.root_uia_provider = root;
+    defer host.root_uia_provider = null;
+
+    // Tab 3 stays in front through both closes, so no selection changes and
+    // the structure event is the only thing that tells a reader.
+    const before = win32_uia.events.testing_structure_changes;
+    try std.testing.expect(host.closeTabInPlace(0));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try std.testing.expectEqual(before + 1, win32_uia.events.testing_structure_changes);
+
+    // A background tab whose program exits goes the same way.
+    app.windowDestroyed(&surface_b);
+    try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+    try std.testing.expectEqual(before + 2, win32_uia.events.testing_structure_changes);
+}
+
+test "win32 redoing a tab close tells UIA the tab list changed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host },
+            .{ .storage = &surface_b, .host = &host },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    const root = try win32_uia.RootProvider.create(std.testing.allocator, @ptrFromInt(0x1));
+    defer _ = win32_uia.RootProvider.Release(&root.base);
+    host.root_uia_provider = root;
+    defer host.root_uia_provider = null;
+
+    var entry = host.detachTabForUndo(1).?;
+    defer entry.dispose(&host, .host_destroy) catch {}; // Best-effort test teardown.
+    const close_tab = &entry.payload.close_tab;
+    try std.testing.expect(try host.restoreClosedTabEntry(close_tab));
+
+    const before = win32_uia.events.testing_structure_changes;
+    try std.testing.expect(try host.redoClosedTabEntry(close_tab));
+    try std.testing.expectEqual(before + 1, win32_uia.events.testing_structure_changes);
+}
+
+test "win32 closing a background tab from its button leaves the active tab in front" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var surface_d: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 2 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+            .{ .storage = &surface_d, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+            .{ .host = &host, .surface = &surface_d, .id = 4 },
+        },
+    });
+    defer session.deinit();
+
+    // C is in front. Closing A, before it, and then D, after it, keeps C.
+    try std.testing.expect(host.closeTabInPlace(0));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try std.testing.expect(host.closeTabInPlace(2));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    // Both can be undone.
+    try std.testing.expectEqual(@as(usize, 2), host.structural_undo_entries.items.len);
+
+    // Activation that shows no window, as after a pane exits while
+    // `toggle_visibility` hides the windows, leaves them hidden.
+    app.windows_hidden = true;
+    app.activateSurfaceNoFocus(&surface_c);
+    try std.testing.expect(app.windows_hidden);
 }
 
 test "win32 prune preserves empty host while structural undo remains" {
@@ -36186,6 +41521,68 @@ test "win32 app undo redo replays last tab close without active surface" {
     try std.testing.expectEqual(@as(usize, 0), host.structural_redo_entries.items.len);
     try std.testing.expect(!surface.host_active);
     try std.testing.expect(!surface.window_visible);
+}
+
+test "PKG32 empty second host undo key restores its own tab and redo cannot target the first host" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b, .host = &host_b, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &surface_a, .id = 11 },
+            .{ .host = &host_b, .surface = &surface_b, .id = 22 },
+        },
+    });
+    defer session.deinit();
+    core_app.focused = true;
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    const undo: input.KeyEvent = .{ .unshifted_codepoint = 'z', .mods = .{ .ctrl = true, .shift = true } };
+    const redo: input.KeyEvent = .{ .unshifted_codepoint = 'y', .mods = .{ .ctrl = true, .shift = true } };
+
+    // Both keys use the same app-scoped dispatch path as a native key on B.
+    // A still has a live surface, so a lost host identity would select A.
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, undo));
+    try std.testing.expectEqual(@as(usize, 1), host_b.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), host_b.structural_redo_entries.items.len);
+    try std.testing.expect(app.empty_host_key_id == null);
+
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, redo));
+    try std.testing.expectEqual(@as(usize, 0), host_b.tabs.items.len);
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, redo));
+    try std.testing.expectEqualStrings("Nothing to redo.", host_b.banner_text.?);
+    try std.testing.expect(host_a.banner_text == null);
+
+    // Expiry is checked before choosing a target. With B's history gone,
+    // the key still must not display a banner or consume history in A.
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+    host_b.structural_undo_entries.items[0].timestamp_ms = 0;
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, undo));
+    try std.testing.expectEqual(@as(usize, 0), host_b.structural_undo_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), host_b.tabs.items.len);
+    try std.testing.expect(host_a.banner_text == null);
+
+    // A pruned host can be removed; retain only its ID through dispatch.
+    _ = app.hosts.orderedRemove(1);
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, undo));
+    try std.testing.expect(app.emptyHostKeyEvent(host_b.id, redo));
+    try std.testing.expect(host_a.banner_text == null);
+    try std.testing.expect(app.empty_host_key_id == null);
 }
 
 test "win32 app undo redo uses focused host" {
@@ -36388,6 +41785,13 @@ test "win32 closeTab this restores tab when structural undo push fails" {
     try std.testing.expect(surface_b.window_visible);
     try std.testing.expectEqual(@as(usize, 1), surface_b.undo_stack.undoDepth());
     try std.testing.expectEqual(@as(usize, 1), surface_b.undo_stack.redoDepth());
+
+    // A background tab closed from its button that fails the same way
+    // comes back where it was, and B stays the active tab.
+    try std.testing.expect(!host.closeTabInPlace(0));
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_a), host.tabs.items[0].focusedSurface());
+    try std.testing.expectEqual(@as(usize, 1), host.active_tab);
 }
 
 test "win32 closeTab this on last tab restores tab when structural undo push fails" {
@@ -37114,6 +42518,138 @@ test "win32 windowDestroyed detaches the removed tab UIA provider" {
             provider,
         ) == null,
     );
+}
+
+test "win32 closing a split keeps focus, or gives it to the closed pane's sibling" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // [A | (B / C)], natively and in the shell model.
+    const Split = struct {
+        fn native(tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
+            var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
+            defer inserted.deinit();
+            const next = try tab.tree.split(std.testing.allocator, tab.findHandle(at).?, direction, 0.5, &inserted);
+            tab.tree.deinit();
+            tab.tree = next;
+        }
+        fn shell(target: *App, at: *Surface, direction: win32_shell.model.Direction, view: *Surface) !void {
+            var prepared = try target.shell_runtime.prepare(.{ .split_pane = .{ .pane = at.shell_id.?, .direction = direction } });
+            defer prepared.deinit();
+            try prepared.commit(&target.shell_runtime);
+            view.shell_id = prepared.created.pane;
+            view.shell_committed = true;
+        }
+        /// What `Surface.requestClose` prepares before it destroys the pane.
+        fn close(target: *App, tab: *Tab, view: *Surface) !void {
+            view.pending_close_tree = try tab.tree.remove(std.testing.allocator, tab.findHandle(view).?);
+            view.pending_shell_close = try target.shell_runtime.prepare(.{ .close_pane = view.shell_id.? });
+            target.windowDestroyed(view);
+        }
+    };
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    surface_a.shell_id = window.created.pane;
+    surface_a.shell_committed = true;
+    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
+    tab.shell_id = window.created.tab;
+    try host.tabs.append(std.testing.allocator, tab);
+    const native_tab = &host.tabs.items[0];
+    try Split.native(native_tab, &surface_a, .right, &surface_b);
+    try Split.shell(&app, &surface_a, .right, &surface_b);
+    try Split.native(native_tab, &surface_b, .down, &surface_c);
+    try Split.shell(&app, &surface_b, .down, &surface_c);
+    // The user is in B; C exits in the background. Focus stays on B, not on
+    // the tree's first pane, A.
+    native_tab.focused = native_tab.findHandle(&surface_b).?;
+    _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
+    try app.validateShellNativeMapping();
+    try Split.close(&app, native_tab, &surface_c);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
+    try app.validateShellNativeMapping();
+
+    // Split B again and close the focused new pane: focus goes to its
+    // sibling B, as the shell model chooses, not to A.
+    try Split.native(native_tab, &surface_b, .down, &surface_c);
+    try Split.shell(&app, &surface_b, .down, &surface_c);
+    native_tab.focused = native_tab.findHandle(&surface_c).?;
+    _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
+    try app.validateShellNativeMapping();
+    try Split.close(&app, native_tab, &surface_c);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
+    try app.validateShellNativeMapping();
+}
+
+test "win32 a background tab's exit keeps the active tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // Tabs [A, B, C] with B active, natively and in the shell model.
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c };
+    for (surfaces, 0..) |surface, index| {
+        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = window.created.window.? });
+        defer if (created) |*prepared| prepared.deinit();
+        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
+        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
+        surface.shell_committed = true;
+        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
+        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
+        try host.tabs.append(std.testing.allocator, tab);
+    }
+    host.active_tab = 1;
+    _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
+    try app.validateShellNativeMapping();
+
+    // A's program exits: its tab closes and B stays active (C before).
+    surface_a.pending_shell_close = try app.shell_runtime.prepare(.{ .close_tab = host.tabs.items[0].shell_id.? });
+    app.windowDestroyed(&surface_a);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), host.activeSurface());
+    try app.validateShellNativeMapping();
 }
 
 test "win32 terminal undo snapshot restores terminal state" {
@@ -38387,6 +43923,7 @@ test "win32 copySharedWindowStateFrom clones host-scoped window fields" {
     source.fullscreen = true;
     source.topmost = true;
     source.restore_rect = .{ .left = 10, .top = 20, .right = 30, .bottom = 40 };
+    source.restore_monitor = .{ .monitor = @ptrFromInt(1), .info = std.mem.zeroes(MONITORINFO), .dpi = 144 };
     source.restore_placement = std.mem.zeroes(WINDOWPLACEMENT);
     source.restore_placement.showCmd = c.SW_MAXIMIZE;
     source.restore_placement.rcNormalPosition = .{ .left = 50, .top = 60, .right = 70, .bottom = 80 };
@@ -38411,6 +43948,7 @@ test "win32 copySharedWindowStateFrom clones host-scoped window fields" {
     try std.testing.expectEqual(source.topmost, dest.topmost);
     try std.testing.expectEqualDeep(source.restore_rect, dest.restore_rect);
     try std.testing.expectEqualDeep(source.restore_placement, dest.restore_placement);
+    try std.testing.expectEqualDeep(source.restore_monitor, dest.restore_monitor);
     try std.testing.expectEqualDeep(source.default_client_size, dest.default_client_size);
     try std.testing.expectEqualDeep(source.cell_size_pixels, dest.cell_size_pixels);
     try std.testing.expectEqual(source.background_opacity_default, dest.background_opacity_default);
@@ -38476,6 +44014,19 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             return placement.rcNormalPosition;
         }
 
+        const Monitors = struct {
+            handles: [8]sys.HMONITOR = undefined,
+            count: usize = 0,
+
+            fn collect(monitor: sys.HMONITOR, _: HDC, _: *RECT, data: LPARAM) callconv(.winapi) BOOL {
+                const self: *@This() = @ptrFromInt(@as(usize, @bitCast(data)));
+                if (self.count == self.handles.len) return 0;
+                self.handles[self.count] = monitor;
+                self.count += 1;
+                return 1;
+            }
+        };
+
         // Maximizing shows a window, so these live on a desktop of their
         // own and never reach the user's.
         fn body(desktop: *anyopaque) !void {
@@ -38518,6 +44069,53 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             try clone.inheritWindowStateFrom(&surface);
             try std.testing.expect(sys.IsZoomed(clone.hwnd.?) != 0);
             try std.testing.expectEqualDeep(normal, try normalRect(clone.hwnd.?));
+
+            // Exercise real monitor/DPI transitions on this hidden desktop.
+            var monitors: Monitors = .{};
+            _ = sys.EnumDisplayMonitors(null, null, Monitors.collect, @bitCast(@intFromPtr(&monitors)));
+            for (monitors.handles[0..monitors.count]) |source_monitor| {
+                const source_info = monitorInfo(source_monitor) orelse return lastError();
+                for (monitors.handles[0..monitors.count]) |dest_monitor| {
+                    if (source_monitor == dest_monitor) continue;
+                    const dest_info = monitorInfo(dest_monitor) orelse return lastError();
+                    for ([_]i32{ 600, source_info.work_area.width() - 40 }) |normal_width| {
+                        for ([_]bool{ false, true }) |maximized| {
+                            _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+                            try std.testing.expect(sys.SetWindowPos(hwnd, null, source_info.work_area.left + 100, source_info.work_area.top + 100, normal_width, 400, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+                            const source_dpi = sys.GetDpiForWindow(hwnd);
+                            var before: RECT = undefined;
+                            try std.testing.expect(sys.GetWindowRect(hwnd, &before) != 0);
+                            if (maximized) _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+                            try surface.enterFullscreen();
+                            try std.testing.expect(sys.SetWindowPos(hwnd, null, dest_info.full_rect.left, dest_info.full_rect.top, dest_info.full_rect.width(), dest_info.full_rect.height(), c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
+                            const dest_dpi = sys.GetDpiForWindow(hwnd);
+                            try surface.leaveFullscreen();
+                            try std.testing.expectEqual(maximized, sys.IsZoomed(hwnd) != 0);
+                            try std.testing.expectEqual(dest_monitor, sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST).?);
+                            const width = @min(dest_info.work_area.width(), sys.MulDiv(before.right - before.left, @intCast(dest_dpi), @intCast(source_dpi)));
+                            const height = @min(dest_info.work_area.height(), sys.MulDiv(before.bottom - before.top, @intCast(dest_dpi), @intCast(source_dpi)));
+                            const expected_left = @max(dest_info.work_area.left, @min(before.left + dest_info.work_area.left - source_info.work_area.left, dest_info.work_area.right - width));
+                            const expected_top = @max(dest_info.work_area.top, @min(before.top + dest_info.work_area.top - source_info.work_area.top, dest_info.work_area.bottom - height));
+                            if (maximized) {
+                                const placed = try normalRect(hwnd);
+                                try std.testing.expectEqual(expected_left - (dest_info.work_area.left - dest_info.full_rect.left), placed.left);
+                                try std.testing.expectEqual(expected_top - (dest_info.work_area.top - dest_info.full_rect.top), placed.top);
+                                try std.testing.expectEqual(width, placed.right - placed.left);
+                                try std.testing.expectEqual(height, placed.bottom - placed.top);
+                                _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+                                try std.testing.expectEqual(dest_monitor, sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST).?);
+                            } else {
+                                var restored: RECT = undefined;
+                                try std.testing.expect(sys.GetWindowRect(hwnd, &restored) != 0);
+                                try std.testing.expectEqual(expected_left, restored.left);
+                                try std.testing.expectEqual(expected_top, restored.top);
+                                try std.testing.expectEqual(width, restored.right - restored.left);
+                                try std.testing.expectEqual(height, restored.bottom - restored.top);
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -40731,6 +46329,102 @@ test "security regression win32 paste WM_DROPFILES matches OLE formatting and cl
     try std.testing.expect(win32_paste_protection.inspect(payload).severity != .safe);
 }
 
+test "security regression win32 link opener allows local junctions without PATHEXT retry" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("target");
+    try tmp.dir.writeFile(.{ .sub_path = "target/safe.txt", .data = "safe" });
+    try tmp.dir.writeFile(.{ .sub_path = "target/probe.cmd", .data = "@exit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "target/binary", .data = "MZ\x00\x00" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const target = try std.fs.path.join(alloc, &.{ root, "target" });
+    defer alloc.free(target);
+    const junction = try std.fs.path.join(alloc, &.{ root, "junction" });
+    defer alloc.free(junction);
+    // Junction creation needs no symlink privilege or developer mode. Windows
+    // need not live in C:\Windows, so take cmd.exe from SystemRoot.
+    const system_root = try std.process.getEnvVarOwned(alloc, "SystemRoot");
+    defer alloc.free(system_root);
+    const cmd_exe = try std.fs.path.join(alloc, &.{ system_root, "System32", "cmd.exe" });
+    defer alloc.free(cmd_exe);
+    const result = try std.process.Child.run(.{ .allocator = alloc, .argv = &.{ cmd_exe, "/d", "/c", "mklink", "/J", junction, target } });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+    // Remove just our junction before tmpDir cleanup, never its target contents.
+    defer tmp.dir.deleteDir("junction") catch {};
+    var writer = try tmp.dir.createFile("target/active.log", .{ .read = true });
+    defer writer.close();
+    const active = try std.fs.path.join(alloc, &.{ junction, "active.log" });
+    defer alloc.free(active);
+    try std.testing.expect(try App.isAllowedWin32OpenTarget(alloc, active));
+    for ([_][]const u8{ "safe.txt", "probe", "binary" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ junction, name });
+        defer alloc.free(path);
+        try std.testing.expectEqual(std.mem.eql(u8, name, "safe.txt"), try App.isAllowedWin32OpenTarget(alloc, path));
+        if (std.mem.eql(u8, name, "safe.txt")) {
+            const prepared = (try App.prepareWin32OpenTarget(alloc, path)).?;
+            defer alloc.free(prepared);
+            try std.testing.expectEqualStrings(path, prepared);
+        }
+    }
+    try std.testing.expect(try App.isAllowedWin32OpenTarget(alloc, junction));
+}
+
+test "security regression win32 link opener allows local symlinks" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "safe.txt", .data = "safe" });
+    const target = try tmp.dir.realpathAlloc(alloc, "safe.txt");
+    defer alloc.free(target);
+    tmp.dir.symLink(target, "absolute.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try tmp.dir.symLink("safe.txt", "relative.txt", .{});
+    try tmp.dir.makeDir("directory");
+    try tmp.dir.writeFile(.{ .sub_path = "directory/safe.txt", .data = "safe" });
+    try tmp.dir.symLink("directory", "folder", .{ .is_directory = true });
+    try tmp.dir.symLink("cycle-b.txt", "cycle-a.txt", .{});
+    try tmp.dir.symLink("cycle-a.txt", "cycle-b.txt", .{});
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    for ([_][]const u8{ "absolute.txt", "relative.txt", "folder/safe.txt", "folder" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        try std.testing.expect(try App.isAllowedWin32OpenTarget(alloc, path));
+    }
+    const cycle = try std.fs.path.join(alloc, &.{ root, "cycle-a.txt" });
+    defer alloc.free(cycle);
+    try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, cycle));
+}
+
+test "security regression win32 link opener refuses UNC symlinks and local chains to UNC" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp.dir.symLink("\\\\noctty-invalid-host.invalid\\share\\safe.txt", "network.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const network = try std.fs.path.join(alloc, &.{ root, "network.txt" });
+    defer alloc.free(network);
+    try tmp.dir.symLink(network, "chain.txt", .{});
+    for ([_][]const u8{ "network.txt", "chain.txt" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, path));
+    }
+}
+
 test "security regression win32 link opener allows known schemes and safe local files" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -40748,11 +46442,117 @@ test "security regression win32 link opener allows known schemes and safe local 
         "gemini://example.com",
         "gopher://example.com",
         "news:comp.security.misc",
-        "C:\\docs\\readme.txt",
-        "file:///C:/docs/readme.txt",
-        "file://localhost/C:/docs/a%20b.txt",
     }) |target| {
         try std.testing.expect(try App.isAllowedWin32OpenTarget(std.testing.allocator, target));
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a b.txt", .data = "ordinary document" });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "a b.txt");
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(try App.isAllowedWin32OpenTarget(std.testing.allocator, path));
+    try tmp.dir.makeDir("directory");
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    for ([_][]const u8{ "./a b.txt", "directory/../a b.txt" }) |relative| {
+        const navigation = try std.fs.path.join(std.testing.allocator, &.{ root, relative });
+        defer std.testing.allocator.free(navigation);
+        try std.testing.expect(try App.isAllowedWin32OpenTarget(std.testing.allocator, navigation));
+    }
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://localhost/{s}", .{path});
+    defer std.testing.allocator.free(uri);
+    try std.testing.expect(try App.isAllowedWin32OpenTarget(std.testing.allocator, uri));
+}
+
+test "security regression win32 link opener rejects PATHEXT siblings and path aliases" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "probe.cmd", .data = "@exit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "safe.txt", .data = "safe" });
+    try tmp.dir.makeDir("directory");
+    try tmp.dir.writeFile(.{ .sub_path = "directory/safe.txt", .data = "safe" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    for ([_][]const u8{ "probe", "safe.txt.", "safe.txt ", "probe.cmd.", "probe.cmd ", "directory./safe.txt", "directory /safe.txt", "directory./../safe.txt" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, path));
+        std.mem.replaceScalar(u8, path, '\\', '/');
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, path));
+        const uri = try std.fmt.allocPrint(alloc, "file:///{s}", .{path});
+        defer alloc.free(uri);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, uri));
+    }
+}
+
+test "security regression win32 link opener preserves directories and extensionless text but rejects PE" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("directory.exe");
+    try tmp.dir.writeFile(.{ .sub_path = "README", .data = "plain text" });
+    try tmp.dir.writeFile(.{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "binary", .data = "MZ\x00\x00" });
+    for ([_][]const u8{ "directory.exe", "README", "empty", "binary" }) |name| {
+        const path = try tmp.dir.realpathAlloc(alloc, name);
+        defer alloc.free(path);
+        try std.testing.expectEqual(!std.mem.eql(u8, name, "binary"), try App.isAllowedWin32OpenTarget(alloc, path));
+    }
+}
+
+test "security regression win32 link opener rejects dangerous handler files" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{
+        "rdp",          "library-ms", "searchConnector-ms", "diagcab",           "iso",   "img",       "vhd", "vhdx",
+        "appinstaller", "msix",       "appx",               "settingcontent-ms", "theme", "themepack", "xll", "website",
+        "jnlp",         "wsc",        "exe",                "cmd",               "lnk",   "ps1",
+    }) |extension| {
+        const name = try std.fmt.allocPrint(alloc, "dangerous.{s}", .{extension});
+        defer alloc.free(name);
+        try tmp.dir.writeFile(.{ .sub_path = name, .data = "fixture" });
+        const path = try tmp.dir.realpathAlloc(alloc, name);
+        defer alloc.free(path);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, path));
+    }
+    // Windows treats the whole leading-dot basename as its extension, unlike
+    // std.fs.path.extension, which is intended to preserve Unix dotfiles.
+    for ([_][]const u8{ ".cmd", ".rdp", ".exe", ".lnk", ".ps1" }) |name| {
+        try tmp.dir.writeFile(.{ .sub_path = name, .data = "fixture" });
+        const path = try tmp.dir.realpathAlloc(alloc, name);
+        defer alloc.free(path);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, path));
+        std.mem.replaceScalar(u8, path, '\\', '/');
+        const uri = try std.fmt.allocPrint(alloc, "file:///{s}", .{path});
+        defer alloc.free(uri);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, uri));
+    }
+}
+
+test "security regression win32 link opener screens normalized navigation targets" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "probe.cmd", .data = "@exit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "binary", .data = "MZ\x00\x00" });
+    for ([_][]const u8{ "probe.cmd", "binary" }) |name| {
+        const path = try tmp.dir.realpathAlloc(alloc, name);
+        defer alloc.free(path);
+        const navigation = try std.fmt.allocPrint(alloc, "{s}\\.", .{path});
+        defer alloc.free(navigation);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, navigation));
+        std.mem.replaceScalar(u8, navigation, '\\', '/');
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, navigation));
+        const uri = try std.fmt.allocPrint(alloc, "file:///{s}", .{navigation});
+        defer alloc.free(uri);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, uri));
     }
 }
 
@@ -40815,6 +46615,161 @@ test "security regression win32 link opener rejects before shell dispatch" {
         DispatchProbe.dispatch,
     );
     try std.testing.expect(allowed.called);
+}
+
+test "security regression win32 link opener dispatches the exact decoded file URI path" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a b%.txt", .data = "document" });
+    const path = try tmp.dir.realpathAlloc(alloc, "a b%.txt");
+    defer alloc.free(path);
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    std.mem.replaceScalar(u8, root, '\\', '/');
+    const uri = try std.fmt.allocPrint(alloc, "file://localhost/{s}/a%20b%25.txt", .{root});
+    defer alloc.free(uri);
+    const Probe = struct {
+        expected: []const u8,
+        called: bool = false,
+        fn dispatch(self: *@This(), target: []const u8) !void {
+            const normalized = try std.testing.allocator.dupe(u8, target);
+            defer std.testing.allocator.free(normalized);
+            std.mem.replaceScalar(u8, normalized, '/', '\\');
+            try std.testing.expectEqualStrings(self.expected, normalized);
+            try std.testing.expect(try App.isAllowedWin32OpenTarget(std.testing.allocator, target));
+            self.called = true;
+        }
+    };
+    var probe: Probe = .{ .expected = path };
+    try App.openWin32Target(alloc, &probe, uri, Probe.dispatch);
+    try std.testing.expect(probe.called);
+    // Navigation must be resolved before both inspection and dispatch.
+    const navigation_uri = try std.fmt.allocPrint(alloc, "file://localhost/{s}/./a%20b%25.txt", .{root});
+    defer alloc.free(navigation_uri);
+    probe.called = false;
+    try App.openWin32Target(alloc, &probe, navigation_uri, Probe.dispatch);
+    try std.testing.expect(probe.called);
+    const navigation_path = try std.fmt.allocPrint(alloc, "{s}/./a b%.txt", .{root});
+    defer alloc.free(navigation_path);
+    probe.called = false;
+    try App.openWin32Target(alloc, &probe, navigation_path, Probe.dispatch);
+    try std.testing.expect(probe.called);
+}
+
+test "security regression win32 link opener PATHEXT live probe on hidden desktop" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const enabled = std.process.getEnvVarOwned(std.testing.allocator, "NOCTTY_RUN_LINK_PATHEXT_PROBE") catch return error.SkipZigTest;
+    defer std.testing.allocator.free(enabled);
+    if (!std.mem.eql(u8, enabled, "1")) return error.SkipZigTest;
+
+    const Probe = struct {
+        extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+        extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+
+        calls: usize = 0,
+        fn dispatch(self: *@This(), target: []const u8) !void {
+            self.calls += 1;
+            try shell(target);
+        }
+        fn shell(target: []const u8) !void {
+            const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, target);
+            defer std.testing.allocator.free(wide);
+            const result = sys.ShellExecuteW(null, shell_open, wide.ptr, null, null, c.SW_HIDE);
+            if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+        }
+        fn run(desktop: *anyopaque, result: *anyerror!void) void {
+            result.* = body(desktop);
+        }
+        fn body(desktop: *anyopaque) !void {
+            if (SetThreadDesktop(desktop) == 0) return lastError();
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            // This is the only executable supplied to ShellExecute: a harmless
+            // marker command inside this test's own temporary directory.
+            try tmp.dir.writeFile(.{ .sub_path = "probe.cmd", .data = "@echo off\r\necho ran>\"%~dp0marker\"\r\nexit /b 0\r\n" });
+            const root = try tmp.dir.realpathAlloc(alloc, ".");
+            defer alloc.free(root);
+            const path = try std.fs.path.join(alloc, &.{ root, "probe" });
+            defer alloc.free(path);
+            for ([_]bool{ false, true }) |forward_slashes| {
+                if (forward_slashes) std.mem.replaceScalar(u8, path, '\\', '/');
+                // Positive control proves this host's ShellExecute really
+                // retries the missing literal with probe.cmd, for both slashes.
+                try shell(path);
+                var seen = false;
+                for (0..100) |_| {
+                    tmp.dir.access("marker", .{}) catch {
+                        std.Thread.sleep(50 * std.time.ns_per_ms);
+                        continue;
+                    };
+                    seen = true;
+                    break;
+                }
+                try std.testing.expect(seen);
+                try tmp.dir.deleteFile("marker");
+                var probe: @This() = .{};
+                try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, path, dispatch));
+                try std.testing.expectEqual(@as(usize, 0), probe.calls);
+                try std.testing.expectError(error.FileNotFound, tmp.dir.access("marker", .{}));
+            }
+            const uri = try std.fmt.allocPrint(alloc, "file:///{s}", .{path});
+            defer alloc.free(uri);
+            // Unlike a plain path, the raw file URI did not PATHEXT-retry.
+            try std.testing.expectError(error.OpenUrlFailed, shell(uri));
+            var probe: @This() = .{};
+            try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, uri, dispatch));
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+            try std.testing.expectError(error.FileNotFound, tmp.dir.access("marker", .{}));
+
+            try tmp.dir.copyFile("probe.cmd", tmp.dir, ".cmd", .{});
+            const dotfile = try std.fs.path.join(alloc, &.{ root, ".cmd" });
+            defer alloc.free(dotfile);
+            try shell(dotfile);
+            var seen = false;
+            for (0..100) |_| {
+                tmp.dir.access("marker", .{}) catch {
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    continue;
+                };
+                seen = true;
+                break;
+            }
+            try std.testing.expect(seen);
+            try tmp.dir.deleteFile("marker");
+            probe = .{};
+            try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, dotfile, dispatch));
+            std.mem.replaceScalar(u8, dotfile, '\\', '/');
+            const dotfile_uri = try std.fmt.allocPrint(alloc, "file:///{s}", .{dotfile});
+            defer alloc.free(dotfile_uri);
+            try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, dotfile_uri, dispatch));
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+            try std.testing.expectError(error.FileNotFound, tmp.dir.access("marker", .{}));
+        }
+    };
+    const name = try std.fmt.allocPrint(std.testing.allocator, "noctty-link-probe-{}", .{windows.GetCurrentProcessId()});
+    defer std.testing.allocator.free(name);
+    const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+    defer std.testing.allocator.free(wide_name);
+    const desktop = Probe.CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return lastError();
+    defer _ = Probe.CloseDesktop(desktop);
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{ desktop, &result });
+    thread.join();
+    try result;
+    // A successful filtered build is not proof this named test ran. The
+    // wrapper supplies a fresh receipt path and requires this final sentinel.
+    const receipt_path = try std.process.getEnvVarOwned(std.testing.allocator, "NOCTTY_LINK_PATHEXT_PROBE_RECEIPT");
+    defer std.testing.allocator.free(receipt_path);
+    if (!windows_shell.isSafeWindowsPath(receipt_path) or
+        !windows_shell.isDriveAbsolutePath(receipt_path) or
+        internal_os.path.isNetworkOrDevicePath(receipt_path)) return error.UnsafeProbeReceiptPath;
+    const receipt = try std.fs.createFileAbsolute(receipt_path, .{ .exclusive = true });
+    defer receipt.close();
+    try receipt.writeAll("NOCTTY_LINK_PATHEXT_PROBE_COMPLETE\n");
 }
 
 test "win32 win32_ipc.encodeListWindowsRequest carries the response deadline" {
@@ -41952,6 +47907,9 @@ test "win32 session state scrollback capture enforces line cap budget and secure
         .mutex = &renderer_mutex,
         .terminal = &terminal_state,
     };
+    // The renderer state above stands in for a live core; capture skips a
+    // surface without one.
+    normal_surface.core_initialized = true;
     var host: Host = .{ .app = &app, .id = 1 };
     defer {
         for (host.tabs.items) |*tab| tab.deinit();
@@ -41983,6 +47941,15 @@ test "win32 session state scrollback capture enforces line cap budget and secure
     const redacted_encoded = try win32_session_state.encodeAlloc(std.testing.allocator, saved_state);
     defer std.testing.allocator.free(redacted_encoded);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, redacted_encoded, "\"scrollback\""));
+
+    // A display-change or end-session save can arrive while a surface is
+    // still in its tab but its core is gone (mid-teardown) or not yet up.
+    normal_surface.core_initialized = false;
+    const torn_down_state = try app.buildSessionState(state_arena.allocator(), 2);
+    for (torn_down_state.windows[0].tabs[0].layout.nodes) |node| switch (node) {
+        .pane => |pane| try std.testing.expect(pane.scrollback == null),
+        .split => {},
+    };
 }
 
 test "win32 session scrollback restore marks snapshots and rejects control lines" {
@@ -42956,12 +48923,118 @@ test "win32 explicit startup flows bypass session restore" {
     try std.testing.expect(!sessionRestorePolicyAllows(true, .always, true, false, false, false));
     try std.testing.expect(!sessionRestorePolicyAllows(false, .never, true, false, false, false));
     try std.testing.expect(!sessionRestorePolicyAllows(false, .always, false, true, true, true));
+}
 
-    // Startup-only restore bypasses must not disable later session saves.
-    try std.testing.expect(sessionSavePolicyAllows(false, .default, true, false, false));
-    try std.testing.expect(!sessionSavePolicyAllows(false, .default, false, false, false));
-    try std.testing.expect(!sessionSavePolicyAllows(false, .default, true, true, false));
-    try std.testing.expect(!sessionSavePolicyAllows(false, .default, true, false, true));
+test "win32 session state is saved only by the process that owns it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(state_path);
+
+    var app: App = undefined;
+    app.safe_mode = false;
+    app.embedding_mode = false;
+    app.startup_profile_picker = false;
+    app.explicit_startup_working_directory = false;
+    app.config.@"window-save-state" = .always;
+    app.config.@"initial-window" = true;
+    app.config.@"initial-command" = null;
+
+    // A launch that forwarded to the primary, lost the IPC race or failed
+    // before its first window never took the session, and with no windows
+    // its save would delete it.
+    app.session_owner = null;
+    try std.testing.expect(!app.sessionStateEnabled());
+
+    app.session_owner = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    defer app.releaseSessionOwnership();
+    try std.testing.expect(app.sessionStateEnabled());
+
+    // A default-terminal handoff server never restored the workspace, so it
+    // must not replace or delete it.
+    app.embedding_mode = true;
+    try std.testing.expect(!app.sessionStateEnabled());
+    app.embedding_mode = false;
+
+    // Neither may an explicit-directory launch (Explorer's "Open noctty
+    // here" verb, a jump-list folder), which never restored it either.
+    app.explicit_startup_working_directory = true;
+    try std.testing.expect(!app.sessionStateEnabled());
+    app.explicit_startup_working_directory = false;
+
+    // A reload to window-save-state = never still stops the owner.
+    app.config.@"window-save-state" = .never;
+    try std.testing.expect(!app.sessionStateEnabled());
+    app.config.@"window-save-state" = .always;
+    try std.testing.expect(app.sessionStateEnabled());
+}
+
+test "win32 sign-out latches the session snapshot and a Restart Manager close does not" {
+    var app: App = undefined;
+    app.session_state_excluded_for_elevation = false;
+    // Not an owner, so the saves themselves are no-ops here.
+    app.session_owner = null;
+    app.palette_mru = .{null} ** 5;
+    app.session_ending = false;
+    app.session_checkpoint_ms = null;
+
+    // ENDSESSION_CLOSEAPP: an installer may leave noctty running.
+    app.saveForEndSession(true);
+    try std.testing.expect(!app.session_ending);
+    try std.testing.expect(app.session_checkpoint_ms != null);
+
+    // A second host's copy of the same message is throttled.
+    const now = sys.GetTickCount64();
+    app.session_checkpoint_ms = now - 500;
+    app.saveForEndSession(true);
+    try std.testing.expectEqual(now - 500, app.session_checkpoint_ms.?);
+    app.session_checkpoint_ms = now - 1500;
+    app.checkpointSessionState();
+    try std.testing.expect(app.session_checkpoint_ms.? >= now);
+
+    // A real sign-out is final: nothing saves after it.
+    app.saveForEndSession(false);
+    try std.testing.expect(app.session_ending);
+    app.session_checkpoint_ms = null;
+    app.saveForEndSession(true);
+    try std.testing.expectEqual(@as(?u64, null), app.session_checkpoint_ms);
+}
+
+test "win32 only a final session save deletes the saved session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "{}" });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
+    defer std.testing.allocator.free(path);
+
+    // A display-change or end-session checkpoint with no session windows
+    // (a host kept alive with zero tabs for undo) keeps the file.
+    try std.testing.expect(!removeEmptySessionState(path, .checkpoint));
+    try tmp.dir.access("session-state.json", .{});
+
+    // The owner closing its last window ends the session.
+    try std.testing.expect(removeEmptySessionState(path, .final));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
+}
+
+test "win32 session owner lock admits one live owner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    // The directory does not exist yet on a first run.
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "noctty", "session-state.json" });
+    defer std.testing.allocator.free(state_path);
+
+    const first = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    // A second instance (single-instance = false) finds it taken.
+    try std.testing.expect((try SessionOwnerLock.acquire(std.testing.allocator, state_path)) == null);
+    first.release();
+    // Once the owner is gone the next launch takes over.
+    const next = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    next.release();
 }
 
 test "win32 session restore transaction preserves first surface state" {
@@ -45579,6 +51652,51 @@ test "win32 gotoSplitFallback maps only previous and next" {
     try std.testing.expect(App.gotoSplitFallbackDirection(.next) != null);
     try std.testing.expect(App.gotoSplitFallbackDirection(.left) == null);
     try std.testing.expect(App.gotoSplitFallbackDirection(.right) == null);
+}
+
+test "win32 goto_split out of a zoomed pane unzooms, or moves the zoom" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{.{ .host = &host, .surface = &surface_a, .id = 1 }},
+    });
+    defer session.deinit();
+    var inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+    defer inserted.deinit();
+    const tab = &host.tabs.items[0];
+    const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+    tab.tree.deinit();
+    tab.tree = next_tree;
+    tab.focused = tab.findHandle(&surface_a).?;
+    tab.tree.zoom(tab.focused);
+    try pushUndoAndRedoBranch(&surface_a.undo_stack, std.testing.allocator, 80);
+
+    // Default: moving to B unzooms, so B is not left hidden behind A. The
+    // zoom change is a structural edit and drops the redo branch.
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .goto_split, .right));
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), tab.focusedSurface());
+    try std.testing.expect(tab.tree.zoomed == null);
+    try std.testing.expectEqual(@as(usize, 0), surface_a.undo_stack.redoDepth());
+
+    // `split-preserve-zoom = navigation`: the zoom follows to the pane.
+    tab.tree.zoom(tab.focused);
+    app.config.@"split-preserve-zoom".navigation = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_b.core() }, .goto_split, .left));
+    try std.testing.expectEqual(@as(?*Surface, &surface_a), tab.focusedSurface());
+    try std.testing.expectEqual(tab.focused, tab.tree.zoomed.?);
 }
 
 test "win32 command palette action parser accepts simple actions" {

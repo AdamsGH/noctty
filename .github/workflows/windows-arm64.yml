@@ -64,15 +64,16 @@ jobs:
         # matches), so this job reported ARM64 coverage it never had. A filter
         # is still only a subset; the full suite is what this job should run.
         run: |
-          zig build test -Demit-test-exe=true -Dtarget=aarch64-windows-msvc -Dcpu=baseline --summary all
+          zig build test -Demit-test-exe=true -Dcustom-shaders=true -Dtarget=aarch64-windows-msvc -Dcpu=baseline --summary all
 
       - name: Build and package ARM64 binaries
         shell: pwsh
-        timeout-minutes: 20
+        timeout-minutes: 45
         run: >
           ./scripts/build-package-windows.ps1
           -Version $env:NOCTTY_CI_VERSION
           -Architecture arm64
+          -Optimize ReleaseFast
 
       - name: Run ARM64 CLI smoke
         shell: pwsh

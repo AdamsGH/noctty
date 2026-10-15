@@ -23,11 +23,13 @@ const Config = @import("../config/Config.zig");
 const cli_help = @import("../cli/help.zig");
 const win32_types = @import("win32_types.zig");
 const win32_theme = @import("win32_theme.zig");
+const palette_catalog = @import("win32_palette_catalog.zig");
 const win32_uia = @import("win32_uia/mod.zig");
 const focus_cue = @import("win32/focus_cue.zig");
 const win32_input = @import("win32/input.zig");
 const settings_transaction = @import("win32_settings_transaction.zig");
 const sys = @import("win32/sys.zig");
+const config_problems = @import("win32/config_problems.zig");
 const SetFocus = sys.SetFocus;
 
 /// Minimal set of Win32 aliases + externs we need here. Shared ABI structs
@@ -39,6 +41,7 @@ const HBRUSH = win32_types.HBRUSH;
 const HCURSOR = win32_types.HCURSOR;
 const HDC = win32_types.HDC;
 const HGDIOBJ = win32_types.HGDIOBJ;
+const HICON = win32_types.HICON;
 const HRGN = *anyopaque;
 const HMENU = win32_types.HMENU;
 const LPCWSTR = win32_types.LPCWSTR;
@@ -58,8 +61,10 @@ const HMONITOR = sys.HMONITOR;
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 const WS_MAXIMIZEBOX: u32 = 0x00010000;
 const WS_EX_APPWINDOW: u32 = 0x00040000;
-const WS_BORDER: u32 = 0x00800000;
+const WS_EX_CONTROLPARENT: u32 = 0x00010000;
 const WS_VSCROLL: u32 = 0x00200000;
+const WS_CLIPCHILDREN: u32 = 0x02000000;
+const WS_CLIPSIBLINGS: u32 = 0x04000000;
 const SW_HIDE: i32 = 0;
 const SW_SHOWNORMAL: i32 = 1;
 const SW_RESTORE: i32 = 9;
@@ -80,7 +85,13 @@ const WM_CLOSE: UINT = 0x0010;
 const WM_NCCREATE: UINT = 0x0081;
 const WM_PAINT: UINT = 0x000F;
 const WM_ERASEBKGND: UINT = 0x0014;
+const WM_PRINTCLIENT: UINT = 0x0318;
+const WM_ENABLE: UINT = 0x000A;
 const WM_NCDESTROY: UINT = 0x0082;
+const WM_NCCALCSIZE: UINT = 0x0083;
+const WM_NCHITTEST: UINT = 0x0084;
+const WM_NCPAINT: UINT = 0x0085;
+const HTCLIENT: LRESULT = 1;
 const WM_GETOBJECT: UINT = 0x003D;
 const WM_COMMAND: UINT = 0x0111;
 const WM_SIZE: UINT = 0x0005;
@@ -92,6 +103,25 @@ const WM_MOUSEMOVE: UINT = 0x0200;
 const WM_MOUSELEAVE: UINT = 0x02A3;
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_SYSKEYDOWN: UINT = 0x0104;
+const WM_ACTIVATE: UINT = 0x0006;
+const WM_SETICON: UINT = 0x0080;
+/// `WM_ACTIVATE` low word: the window is being deactivated.
+const WA_INACTIVE: usize = 0;
+const ICON_SMALL: usize = 0;
+const ICON_BIG: usize = 1;
+const VK_RETURN: usize = 0x0D;
+const VK_ESCAPE: usize = 0x1B;
+const BM_CLICK: UINT = 0x00F5;
+const DLGC_DEFPUSHBUTTON: LRESULT = 0x0010;
+const DLGC_UNDEFPUSHBUTTON: LRESULT = 0x0020;
+const WM_GETDLGCODE: UINT = 0x0087;
+const SPI_GETWHEELSCROLLLINES: UINT = 0x0068;
+const WHEEL_DELTA: i32 = 120;
+const WHEEL_PAGESCROLL: u32 = 0xFFFF_FFFF;
+const CB_GETDROPPEDSTATE: UINT = 0x0157;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
+const VK_SHIFT: i32 = 0x10;
 const WM_MENUCHAR: UINT = 0x0120;
 /// `WM_MENUCHAR` reply: close the active menu without a beep.
 const MNC_CLOSE: u32 = 1;
@@ -124,7 +154,7 @@ const WM_SETTINGS_PROOF_LIVE_FOCUS_RING: UINT = WM_APP + 0x106;
 const WM_SETTINGS_PROOF_CHILD: UINT = WM_APP + 0x107;
 const WM_SETTINGS_PROOF_SET_FOCUS: UINT = WM_APP + 0x108;
 const WM_SETTINGS_PROOF_PAINT_COUNT: UINT = WM_APP + 0x109;
-const WM_SETTINGS_PROOF_LAYOUT_REDRAW_SUCCEEDED: UINT = WM_APP + 0x10A;
+const WM_SETTINGS_PROOF_LAYOUT_BATCHED: UINT = WM_APP + 0x10A;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_TABSTOP: u32 = 0x00010000;
@@ -149,9 +179,11 @@ const BTN_CONFLICT_KEEP: usize = 303;
 const BTN_CONFLICT_USE_DISK: usize = 304;
 const BTN_CLOSE_SAVE: usize = 305;
 const BTN_CLOSE_DISCARD: usize = 306;
-// IsDialogMessageW maps Escape to the conventional cancel control ID,
-// including when focus is inside an EDIT or COMBO child.
-const BTN_CLOSE_KEEP_EDITING: usize = 2;
+// IsDialogMessageW maps Escape to the conventional cancel command ID
+// (IDCANCEL), including when focus is inside an EDIT or COMBO child. The
+// close prompt's "Keep editing" button owns that ID.
+const IDCANCEL: usize = 2;
+const BTN_CLOSE_KEEP_EDITING: usize = IDCANCEL;
 const EDIT_SCROLLBACK: usize = 401;
 const EDIT_FONT_SIZE: usize = 402;
 const COMBO_CONFIRM_CLOSE: usize = 403;
@@ -202,6 +234,7 @@ const CB_SETCURSEL: UINT = 0x014E;
 const CB_GETCURSEL: UINT = 0x0147;
 const CB_RESETCONTENT: UINT = 0x014B;
 const CB_SETITEMHEIGHT: UINT = 0x0153;
+const CB_GETITEMHEIGHT: UINT = 0x0154;
 const CBS_DROPDOWNLIST: u32 = 0x3;
 const CBS_HASSTRINGS: u32 = 0x200;
 const OBJID_CLIENT: u32 = @bitCast(@as(i32, -4));
@@ -213,9 +246,16 @@ const CLSCTX_INPROC_SERVER: u32 = 0x1;
 const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 const SPI_GETWORKAREA: UINT = 0x0030;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
+const SWP_NOSIZE: UINT = 0x0001;
+const SWP_NOMOVE: UINT = 0x0002;
 const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOREDRAW: UINT = 0x0008;
 const SWP_NOACTIVATE: UINT = 0x0010;
+const SWP_FRAMECHANGED: UINT = 0x0020;
+const SWP_NOCOPYBITS: UINT = 0x0100;
+const SW_SCROLLCHILDREN: UINT = 0x0001;
+const SW_INVALIDATE: UINT = 0x0002;
+const SM_CXVSCROLL: c_int = 2;
 const SB_VERT: c_int = 1;
 const SB_LINEUP: usize = 0;
 const SB_LINEDOWN: usize = 1;
@@ -231,7 +271,6 @@ const SIF_POS: u32 = 0x0004;
 const SIF_TRACKPOS: u32 = 0x0010;
 const TME_LEAVE: u32 = 0x00000002;
 const RDW_INVALIDATE: u32 = 0x0001;
-const RDW_ERASE: u32 = 0x0004;
 const RDW_ALLCHILDREN: u32 = 0x0080;
 const RDW_UPDATENOW: u32 = 0x0100;
 
@@ -287,13 +326,13 @@ pub const Section = enum(u32) {
 
     fn placeholderText(self: Section) []const u8 {
         return switch (self) {
-            .appearance => "Font family, size, theme, opacity, cursor, padding, and background blur.",
-            .terminal => "Scrollback, close confirmation, copy behavior, and clipboard trimming.",
-            .shell => "Default shell command and shell integration detection mode.",
-            .privacy => "Clipboard access, link handling, and notification privacy controls.",
-            .updates => "Automatic update policy and release channel.",
-            .keybindings => "Open the config file for keybind edits; list defaults, actions, and docs from the CLI.",
-            .advanced => "Updater defaults plus the text editor escape hatch for config keys that do not yet have native controls.",
+            .appearance => "Fonts, theme, opacity, cursor, and window padding.",
+            .terminal => "Scrollback, closing, copying, and clipboard trimming.",
+            .shell => "The program a new tab starts, and how noctty works with your shell.",
+            .privacy => "What programs may do with your clipboard, links, and notifications.",
+            .updates => "Whether noctty checks for updates, and which releases it follows.",
+            .keybindings => "Key bindings are set in the config file. Open it here, or list the current bindings from a terminal.",
+            .advanced => "Open the config file in your text editor for settings that have no control here. The file Settings saves to, the problems found in the config, and changes you have not saved yet are listed below.",
         };
     }
 };
@@ -360,6 +399,100 @@ pub const SettingField = enum {
     padding_balance,
     auto_update,
     auto_update_channel,
+
+    /// The name a person sees for this setting in the conflict message, the
+    /// Advanced page and the command palette. The enum tag is an internal
+    /// identifier (the palette's stable id and payload still use it) and must
+    /// not reach the screen.
+    pub fn label(self: SettingField) []const u8 {
+        return switch (self) {
+            .scrollback_limit => "Scrollback limit",
+            .font_size => "Font size",
+            .background_opacity => "Background opacity",
+            .window_padding_x => "Window padding X",
+            .window_padding_y => "Window padding Y",
+            .trim_trailing_spaces => "Trim trailing spaces on copy",
+            .desktop_notifications => "Terminal desktop notifications",
+            .app_notify_clipboard => "Clipboard copy notification",
+            .app_notify_config => "Config reload notification",
+            .confirm_close => "Close confirmation",
+            .copy_on_select => "Copy on select",
+            .clipboard_read => "Clipboard read requests (OSC 52)",
+            .clipboard_write => "Clipboard write requests (OSC 52)",
+            .link_url => "Clickable URL opening",
+            .link_previews => "Link preview popups",
+            .window_theme => "Window theme",
+            .shell_integration => "Shell integration",
+            .cursor_style => "Cursor style",
+            .background_blur => "Background blur",
+            .padding_balance => "Window padding balance",
+            .auto_update => "Auto-update mode",
+            .auto_update_channel => "Auto-update channel",
+        };
+    }
+
+    /// The config-file key behind this setting (`app-notifications` for the two
+    /// notification toggles, which are sub-fields of it).
+    pub fn configKey(self: SettingField) []const u8 {
+        return switch (self) {
+            .scrollback_limit => "scrollback-limit",
+            .font_size => "font-size",
+            .background_opacity => "background-opacity",
+            .window_padding_x => "window-padding-x",
+            .window_padding_y => "window-padding-y",
+            .trim_trailing_spaces => "clipboard-trim-trailing-spaces",
+            .desktop_notifications => "desktop-notifications",
+            .app_notify_clipboard, .app_notify_config => "app-notifications",
+            .confirm_close => "confirm-close-surface",
+            .copy_on_select => "copy-on-select",
+            .clipboard_read => "clipboard-read",
+            .clipboard_write => "clipboard-write",
+            .link_url => "link-url",
+            .link_previews => "link-previews",
+            .window_theme => "window-theme",
+            .shell_integration => "shell-integration",
+            .cursor_style => "cursor-style",
+            .background_blur => "background-blur",
+            .padding_balance => "window-padding-balance",
+            .auto_update => "auto-update",
+            .auto_update_channel => "auto-update-channel",
+        };
+    }
+
+    /// Words that find this setting in the command palette besides its label:
+    /// the config key people copy from the docs, and the plain words for it.
+    /// The key has to be here, because the palette matches on keywords.
+    pub fn paletteKeywords(self: SettingField) []const u8 {
+        const kw = struct {
+            fn with(comptime words: []const u8) []const u8 {
+                return "settings preferences configuration " ++ words;
+            }
+        }.with;
+        return switch (self) {
+            .scrollback_limit => kw("scrollback-limit history lines buffer"),
+            .font_size => kw("font-size text zoom"),
+            .background_opacity => kw("background-opacity transparency transparent"),
+            .window_padding_x => kw("window-padding-x margin"),
+            .window_padding_y => kw("window-padding-y margin"),
+            .trim_trailing_spaces => kw("clipboard-trim-trailing-spaces whitespace copy"),
+            .desktop_notifications => kw("desktop-notifications alerts"),
+            .app_notify_clipboard => kw("app-notifications clipboard-copy toast"),
+            .app_notify_config => kw("app-notifications config-reload toast"),
+            .confirm_close => kw("confirm-close-surface quit exit running"),
+            .copy_on_select => kw("copy-on-select selection clipboard"),
+            .clipboard_read => kw("clipboard-read osc 52 paste"),
+            .clipboard_write => kw("clipboard-write osc 52 copy"),
+            .link_url => kw("link-url url hyperlink"),
+            .link_previews => kw("link-previews url hyperlink tooltip"),
+            .window_theme => kw("window-theme dark light mode"),
+            .shell_integration => kw("shell-integration powershell bash prompt"),
+            .cursor_style => kw("cursor-style caret block bar underline"),
+            .background_blur => kw("background-blur"),
+            .padding_balance => kw("window-padding-balance margin"),
+            .auto_update => kw("auto-update upgrade"),
+            .auto_update_channel => kw("auto-update-channel stable tip release"),
+        };
+    }
 };
 
 const OwnedSettingField = enum {
@@ -411,6 +544,81 @@ const SettingsStatus = union(enum) {
     none,
 };
 
+/// What the status line says while no validation error or conflict needs the
+/// user. A note is replaced by the next edit.
+const StatusNote = enum {
+    none,
+    saved,
+    saved_overridden,
+    save_failed,
+    /// The config file is UTF-16 or UTF-32 text that a save cannot patch.
+    unsupported_encoding,
+    /// The config path is a link whose target is missing.
+    dangling_link,
+    /// The config file holds NUL bytes without a byte order mark.
+    binary_config,
+    /// A config file, or a file it includes, will not open. Names it.
+    file_unopenable,
+    /// The in-place rewrite stopped part way. Names the complete copy.
+    write_incomplete,
+    close_failed,
+    resolve_first,
+    conflict_not_resolved,
+    disk_value_not_adopted,
+    /// An edit whose result shows in the open terminals at once.
+    previews_live,
+    /// An edit that only takes effect once it is saved.
+    applies_on_save,
+
+    fn text(self: StatusNote) []const u8 {
+        return switch (self) {
+            .none => "",
+            .saved => "Settings saved.",
+            .saved_overridden => "Saved, but a later config file or command-line option overrides some of these values, so they will not take effect.",
+            .save_failed => "Save failed. Your edits are kept. Check that the config file can be written and is not open in another program, then try again.",
+            .unsupported_encoding => "Nothing was saved: the config file is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .dangling_link => "Nothing was saved: the config file is a link to a file that does not exist. Fix or remove the link, then save again. Your edits are kept.",
+            .binary_config => "Nothing was saved: the config file contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .file_unopenable => "Nothing was saved: a config file cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.",
+            .write_incomplete => "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in a temporary file beside it. Copy that over the config file, then save again. Your edits are kept.",
+            .close_failed => "Could not close the settings window; your edits are kept.",
+            .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
+            .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
+            .disk_value_not_adopted => "Could not take the value from disk; your edit is kept.",
+            .previews_live => "Previewing now. Save to keep it.",
+            .applies_on_save => "Applies when you save.",
+        };
+    }
+
+    /// Whether the sentence can name what it is about (`textWithDetail`): a
+    /// file, or for a save that a later layer overrides, the settings.
+    fn takesDetail(self: StatusNote) bool {
+        return switch (self) {
+            .file_unopenable, .write_incomplete, .unsupported_encoding, .binary_config, .saved_overridden => true,
+            else => false,
+        };
+    }
+
+    /// `text` with the file named: what `detail` holds is a path, or a short
+    /// phrase ending in one; for `saved_overridden`, the config keys. Owned.
+    fn textWithDetail(self: StatusNote, alloc: std.mem.Allocator, detail: []const u8) std.mem.Allocator.Error![]u8 {
+        return switch (self) {
+            .saved_overridden => std.fmt.allocPrint(alloc, "Saved, but a later config file or command-line option overrides {s}, so the saved value is not used.", .{detail}),
+            .unsupported_encoding => std.fmt.allocPrint(alloc, "Nothing was saved: {s} is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
+            .binary_config => std.fmt.allocPrint(alloc, "Nothing was saved: {s} contains NUL bytes, so it is a binary file or text in UTF-16 or UTF-32. Save it as UTF-8 in an editor, then save again. Your edits are kept.", .{detail}),
+            .file_unopenable => std.fmt.allocPrint(alloc, "Nothing was saved: {s} cannot be opened. Close any program that has it open, or check its permissions, then save again. Your edits are kept.", .{detail}),
+            .write_incomplete => std.fmt.allocPrint(alloc, "Saving stopped part way through the config file, which may now be incomplete. The complete new text is kept in {s}. Copy that over the config file, then save again. Your edits are kept.", .{detail}),
+            else => alloc.dupe(u8, self.text()),
+        };
+    }
+};
+
+/// Shown beside the disabled Save button, so that "nothing to save" is said in
+/// words and does not have to be read from the button's shade (a disabled Save
+/// is nearly indistinguishable from an enabled one in the dark theme).
+const nothing_to_save_text = "No changes to save.";
+const unsaved_changes_text = "You have unsaved changes.";
+
 pub const SettingValue = union(SettingField) {
     scrollback_limit: @FieldType(Config, "scrollback-limit"),
     font_size: @FieldType(Config, "font-size"),
@@ -442,6 +650,69 @@ fn settingValueEql(a: SettingValue, b: SettingValue) bool {
 
 const SettingsTransaction = settings_transaction.Transaction(SettingField, SettingValue, settingValueEql);
 const setting_field_count = std.enums.values(SettingField).len;
+
+/// The lowest background opacity a live preview shows. The Background opacity
+/// field previews every keystroke, so typing 0.85 passes through 0 and the
+/// terminal window turns invisible until the next digit arrives. The floor
+/// applies to the preview of an edit only: the draft, the transaction and the
+/// saved value keep what was typed, and a rollback restores the exact
+/// original. A saved value already below the floor lowers it, so a preview
+/// never shows a window more transparent than the one the user already has.
+const preview_opacity_floor: f64 = 0.2;
+
+/// The value a live edit previews, which differs from the typed one only for
+/// the opacity floor above.
+fn previewValue(transaction: *const SettingsTransaction, typed: SettingValue) SettingValue {
+    switch (typed) {
+        .background_opacity => |opacity| {
+            const saved = (transaction.entryConst(.background_opacity) orelse return typed).current.background_opacity;
+            return .{ .background_opacity = @max(opacity, @min(preview_opacity_floor, saved)) };
+        },
+        else => return typed,
+    }
+}
+
+/// The command palette's row for `field`. The id and the payload stay the
+/// field's tag: saved recents and the dispatch of a chosen row key on it. What
+/// the user reads and searches is the label and the config key.
+pub fn paletteDescriptor(field: SettingField) palette_catalog.Descriptor {
+    const key = @tagName(field);
+    return .{
+        .item = .{
+            .id = palette_catalog.stableStringId(.setting, key),
+            .title = field.label(),
+            .subtitle = if (field == .background_blur) "Setting (not supported on Windows)" else "Setting",
+            .keywords = field.paletteKeywords(),
+        },
+        .payload = .{ .setting = key },
+    };
+}
+
+/// What a live preview of a field has to refresh once the App writes it to
+/// `app.config`. Rebuilding the theme costs 80-150 ms of UI thread (every host's
+/// brushes, fonts and DWM attributes, a forced redraw of everything, then the
+/// Settings window), and the preview fires on every keystroke, so each field
+/// gets only the work that shows it. Font size, padding, cursor style and
+/// blur have no consumer on a live surface, which reads its own copy of the
+/// config: the written value reaches terminals created afterwards, and
+/// `Surface.applyRuntimeConfig` reads none of them. A previewed field that
+/// gains one must be listed here.
+///
+/// The status line reads this too: only a field with an effect other than
+/// `.none` can say "Previewing now", because the other previewed fields show
+/// nothing in the open terminals until they are saved.
+pub const PreviewEffect = enum { none, theme, opacity };
+
+pub fn previewEffect(field: SettingField) PreviewEffect {
+    return switch (field) {
+        // `resolveTheme` reads `window-theme`, nothing else a preview edits.
+        .window_theme => .theme,
+        // The layered alpha of the host window is the only thing that makes
+        // `background-opacity` visible on Win32.
+        .background_opacity => .opacity,
+        else => .none,
+    };
+}
 
 pub const ConflictResolution = SettingsTransaction.Resolution;
 pub const ApplyId = SettingsTransaction.ApplyId;
@@ -505,14 +776,116 @@ fn setSettingValue(config: *Config, value: SettingValue) void {
     }
 }
 
+/// `text` without its backticks. The CLI help is written for Markdown; the
+/// Settings window shows plain text, where a backtick is just noise.
+fn withoutBackticks(comptime text: []const u8) *const [text.len - std.mem.count(u8, text, "`")]u8 {
+    comptime {
+        var out: [text.len - std.mem.count(u8, text, "`")]u8 = undefined;
+        var len: usize = 0;
+        for (text) |byte| {
+            if (byte == '`') continue;
+            out[len] = byte;
+            len += 1;
+        }
+        const result = out;
+        return &result;
+    }
+}
+
 fn keybindingsHelpText() []const u8 {
-    return "Useful commands:\n" ++
-        cli_help.keybinding_discovery_hint ++
-        "\n" ++
-        "Config syntax:\n" ++
-        "  keybind = ctrl+shift+c=copy_to_clipboard\n" ++
-        "  keybind = ctrl+a>n=new_window\n" ++
-        "  keybind = chain=goto_split:left";
+    return "Commands to run in a terminal:\n" ++
+        comptime withoutBackticks(cli_help.keybinding_discovery_hint) ++
+            "\n" ++
+            "Example lines for the config file:\n" ++
+            "  keybind = ctrl+shift+c=copy_to_clipboard\n" ++
+            "  keybind = ctrl+a>n=new_window\n" ++
+            "  keybind = chain=goto_split:left";
+}
+
+// Dropdown items. The position of an item IS the contract with the matching
+// `...FromComboIndex` / `comboIndexFrom...` pair below, and with the order of
+// the config enum's values as the form has always stored them: the text only
+// ever changes how an option reads. What is written to the config file is
+// still the raw token (`false`, `block_hollow`, ...), never this text.
+
+const CursorStyle = @FieldType(Config, "cursor-style");
+const AutoUpdate = @typeInfo(@FieldType(Config, "auto-update")).optional.child;
+const ReleaseChannel = @typeInfo(@FieldType(Config, "auto-update-channel")).optional.child;
+
+/// `true` asks unless the cursor is at a shell prompt, which needs the shell
+/// integration to know; without it a terminal is never "at a prompt", so it asks.
+const confirm_close_labels = [_][]const u8{ "Never", "Unless at a shell prompt", "Always" };
+/// `true` and `clipboard` differ only in the selection clipboard, which Windows
+/// does not have: both copy to the one clipboard.
+const copy_on_select_labels = [_][]const u8{ "Off", "On", "On (same as On on Windows)" };
+const clipboard_access_labels = [_][]const u8{ "Ask each time", "Always allow", "Never allow" };
+const link_url_labels = [_][]const u8{ "On", "Off" };
+const link_previews_labels = [_][]const u8{ "All links", "Only links the program sets", "Off" };
+/// `auto` and `system` resolve to the same thing in the Win32 runtime (follow
+/// the Windows light/dark setting); the config keeps both values, so both stay
+/// in the list and say so. `ghostty` is the dark palette plus the config's
+/// title bar colors.
+const window_theme_labels = [_][]const u8{
+    "Match Windows (auto, default)",
+    "Match Windows (system)",
+    "Light",
+    "Dark",
+    "Dark, custom title bar colors",
+};
+/// `detect` is what starts the integration for PowerShell and cmd on Windows.
+const shell_integration_labels = [_][]const u8{
+    "Off",
+    "Automatic (includes PowerShell and cmd)",
+    "Bash",
+    "Elvish",
+    "Fish",
+    "Nushell",
+    "Zsh",
+};
+const cursor_style_labels = [_][]const u8{ "Bar", "Block", "Underline", "Hollow block" };
+const padding_balance_labels = [_][]const u8{ "Off", "On (top padding capped)", "On (equal on all sides)" };
+/// A missing `auto-update` behaves as `check`.
+const auto_update_labels = [_][]const u8{
+    "Default (check for updates)",
+    "Off",
+    "Check for updates",
+    "Check and download updates",
+};
+/// The Windows updater only checks `stable` by itself; `tip` is a manual channel.
+const auto_update_channel_labels = [_][]const u8{ "Default (matches this build)", "Stable", "Tip (no automatic checks)" };
+
+fn confirmCloseFromComboIndex(idx: LRESULT) ?Config.ConfirmCloseSurface {
+    return switch (idx) {
+        0 => .false,
+        1 => .true,
+        2 => .always,
+        else => null,
+    };
+}
+
+fn comboIndexFromConfirmClose(value: Config.ConfirmCloseSurface) usize {
+    return switch (value) {
+        .false => 0,
+        .true => 1,
+        .always => 2,
+    };
+}
+
+fn copyOnSelectFromComboIndex(idx: LRESULT) ?Config.CopyOnSelect {
+    return switch (idx) {
+        0 => .false,
+        1 => .true,
+        2 => .clipboard,
+        else => null,
+    };
+}
+
+fn comboIndexFromCopyOnSelect(value: Config.CopyOnSelect) usize {
+    return switch (value) {
+        .false => 0,
+        .true => 1,
+        .clipboard => 2,
+    };
 }
 
 fn clipboardAccessFromComboIndex(idx: LRESULT) ?Config.ClipboardAccess {
@@ -561,6 +934,124 @@ fn comboIndexFromLinkPreviews(value: Config.LinkPreviews) usize {
     };
 }
 
+fn windowThemeFromComboIndex(idx: LRESULT) ?Config.WindowTheme {
+    return switch (idx) {
+        0 => .auto,
+        1 => .system,
+        2 => .light,
+        3 => .dark,
+        4 => .ghostty,
+        else => null,
+    };
+}
+
+fn comboIndexFromWindowTheme(value: Config.WindowTheme) usize {
+    return switch (value) {
+        .auto => 0,
+        .system => 1,
+        .light => 2,
+        .dark => 3,
+        .ghostty => 4,
+    };
+}
+
+fn shellIntegrationFromComboIndex(idx: LRESULT) ?Config.ShellIntegration {
+    return switch (idx) {
+        0 => .none,
+        1 => .detect,
+        2 => .bash,
+        3 => .elvish,
+        4 => .fish,
+        5 => .nushell,
+        6 => .zsh,
+        else => null,
+    };
+}
+
+fn comboIndexFromShellIntegration(value: Config.ShellIntegration) usize {
+    return switch (value) {
+        .none => 0,
+        .detect => 1,
+        .bash => 2,
+        .elvish => 3,
+        .fish => 4,
+        .nushell => 5,
+        .zsh => 6,
+    };
+}
+
+fn cursorStyleFromComboIndex(idx: LRESULT) ?CursorStyle {
+    return switch (idx) {
+        0 => .bar,
+        1 => .block,
+        2 => .underline,
+        3 => .block_hollow,
+        else => null,
+    };
+}
+
+fn comboIndexFromCursorStyle(value: CursorStyle) usize {
+    return switch (value) {
+        .bar => 0,
+        .block => 1,
+        .underline => 2,
+        .block_hollow => 3,
+    };
+}
+
+fn paddingBalanceFromComboIndex(idx: LRESULT) ?Config.WindowPaddingBalance {
+    return switch (idx) {
+        0 => .false,
+        1 => .true,
+        2 => .equal,
+        else => null,
+    };
+}
+
+fn comboIndexFromPaddingBalance(value: Config.WindowPaddingBalance) usize {
+    return switch (value) {
+        .false => 0,
+        .true => 1,
+        .equal => 2,
+    };
+}
+
+/// The inner optional is the setting (null is "default"); the outer one says
+/// the index is not an item at all.
+fn autoUpdateFromComboIndex(idx: LRESULT) ??AutoUpdate {
+    return switch (idx) {
+        0 => @as(?AutoUpdate, null),
+        1 => @as(?AutoUpdate, .off),
+        2 => @as(?AutoUpdate, .check),
+        3 => @as(?AutoUpdate, .download),
+        else => null,
+    };
+}
+
+fn comboIndexFromAutoUpdate(value: ?AutoUpdate) usize {
+    return if (value) |mode| switch (mode) {
+        .off => 1,
+        .check => 2,
+        .download => 3,
+    } else 0;
+}
+
+fn autoUpdateChannelFromComboIndex(idx: LRESULT) ??ReleaseChannel {
+    return switch (idx) {
+        0 => @as(?ReleaseChannel, null),
+        1 => @as(?ReleaseChannel, .stable),
+        2 => @as(?ReleaseChannel, .tip),
+        else => null,
+    };
+}
+
+fn comboIndexFromAutoUpdateChannel(value: ?ReleaseChannel) usize {
+    return if (value) |channel| switch (channel) {
+        .stable => 1,
+        .tip => 2,
+    } else 0;
+}
+
 // Win32 entry points used by this module. `win32/sys.zig` owns the shared
 // declarations; the few below it does not export stay local.
 
@@ -602,14 +1093,12 @@ const GetWindowTextW = sys.GetWindowTextW;
 const SendMessageW = sys.SendMessageW;
 const ShowScrollBar = sys.ShowScrollBar;
 const TrackMouseEvent = sys.TrackMouseEvent;
-const SetWindowRgn = sys.SetWindowRgn;
 const GetSysColor = sys.GetSysColor;
 const NotifyWinEvent = sys.NotifyWinEvent;
 const EnumChildWindows = sys.EnumChildWindows;
 const CreateFontW = sys.CreateFontW;
 const DeleteObject = sys.DeleteObject;
 const SelectObject = sys.SelectObject;
-const CreateRectRgn = sys.CreateRectRgn;
 const FillRect = sys.FillRect;
 const GetStockObject = sys.GetStockObject;
 const SetDCBrushColor = sys.SetDCBrushColor;
@@ -621,9 +1110,35 @@ const MoveWindow = sys.MoveWindow;
 
 extern "user32" fn AdjustWindowRectExForDpi(lpRect: *RECT, dwStyle: u32, bMenu: BOOL, dwExStyle: u32, dpi: UINT) callconv(.winapi) BOOL;
 extern "user32" fn GetUpdateRect(hWnd: HWND, lpRect: ?*RECT, bErase: BOOL) callconv(.winapi) BOOL;
+extern "user32" fn GetDlgCtrlID(hWnd: HWND) callconv(.winapi) c_int;
 extern "user32" fn SetScrollInfo(hWnd: HWND, nBar: c_int, lpsi: *const SCROLLINFO, redraw: BOOL) callconv(.winapi) c_int;
 extern "user32" fn GetScrollInfo(hWnd: HWND, nBar: c_int, lpsi: *SCROLLINFO) callconv(.winapi) BOOL;
 extern "user32" fn FrameRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) callconv(.winapi) i32;
+extern "user32" fn ScrollWindowEx(
+    hWnd: HWND,
+    dx: i32,
+    dy: i32,
+    prcScroll: ?*const RECT,
+    prcClip: ?*const RECT,
+    hrgnUpdate: ?HRGN,
+    prcUpdate: ?*RECT,
+    flags: UINT,
+) callconv(.winapi) c_int;
+extern "user32" fn BeginDeferWindowPos(nNumWindows: c_int) callconv(.winapi) ?*anyopaque;
+extern "user32" fn DeferWindowPos(
+    hWinPosInfo: *anyopaque,
+    hWnd: HWND,
+    hWndInsertAfter: ?HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    uFlags: UINT,
+) callconv(.winapi) ?*anyopaque;
+extern "user32" fn EndDeferWindowPos(hWinPosInfo: *anyopaque) callconv(.winapi) BOOL;
+extern "user32" fn GetSystemMetricsForDpi(nIndex: c_int, dpi: UINT) callconv(.winapi) c_int;
+extern "user32" fn GetWindowDC(hWnd: HWND) callconv(.winapi) HDC;
+extern "gdi32" fn ExcludeClipRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) c_int;
 extern "gdi32" fn EnumFontFamiliesExW(
     hdc: HDC,
     logfont: *LOGFONTW,
@@ -666,11 +1181,19 @@ const SCROLLINFO = extern struct {
 };
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings");
+/// The child window that holds the form: it clips the fields to the band
+/// between the section header and the action bar, and owns the scroll bar.
+const viewport_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings.viewport");
 const edit_text_max_code_units: usize = 4096;
 const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 
+/// `scrollback-limit` is a byte budget per terminal, and 0 turns scrollback off
+/// (Config.zig, Screen.zig); there is no "unlimited". Only new terminals read it.
+/// The accessible name stays the prefix, "Scrollback limit".
+const scrollback_label = "Scrollback limit (bytes; 0 = off; new terminals only)";
+
 const settings_label_specs = [_][]const u8{
-    "Scrollback limit (rows, 0 = unlimited)",
+    scrollback_label,
     "Close confirmation",
     "Copy on select",
     "Font family fallbacks (comma-separated)",
@@ -696,6 +1219,7 @@ const settings_label_specs = [_][]const u8{
 };
 
 const settings_text_count = 5 + settings_label_specs.len;
+const background_blur_label = "Background blur (not supported on Windows)";
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
 const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
     .{ .role = .edit, .name = "Scrollback limit" },
@@ -814,11 +1338,29 @@ fn labelIndexIsCheckbox(index: usize) bool {
 /// edits.
 pub const SaveError = error{
     PathResolveFailed,
+    /// The config path is a link to a file that does not exist. Writing would
+    /// replace the link, so nothing is written.
+    DanglingLink,
     TempCreateFailed,
     SerializeFailed,
     ReplaceFailed,
     ReloadFailed,
     OutOfMemory,
+    /// The config file is UTF-16 or UTF-32 text. Patching it with UTF-8 lines
+    /// would leave a file that mixes encodings, so nothing is written.
+    UnsupportedEncoding,
+    /// The config file holds NUL bytes but no byte order mark: a binary file,
+    /// or UTF-16 or UTF-32 text without one.
+    BinaryConfig,
+    /// A config file, or a file it includes, exists but will not open. The
+    /// load would skip it and apply the rest, so nothing is saved.
+    FileUnopenable,
+    /// The in-place rewrite of a hard-linked file stopped after its first
+    /// byte: the file may hold new bytes followed by old ones.
+    IncompleteWrite,
+    /// The palette's theme pick found the theme changed in the config file.
+    /// There is no conflict prompt there, so the pick is refused.
+    DiskChanged,
     /// Write + reload both succeeded, but at least one GUI-edited
     /// field is masked by a later layer (included `config-file`,
     /// subsequent `--config-file`, `--config-default-files=false`
@@ -834,6 +1376,51 @@ pub const SaveReloadOutcome = union(enum) {
     completed_masked,
     failed: SaveError,
 };
+
+/// The file a failed save is about, when the status line should name it: an
+/// include that will not open, or the complete copy of a half-written config.
+/// Owned by whoever runs the save (`AppHandle.failureDetail` lends it).
+pub const FailureDetail = struct {
+    text: ?[]u8 = null,
+
+    pub fn set(self: *FailureDetail, alloc: std.mem.Allocator, text: []const u8) void {
+        self.clear(alloc);
+        self.text = alloc.dupe(u8, text) catch null;
+    }
+
+    pub fn clear(self: *FailureDetail, alloc: std.mem.Allocator) void {
+        if (self.text) |text| alloc.free(text);
+        self.text = null;
+    }
+};
+
+/// What the status line says about a save that wrote nothing (or, for
+/// `IncompleteWrite`, too little). Most failures share one hint (the file
+/// cannot be written); the ones the user can act on are named.
+fn saveFailureNote(err: SaveError) StatusNote {
+    return switch (err) {
+        error.UnsupportedEncoding => .unsupported_encoding,
+        error.BinaryConfig => .binary_config,
+        error.DanglingLink => .dangling_link,
+        error.FileUnopenable => .file_unopenable,
+        error.IncompleteWrite => .write_incomplete,
+        else => .save_failed,
+    };
+}
+
+/// What the notification for a save that something overrides says. It names
+/// the settings, in the words a config file uses for them, when the app told
+/// which; the pointer to the log it used to give is gone, since a GUI launch
+/// has none to read.
+fn maskedNotificationBody(buf: []u8, keys: ?[]const u8) []const u8 {
+    const generic = "A later config file or a command-line option overrides them, so they will not take effect. Check the config-file lines and the launch options.";
+    const named = keys orelse return generic;
+    return std.fmt.bufPrint(
+        buf,
+        "{s}: a later config file or a command-line option overrides the saved value, so it will not take effect. Check the config-file lines and the launch options.",
+        .{named},
+    ) catch generic;
+}
 
 pub fn saveReloadOutcome(result: SaveError!void) SaveReloadOutcome {
     result catch |err| return switch (err) {
@@ -925,8 +1512,12 @@ fn applyNativeControlThemeToChild(hwnd: HWND, lParam: LPARAM) callconv(.winapi) 
     return 1;
 }
 
+/// The frame too: a text field's frame and the viewport's scroll bar are
+/// non-client, and their colours come from the theme as well.
 fn invalidateThemeChild(hwnd: HWND, _: LPARAM) callconv(.winapi) BOOL {
-    _ = sys.InvalidateRect(hwnd, null, 1);
+    const rdw_erase: u32 = 0x0004;
+    const rdw_frame: u32 = 0x0400;
+    _ = sys.RedrawWindow(hwnd, null, null, RDW_INVALIDATE | rdw_erase | rdw_frame);
     return 1;
 }
 
@@ -945,6 +1536,10 @@ pub const AppHandle = struct {
     /// HINSTANCE used for window class registration + creation.
     hinstance: HINSTANCE,
     ownerWindow: ?*const fn (ctx: *anyopaque) ?HWND = null,
+    /// The application icon at the caption size (`small`) or the Alt+Tab and
+    /// taskbar size. Without one the window shows the generic application
+    /// glyph.
+    appIcon: ?*const fn (ctx: *anyopaque, small: bool) HICON = null,
     /// Chrome background color (COLORREF) to paint into the settings
     /// content pane. Queried per paint so theme swaps propagate.
     chromeBg: *const fn (ctx: *anyopaque) COLORREF,
@@ -985,6 +1580,29 @@ pub const AppHandle = struct {
     /// Optional conflict notification. The UI model retains the draft until
     /// `resolveConflict` is called with keep-mine or use-disk.
     notifyConflict: ?*const fn (ctx: *anyopaque, field: SettingField) void = null,
+    /// Optional. Asked before a save writes anything: the file may have been
+    /// edited since this window last read it, with no reload to say so. When
+    /// it finds an edit to a setting that is also being edited here, it applies
+    /// the file as a reload does, so `externalConfigChanged` flags what
+    /// overlaps and the save stops at the conflict. A save that wrote over such
+    /// an edit would lose it without a word. An error means the file could not
+    /// be checked, and nothing is saved.
+    reconcileDisk: ?*const fn (ctx: *anyopaque, pending: *const Config, original: *const Config) SaveError!void = null,
+    /// Optional. The file a save that just failed was about, for the errors
+    /// whose status sentence names one (`StatusNote.takesDetail`). Borrowed
+    /// until the next save.
+    failureDetail: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
+    /// Optional. The config keys the save that just completed wrote and a later
+    /// config file or command-line option overrides, comma separated, for
+    /// the status line and the notification. Borrowed until the next save.
+    maskedKeys: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
+    /// Optional. The file a save writes, copied into `buf` (at least 243 bytes),
+    /// for the Advanced page; null when it cannot be resolved. Looking must not
+    /// create the file.
+    saveTarget: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
+    /// Optional. The problems the config load found, as the Advanced page lists
+    /// them (`config_problems.Problems.listText`), copied into `buf`.
+    configProblems: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
     /// Optional asynchronous two-phase persistence hook. The receiver must
     /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
     /// When absent, `saveAndReload` remains the synchronous compatibility path.
@@ -1024,6 +1642,16 @@ pub const AppHandle = struct {
 pub const SettingsWindow = struct {
     handle: AppHandle,
     hwnd: ?HWND = null,
+    /// The form's own window (`viewport_class_name`): every field, its label
+    /// and the help text are its children, so its client area is what clips
+    /// them. Window regions cannot: the stock control classes carry
+    /// `CS_PARENTDC`, which paints through the parent's clip and ignores a
+    /// window region, so scrolled fields drew over the header and the action
+    /// bar.
+    viewport: ?HWND = null,
+    /// Stays out of the UIA control view (`layout_pane`), so the fields keep
+    /// reading as children of the window.
+    viewport_uia_provider: ?*win32_uia.SettingsControlProvider = null,
     btn_open_editor: ?HWND = null,
     btn_section_appearance: ?HWND = null,
     btn_section_terminal: ?HWND = null,
@@ -1053,6 +1681,20 @@ pub const SettingsWindow = struct {
     text_header: ?HWND = null,
     text_summary: ?HWND = null,
     text_status: ?HWND = null,
+    status_note: StatusNote = .none,
+    /// The sentence for `status_note` when it names a file (`takesDetail`).
+    /// Owned; only meaningful while `status_note` takes a detail.
+    note_text: ?[]u8 = null,
+    /// The status text measured for `status_measure_width` / `status_measure_dpi`:
+    /// how wide it is on one line, and how tall it is wrapped to that width.
+    /// `-1` means it has to be measured again.
+    status_measure_width: i32 = -1,
+    status_measure_dpi: u32 = 0,
+    status_measure_single_line: i32 = 0,
+    status_measure_wrapped: i32 = 0,
+    /// The status row the last layout applied (see `StatusRow`).
+    status_row_separate: bool = false,
+    status_row_height: i32 = 0,
     text_close_prompt: ?HWND = null,
     text_help: ?HWND = null,
     field_labels: [settings_label_specs.len]?HWND = [_]?HWND{null} ** settings_label_specs.len,
@@ -1065,9 +1707,14 @@ pub const SettingsWindow = struct {
     emphasis_font: HGDIOBJ = null,
     header_font: HGDIOBJ = null,
     theme_adapter: SettingsThemeAdapter = .{},
+    /// DPI the UI fonts were last built for, and how many times `themeChanged`
+    /// has actually re-themed the window (a test reads the latter).
+    ui_font_dpi: u32 = 0,
+    theme_applications: u32 = 0,
     close_prompt_measure_width: i32 = -1,
     close_prompt_measure_dpi: u32 = 0,
     close_prompt_measure_saving: bool = false,
+    close_prompt_measure_quitting: bool = false,
     close_prompt_measure_height: i32 = 0,
     edit_scrollback: ?HWND = null,
     edit_font_family: ?HWND = null,
@@ -1096,8 +1743,21 @@ pub const SettingsWindow = struct {
     combo_auto_update_channel: ?HWND = null,
     active_section: Section = .appearance,
     dpi: u32 = 96,
-    /// Class atom lazily registered the first time `open` runs.
+    /// Class atoms lazily registered the first time `open` runs.
     class_atom: ATOM = 0,
+    viewport_class_atom: ATOM = 0,
+    /// Line height of the field font, which the text fields centre their text
+    /// on (`fieldFrameInsets`). Measured when the fonts are built.
+    field_text_height: i32 = 0,
+    /// The field whose frame was last painted as invalid, so the frame can be
+    /// repainted when `validation_control` moves on.
+    framed_invalid_field: ?HWND = null,
+    /// Whether the last layout showed the help text (Keybindings, Advanced).
+    help_shown: bool = false,
+    /// What the frame window painted last time: when the action bar or the
+    /// column changes height or width without the window resizing, the old
+    /// separators have to be painted over.
+    background_geometry: ?BackgroundGeometry = null,
 
     /// Frozen snapshot of the config at the moment the window last
     /// opened. Independently owned via `Config.clone` so an
@@ -1119,6 +1779,12 @@ pub const SettingsWindow = struct {
     close_after_save: bool = false,
     close_posted: bool = false,
     close_notified: bool = false,
+    /// The app's quit waits on the close prompt: set by
+    /// `holdQuitForUnsavedChanges`, cleared by Keep editing or a failed
+    /// save, and taken by the app's `onClosed` once Save or Discard closed
+    /// the window. Outlives the window's state reset in WM_NCDESTROY,
+    /// which runs before `onClosed`.
+    quit_after_close: bool = false,
     close_prior_focus: ?HWND = null,
     validation_control: ?HWND = null,
     owned_validation_control: ?HWND = null,
@@ -1143,10 +1809,23 @@ pub const SettingsWindow = struct {
     proof_redraw_succeeded: bool = false,
     proof_update_pending: bool = false,
     proof_paint_count: u32 = 0,
-    proof_layout_redraw_succeeded: bool = false,
+    /// Whether the last layout moved its windows in deferred batches.
+    proof_layout_batched: bool = false,
     /// Guard flag so the EN_CHANGE handler doesn't fire a cascade
     /// when we programmatically set the EDIT text on open.
     suppress_edit_events: bool = false,
+    /// The child that held keyboard focus when the window was deactivated.
+    /// `DefWindowProc` hands focus to the frame on activation, so without this
+    /// the field the user was typing in stops receiving keys after Alt+Tab.
+    focus_before_deactivate: ?HWND = null,
+    /// Wheel movement not yet turned into whole pixels, in 1/`WHEEL_DELTA`
+    /// pixel: a precision touchpad sends deltas far below one notch.
+    wheel_remainder: i32 = 0,
+    /// Set while `forwardFrameFocus` moves focus, so the focus notification
+    /// does not scroll the form.
+    restoring_focus: bool = false,
+    /// Lines per wheel notch for tests; null reads the system setting.
+    wheel_lines_override: ?u32 = null,
 
     pub fn init(handle: AppHandle) SettingsWindow {
         return .{ .handle = handle };
@@ -1164,6 +1843,55 @@ pub const SettingsWindow = struct {
         return scaleForDpi(logical, self.dpi);
     }
 
+    fn appIcon(self: *const SettingsWindow, small: bool) HICON {
+        const provide = self.handle.appIcon orelse return null;
+        return provide(self.handle.ctx, small);
+    }
+
+    /// What clicking Save does, gated on the button's own state so a shortcut
+    /// cannot save while the button is disabled, hidden or the prompt is open.
+    fn saveIfAllowed(self: *SettingsWindow) void {
+        const button_enabled = if (self.btn_save) |button| sys.IsWindowEnabled(button) != 0 else false;
+        const button_visible = if (self.btn_save) |button| sys.IsWindowVisible(button) != 0 else false;
+        if (saveCommandCanDispatch(
+            self.close_prompt_visible,
+            self.save_in_flight,
+            self.close_posted,
+            button_enabled,
+            button_visible,
+        )) self.save();
+    }
+
+    /// Keys the dialog manager does not handle the way a settings window needs.
+    /// The App pump asks this BEFORE `IsDialogMessageW`; true means consumed.
+    ///   * Ctrl+S saves. (Enter never saves: in a field it does nothing.)
+    ///   * Enter presses the focused push button.
+    ///   * An auto-repeated Escape is swallowed, so holding the key does not
+    ///     toggle the close prompt open and shut.
+    pub fn handleAccelerator(self: *SettingsWindow, target: ?HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) bool {
+        // Cheapest test first: this runs for every message while Settings is open.
+        if (msg != WM_KEYDOWN) return false;
+        if (wParam != 'S' and wParam != VK_RETURN and wParam != VK_ESCAPE) return false;
+        const hwnd = self.hwnd orelse return false;
+        const control = target orelse return false;
+        if (control != hwnd and IsChild(hwnd, control) == 0) return false;
+        const repeat = (lParam & (1 << 30)) != 0;
+        switch (wParam) {
+            'S' => {
+                if (!isSaveShortcut(
+                    'S',
+                    win32_input.keyPressed(VK_CONTROL),
+                    win32_input.keyPressed(VK_MENU),
+                    win32_input.keyPressed(VK_SHIFT),
+                )) return false;
+                self.saveIfAllowed();
+                return true;
+            },
+            VK_RETURN => return self.pressFocusedButton(repeat),
+            else => return repeat,
+        }
+    }
+
     fn deleteUiFont(self: *SettingsWindow) void {
         if (self.ui_font) |font| _ = sys.DeleteObject(font);
         self.ui_font = null;
@@ -1176,6 +1904,7 @@ pub const SettingsWindow = struct {
     }
 
     pub fn deinit(self: *SettingsWindow) void {
+        self.freeNoteText();
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) _ = sys.DestroyWindow(h);
         }
@@ -1183,6 +1912,7 @@ pub const SettingsWindow = struct {
         self.releaseTextUiaProviders();
         self.releaseControlUiaProviders();
         self.hwnd = null;
+        self.forgetFormWindows();
         self.deleteUiFont();
         self.theme_adapter.deinit();
         self.btn_open_editor = null;
@@ -1199,6 +1929,7 @@ pub const SettingsWindow = struct {
         // reached by whatever opened it, not by the keys pressed in the
         // previous one, so it starts ring-less like a fresh one.
         self.focus_input_mode = .pointer;
+        self.focus_before_deactivate = null;
         self.text_uia_prev_proc = null;
         self.btn_save = null;
         self.btn_keybindings_editor = null;
@@ -1234,6 +1965,7 @@ pub const SettingsWindow = struct {
         self.combo_auto_update = null;
         self.combo_auto_update_channel = null;
         self.resetClosePromptState();
+        self.quit_after_close = false;
         self.clearPending();
     }
 
@@ -1272,7 +2004,6 @@ pub const SettingsWindow = struct {
         self.original = null;
         if (self.current) |*c| c.deinit();
         self.current = null;
-        self.setStatus("");
         self.updateSaveEnabled();
     }
 
@@ -1323,8 +2054,17 @@ pub const SettingsWindow = struct {
             std.log.warn("settings: edit transaction failed field={s} err={}", .{ @tagName(field), err });
             return;
         };
+        if (live_preview) for (emitted) |*effect| switch (effect.*) {
+            .set_preview => |*change| change.value = previewValue(transaction, change.value),
+            else => {},
+        };
         self.dispatchEffects(emitted);
         self.refreshNativeSectionText();
+        // Whether the edit shows in the open terminals now or only after a
+        // save is told by what its preview refreshes, not by the transaction's
+        // `live_preview` flag: font size, padding and cursor style are
+        // previewed into the config but no open terminal reads it.
+        self.status_note = if (previewEffect(field) != .none) .previews_live else .applies_on_save;
         self.updateSaveEnabled();
     }
 
@@ -1346,6 +2086,72 @@ pub const SettingsWindow = struct {
             self.hasPendingChanges();
         if (self.btn_save) |button| _ = sys.EnableWindow(button, @intFromBool(enabled));
         self.updateClosePromptActions();
+        self.syncIdleStatus();
+        self.syncFieldFrames();
+    }
+
+    /// Say an outcome (`note`) now, whatever else the line shows, and keep
+    /// saying it until the next edit or a new attempt replaces it. It goes up
+    /// even while a conflict or a validation error holds the line, as the
+    /// ad-hoc messages it replaces did.
+    fn setNote(self: *SettingsWindow, note: StatusNote) void {
+        self.freeNoteText();
+        self.status_note = note;
+        self.setStatus(note.text());
+    }
+
+    /// `setNote` for a failed save: when the sentence names a file, the app
+    /// says which.
+    fn setSaveFailureNote(self: *SettingsWindow, err: SaveError) void {
+        const note = saveFailureNote(err);
+        self.setNote(note);
+        if (!note.takesDetail()) return;
+        const lend = self.handle.failureDetail orelse return;
+        const detail = lend(self.handle.ctx) orelse return;
+        self.note_text = note.textWithDetail(self.handle.alloc, detail) catch return;
+        self.setStatus(self.noteText());
+    }
+
+    fn freeNoteText(self: *SettingsWindow) void {
+        if (self.note_text) |text| self.handle.alloc.free(text);
+        self.note_text = null;
+    }
+
+    fn noteText(self: *const SettingsWindow) []const u8 {
+        if (self.note_text) |text| if (self.status_note.takesDetail()) return text;
+        return self.status_note.text();
+    }
+
+    /// What the status line says when no validation error or conflict holds it.
+    fn idleStatusText(self: *const SettingsWindow) []const u8 {
+        switch (self.status_note) {
+            // A save's result stays up whatever the draft looks like now.
+            .saved => return self.status_note.text(),
+            .saved_overridden => return self.noteText(),
+            // These are about edits that are still there to be saved.
+            .save_failed,
+            .unsupported_encoding,
+            .binary_config,
+            .dangling_link,
+            .file_unopenable,
+            .write_incomplete,
+            .close_failed,
+            .resolve_first,
+            .conflict_not_resolved,
+            .disk_value_not_adopted,
+            => if (self.hasPendingChanges()) return self.noteText(),
+            .none, .previews_live, .applies_on_save => {},
+        }
+        if (!self.hasPendingChanges()) return nothing_to_save_text;
+        const text = self.noteText();
+        return if (text.len != 0) text else unsaved_changes_text;
+    }
+
+    fn syncIdleStatus(self: *SettingsWindow) void {
+        switch (self.nextStatus()) {
+            .none => self.setStatus(self.idleStatusText()),
+            else => {},
+        }
     }
 
     fn hasRawScalarEdits(self: *const SettingsWindow) bool {
@@ -1363,7 +2169,12 @@ pub const SettingsWindow = struct {
         self.raw_scalar_error[index] = null;
         if (self.active_raw_validation == field) {
             self.active_raw_validation = null;
-            self.surfaceNextValidation(true);
+            // The remaining errors go to the status line. Moving the user to
+            // another field, or another section, while they type a valid value
+            // here would take the keyboard out from under them. Only the close
+            // prompt's "Save and close" moves focus to an error (Save itself
+            // is disabled while one exists).
+            self.surfaceNextValidation(false);
         }
     }
 
@@ -1427,6 +2238,8 @@ pub const SettingsWindow = struct {
 
     fn surfaceNextValidation(self: *SettingsWindow, focus: bool) void {
         const visibility_changed = self.syncConflictControls();
+        // Before the text: the status row is measured in the font it is drawn in.
+        self.syncStatusFont();
         switch (self.nextStatus()) {
             .raw_validation => |field| {
                 const destination = self.rawScalarDestination(field);
@@ -1455,23 +2268,20 @@ pub const SettingsWindow = struct {
                 self.active_raw_validation = null;
                 self.validation_control = null;
                 var buf: [256]u8 = undefined;
-                const text = std.fmt.bufPrint(&buf, "{s} also changed on disk. Choose Keep mine or Use disk.", .{@tagName(field)}) catch "A setting also changed on disk.";
-                self.setStatus(text);
+                self.setStatus(conflictStatusText(&buf, field.label()));
             },
             .owned_conflict => |field| {
                 self.active_raw_validation = null;
                 self.validation_control = null;
                 var buf: [256]u8 = undefined;
-                const text = std.fmt.bufPrint(&buf, "{s} also changed on disk. Choose Keep mine or Use disk.", .{field.label()}) catch "A setting also changed on disk.";
-                self.setStatus(text);
+                self.setStatus(conflictStatusText(&buf, field.label()));
             },
             .none => {
                 self.active_raw_validation = null;
                 self.validation_control = null;
-                self.setStatus("");
+                self.setStatus(self.idleStatusText());
             },
         }
-        self.syncStatusFont();
         if (visibility_changed) layoutChildren(self);
         self.updateSaveEnabled();
     }
@@ -1480,6 +2290,8 @@ pub const SettingsWindow = struct {
         if (self.suppress_edit_events) return;
         self.owned_text_changed[@intFromEnum(field)] = true;
         self.clearValidationError(control);
+        // Font family, theme and default command are only read at save.
+        self.status_note = .applies_on_save;
         self.updateSaveEnabled();
     }
 
@@ -1515,6 +2327,8 @@ pub const SettingsWindow = struct {
             self.owned_dirty[index] = true;
             self.owned_conflict[index] = !ownedSettingEql(current, original, field);
         }
+        // Font family, theme and default command are only read at save.
+        self.status_note = .applies_on_save;
         self.surfaceNextValidation(false);
         self.refreshNativeSectionText();
         self.updateSaveEnabled();
@@ -1608,6 +2422,8 @@ pub const SettingsWindow = struct {
 
     fn setMutableControlsEnabled(self: *SettingsWindow, enabled: bool) void {
         for (self.mutableControls()) |control| {
+            // The blur box stays disabled whatever the save is doing.
+            if (control == self.chk_bg_blur) continue;
             if (control) |hwnd| _ = sys.EnableWindow(hwnd, @intFromBool(enabled));
         }
     }
@@ -1688,7 +2504,9 @@ pub const SettingsWindow = struct {
         if (self.handle.previewField) |preview| {
             for (transaction.entries) |entry| {
                 if (entry.dirty and entry.previewed) {
-                    preview(self.handle.ctx, entry.field, entry.draft);
+                    // The reload replaced the live config, so the draft is
+                    // previewed again, floored like the keystroke that made it.
+                    preview(self.handle.ctx, entry.field, previewValue(transaction, entry.draft));
                 }
             }
         }
@@ -1705,28 +2523,40 @@ pub const SettingsWindow = struct {
     }
 
     fn pendingDiffText(self: *const SettingsWindow, buf: []u8) []const u8 {
-        const transaction = &(self.transaction orelse return "No pending source changes.");
-        var writer: std.Io.Writer = .fixed(buf);
+        const transaction = &(self.transaction orelse return no_pending_changes_text);
+        // The tail of the buffer is kept for the "and more" line.
+        var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - more_changes_text.len]);
         var count: usize = 0;
+        var truncated = false;
         for (transaction.entries) |entry| {
             if (!entry.dirty) continue;
-            writer.print("{s}: {any} -> {any}\n", .{
-                @tagName(entry.field),
-                entry.baseline,
-                entry.draft,
-            }) catch break;
+            const line_start = writer.end;
+            writeSettingDiffLine(&writer, entry.field, entry.baseline, entry.draft) catch {
+                // A cut-off line may end inside a character, which would blank the page.
+                writer.end = line_start;
+                truncated = true;
+                break;
+            };
             count += 1;
         }
-        if (self.original) |*original| if (self.pending) |*pending| {
-            count += writeOwnedSettingDiffs(
+        if (!truncated) if (self.original) |*original| if (self.pending) |*pending| {
+            const owned = writeOwnedSettingDiffs(
                 &writer,
                 original,
                 pending,
                 self.owned_dirty,
                 self.owned_conflict,
-            ) catch 0;
+            );
+            count += owned.lines;
+            truncated = owned.truncated;
         };
-        return if (count == 0) "No pending source changes." else writer.buffered();
+        if (count == 0 and !truncated) return no_pending_changes_text;
+        if (truncated) {
+            const end = writer.end;
+            @memcpy(buf[end..][0..more_changes_text.len], more_changes_text);
+            return buf[0 .. end + more_changes_text.len];
+        }
+        return writer.buffered();
     }
 
     pub fn hasConflict(self: *const SettingsWindow, field: SettingField) bool {
@@ -1741,6 +2571,7 @@ pub const SettingsWindow = struct {
         resolution: ConflictResolution,
     ) void {
         const transaction = &(self.transaction orelse return);
+        self.status_note = .none;
         var effects: [1]SettingsTransaction.Effect = undefined;
         const emitted = transaction.dispatch(.{ .resolve_conflict = .{
             .field = field,
@@ -1811,6 +2642,7 @@ pub const SettingsWindow = struct {
 
     fn resolveOwnedConflict(self: *SettingsWindow, field: OwnedSettingField, resolution: ConflictResolution) void {
         const index = @intFromEnum(field);
+        self.status_note = .none;
         if (resolution == .keep_mine and self.owned_text_changed[index]) {
             self.syncOwnedControl(field);
             if (self.owned_text_changed[index]) return;
@@ -1820,13 +2652,13 @@ pub const SettingsWindow = struct {
         const pending = &(self.pending orelse return);
         copyOwnedSetting(original, current, field) catch |err| {
             std.log.warn("settings: conflict baseline copy failed field={s} err={}", .{ @tagName(field), err });
-            self.setStatus("Could not resolve the settings conflict; your draft is preserved.");
+            self.setNote(.conflict_not_resolved);
             return;
         };
         if (resolution == .use_disk) {
             copyOwnedSetting(pending, current, field) catch |err| {
                 std.log.warn("settings: conflict draft copy failed field={s} err={}", .{ @tagName(field), err });
-                self.setStatus("Could not adopt the disk value; your draft is preserved.");
+                self.setNote(.disk_value_not_adopted);
                 return;
             };
             self.refreshOwnedControl(field);
@@ -1854,6 +2686,7 @@ pub const SettingsWindow = struct {
         self.releaseTextUiaProviders();
         self.releaseControlUiaProviders();
         self.hwnd = null;
+        self.forgetFormWindows();
         self.text_header = null;
         self.text_summary = null;
         self.text_status = null;
@@ -1872,6 +2705,7 @@ pub const SettingsWindow = struct {
         self.section_button_prev_proc = null;
         self.section_hovered = null;
         self.focus_input_mode = .pointer;
+        self.focus_before_deactivate = null;
         self.btn_save = null;
         self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
@@ -2009,6 +2843,20 @@ pub const SettingsWindow = struct {
             );
         }
         self.control_uia_prev_procs = [_]?*const anyopaque{null} ** settings_control_count;
+        if (self.viewport_uia_provider) |provider| {
+            self.viewport_uia_provider = null;
+            provider.detach();
+            self.deferProviderDisconnect(@ptrCast(provider), settingsControlDisconnect, settingsControlRelease);
+        }
+    }
+
+    /// The viewport and the state the layout and the field frames keep about
+    /// it, for a window that is gone.
+    fn forgetFormWindows(self: *SettingsWindow) void {
+        self.viewport = null;
+        self.framed_invalid_field = null;
+        self.help_shown = false;
+        self.background_geometry = null;
     }
 
     fn deferProviderDisconnect(
@@ -2091,6 +2939,18 @@ pub const SettingsWindow = struct {
     fn initializeControlUiaProviders(self: *SettingsWindow) void {
         self.releaseControlUiaProviders();
         if (!self.canInitializeCustomUiaProviders()) return;
+        if (self.viewport) |viewport| {
+            // Answered from the viewport's own window procedure; no subclass.
+            self.viewport_uia_provider = win32_uia.SettingsControlProvider.create(
+                std.heap.page_allocator,
+                viewport,
+                .layout_pane,
+                null,
+            ) catch |err| blk: {
+                std.log.warn("settings viewport UIA provider unavailable err={}", .{err});
+                break :blk null;
+            };
+        }
         for (settings_control_specs, 0..) |spec, index| {
             const control = self.controlHwnd(index) orelse continue;
             const provider = win32_uia.SettingsControlProvider.create(
@@ -2193,44 +3053,292 @@ pub const SettingsWindow = struct {
         }
     }
 
+    /// Switch the form to `next`. The new section's fields are placed while
+    /// they are still hidden, swapped in for the old ones, and painted before
+    /// this returns, so no frame shows a field that has not drawn itself yet.
+    /// Only the form and the header text repaint; the frame window does not.
     fn setActiveSection(self: *SettingsWindow, next: Section) void {
         const changed = self.active_section != next;
         self.active_section = next;
         if (self.section_uia_group) |group| group.setSelected(@intFromEnum(next));
         self.content_scroll_y = 0;
-        self.applySectionVisibility();
         self.refreshNativeSectionText();
         layoutChildren(self);
+        self.applySectionVisibility();
+        if (self.hwnd) |hwnd| _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
         if (changed) {
             if (self.sectionProvider(next)) |provider| provider.raiseSelected();
-            if (self.hwnd) |h| _ = sys.InvalidateRect(h, null, 1);
         }
     }
 
+    /// Scroll the form to `next`. The viewport moves its pixels and its child
+    /// windows together and repaints only the strip that comes into view; the
+    /// header and the action bar are outside it and do not repaint at all.
     fn setContentScroll(self: *SettingsWindow, next: i32) void {
         const clamped = std.math.clamp(next, 0, self.content_scroll_max);
         if (clamped == self.content_scroll_y) return;
+        const delta = self.content_scroll_y - clamped;
         self.content_scroll_y = clamped;
-        layoutChildren(self);
-        if (self.hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 1);
+        const viewport = self.viewport orelse return;
+        _ = ScrollWindowEx(viewport, 0, delta, null, null, null, null, SW_SCROLLCHILDREN | SW_INVALIDATE);
+        _ = RedrawWindow(viewport, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
+        const position: SCROLLINFO = .{
+            .cbSize = @sizeOf(SCROLLINFO),
+            .fMask = SIF_POS,
+            .nMin = 0,
+            .nMax = 0,
+            .nPage = 0,
+            .nPos = clamped,
+            .nTrackPos = 0,
+        };
+        _ = SetScrollInfo(viewport, SB_VERT, &position, 1);
+        self.syncViewportClipFlags();
+    }
+
+    /// Height of one "page" of the form for Page Up/Down and page-scroll wheels.
+    fn contentPage(self: *SettingsWindow) i32 {
+        const viewport = self.viewport orelse return self.px(240);
+        var client: RECT = undefined;
+        if (GetClientRect(viewport, &client) == 0) return self.px(240);
+        return @max(1, client.bottom - self.px(settings_control_height));
+    }
+
+    /// A `WM_VSCROLL` from the viewport's scroll bar.
+    fn scrollByBar(self: *SettingsWindow, code: usize) void {
+        const viewport = self.viewport orelse return;
+        var tracking: SCROLLINFO = .{
+            .cbSize = @sizeOf(SCROLLINFO),
+            .fMask = SIF_TRACKPOS,
+            .nMin = 0,
+            .nMax = 0,
+            .nPage = 0,
+            .nPos = 0,
+            .nTrackPos = self.content_scroll_y,
+        };
+        if (code == SB_THUMBPOSITION or code == SB_THUMBTRACK) _ = GetScrollInfo(viewport, SB_VERT, &tracking);
+        const page = self.contentPage();
+        self.setContentScroll(switch (code) {
+            SB_LINEUP => self.content_scroll_y - self.px(32),
+            SB_LINEDOWN => self.content_scroll_y + self.px(32),
+            SB_PAGEUP => self.content_scroll_y - page,
+            SB_PAGEDOWN => self.content_scroll_y + page,
+            SB_THUMBPOSITION, SB_THUMBTRACK => tracking.nTrackPos,
+            SB_TOP => 0,
+            SB_BOTTOM => self.content_scroll_max,
+            else => self.content_scroll_y,
+        });
+    }
+
+    /// Tell each field's UIA provider whether the viewport hides it entirely;
+    /// a field cut by an edge is still on screen.
+    fn syncViewportClipFlags(self: *SettingsWindow) void {
+        const viewport = self.viewport orelse return;
+        var client: RECT = undefined;
+        if (GetClientRect(viewport, &client) == 0) return;
+        var active_controls = [_]bool{false} ** settings_clipped_control_count;
+        var active_labels = [_]bool{false} ** settings_label_specs.len;
+        for (self.formItems()) |item| {
+            active_controls[item.control_index] = true;
+            if (item.label_index) |index| active_labels[index] = true;
+        }
+        for (0..settings_clipped_control_count) |index| if (self.control_uia_providers[index]) |provider| {
+            provider.setViewportFullyClipped(!active_controls[index] or
+                viewportHidesChild(viewport, self.controlHwnd(index), client.bottom));
+        };
+        if (self.text_uia_providers[4]) |provider| {
+            provider.setViewportFullyClipped(!self.help_shown or viewportHidesChild(viewport, self.text_help, client.bottom));
+        }
+        for (self.field_labels, 0..) |label, index| if (self.text_uia_providers[index + 5]) |provider| {
+            provider.setViewportFullyClipped(!active_labels[index] or viewportHidesChild(viewport, label, client.bottom));
+        };
+    }
+
+    /// Scroll the form by one wheel message. Notches and precision-touchpad
+    /// deltas (a fraction of a notch each) take the same path: the movement is
+    /// accumulated until it is a whole pixel, scaled by the user's "lines per
+    /// notch" setting, so nothing is truncated to zero.
+    fn scrollByWheel(self: *SettingsWindow, delta: i16) void {
+        const lines = self.wheel_lines_override orelse systemWheelScrollLines();
+        const notch_px: i32 = if (lines == WHEEL_PAGESCROLL)
+            self.contentPage()
+        else
+            wheelNotchPixels(self.px(settings_wheel_notch_px), lines);
+        const pixels = wheelScrollPixels(&self.wheel_remainder, delta, notch_px);
+        if (pixels != 0) self.setContentScroll(self.content_scroll_y - pixels);
+    }
+
+    /// Enter on a focused push button presses it. A window class that is not
+    /// a dialog has no default button for the dialog manager to ask about
+    /// (`DM_GETDEFID`), so Enter would do nothing at all; answering it with the
+    /// focused button instead would leave the manager stripping the default
+    /// style from the previous answer. So the key is taken before the manager
+    /// and the button is clicked directly. Returns whether the key was consumed;
+    /// an auto-repeat is consumed without clicking again.
+    fn pressFocusedButton(self: *SettingsWindow, repeat: bool) bool {
+        const hwnd = self.hwnd orelse return false;
+        const focused = GetFocus() orelse return false;
+        if (IsChild(hwnd, focused) == 0 or sys.IsWindowEnabled(focused) == 0) return false;
+        const code = SendMessageW(focused, WM_GETDLGCODE, 0, 0);
+        if ((code & (DLGC_DEFPUSHBUTTON | DLGC_UNDEFPUSHBUTTON)) == 0) return false;
+        if (!repeat) _ = SendMessageW(focused, BM_CLICK, 0, 0);
+        return true;
+    }
+
+    /// A close request from the caption, Alt+F4 or Escape: close at once when
+    /// clean, otherwise ask what to do with the unsaved changes.
+    fn requestClose(self: *SettingsWindow, hwnd: HWND) void {
+        switch (closeRequestAction(self.hasPendingChanges(), self.close_prompt_visible, self.close_posted)) {
+            .close_now => self.closeNow(hwnd),
+            .show_prompt, .focus_prompt => self.showClosePrompt(),
+            .ignore => {},
+        }
+    }
+
+    /// Escape arrives as IDCANCEL. With the close prompt open it is the
+    /// prompt's "Keep editing"; otherwise it is a close request.
+    fn cancelRequested(self: *SettingsWindow, hwnd: HWND) void {
+        if (self.close_prompt_visible) return self.cancelClosePrompt();
+        self.requestClose(hwnd);
+    }
+
+    /// Whether `control` can take keyboard focus back: still a live, visible,
+    /// enabled descendant of this window.
+    fn focusTargetUsable(self: *const SettingsWindow, control: HWND) bool {
+        const settings_hwnd = self.hwnd orelse return false;
+        return control != settings_hwnd and
+            sys.IsWindow(control) != 0 and
+            IsChild(settings_hwnd, control) != 0 and
+            sys.IsWindowVisible(control) != 0 and
+            sys.IsWindowEnabled(control) != 0;
+    }
+
+    /// `WA_INACTIVE`: keep the focused child, the way `DefDlgProc` does.
+    fn rememberFocus(self: *SettingsWindow) void {
+        self.focus_before_deactivate = if (GetFocus()) |focused|
+            (if (self.focusTargetUsable(focused)) focused else null)
+        else
+            null;
+    }
+
+    /// The frame itself received focus (`DefWindowProc` puts it there when the
+    /// window is activated or restored from minimized): hand it to the child
+    /// that had it, or to the section rail when that is gone. Done from
+    /// `WM_SETFOCUS` rather than `WM_ACTIVATE` because restoring a minimized
+    /// window sets frame focus without a second `WM_ACTIVATE`. Focusing the
+    /// child must not scroll the form: after a click-activation the click has
+    /// already been hit-tested against the controls where they are.
+    fn forwardFrameFocus(self: *SettingsWindow) void {
+        self.restoring_focus = true;
+        defer self.restoring_focus = false;
+        if (self.focus_before_deactivate) |control| {
+            if (self.focusTargetUsable(control)) {
+                _ = SetFocus(control);
+                return;
+            }
+            self.focus_before_deactivate = null;
+        }
+        if (self.sectionButton(self.active_section)) |button| _ = SetFocus(button);
+    }
+
+    /// Put the controls in the order Tab should visit them: the rail, then each
+    /// section's fields as laid out, then the action bar. Tab follows z-order,
+    /// which is creation order, and creation order is by control type with Save
+    /// before every field. Moving each control to the bottom in turn leaves the
+    /// z-order (and with it the UIA sibling order) equal to the visual order.
+    ///
+    /// Only the Appearance rail button starts a dialog group, so without more
+    /// the arrow-key group of the rail would run on into the fields and Save:
+    /// each section's first field and the action bar start their own.
+    fn applyTabOrder(self: *SettingsWindow) void {
+        for (std.enums.values(Section)) |section| for (formItemsForSection(section), 0..) |item, index| {
+            const control = self.controlHwnd(item.control_index) orelse continue;
+            sendToBottom(control);
+            if (index == 0) startGroup(control);
+        };
+        // Conflict choices sit left of Save; the close prompt replaces them all.
+        var first_action = true;
+        for ([_]?HWND{
+            self.btn_conflict_keep,
+            self.btn_conflict_use_disk,
+            self.btn_save,
+            self.btn_close_save,
+            self.btn_close_discard,
+            self.btn_close_keep_editing,
+        }) |button| if (button) |control| {
+            sendToBottom(control);
+            if (first_action) startGroup(control);
+            first_action = false;
+        };
     }
 
     fn refreshNativeSectionText(self: *SettingsWindow) void {
         setWindowTextUtf8(self.text_header, self.active_section.headerText());
         setWindowTextUtf8(self.text_summary, self.active_section.placeholderText());
-        var diff_buf: [2048]u8 = undefined;
+        // A static text holds 2047 UTF-16 units, so the page is built in as
+        // many bytes.
+        var help_buf: [2047]u8 = undefined;
         const help = switch (self.active_section) {
             .keybindings => keybindingsHelpText(),
-            .advanced => self.pendingDiffText(&diff_buf),
+            .advanced => self.advancedHelpText(&help_buf),
             else => "",
         };
         setWindowTextUtf8(self.text_help, help);
     }
 
+    /// The app loaded the config again, so what the Advanced page lists as
+    /// wrong with it may have changed.
+    pub fn configProblemsChanged(self: *SettingsWindow) void {
+        if (self.hwnd == null) return;
+        self.refreshNativeSectionText();
+        if (self.active_section == .advanced) layoutChildren(self);
+    }
+
+    /// The Advanced page: the file a save writes, what is wrong with the config
+    /// as loaded, and the changes waiting to be saved. The first two are cut to
+    /// their share of the room (whole entries, `config_problems`); what is
+    /// left goes to the changes.
+    fn advancedHelpText(self: *const SettingsWindow, buf: []u8) []const u8 {
+        const head = buf[0..@min(buf.len, advanced_head_bytes)];
+        var len: usize = 0;
+        if (self.handle.saveTarget) |lend| {
+            var path_buf: [advanced_target_bytes]u8 = undefined;
+            if (lend(self.handle.ctx, &path_buf)) |path| {
+                config_problems.appendWhole(head, &len, "Settings saves to ");
+                config_problems.appendWhole(head, &len, path);
+                config_problems.appendWhole(head, &len, "\n\n");
+            }
+        }
+        if (self.handle.configProblems) |lend| {
+            var problems_buf: [advanced_problems_bytes]u8 = undefined;
+            config_problems.appendWhole(head, &len, lend(self.handle.ctx, &problems_buf));
+            config_problems.appendWhole(head, &len, "\n");
+        }
+        const changes = self.pendingDiffText(buf[len..]);
+        // Short answers are literals, longer ones were written into `buf`.
+        if (changes.ptr != buf[len..].ptr) config_problems.appendWhole(buf, &len, changes) else len += changes.len;
+        return buf[0..len];
+    }
+
     fn setStatus(self: *SettingsWindow, text: []const u8) void {
         const status = self.text_status orelse return;
         if (!setWindowTextUtf8IfChanged(status, text)) return;
+        self.status_measure_width = -1;
         sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, status, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
+        // A message too long for the room beside the buttons gets a row of its
+        // own, and a shorter one gives it back. The form loses or gains that much
+        // height, so the field being typed in is kept in view.
+        if (self.statusRowChanged()) {
+            layoutChildren(self);
+            if (GetFocus()) |focused| self.ensureControlVisible(focused);
+        }
+    }
+
+    fn statusRowChanged(self: *SettingsWindow) bool {
+        const hwnd = self.hwnd orelse return false;
+        var rect: RECT = undefined;
+        if (GetClientRect(hwnd, &rect) == 0) return false;
+        const bar = closePromptLayoutGeometry(self, actionColumnWidth(self, rect), actionBarAvailableHeight(self, rect));
+        return bar.status_separate != self.status_row_separate or bar.status_height != self.status_row_height;
     }
 
     fn recreateUiFont(self: *SettingsWindow) void {
@@ -2258,12 +3366,14 @@ pub const SettingsWindow = struct {
         const previous_secondary = self.secondary_font;
         const previous_emphasis = self.emphasis_font;
         const previous_header = self.header_font;
+        self.ui_font_dpi = self.dpi;
         self.ui_font = next;
         self.secondary_font = next_secondary;
         self.emphasis_font = next_emphasis;
         self.header_font = next_header;
         self.close_prompt_measure_width = -1;
         self.close_prompt_measure_height = 0;
+        self.status_measure_width = -1;
         _ = EnumChildWindows(hwnd, applyChildFont, @bitCast(@intFromPtr(next)));
         if (self.text_header) |header| _ = SendMessageW(header, WM_SETFONT, @intFromPtr(next_header), 1);
         if (self.text_summary) |text| _ = SendMessageW(text, WM_SETFONT, @intFromPtr(next_secondary), 1);
@@ -2279,6 +3389,12 @@ pub const SettingsWindow = struct {
         if (previous_secondary) |font| _ = DeleteObject(font);
         if (previous_emphasis) |font| _ = DeleteObject(font);
         if (previous_header) |font| _ = DeleteObject(font);
+        self.field_text_height = fontLineHeight(hwnd, next);
+        // The text fields centre on the new line height and the frame scales
+        // with the DPI: ask each one for its frame again.
+        for (self.editControls()) |edit| if (edit) |control| {
+            _ = SetWindowPos(control, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        };
         self.updateComboMetrics();
     }
 
@@ -2292,6 +3408,7 @@ pub const SettingsWindow = struct {
             const current: LRESULT = @bitCast(@intFromPtr(value));
             if (SendMessageW(status, WM_GETFONT, 0, 0) != current) {
                 _ = SendMessageW(status, WM_SETFONT, @intFromPtr(value), 1);
+                self.status_measure_width = -1;
             }
         }
     }
@@ -2313,13 +3430,98 @@ pub const SettingsWindow = struct {
         };
     }
 
+    fn editControls(self: *const SettingsWindow) [8]?HWND {
+        return .{
+            self.edit_scrollback,
+            self.edit_font_family,
+            self.edit_font_size,
+            self.edit_theme,
+            self.edit_bg_opacity,
+            self.edit_command,
+            self.edit_pad_x,
+            self.edit_pad_y,
+        };
+    }
+
+    fn isEditControl(self: *const SettingsWindow, hwnd: HWND) bool {
+        for (self.editControls()) |edit| if (edit == hwnd) return true;
+        return false;
+    }
+
+    /// Width of a text field's frame: the focus stroke, which the resting
+    /// 1 DIP line sits inside, so focus does not move the text.
+    fn fieldStroke(self: *const SettingsWindow) i32 {
+        return @max(1, self.px(settings_metrics.stroke_focus));
+    }
+
+    /// Paint `edit`'s frame (see `settingsEditProc`). `focused` overrides
+    /// `GetFocus` while focus is changing hands.
+    fn paintFieldFrame(self: *SettingsWindow, edit: HWND, focused: ?bool) void {
+        var window: RECT = undefined;
+        var client: RECT = undefined;
+        var client_origin: POINT = .{ .x = 0, .y = 0 };
+        if (GetWindowRect(edit, &window) == 0 or
+            GetClientRect(edit, &client) == 0 or
+            sys.ClientToScreen(edit, &client_origin) == 0) return;
+        const hdc = GetWindowDC(edit) orelse return;
+        defer _ = ReleaseDC(edit, hdc);
+        const left = client_origin.x - window.left;
+        const top = client_origin.y - window.top;
+        _ = ExcludeClipRect(hdc, left, top, left + client.right, top + client.bottom);
+
+        const colors = self.theme_adapter.colors;
+        const enabled = sys.IsWindowEnabled(edit) != 0;
+        const state = fieldFrameState(focused orelse (GetFocus() == edit), enabled and self.validation_control == edit);
+        const outer: RECT = .{ .left = 0, .top = 0, .right = window.right - window.left, .bottom = window.bottom - window.top };
+        // A disabled EDIT asks for WM_CTLCOLORSTATIC and draws on the pane colour.
+        fillSolid(hdc, outer, if (enabled) colors.edit_bg else colors.window_bg);
+        const stroke: struct { color: COLORREF, width: i32 } = switch (state) {
+            .rest => .{
+                .color = if (enabled) colors.field_border else colors.disabled_text,
+                .width = @max(1, self.px(settings_metrics.stroke_hairline)),
+            },
+            .focused => .{ .color = colors.accent, .width = self.fieldStroke() },
+            .invalid => .{ .color = colors.error_text, .width = self.fieldStroke() },
+        };
+        strokeRect(hdc, outer, stroke.color, stroke.width);
+    }
+
+    /// Repaint the frames of the field that stops being invalid and of the
+    /// one that starts (`fieldFrameState`).
+    fn syncFieldFrames(self: *SettingsWindow) void {
+        const next = self.validation_control;
+        if (next == self.framed_invalid_field) return;
+        const previous = self.framed_invalid_field;
+        self.framed_invalid_field = next;
+        for ([_]?HWND{ previous, next }) |field| if (field) |control| {
+            if (self.isEditControl(control)) self.paintFieldFrame(control, null);
+        };
+    }
+
     fn updateComboMetrics(self: *SettingsWindow) void {
-        const field_height: LPARAM = self.px(settings_control_height);
         const item_height: LPARAM = self.px(settings_combo_item_height);
         for (self.comboControls()) |combo| if (combo) |control| {
-            _ = SendMessageW(control, CB_SETITEMHEIGHT, std.math.maxInt(WPARAM), field_height);
-            _ = SendMessageW(control, CB_SETITEMHEIGHT, 0, item_height);
             win32_theme.WindowThemeAdapter.applyNativeCombo(control, self.theme_adapter.colors);
+            _ = SendMessageW(control, CB_SETITEMHEIGHT, 0, item_height);
+        };
+        self.fitComboFields();
+    }
+
+    /// Make each closed dropdown exactly as tall as a text field. A dropdown
+    /// that is resized, as every layout does (its height is that of the open
+    /// list), puts its selection field back to the font's height, so the
+    /// height set before the layout was lost: 35 px against 48 px text fields
+    /// at 150%. This runs after the layout. The height asked for is the
+    /// selection field's; the window adds a frame, which is measured.
+    fn fitComboFields(self: *SettingsWindow) void {
+        const target = self.px(settings_control_height);
+        for (self.comboControls()) |combo| if (combo) |control| {
+            var rect: RECT = undefined;
+            if (GetWindowRect(control, &rect) == 0) continue;
+            const current = SendMessageW(control, CB_GETITEMHEIGHT, std.math.maxInt(WPARAM), 0);
+            if (current <= 0) continue;
+            const next = comboSelectionHeight(rect.bottom - rect.top, @intCast(current), target);
+            if (next != current) _ = SendMessageW(control, CB_SETITEMHEIGHT, std.math.maxInt(WPARAM), next);
         };
     }
 
@@ -2336,13 +3538,36 @@ pub const SettingsWindow = struct {
         noteSettingsInput(self, msg, wParam);
     }
 
+    /// Re-theme the window when something it was themed from has changed.
+    /// WM_SETTINGCHANGE, WM_SYSCOLORCHANGE and WM_THEMECHANGED also arrive for
+    /// settings that have nothing to do with it (Environment, taskbar, input),
+    /// and every App-level theme rebuild calls this too, so the callers cannot
+    /// tell. Doing the work anyway costs 80-200 ms of UI thread and blanks
+    /// every control, which is why the work is keyed on what it reads: the
+    /// resolved colors (High Contrast state included) and the DPI the fonts
+    /// were built for. Do not filter by the broadcast's lParam instead; system
+    /// font and High Contrast changes arrive under several names.
     pub fn themeChanged(self: *SettingsWindow) void {
-        if (self.hwnd) |hwnd| {
-            self.theme_adapter.apply(hwnd, self.resolveThemeColors());
-        }
+        const hwnd = self.hwnd orelse return;
+        const colors = self.resolveThemeColors();
+        if (self.themeInputsApplied(colors)) return;
+        self.theme_applications +%= 1;
+        self.theme_adapter.apply(hwnd, colors);
         self.recreateUiFont();
         layoutChildren(self);
-        if (self.hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 1);
+        _ = sys.InvalidateRect(hwnd, null, 1);
+    }
+
+    fn themeInputsApplied(self: *const SettingsWindow, colors: win32_theme.SettingsColors) bool {
+        // `apply` creates the four brushes independently, so a shortage of GDI
+        // objects can leave some of them null; any missing one retries.
+        return self.theme_adapter.window_brush != null and
+            self.theme_adapter.rail_brush != null and
+            self.theme_adapter.edit_brush != null and
+            self.theme_adapter.button_brush != null and
+            self.ui_font != null and
+            self.ui_font_dpi == self.dpi and
+            std.meta.eql(self.theme_adapter.colors, colors);
     }
 
     fn resolveThemeColors(self: *const SettingsWindow) win32_theme.SettingsColors {
@@ -2382,50 +3607,49 @@ pub const SettingsWindow = struct {
             }
         }
         if (!is_form_control) return;
-        const hwnd = self.hwnd orelse return;
+        const viewport = self.viewport orelse return;
         var child_rect: RECT = undefined;
         var client_rect: RECT = undefined;
         if (sys.GetWindowRect(control, &child_rect) == 0 or
-            sys.GetClientRect(hwnd, &client_rect) == 0) return;
+            sys.GetClientRect(viewport, &client_rect) == 0) return;
         var child_origin: POINT = .{ .x = child_rect.left, .y = child_rect.top };
-        if (sys.ScreenToClient(hwnd, &child_origin) == 0) return;
+        if (sys.ScreenToClient(viewport, &child_origin) == 0) return;
         const top = child_origin.y;
         const bottom = top + child_rect.bottom - child_rect.top;
-        const viewport_top = settingsContentViewportTop(self, client_rect);
-        const viewport_bottom = settingsContentViewportBottom(self, client_rect);
-        if (top < viewport_top) {
-            self.setContentScroll(self.content_scroll_y - (viewport_top - top));
-        } else if (bottom > viewport_bottom) {
-            self.setContentScroll(self.content_scroll_y + (bottom - viewport_bottom));
+        if (top < 0) {
+            self.setContentScroll(self.content_scroll_y + top);
+        } else if (bottom > client_rect.bottom) {
+            self.setContentScroll(self.content_scroll_y + (bottom - client_rect.bottom));
         }
     }
 
+    /// Show the active section's fields and labels and hide the rest. A
+    /// window already in the wanted state is left alone, so it does not
+    /// repaint.
     fn applySectionVisibility(self: *SettingsWindow) void {
         for (std.enums.values(Section)) |section| {
             if (self.sectionButton(section)) |button| {
-                _ = sys.SendMessageW(
-                    button,
-                    BM_SETCHECK,
-                    if (section == self.active_section) BST_CHECKED else BST_UNCHECKED,
-                    0,
-                );
+                const check: usize = if (section == self.active_section) BST_CHECKED else BST_UNCHECKED;
+                if (@as(usize, @bitCast(sys.SendMessageW(button, BM_GETCHECK, 0, 0))) != check) {
+                    _ = sys.SendMessageW(button, BM_SETCHECK, check, 0);
+                }
                 const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(button, GWL_STYLE))));
                 const next_style = if (section == self.active_section) style | WS_TABSTOP else style & ~WS_TABSTOP;
                 if (next_style != style) _ = sys.SetWindowLongPtrW(button, GWL_STYLE, @intCast(next_style));
             }
         }
-        for (0..settings_clipped_control_count) |index| if (self.controlHwnd(index)) |control| {
-            _ = ShowWindow(control, SW_HIDE);
-        };
-        for (self.field_labels) |label| {
-            if (label) |control| _ = ShowWindow(control, SW_HIDE);
-        }
+        var active_controls = [_]bool{false} ** settings_clipped_control_count;
+        var active_labels = [_]bool{false} ** settings_label_specs.len;
         for (self.formItems()) |item| {
-            if (self.controlHwnd(item.control_index)) |control| _ = ShowWindow(control, SW_SHOWNORMAL);
-            if (item.label_index) |index| {
-                if (self.field_labels[index]) |label| _ = ShowWindow(label, SW_SHOWNORMAL);
-            }
+            active_controls[item.control_index] = true;
+            if (item.label_index) |index| active_labels[index] = true;
         }
+        for (0..settings_clipped_control_count) |index| if (self.controlHwnd(index)) |control| {
+            setChildShown(control, active_controls[index]);
+        };
+        for (self.field_labels, 0..) |label, index| if (label) |control| {
+            setChildShown(control, active_labels[index]);
+        };
     }
 
     /// Read the current EDIT text and write the parsed integer into
@@ -2776,25 +4000,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_confirm_close orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"confirm-close-surface" = switch (idx) {
-            0 => .false,
-            1 => .true,
-            2 => .always,
-            else => return,
-        };
+        p.*.@"confirm-close-surface" = confirmCloseFromComboIndex(idx) orelse return;
         self.trackEdit(.confirm_close, false);
     }
 
     fn displayConfirmCloseInCombo(self: *SettingsWindow) void {
         const combo = self.combo_confirm_close orelse return;
         const p = self.pending orelse return;
-        const idx: usize = switch (p.@"confirm-close-surface") {
-            .false => 0,
-            .true => 1,
-            .always => 2,
-        };
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromConfirmClose(p.@"confirm-close-surface"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -2804,25 +4018,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_copy_on_select orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"copy-on-select" = switch (idx) {
-            0 => .false,
-            1 => .true,
-            2 => .clipboard,
-            else => return,
-        };
+        p.*.@"copy-on-select" = copyOnSelectFromComboIndex(idx) orelse return;
         self.trackEdit(.copy_on_select, false);
     }
 
     fn displayCopyOnSelectInCombo(self: *SettingsWindow) void {
         const combo = self.combo_copy_on_select orelse return;
         const p = self.pending orelse return;
-        const idx: usize = switch (p.@"copy-on-select") {
-            .false => 0,
-            .true => 1,
-            .clipboard => 2,
-        };
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromCopyOnSelect(p.@"copy-on-select"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -2893,29 +4097,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_window_theme orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"window-theme" = switch (idx) {
-            0 => .auto,
-            1 => .system,
-            2 => .light,
-            3 => .dark,
-            4 => .ghostty,
-            else => return,
-        };
+        p.*.@"window-theme" = windowThemeFromComboIndex(idx) orelse return;
         self.trackEdit(.window_theme, true);
     }
 
     fn displayWindowThemeInCombo(self: *SettingsWindow) void {
         const combo = self.combo_window_theme orelse return;
         const p = self.pending orelse return;
-        const idx: usize = switch (p.@"window-theme") {
-            .auto => 0,
-            .system => 1,
-            .light => 2,
-            .dark => 3,
-            .ghostty => 4,
-        };
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromWindowTheme(p.@"window-theme"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -2925,33 +4115,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_shell_integ orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"shell-integration" = switch (idx) {
-            0 => .none,
-            1 => .detect,
-            2 => .bash,
-            3 => .elvish,
-            4 => .fish,
-            5 => .nushell,
-            6 => .zsh,
-            else => return,
-        };
+        p.*.@"shell-integration" = shellIntegrationFromComboIndex(idx) orelse return;
         self.trackEdit(.shell_integration, false);
     }
 
     fn displayShellIntegInCombo(self: *SettingsWindow) void {
         const combo = self.combo_shell_integ orelse return;
         const p = self.pending orelse return;
-        const idx: usize = switch (p.@"shell-integration") {
-            .none => 0,
-            .detect => 1,
-            .bash => 2,
-            .elvish => 3,
-            .fish => 4,
-            .nushell => 5,
-            .zsh => 6,
-        };
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromShellIntegration(p.@"shell-integration"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -2961,27 +4133,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_cursor_style orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"cursor-style" = switch (idx) {
-            0 => .bar,
-            1 => .block,
-            2 => .underline,
-            3 => .block_hollow,
-            else => return,
-        };
+        p.*.@"cursor-style" = cursorStyleFromComboIndex(idx) orelse return;
         self.trackEdit(.cursor_style, true);
     }
 
     fn displayCursorStyleInCombo(self: *SettingsWindow) void {
         const combo = self.combo_cursor_style orelse return;
         const p = self.pending orelse return;
-        const idx: usize = switch (p.@"cursor-style") {
-            .bar => 0,
-            .block => 1,
-            .underline => 2,
-            .block_hollow => 3,
-        };
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromCursorStyle(p.@"cursor-style"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -3020,25 +4180,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_pad_balance orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"window-padding-balance" = switch (idx) {
-            0 => .false,
-            1 => .true,
-            2 => .equal,
-            else => return,
-        };
+        p.*.@"window-padding-balance" = paddingBalanceFromComboIndex(idx) orelse return;
         self.trackEdit(.padding_balance, true);
     }
 
     fn displayPadBalanceInCombo(self: *SettingsWindow) void {
         const combo = self.combo_pad_balance orelse return;
         const p = self.pending orelse return;
-        const idx: usize = switch (p.@"window-padding-balance") {
-            .false => 0,
-            .true => 1,
-            .equal => 2,
-        };
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromPaddingBalance(p.@"window-padding-balance"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -3048,26 +4198,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_auto_update orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"auto-update" = switch (idx) {
-            0 => null,
-            1 => .off,
-            2 => .check,
-            3 => .download,
-            else => return,
-        };
+        p.*.@"auto-update" = autoUpdateFromComboIndex(idx) orelse return;
         self.trackEdit(.auto_update, false);
     }
 
     fn displayAutoUpdateInCombo(self: *SettingsWindow) void {
         const combo = self.combo_auto_update orelse return;
         const p = self.pending orelse return;
-        const idx: usize = if (p.@"auto-update") |value| switch (value) {
-            .off => 1,
-            .check => 2,
-            .download => 3,
-        } else 0;
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromAutoUpdate(p.@"auto-update"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -3077,24 +4216,15 @@ pub const SettingsWindow = struct {
         const combo = self.combo_auto_update_channel orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"auto-update-channel" = switch (idx) {
-            0 => null,
-            1 => .stable,
-            2 => .tip,
-            else => return,
-        };
+        p.*.@"auto-update-channel" = autoUpdateChannelFromComboIndex(idx) orelse return;
         self.trackEdit(.auto_update_channel, false);
     }
 
     fn displayAutoUpdateChannelInCombo(self: *SettingsWindow) void {
         const combo = self.combo_auto_update_channel orelse return;
         const p = self.pending orelse return;
-        const idx: usize = if (p.@"auto-update-channel") |value| switch (value) {
-            .stable => 1,
-            .tip => 2,
-        } else 0;
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
+        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromAutoUpdateChannel(p.@"auto-update-channel"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -3140,6 +4270,17 @@ pub const SettingsWindow = struct {
             self.ensureControlVisible(control);
             return;
         }
+        // The check may merge a changed file into this window, so it runs on
+        // the window's own configs, and nothing below uses a copy made before
+        // it. A conflict it finds is shown the way one that was already open is.
+        if (self.conflictCount() == 0) if (self.handle.reconcileDisk) |reconcile| {
+            if (self.pending) |*draft| if (self.original) |*baseline| reconcile(self.handle.ctx, draft, baseline) catch |err| {
+                std.log.warn("settings: could not check the config file before saving err={}; draft preserved", .{err});
+                self.setSaveFailureNote(err);
+                self.updateSaveEnabled();
+                return;
+            };
+        };
         if (self.conflictCount() != 0) {
             self.surfaceNextValidation(false);
             return;
@@ -3153,7 +4294,7 @@ pub const SettingsWindow = struct {
             var effects: [setting_field_count + 1]SettingsTransaction.Effect = undefined;
             const emitted = transaction.dispatch(.apply, &effects) catch |err| {
                 std.log.warn("settings: save transaction rejected err={}; draft preserved", .{err});
-                self.setStatus("Resolve settings conflicts or invalid fields before saving.");
+                self.setNote(.resolve_first);
                 return;
             };
             for (emitted) |effect| switch (effect) {
@@ -3194,7 +4335,7 @@ pub const SettingsWindow = struct {
                 // is fixed, or close the window to discard.
                 if (apply_id) |id| if (!self.failApply(id)) return;
                 std.log.warn("settings: save failed err={}; draft preserved", .{err});
-                self.setStatus("Save failed. Your edits are preserved; check permissions or another editor and retry.");
+                self.setSaveFailureNote(err);
                 self.updateSaveEnabled();
             },
         }
@@ -3218,7 +4359,7 @@ pub const SettingsWindow = struct {
 
     fn syncClosePromptText(self: *SettingsWindow, announce: bool) void {
         const text = self.text_close_prompt orelse return;
-        setWindowTextUtf8(text, closePromptText(self.save_in_flight));
+        setWindowTextUtf8(text, closePromptText(self.save_in_flight, self.quit_after_close));
         if (announce) {
             sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, text, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
         }
@@ -3251,9 +4392,35 @@ pub const SettingsWindow = struct {
         if (self.btn_close_keep_editing) |button| _ = sys.SetFocus(button);
     }
 
+    /// The app's quit asks here first. With unsaved changes, raise the window
+    /// with its close prompt and hold the quit: Save or Discard closes the
+    /// window and `onClosed` resumes the quit (`takeQuitAfterClose`), while
+    /// Keep editing, or a save that fails, drops it. Returns whether the
+    /// quit has to wait.
+    pub fn holdQuitForUnsavedChanges(self: *SettingsWindow) bool {
+        const hwnd = self.hwnd orelse return false;
+        if (self.close_posted or !self.hasPendingChanges()) return false;
+        if (sys.IsIconic(hwnd) != 0) _ = sys.ShowWindow(hwnd, SW_RESTORE);
+        _ = SetForegroundWindow(hwnd);
+        self.quit_after_close = true;
+        // An open prompt still says "closing"; say "quitting" instead.
+        if (self.close_prompt_visible) {
+            self.syncClosePromptText(true);
+            layoutChildren(self);
+        }
+        self.showClosePrompt();
+        return true;
+    }
+
+    pub fn takeQuitAfterClose(self: *SettingsWindow) bool {
+        defer self.quit_after_close = false;
+        return self.quit_after_close;
+    }
+
     fn cancelClosePrompt(self: *SettingsWindow) void {
         if (!closePromptCanCancel(self.close_prompt_visible, self.close_posted)) return;
         const prior_focus = self.close_prior_focus;
+        self.quit_after_close = false;
         self.close_prompt_visible = false;
         self.close_after_save = false;
         self.close_prior_focus = null;
@@ -3314,7 +4481,7 @@ pub const SettingsWindow = struct {
         if (sys.PostMessageW(hwnd, WM_SETTINGS_CLOSE_NOW, 0, 0) == 0) {
             self.close_posted = false;
             self.updateClosePromptActions();
-            self.setStatus("Could not close the settings window; your edits are preserved.");
+            self.setNote(.close_failed);
             self.cancelClosePrompt();
         }
     }
@@ -3328,7 +4495,7 @@ pub const SettingsWindow = struct {
             self.close_posted = false;
             _ = sys.ShowWindow(hwnd, SW_SHOWNORMAL);
             self.updateClosePromptActions();
-            self.setStatus("Could not close the settings window; your edits are preserved.");
+            self.setNote(.close_failed);
             self.cancelClosePrompt();
             return;
         }
@@ -3366,19 +4533,32 @@ pub const SettingsWindow = struct {
 
     fn finishSuccessfulSave(self: *SettingsWindow, masked: bool) void {
         const should_close = self.close_after_save;
+        // Before anything repaints the status: the note outlives the reset.
+        self.freeNoteText();
+        self.status_note = if (masked) .saved_overridden else .saved;
+        // The settings the save wrote that something later overrides, by the
+        // names a config file knows them by.
+        const masked_keys: ?[]const u8 = if (masked)
+            if (self.handle.maskedKeys) |lend| lend(self.handle.ctx) else null
+        else
+            null;
+        if (masked_keys) |keys| {
+            self.note_text = StatusNote.saved_overridden.textWithDetail(self.handle.alloc, keys) catch null;
+        }
         self.adoptCurrentConfig() catch |err| {
             std.log.err("settings: failed to refresh saved config snapshot err={}", .{err});
             if (should_close) self.cancelClosePrompt();
             return;
         };
         self.refreshAllControls();
-        self.setStatus(if (masked) "Saved, but a later config layer masks one or more values." else "Settings saved.");
         self.updateSaveEnabled();
         if (masked) {
+            var body_buf: [1024]u8 = undefined;
+            const body = maskedNotificationBody(&body_buf, masked_keys);
             self.handle.notifySuccess(
                 self.handle.ctx,
-                "Settings saved — some values are masked by a later config-file layer",
-                "Check the log for which fields.",
+                "Settings saved, but some values are overridden",
+                body,
             );
         } else {
             self.handle.notifySuccess(self.handle.ctx, "Settings saved", "");
@@ -3412,7 +4592,7 @@ pub const SettingsWindow = struct {
                 if (!self.failApply(apply_id)) return;
                 self.setSaveInFlight(false);
                 std.log.warn("settings: asynchronous save failed err={}; draft preserved", .{err});
-                self.setStatus("Save failed. Your edits are preserved; retry when the underlying problem is resolved.");
+                self.setNote(.save_failed);
                 self.updateSaveEnabled();
                 if (self.close_after_save) self.cancelClosePrompt();
             },
@@ -3470,8 +4650,20 @@ pub const SettingsWindow = struct {
         self.setActiveSection(destination.section);
         if (destination.hwnd) |control| {
             self.ensureControlVisible(control);
-            _ = SetFocus(control);
+            // The blur checkbox is disabled: focus stays on the section instead.
+            if (sys.IsWindowEnabled(control) != 0) {
+                _ = SetFocus(control);
+            } else if (self.sectionButton(destination.section)) |button| {
+                _ = SetFocus(button);
+            }
         }
+    }
+
+    /// Open Settings on `section`, with focus on its rail button.
+    pub fn openSection(self: *SettingsWindow, section: Section) !void {
+        try self.open();
+        self.setActiveSection(section);
+        if (self.sectionButton(section)) |button| _ = SetFocus(button);
     }
 
     /// Bring the settings window up. Idempotent: a subsequent open
@@ -3489,6 +4681,7 @@ pub const SettingsWindow = struct {
                     .cancel_discard_close => {
                         // The user already chose Discard. A reopen that wins
                         // the posted-close race must not resurrect that draft.
+                        self.status_note = .none;
                         try self.adoptCurrentConfig();
                         self.refreshAllControls();
                         self.close_posted = false;
@@ -3504,9 +4697,12 @@ pub const SettingsWindow = struct {
         }
         self.resetClosePromptState();
         self.close_notified = false;
+        self.focus_before_deactivate = null;
+        self.wheel_remainder = 0;
 
         // Fresh owned snapshots of the live config. Discarded on close
         // or atomically refreshed after a successful save.
+        self.status_note = .none;
         try self.adoptCurrentConfig();
 
         if (self.class_atom == 0) {
@@ -3517,21 +4713,45 @@ pub const SettingsWindow = struct {
                 .cbClsExtra = 0,
                 .cbWndExtra = 0,
                 .hInstance = self.handle.hinstance,
-                .hIcon = null,
+                .hIcon = self.appIcon(false),
                 .hCursor = sys.LoadCursorW(null, @ptrFromInt(IDC_ARROW)),
                 .hbrBackground = null,
                 .lpszMenuName = null,
                 .lpszClassName = class_name,
-                .hIconSm = null,
+                .hIconSm = self.appIcon(true),
             };
             self.class_atom = sys.RegisterClassExW(&wc);
             if (self.class_atom == 0) {
                 return windows.unexpectedError(windows.kernel32.GetLastError());
             }
         }
+        if (self.viewport_class_atom == 0) {
+            const wc: WNDCLASSEXW = .{
+                .cbSize = @sizeOf(WNDCLASSEXW),
+                .style = 0,
+                .lpfnWndProc = &viewportProc,
+                .cbClsExtra = 0,
+                .cbWndExtra = 0,
+                .hInstance = self.handle.hinstance,
+                .hIcon = null,
+                .hCursor = sys.LoadCursorW(null, @ptrFromInt(IDC_ARROW)),
+                .hbrBackground = null,
+                .lpszMenuName = null,
+                .lpszClassName = viewport_class_name,
+                .hIconSm = null,
+            };
+            self.viewport_class_atom = sys.RegisterClassExW(&wc);
+            if (self.viewport_class_atom == 0) {
+                return windows.unexpectedError(windows.kernel32.GetLastError());
+            }
+        }
 
         const title = std.unicode.utf8ToUtf16LeStringLiteral("noctty settings");
-        const window_style = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_VSCROLL;
+        // WS_CLIPCHILDREN: painting the frame never paints over a child, so a
+        // relayout, a section switch or a theme refresh no longer blanks the
+        // form until every control has repainted. The scroll bar belongs to
+        // the viewport, not to the window.
+        const window_style = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
         const initial_outer = settingsOuterSizeForClient(960, 640, 96, window_style, WS_EX_APPWINDOW);
         const owner_hwnd = if (self.handle.ownerWindow) |get_owner| get_owner(self.handle.ctx) else null;
         const hwnd = sys.CreateWindowExW(
@@ -3554,6 +4774,10 @@ pub const SettingsWindow = struct {
         ) orelse return windows.unexpectedError(windows.kernel32.GetLastError());
         self.hwnd = hwnd;
         self.dpi = normalizedDpi(sys.GetDpiForWindow(hwnd));
+        // The class icon is what Alt+Tab shows; the caption and taskbar sizes
+        // are set on the window itself, as the terminal windows do.
+        if (self.appIcon(false)) |icon| _ = sys.SendMessageW(hwnd, WM_SETICON, ICON_BIG, @bitCast(@intFromPtr(icon)));
+        if (self.appIcon(true)) |icon| _ = sys.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, @bitCast(@intFromPtr(icon)));
 
         // PerMonitorV2 coordinates are physical pixels. Start at the intended
         // logical size, capped to the current work area, so a high-DPI monitor
@@ -3596,11 +4820,6 @@ pub const SettingsWindow = struct {
         self.text_status = makeStatic(hwnd, self.handle.hinstance, "");
         self.text_close_prompt = makeStatic(hwnd, self.handle.hinstance, "Save changes before closing?");
         if (self.text_close_prompt) |text| _ = sys.ShowWindow(text, SW_HIDE);
-        self.text_help = makeStatic(hwnd, self.handle.hinstance, "");
-        for (settings_label_specs, 0..) |spec, i| {
-            self.field_labels[i] = makeStatic(hwnd, self.handle.hinstance, spec);
-        }
-        self.initializeTextUiaProviders();
 
         // Left-rail section buttons. Clicks arrive via WM_COMMAND on
         // the parent; the id maps back to a `Section` via
@@ -3614,6 +4833,40 @@ pub const SettingsWindow = struct {
         self.btn_section_advanced = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.advanced);
         self.subclassSectionButtons();
         self.initializeSectionUiaProviders();
+
+        // The form: every field, its label and the help text live in the
+        // viewport, after the rail in z-order so Tab goes rail, fields, action
+        // bar. WS_EX_CONTROLPARENT lets the dialog manager walk into it.
+        // WM_COMMAND and WM_CTLCOLOR* from the fields are forwarded here.
+        const form = sys.CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            viewport_class_name,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VSCROLL,
+            0,
+            0,
+            1,
+            1,
+            hwnd,
+            null,
+            self.handle.hinstance,
+            self,
+        ) orelse {
+            const err = windows.kernel32.GetLastError();
+            _ = sys.DestroyWindow(hwnd);
+            return windows.unexpectedError(err);
+        };
+        self.viewport = form;
+        self.text_help = makeStatic(form, self.handle.hinstance, "");
+        // The arrow keys walk a group from window to window and step into the
+        // viewport, ignoring a group style on the viewport itself: its first
+        // child has to end the rail's group, or Down from the last section
+        // would run on into the labels.
+        if (self.text_help) |help| startGroup(help);
+        for (settings_label_specs, 0..) |spec, i| {
+            self.field_labels[i] = makeStatic(form, self.handle.hinstance, spec);
+        }
+        self.initializeTextUiaProviders();
 
         // "Open in default editor" button — escape hatch for users
         // who prefer text-editing the config file directly. Lives
@@ -3629,7 +4882,7 @@ pub const SettingsWindow = struct {
             0,
             settings_field_max_width,
             32,
-            hwnd,
+            form,
             @ptrFromInt(BTN_OPEN_EDITOR),
             self.handle.hinstance,
             null,
@@ -3733,7 +4986,7 @@ pub const SettingsWindow = struct {
             0,
             settings_field_max_width,
             32,
-            hwnd,
+            form,
             @ptrFromInt(BTN_KEYBINDINGS_EDITOR),
             self.handle.hinstance,
             null,
@@ -3741,52 +4994,52 @@ pub const SettingsWindow = struct {
 
         // Scrollback limit EDIT. Lives in the Terminal section. Digit-
         // only input via ES_NUMBER; EN_CHANGE syncs into `pending`.
-        self.edit_scrollback = makeEdit(hwnd, self.handle.hinstance, EDIT_SCROLLBACK, ES_NUMBER);
+        self.edit_scrollback = makeEdit(form, self.handle.hinstance, EDIT_SCROLLBACK, ES_NUMBER);
 
         // font-family EDIT. Comma-separated fallback families.
-        self.edit_font_family = makeEdit(hwnd, self.handle.hinstance, EDIT_FONT_FAMILY, 0);
+        self.edit_font_family = makeEdit(form, self.handle.hinstance, EDIT_FONT_FAMILY, 0);
 
         // font-size EDIT. Appearance section. We accept floats via a
         // plain EDIT (not ES_NUMBER — which rejects '.') and validate
         // on EN_CHANGE.
-        self.edit_font_size = makeEdit(hwnd, self.handle.hinstance, EDIT_FONT_SIZE, 0);
+        self.edit_font_size = makeEdit(form, self.handle.hinstance, EDIT_FONT_SIZE, 0);
 
         // theme EDIT. Accepts a built-in/custom name or light/dark pair.
-        self.edit_theme = makeEdit(hwnd, self.handle.hinstance, EDIT_THEME, 0);
+        self.edit_theme = makeEdit(form, self.handle.hinstance, EDIT_THEME, 0);
 
         // background-opacity EDIT. Appearance section. 0.0..1.0.
-        self.edit_bg_opacity = makeEdit(hwnd, self.handle.hinstance, EDIT_BG_OPACITY, 0);
+        self.edit_bg_opacity = makeEdit(form, self.handle.hinstance, EDIT_BG_OPACITY, 0);
 
-        self.edit_command = makeEdit(hwnd, self.handle.hinstance, EDIT_COMMAND, 0);
+        self.edit_command = makeEdit(form, self.handle.hinstance, EDIT_COMMAND, 0);
 
-        self.edit_pad_x = makeEdit(hwnd, self.handle.hinstance, EDIT_PAD_X, 0);
+        self.edit_pad_x = makeEdit(form, self.handle.hinstance, EDIT_PAD_X, 0);
 
-        self.edit_pad_y = makeEdit(hwnd, self.handle.hinstance, EDIT_PAD_Y, 0);
+        self.edit_pad_y = makeEdit(form, self.handle.hinstance, EDIT_PAD_Y, 0);
 
         // clipboard-trim-trailing-spaces checkbox. Terminal section.
         self.chk_trim_trail = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_TRIM_TRAIL,
             std.unicode.utf8ToUtf16LeStringLiteral("Trim trailing spaces on copy"),
         );
 
         self.chk_desktop_notifications = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_DESKTOP_NOTIFICATIONS,
             std.unicode.utf8ToUtf16LeStringLiteral("Allow terminal desktop notifications"),
         );
 
         self.chk_app_notify_clipboard = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CLIPBOARD,
             std.unicode.utf8ToUtf16LeStringLiteral("Notify when clipboard copy completes"),
         );
 
         self.chk_app_notify_config = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CONFIG,
             std.unicode.utf8ToUtf16LeStringLiteral("Notify after config reload"),
@@ -3794,106 +5047,110 @@ pub const SettingsWindow = struct {
 
         // Comboboxes for enum fields.
         self.combo_confirm_close = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CONFIRM_CLOSE,
             settings_combo_popup_height,
-            &.{ "false", "true", "always" },
+            &confirm_close_labels,
         );
 
         self.combo_copy_on_select = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_COPY_ON_SELECT,
             settings_combo_popup_height,
-            &.{ "false", "true", "clipboard" },
+            &copy_on_select_labels,
         );
 
         self.combo_clipboard_read = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CLIPBOARD_READ,
             settings_combo_popup_height,
-            &.{ "ask", "allow", "deny" },
+            &clipboard_access_labels,
         );
 
         self.combo_clipboard_write = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CLIPBOARD_WRITE,
             settings_combo_popup_height,
-            &.{ "ask", "allow", "deny" },
+            &clipboard_access_labels,
         );
 
         self.combo_link_url = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_LINK_URL,
             settings_combo_popup_height,
-            &.{ "enabled", "disabled" },
+            &link_url_labels,
         );
 
         self.combo_link_previews = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_LINK_PREVIEWS,
             settings_combo_popup_height,
-            &.{ "all links", "OSC 8 only", "disabled" },
+            &link_previews_labels,
         );
 
         self.combo_window_theme = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_WINDOW_THEME,
             settings_combo_popup_height,
-            &.{ "auto", "system", "light", "dark", "ghostty" },
+            &window_theme_labels,
         );
 
         self.combo_shell_integ = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_SHELL_INTEG,
             settings_combo_popup_height,
-            &.{ "none", "detect", "bash", "elvish", "fish", "nushell", "zsh" },
+            &shell_integration_labels,
         );
 
         self.combo_cursor_style = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_CURSOR_STYLE,
             settings_combo_popup_height,
-            &.{ "bar", "block", "underline", "block_hollow" },
+            &cursor_style_labels,
         );
 
+        // Nothing in the Win32 runtime can show a backdrop blur (AGENTS.md,
+        // 2026-09-14), so the box is shown for what the config file may say and
+        // cannot be changed here. It keeps its place and its accessible name.
         self.chk_bg_blur = makeCheckbox(
-            hwnd,
+            form,
             self.handle.hinstance,
             CHK_BG_BLUR,
-            std.unicode.utf8ToUtf16LeStringLiteral("Enable background blur"),
+            std.unicode.utf8ToUtf16LeStringLiteral(background_blur_label),
         );
+        if (self.chk_bg_blur) |chk| _ = sys.EnableWindow(chk, 0);
 
         self.combo_pad_balance = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_PAD_BALANCE,
             settings_combo_popup_height,
-            &.{ "false", "true", "equal" },
+            &padding_balance_labels,
         );
 
         self.combo_auto_update = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_AUTO_UPDATE,
             settings_combo_popup_height,
-            &.{ "default", "off", "check", "download" },
+            &auto_update_labels,
         );
 
         self.combo_auto_update_channel = makeCombo(
-            hwnd,
+            form,
             self.handle.hinstance,
             COMBO_AUTO_UPDATE_CHANNEL,
             settings_combo_popup_height,
-            &.{ "default", "stable", "tip" },
+            &auto_update_channel_labels,
         );
 
         // Painted field labels keep the native dark visual treatment, while
@@ -3901,6 +5158,11 @@ pub const SettingsWindow = struct {
         // through the UI Automation bridge. Values remain owned by the native
         // controls and are not conflated with their accessible names.
         annotateAccessibleControls(self);
+        // Before the UIA providers: they subclass the same HWNDs and call
+        // down to whatever procedure is installed when they arrive.
+        for (self.comboControls()) |combo| if (combo) |control| subclassCombo(control);
+        for (self.editControls()) |edit| if (edit) |control| subclassEdit(control);
+        self.applyTabOrder();
         self.initializeControlUiaProviders();
 
         self.refreshAllControls();
@@ -4113,16 +5375,15 @@ fn makeEdit(
     extra_style: u32,
 ) ?HWND {
     const edit_class = std.unicode.utf8ToUtf16LeStringLiteral("EDIT");
-    // `WS_EX_CLIENTEDGE` is the classic sunken 3-D frame. It ignores the
-    // `DarkMode_Explorer` theme entirely, so on the dark pane every field
-    // wore a two-pixel near-white bevel. A themed `WS_BORDER` EDIT draws
-    // the same 1 px frame the combo boxes beside it draw, in the theme's
-    // own colour, in both modes.
+    // No border style: the field draws its own frame (`settingsEditProc`).
+    // `WS_EX_CLIENTEDGE` is the classic sunken 3-D frame and ignores the dark
+    // theme; a themed `WS_BORDER` has no focused state, and the themed EDIT
+    // drew it a second time inside the text area once the frame was ours.
     const edit = CreateWindowExW(
         0,
         edit_class,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | extra_style,
+        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | extra_style,
         0,
         0,
         settings_field_max_width,
@@ -4243,6 +5504,8 @@ const settings_control_height: i32 = settings_metrics.space_9;
 const settings_combo_item_height: i32 = settings_metrics.space_9;
 const settings_field_group_gap: i32 = settings_metrics.space_5;
 const settings_field_row_pitch: i32 = 64;
+/// What one wheel notch scrolls at the default of three lines per notch.
+const settings_wheel_notch_px: i32 = 64;
 const settings_column_gap: i32 = settings_metrics.space_8;
 const settings_column_min_width: i32 = 320;
 const settings_two_column_min_width: i32 = 664;
@@ -4323,8 +5586,10 @@ fn closeActionRowGeometry(available_width: i32, available_height: i32, dpi: u32)
         .stacked = false,
     };
 
-    const width = @max(0, available_width);
-    const height = @max(0, available_height);
+    // Typed: `@max(0, x)` alone is a u31, and `height - 3` below wraps when the
+    // pane is shorter than 3 px (the closed prompt asks with a height of 0).
+    const width: i32 = @max(0, available_width);
+    const height: i32 = @max(0, available_height);
     const vertical_gap = @min(scaleForDpi(6, dpi), @divTrunc(@max(0, height - 3), 2));
     const button_height = @min(preferred_height, @divTrunc(@max(0, height - 2 * vertical_gap), 3));
     return .{
@@ -4361,8 +5626,8 @@ fn normalActionRowGeometry(pane_width: i32, available_height: i32, conflict: boo
     const preferred_save_width = scaleForDpi(96, dpi);
     const preferred_conflict_width = scaleForDpi(112, dpi);
     const preferred_height = scaleForDpi(settings_control_height, dpi);
-    const width = @max(0, pane_width);
-    const height = @max(0, available_height);
+    const width: i32 = @max(0, pane_width);
+    const height: i32 = @max(0, available_height);
     if (!conflict) {
         const save_width = @min(preferred_save_width, width);
         const save_x = width - save_width;
@@ -4450,7 +5715,10 @@ fn closePromptActions(visible: bool, save_in_flight: bool, close_posted: bool) C
     return .{
         .save = can_choose and !save_in_flight,
         .discard = can_choose and !save_in_flight,
-        .keep_editing = can_choose,
+        // The button that owns IDCANCEL stays enabled while it is hidden:
+        // `IsDialogMessageW` does not send Escape to a disabled cancel button,
+        // and Escape without the prompt is a close request.
+        .keep_editing = !close_posted,
     };
 }
 
@@ -4458,9 +5726,11 @@ fn closePromptCanCancel(visible: bool, close_posted: bool) bool {
     return visible and !close_posted;
 }
 
-fn closePromptText(save_in_flight: bool) []const u8 {
+fn closePromptText(save_in_flight: bool, quitting: bool) []const u8 {
     return if (save_in_flight)
         "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open."
+    else if (quitting)
+        "Save changes before quitting?"
     else
         "Save changes before closing?";
 }
@@ -4468,6 +5738,10 @@ fn closePromptText(save_in_flight: bool) []const u8 {
 fn pendingCloseReopenAction(close_posted: bool, close_after_save: bool) PendingCloseReopenAction {
     if (!close_posted) return .none;
     return if (close_after_save) .cancel_saved_close else .cancel_discard_close;
+}
+
+fn isSaveShortcut(vk: u32, ctrl: bool, alt: bool, shift: bool) bool {
+    return vk == 'S' and ctrl and !alt and !shift;
 }
 
 fn saveCommandCanDispatch(
@@ -4489,10 +5763,11 @@ test "settings dirty close transition is conservative and idempotent" {
 }
 
 test "settings close prompt uses one display and measurement text source" {
-    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false));
+    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false, false));
+    try std.testing.expectEqualStrings("Save changes before quitting?", closePromptText(false, true));
     try std.testing.expectEqualStrings(
         "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open.",
-        closePromptText(true),
+        closePromptText(true, false),
     );
 }
 
@@ -4508,6 +5783,12 @@ test "settings dirty close actions prevent discard during save" {
     try std.testing.expectEqual(
         ClosePromptActions{ .save = false, .discard = false, .keep_editing = false },
         closePromptActions(true, false, true),
+    );
+    // The hidden prompt keeps IDCANCEL's button enabled so Escape reaches it,
+    // and nothing else is pressable.
+    try std.testing.expectEqual(
+        ClosePromptActions{ .save = false, .discard = false, .keep_editing = true },
+        closePromptActions(false, false, false),
     );
     try std.testing.expect(closePromptCanCancel(true, false));
     try std.testing.expect(!closePromptCanCancel(true, true));
@@ -4600,6 +5881,290 @@ test "settings numeric edits reject nonfinite floats and excessive padding" {
     _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("4294967295"));
     settings.syncPaddingFromEdit(.x);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.window_padding_x)] != null);
+}
+
+test "settings opacity preview is floored while the draft keeps the typed value" {
+    const Capture = struct {
+        previews: [8]f64 = undefined,
+        count: usize = 0,
+        fn preview(ctx: *anyopaque, field: SettingField, value: SettingValue) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (field != .background_opacity) return;
+            self.previews[self.count] = value.background_opacity;
+            self.count += 1;
+        }
+    };
+    const edit = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Unexpected;
+    defer _ = sys.DestroyWindow(edit);
+    // A saved opacity below the floor lowers it, so a preview never shows a
+    // window more transparent than the one the user already has.
+    for ([_]struct { saved: f64, floor: f64 }{
+        .{ .saved = 1.0, .floor = 0.2 },
+        .{ .saved = 0.1, .floor = 0.1 },
+    }) |case| {
+        var current = try Config.default(std.testing.allocator);
+        current.@"background-opacity" = case.saved;
+        var capture: Capture = .{};
+        var settings: SettingsWindow = .{
+            .handle = .{ .ctx = &capture, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = undefined, .notifySuccess = undefined, .onClosed = undefined, .previewField = Capture.preview },
+            .current = current,
+            .original = try current.clone(std.testing.allocator),
+            .pending = try current.clone(std.testing.allocator),
+            .edit_bg_opacity = edit,
+        };
+        settings.initTransaction();
+
+        // Typing 0.85: the intermediate 0 must not turn the window invisible.
+        _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0"));
+        settings.syncBgOpacityFromEdit();
+        try std.testing.expectEqual(@as(f64, 0), settings.pending.?.@"background-opacity");
+        try std.testing.expectEqual(@as(usize, 1), capture.count);
+        try std.testing.expectEqual(case.floor, capture.previews[0]);
+
+        // A config reload replaces the live config, so the draft is previewed
+        // again; that preview is floored too.
+        var reloaded = try Config.default(std.testing.allocator);
+        defer reloaded.deinit();
+        reloaded.@"background-opacity" = case.saved;
+        settings.externalConfigChanged(&reloaded, 100);
+        try std.testing.expectEqual(@as(usize, 2), capture.count);
+        try std.testing.expectEqual(case.floor, capture.previews[1]);
+
+        _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0.85"));
+        settings.syncBgOpacityFromEdit();
+        try std.testing.expectEqual(@as(f64, 0.85), settings.pending.?.@"background-opacity");
+        try std.testing.expectEqual(@as(f64, 0.85), capture.previews[2]);
+
+        // A rollback restores the saved value exactly, floor or not.
+        _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0"));
+        settings.syncBgOpacityFromEdit();
+        settings.clearPending();
+        try std.testing.expectEqual(case.saved, capture.previews[capture.count - 1]);
+    }
+}
+
+test "settings save checks the file for edits first, and a conflict stops it" {
+    const Capture = struct {
+        saved: u32 = 0,
+        asked: u32 = 0,
+        /// What the file now holds for the font size; null means it still
+        /// holds what this session started from.
+        disk_font_size: ?f32 = null,
+        /// The file cannot be checked.
+        fail: bool = false,
+        settings: *SettingsWindow = undefined,
+        fn save(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.saved += 1;
+            // Keep the draft, as a failed write does, so the test need not
+            // fake a config reload.
+            return error.SerializeFailed;
+        }
+        fn reconcile(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.asked += 1;
+            if (self.fail) return error.ReloadFailed;
+            const size = self.disk_font_size orelse return;
+            // What the app does on finding a changed file: apply it as a reload.
+            var disk = Config.default(std.testing.allocator) catch return error.OutOfMemory;
+            defer disk.deinit();
+            disk.@"font-size" = size;
+            self.settings.externalConfigChanged(&disk, 100);
+        }
+    };
+    const edit = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Unexpected;
+    defer _ = sys.DestroyWindow(edit);
+    const current = try Config.default(std.testing.allocator);
+    var capture: Capture = .{};
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &capture, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = Capture.save, .notifySuccess = undefined, .onClosed = undefined, .reconcileDisk = Capture.reconcile },
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+        .edit_font_size = edit,
+    };
+    capture.settings = &settings;
+    settings.initTransaction();
+    defer settings.clearPending();
+
+    // The draft: font size 14, from a session that started at the default 12.
+    _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("14"));
+    settings.syncFontSizeFromEdit();
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // The file is as the session left it: the save goes ahead.
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 1), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+
+    // The file now says 16 for the setting being edited: nothing is written,
+    // the conflict is shown, and the draft is kept for Keep mine / Use disk.
+    capture.disk_font_size = 16;
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 2), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+    try std.testing.expect(settings.hasConflict(.font_size));
+    try std.testing.expectEqual(@as(usize, 1), settings.conflictCount());
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // While a conflict is open the save does not even read the file again.
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 2), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+
+    // Keep mine adopts the file's value as the baseline; the next save
+    // writes the draft.
+    capture.disk_font_size = null;
+    settings.resolveConflict(.font_size, .keep_mine);
+    try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 3), capture.asked);
+    try std.testing.expectEqual(@as(u32, 2), capture.saved);
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // A file that cannot be checked is not written over blind: nothing is
+    // saved, the draft stays and the status says the save failed.
+    capture.fail = true;
+    settings.status_note = .none;
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 4), capture.asked);
+    try std.testing.expectEqual(@as(u32, 2), capture.saved);
+    try std.testing.expectEqual(StatusNote.save_failed, settings.status_note);
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+}
+
+test "settings status line names an unusable encoding and a dangling link, and any other failed save generically" {
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.SerializeFailed));
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.ReplaceFailed));
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.PathResolveFailed));
+    try std.testing.expectEqual(StatusNote.unsupported_encoding, saveFailureNote(error.UnsupportedEncoding));
+    try std.testing.expectEqual(StatusNote.dangling_link, saveFailureNote(error.DanglingLink));
+    try std.testing.expectEqual(StatusNote.binary_config, saveFailureNote(error.BinaryConfig));
+    try std.testing.expectEqual(StatusNote.file_unopenable, saveFailureNote(error.FileUnopenable));
+    try std.testing.expectEqual(StatusNote.write_incomplete, saveFailureNote(error.IncompleteWrite));
+    // The causes are told apart in words: a mark says UTF-16, NUL bytes say
+    // binary or unmarked UTF-16/32, and the others do not claim an encoding.
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.unsupported_encoding.text(), "UTF-16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.binary_config.text(), "NUL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.file_unopenable.text(), "UTF") == null);
+    try std.testing.expect(std.mem.indexOf(u8, StatusNote.write_incomplete.text(), "incomplete") != null);
+    // Each note tells the person what to do, in words.
+    const encoding = StatusNote.unsupported_encoding.text();
+    try std.testing.expect(std.mem.indexOf(u8, encoding, "UTF-8") != null);
+    try expectNoInternalSyntax(encoding);
+    const link = StatusNote.dangling_link.text();
+    try std.testing.expect(std.mem.indexOf(u8, link, "link") != null);
+    try expectNoInternalSyntax(link);
+}
+
+test "settings status line names the file a failed save is about" {
+    const Lender = struct {
+        text: ?[]const u8,
+        fn lend(ctx: *anyopaque) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.text;
+        }
+    };
+    var lender: Lender = .{ .text = "the included file C:\\dotfiles\\inc.conf" };
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &lender, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = undefined, .notifySuccess = undefined, .onClosed = undefined, .failureDetail = Lender.lend },
+    };
+    defer settings.freeNoteText();
+
+    // An include that will not open is named, with the way out.
+    settings.setSaveFailureNote(error.FileUnopenable);
+    try std.testing.expectEqual(StatusNote.file_unopenable, settings.status_note);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the included file C:\\dotfiles\\inc.conf cannot be opened") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "Nothing was saved") != null);
+
+    // A half-written config says it may be incomplete and where the whole text is.
+    lender.text = "C:\\dotfiles\\config.ghostty.tmp-1-2";
+    settings.setSaveFailureNote(error.IncompleteWrite);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "may now be incomplete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "kept in C:\\dotfiles\\config.ghostty.tmp-1-2") != null);
+
+    // The encoding sentences name the file too, so an include is not blamed on
+    // the config file.
+    lender.text = "the file C:\\dotfiles\\inc.conf";
+    settings.setSaveFailureNote(error.UnsupportedEncoding);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the file C:\\dotfiles\\inc.conf is not readable as UTF-8 text") != null);
+    settings.setSaveFailureNote(error.BinaryConfig);
+    try std.testing.expect(std.mem.indexOf(u8, settings.noteText(), "the file C:\\dotfiles\\inc.conf contains NUL bytes") != null);
+
+    // Nothing lent, or an error with no file to name: the plain sentence.
+    lender.text = null;
+    settings.setSaveFailureNote(error.FileUnopenable);
+    try std.testing.expectEqualStrings(StatusNote.file_unopenable.text(), settings.noteText());
+    lender.text = "C:\\ignored";
+    settings.setSaveFailureNote(error.SerializeFailed);
+    try std.testing.expectEqualStrings(StatusNote.save_failed.text(), settings.noteText());
+}
+
+fn stubChromeBg(_: *anyopaque) COLORREF {
+    return 0x202020;
+}
+
+fn stubTextPrimary(_: *anyopaque) COLORREF {
+    return 0xF0F0F0;
+}
+
+fn stubHighContrast(ctx: *anyopaque) bool {
+    const active: *const bool = @ptrCast(@alignCast(ctx));
+    return active.*;
+}
+
+fn stubOpenInEditor(_: *anyopaque) void {}
+
+test "settings theme change with unchanged inputs rebuilds nothing" {
+    // Never shown, but large enough for `layoutChildren` to lay out a pane.
+    const window = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 900, 700, null, null, null, null) orelse return error.Unexpected;
+    defer _ = sys.DestroyWindow(window);
+    var high_contrast = false;
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &high_contrast, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = stubChromeBg, .textPrimary = stubTextPrimary, .highContrast = stubHighContrast, .openInEditor = stubOpenInEditor, .currentConfig = undefined, .saveAndReload = undefined, .notifySuccess = undefined, .onClosed = undefined },
+        .hwnd = window,
+    };
+    defer {
+        settings.theme_adapter.deinit();
+        for ([_]HGDIOBJ{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font }) |font| {
+            if (font) |handle| _ = DeleteObject(handle);
+        }
+    }
+
+    // The first broadcast themes the window; the unrelated ones after it
+    // (Environment, taskbar and input settings arrive as WM_SETTINGCHANGE too)
+    // find the same inputs and leave the 4 brushes and 4 fonts alone.
+    settings.themeChanged();
+    try std.testing.expectEqual(@as(u32, 1), settings.theme_applications);
+    for (0..3) |_| settings.themeChanged();
+    try std.testing.expectEqual(@as(u32, 1), settings.theme_applications);
+
+    // A change it reads still rebuilds: the High Contrast state, then the DPI.
+    high_contrast = true;
+    settings.themeChanged();
+    try std.testing.expectEqual(@as(u32, 2), settings.theme_applications);
+    try std.testing.expect(settings.theme_adapter.colors.high_contrast);
+    settings.dpi = 120;
+    settings.themeChanged();
+    try std.testing.expectEqual(@as(u32, 3), settings.theme_applications);
+    try std.testing.expectEqual(@as(u32, 120), settings.ui_font_dpi);
+    settings.themeChanged();
+    try std.testing.expectEqual(@as(u32, 3), settings.theme_applications);
+
+    // A brush that could not be created is retried by the next broadcast.
+    if (settings.theme_adapter.button_brush) |brush| _ = sys.DeleteObject(brush);
+    settings.theme_adapter.button_brush = null;
+    settings.themeChanged();
+    try std.testing.expectEqual(@as(u32, 4), settings.theme_applications);
+    try std.testing.expect(settings.theme_adapter.button_brush != null);
+}
+
+test "settings Ctrl+S is the only save shortcut" {
+    try std.testing.expect(isSaveShortcut('S', true, false, false));
+    try std.testing.expect(!isSaveShortcut('S', false, false, false));
+    try std.testing.expect(!isSaveShortcut('S', true, true, false));
+    try std.testing.expect(!isSaveShortcut('S', true, false, true));
+    try std.testing.expect(!isSaveShortcut('A', true, false, false));
 }
 
 test "settings save command rechecks dispatch state" {
@@ -5075,43 +6640,34 @@ fn confirmedStaAllowsCustomUiaProviders(confirmed_sta: bool) bool {
     return confirmed_sta;
 }
 
-fn viewportRegionIsFullyClipped(width: i32, clip_top: i32, clip_bottom: i32) bool {
-    return width == 0 or clip_top == clip_bottom;
+/// Whether a child spanning `top`..`bottom` (viewport client coordinates) is
+/// entirely outside a viewport `height` tall. One cut by an edge is on screen.
+fn viewportHidesSpan(top: i32, bottom: i32, height: i32) bool {
+    return height <= 0 or bottom <= top or bottom <= 0 or top >= height;
+}
+
+fn viewportHidesChild(viewport: HWND, child: ?HWND, height: i32) bool {
+    const hwnd = child orelse return true;
+    var rect: RECT = undefined;
+    if (sys.GetWindowRect(hwnd, &rect) == 0) return true;
+    var origin: POINT = .{ .x = rect.left, .y = rect.top };
+    if (sys.ScreenToClient(viewport, &origin) == 0) return true;
+    return viewportHidesSpan(origin.y, origin.y + (rect.bottom - rect.top), height);
 }
 
 test "settings viewport exposes partially clipped controls as onscreen" {
-    try std.testing.expect(viewportRegionIsFullyClipped(100, 20, 20));
-    try std.testing.expect(viewportRegionIsFullyClipped(0, 0, 10));
-    try std.testing.expect(!viewportRegionIsFullyClipped(100, 20, 21));
-    try std.testing.expect(!viewportRegionIsFullyClipped(100, 0, 40));
+    try std.testing.expect(viewportHidesSpan(-40, 0, 300));
+    try std.testing.expect(viewportHidesSpan(300, 340, 300));
+    try std.testing.expect(viewportHidesSpan(20, 20, 300));
+    try std.testing.expect(viewportHidesSpan(0, 40, 0));
+    try std.testing.expect(!viewportHidesSpan(-39, 1, 300));
+    try std.testing.expect(!viewportHidesSpan(299, 339, 300));
+    try std.testing.expect(!viewportHidesSpan(0, 40, 300));
 }
 
 test "settings custom UIA providers require confirmed STA initialization" {
     try std.testing.expect(!confirmedStaAllowsCustomUiaProviders(false));
     try std.testing.expect(confirmedStaAllowsCustomUiaProviders(true));
-}
-
-fn clipChildToViewport(parent: HWND, child: ?HWND, viewport_top: i32, viewport_bottom: i32) bool {
-    const hwnd = child orelse return true;
-    var rect: RECT = undefined;
-    if (sys.GetWindowRect(hwnd, &rect) == 0) return false;
-    var origin: POINT = .{ .x = rect.left, .y = rect.top };
-    if (sys.ScreenToClient(parent, &origin) == 0) return false;
-    const width = @max(0, rect.right - rect.left);
-    const height = @max(0, rect.bottom - rect.top);
-    const clip_top = std.math.clamp(viewport_top - origin.y, 0, height);
-    const clip_bottom = std.math.clamp(viewport_bottom - origin.y, clip_top, height);
-    if (clip_top == 0 and clip_bottom == height) {
-        _ = SetWindowRgn(hwnd, null, 0);
-        return false;
-    }
-    const fully_clipped = viewportRegionIsFullyClipped(width, clip_top, clip_bottom);
-    const region = CreateRectRgn(0, clip_top, width, clip_bottom) orelse return false;
-    if (SetWindowRgn(hwnd, region, 0) == 0) {
-        _ = DeleteObject(region);
-        return false;
-    }
-    return fully_clipped;
 }
 
 test "settings scrollbar thumb and maximum cover real extents" {
@@ -5138,6 +6694,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     if (self.close_prompt_measure_width == pane_width and
         self.close_prompt_measure_dpi == self.dpi and
         self.close_prompt_measure_saving == self.save_in_flight and
+        self.close_prompt_measure_quitting == self.quit_after_close and
         self.close_prompt_measure_height > 0)
     {
         return self.close_prompt_measure_height;
@@ -5151,7 +6708,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     }
 
     var text_w: [256]u16 = undefined;
-    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight)));
+    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight, self.quit_after_close)));
     var measure = RECT{
         .left = 0,
         .top = 0,
@@ -5169,6 +6726,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     self.close_prompt_measure_width = pane_width;
     self.close_prompt_measure_dpi = self.dpi;
     self.close_prompt_measure_saving = self.save_in_flight;
+    self.close_prompt_measure_quitting = self.quit_after_close;
     self.close_prompt_measure_height = height;
     return height;
 }
@@ -5180,7 +6738,57 @@ const ClosePromptLayoutGeometry = struct {
     bar_height: i32,
     prompt_top: i32,
     actions_top: i32,
+    /// A status message that does not fit on one line beside the buttons sits in
+    /// a row of its own above them, across the whole pane, wrapped. Otherwise
+    /// `status_separate` is false and the message shares the buttons' row.
+    status_separate: bool = false,
+    status_top: i32 = 0,
+    status_height: i32 = 0,
 };
+
+/// The status text measured in the font it is drawn in: its width on one line,
+/// and its height wrapped to `full_width`. Zero while there is no text, no
+/// window to measure in, or the close prompt owns the bar.
+fn statusMeasure(self: *SettingsWindow, full_width: i32) struct { single_line: i32, wrapped: i32 } {
+    if (self.status_measure_width == full_width and self.status_measure_dpi == self.dpi) {
+        return .{ .single_line = self.status_measure_single_line, .wrapped = self.status_measure_wrapped };
+    }
+    const status = self.text_status orelse return .{ .single_line = 0, .wrapped = 0 };
+    const parent = self.hwnd orelse return .{ .single_line = 0, .wrapped = 0 };
+    var buffer: [2048:0]u16 = undefined;
+    const length = GetWindowTextW(status, &buffer, @intCast(buffer.len));
+    var single_line: i32 = 0;
+    var wrapped: i32 = 0;
+    if (length > 0) if (GetDC(parent)) |hdc| {
+        defer _ = ReleaseDC(parent, hdc);
+        const raw_font: usize = @bitCast(SendMessageW(status, WM_GETFONT, 0, 0));
+        const font: HGDIOBJ = if (raw_font != 0) @ptrFromInt(raw_font) else self.secondary_font;
+        const previous = if (font) |value| SelectObject(hdc, value) else null;
+        defer {
+            if (previous) |value| _ = SelectObject(hdc, value);
+        }
+        var one_line: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = DrawTextW(hdc, &buffer, length, &one_line, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        single_line = one_line.right - one_line.left;
+        var wrap: RECT = .{ .left = 0, .top = 0, .right = @max(1, full_width), .bottom = 0 };
+        _ = DrawTextW(hdc, &buffer, length, &wrap, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        wrapped = wrap.bottom - wrap.top;
+    };
+    self.status_measure_width = full_width;
+    self.status_measure_dpi = self.dpi;
+    self.status_measure_single_line = single_line;
+    self.status_measure_wrapped = wrapped;
+    return .{ .single_line = single_line, .wrapped = wrapped };
+}
+
+/// Whether the status message needs a row of its own and how tall that row is.
+/// `inline_width` is the room beside the buttons.
+fn statusRowGeometry(self: *SettingsWindow, full_width: i32, inline_width: i32) struct { separate: bool, height: i32 } {
+    const measure = statusMeasure(self, full_width);
+    if (measure.single_line <= 0) return .{ .separate = false, .height = 0 };
+    if (measure.single_line <= inline_width) return .{ .separate = false, .height = 0 };
+    return .{ .separate = true, .height = @max(self.px(20), measure.wrapped) };
+}
 
 /// Height the fixed action bar is allowed to occupy, leaving at least one
 /// control row of form viewport above it.
@@ -5189,8 +6797,7 @@ const ClosePromptLayoutGeometry = struct {
 /// monitor work area, so a short work area at a high scale can produce a
 /// client that the scaled header plus a stacked dirty-close bar would consume
 /// entirely: a 1366x768 work area at 288 DPI gives a viewport of exactly zero
-/// height, and `clipChildToViewport` then assigns an empty region to every
-/// control and label, i.e. a blank form. The viewport is reserved first and
+/// height, i.e. a blank form. The viewport is reserved first and
 /// the action bar gives way, which it already handles because it clamps its
 /// own contents to whatever height it is given.
 fn actionBarAvailableHeight(self: *SettingsWindow, client_rect: RECT) i32 {
@@ -5202,7 +6809,7 @@ fn actionBarAvailableHeight(self: *SettingsWindow, client_rect: RECT) i32 {
 }
 
 fn closePromptLayoutGeometry(self: *SettingsWindow, pane_width: i32, client_height: i32) ClosePromptLayoutGeometry {
-    const available_height = @max(0, client_height);
+    const available_height: i32 = @max(0, client_height);
     const desired_padding = self.px(settings_action_padding);
     if (!self.close_prompt_visible) {
         const conflict_visible = self.active_conflict_field != null or self.active_owned_conflict_field != null;
@@ -5213,14 +6820,21 @@ fn closePromptLayoutGeometry(self: *SettingsWindow, pane_width: i32, client_heig
             self.dpi,
         );
         const preferred_span = preferred_actions.save_y + preferred_actions.button_height;
+        const status = statusRowGeometry(self, pane_width, preferred_actions.status_right);
+        const status_gap = self.px(6);
+        const wanted_block = if (status.separate) status.height + status_gap else 0;
         const bar_height = @min(
             available_height,
-            @max(self.px(settings_action_bar_height), 2 * desired_padding + preferred_span),
+            @max(self.px(settings_action_bar_height), 2 * desired_padding + wanted_block + preferred_span),
         );
         const padding = @min(desired_padding, @divTrunc(bar_height, 4));
+        // The buttons come first: the status row gets what is left, clipped.
+        const room = @max(0, bar_height - 2 * padding);
+        const status_block = @min(wanted_block, @max(0, room - preferred_span));
+        const status_height = if (status_block > status_gap) status_block - status_gap else 0;
         const normal_actions = normalActionRowGeometry(
             pane_width,
-            @max(0, bar_height - 2 * padding),
+            @max(0, room - status_block),
             conflict_visible,
             self.dpi,
         );
@@ -5230,7 +6844,10 @@ fn closePromptLayoutGeometry(self: *SettingsWindow, pane_width: i32, client_heig
             .prompt_height = 0,
             .bar_height = bar_height,
             .prompt_top = padding,
-            .actions_top = padding,
+            .actions_top = padding + status_block,
+            .status_separate = status_height > 0,
+            .status_top = padding,
+            .status_height = status_height,
         };
     }
 
@@ -5291,9 +6908,61 @@ fn paneBounds(self: *const SettingsWindow, client_rect: RECT) PaneBounds {
 }
 
 fn settingsContentViewportBottom(self: *SettingsWindow, client_rect: RECT) i32 {
-    const pane = paneBounds(self, client_rect);
-    const action_bar = closePromptLayoutGeometry(self, pane.width, actionBarAvailableHeight(self, client_rect));
+    const action_bar = closePromptLayoutGeometry(self, actionColumnWidth(self, client_rect), actionBarAvailableHeight(self, client_rect));
     return @max(settingsContentViewportTop(self, client_rect), client_rect.bottom - action_bar.bar_height - self.px(settings_pane_padding));
+}
+
+/// The width the form is laid out in. The viewport runs from the pane's left
+/// edge to the window's right edge, so its scroll bar normally sits in the
+/// pane's right padding; whatever part of the bar reaches into the pane is
+/// left out, shown or not, so the fields never sit under it and never move
+/// when it appears.
+fn formPaneWidth(self: *const SettingsWindow, client_rect: RECT) i32 {
+    const pane = paneBounds(self, client_rect);
+    const scrollbar = @max(0, GetSystemMetricsForDpi(SM_CXVSCROLL, normalizedDpi(self.dpi)));
+    return @max(0, @min(pane.width, client_rect.right - pane.left - scrollbar));
+}
+
+/// How wide the laid-out form is: one lane, or two lanes and the gap.
+fn settingsFormColumnWidth(form_pane_width: i32, dpi: u32) i32 {
+    const lane = settingsFieldRects(0, form_pane_width, dpi).control;
+    const lane_width = lane.right - lane.left;
+    if (settingsColumnCount(form_pane_width, dpi) < 2) return lane_width;
+    return 2 * lane_width + scaleForDpi(settings_column_gap, dpi);
+}
+
+/// The width of the action bar and of the separators. Once the form has two
+/// lanes it is the form's own width, so Save stays at the form's right edge
+/// however wide the window gets (it drifted to the far right before). A
+/// one-lane form keeps the whole pane: the action rows need more than one
+/// lane to stand side by side.
+fn settingsActionColumnWidth(pane_width: i32, form_pane_width: i32, dpi: u32) i32 {
+    if (settingsColumnCount(form_pane_width, dpi) < 2) return pane_width;
+    return @min(pane_width, settingsFormColumnWidth(form_pane_width, dpi));
+}
+
+fn actionColumnWidth(self: *const SettingsWindow, client_rect: RECT) i32 {
+    return settingsActionColumnWidth(paneBounds(self, client_rect).width, formPaneWidth(self, client_rect), self.dpi);
+}
+
+test "settings action bar follows the form's column once it has two lanes" {
+    for ([_]u32{ 96, 144, 192, 288 }) |dpi| {
+        // One lane: the whole pane, so the close prompt's three buttons fit.
+        const narrow = scaleForDpi(500, dpi);
+        try std.testing.expectEqual(narrow, settingsActionColumnWidth(narrow, narrow, dpi));
+        // Two lanes in a wide pane: two full lanes and the gap, not the pane.
+        const wide = scaleForDpi(1600, dpi);
+        const column = settingsActionColumnWidth(wide, wide, dpi);
+        try std.testing.expectEqual(2 * scaleForDpi(settings_field_max_width, dpi) + scaleForDpi(settings_column_gap, dpi), column);
+        // Just wide enough for two lanes: the form fills the pane.
+        const tight = scaleForDpi(settings_two_column_min_width, dpi);
+        try std.testing.expect(settingsActionColumnWidth(tight, tight, dpi) <= tight);
+        try std.testing.expect(settingsActionColumnWidth(tight, tight, dpi) >= tight - 1);
+        // The right lane's controls end where the column ends.
+        var rects: [2]SettingsFieldRects = undefined;
+        settingsFormItemRects(&.{ .{ .control_index = 4, .label_index = 3 }, .{ .control_index = 5, .label_index = 4 } }, wide, dpi, &rects);
+        try std.testing.expectEqual(column, rects[1].control.right);
+    }
 }
 
 fn measureStaticTextHeight(self: *SettingsWindow, text_opt: ?HWND, width: i32) i32 {
@@ -5318,29 +6987,124 @@ fn isComboControl(self: *const SettingsWindow, hwnd: HWND) bool {
     return false;
 }
 
+/// Child windows to place at once. One `DeferWindowPos` batch moves them all
+/// before anything repaints, and Windows invalidates only what moved or was
+/// uncovered. If the batch cannot be built, each window is moved on its own.
+/// All windows in one batch must share a parent.
+fn ChildPlacements(comptime capacity: usize) type {
+    return struct {
+        windows: [capacity]HWND = undefined,
+        rects: [capacity]RECT = undefined,
+        flags: [capacity]UINT = undefined,
+        len: usize = 0,
+
+        fn add(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
+            self.put(hwnd, x, y, width, height, false);
+        }
+
+        /// A static whose text wraps to its width. Moving a window keeps
+        /// what it showed, and the Static class does not ask to be drawn
+        /// again when its size changes (no `CS_HREDRAW`). A resize of the
+        /// Settings window repaints every child anyway (its class has
+        /// `CS_HREDRAW | CS_VREDRAW`), but a static can change size while the
+        /// window keeps its own: a status message that needs a row of its
+        /// own, or a DPI change on a window already at its capped minimum,
+        /// where `WM_SETFONT` has just drawn the text in the new font at the
+        /// old size. Such a static would keep its old picture, so a resized
+        /// one is drawn again whole.
+        fn addText(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32) void {
+            self.put(hwnd, x, y, width, height, true);
+        }
+
+        fn put(self: *@This(), hwnd: ?HWND, x: i32, y: i32, width: i32, height: i32, wraps: bool) void {
+            const window = hwnd orelse return;
+            std.debug.assert(self.len < capacity);
+            const r: RECT = .{ .left = x, .top = y, .right = x + @max(0, width), .bottom = y + @max(0, height) };
+            var flags: UINT = SWP_NOZORDER | SWP_NOACTIVATE;
+            if (wraps) {
+                var current: RECT = undefined;
+                const resized = GetWindowRect(window, &current) == 0 or
+                    current.right - current.left != r.right - r.left or
+                    current.bottom - current.top != r.bottom - r.top;
+                if (resized) flags |= SWP_NOCOPYBITS;
+            }
+            self.windows[self.len] = window;
+            self.rects[self.len] = r;
+            self.flags[self.len] = flags;
+            self.len += 1;
+        }
+
+        fn apply(self: *const @This()) bool {
+            if (self.len == 0) return true;
+            if (BeginDeferWindowPos(@intCast(self.len))) |first| {
+                var batch: ?*anyopaque = first;
+                for (self.windows[0..self.len], self.rects[0..self.len], self.flags[0..self.len]) |window, r, flags| {
+                    // A failed call has already discarded the batch.
+                    batch = DeferWindowPos(batch.?, window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+                    if (batch == null) break;
+                }
+                if (batch) |complete| if (EndDeferWindowPos(complete) != 0) return true;
+            }
+            for (self.windows[0..self.len], self.rects[0..self.len], self.flags[0..self.len]) |window, r, flags| {
+                _ = SetWindowPos(window, null, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+            }
+            return false;
+        }
+    };
+}
+
+/// Rail buttons, header, summary, viewport, status, prompt, five action buttons.
+const settings_frame_child_count = section_count + 11;
+/// Every label and field of the largest section, and the help text.
+const settings_form_child_count = settings_max_form_items * 2 + 1;
+
+/// What the frame window paints besides its background colour.
+const BackgroundGeometry = struct {
+    rail: RECT,
+    rail_separator: RECT,
+    header_separator: RECT,
+    action_separator: RECT,
+};
+
+fn backgroundGeometry(self: *SettingsWindow, client_rect: RECT) BackgroundGeometry {
+    const separator_width = @max(1, self.px(settings_metrics.stroke_hairline));
+    const rail_right = self.px(settings_rail_width);
+    const pane = paneBounds(self, client_rect);
+    const column = actionColumnWidth(self, client_rect);
+    const rail_geometry = sectionRailGeometry(client_rect.bottom - client_rect.top, self.dpi);
+    const header_y = rail_geometry.top_pad + self.px(settings_header_separator_y);
+    const action_bar = closePromptLayoutGeometry(self, column, actionBarAvailableHeight(self, client_rect));
+    const action_y = client_rect.bottom - action_bar.bar_height;
+    return .{
+        .rail = .{ .left = client_rect.left, .top = client_rect.top, .right = rail_right, .bottom = client_rect.bottom },
+        .rail_separator = .{ .left = rail_right - separator_width, .top = client_rect.top, .right = rail_right, .bottom = client_rect.bottom },
+        .header_separator = .{ .left = pane.left, .top = header_y, .right = pane.left + column, .bottom = header_y + separator_width },
+        .action_separator = .{ .left = pane.left, .top = action_y, .right = pane.left + column, .bottom = action_y + separator_width },
+    };
+}
+
 fn layoutChildren(self: *SettingsWindow) void {
     const hwnd = self.hwnd orelse return;
     var rect: RECT = undefined;
     if (GetClientRect(hwnd, &rect) == 0) return;
-    const position_flags = SWP_NOREDRAW | SWP_NOZORDER | SWP_NOACTIVATE;
 
+    var frame: ChildPlacements(settings_frame_child_count) = .{};
     const rail_width = self.px(settings_rail_width);
     const rail_padding = self.px(settings_rail_padding_x);
     const pane_padding = self.px(settings_pane_padding);
     const rail_geometry = sectionRailGeometry(rect.bottom - rect.top, self.dpi);
     var rail_y = rail_geometry.top_pad;
     for (std.enums.values(Section)) |section| {
-        if (self.sectionButton(section)) |button| {
-            _ = SetWindowPos(button, null, rail_padding, rail_y, rail_width - 2 * rail_padding, rail_geometry.button_height, position_flags);
-        }
+        frame.add(self.sectionButton(section), rail_padding, rail_y, rail_width - 2 * rail_padding, rail_geometry.button_height);
         rail_y += rail_geometry.button_height + rail_geometry.gap;
     }
 
     const pane = paneBounds(self, rect);
     const pane_left = pane.left;
-    const pane_width = pane.width;
+    const form_width = formPaneWidth(self, rect);
+    const column_width = settingsActionColumnWidth(pane.width, form_width, self.dpi);
     const pane_top = rail_geometry.top_pad;
-    const action_bar = closePromptLayoutGeometry(self, pane_width, actionBarAvailableHeight(self, rect));
+    const action_bar = closePromptLayoutGeometry(self, column_width, actionBarAvailableHeight(self, rect));
     const action_bar_top = rect.bottom - action_bar.bar_height;
     const viewport_top = pane_top + self.px(settings_form_viewport_top);
     const viewport_bottom = @max(viewport_top, action_bar_top - pane_padding);
@@ -5348,15 +7112,19 @@ fn layoutChildren(self: *SettingsWindow) void {
     self.proof_viewport_bottom = viewport_bottom;
     const viewport_height = @max(0, viewport_bottom - viewport_top);
 
-    const prose_width = @min(pane_width, self.px(settings_prose_max_width));
-    if (self.text_header) |text| _ = SetWindowPos(text, null, pane_left, pane_top, prose_width, self.px(settings_header_title_height), position_flags);
-    if (self.text_summary) |text| _ = SetWindowPos(text, null, pane_left, pane_top + self.px(settings_header_summary_top), prose_width, self.px(settings_header_summary_height), position_flags);
+    const prose_width = @min(pane.width, self.px(settings_prose_max_width));
+    frame.addText(self.text_header, pane_left, pane_top, prose_width, self.px(settings_header_title_height));
+    frame.addText(self.text_summary, pane_left, pane_top + self.px(settings_header_summary_top), prose_width, self.px(settings_header_summary_height));
+    // To the window's right edge, so its scroll bar sits at the edge of the
+    // window but only beside the form.
+    frame.add(self.viewport, pane_left, viewport_top, rect.right - pane_left, viewport_height);
 
+    // The form, in viewport coordinates.
     const form_items = self.formItems();
     var item_rects: [settings_max_form_items]SettingsFieldRects = undefined;
     var extent_rects: [settings_max_form_items * 2 + 1]RECT = undefined;
     var extent_count: usize = 0;
-    settingsFormItemRects(form_items, pane_width, self.dpi, item_rects[0..form_items.len]);
+    settingsFormItemRects(form_items, form_width, self.dpi, item_rects[0..form_items.len]);
     for (form_items, 0..) |item, index| {
         if (self.controlHwnd(item.control_index) == null) continue;
         if (item.label_index != null) {
@@ -5370,7 +7138,7 @@ fn layoutChildren(self: *SettingsWindow) void {
     var help_rect: ?RECT = null;
     if (self.active_section == .keybindings or self.active_section == .advanced) {
         const help_top = self.px(settings_field_row_pitch);
-        const help_width = @min(pane_width, self.px(settings_prose_max_width));
+        const help_width = @min(form_width, self.px(settings_prose_max_width));
         const help_height = measureStaticTextHeight(self, self.text_help, help_width);
         if (help_height > 0) {
             help_rect = .{ .left = 0, .top = help_top, .right = help_width, .bottom = help_top + help_height };
@@ -5382,92 +7150,1913 @@ fn layoutChildren(self: *SettingsWindow) void {
     const scroll_geometry = settingsScrollGeometry(content_extent, viewport_height);
     self.content_scroll_max = scroll_geometry.max_position;
     self.content_scroll_y = std.math.clamp(self.content_scroll_y, 0, self.content_scroll_max);
-    const scroll_info: SCROLLINFO = .{
-        .cbSize = @sizeOf(SCROLLINFO),
-        .fMask = SIF_RANGE | SIF_PAGE | SIF_POS,
-        .nMin = 0,
-        .nMax = scroll_geometry.nmax,
-        .nPage = scroll_geometry.page,
-        .nPos = self.content_scroll_y,
-        .nTrackPos = 0,
-    };
-    _ = SetScrollInfo(hwnd, SB_VERT, &scroll_info, 1);
-    _ = ShowScrollBar(hwnd, SB_VERT, @intFromBool(self.content_scroll_max > 0));
+    const scroll_y = self.content_scroll_y;
 
+    var form: ChildPlacements(settings_form_child_count) = .{};
     for (form_items, 0..) |item, index| {
         const control = self.controlHwnd(item.control_index) orelse continue;
         const geometry = item_rects[index];
-        if (item.label_index) |label_index| if (self.field_labels[label_index]) |label| {
-            _ = SetWindowPos(
-                label,
-                null,
-                pane_left + geometry.label.left,
-                viewport_top + geometry.label.top - self.content_scroll_y,
-                geometry.label.right - geometry.label.left,
-                geometry.label.bottom - geometry.label.top,
-                position_flags,
-            );
-        };
-        _ = SetWindowPos(
-            control,
-            null,
-            pane_left + geometry.control.left,
-            viewport_top + geometry.control.top - self.content_scroll_y,
-            geometry.control.right - geometry.control.left,
-            if (isComboControl(self, control)) self.px(settings_combo_popup_height) else self.px(settings_control_height),
-            position_flags,
-        );
+        if (item.label_index) |label_index| {
+            const label = geometry.label;
+            form.addText(self.field_labels[label_index], label.left, label.top - scroll_y, label.right - label.left, label.bottom - label.top);
+        }
+        // A dropdown's height is that of its open list; its closed height is
+        // set afterwards (`fitComboFields`).
+        const height = if (isComboControl(self, control)) self.px(settings_combo_popup_height) else self.px(settings_control_height);
+        form.add(control, geometry.control.left, geometry.control.top - scroll_y, geometry.control.right - geometry.control.left, height);
     }
-    if (help_rect) |help| if (self.text_help) |text| {
-        _ = SetWindowPos(
-            text,
-            null,
-            pane_left + help.left,
-            viewport_top + help.top - self.content_scroll_y,
-            help.right - help.left,
-            help.bottom - help.top,
-            position_flags,
-        );
-    };
-    if (self.text_help) |text| _ = ShowWindow(text, if (help_rect != null) SW_SHOWNORMAL else SW_HIDE);
+    if (help_rect) |help| form.addText(self.text_help, help.left, help.top - scroll_y, help.right - help.left, help.bottom - help.top);
 
     const row_top = action_bar_top + action_bar.actions_top;
     const action_gap = self.px(settings_action_gap);
     const normal_actions = action_bar.normal_actions;
-    if (self.btn_save) |button| _ = SetWindowPos(button, null, pane_left + normal_actions.save_x, row_top + normal_actions.save_y, normal_actions.save_width, normal_actions.button_height, position_flags);
-    if (self.btn_conflict_keep) |button| _ = SetWindowPos(button, null, pane_left + normal_actions.keep_mine_x, row_top + normal_actions.keep_mine_y, normal_actions.keep_mine_width, normal_actions.button_height, position_flags);
-    if (self.btn_conflict_use_disk) |button| _ = SetWindowPos(button, null, pane_left + normal_actions.use_disk_x, row_top + normal_actions.use_disk_y, normal_actions.use_disk_width, normal_actions.button_height, position_flags);
-    if (self.text_status) |text| _ = SetWindowPos(text, null, pane_left, row_top + self.px(6), @max(0, normal_actions.status_right), self.px(20), position_flags);
+    frame.add(self.btn_save, pane_left + normal_actions.save_x, row_top + normal_actions.save_y, normal_actions.save_width, normal_actions.button_height);
+    frame.add(self.btn_conflict_keep, pane_left + normal_actions.keep_mine_x, row_top + normal_actions.keep_mine_y, normal_actions.keep_mine_width, normal_actions.button_height);
+    frame.add(self.btn_conflict_use_disk, pane_left + normal_actions.use_disk_x, row_top + normal_actions.use_disk_y, normal_actions.use_disk_width, normal_actions.button_height);
+    if (action_bar.status_separate) {
+        frame.addText(self.text_status, pane_left, action_bar_top + action_bar.status_top, column_width, action_bar.status_height);
+    } else {
+        frame.addText(self.text_status, pane_left, row_top + self.px(6), @max(0, normal_actions.status_right), self.px(20));
+    }
+    self.status_row_separate = action_bar.status_separate;
+    self.status_row_height = action_bar.status_height;
 
     const close_actions = action_bar.actions;
     const close_top = action_bar_top + action_bar.actions_top;
-    const prompt_width = if (close_actions.stacked) pane_width else @max(0, close_actions.first_x - action_gap);
-    if (self.text_close_prompt) |text| _ = SetWindowPos(text, null, pane_left, action_bar_top + action_bar.prompt_top, prompt_width, action_bar.prompt_height, position_flags);
-    if (self.btn_close_save) |button| _ = SetWindowPos(button, null, pane_left + close_actions.first_x, close_top, close_actions.first_width, close_actions.button_height, position_flags);
-    if (self.btn_close_discard) |button| _ = SetWindowPos(button, null, pane_left + close_actions.second_x, close_top + close_actions.second_y, close_actions.second_width, close_actions.button_height, position_flags);
-    if (self.btn_close_keep_editing) |button| _ = SetWindowPos(button, null, pane_left + close_actions.third_x, close_top + close_actions.third_y, close_actions.third_width, close_actions.button_height, position_flags);
+    const prompt_width = if (close_actions.stacked) column_width else @max(0, close_actions.first_x - action_gap);
+    frame.addText(self.text_close_prompt, pane_left, action_bar_top + action_bar.prompt_top, prompt_width, action_bar.prompt_height);
+    frame.add(self.btn_close_save, pane_left + close_actions.first_x, close_top, close_actions.first_width, close_actions.button_height);
+    frame.add(self.btn_close_discard, pane_left + close_actions.second_x, close_top + close_actions.second_y, close_actions.second_width, close_actions.button_height);
+    frame.add(self.btn_close_keep_editing, pane_left + close_actions.third_x, close_top + close_actions.third_y, close_actions.third_width, close_actions.button_height);
 
-    var active_clipped_controls = [_]bool{false} ** settings_clipped_control_count;
-    for (form_items) |item| active_clipped_controls[item.control_index] = true;
-    for (0..settings_clipped_control_count) |index| {
-        const control = self.controlHwnd(index);
-        const region_fully_clipped = clipChildToViewport(hwnd, control, viewport_top, viewport_bottom);
-        const fully_clipped = !active_clipped_controls[index] or region_fully_clipped;
-        if (self.control_uia_providers[index]) |provider| provider.setViewportFullyClipped(fully_clipped);
+    const frame_batched = frame.apply();
+    if (self.viewport) |viewport| {
+        const scroll_info: SCROLLINFO = .{
+            .cbSize = @sizeOf(SCROLLINFO),
+            .fMask = SIF_RANGE | SIF_PAGE | SIF_POS,
+            .nMin = 0,
+            .nMax = scroll_geometry.nmax,
+            .nPage = scroll_geometry.page,
+            .nPos = scroll_y,
+            .nTrackPos = 0,
+        };
+        _ = SetScrollInfo(viewport, SB_VERT, &scroll_info, 1);
+        _ = ShowScrollBar(viewport, SB_VERT, @intFromBool(self.content_scroll_max > 0));
     }
-    const help_region_fully_clipped = clipChildToViewport(hwnd, self.text_help, viewport_top, viewport_bottom);
-    const help_fully_clipped = help_rect == null or help_region_fully_clipped;
-    if (self.text_uia_providers[4]) |provider| provider.setViewportFullyClipped(help_fully_clipped);
-    var active_labels = [_]bool{false} ** settings_label_specs.len;
-    for (form_items) |item| {
-        if (item.label_index) |index| active_labels[index] = true;
+    const form_batched = form.apply();
+    self.fitComboFields();
+    self.help_shown = help_rect != null;
+    if (self.text_help) |text| setChildShown(text, self.help_shown);
+    self.proof_layout_batched = frame_batched and form_batched;
+    self.syncViewportClipFlags();
+
+    // Moving children repaints them and whatever they uncovered. The frame's
+    // own lines move only with the action bar or the column, which a window
+    // that keeps its size does not repaint on its own: repaint where each one
+    // was and where it is now.
+    const background = backgroundGeometry(self, rect);
+    if (self.background_geometry) |previous| {
+        inline for (std.meta.fields(BackgroundGeometry)) |field| {
+            const old_rect = @field(previous, field.name);
+            const new_rect = @field(background, field.name);
+            if (!std.meta.eql(old_rect, new_rect)) {
+                _ = InvalidateRect(hwnd, &old_rect, 0);
+                _ = InvalidateRect(hwnd, &new_rect, 0);
+            }
+        }
     }
-    for (self.field_labels, 0..) |label, index| {
-        const region_fully_clipped = clipChildToViewport(hwnd, label, viewport_top, viewport_bottom);
-        const fully_clipped = !active_labels[index] or region_fully_clipped;
-        if (self.text_uia_providers[index + 5]) |provider| provider.setViewportFullyClipped(fully_clipped);
+    self.background_geometry = background;
+}
+
+/// Dialog-semantics tests drive a real Settings window. They run on a desktop
+/// of their own (the window is shown, and `SetThreadDesktop` fails on a thread
+/// that already owns one), so nothing reaches or takes focus from the user's.
+const dialog_test = struct {
+    extern "user32" fn CreateDesktopW(
+        name: [*:0]const u16,
+        device: ?*anyopaque,
+        mode: ?*anyopaque,
+        flags: u32,
+        access: u32,
+        attributes: ?*anyopaque,
+    ) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn GetClassLongPtrW(hwnd: HWND, index: i32) callconv(.winapi) usize;
+    extern "user32" fn LoadIconW(instance: ?HINSTANCE, name: ?*anyopaque) callconv(.winapi) HICON;
+    extern "user32" fn GetNextDlgTabItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
+    extern "user32" fn GetKeyboardState(keys: *[256]u8) callconv(.winapi) BOOL;
+    extern "user32" fn SetKeyboardState(keys: *const [256]u8) callconv(.winapi) BOOL;
+
+    /// Make exactly these modifiers the ones the calling thread sees held, and
+    /// no other key. The whole 256-entry table is replaced, then read back
+    /// through `GetKeyState`, which is what the code under test reads: a
+    /// table the system refreshed from the real keyboard in between fails here
+    /// with the key that leaked, not later in an unrelated assertion.
+    fn holdKeys(held: struct { ctrl: bool = false, alt: bool = false, shift: bool = false }) !void {
+        var keys: [256]u8 = @splat(0);
+        const down: u8 = 0x80;
+        if (held.ctrl) keys[VK_CONTROL] = down;
+        if (held.alt) keys[VK_MENU] = down;
+        if (held.shift) keys[VK_SHIFT] = down;
+        try std.testing.expect(SetKeyboardState(&keys) != 0);
+        try std.testing.expectEqual(held.ctrl, win32_input.keyPressed(VK_CONTROL));
+        try std.testing.expectEqual(held.alt, win32_input.keyPressed(VK_MENU));
+        try std.testing.expectEqual(held.shift, win32_input.keyPressed(VK_SHIFT));
     }
-    self.proof_layout_redraw_succeeded = RedrawWindow(hwnd, null, null, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE) != 0;
+    extern "user32" fn GetNextDlgGroupItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
+    extern "gdi32" fn BitBlt(dst: HDC, x: i32, y: i32, width: i32, height: i32, src: HDC, src_x: i32, src_y: i32, rop: u32) callconv(.winapi) BOOL;
+    extern "user32" fn HideCaret(hwnd: ?HWND) callconv(.winapi) BOOL;
+    extern "user32" fn GetClassNameW(hwnd: HWND, name: [*]u16, count: c_int) callconv(.winapi) c_int;
+    extern "user32" fn MapWindowPoints(from: ?HWND, to: ?HWND, points: [*]POINT, count: UINT) callconv(.winapi) c_int;
+    extern "gdi32" fn CreateDIBSection(hdc: HDC, info: *const BITMAPINFO, usage: UINT, bits: *?*anyopaque, section: ?*anyopaque, offset: u32) callconv(.winapi) HGDIOBJ;
+    extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
+
+    const BITMAPINFO = extern struct {
+        biSize: u32 = @sizeOf(BITMAPINFO) - 4,
+        biWidth: i32,
+        biHeight: i32,
+        biPlanes: u16 = 1,
+        biBitCount: u16 = 32,
+        biCompression: u32 = 0,
+        biSizeImage: u32 = 0,
+        biXPelsPerMeter: i32 = 0,
+        biYPelsPerMeter: i32 = 0,
+        biClrUsed: u32 = 0,
+        biClrImportant: u32 = 0,
+        colors: [1]u32 = .{0},
+    };
+
+    /// The client area of `hwnd` as its surface holds it now, children
+    /// included, top row first: a BitBlt from the window DC, which shows a
+    /// missing repaint (a hidden desktop cannot be screen-captured, and
+    /// `PrintWindow` repaints everything first).
+    const Capture = struct {
+        pixels: []u32,
+        width: usize,
+        height: usize,
+
+        fn take(hwnd: HWND) !Capture {
+            var rect: RECT = undefined;
+            if (GetClientRect(hwnd, &rect) == 0 or rect.right <= 0 or rect.bottom <= 0) return error.NoClientArea;
+            const memory = sys.CreateCompatibleDC(null) orelse return error.NoDC;
+            defer _ = sys.DeleteDC(memory);
+            const info: BITMAPINFO = .{ .biWidth = rect.right, .biHeight = -rect.bottom };
+            var bits: ?*anyopaque = null;
+            const bitmap = CreateDIBSection(memory, &info, 0, &bits, null, 0) orelse return error.NoBitmap;
+            defer _ = DeleteObject(bitmap);
+            const previous = SelectObject(memory, bitmap);
+            defer _ = SelectObject(memory, previous);
+            const source_dc = GetDC(hwnd) orelse return error.NoDC;
+            defer _ = ReleaseDC(hwnd, source_dc);
+            const srccopy: u32 = 0x00CC0020;
+            if (BitBlt(memory, 0, 0, rect.right, rect.bottom, source_dc, 0, 0, srccopy) == 0) return error.BitBltFailed;
+            _ = GdiFlush();
+            const width: usize = @intCast(rect.right);
+            const height: usize = @intCast(rect.bottom);
+            const source: [*]const u32 = @ptrCast(@alignCast(bits.?));
+            return .{ .pixels = try std.testing.allocator.dupe(u32, source[0 .. width * height]), .width = width, .height = height };
+        }
+
+        fn deinit(self: Capture) void {
+            std.testing.allocator.free(self.pixels);
+        }
+
+        fn rows(self: Capture, top: i32, bottom: i32) []const u32 {
+            const first: usize = @intCast(std.math.clamp(top, 0, @as(i32, @intCast(self.height))));
+            const last: usize = @intCast(std.math.clamp(bottom, top, @as(i32, @intCast(self.height))));
+            return self.pixels[first * self.width .. last * self.width];
+        }
+
+        /// Pixels inside `rect` (client coordinates) that differ from `other`,
+        /// skipping the columns `skip_left`..`skip_right`.
+        fn countDifferent(self: Capture, other: Capture, rect: RECT, skip_left: i32, skip_right: i32) usize {
+            var count: usize = 0;
+            var y = @max(0, rect.top);
+            while (y < @min(rect.bottom, @as(i32, @intCast(self.height)))) : (y += 1) {
+                var x = @max(0, rect.left);
+                while (x < @min(rect.right, @as(i32, @intCast(self.width)))) : (x += 1) {
+                    if (x >= skip_left and x < skip_right) continue;
+                    const index = @as(usize, @intCast(y)) * self.width + @as(usize, @intCast(x));
+                    if (self.pixels[index] != other.pixels[index]) count += 1;
+                }
+            }
+            return count;
+        }
+    };
+
+    /// Lay the window out as on a monitor at `dpi`, the way `WM_DPICHANGED`
+    /// does (fonts, metrics, layout), without moving it to such a monitor.
+    fn simulateDpi(hwnd: HWND, dpi: u32) void {
+        var rect: RECT = undefined;
+        _ = GetWindowRect(hwnd, &rect);
+        _ = SendMessageW(hwnd, WM_DPICHANGED, (@as(usize, dpi) << 16) | dpi, @bitCast(@intFromPtr(&rect)));
+    }
+
+    /// Paint everything that is waiting to be painted, children included.
+    fn flushPaint(hwnd: HWND) void {
+        _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+
+    /// What the window shows now equals a full repaint of it: nothing was left
+    /// unpainted or stale by whatever ran before. The caret is hidden.
+    fn expectNothingStale(hwnd: HWND) !void {
+        _ = HideCaret(null);
+        flushPaint(hwnd);
+        const shown = try Capture.take(hwnd);
+        defer shown.deinit();
+        const rdw_frame: UINT = 0x0400;
+        _ = RedrawWindow(hwnd, null, null, RDW_INVALIDATE | rdw_frame | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        const repainted = try Capture.take(hwnd);
+        defer repainted.deinit();
+        const all: RECT = .{ .left = 0, .top = 0, .right = @intCast(shown.width), .bottom = @intCast(shown.height) };
+        const stale = shown.countDifferent(repainted, all, 0, 0);
+        if (stale != 0) {
+            var box: RECT = .{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = -1, .bottom = -1 };
+            for (shown.pixels, repainted.pixels, 0..) |a, b, index| if (a != b) {
+                const x: i32 = @intCast(index % shown.width);
+                const y: i32 = @intCast(index / shown.width);
+                box = .{ .left = @min(box.left, x), .top = @min(box.top, y), .right = @max(box.right, x + 1), .bottom = @max(box.bottom, y + 1) };
+            };
+            std.debug.print("stale pixels {d} in ({d},{d})-({d},{d}) of a {d}x{d} client\n", .{ stale, box.left, box.top, box.right, box.bottom, shown.width, shown.height });
+            // The first rows' runs of stale pixels, with both colours.
+            var y: usize = @intCast(box.top);
+            while (y < @min(@as(usize, @intCast(box.bottom)), @as(usize, @intCast(box.top)) + 16)) : (y += 1) {
+                var x: usize = 0;
+                var runs: usize = 0;
+                while (x < shown.width and runs < 4) : (x += 1) {
+                    const index = y * shown.width + x;
+                    if (shown.pixels[index] == repainted.pixels[index]) continue;
+                    const start = x;
+                    while (x < shown.width and shown.pixels[y * shown.width + x] != repainted.pixels[y * shown.width + x]) x += 1;
+                    std.debug.print("  y={d} x={d}..{d} shown=0x{x:0>6} repainted=0x{x:0>6}\n", .{ y, start, x, shown.pixels[index] & 0xFFFFFF, repainted.pixels[index] & 0xFFFFFF });
+                    runs += 1;
+                }
+            }
+            // The visible windows that cover them. A point lookup would not
+            // do: a static answers `HTTRANSPARENT`, so it reports the parent.
+            const Overlapping = struct {
+                var root: HWND = undefined;
+                var area: RECT = undefined;
+                fn each(child: HWND, _: LPARAM) callconv(.winapi) BOOL {
+                    if (sys.IsWindowVisible(child) == 0) return 1;
+                    const r = rectIn(root, child);
+                    if (r.right <= area.left or r.left >= area.right or r.bottom <= area.top or r.top >= area.bottom) return 1;
+                    var class_w: [64]u16 = undefined;
+                    const length = GetClassNameW(child, &class_w, class_w.len);
+                    std.debug.print("  under them: {f} ({d},{d})-({d},{d}), a direct child: {}\n", .{
+                        std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
+                        r.left,
+                        r.top,
+                        r.right,
+                        r.bottom,
+                        sys.GetParent(child) == root,
+                    });
+                    return 1;
+                }
+            };
+            Overlapping.root = hwnd;
+            Overlapping.area = box;
+            _ = sys.EnumChildWindows(hwnd, Overlapping.each, 0);
+        }
+        try std.testing.expectEqual(@as(usize, 0), stale);
+    }
+
+    /// `child`'s window rect in `parent`'s client coordinates.
+    fn rectIn(parent: HWND, child: HWND) RECT {
+        var rect: RECT = undefined;
+        _ = GetWindowRect(child, &rect);
+        var corners = [_]POINT{ .{ .x = rect.left, .y = rect.top }, .{ .x = rect.right, .y = rect.bottom } };
+        _ = MapWindowPoints(null, parent, &corners, 2);
+        return .{ .left = corners[0].x, .top = corners[0].y, .right = corners[1].x, .bottom = corners[1].y };
+    }
+
+    const GCLP_HICON: i32 = -14;
+    const GCLP_HICONSM: i32 = -34;
+    const WM_GETICON: UINT = 0x007F;
+    const IDI_APPLICATION: usize = 32512;
+    const WA_ACTIVE: usize = 1;
+
+    fn run(desktop: *anyopaque, result: *anyerror!void, body: *const fn () anyerror!void) void {
+        if (SetThreadDesktop(desktop) == 0) {
+            result.* = error.SkipZigTest;
+            return;
+        }
+        body() catch |err| {
+            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+            result.* = err;
+        };
+    }
+
+    fn onHiddenDesktop(body: *const fn () anyerror!void) !void {
+        // One desktop per test process. Two test runs at once (parallel
+        // worktrees) shared one named desktop, and the Ctrl+S test failed in a
+        // run that overlapped another one while passing on its own.
+        var name_utf8: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_utf8, "noctty-test-settings-dialog-{d}", .{windows.GetCurrentProcessId()});
+        var name_w: [64:0]u16 = undefined;
+        const desktop = CreateDesktopW(
+            utf8ToW(&name_w, name),
+            null,
+            null,
+            0,
+            0x10000000, // GENERIC_ALL
+            null,
+        ) orelse return error.SkipZigTest;
+        defer _ = CloseDesktop(desktop);
+        var result: anyerror!void = {};
+        const thread = try std.Thread.spawn(.{}, run, .{ desktop, &result, body });
+        thread.join();
+        try result;
+    }
+
+    /// A Settings window opened over stub callbacks that count what reaches the App.
+    const Fixture = struct {
+        config: Config,
+        settings: SettingsWindow,
+        icon: HICON,
+        closed: u32 = 0,
+        editor_opened: u32 = 0,
+        saved: u32 = 0,
+        custom_uia: bool = false,
+
+        fn start() !*Fixture {
+            return startWith(false);
+        }
+
+        fn startWith(custom_uia: bool) !*Fixture {
+            const self = try std.testing.allocator.create(Fixture);
+            errdefer std.testing.allocator.destroy(self);
+            self.* = .{
+                .config = try Config.default(std.testing.allocator),
+                .settings = undefined,
+                .icon = LoadIconW(null, @ptrFromInt(IDI_APPLICATION)),
+                .custom_uia = custom_uia,
+            };
+            errdefer self.config.deinit();
+            self.settings = SettingsWindow.init(.{
+                .ctx = self,
+                .alloc = std.testing.allocator,
+                .hinstance = sys.GetModuleHandleW(null),
+                .appIcon = &appIcon,
+                .chromeBg = &stubChromeBg,
+                .textPrimary = &stubTextPrimary,
+                .openInEditor = &openInEditor,
+                .currentConfig = &currentConfig,
+                .saveAndReload = &saveAndReload,
+                .notifySuccess = &notifySuccess,
+                .customUiaProvidersEnabled = &customUia,
+                .onClosed = &onClosed,
+            });
+            self.settings.wheel_lines_override = 3;
+            try self.settings.open();
+            return self;
+        }
+
+        fn finish(self: *Fixture) void {
+            self.settings.deinit();
+            _ = sys.UnregisterClassW(class_name, self.settings.handle.hinstance);
+            _ = sys.UnregisterClassW(viewport_class_name, self.settings.handle.hinstance);
+            self.config.deinit();
+            std.testing.allocator.destroy(self);
+        }
+
+        fn hwnd(self: *const Fixture) HWND {
+            return self.settings.hwnd.?;
+        }
+
+        fn appIcon(ctx: *anyopaque, _: bool) HICON {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            return self.icon;
+        }
+
+        fn openInEditor(ctx: *anyopaque) void {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            self.editor_opened += 1;
+        }
+
+        fn currentConfig(ctx: *anyopaque) *const Config {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            return &self.config;
+        }
+
+        fn saveAndReload(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            self.saved += 1;
+        }
+
+        fn customUia(ctx: *anyopaque) bool {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            return self.custom_uia;
+        }
+
+        fn notifySuccess(_: *anyopaque, _: []const u8, _: []const u8) void {}
+
+        fn onClosed(ctx: *anyopaque) void {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            self.closed += 1;
+        }
+
+        /// Hand a key down to Settings the way the App pump does: the
+        /// accelerators first, then the dialog manager.
+        fn pumpKey(self: *Fixture, vk: u32) bool {
+            return self.pumpKeyRepeat(vk, false);
+        }
+
+        fn pumpKeyRepeat(self: *Fixture, vk: u32, repeat: bool) bool {
+            const target = sys.GetFocus() orelse self.hwnd();
+            var msg: sys.MSG = .{
+                .hwnd = target,
+                .message = WM_KEYDOWN,
+                .wParam = vk,
+                .lParam = if (repeat) 1 << 30 else 0,
+                .time = 0,
+                .pt = .{ .x = 0, .y = 0 },
+                .lPrivate = 0,
+            };
+            if (self.settings.handleAccelerator(msg.hwnd, msg.message, msg.wParam, msg.lParam)) return true;
+            return sys.IsDialogMessageW(self.hwnd(), &msg) != 0;
+        }
+
+        fn wheel(target: HWND, delta: i16) void {
+            const high: usize = @as(u16, @bitCast(delta));
+            _ = sys.SendMessageW(target, WM_MOUSEWHEEL, high << 16, 0);
+        }
+
+        /// Shrink to the minimum size, where a single column of Appearance
+        /// fields no longer fits and the form scrolls, at the work area's
+        /// corner. On a screen smaller than that size (a CI runner's is
+        /// 1024x768) the minimum is the work area, so the window keeps one
+        /// size across DPI changes: see "settings text resized inside a
+        /// window of one size is drawn again".
+        fn makeFormScrollable(self: *Fixture) !void {
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(self.hwnd(), &work);
+            const width = @min(self.settings.px(720), work.right - work.left);
+            const height = @min(self.settings.px(520), work.bottom - work.top);
+            _ = SetWindowPos(self.hwnd(), null, work.left, work.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+            try std.testing.expect(self.settings.content_scroll_max > 0);
+        }
+    };
+};
+
+test "settings Escape without the close prompt closes a clean window and prompts a dirty one" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            // A dirty window asks first; Escape is the same request as the X.
+            settings.markRawScalarEdit(.font_size);
+            _ = sys.SetFocus(settings.edit_font_size.?);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+
+            // With the prompt open Escape still means "keep editing".
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+            // ... and focus goes back to the field it was taken from.
+            try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+
+            // A clean window closes.
+            settings.raw_scalar_dirty[@intFromEnum(RawScalarField.font_size)] = false;
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expectEqual(@as(u32, 1), fixture.closed);
+            try std.testing.expect(sys.IsWindow(hwnd) == 0);
+        }
+    }.body);
+}
+
+test "settings holds a quit for unsaved changes until Save or Discard closes the window" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            // Nothing unsaved: the quit goes ahead.
+            try std.testing.expect(!settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(!settings.close_prompt_visible);
+
+            // Unsaved: the close prompt holds the quit; Keep editing drops it.
+            settings.markRawScalarEdit(.font_size);
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expect(!settings.takeQuitAfterClose());
+
+            // Discard closes the window and hands the quit back once.
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            settings.discardAndClose();
+            try std.testing.expect(settings.close_posted);
+            _ = SendMessageW(hwnd, WM_SETTINGS_CLOSE_NOW, 0, 0);
+            try std.testing.expectEqual(@as(u32, 1), fixture.closed);
+            try std.testing.expect(sys.IsWindow(hwnd) == 0);
+            try std.testing.expect(settings.takeQuitAfterClose());
+            try std.testing.expect(!settings.takeQuitAfterClose());
+        }
+    }.body);
+}
+
+test "settings Enter presses the focused push button and does nothing in a field" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            settings.setActiveSection(.advanced);
+            _ = sys.SetFocus(settings.btn_open_editor.?);
+            try std.testing.expectEqual(settings.btn_open_editor.?, sys.GetFocus().?);
+            try std.testing.expect(fixture.pumpKey(0x0D));
+            try std.testing.expectEqual(@as(u32, 1), fixture.editor_opened);
+
+            // A held key clicks once.
+            try std.testing.expect(fixture.pumpKeyRepeat(0x0D, true));
+            try std.testing.expectEqual(@as(u32, 1), fixture.editor_opened);
+
+            // With a change pending (Save enabled), Enter in a field neither
+            // saves nor closes the window.
+            settings.setActiveSection(.appearance);
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+            _ = sys.SetFocus(settings.edit_font_size.?);
+            _ = fixture.pumpKey(0x0D);
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+            try std.testing.expectEqual(@as(u32, 1), fixture.editor_opened);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+            try std.testing.expect(sys.IsWindow(fixture.hwnd()) != 0);
+
+            // On the Save button itself it saves.
+            _ = sys.SetFocus(settings.btn_save.?);
+            try std.testing.expect(fixture.pumpKey(0x0D));
+            try std.testing.expectEqual(@as(u32, 1), fixture.saved);
+        }
+    }.body);
+}
+
+test "settings Ctrl+S reaches Save through the accelerator hook" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            _ = sys.SetFocus(settings.edit_font_size.?);
+
+            // The thread's key table starts as a copy of what the real keyboard
+            // holds, so a test that sets only Ctrl in it inherits any Shift,
+            // Alt or Ctrl the person running the suite has down (failed 2 of 6
+            // runs on a reviewer's machine). Own every key the shortcut reads.
+            var original: [256]u8 = undefined;
+            try std.testing.expect(dialog_test.GetKeyboardState(&original) != 0);
+            defer _ = dialog_test.SetKeyboardState(&original);
+
+            // Without Ctrl the key is not ours.
+            const focus = sys.GetFocus().?;
+            try dialog_test.holdKeys(.{});
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+
+            // Ctrl with Shift or Alt is a different chord.
+            try dialog_test.holdKeys(.{ .ctrl = true, .shift = true });
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try dialog_test.holdKeys(.{ .ctrl = true, .alt = true });
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+
+            // With only the thread's Ctrl key down it is consumed and saves.
+            try dialog_test.holdKeys(.{ .ctrl = true });
+            try std.testing.expect(settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try std.testing.expectEqual(@as(u32, 1), fixture.saved);
+        }
+    }.body);
+}
+
+test "settings Ctrl+S gate follows the Save button and a held Escape does not flap the prompt" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            // Clean: Save is disabled, so the shortcut's path saves nothing.
+            settings.saveIfAllowed();
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            settings.saveIfAllowed();
+            try std.testing.expectEqual(@as(u32, 1), fixture.saved);
+
+            // Dirty again: Escape opens the prompt, its auto-repeats do not
+            // toggle it, and nothing closes while a close is already posted.
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 3, 0);
+            settings.syncCursorStyleFromCombo();
+            _ = sys.SetFocus(settings.edit_font_size.?);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(settings.close_prompt_visible);
+            for (0..3) |_| try std.testing.expect(fixture.pumpKeyRepeat(0x1B, true));
+            try std.testing.expect(settings.close_prompt_visible);
+            // The prompt blocks Save, so the shortcut's path saves nothing there.
+            settings.saveIfAllowed();
+            try std.testing.expectEqual(@as(u32, 1), fixture.saved);
+            settings.close_posted = true;
+            _ = fixture.pumpKey(0x1B);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+            settings.close_posted = false;
+        }
+    }.body);
+}
+
+test "settings wheel accumulates touchpad deltas and scrolls the form" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try fixture.makeFormScrollable();
+
+            // Four precision deltas of 30 are one notch (120) between them.
+            for (0..4) |_| dialog_test.Fixture.wheel(fixture.hwnd(), -30);
+            try std.testing.expectEqual(settings.px(64), settings.content_scroll_y);
+
+            // A whole notch up scrolls back.
+            dialog_test.Fixture.wheel(fixture.hwnd(), 120);
+            try std.testing.expectEqual(@as(i32, 0), settings.content_scroll_y);
+        }
+    }.body);
+}
+
+test "settings wheel over a closed dropdown scrolls the form instead of changing it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try fixture.makeFormScrollable();
+
+            const combo = settings.combo_cursor_style.?;
+            _ = sys.SendMessageW(combo, CB_SETCURSEL, 1, 0);
+            _ = sys.SetFocus(combo);
+            // Focusing the combo may scroll it into view; measure from there.
+            const before = settings.content_scroll_y;
+            dialog_test.Fixture.wheel(combo, -120);
+            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(combo, CB_GETCURSEL, 0, 0));
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expectEqual(@min(before + settings.px(64), settings.content_scroll_max), settings.content_scroll_y);
+        }
+    }.body);
+}
+
+test "settings reactivation restores the focused field" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            const field = settings.edit_font_size.?;
+            _ = sys.SetFocus(field);
+            try std.testing.expectEqual(field, sys.GetFocus().?);
+
+            // Alt+Tab away and back: the system leaves focus on the frame.
+            _ = sys.SendMessageW(hwnd, WM_ACTIVATE, WA_INACTIVE, 0);
+            _ = sys.SetFocus(hwnd);
+            _ = sys.SendMessageW(hwnd, WM_ACTIVATE, dialog_test.WA_ACTIVE, 0);
+            try std.testing.expectEqual(field, sys.GetFocus().?);
+
+            // A control that vanished meanwhile falls back to the section.
+            _ = sys.SendMessageW(hwnd, WM_ACTIVATE, WA_INACTIVE, 0);
+            _ = sys.ShowWindow(field, SW_HIDE);
+            _ = sys.SetFocus(hwnd);
+            _ = sys.SendMessageW(hwnd, WM_ACTIVATE, dialog_test.WA_ACTIVE, 0);
+            try std.testing.expectEqual(settings.sectionButton(.appearance).?, sys.GetFocus().?);
+        }
+    }.body);
+}
+
+test "settings Tab visits the fields in form order and Save last" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            // A pending change enables Save, which is created before every field.
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+
+            for (std.enums.values(Section)) |section| {
+                settings.setActiveSection(section);
+                // A disabled control (the background blur box) is not a tab stop.
+                var fields: [settings_max_form_items]HWND = undefined;
+                var field_count: usize = 0;
+                for (settings.formItems()) |item| {
+                    const control = settings.controlHwnd(item.control_index).?;
+                    if (sys.IsWindowEnabled(control) == 0) continue;
+                    fields[field_count] = control;
+                    field_count += 1;
+                }
+                const first = fields[0];
+                var visited: [16]HWND = undefined;
+                var count: usize = 0;
+                var current = first;
+                while (count < visited.len) {
+                    visited[count] = current;
+                    count += 1;
+                    current = dialog_test.GetNextDlgTabItem(hwnd, current, 0) orelse break;
+                    if (current == first) break;
+                }
+                // Every field in form order, then Save, then the rail wraps.
+                try std.testing.expectEqual(field_count + 2, count);
+                for (fields[0..field_count], 0..) |control, index| {
+                    try std.testing.expectEqual(control, visited[index]);
+                }
+                try std.testing.expectEqual(settings.btn_save.?, visited[field_count]);
+                try std.testing.expectEqual(settings.sectionButton(section).?, visited[field_count + 1]);
+
+                // Shift+Tab walks it back: Save, the fields in reverse, the rail.
+                var back = settings.btn_save.?;
+                var index = field_count;
+                while (index > 0) {
+                    index -= 1;
+                    back = dialog_test.GetNextDlgTabItem(hwnd, back, 1).?;
+                    try std.testing.expectEqual(fields[index], back);
+                }
+                try std.testing.expectEqual(settings.sectionButton(section).?, dialog_test.GetNextDlgTabItem(hwnd, back, 1).?);
+            }
+        }
+    }.body);
+}
+
+test "settings arrow-key groups stop at the rail and the action bar" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            // Down from the last rail button wraps to the first, rather than
+            // running on into the fields.
+            try std.testing.expectEqual(
+                settings.btn_section_appearance.?,
+                dialog_test.GetNextDlgGroupItem(hwnd, settings.btn_section_advanced.?, 0).?,
+            );
+        }
+    }.body);
+}
+
+test "settings focus forwarded to a saved field does not scroll the form" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            try fixture.makeFormScrollable();
+
+            const field = settings.edit_pad_y.?;
+            _ = sys.SetFocus(field);
+            _ = sys.SendMessageW(hwnd, WM_ACTIVATE, WA_INACTIVE, 0);
+            // The click that reactivates the window was aimed at the form as
+            // it is now; restoring focus must not move it.
+            settings.setContentScroll(0);
+            _ = sys.SetFocus(hwnd);
+            try std.testing.expectEqual(field, sys.GetFocus().?);
+            try std.testing.expectEqual(@as(i32, 0), settings.content_scroll_y);
+        }
+    }.body);
+}
+
+test "settings dropdown wheel forwarding survives the UIA control subclass" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try fixture.makeFormScrollable();
+
+            const combo = settings.combo_cursor_style.?;
+            // The UIA subclass sits on top of the combo subclass.
+            try std.testing.expect(settings.controlIndex(combo) != null);
+            try std.testing.expect(settings.control_uia_providers[settings.controlIndex(combo).?] != null);
+            _ = sys.SendMessageW(combo, CB_SETCURSEL, 1, 0);
+            const before = settings.content_scroll_y;
+            dialog_test.Fixture.wheel(combo, -120);
+            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(combo, CB_GETCURSEL, 0, 0));
+            try std.testing.expectEqual(@min(before + settings.px(64), settings.content_scroll_max), settings.content_scroll_y);
+        }
+    }.body);
+}
+
+test "settings correcting one invalid field does not move to another section" {
+    var settings: SettingsWindow = .{ .handle = undefined };
+    settings.edit_scrollback = @ptrFromInt(0x201);
+    settings.edit_font_size = @ptrFromInt(0x202);
+
+    settings.markRawScalarEdit(.scrollback_limit);
+    settings.setRawScalarValidationError(.scrollback_limit, settings.edit_scrollback.?, "Scrollback limit is required.");
+    settings.active_section = .appearance;
+    settings.markRawScalarEdit(.font_size);
+    settings.setRawScalarValidationError(.font_size, settings.edit_font_size.?, "Font size is required.");
+
+    // Typing a valid size leaves the user in Appearance; the other error stays
+    // in the status line for them to find.
+    settings.finishRawScalarEdit(.font_size);
+    try std.testing.expectEqual(Section.appearance, settings.active_section);
+    try std.testing.expectEqual(RawScalarField.scrollback_limit, settings.active_raw_validation.?);
+    try std.testing.expectEqual(settings.edit_scrollback.?, settings.validation_control.?);
+}
+
+test "settings window carries the application icon" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const hwnd = fixture.hwnd();
+            const icon: usize = @intFromPtr(fixture.icon.?);
+
+            try std.testing.expectEqual(icon, dialog_test.GetClassLongPtrW(hwnd, dialog_test.GCLP_HICON));
+            try std.testing.expectEqual(icon, dialog_test.GetClassLongPtrW(hwnd, dialog_test.GCLP_HICONSM));
+            try std.testing.expectEqual(
+                @as(LRESULT, @bitCast(icon)),
+                sys.SendMessageW(hwnd, dialog_test.WM_GETICON, ICON_BIG, 0),
+            );
+        }
+    }.body);
+}
+
+fn windowStyle(hwnd: HWND) u32 {
+    return @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, GWL_STYLE))));
+}
+
+test "settings fields, labels and help live in a viewport that clips them" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            const viewport = sys.GetParent(settings.edit_font_size.?).?;
+            try std.testing.expect(viewport != hwnd);
+            try std.testing.expectEqual(hwnd, sys.GetParent(viewport).?);
+            try std.testing.expect(windowStyle(viewport) & WS_CLIPCHILDREN != 0);
+            // Painting the window never paints over a child, and once the
+            // form overflows the scroll bar spans the form, not the rail and
+            // the action bar.
+            try std.testing.expect(windowStyle(hwnd) & WS_CLIPCHILDREN != 0);
+            try fixture.makeFormScrollable();
+            try std.testing.expect(windowStyle(viewport) & WS_VSCROLL != 0);
+            try std.testing.expect(windowStyle(hwnd) & WS_VSCROLL == 0);
+
+            for (0..settings_clipped_control_count) |index| {
+                try std.testing.expectEqual(viewport, sys.GetParent(settings.controlHwnd(index).?).?);
+            }
+            for (settings.field_labels) |label| try std.testing.expectEqual(viewport, sys.GetParent(label.?).?);
+            try std.testing.expectEqual(viewport, sys.GetParent(settings.text_help.?).?);
+            for ([_]?HWND{
+                settings.text_header,            settings.text_summary,   settings.text_status,
+                settings.text_close_prompt,      settings.btn_save,       settings.btn_conflict_keep,
+                settings.btn_conflict_use_disk,  settings.btn_close_save, settings.btn_close_discard,
+                settings.btn_close_keep_editing,
+            }) |child| try std.testing.expectEqual(hwnd, sys.GetParent(child.?).?);
+            // The UIA subclasses find the window through the control's parent.
+            for (0..settings_control_count) |index| {
+                const parent = sys.GetParent(settings.controlHwnd(index).?).?;
+                try std.testing.expectEqual(settings, recoverOwner(parent).?);
+            }
+        }
+    }.body);
+}
+
+test "settings scrolling leaves the header and the action bar untouched" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            for ([_]u32{ 144, 96, 192, 288 }) |dpi| {
+                dialog_test.simulateDpi(hwnd, dpi);
+                try fixture.makeFormScrollable();
+                settings.setContentScroll(0);
+                dialog_test.flushPaint(hwnd);
+                const before = try dialog_test.Capture.take(hwnd);
+                defer before.deinit();
+
+                for (0..3) |_| dialog_test.Fixture.wheel(hwnd, -120);
+                try std.testing.expect(settings.content_scroll_y > 0);
+                dialog_test.flushPaint(hwnd);
+                const after = try dialog_test.Capture.take(hwnd);
+                defer after.deinit();
+
+                const width: i32 = @intCast(before.width);
+                const height: i32 = @intCast(before.height);
+                const header: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = settings.proof_viewport_top };
+                const action_bar: RECT = .{ .left = 0, .top = settings.proof_viewport_bottom, .right = width, .bottom = height };
+                const form: RECT = .{ .left = 0, .top = settings.proof_viewport_top, .right = width, .bottom = settings.proof_viewport_bottom };
+                try std.testing.expectEqual(@as(usize, 0), before.countDifferent(after, header, 0, 0));
+                try std.testing.expectEqual(@as(usize, 0), before.countDifferent(after, action_bar, 0, 0));
+                // The form itself did move.
+                try std.testing.expect(before.countDifferent(after, form, 0, 0) > 0);
+                try dialog_test.expectNothingStale(hwnd);
+            }
+        }
+    }.body);
+}
+
+test "settings scrolling puts every field where a fresh layout does" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const viewport = settings.viewport.?;
+            try fixture.makeFormScrollable();
+
+            // A jump past the whole viewport moves fields that started below
+            // its bottom edge too; then back.
+            for ([_]i32{ settings.content_scroll_max, settings.px(37), 0 }) |position| {
+                settings.setContentScroll(position);
+                var scrolled: [settings_max_form_items]RECT = undefined;
+                for (settings.formItems(), 0..) |item, index| {
+                    scrolled[index] = dialog_test.rectIn(viewport, settings.controlHwnd(item.control_index).?);
+                }
+                layoutChildren(settings);
+                for (settings.formItems(), 0..) |item, index| {
+                    try std.testing.expectEqual(scrolled[index], dialog_test.rectIn(viewport, settings.controlHwnd(item.control_index).?));
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings dropdowns are as tall as text fields and the text sits in the middle" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            for ([_]u32{ 144, 96, 192, 288 }) |dpi| {
+                dialog_test.simulateDpi(hwnd, dpi);
+                const field = settings.edit_font_size.?;
+                const edit = dialog_test.rectIn(hwnd, field);
+                for (settings.comboControls()) |combo| {
+                    const rect = dialog_test.rectIn(hwnd, combo.?);
+                    try std.testing.expectEqual(edit.bottom - edit.top, rect.bottom - rect.top);
+                }
+                // One line of text, centred: the client area is the line.
+                var client: RECT = undefined;
+                _ = GetClientRect(field, &client);
+                var origin = [_]POINT{.{ .x = 0, .y = 0 }};
+                _ = dialog_test.MapWindowPoints(field, hwnd, &origin, 1);
+                const above = origin[0].y - edit.top;
+                const below = edit.bottom - (origin[0].y + client.bottom);
+                try std.testing.expectEqual(above, below);
+                try std.testing.expect(client.bottom >= settings.field_text_height);
+                try std.testing.expect(client.bottom <= settings.field_text_height + 1);
+            }
+        }
+    }.body);
+}
+
+test "settings section switches and scrolling leave the window's own paint alone" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            try fixture.makeFormScrollable();
+
+            // Each switch repaints the form and the header text, which are
+            // children; the window itself is neither erased nor repainted.
+            for ([_]Section{ .terminal, .privacy, .keybindings, .appearance }) |section| {
+                dialog_test.flushPaint(hwnd);
+                const paints = settings.proof_paint_count;
+                const button = settings.sectionButton(section).?;
+                const id: usize = @intCast(GetDlgCtrlID(button));
+                _ = SendMessageW(hwnd, WM_COMMAND, (@as(usize, BN_CLICKED) << 16) | id, @bitCast(@intFromPtr(button)));
+                try std.testing.expectEqual(section, settings.active_section);
+                dialog_test.flushPaint(hwnd);
+                try std.testing.expectEqual(paints, settings.proof_paint_count);
+                try dialog_test.expectNothingStale(hwnd);
+            }
+            const paints = settings.proof_paint_count;
+            dialog_test.Fixture.wheel(hwnd, -120);
+            try std.testing.expect(settings.content_scroll_y > 0);
+            dialog_test.flushPaint(hwnd);
+            try std.testing.expectEqual(paints, settings.proof_paint_count);
+        }
+    }.body);
+}
+
+test "settings text resized inside a window of one size is drawn again" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn sized(rect: RECT) [2]i32 {
+            return .{ rect.right - rect.left, rect.bottom - rect.top };
+        }
+
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            dialog_test.simulateDpi(hwnd, 96);
+            var work: RECT = .{ .left = 0, .top = 0, .right = 1024, .bottom = 728 };
+            _ = windowWorkArea(hwnd, &work);
+
+            // A resize of the window repaints every child (the frame's class
+            // has CS_HREDRAW | CS_VREDRAW); these resize text inside a window
+            // that keeps its size. First a status message too long for the
+            // room beside the buttons, which gets a row of its own, and a
+            // short one that gives it back.
+            const long_status = "A status message far too long to fit beside the buttons, so it takes a row of its own and wraps onto more than one line of it.";
+            for ([_]i32{ 900, 760 }) |logical_width| {
+                _ = SetWindowPos(hwnd, null, work.left, work.top, settings.px(logical_width), settings.px(560), SWP_NOZORDER | SWP_NOACTIVATE);
+                dialog_test.flushPaint(hwnd);
+                for ([_][]const u8{ long_status, "Saved." }) |message| {
+                    const before = sized(dialog_test.rectIn(hwnd, settings.text_status.?));
+                    settings.setStatus(message);
+                    try std.testing.expect(!std.meta.eql(before, sized(dialog_test.rectIn(hwnd, settings.text_status.?))));
+                    try dialog_test.expectNothingStale(hwnd);
+                }
+            }
+
+            // Then a DPI change that leaves the window's size alone, as when
+            // the window is already as large as the screen allows (a CI
+            // runner's is 1024x768): `WM_SETFONT` draws the text in the new
+            // font before the layout gives it its new width. Advanced has
+            // the longest summary.
+            const button = settings.sectionButton(.advanced).?;
+            const id: usize = @intCast(GetDlgCtrlID(button));
+            _ = SendMessageW(hwnd, WM_COMMAND, (@as(usize, BN_CLICKED) << 16) | id, @bitCast(@intFromPtr(button)));
+            try std.testing.expectEqual(Section.advanced, settings.active_section);
+            _ = SetWindowPos(hwnd, null, work.left, work.top, 1100, 800, SWP_NOZORDER | SWP_NOACTIVATE);
+            dialog_test.flushPaint(hwnd);
+            var window: RECT = undefined;
+            _ = GetWindowRect(hwnd, &window);
+            for ([_]u32{ 144, 96 }) |dpi| {
+                const before = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                dialog_test.simulateDpi(hwnd, dpi);
+                var now: RECT = undefined;
+                _ = GetWindowRect(hwnd, &now);
+                try std.testing.expectEqual(window, now);
+                const after = dialog_test.rectIn(hwnd, settings.text_summary.?);
+                try std.testing.expect(before.right - before.left != after.right - after.left);
+                try dialog_test.expectNothingStale(hwnd);
+            }
+        }
+    }.body);
+}
+
+test "settings field frames take the new colours when the theme changes" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn alwaysHighContrast(_: *anyopaque) bool {
+            return true;
+        }
+
+        /// The capture's pixel (0x00RRGGBB) as a COLORREF (0x00BBGGRR).
+        fn colorAt(capture: dialog_test.Capture, x: i32, y: i32) u32 {
+            const pixel = capture.pixels[@as(usize, @intCast(y)) * capture.width + @as(usize, @intCast(x))];
+            return ((pixel & 0xFF) << 16) | (pixel & 0xFF00) | ((pixel >> 16) & 0xFF);
+        }
+
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const field = dialog_test.rectIn(hwnd, settings.edit_font_family.?);
+            const middle = @divTrunc(field.top + field.bottom, 2);
+
+            dialog_test.flushPaint(hwnd);
+            const light = try dialog_test.Capture.take(hwnd);
+            defer light.deinit();
+            try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(light, field.left, middle));
+
+            // High Contrast turns on: the frame is non-client, and must follow.
+            settings.handle.highContrast = &alwaysHighContrast;
+            settings.themeChanged();
+            try std.testing.expect(settings.theme_adapter.colors.high_contrast);
+            dialog_test.flushPaint(hwnd);
+            const high_contrast = try dialog_test.Capture.take(hwnd);
+            defer high_contrast.deinit();
+            try std.testing.expectEqual(settings.theme_adapter.colors.field_border, colorAt(high_contrast, field.left, middle));
+
+            // A theme change also gives every control its theme again and
+            // reframes the text fields for the new font, and either of those
+            // redraws the frame on its own. The adapter's own redraw must
+            // cover the frame without them: new colours, then that redraw only.
+            settings.theme_adapter.colors.field_border = 0x0000C0;
+            settings.theme_adapter.colors.edit_bg = 0x00C000;
+            _ = sys.EnumChildWindows(hwnd, invalidateThemeChild, 0);
+            dialog_test.flushPaint(hwnd);
+            const redrawn = try dialog_test.Capture.take(hwnd);
+            defer redrawn.deinit();
+            try std.testing.expectEqual(@as(u32, 0x0000C0), colorAt(redrawn, field.left, middle));
+            try std.testing.expectEqual(@as(u32, 0x00C000), colorAt(redrawn, field.left + settings.fieldStroke(), field.top + settings.fieldStroke()));
+        }
+    }.body);
+}
+
+test "settings an empty focused text field shows that it has focus" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+            const field = settings.edit_font_family.?;
+            var text: [8]u16 = undefined;
+            try std.testing.expectEqual(@as(c_int, 0), GetWindowTextW(field, &text, @intCast(text.len)));
+
+            for ([_]u32{ 96, 144 }) |dpi| {
+                dialog_test.simulateDpi(hwnd, dpi);
+                _ = SetFocus(settings.sectionButton(.appearance).?);
+                dialog_test.flushPaint(hwnd);
+                const unfocused = try dialog_test.Capture.take(hwnd);
+                defer unfocused.deinit();
+                _ = SetFocus(field);
+                _ = dialog_test.HideCaret(null);
+                dialog_test.flushPaint(hwnd);
+                const focused = try dialog_test.Capture.take(hwnd);
+                defer focused.deinit();
+                try std.testing.expect(unfocused.countDifferent(focused, dialog_test.rectIn(hwnd, field), 0, 0) > 0);
+                // Painted when focus arrived, not only by a later full repaint.
+                try dialog_test.expectNothingStale(hwnd);
+            }
+        }
+    }.body);
+}
+
+test "settings field frame insets centre one line inside the stroke" {
+    // 48 px box, 3 px stroke, 22 px line: 13 above, 13 below.
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 3, .y = 13 }, fieldFrameInsets(360, 48, 22, 3));
+    // An odd remainder goes below.
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 2, .y = 7 }, fieldFrameInsets(200, 32, 17, 2));
+    // A line taller than the box keeps the stroke, and never more than half.
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 2, .y = 2 }, fieldFrameInsets(200, 20, 40, 2));
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 1, .y = 1 }, fieldFrameInsets(3, 3, 0, 2));
+    try std.testing.expectEqual(FieldFrameInsets{ .x = 0, .y = 0 }, fieldFrameInsets(-5, -5, 10, 2));
+    // Focus wins over an invalid value while the user is typing it.
+    try std.testing.expectEqual(FieldFrameState.focused, fieldFrameState(true, true));
+    try std.testing.expectEqual(FieldFrameState.invalid, fieldFrameState(false, true));
+    try std.testing.expectEqual(FieldFrameState.rest, fieldFrameState(false, false));
+    // A dropdown is asked for its field height less its own frame.
+    try std.testing.expectEqual(@as(i32, 42), comboSelectionHeight(35, 29, 48));
+    try std.testing.expectEqual(@as(i32, 1), comboSelectionHeight(80, 10, 4));
+}
+
+test "settings viewport stays out of the UIA control view" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const provider = settings.viewport_uia_provider.?;
+            try std.testing.expectEqual(settings.viewport.?, provider.hwnd);
+            try std.testing.expectEqual(win32_uia.SettingsControlProvider.Role.layout_pane, provider.role);
+            for (0..settings_control_count) |index| try std.testing.expect(settings.control_uia_providers[index] != null);
+        }
+    }.body);
+}
+
+fn modelOnlyHandle() AppHandle {
+    return .{
+        .ctx = undefined,
+        .alloc = std.testing.allocator,
+        .hinstance = undefined,
+        .chromeBg = undefined,
+        .textPrimary = undefined,
+        .openInEditor = undefined,
+        .currentConfig = undefined,
+        .saveAndReload = undefined,
+        .notifySuccess = undefined,
+        .onClosed = undefined,
+    };
+}
+
+fn expectNoInternalSyntax(text: []const u8) !void {
+    // A Zig debug rendering (`.{ .field = ... }`), an enum tag (`font_size`) or
+    // a bare token spelled as code must never reach the screen.
+    try std.testing.expect(std.mem.indexOf(u8, text, ".{") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '_') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '@') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '`') == null);
+}
+
+test "settings pending changes read in the form's words" {
+    var current = try Config.default(std.testing.allocator);
+    current.@"font-size" = 12;
+    current.@"window-padding-x" = .{ .top_left = 2, .bottom_right = 2 };
+    current.@"clipboard-trim-trailing-spaces" = true;
+    current.@"copy-on-select" = .false;
+    current.@"window-theme" = .auto;
+    current.@"cursor-style" = .block;
+    var settings: SettingsWindow = .{
+        .handle = modelOnlyHandle(),
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("No changes waiting to be saved.", settings.pendingDiffText(&buf));
+
+    const pending = &settings.pending.?;
+    pending.@"font-size" = 14;
+    settings.trackEdit(.font_size, true);
+    pending.@"window-padding-x" = .{ .top_left = 4, .bottom_right = 6 };
+    settings.trackEdit(.window_padding_x, true);
+    pending.@"clipboard-trim-trailing-spaces" = false;
+    settings.trackEdit(.trim_trailing_spaces, false);
+    pending.@"copy-on-select" = .true;
+    settings.trackEdit(.copy_on_select, false);
+    pending.@"window-theme" = .dark;
+    settings.trackEdit(.window_theme, true);
+    pending.@"cursor-style" = .underline;
+    settings.trackEdit(.cursor_style, true);
+
+    const text = settings.pendingDiffText(&buf);
+    try std.testing.expectEqualStrings(
+        "Font size: 12 pt -> 14 pt\n" ++
+            "Window padding X: 2 -> 4,6\n" ++
+            "Trim trailing spaces on copy: On -> Off\n" ++
+            "Copy on select: Off -> On\n" ++
+            "Window theme: Match Windows (auto, default) -> Dark\n" ++
+            "Cursor style: Block -> Underline\n",
+        text,
+    );
+    try expectNoInternalSyntax(text);
+}
+
+test "settings pending changes drop a line that does not fit, not the lines before it" {
+    var current = try Config.default(std.testing.allocator);
+    current.@"font-size" = 12;
+    current.@"cursor-style" = .block;
+    var settings: SettingsWindow = .{
+        .handle = modelOnlyHandle(),
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+    const pending = &settings.pending.?;
+    pending.@"font-size" = 14;
+    settings.trackEdit(.font_size, true);
+    pending.@"cursor-style" = .underline;
+    settings.trackEdit(.cursor_style, true);
+
+    // Room for the first line and the closing one, not the second.
+    var small: [48]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Font size: 12 pt -> 14 pt\n" ++ more_changes_text,
+        settings.pendingDiffText(&small),
+    );
+
+    // The owned fields: a short font family stays when a long command cannot fit.
+    const arena = pending._arena.?.allocator();
+    pending.@"font-family" = try parseFontFamilyEditText(arena, "Cascadia Mono");
+    settings.owned_dirty[@intFromEnum(OwnedSettingField.font_family)] = true;
+    const long_command = try arena.dupeZ(u8, "pwsh.exe " ++ "-NoLogo " ** 40);
+    pending.command = .{ .shell = long_command };
+    settings.owned_dirty[@intFromEnum(OwnedSettingField.command)] = true;
+    var buf: [256]u8 = undefined;
+    const text = settings.pendingDiffText(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Font size: 12 pt -> 14 pt\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Font family: (default) -> Cascadia Mono\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Default command") == null);
+    try std.testing.expect(std.mem.endsWith(u8, text, more_changes_text));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+}
+
+test "settings a save that something overrides names the settings and no log" {
+    const alloc = std.testing.allocator;
+    const text = try StatusNote.saved_overridden.textWithDetail(alloc, "font-size, theme");
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "Saved, but a later config file or command-line option overrides font-size, theme, so the saved value is not used.",
+        text,
+    );
+    try std.testing.expect(StatusNote.saved_overridden.takesDetail());
+
+    var buf: [1024]u8 = undefined;
+    const named = maskedNotificationBody(&buf, "font-size, theme");
+    try std.testing.expect(std.mem.startsWith(u8, named, "font-size, theme: a later config file"));
+    // A GUI launch has no log to read.
+    try std.testing.expect(std.mem.indexOf(u8, named, "log") == null);
+    const unnamed = maskedNotificationBody(&buf, null);
+    try std.testing.expect(std.mem.indexOf(u8, unnamed, "Check the config-file lines") != null);
+    // Names too long for the buffer fall back to the sentence without them.
+    var small: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(unnamed, maskedNotificationBody(&small, "font-size, theme"));
+}
+
+test "settings the Advanced page lists the save target, the config problems and the pending changes" {
+    const Lender = struct {
+        fn target(_: *anyopaque, buf: []u8) ?[]const u8 {
+            const path = "C:\\cfg\\config.ghostty";
+            @memcpy(buf[0..path.len], path);
+            return buf[0..path.len];
+        }
+        fn problems(_: *anyopaque, buf: []u8) []const u8 {
+            const list = "Config problems (1):\n1. font-szie: unknown field\n";
+            @memcpy(buf[0..list.len], list);
+            return buf[0..list.len];
+        }
+    };
+    var context: u8 = 0;
+    var handle = modelOnlyHandle();
+    handle.ctx = &context;
+    handle.saveTarget = Lender.target;
+    handle.configProblems = Lender.problems;
+    var settings: SettingsWindow = .{ .handle = handle };
+
+    var buf: [2047]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Settings saves to C:\\cfg\\config.ghostty\n\n" ++
+            "Config problems (1):\n1. font-szie: unknown field\n\n" ++
+            no_pending_changes_text,
+        settings.advancedHelpText(&buf),
+    );
+
+    // A window with nothing to say about either still shows the changes.
+    var bare: SettingsWindow = .{ .handle = modelOnlyHandle() };
+    try std.testing.expectEqualStrings(no_pending_changes_text, bare.advancedHelpText(&buf));
+}
+
+test "settings the Advanced page keeps within one static text however long the problems list is" {
+    const Lender = struct {
+        fn target(_: *anyopaque, buf: []u8) ?[]const u8 {
+            @memset(buf[0..240], 'p');
+            return buf[0..240];
+        }
+        fn problems(_: *anyopaque, buf: []u8) []const u8 {
+            @memset(buf, 'x');
+            return buf;
+        }
+    };
+    var context: u8 = 0;
+    var handle = modelOnlyHandle();
+    handle.ctx = &context;
+    handle.saveTarget = Lender.target;
+    handle.configProblems = Lender.problems;
+    var current = try Config.default(std.testing.allocator);
+    current.@"font-size" = 12;
+    var settings: SettingsWindow = .{
+        .handle = handle,
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+    settings.pending.?.@"font-size" = 14;
+    settings.trackEdit(.font_size, true);
+
+    var buf: [2047]u8 = undefined;
+    const text = settings.advancedHelpText(&buf);
+    try std.testing.expect(text.len <= buf.len);
+    // The change still gets its line when the head has taken its whole share.
+    try std.testing.expect(std.mem.endsWith(u8, text, "Font size: 12 pt -> 14 pt\n"));
+}
+
+test "settings diff writes every field's values without debug syntax" {
+    var buf: [256]u8 = undefined;
+    for (std.enums.values(SettingField)) |field| {
+        var config = try Config.default(std.testing.allocator);
+        defer config.deinit();
+        var writer: std.Io.Writer = .fixed(&buf);
+        const value = settingValue(&config, field);
+        try writeSettingDiffLine(&writer, field, value, value);
+        const line = writer.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, line, field.label()));
+        try std.testing.expect(line[line.len - 1] == '\n');
+        try expectNoInternalSyntax(line);
+    }
+}
+
+test "settings scrollback label states the unit, that 0 turns scrollback off, and who it applies to" {
+    // `scrollback-limit` is bytes per terminal, 0 disables scrollback and
+    // there is no unlimited setting (Config.zig, Screen.zig); a change reaches
+    // terminals created afterwards. The old label said "rows, 0 = unlimited".
+    comptime std.debug.assert(@FieldType(Config, "scrollback-limit") == usize);
+    try std.testing.expectEqualStrings(scrollback_label, settings_label_specs[0]);
+    for ([_][]const u8{ "bytes", "0 = off", "new terminals" }) |fact| {
+        try std.testing.expect(std.mem.indexOf(u8, scrollback_label, fact) != null);
+    }
+    for ([_][]const u8{ "rows", "unlimited" }) |claim| {
+        try std.testing.expect(std.mem.indexOf(u8, scrollback_label, claim) == null);
+    }
+    // The accessible name stays the visible label's first words (the UIA
+    // harness finds the field by it).
+    try std.testing.expect(std.mem.startsWith(u8, scrollback_label, settings_control_specs[0].name));
+    try std.testing.expect(std.mem.startsWith(u8, scrollback_label, SettingField.scrollback_limit.label()));
+}
+
+test "settings labels fit on one line in the narrowest two-column lane" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            for ([_]u32{ 96, 144, 192 }) |dpi| {
+                dialog_test.simulateDpi(fixture.hwnd(), dpi);
+                const lane = @divTrunc(scaleForDpi(settings_two_column_min_width, dpi) - scaleForDpi(settings_column_gap, dpi), 2);
+                for (settings.field_labels, settings_label_specs) |maybe_label, spec| {
+                    const label = maybe_label.?;
+                    const hdc = GetDC(label) orelse return error.NoDC;
+                    defer _ = ReleaseDC(label, hdc);
+                    const raw_font: usize = @bitCast(SendMessageW(label, WM_GETFONT, 0, 0));
+                    const previous = SelectObject(hdc, @ptrFromInt(raw_font));
+                    defer _ = SelectObject(hdc, previous);
+                    var text_w: [256:0]u16 = undefined;
+                    const length = std.unicode.utf8ToUtf16Le(&text_w, spec) catch return error.LabelTooLong;
+                    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    _ = DrawTextW(hdc, &text_w, @intCast(length), &rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                    if (rect.right - rect.left > lane) {
+                        std.debug.print("label \"{s}\" is {d}px wide in a {d}px lane at {d} dpi\n", .{ spec, rect.right - rect.left, lane, dpi });
+                        return error.LabelWiderThanLane;
+                    }
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings fields carry a label, a config key and palette words" {
+    var catalog_items: [32]palette_catalog.Item = undefined;
+    var catalog_payloads: [32]palette_catalog.Payload = undefined;
+    var catalog = try palette_catalog.Catalog.init(&catalog_items, &catalog_payloads);
+
+    const fields = std.enums.values(SettingField);
+    for (fields, 0..) |field, index| {
+        const label = field.label();
+        try std.testing.expect(label.len > 0);
+        try expectNoInternalSyntax(label);
+        for (fields[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, label, other.label()));
+
+        // The key is a real config key, one the form is allowed to write, and
+        // the palette can find the field by it.
+        const key = std.meta.stringToEnum(Config.Key, field.configKey()) orelse return error.UnknownConfigKey;
+        var allowed = false;
+        inline for (editable_keys) |editable| {
+            if (editable == key) allowed = true;
+        }
+        try std.testing.expect(allowed);
+        try std.testing.expect(std.mem.indexOf(u8, field.paletteKeywords(), field.configKey()) != null);
+
+        // The row keeps its identity: recents and dispatch key on the tag.
+        const descriptor = paletteDescriptor(field);
+        try std.testing.expectEqualStrings(@tagName(field), descriptor.payload.setting);
+        try std.testing.expect(descriptor.item.id.eql(palette_catalog.stableStringId(.setting, @tagName(field))));
+        try std.testing.expectEqualStrings(label, descriptor.item.title);
+        try catalog.append(descriptor);
+    }
+
+    var ranked: [32]palette_catalog.Ranked = undefined;
+    const by_key = catalog.rank("clipboard-trim", .{}, &ranked);
+    try std.testing.expect(by_key.len > 0);
+    try std.testing.expectEqualStrings("trim_trailing_spaces", catalog.payloadFor(by_key[0]).?.setting);
+    const by_words = catalog.rank("cursor style", .{}, &ranked);
+    try std.testing.expect(by_words.len > 0);
+    try std.testing.expectEqualStrings("cursor_style", catalog.payloadFor(by_words[0]).?.setting);
+}
+
+fn expectComboMapping(
+    comptime labels: []const []const u8,
+    comptime fromIndex: anytype,
+    comptime toIndex: anytype,
+    comptime tokens: []const []const u8,
+) !void {
+    try std.testing.expectEqual(tokens.len, labels.len);
+    inline for (labels, tokens, 0..) |label, token, index| {
+        try std.testing.expect(label.len > 0);
+        try expectNoInternalSyntax(label);
+        // What is saved is still the raw config token for that position.
+        const value = fromIndex(@as(LRESULT, index)).?;
+        try std.testing.expectEqualStrings(token, @tagName(value));
+        try std.testing.expectEqual(@as(usize, index), toIndex(value));
+    }
+    try std.testing.expect(fromIndex(@as(LRESULT, labels.len)) == null);
+    try std.testing.expect(fromIndex(@as(LRESULT, -1)) == null);
+}
+
+test "settings dropdown text changes while the index and the saved token stay put" {
+    try expectComboMapping(&confirm_close_labels, confirmCloseFromComboIndex, comboIndexFromConfirmClose, &.{ "false", "true", "always" });
+    try expectComboMapping(&copy_on_select_labels, copyOnSelectFromComboIndex, comboIndexFromCopyOnSelect, &.{ "false", "true", "clipboard" });
+    try expectComboMapping(&clipboard_access_labels, clipboardAccessFromComboIndex, comboIndexFromClipboardAccess, &.{ "ask", "allow", "deny" });
+    try expectComboMapping(&link_previews_labels, linkPreviewsFromComboIndex, comboIndexFromLinkPreviews, &.{ "true", "osc8", "false" });
+    try expectComboMapping(&window_theme_labels, windowThemeFromComboIndex, comboIndexFromWindowTheme, &.{ "auto", "system", "light", "dark", "ghostty" });
+    try expectComboMapping(&shell_integration_labels, shellIntegrationFromComboIndex, comboIndexFromShellIntegration, &.{ "none", "detect", "bash", "elvish", "fish", "nushell", "zsh" });
+    try expectComboMapping(&cursor_style_labels, cursorStyleFromComboIndex, comboIndexFromCursorStyle, &.{ "bar", "block", "underline", "block_hollow" });
+    try expectComboMapping(&padding_balance_labels, paddingBalanceFromComboIndex, comboIndexFromPaddingBalance, &.{ "false", "true", "equal" });
+
+    // link-url is a bool and the two update settings are optional: position 0
+    // of the latter is "unset".
+    try std.testing.expectEqual(@as(usize, 2), link_url_labels.len);
+    try std.testing.expectEqual(true, linkUrlFromComboIndex(0).?);
+    try std.testing.expectEqual(false, linkUrlFromComboIndex(1).?);
+    try std.testing.expect(linkUrlFromComboIndex(2) == null);
+    try std.testing.expectEqual(@as(usize, 4), auto_update_labels.len);
+    try std.testing.expect(autoUpdateFromComboIndex(0).? == null);
+    try std.testing.expectEqual(AutoUpdate.off, autoUpdateFromComboIndex(1).?.?);
+    try std.testing.expectEqual(AutoUpdate.check, autoUpdateFromComboIndex(2).?.?);
+    try std.testing.expectEqual(AutoUpdate.download, autoUpdateFromComboIndex(3).?.?);
+    try std.testing.expect(autoUpdateFromComboIndex(4) == null);
+    for (0..4) |index| try std.testing.expectEqual(index, comboIndexFromAutoUpdate(autoUpdateFromComboIndex(@intCast(index)).?));
+    try std.testing.expectEqual(@as(usize, 3), auto_update_channel_labels.len);
+    try std.testing.expect(autoUpdateChannelFromComboIndex(0).? == null);
+    try std.testing.expectEqual(ReleaseChannel.stable, autoUpdateChannelFromComboIndex(1).?.?);
+    try std.testing.expectEqual(ReleaseChannel.tip, autoUpdateChannelFromComboIndex(2).?.?);
+    try std.testing.expect(autoUpdateChannelFromComboIndex(3) == null);
+    for (0..3) |index| try std.testing.expectEqual(index, comboIndexFromAutoUpdateChannel(autoUpdateChannelFromComboIndex(@intCast(index)).?));
+
+    // `auto` and `system` do the same thing; the list says so and keeps both.
+    try std.testing.expect(std.mem.startsWith(u8, window_theme_labels[0], "Match Windows"));
+    try std.testing.expect(std.mem.startsWith(u8, window_theme_labels[1], "Match Windows"));
+    try std.testing.expect(!std.mem.eql(u8, window_theme_labels[0], window_theme_labels[1]));
+    // `detect` is how PowerShell gets its integration.
+    try std.testing.expect(std.mem.indexOf(u8, shell_integration_labels[1], "PowerShell") != null);
+}
+
+test "settings dropdowns list the text of their labels in order" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            const Case = struct { combo: ?HWND, labels: []const []const u8 };
+            const cases = [_]Case{
+                .{ .combo = settings.combo_confirm_close, .labels = &confirm_close_labels },
+                .{ .combo = settings.combo_copy_on_select, .labels = &copy_on_select_labels },
+                .{ .combo = settings.combo_clipboard_read, .labels = &clipboard_access_labels },
+                .{ .combo = settings.combo_clipboard_write, .labels = &clipboard_access_labels },
+                .{ .combo = settings.combo_link_url, .labels = &link_url_labels },
+                .{ .combo = settings.combo_link_previews, .labels = &link_previews_labels },
+                .{ .combo = settings.combo_window_theme, .labels = &window_theme_labels },
+                .{ .combo = settings.combo_shell_integ, .labels = &shell_integration_labels },
+                .{ .combo = settings.combo_cursor_style, .labels = &cursor_style_labels },
+                .{ .combo = settings.combo_pad_balance, .labels = &padding_balance_labels },
+                .{ .combo = settings.combo_auto_update, .labels = &auto_update_labels },
+                .{ .combo = settings.combo_auto_update_channel, .labels = &auto_update_channel_labels },
+            };
+            const CB_GETCOUNT: UINT = 0x0146;
+            const CB_GETLBTEXT: UINT = 0x0148;
+            for (cases) |case| {
+                const combo = case.combo.?;
+                try std.testing.expectEqual(@as(LRESULT, @intCast(case.labels.len)), sys.SendMessageW(combo, CB_GETCOUNT, 0, 0));
+                for (case.labels, 0..) |label, index| {
+                    var wide: [64]u16 = undefined;
+                    const n = sys.SendMessageW(combo, CB_GETLBTEXT, index, @bitCast(@intFromPtr(&wide)));
+                    var utf8: [128]u8 = undefined;
+                    const len = try std.unicode.utf16LeToUtf8(&utf8, wide[0..@intCast(n)]);
+                    try std.testing.expectEqualStrings(label, utf8[0..len]);
+                }
+            }
+
+            // The shipped selection still follows the config value.
+            try std.testing.expectEqual(
+                @as(LRESULT, @intCast(comboIndexFromCursorStyle(settings.pending.?.@"cursor-style"))),
+                sys.SendMessageW(settings.combo_cursor_style.?, CB_GETCURSEL, 0, 0),
+            );
+        }
+    }.body);
+}
+
+test "settings background blur is shown but cannot be changed" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const blur = settings.chk_bg_blur.?;
+
+            try std.testing.expect(sys.IsWindowEnabled(blur) == 0);
+            var wide: [128]u16 = undefined;
+            const n = sys.GetWindowTextW(blur, &wide, @intCast(wide.len));
+            var utf8: [256]u8 = undefined;
+            const len = try std.unicode.utf16LeToUtf8(&utf8, wide[0..@intCast(n)]);
+            try std.testing.expectEqualStrings(background_blur_label, utf8[0..len]);
+            try std.testing.expect(std.mem.indexOf(u8, background_blur_label, "not supported on Windows") != null);
+            // The section blurb no longer promises it.
+            try std.testing.expect(std.mem.indexOf(u8, Section.appearance.placeholderText(), "blur") == null);
+
+            // A save in flight enables and disables the other controls only.
+            settings.setMutableControlsEnabled(false);
+            settings.setMutableControlsEnabled(true);
+            try std.testing.expect(sys.IsWindowEnabled(blur) == 0);
+            try std.testing.expect(sys.IsWindowEnabled(settings.edit_font_size.?) != 0);
+        }
+    }.body);
+}
+
+fn statusTextOf(settings: *const SettingsWindow, buf: []u8) ![]const u8 {
+    var wide: [512]u16 = undefined;
+    const n = sys.GetWindowTextW(settings.text_status.?, &wide, @intCast(wide.len));
+    const len = try std.unicode.utf16LeToUtf8(buf, wide[0..@intCast(n)]);
+    return buf[0..len];
+}
+
+test "settings status line says whether an edit previews or waits for a save" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buf: [256]u8 = undefined;
+
+            // Nothing edited: the disabled Save says why in words.
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+            try std.testing.expectEqualStrings(nothing_to_save_text, try statusTextOf(settings, &buf));
+
+            // An edit that shows in the open terminals now.
+            _ = sys.SendMessageW(settings.combo_window_theme.?, CB_SETCURSEL, 3, 0);
+            settings.syncWindowThemeFromCombo();
+            try std.testing.expectEqualStrings("Previewing now. Save to keep it.", try statusTextOf(settings, &buf));
+
+            // Cursor style is previewed into the config, but no open terminal
+            // reads it until the save, so it must not claim a preview.
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
+
+            // A setting that is only read at save says so too.
+            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncConfirmCloseFromCombo();
+            try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
+
+            // Putting everything back leaves nothing to save.
+            _ = sys.SendMessageW(settings.combo_window_theme.?, CB_SETCURSEL, 0, 0);
+            settings.syncWindowThemeFromCombo();
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, @as(usize, comboIndexFromCursorStyle(settings.original.?.@"cursor-style")), 0);
+            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, @as(usize, comboIndexFromConfirmClose(settings.original.?.@"confirm-close-surface")), 0);
+            settings.syncConfirmCloseFromCombo();
+            try std.testing.expectEqualStrings(nothing_to_save_text, try statusTextOf(settings, &buf));
+
+            // A saved edit is reported, and the next edit replaces that.
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            settings.save();
+            try std.testing.expectEqual(@as(u32, 1), fixture.saved);
+            try std.testing.expectEqualStrings("Settings saved.", try statusTextOf(settings, &buf));
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
+        }
+    }.body);
+}
+
+test "settings status notes are plain sentences" {
+    for (std.enums.values(StatusNote)) |note| {
+        const text = note.text();
+        try expectNoInternalSyntax(text);
+        // The old masked-save text sent people to a log they cannot open.
+        try std.testing.expect(std.mem.indexOf(u8, text, "log") == null);
+        if (text.len > 0) try std.testing.expect(text[text.len - 1] == '.');
+    }
+}
+
+test "settings outcome messages show over a conflict and do not outlive their edits" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buf: [256]u8 = undefined;
+
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            var disk = try Config.default(std.testing.allocator);
+            defer disk.deinit();
+            disk.@"cursor-style" = .bar;
+            settings.externalConfigChanged(&disk, 100);
+            try std.testing.expectEqual(@as(usize, 1), settings.conflictCount());
+
+            // The failure is said at once, as the ad-hoc messages were, even
+            // though the conflict still holds the line ...
+            settings.setNote(.conflict_not_resolved);
+            try std.testing.expectEqualStrings(StatusNote.conflict_not_resolved.text(), try statusTextOf(settings, &buf));
+            // ... and a later successful resolution does not bring it back.
+            settings.resolveConflict(.cursor_style, .use_disk);
+            try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+            try std.testing.expect(!std.mem.eql(u8, StatusNote.conflict_not_resolved.text(), try statusTextOf(settings, &buf)));
+
+            // A failure is about edits that are still there to save.
+            settings.status_note = .save_failed;
+            try std.testing.expectEqualStrings(nothing_to_save_text, settings.idleStatusText());
+            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncConfirmCloseFromCombo();
+            // The edit replaced the note.
+            try std.testing.expectEqualStrings("Applies when you save.", settings.idleStatusText());
+        }
+    }.body);
+}
+
+test "settings typing in a text field replaces the saved message" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buf: [256]u8 = undefined;
+
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            settings.save();
+            try std.testing.expectEqualStrings("Settings saved.", try statusTextOf(settings, &buf));
+
+            // Font family, theme and default command only commit when they lose
+            // focus; Save is already enabled by the first keystroke, and the
+            // line must not keep saying the last save went through.
+            _ = sys.SetWindowTextW(settings.edit_font_family.?, std.unicode.utf8ToUtf16LeStringLiteral("Cascadia Mono"));
+            settings.markOwnedTextChanged(.font_family, settings.edit_font_family.?);
+            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+            try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
+        }
+    }.body);
+}
+
+test "settings palette row for background blur says it cannot be changed and focus stays on the section" {
+    try std.testing.expect(std.mem.indexOf(u8, paletteDescriptor(.background_blur).item.subtitle, "not supported") != null);
+    try std.testing.expectEqualStrings("Setting", paletteDescriptor(.font_size).item.subtitle);
+
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            try settings.openField(.background_blur);
+            try std.testing.expectEqual(Section.appearance, settings.active_section);
+            try std.testing.expectEqual(settings.sectionButton(.appearance).?, sys.GetFocus().?);
+        }
+    }.body);
+}
+
+fn wrappedTextHeight(settings: *const SettingsWindow, control: HWND, width: i32) i32 {
+    var wide: [512:0]u16 = undefined;
+    const n = sys.GetWindowTextW(control, &wide, @intCast(wide.len));
+    const hdc = GetDC(settings.hwnd.?).?;
+    defer _ = ReleaseDC(settings.hwnd.?, hdc);
+    const font: usize = @bitCast(sys.SendMessageW(control, WM_GETFONT, 0, 0));
+    const previous = SelectObject(hdc, @ptrFromInt(font));
+    defer {
+        if (previous) |old| _ = SelectObject(hdc, old);
+    }
+    var measure: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = 0 };
+    _ = DrawTextW(hdc, &wide, n, &measure, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    return measure.bottom - measure.top;
+}
+
+fn rectInClient(parent: HWND, child: HWND) RECT {
+    var screen: RECT = undefined;
+    _ = GetWindowRect(child, &screen);
+    var top_left: POINT = .{ .x = screen.left, .y = screen.top };
+    var bottom_right: POINT = .{ .x = screen.right, .y = screen.bottom };
+    _ = ScreenToClient(parent, &top_left);
+    _ = ScreenToClient(parent, &bottom_right);
+    return .{ .left = top_left.x, .top = top_left.y, .right = bottom_right.x, .bottom = bottom_right.y };
+}
+
+test "settings conflict message uses the field's name and fits its own row" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buf: [256]u8 = undefined;
+
+            // The same field edited here and, differently, on disk.
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            var disk = try Config.default(std.testing.allocator);
+            defer disk.deinit();
+            disk.@"cursor-style" = .bar;
+            settings.externalConfigChanged(&disk, 100);
+            try std.testing.expectEqual(@as(usize, 1), settings.conflictCount());
+
+            const message = "Cursor style also changed on disk. Choose Keep mine or Use disk.";
+            try std.testing.expectEqualStrings(message, try statusTextOf(settings, &buf));
+            try std.testing.expectEqualStrings(message, conflictStatusText(&buf, SettingField.cursor_style.label()));
+
+            for ([_]u32{ 96, 144 }) |dpi| {
+                settings.dpi = dpi;
+                settings.recreateUiFont();
+                try fixture.makeFormScrollable();
+                layoutChildren(settings);
+
+                const hwnd = fixture.hwnd();
+                const status = settings.text_status.?;
+                const rect = rectInClient(hwnd, status);
+                var client: RECT = undefined;
+                _ = GetClientRect(hwnd, &client);
+                const pane = paneBounds(settings, client);
+
+                // Its own row, as wide as the pane, tall enough for the wrapped
+                // text in the font it is drawn in.
+                try std.testing.expect(settings.status_row_separate);
+                try std.testing.expectEqual(pane.width, rect.right - rect.left);
+                try std.testing.expect(rect.bottom - rect.top >= wrappedTextHeight(settings, status, pane.width));
+
+                // And clear of the buttons below it and of the form above it.
+                const save = rectInClient(hwnd, settings.btn_save.?);
+                try std.testing.expect(rect.bottom <= save.top);
+                try std.testing.expect(rect.top >= settings.proof_viewport_bottom);
+                try std.testing.expect(rect.bottom <= client.bottom);
+                for ([_]?HWND{ settings.btn_conflict_keep, settings.btn_conflict_use_disk }) |button| {
+                    try std.testing.expect(rect.bottom <= rectInClient(hwnd, button.?).top);
+                }
+            }
+
+            // Resolving the conflict gives the row back.
+            settings.resolveConflict(.cursor_style, .keep_mine);
+            try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+            try std.testing.expect(!settings.status_row_separate);
+        }
+    }.body);
+}
+
+test "settings stacked action bar keeps a wide status row above the buttons" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCursorStyleFromCombo();
+            var disk = try Config.default(std.testing.allocator);
+            defer disk.deinit();
+            disk.@"cursor-style" = .bar;
+            settings.externalConfigChanged(&disk, 100);
+
+            for ([_]u32{ 96, 144 }) |dpi| {
+                settings.dpi = dpi;
+                settings.recreateUiFont();
+                // Narrower than the three buttons side by side: they stack, and
+                // there is no room beside them for the message at all.
+                const narrow = settings.px(300);
+                const bar = closePromptLayoutGeometry(settings, narrow, settings.px(600));
+                try std.testing.expect(bar.normal_actions.stacked);
+                try std.testing.expect(bar.status_separate);
+                try std.testing.expect(bar.status_height >= wrappedTextHeight(settings, settings.text_status.?, narrow));
+                try std.testing.expect(bar.status_top + bar.status_height <= bar.actions_top);
+                try std.testing.expect(bar.actions_top + bar.normal_actions.save_y + bar.normal_actions.button_height <= bar.bar_height);
+            }
+        }
+    }.body);
+}
+
+test "settings sections say what is on their page" {
+    for (std.enums.values(Section)) |section| {
+        const summary = section.placeholderText();
+        try std.testing.expect(summary.len > 0);
+        try std.testing.expect(summary[summary.len - 1] == '.');
+        try expectNoInternalSyntax(summary);
+    }
+    // The updater controls moved to Updates.
+    try std.testing.expect(std.mem.indexOf(u8, Section.advanced.placeholderText(), "Updater") == null);
+    try std.testing.expect(std.mem.indexOf(u8, Section.advanced.placeholderText(), "native controls") == null);
+}
+
+test "settings action row geometry holds for panes shorter than its gaps" {
+    // `@max(0, height)` is a u31, so `height - 3` wrapped below 3 px.
+    for ([_]i32{ -20, -1, 0, 1, 2, 3, 4 }) |height| {
+        for ([_]i32{ 0, 90, 300 }) |width| {
+            const close = closeActionRowGeometry(width, height, 96);
+            try std.testing.expect(close.stacked);
+            try std.testing.expect(close.button_height >= 0);
+            try std.testing.expect(close.second_y >= 0 and close.third_y >= close.second_y);
+
+            const normal = normalActionRowGeometry(width, height, true, 96);
+            try std.testing.expect(normal.stacked);
+            try std.testing.expect(normal.button_height >= 0);
+            try std.testing.expect(normal.use_disk_y >= 0 and normal.save_y >= normal.use_disk_y);
+        }
+    }
 }
 
 fn settingsTextProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
@@ -5520,6 +9109,200 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
         }
     }
     return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/// Subclass for the dropdowns. A closed COMBOBOX changes its selection on the
+/// wheel, so scrolling the page past one silently edits it; the wheel goes to
+/// the window instead, and stays with the combo only while its list is open.
+/// The previous procedure lives in the combo's own `GWLP_USERDATA` (a stock
+/// control leaves it unused) so the subclass reads no `SettingsWindow` state
+/// and cannot outlive it: it detaches itself in `WM_NCDESTROY`.
+fn settingsComboProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+    const previous = sys.GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (previous == 0) return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+    if (msg == WM_MOUSEWHEEL and sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) == 0) {
+        const parent = sys.GetParent(hwnd) orelse return 0;
+        return sys.SendMessageW(parent, msg, wParam, lParam);
+    }
+    const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
+    if (msg == WM_NCDESTROY) {
+        _ = sys.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
+        _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+    return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+}
+
+fn subclassCombo(combo: HWND) void {
+    // Already ours (the prior procedure is recorded): nothing to do.
+    if (sys.GetWindowLongPtrW(combo, GWLP_USERDATA) != 0) return;
+    const previous = sys.SetWindowLongPtrW(
+        combo,
+        GWLP_WNDPROC,
+        @as(LONG_PTR, @intCast(@intFromPtr(&settingsComboProc))),
+    );
+    if (previous == 0) return;
+    _ = sys.SetWindowLongPtrW(combo, GWLP_USERDATA, previous);
+}
+
+/// Subclass for the text fields, which draw their own frame (`fieldFrameInsets`,
+/// `SettingsWindow.paintFieldFrame`). The themed one-pixel border has no focused
+/// state, so an empty focused field showed nothing but its caret, and a
+/// single-line EDIT puts its text at the top of its box. The frame is the
+/// non-client area: a stroke all round and, above and below, whatever centres
+/// one line of text. Clicks there count as clicks in the field. The previous
+/// procedure lives in `GWLP_USERDATA`, as for the dropdowns.
+fn settingsEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+    const previous = sys.GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (previous == 0) return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+    const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
+    const owner = if (sys.GetParent(hwnd)) |parent| recoverOwner(parent) else null;
+    switch (msg) {
+        WM_NCCALCSIZE => if (owner) |settings| {
+            // Both forms put the proposed window rect first: a bare RECT, or
+            // `NCCALCSIZE_PARAMS.rgrc[0]`. It becomes the client rect.
+            const rect: *RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            const insets = fieldFrameInsets(
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                settings.field_text_height,
+                settings.fieldStroke(),
+            );
+            rect.left += insets.x;
+            rect.right -= insets.x;
+            rect.top += insets.y;
+            rect.bottom -= insets.y;
+            return 0;
+        },
+        WM_NCHITTEST => if (owner != null) return HTCLIENT,
+        WM_NCPAINT => if (owner) |settings| {
+            settings.paintFieldFrame(hwnd, null);
+            return 0;
+        },
+        WM_SETFOCUS, WM_KILLFOCUS, WM_ENABLE => {
+            const result = sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+            if (owner) |settings| settings.paintFieldFrame(hwnd, switch (msg) {
+                WM_SETFOCUS => true,
+                WM_KILLFOCUS => false,
+                else => null,
+            });
+            return result;
+        },
+        WM_NCDESTROY => {
+            _ = sys.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
+            _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        },
+        else => {},
+    }
+    return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+}
+
+fn subclassEdit(edit: HWND) void {
+    if (sys.GetWindowLongPtrW(edit, GWLP_USERDATA) != 0) return;
+    const previous = sys.SetWindowLongPtrW(
+        edit,
+        GWLP_WNDPROC,
+        @as(LONG_PTR, @intCast(@intFromPtr(&settingsEditProc))),
+    );
+    if (previous == 0) return;
+    _ = sys.SetWindowLongPtrW(edit, GWLP_USERDATA, previous);
+}
+
+const FieldFrameInsets = struct { x: i32, y: i32 };
+
+/// What a text field's frame takes from each side of a `width` x `height`
+/// window: the stroke all round, and above and below whatever centres a
+/// `line_height` line (an odd pixel goes below). Never more than half the box.
+fn fieldFrameInsets(width: i32, height: i32, line_height: i32, stroke: i32) FieldFrameInsets {
+    const w: i32 = @max(0, width);
+    const h: i32 = @max(0, height);
+    const centred: i32 = if (line_height > 0) @divTrunc(h - line_height, 2) else 0;
+    return .{
+        .x = @min(stroke, @divTrunc(w, 2)),
+        .y = @min(@max(stroke, centred), @divTrunc(h, 2)),
+    };
+}
+
+const FieldFrameState = enum { rest, focused, invalid };
+
+/// Focus wins: the field being typed in shows the accent even while its value
+/// does not parse, so the error colour does not flash on each keystroke. It
+/// shows once the user leaves the field (the status line says why at once).
+fn fieldFrameState(focused: bool, invalid: bool) FieldFrameState {
+    if (focused) return .focused;
+    if (invalid) return .invalid;
+    return .rest;
+}
+
+/// Lines a full wheel notch moves, per the user's mouse setting.
+fn systemWheelScrollLines() u32 {
+    var lines: u32 = 3;
+    if (sys.SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0) == 0) return 3;
+    return lines;
+}
+
+/// Pixels one notch moves at `lines` lines per notch, where the default of
+/// three lines moves `default_px`.
+fn wheelNotchPixels(default_px: i32, lines: u32) i32 {
+    const capped: i32 = @intCast(@min(lines, 100));
+    return @divTrunc(default_px * capped, 3);
+}
+
+/// Turn a wheel delta into whole pixels. `remainder` carries what is left of a
+/// pixel, in 1/`WHEEL_DELTA` pixel, between messages: a precision touchpad
+/// sends many deltas far below one notch, and dividing each by the notch size
+/// on its own rounds every one of them to nothing.
+fn wheelScrollPixels(remainder: *i32, delta: i32, notch_px: i32) i32 {
+    // The leftover belongs to the previous direction.
+    if (delta != 0 and remainder.* != 0 and (delta < 0) != (remainder.* < 0)) remainder.* = 0;
+    const total: i64 = @as(i64, remainder.*) + @as(i64, delta) * notch_px;
+    const pixels: i64 = @divTrunc(total, WHEEL_DELTA);
+    remainder.* = @intCast(total - pixels * WHEEL_DELTA);
+    return @intCast(std.math.clamp(pixels, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+fn startGroup(control: HWND) void {
+    const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
+    if (style & WS_GROUP == 0) _ = sys.SetWindowLongPtrW(control, GWL_STYLE, @intCast(style | WS_GROUP));
+}
+
+/// Show or hide a child window, leaving one already in that state alone. The
+/// style bit is read rather than `IsWindowVisible`, which is false for every
+/// child until the window itself is shown.
+fn setChildShown(control: HWND, shown: bool) void {
+    const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
+    if ((style & WS_VISIBLE != 0) == shown) return;
+    _ = ShowWindow(control, if (shown) SW_SHOWNORMAL else SW_HIDE);
+}
+
+fn sendToBottom(control: HWND) void {
+    const hwnd_bottom: ?*anyopaque = @ptrFromInt(1);
+    const flags: UINT = 0x0002 | 0x0001 | SWP_NOACTIVATE | SWP_NOREDRAW; // SWP_NOMOVE | SWP_NOSIZE
+    _ = sys.SetWindowPos(control, hwnd_bottom, 0, 0, 0, 0, flags);
+}
+
+test "settings wheel carries sub-pixel movement between messages" {
+    var remainder: i32 = 0;
+    // 30/120 of a 64 px notch is exactly 16 px each.
+    try std.testing.expectEqual(@as(i32, -16), wheelScrollPixels(&remainder, -30, 64));
+    // Ten units on a 3 px notch is a quarter of a pixel: a pixel every fourth
+    // message, and two over eight, where each message alone rounds to zero.
+    remainder = 0;
+    var total: i32 = 0;
+    for (0..8) |_| total += wheelScrollPixels(&remainder, 10, 3);
+    try std.testing.expectEqual(@as(i32, 2), total);
+    // Reversing direction drops the leftover rather than cancelling against it.
+    remainder = 0;
+    _ = wheelScrollPixels(&remainder, 10, 5);
+    try std.testing.expect(remainder > 0);
+    _ = wheelScrollPixels(&remainder, -10, 5);
+    try std.testing.expect(remainder <= 0);
+}
+
+test "settings wheel notch honours lines per notch" {
+    try std.testing.expectEqual(@as(i32, 64), wheelNotchPixels(64, 3));
+    try std.testing.expectEqual(@as(i32, 21), wheelNotchPixels(64, 1));
+    try std.testing.expectEqual(@as(i32, 0), wheelNotchPixels(64, 0));
+    try std.testing.expectEqual(wheelNotchPixels(64, 100), wheelNotchPixels(64, 4000));
 }
 
 fn shouldDrawSettingsSectionFocusRing(
@@ -5749,8 +9532,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (owner) |o| return @intCast(o.proof_paint_count);
             return 0;
         },
-        WM_SETTINGS_PROOF_LAYOUT_REDRAW_SUCCEEDED => {
-            if (owner) |o| return @intFromBool(o.proof_layout_redraw_succeeded);
+        WM_SETTINGS_PROOF_LAYOUT_BATCHED => {
+            if (owner) |o| return @intFromBool(o.proof_layout_batched);
             return 0;
         },
         WM_SETTINGS_PROOF_CHILD => {
@@ -5775,6 +9558,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         WM_ERASEBKGND => return 1,
+        WM_PRINTCLIENT => {
+            if (owner) |o| if (wParam != 0) paintBackground(hwnd, o, @ptrFromInt(wParam));
+            return 0;
+        },
         WM_PAINT => {
             if (owner) |o| {
                 o.proof_paint_count +%= 1;
@@ -5835,6 +9622,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_DPICHANGED => {
             if (owner) |o| {
                 o.dpi = normalizedDpi(@intCast(wParam & 0xFFFF));
+                // Fonts first: the resize below lays out and paints at once,
+                // and must not paint the new size with the old fonts.
+                o.recreateUiFont();
                 const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
                 _ = sys.SetWindowPos(
                     hwnd,
@@ -5845,7 +9635,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                     suggested.bottom - suggested.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                o.recreateUiFont();
                 layoutChildren(o);
                 _ = sys.InvalidateRect(hwnd, null, 1);
             }
@@ -5871,7 +9660,12 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             return 0;
         },
         WM_SIZE => {
-            if (owner) |o| layoutChildren(o);
+            if (owner) |o| {
+                layoutChildren(o);
+                // Each step of a live resize is painted before the next one
+                // arrives, rather than whenever the size loop gets to it.
+                _ = RedrawWindow(hwnd, null, null, RDW_UPDATENOW | RDW_ALLCHILDREN);
+            }
             return 0;
         },
         WM_MENUCHAR => {
@@ -5891,57 +9685,41 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_MOUSEWHEEL => {
             if (owner) |o| {
                 const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
-                const steps = @divTrunc(@as(i32, delta), 120);
-                if (steps != 0) o.setContentScroll(o.content_scroll_y - steps * o.px(64));
+                o.scrollByWheel(delta);
             }
             return 0;
         },
-        WM_VSCROLL => {
+        WM_ACTIVATE => {
+            // Deactivation (Alt+Tab away, minimize): remember the focused
+            // child. Activation needs nothing here: DefWindowProc focuses the
+            // frame, and WM_SETFOCUS below hands that on.
+            if (owner) |o| if ((wParam & 0xFFFF) == WA_INACTIVE) o.rememberFocus();
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        WM_SETFOCUS => {
+            // Focus landed on the frame itself (activation, restore from
+            // minimized): forward it to the field the user was typing in.
             if (owner) |o| {
-                const code = wParam & 0xFFFF;
-                var client: RECT = undefined;
-                const viewport_height = if (GetClientRect(hwnd, &client) != 0)
-                    @max(1, settingsContentViewportBottom(o, client) - settingsContentViewportTop(o, client))
-                else
-                    o.px(240);
-                const page = @max(1, viewport_height - o.px(settings_control_height));
-                var tracking: SCROLLINFO = .{
-                    .cbSize = @sizeOf(SCROLLINFO),
-                    .fMask = SIF_TRACKPOS,
-                    .nMin = 0,
-                    .nMax = 0,
-                    .nPage = 0,
-                    .nPos = 0,
-                    .nTrackPos = o.content_scroll_y,
-                };
-                if (code == SB_THUMBPOSITION or code == SB_THUMBTRACK) _ = GetScrollInfo(hwnd, SB_VERT, &tracking);
-                const next = switch (code) {
-                    SB_LINEUP => o.content_scroll_y - o.px(32),
-                    SB_LINEDOWN => o.content_scroll_y + o.px(32),
-                    SB_PAGEUP => o.content_scroll_y - page,
-                    SB_PAGEDOWN => o.content_scroll_y + page,
-                    SB_THUMBPOSITION, SB_THUMBTRACK => tracking.nTrackPos,
-                    SB_TOP => 0,
-                    SB_BOTTOM => o.content_scroll_max,
-                    else => o.content_scroll_y,
-                };
-                o.setContentScroll(next);
+                o.forwardFrameFocus();
+                return 0;
             }
-            return 0;
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         WM_COMMAND => {
             const id: usize = wParam & 0xFFFF;
             const notify: u16 = @intCast((wParam >> 16) & 0xFFFF);
             // IsDialogMessageW maps Escape to IDCANCEL as a synthetic
-            // command with no originating control HWND. Do not treat the
-            // button's BN_SETFOCUS notification as cancellation, or the
+            // command with no originating control HWND. Only a click counts:
+            // the button's BN_SETFOCUS notification must not cancel, or the
             // conservative default focus immediately dismisses the prompt.
-            if (id == BTN_CLOSE_KEEP_EDITING and lParam == 0) {
-                if (owner) |o| o.cancelClosePrompt();
+            // The prompt's "Keep editing" button shares the ID, so a click
+            // arrives here too; with no prompt open it is a close request.
+            if (id == IDCANCEL and notify == BN_CLICKED) {
+                if (owner) |o| o.cancelRequested(hwnd);
                 return 0;
             }
             if (lParam != 0 and (notify == EN_SETFOCUS or notify == CBN_SETFOCUS or notify == BN_SETFOCUS)) {
-                if (owner) |o| o.ensureControlVisible(@ptrFromInt(@as(usize, @bitCast(lParam))));
+                if (owner) |o| if (!o.restoring_focus) o.ensureControlVisible(@ptrFromInt(@as(usize, @bitCast(lParam))));
             }
             if (clickedButton(id, notify, BTN_OPEN_EDITOR)) {
                 if (owner) |o| o.handle.openInEditor(o.handle.ctx);
@@ -5952,17 +9730,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 return 0;
             }
             if (clickedButton(id, notify, BTN_SAVE)) {
-                if (owner) |o| {
-                    const button_enabled = if (o.btn_save) |button| sys.IsWindowEnabled(button) != 0 else false;
-                    const button_visible = if (o.btn_save) |button| sys.IsWindowVisible(button) != 0 else false;
-                    if (saveCommandCanDispatch(
-                        o.close_prompt_visible,
-                        o.save_in_flight,
-                        o.close_posted,
-                        button_enabled,
-                        button_visible,
-                    )) o.save();
-                }
+                if (owner) |o| o.saveIfAllowed();
                 return 0;
             }
             if (clickedButton(id, notify, BTN_CLOSE_SAVE)) {
@@ -5971,10 +9739,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             }
             if (clickedButton(id, notify, BTN_CLOSE_DISCARD)) {
                 if (owner) |o| o.discardAndClose();
-                return 0;
-            }
-            if (clickedButton(id, notify, BTN_CLOSE_KEEP_EDITING)) {
-                if (owner) |o| o.cancelClosePrompt();
                 return 0;
             }
             if (id == BTN_CONFLICT_KEEP and notify == BN_CLICKED) {
@@ -6131,13 +9895,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         WM_CLOSE => {
-            if (owner) |o| {
-                switch (closeRequestAction(o.hasPendingChanges(), o.close_prompt_visible, o.close_posted)) {
-                    .close_now => o.closeNow(hwnd),
-                    .show_prompt, .focus_prompt => o.showClosePrompt(),
-                    .ignore => {},
-                }
-            }
+            if (owner) |o| o.requestClose(hwnd);
             return 0;
         },
         WM_SETTINGS_CLOSE_NOW => {
@@ -6166,6 +9924,55 @@ fn recoverOwner(hwnd: HWND) ?*SettingsWindow {
     const raw = sys.GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (raw == 0) return null;
     return @ptrFromInt(@as(usize, @intCast(raw)));
+}
+
+/// The form viewport (`SettingsWindow.viewport`). It paints only the pane
+/// colour behind the fields and owns the scroll bar; the fields' commands and
+/// colour queries go on to the Settings window, which handles them as it did
+/// when the fields were its own children. The wheel needs nothing here:
+/// `DefWindowProc` hands it to the parent.
+fn viewportProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+    if (msg == WM_NCCREATE) {
+        const cs: *const CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
+        if (cs.lpCreateParams) |ptr| _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, @intCast(@intFromPtr(ptr)));
+    }
+    const owner = recoverOwner(hwnd) orelse return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+    switch (msg) {
+        WM_ERASEBKGND => return 1,
+        WM_PRINTCLIENT => {
+            var rect: RECT = undefined;
+            if (wParam != 0 and GetClientRect(hwnd, &rect) != 0) fillSolid(@ptrFromInt(wParam), rect, owner.theme_adapter.colors.window_bg);
+            return 0;
+        },
+        WM_PAINT => {
+            var ps: PAINTSTRUCT = undefined;
+            const hdc = sys.BeginPaint(hwnd, &ps);
+            fillSolid(hdc, ps.rcPaint, owner.theme_adapter.colors.window_bg);
+            _ = sys.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        WM_COMMAND,
+        WM_CTLCOLORMSGBOX,
+        WM_CTLCOLOREDIT,
+        WM_CTLCOLORLISTBOX,
+        WM_CTLCOLORBTN,
+        WM_CTLCOLORDLG,
+        WM_CTLCOLORSTATIC,
+        => if (owner.hwnd) |settings| return sys.SendMessageW(settings, msg, wParam, lParam),
+        WM_VSCROLL => {
+            owner.scrollByBar(wParam & 0xFFFF);
+            return 0;
+        },
+        WM_GETOBJECT => if (owner.viewport_uia_provider) |provider| {
+            if (win32_uia.returnSettingsControlProvider(hwnd, wParam, lParam, provider)) |result| return result;
+        },
+        WM_NCDESTROY => {
+            if (owner.viewport_uia_provider) |provider| provider.detach();
+            _ = sys.SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        },
+        else => {},
+    }
+    return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 fn settingsSectionDisconnect(ctx: *anyopaque) win32_uia.HRESULT {
@@ -6199,55 +10006,63 @@ fn paint(hwnd: HWND, owner: *SettingsWindow) void {
     var ps: PAINTSTRUCT = undefined;
     const hdc = sys.BeginPaint(hwnd, &ps);
     defer _ = sys.EndPaint(hwnd, &ps);
+    paintBackground(hwnd, owner, hdc);
+}
 
+/// The frame window's own pixels: the pane colour, the rail and the three
+/// separators. Under WS_CLIPCHILDREN this never reaches a child. Also drawn
+/// into the DC a themed child hands over through DrawThemeParentBackground
+/// (WM_PRINTCLIENT), which a button's rounded corners need now that the frame
+/// no longer paints under its children.
+fn paintBackground(hwnd: HWND, owner: *SettingsWindow, hdc: HDC) void {
     var rect: RECT = undefined;
     if (sys.GetClientRect(hwnd, &rect) == 0) return;
-
     const colors = owner.theme_adapter.colors;
-    const fallback_brush = sys.GetStockObject(DC_BRUSH);
-    const window_brush = owner.theme_adapter.window_brush orelse fallback_brush;
-    if (owner.theme_adapter.window_brush == null) {
-        _ = sys.SetDCBrushColor(hdc, colors.window_bg);
-    }
-    _ = sys.FillRect(hdc, &rect, window_brush);
+    const geometry = backgroundGeometry(owner, rect);
+    var pane = rect;
+    pane.left = geometry.rail.right;
+    fillSolid(hdc, pane, colors.window_bg);
+    fillSolid(hdc, geometry.rail, colors.rail_bg);
+    fillSolid(hdc, geometry.rail_separator, colors.rail_separator);
+    fillSolid(hdc, geometry.header_separator, colors.pane_separator);
+    fillSolid(hdc, geometry.action_separator, colors.pane_separator);
+}
 
-    var rail_rect = rect;
-    rail_rect.right = owner.px(settings_rail_width);
-    const rail_brush = owner.theme_adapter.rail_brush orelse fallback_brush;
-    if (owner.theme_adapter.rail_brush == null) {
-        _ = sys.SetDCBrushColor(hdc, colors.rail_bg);
-    }
-    _ = FillRect(hdc, &rail_rect, rail_brush);
+fn fillSolid(hdc: HDC, rect: RECT, color: COLORREF) void {
+    _ = SetDCBrushColor(hdc, color);
+    _ = FillRect(hdc, &rect, GetStockObject(DC_BRUSH));
+}
 
-    const rail_separator_brush = CreateSolidBrush(colors.rail_separator) orelse return;
-    defer _ = DeleteObject(rail_separator_brush);
-    const pane_separator_brush = CreateSolidBrush(colors.pane_separator) orelse return;
-    defer _ = DeleteObject(pane_separator_brush);
-    const separator_width = @max(1, owner.px(settings_metrics.stroke_hairline));
-    const pane = paneBounds(owner, rect);
-    const rail_separator: RECT = .{
-        .left = owner.px(settings_rail_width) - separator_width,
-        .top = rect.top,
-        .right = owner.px(settings_rail_width),
-        .bottom = rect.bottom,
+/// A `width`-pixel line just inside `rect`.
+fn strokeRect(hdc: HDC, rect: RECT, color: COLORREF, width: i32) void {
+    const w = @min(width, @divTrunc(rect.right - rect.left, 2), @divTrunc(rect.bottom - rect.top, 2));
+    if (w <= 0) return;
+    const sides = [_]RECT{
+        .{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + w },
+        .{ .left = rect.left, .top = rect.bottom - w, .right = rect.right, .bottom = rect.bottom },
+        .{ .left = rect.left, .top = rect.top + w, .right = rect.left + w, .bottom = rect.bottom - w },
+        .{ .left = rect.right - w, .top = rect.top + w, .right = rect.right, .bottom = rect.bottom - w },
     };
-    _ = FillRect(hdc, &rail_separator, rail_separator_brush);
-    const rail_geometry = sectionRailGeometry(rect.bottom - rect.top, owner.dpi);
-    const header_separator: RECT = .{
-        .left = pane.left,
-        .top = rail_geometry.top_pad + owner.px(settings_header_separator_y),
-        .right = pane.right,
-        .bottom = rail_geometry.top_pad + owner.px(settings_header_separator_y) + separator_width,
-    };
-    _ = FillRect(hdc, &header_separator, pane_separator_brush);
-    const action_bar = closePromptLayoutGeometry(owner, pane.width, actionBarAvailableHeight(owner, rect));
-    const action_separator: RECT = .{
-        .left = pane.left,
-        .top = rect.bottom - action_bar.bar_height,
-        .right = pane.right,
-        .bottom = rect.bottom - action_bar.bar_height + separator_width,
-    };
-    _ = FillRect(hdc, &action_separator, pane_separator_brush);
+    for (sides) |side| fillSolid(hdc, side, color);
+}
+
+/// Line height of `font` (one line of `DrawText` is the font's full height,
+/// as an EDIT lays out its line).
+fn fontLineHeight(hwnd: HWND, font: HGDIOBJ) i32 {
+    const hdc = GetDC(hwnd) orelse return 0;
+    defer _ = ReleaseDC(hwnd, hdc);
+    const previous = SelectObject(hdc, font);
+    defer _ = SelectObject(hdc, previous);
+    const sample = std.unicode.utf8ToUtf16LeStringLiteral("Ag");
+    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = DrawTextW(hdc, sample, sample.len, &rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    return rect.bottom - rect.top;
+}
+
+/// The selection-field height to ask a dropdown for so that its window is
+/// `target` tall, given its window height now and the field height it has.
+fn comboSelectionHeight(window_height: i32, selection_height: i32, target: i32) i32 {
+    return @max(1, target - (window_height - selection_height));
 }
 
 fn readEditUtf8(edit: HWND, buf: []u8) ?[]const u8 {
@@ -6342,7 +10157,7 @@ fn copyOwnedSetting(target: *Config, source: *const Config, field: OwnedSettingF
 fn writeOwnedSettingValue(writer: *std.Io.Writer, config: *const Config, field: OwnedSettingField) !void {
     switch (field) {
         .font_family => {
-            if (config.@"font-family".list.items.len == 0) return writer.writeAll("<default>");
+            if (config.@"font-family".list.items.len == 0) return writer.writeAll("(default)");
             for (config.@"font-family".list.items, 0..) |family, i| {
                 if (i != 0) try writer.writeAll(", ");
                 try writer.writeAll(family);
@@ -6350,33 +10165,121 @@ fn writeOwnedSettingValue(writer: *std.Io.Writer, config: *const Config, field: 
         },
         .theme => if (config.theme) |theme| {
             try theme.formatValue(writer);
-        } else try writer.writeAll("<default>"),
+        } else try writer.writeAll("(default)"),
         .command => if (config.command) |command| {
             try writeCommandForEdit(writer, command);
-        } else try writer.writeAll("<auto-detect>"),
+        } else try writer.writeAll("(automatic)"),
     }
 }
 
+/// The room the Advanced page gives the save target and the config problems
+/// ahead of the pending changes, and the part of it for each. The save target
+/// is at most 240 bytes of path and an ellipsis.
+const advanced_head_bytes = 1400;
+const advanced_problems_bytes = 1000;
+const advanced_target_bytes = 243;
+const no_pending_changes_text = "No changes waiting to be saved.";
+
+fn writePaddingValue(writer: *std.Io.Writer, padding: @FieldType(Config, "window-padding-x")) !void {
+    if (padding.top_left == padding.bottom_right) {
+        try writer.print("{d}", .{padding.top_left});
+    } else {
+        try writer.print("{d},{d}", .{ padding.top_left, padding.bottom_right });
+    }
+}
+
+fn writeOnOff(writer: *std.Io.Writer, on: bool) !void {
+    try writer.writeAll(if (on) "On" else "Off");
+}
+
+/// A setting's value the way the form shows it: the dropdown's text for a
+/// dropdown, "on" and "off" for a checkbox, the number for a number. Never the
+/// Zig debug rendering of the transaction's union.
+fn writeSettingValue(writer: *std.Io.Writer, value: SettingValue) !void {
+    switch (value) {
+        .scrollback_limit => |v| try writer.print("{d}", .{v}),
+        .font_size => |v| try writer.print("{d} pt", .{v}),
+        .background_opacity => |v| try writer.print("{d}", .{v}),
+        .window_padding_x, .window_padding_y => |v| try writePaddingValue(writer, v),
+        .trim_trailing_spaces,
+        .desktop_notifications,
+        .app_notify_clipboard,
+        .app_notify_config,
+        => |v| try writeOnOff(writer, v),
+        .confirm_close => |v| try writer.writeAll(confirm_close_labels[comboIndexFromConfirmClose(v)]),
+        .copy_on_select => |v| try writer.writeAll(copy_on_select_labels[comboIndexFromCopyOnSelect(v)]),
+        .clipboard_read, .clipboard_write => |v| try writer.writeAll(clipboard_access_labels[comboIndexFromClipboardAccess(v)]),
+        .link_url => |v| try writer.writeAll(link_url_labels[comboIndexFromLinkUrl(v)]),
+        .link_previews => |v| try writer.writeAll(link_previews_labels[comboIndexFromLinkPreviews(v)]),
+        .window_theme => |v| try writer.writeAll(window_theme_labels[comboIndexFromWindowTheme(v)]),
+        .shell_integration => |v| try writer.writeAll(shell_integration_labels[comboIndexFromShellIntegration(v)]),
+        .cursor_style => |v| try writer.writeAll(cursor_style_labels[comboIndexFromCursorStyle(v)]),
+        .background_blur => |v| try writeOnOff(writer, v.win32BlurRequested()),
+        .padding_balance => |v| try writer.writeAll(padding_balance_labels[comboIndexFromPaddingBalance(v)]),
+        .auto_update => |v| try writer.writeAll(auto_update_labels[comboIndexFromAutoUpdate(v)]),
+        .auto_update_channel => |v| try writer.writeAll(auto_update_channel_labels[comboIndexFromAutoUpdateChannel(v)]),
+    }
+}
+
+/// One line of the "waiting to be saved" list: `Cursor style: Block -> Bar`.
+fn writeSettingDiffLine(writer: *std.Io.Writer, field: SettingField, baseline: SettingValue, draft: SettingValue) !void {
+    try writer.print("{s}: ", .{field.label()});
+    try writeSettingValue(writer, baseline);
+    try writer.writeAll(" -> ");
+    try writeSettingValue(writer, draft);
+    try writer.writeByte('\n');
+}
+
+/// The status line for a setting that changed in the config file while it was
+/// being edited here. `label` is the name the form shows, not the field tag.
+fn conflictStatusText(buf: []u8, label: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s} also changed on disk. Choose Keep mine or Use disk.", .{label}) catch
+        "A setting also changed on disk. Choose Keep mine or Use disk.";
+}
+
+/// Closes a diff list that did not fit; written into the buffer's reserved tail.
+const more_changes_text = "...and more changes.\n";
+
+const OwnedDiffs = struct { lines: usize, truncated: bool };
+
+/// The lines of the owned fields (font family, theme, default command) that are
+/// edited or in conflict. A line that does not fit is dropped whole, so a long
+/// default command costs only its own line, not the short ones before it.
 fn writeOwnedSettingDiffs(
     writer: *std.Io.Writer,
     original: *const Config,
     pending: *const Config,
     dirty: [owned_setting_field_count]bool,
     conflict: [owned_setting_field_count]bool,
-) !usize {
-    var count: usize = 0;
+) OwnedDiffs {
+    var result: OwnedDiffs = .{ .lines = 0, .truncated = false };
     for (std.enums.values(OwnedSettingField)) |field| {
         const index = @intFromEnum(field);
         if (!dirty[index] and !conflict[index]) continue;
-        try writer.print("{s}: ", .{field.label()});
-        try writeOwnedSettingValue(writer, original, field);
-        try writer.writeAll(" -> ");
-        try writeOwnedSettingValue(writer, pending, field);
-        if (conflict[index]) try writer.writeAll(" (conflict)");
-        try writer.writeByte('\n');
-        count += 1;
+        const line_start = writer.end;
+        writeOwnedSettingDiffLine(writer, original, pending, field, conflict[index]) catch {
+            writer.end = line_start;
+            result.truncated = true;
+            break;
+        };
+        result.lines += 1;
     }
-    return count;
+    return result;
+}
+
+fn writeOwnedSettingDiffLine(
+    writer: *std.Io.Writer,
+    original: *const Config,
+    pending: *const Config,
+    field: OwnedSettingField,
+    conflict: bool,
+) !void {
+    try writer.print("{s}: ", .{field.label()});
+    try writeOwnedSettingValue(writer, original, field);
+    try writer.writeAll(" -> ");
+    try writeOwnedSettingValue(writer, pending, field);
+    if (conflict) try writer.writeAll(" (conflict)");
+    try writer.writeByte('\n');
 }
 
 fn utf8ToW(buf: []u16, text: []const u8) [*:0]const u16 {
@@ -6614,10 +10517,9 @@ test "win32_settings: advanced diff includes arena-backed-only edits" {
     conflict[@intFromEnum(OwnedSettingField.theme)] = true;
     var buf: [1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    try std.testing.expectEqual(
-        @as(usize, 3),
-        try writeOwnedSettingDiffs(&writer, &original, &pending, dirty, conflict),
-    );
+    const owned = writeOwnedSettingDiffs(&writer, &original, &pending, dirty, conflict);
+    try std.testing.expectEqual(@as(usize, 3), owned.lines);
+    try std.testing.expect(!owned.truncated);
     const text = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "Font family: Cascadia Mono -> JetBrains Mono, Symbols Nerd Font") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Terminal theme: Old Theme -> light:Day,dark:Night (conflict)") != null);
@@ -6668,6 +10570,8 @@ test "win32_settings: keybinding help points to discoverability commands" {
 
     try std.testing.expect(text.len < 1024);
     try std.testing.expect(std.mem.indexOfScalar(u8, text, 0) == null);
+    // Plain text: the CLI's Markdown backticks are not shown.
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '`') == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+list-keybinds --default") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+list-keybinds --docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+list-actions --docs") != null);

@@ -293,6 +293,7 @@ pub fn build(b: *std.Build) !void {
     const benches = [_]struct { name: []const u8, root: []const u8 }{
         .{ .name = "palette-match", .root = "src/bench/palette_match.zig" },
         .{ .name = "vt-throughput", .root = "src/bench/vt_throughput.zig" },
+        .{ .name = "search-stream", .root = "src/bench/search_stream.zig" },
     };
     if (config.app_runtime != .none) {
         // The compile root alone is not enough: terminal build options also

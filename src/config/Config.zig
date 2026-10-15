@@ -2413,6 +2413,13 @@ keybind: Keybinds = .{},
 ///   * `allow`
 ///   * `deny`
 ///
+/// On Windows, `ask` shows a prompt of its own that names the tab the
+/// request came from. It opens with Cancel focused, and Allow works only
+/// half a second after the prompt opened and after the last key it
+/// received, so keys you were typing when it appeared cannot approve it.
+/// A program's request never replaces a prompt, or the command palette,
+/// search or a rename, that is already open: it is declined instead.
+///
 @"clipboard-read": ClipboardAccess = .ask,
 @"clipboard-write": ClipboardAccess = .allow,
 
@@ -2533,6 +2540,12 @@ keybind: Keybinds = .{},
 /// any confirmation. This can also be set to `always`, which will always
 /// confirm closing a surface, even if shell integration says a process isn't
 /// running.
+///
+/// Closing a window, quitting, `close_all_windows` and `close_tab:other` or
+/// `close_tab:right` ask once for all the surfaces they would close.
+/// `close_tab:this` does not ask, because `undo` can bring the tab back
+/// until `undo-timeout` runs out; with `undo-timeout = 0` it cannot, so
+/// `close_tab:this` asks like the others.
 @"confirm-close-surface": ConfirmCloseSurface = .true,
 
 /// Whether or not to quit after the last surface is closed.
@@ -3426,6 +3439,12 @@ _arena: ?ArenaAllocator = null,
 /// supplied by a config layer. The executable stays available to runtime callers.
 _command_defaulted: bool = false,
 
+/// The last config file that was skipped whole because it is UTF-16 text that
+/// does not decode (see `loadReader`); everything it set is missing from this
+/// load. Lives in the arena of this load; `clone` and `loadTheme` (which
+/// rebuilds the config by replay) copy it, `changeConditionalState` does not.
+_undecodable_file: ?[:0]const u8 = null,
+
 /// List of diagnostics that were generated during the loading of
 /// the configuration.
 _diagnostics: cli.DiagnosticList = .{},
@@ -3570,11 +3589,82 @@ fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []c
             reader.toss(bom.len);
         }
     }
-    var line_iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
+
+    // Windows PowerShell 5.1 writes UTF-16 with a byte order mark for `>` and
+    // Out-File. Read as bytes that is NUL-separated noise which sets nothing
+    // and says nothing, so decode it first.
+    var decoded: ?[]u8 = null;
+    defer if (decoded) |text| alloc.free(text);
+    var decoded_reader: std.Io.Reader = undefined;
+    var source = reader;
+    if (utf16ByteOrder(reader)) |order| {
+        reader.toss(2);
+        decoded = self.decodeUtf16(alloc, reader, order, path) catch |err| switch (err) {
+            error.InvalidUtf16 => return,
+            else => |e| return e,
+        };
+        log.warn("{s}: UTF-16 text, read as such; save it as UTF-8 so the Settings window can edit it", .{path});
+        decoded_reader = .fixed(decoded.?);
+        source = &decoded_reader;
+    }
+
+    var line_iter: cli.args.LineIterator = .{ .r = source, .filepath = path };
     var iter: ConfigFileIterator = .{ .inner = &line_iter };
     try self.loadIter(alloc, &iter);
 
     try self.expandPaths(std.fs.path.dirname(path).?);
+}
+
+/// The byte order of the UTF-16 text `reader` starts with, if its first two
+/// bytes are a byte order mark. Consumes nothing.
+fn utf16ByteOrder(reader: *std.Io.Reader) ?std.builtin.Endian {
+    const str = reader.peek(2) catch return null;
+    if (std.mem.eql(u8, str, "\xff\xfe")) return .little;
+    if (std.mem.eql(u8, str, "\xfe\xff")) return .big;
+    return null;
+}
+
+/// Read the rest of `reader` as UTF-16 and return it as UTF-8. A file that is
+/// not valid UTF-16 (or is absurdly large) is skipped with a diagnostic; an
+/// error here would otherwise end the whole configuration load. A trailing odd
+/// byte, as a truncated write leaves, is dropped.
+fn decodeUtf16(
+    self: *Config,
+    alloc: Allocator,
+    reader: *std.Io.Reader,
+    order: std.builtin.Endian,
+    path: []const u8,
+) ![]u8 {
+    const bytes = reader.allocRemaining(alloc, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+        error.StreamTooLong => return self.invalidUtf16(path, "is too large"),
+        else => |e| return e,
+    };
+    defer alloc.free(bytes);
+    const units = try alloc.alloc(u16, bytes.len / 2);
+    defer alloc.free(units);
+    for (units, 0..) |*unit, i| {
+        unit.* = std.mem.nativeToLittle(u16, std.mem.readInt(u16, bytes[i * 2 ..][0..2], order));
+    }
+    return std.unicode.utf16LeToUtf8Alloc(alloc, units) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => self.invalidUtf16(path, "is not valid UTF-16"),
+    };
+}
+
+fn invalidUtf16(self: *Config, path: []const u8, reason: []const u8) error{ OutOfMemory, InvalidUtf16 } {
+    const arena_alloc = self._arena.?.allocator();
+    self._undecodable_file = arena_alloc.dupeZ(u8, path) catch return error.OutOfMemory;
+    const diag: cli.Diagnostic = .{
+        .message = std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "config file {s} {s}; not reading it. Save it as UTF-8",
+            .{ path, reason },
+            0,
+        ) catch return error.OutOfMemory,
+    };
+    self._diagnostics.append(arena_alloc, diag) catch return error.OutOfMemory;
+    self._replay_steps.append(arena_alloc, .{ .diagnostic = diag }) catch return error.OutOfMemory;
+    return error.InvalidUtf16;
 }
 
 /// Remove the `--launch-layout` steps at or after `from` in the replay log,
@@ -3808,6 +3898,124 @@ test "handle bom in config files" {
     }
 }
 
+/// `text` as the bytes of a UTF-16 file, byte order mark first.
+fn testUtf16Bytes(alloc: Allocator, text: []const u8, order: std.builtin.Endian) ![]u8 {
+    const units = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
+    defer alloc.free(units);
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, if (order == .little) "\xff\xfe" else "\xfe\xff");
+    for (units) |unit| {
+        var pair: [2]u8 = undefined;
+        std.mem.writeInt(u16, &pair, std.mem.littleToNative(u16, unit), order);
+        try out.appendSlice(alloc, &pair);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "UTF-16 config files are read as the text they hold" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // What Windows PowerShell 5.1 writes for `'...' > config`: UTF-16LE with
+    // a byte order mark and CRLF. The comment holds a character outside the
+    // basic plane, which takes a surrogate pair.
+    const text = "font-size = 14\r\n# caf\u{e9} \u{1f680}\r\ncursor-style = bar\r\n";
+    for ([_]std.builtin.Endian{ .little, .big }) |order| {
+        const data = try testUtf16Bytes(alloc, text, order);
+        defer alloc.free(data);
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try cfg.finalize();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 14), cfg.@"font-size");
+        try testing.expect(cfg.@"cursor-style" == .bar);
+    }
+
+    // A truncated write leaves half a code unit: the last byte is dropped.
+    {
+        const whole = try testUtf16Bytes(alloc, "font-size = 15\n", .little);
+        defer alloc.free(whole);
+        const data = try std.mem.concat(alloc, u8, &.{ whole, "\x0a" });
+        defer alloc.free(data);
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 15), cfg.@"font-size");
+    }
+
+    // A lone surrogate is not text. The file is skipped with a diagnostic that
+    // names it, and loading goes on: an error here would end the whole load,
+    // since an included file is read the same way.
+    {
+        const data = "\xff\xfe\x00\xd8f\x00o\x00";
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try testing.expectEqual(@as(usize, 1), cfg._diagnostics.list.items.len);
+        try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "config.ghostty") != null);
+        try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "UTF-16") != null);
+        try testing.expectEqual(@as(f32, 12), cfg.@"font-size");
+        // Callers that must not act on a partial load can tell which file it was.
+        try testing.expectEqualStrings("/home/ghostty/.config/ghostty/config.ghostty", cfg._undecodable_file.?);
+    }
+}
+
+test "the record of a skipped UTF-16 file survives the theme replay and a clone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "bad16.conf", .data = "\xff\xfe\x00\xd8f\x00o\x00" });
+    try tmp.dir.writeFile(.{ .sub_path = "x.theme", .data = "cursor-style = underline\n" });
+    const bad_path = try tmp.dir.realpathAlloc(alloc, "bad16.conf");
+    defer alloc.free(bad_path);
+    const theme_path = try tmp.dir.realpathAlloc(alloc, "x.theme");
+    defer alloc.free(theme_path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, bad_path);
+    const text = try std.fmt.allocPrint(alloc, "theme = {s}\n", .{theme_path});
+    defer alloc.free(text);
+    var reader: std.Io.Reader = .fixed(text);
+    try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+    try testing.expect(cfg._undecodable_file != null);
+
+    // finalize loads the theme by rebuilding the config from its replay steps.
+    try cfg.finalize();
+    try testing.expect(cfg.@"cursor-style" == .underline);
+    try testing.expectEqualStrings(bad_path, cfg._undecodable_file.?);
+
+    var copy = try cfg.clone(alloc);
+    defer copy.deinit();
+    try testing.expectEqualStrings(bad_path, copy._undecodable_file.?);
+}
+
+test "a UTF-16 config file on disk is read through loadFile" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testUtf16Bytes(alloc, "font-size = 16\r\n", .little);
+    defer alloc.free(data);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = data });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, path);
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
+}
+
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
 
 /// Load optional configuration file from `path`. All errors are ignored.
@@ -3874,6 +4082,14 @@ test "writeConfigTemplate writes the template with its path" {
     const preserved = try tmp.dir.readFileAlloc(alloc, "config.ghostty", 8192);
     defer alloc.free(preserved);
     try std.testing.expectEqualStrings(user_content, preserved);
+}
+
+test "the embedded config template has LF line endings in every checkout" {
+    // The template is embedded in the executable and written as the first-run
+    // config. `.gitattributes` pins it to LF; without that pin, a checkout with
+    // `core.autocrlf=true` (Git for Windows' default) builds CRLF bytes into
+    // the release binary, as v1.3.131's did.
+    try std.testing.expect(std.mem.indexOfScalar(u8, @embedFile("./config-template"), '\r') == null);
 }
 
 fn defaultConfigIsEmpty(path: []const u8) bool {
@@ -4520,6 +4736,12 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     var slice_it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &slice_it);
 
+    // The replay re-applies values, not the loader's record of a file it
+    // skipped; carry that over before the old arena goes.
+    if (self._undecodable_file) |skipped| {
+        new_config._undecodable_file = try new_config._arena.?.allocator().dupeZ(u8, skipped);
+    }
+
     // Success, swap our new config in and free the old.
     self.deinit();
     self.* = new_config;
@@ -4989,6 +5211,7 @@ pub fn clone(
     // Copy our diagnostics
     result._diagnostics = try self._diagnostics.clone(alloc_arena);
     result._command_defaulted = self._command_defaulted;
+    if (self._undecodable_file) |skipped| result._undecodable_file = try alloc_arena.dupeZ(u8, skipped);
 
     // Preserve our replay steps. We copy them exactly to also preserve
     // the exact conditionals required for some steps.
@@ -6815,13 +7038,8 @@ pub const Keybinds = struct {
             // `ctrl+shift+r`, the obvious chord for it, is what our own
             // getting-started guide shows users rebinding to reload_config.
             // It stays available from the command palette and user keybinds.
-            if (comptime builtin.target.os.tag == .windows) {
-                try self.set.put(
-                    alloc,
-                    .{ .key = .{ .unicode = 'y' }, .mods = .{ .shift = true, .ctrl = true } },
-                    .{ .copy_last_command_output = {} },
-                );
-            }
+            // `copy_last_command_output` is palette-only by default on
+            // Windows: Ctrl+Shift+Y is redo, paired with Ctrl+Shift+Z undo.
 
             // Search
             try self.set.putFlags(
@@ -6851,12 +7069,17 @@ pub const Keybinds = struct {
                 .{ .select_all = {} },
             );
 
-            // Selection clipboard paste
-            try self.set.put(
-                alloc,
-                .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
-                .{ .paste_from_selection = {} },
-            );
+            // Selection clipboard paste. Windows has no selection clipboard, so
+            // there `shift+insert` stays the clipboard paste added above; a
+            // later `paste_from_selection` here replaced it and, doing
+            // nothing, swallowed the key.
+            if (comptime builtin.target.os.tag != .windows) {
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
+                    .{ .paste_from_selection = {} },
+                );
+            }
         }
         {
             // On macOS we default to super but everywhere else
@@ -6927,12 +7150,23 @@ pub const Keybinds = struct {
             );
         }
 
-        // Toggle fullscreen
-        try self.set.put(
-            alloc,
-            .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
-            .{ .toggle_fullscreen = {} },
-        );
+        // Toggle fullscreen. F11 is the Windows convention (every browser,
+        // Windows Terminal). Ctrl+Enter and Alt+Enter stay unbound there: a
+        // program tells Ctrl+Enter from Enter now (Win32 input mode records),
+        // and Alt+Enter is a TUI chord.
+        if (comptime builtin.target.os.tag == .windows) {
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .f11 } },
+                .{ .toggle_fullscreen = {} },
+            );
+        } else {
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
+                .{ .toggle_fullscreen = {} },
+            );
+        }
 
         // Toggle zoom a split
         try self.set.put(
@@ -6955,20 +7189,54 @@ pub const Keybinds = struct {
             .toggle_quick_select,
         );
 
-        // Keyboard focus-region cycle. F6 / Shift+F6 is the Windows
-        // convention for moving focus between the panes of a window, and
-        // it is the only keyboard path into the tab strip, the docked
-        // search controls, and the host banner.
+        // Keyboard focus-region cycle. It is the only keyboard path into the
+        // tab strip, the docked search controls, and the host banner. Ctrl+F6
+        // / Ctrl+Shift+F6 is the Windows chord for moving between the windows
+        // of an application; a bare F6 belongs to the program in the pane
+        // (htop's nice, Midnight Commander's move, vim mappings).
         try self.set.put(
             alloc,
-            .{ .key = .{ .physical = .f6 } },
+            .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true } },
             .{ .cycle_focus_region = .next },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .physical = .f6 }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true, .shift = true } },
             .{ .cycle_focus_region = .previous },
         );
+
+        // Undo and redo, and search navigation, on Windows. All are
+        // performable: with nothing to undo, redo or navigate the chord goes to
+        // the program in the pane (F3 is Midnight Commander's view and htop's
+        // search). Copy last command output remains in the command palette.
+        if (comptime builtin.target.os.tag == .windows) {
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .undo = {} },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .redo = {} },
+                .{ .performable = true },
+            );
+            // F3 does what Enter does in the docked search bar: the next match
+            // down. Shift+F3 does what Shift+Enter does.
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .f3 } },
+                .{ .navigate_search = .previous },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } },
+                .{ .navigate_search = .next },
+                .{ .performable = true },
+            );
+        }
 
         // Copy mode. The named table is intentionally user-customizable, but
         // its defaults consume every otherwise-unbound key so modal input can
@@ -8081,7 +8349,7 @@ pub const Keybinds = struct {
             },
             .{
                 .trigger = .{ .key = .{ .unicode = 'y' }, .mods = .{ .shift = true, .ctrl = true } },
-                .action = .copy_last_command_output,
+                .action = .redo,
             },
         };
 
@@ -8289,6 +8557,77 @@ pub const Keybinds = struct {
         try testing.expect(keybinds.set.bindings.count() > 0);
     }
 };
+
+test "default Windows keybinds: clipboard, focus cycle, fullscreen, undo and search" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    const set = &cfg.keybind.set;
+
+    const Binding = inputpkg.Binding;
+    const Case = struct {
+        trigger: Binding.Trigger,
+        action: Binding.Action,
+        performable: bool = false,
+    };
+    const cases = [_]Case{
+        // Shift+Insert pastes the clipboard. A later `paste_from_selection`
+        // on the same chord replaced it and, doing nothing on Windows,
+        // swallowed the key.
+        .{ .trigger = .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } }, .action = .{ .paste_from_clipboard = {} } },
+        .{ .trigger = .{ .key = .{ .physical = .insert }, .mods = .{ .ctrl = true } }, .action = .{ .copy_to_clipboard = .mixed } },
+        // The focus-region cycle left F6 for Ctrl+F6, which gives a bare F6
+        // back to htop, Midnight Commander and vim.
+        .{ .trigger = .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true } }, .action = .{ .cycle_focus_region = .next } },
+        .{ .trigger = .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .cycle_focus_region = .previous } },
+        .{ .trigger = .{ .key = .{ .physical = .f11 } }, .action = .{ .toggle_fullscreen = {} } },
+        .{ .trigger = .{ .key = .{ .physical = .enter }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .toggle_split_zoom = {} } },
+        // Performable: with nothing to undo, redo or step through, the chord
+        // goes on to the program in the pane.
+        .{ .trigger = .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .undo = {} }, .performable = true },
+        .{ .trigger = .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .redo = {} }, .performable = true },
+        .{ .trigger = .{ .key = .{ .physical = .f3 } }, .action = .{ .navigate_search = .previous }, .performable = true },
+        .{ .trigger = .{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } }, .action = .{ .navigate_search = .next }, .performable = true },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("default binding: {f}\n", .{case.trigger});
+        const entry = set.get(case.trigger) orelse return error.DefaultBindingMissing;
+        const leaf = switch (entry.value_ptr.*) {
+            .leaf => |leaf| leaf,
+            else => return error.DefaultBindingNotALeaf,
+        };
+        try testing.expectEqualDeep(case.action, leaf.action);
+        try testing.expectEqual(case.performable, leaf.flags.performable);
+    }
+
+    // Left to the program in the pane: a bare F6, Ctrl+Enter, Alt+Enter, and
+    // the shell's own Ctrl+Z, Ctrl+Y and Ctrl+R.
+    const unbound = [_]Binding.Trigger{
+        .{ .key = .{ .physical = .f6 } },
+        .{ .key = .{ .physical = .f6 }, .mods = .{ .shift = true } },
+        .{ .key = .{ .physical = .enter }, .mods = .{ .ctrl = true } },
+        .{ .key = .{ .physical = .enter }, .mods = .{ .alt = true } },
+        .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true } },
+        .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true } },
+        .{ .key = .{ .unicode = 'r' }, .mods = .{ .ctrl = true, .shift = true } },
+    };
+    for (unbound) |trigger| {
+        errdefer std.debug.print("bound by default: {f}\n", .{trigger});
+        try testing.expect(set.get(trigger) == null);
+    }
+
+    // Windows has no selection clipboard, so nothing may default to pasting it.
+    var it = set.bindings.iterator();
+    while (it.next()) |entry| switch (entry.value_ptr.*) {
+        .leaf => |leaf| {
+            try testing.expect(leaf.action != .paste_from_selection);
+            try testing.expect(leaf.action != .copy_last_command_output);
+        },
+        else => {},
+    };
+}
 
 /// See "font-codepoint-map" for documentation.
 pub const RepeatableCodepointMap = struct {

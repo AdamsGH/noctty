@@ -95,6 +95,13 @@ pub const PageListSearch = struct {
         self.list.untrackPin(self.pin);
     }
 
+    /// Release owned search buffers after the PageList itself has already
+    /// been destroyed. Its pin belonged to the PageList pool and was freed
+    /// with that list, so it must not be untracked here.
+    pub fn deinitListInvalid(self: *PageListSearch) void {
+        self.window.deinit();
+    }
+
     /// Return the next match in the loaded page nodes. If this returns
     /// null then the PageList search needs to be fed the next node(s).
     /// Call, `feed` to do this.

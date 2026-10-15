@@ -9,7 +9,7 @@ pub fn parse(parser: anytype, _: ?u8) ?*@TypeOf(parser.command) {
         parser.state = .invalid;
         return null;
     };
-    cap.writer.writeByte(0) catch {
+    cap.writeByte(0) catch {
         parser.state = .invalid;
         return null;
     };

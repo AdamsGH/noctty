@@ -1,8 +1,10 @@
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$UncPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$script:AssertionCount = 0
 
 function Assert-True {
     param(
@@ -12,6 +14,17 @@ function Assert-True {
     if (-not $Condition) {
         throw $Message
     }
+    $script:AssertionCount++
+}
+
+function ConvertTo-PowerShellLiteralContent {
+    param([string]$Value)
+    $escaped = $Value.Replace("'", "''")
+    foreach ($point in 0x2018..0x201B) {
+        $quote = [string][char]$point
+        $escaped = $escaped.Replace($quote, $quote + $quote)
+    }
+    return $escaped
 }
 
 $script:OriginalPrompt = $function:global:prompt
@@ -21,11 +34,23 @@ $script:OriginalFeatures = $env:GHOSTTY_SHELL_FEATURES
 # until the history-handler section below imports the module itself.
 $script:PSReadLineImported = $false
 $script:OriginalAddToHistoryHandler = $null
+$script:OriginalHistoryOptions = $null
 $script:IntegrationPath = Join-Path $RepoRoot 'src\shell-integration\powershell\integration.ps1'
 $script:TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-ps-si-" + [guid]::NewGuid().ToString('n'))
 
 try {
     New-Item -ItemType Directory -Force -Path $script:TempDir | Out-Null
+    # APPDATA does not redirect PSReadLine history. Isolate an already loaded
+    # module too, so invoking this harness from an interactive host is safe.
+    if (Get-Module PSReadLine) {
+        $options = Get-PSReadLineOption
+        $script:OriginalHistoryOptions = @{
+            HistorySavePath = $options.HistorySavePath
+            HistorySaveStyle = $options.HistorySaveStyle
+        }
+        Set-PSReadLineOption -HistorySaveStyle SaveNothing
+        Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
+    }
     $specialDir = Join-Path $script:TempDir 'a b#c%d&e+f'
     New-Item -ItemType Directory -Force -Path $specialDir | Out-Null
     Push-Location $specialDir
@@ -134,6 +159,20 @@ try {
     Assert-True ($fakeOutput.Contains('COLORTERM=truecolor')) "ssh-env wrapper did not set COLORTERM for child process"
     Assert-True ($fakeOutput.Contains('ARGS=-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" example.com -p 22')) "ssh wrapper argv was not forwarded correctly: $fakeOutput"
 
+    # Unquoted flags go through PowerShell's binder; quoted flags above do not.
+    ssh -i k -p 22 -o A=b -E log -v -A host
+    $fakeOutput = Get-Content -LiteralPath $fakeCapture -Raw
+    Assert-True ($fakeOutput.Contains('ARGS=-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" -i k -p 22 -o A=b -E log -v -A host')) "ssh swallowed or rebound native flags: $fakeOutput"
+    ssh -V
+    $fakeOutput = Get-Content -LiteralPath $fakeCapture -Raw
+    Assert-True ($fakeOutput.Contains('ARGS=-V')) "ssh -V did not forward the version flag unchanged: $fakeOutput"
+    ssh host -V
+    $fakeOutput = Get-Content -LiteralPath $fakeCapture -Raw
+    Assert-True ($fakeOutput.Contains('ARGS=-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" host -V')) "A remote command's -V incorrectly bypassed SSH integration: $fakeOutput"
+    ssh
+    $fakeOutput = Get-Content -LiteralPath $fakeCapture -Raw
+    Assert-True ($fakeOutput.Contains("ARGS=`r`n") -or $fakeOutput.Contains("ARGS=`n")) "Bare ssh added arguments: $fakeOutput"
+
     Remove-Item Env:TERM -ErrorAction SilentlyContinue
     Remove-Item Env:COLORTERM -ErrorAction SilentlyContinue
     ssh 'example.org'
@@ -165,6 +204,7 @@ try {
     }
     $B = "$([char]27)]133;B$([char]7)"
     $A = "]133;A;cl=line;aid=$PID;redraw=0"
+    $modeReset = "$([char]27)[<99u$([char]27)[>4;0m"
 
     $drawn = Invoke-TestPrompt
     # A generated function, not an alias: `Get-Command prompt` stays a
@@ -175,8 +215,28 @@ try {
     Assert-True ($drawn.Osc.Contains("]133;D;0;aid=$PID")) "Prompt output missing OSC 133 D aid metadata"
     Assert-True ($drawn.Osc.Contains(']7;file://')) "Prompt output missing OSC 7 cwd"
     Assert-True ($drawn.Osc.Contains($A)) "Prompt output missing OSC 133 A prompt metadata (redraw=0)"
+    Assert-True ($drawn.Osc.Contains("$modeReset$([char]27)$A")) "Prompt did not reset Kitty and modifyOtherKeys before A"
     Assert-True (-not $drawn.Osc.Contains(']133;B')) "OSC 133 B was written directly, ahead of the prompt text: $($drawn.Osc -replace [char]27, '<ESC>')"
     Assert-True ($drawn.Text -ceq "NOCTTYPROBE> $B") "The returned prompt is not the user's text followed by B: $($drawn.Text -replace [char]27, '<ESC>')"
+
+    $unsupportedLocations = @('HKCU:\Software', 'Env:\')
+    if ($UncPath) { $unsupportedLocations += $UncPath }
+    New-PSDrive -Name NocttyProbe -PSProvider FileSystem -Root $specialDir | Out-Null
+    try {
+        Push-Location 'NocttyProbe:\'
+        Assert-True ((__ghostty_encode_cwd_uri).TrimEnd('/') -ceq $cwdUri.TrimEnd('/')) "A filesystem PSDrive emitted its logical drive name rather than the native cwd"
+        Pop-Location
+        foreach ($providerLocation in $unsupportedLocations) {
+            Push-Location $providerLocation
+            $nonFilePrompt = Invoke-TestPrompt
+            Assert-True ($null -eq (__ghostty_encode_cwd_uri)) "An unsupported cwd emitted a URI: $providerLocation"
+            Assert-True (-not $nonFilePrompt.Osc.Contains(']7;')) "An unsupported cwd prompt emitted OSC 7: $providerLocation"
+            Assert-True ($nonFilePrompt.Osc.Contains(']133;D;') -and $nonFilePrompt.Osc.Contains($A)) "Skipping OSC 7 dropped the command or prompt marks"
+            Pop-Location
+        }
+    } finally {
+        Remove-PSDrive NocttyProbe -Force -Confirm:$false -WhatIf:$false
+    }
 
     $savedPrompt = $function:global:prompt
     try {
@@ -217,10 +277,10 @@ try {
         # A ReadOnly prompt cannot be wrapped. The line reader tries before
         # every line, and it must neither put an error in $Error each time
         # nor use up a wrapper id per attempt.
-        Microsoft.PowerShell.Management\Set-Item -Path 'function:prompt' -Value { 'LOCKED> ' } -Options ReadOnly -Force
+        Microsoft.PowerShell.Management\Set-Item -Path 'function:global:prompt' -Value { 'LOCKED> ' } -Options ReadOnly -Force
         try {
-            # Set-Item on the function drive changes the existing global prompt
-            # in place rather than shadowing it in script scope; make sure.
+            # CI invokes this harness from another script. Target global scope
+            # explicitly so that caller's script scope cannot shadow the fixture.
             Assert-True ((& ${function:global:prompt}) -ceq 'LOCKED> ') "The ReadOnly test prompt is not the global prompt"
             $countBefore = $Global:__ghostty_prompt_count
             $errorsBefore = $Error.Count
@@ -230,7 +290,7 @@ try {
             $lockedIds = $Global:__ghostty_prompt_count - $countBefore
             $lockedText = (Invoke-TestPrompt).Text
         } finally {
-            Microsoft.PowerShell.Management\Remove-Item -Path 'function:prompt' -Force
+            Microsoft.PowerShell.Management\Set-Item -Path 'function:global:prompt' -Value $savedPrompt -Options None -Force
         }
         Assert-True ($lockedErrors -eq 0) "Wrapping a ReadOnly prompt added $lockedErrors record(s) to `$Error"
         Assert-True ($lockedIds -eq 0) "Wrapping a ReadOnly prompt used up $lockedIds wrapper id(s)"
@@ -364,13 +424,14 @@ try {
     # unmarked prompt: written into its running command, a D or B would end
     # it and make the answer typed at the script the terminal's last command.
     $direct = Invoke-TestReadLine 'answer'
+    Assert-True (-not $direct.Osc.Contains($modeReset)) "A script calling the reader reset keyboard modes"
     Assert-True (-not ($direct.Osc -match '\]133;[DPB]|\]7;')) "A script's own call to the reader got prompt marks: $($direct.Osc -replace [char]27, '<ESC>')"
     Assert-True ($direct.Osc.Contains(']133;C;')) "A script's own call to the reader lost its C"
     # The prompt is ours again now (that read wrapped it); replace it anew.
     function global:prompt { 'REPLACED> ' }
     [void](Invoke-TestPrompt)
     $unmarked = Invoke-TestReadLine 'Get-Date' -AsHost
-    Assert-True ($unmarked.Osc -match "^$([char]27)\]133;D;0;aid=$PID$([char]7)$([char]27)\]7;file://[^$([char]7)]+$([char]7)$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))$([regex]::Escape($C))") "An unmarked prompt did not get D, OSC 7, P and B: $($unmarked.Osc -replace [char]27, '<ESC>')"
+    Assert-True ($unmarked.Osc -match "^$([char]27)\]133;D;0;aid=$PID$([char]7)$([char]27)\]7;file://[^$([char]7)]+$([char]7)$([regex]::Escape($modeReset))$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))$([regex]::Escape($C))") "An unmarked prompt did not get D, OSC 7, mode reset, P and B: $($unmarked.Osc -replace [char]27, '<ESC>')"
     Assert-True (__ghostty_prompt_is_ours $function:global:prompt) "The line reader did not wrap a replaced prompt"
     [void](Invoke-TestPrompt)
     $marked = Invoke-TestReadLine 'Get-Date' -AsHost
@@ -441,6 +502,17 @@ try {
     # integration must leave it, or any handler a profile set, as it was.
     if ($null -ne (Get-Module PSReadLine -ListAvailable | Select-Object -First 1)) {
         Import-Module PSReadLine -ErrorAction Stop
+        if ($null -eq $script:OriginalHistoryOptions) {
+            $options = Get-PSReadLineOption
+            $script:OriginalHistoryOptions = @{
+                HistorySavePath = $options.HistorySavePath
+                HistorySaveStyle = $options.HistorySaveStyle
+            }
+        }
+        Set-PSReadLineOption -HistorySaveStyle SaveNothing
+        Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
+        Assert-True ((Get-PSReadLineOption).HistorySaveStyle -eq 'SaveNothing') "Parent PSReadLine history writes are not disabled"
+        Assert-True ((Get-PSReadLineOption).HistorySavePath -eq (Join-Path $script:TempDir 'parent-history.txt')) "Parent PSReadLine history is not isolated"
         $script:PSReadLineImported = $true
         $script:OriginalAddToHistoryHandler = (Get-PSReadLineOption).AddToHistoryHandler
 
@@ -505,7 +577,7 @@ try {
     $psHost = (Get-Process -Id $PID).Path
     Assert-True (-not [string]::IsNullOrEmpty($psHost)) "Could not resolve the current PowerShell host path"
 
-    $childQuotedPath = $script:IntegrationPath.Replace("'", "''")
+    $childQuotedPath = ConvertTo-PowerShellLiteralContent $script:IntegrationPath
     # The child echoes each stdin line back, so the success token must be
     # assembled at runtime; a literal would match its own echo and the
     # assertion would pass even when the helper is gone.
@@ -520,7 +592,10 @@ try {
             [string]$Postamble,
             [string[]]$Lines = $null,
             [switch]$WithoutPSReadLine,
-            [switch]$StandInReader
+            [switch]$StandInReader,
+            [string]$ExecutionPolicy = 'Bypass',
+            [switch]$ScrubExecutionPolicy,
+            [string]$IntegrationPath = $script:IntegrationPath
         )
 
         if ($null -eq $Lines) { $Lines = $script:ChildInput }
@@ -542,27 +617,174 @@ try {
         } elseif ($WithoutPSReadLine) {
             'Remove-Module PSReadLine -Force -ErrorAction Ignore; '
         } else { '' }
-        $payload = $prefix + $Preamble +
+        $childQuotedPath = ConvertTo-PowerShellLiteralContent $IntegrationPath
+        # Do this before any prompt or stdin line, including in children that
+        # subsequently unload PSReadLine. The scratch path is a second barrier.
+        $historyPath = ConvertTo-PowerShellLiteralContent (Join-Path $script:TempDir 'child-history.txt')
+        # Under Restricted PSReadLine cannot load, so do not import it just for
+        # this guard. If the host loaded it, isolate it before it reads a line.
+        $historyPrefix = "if (Get-Module PSReadLine) { Set-PSReadLineOption -HistorySaveStyle SaveNothing; Set-PSReadLineOption -HistorySavePath '$historyPath'; if ((Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing' -or (Get-PSReadLineOption).HistorySavePath -ne '$historyPath') { throw 'Child history isolation failed' } }; [Console]::WriteLine('HISTORY' + '-ISOLATED'); "
+        $payload = '[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); ' + $historyPrefix + $prefix + $Preamble +
             "function global:prompt { 'NOCTTYPROBE> ' }; " +
-            "& { `$__ghostty_utf8_console = `$false; . '$childQuotedPath' }" +
+            "& { `$__ghostty_utf8_console = `$false; `$__ghostty_integration_path = '$childQuotedPath" +
+            '''; try { if ($ExecutionContext.SessionState.LanguageMode -ne ''FullLanguage'') { Microsoft.PowerShell.Utility\Write-Warning ''noctty PowerShell integration skipped: unsupported language mode.'' -WarningAction Continue } else { $__ghostty_load_error_head = $null; if ($Error.Count) { $__ghostty_load_error_head = $Error[0] }; Microsoft.PowerShell.Core\Import-Module ([Reflection.Assembly]::Load(''Microsoft.PowerShell.Security'').Location) -ErrorAction Stop; if ((Microsoft.PowerShell.Security\Get-ExecutionPolicy -ErrorAction Stop) -eq ''AllSigned'') { . $__ghostty_integration_path } else { . ([scriptblock]::Create([IO.File]::ReadAllText($__ghostty_integration_path))) } } } catch { while ($Error.Count -gt 0 -and -not [object]::ReferenceEquals($Error[0], $__ghostty_load_error_head)) { $Error.RemoveAt(0) }; Microsoft.PowerShell.Utility\Write-Warning ''noctty PowerShell integration could not load (execution policy or script error).'' -WarningAction Continue } }' +
             $Postamble
-        # `2>&1` on a native command produces ErrorRecords. Under Windows
-        # PowerShell 5.1 with $ErrorActionPreference = 'Stop' (set at the top
-        # of this file) that throws a RemoteException instead of landing in
-        # the captured output, which would turn any child stderr — exactly
-        # the diagnostic we want to read — into an unrelated crash. pwsh 7
-        # does not do this.
-        $saved = $ErrorActionPreference
+        $payloadErrors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($payload, [ref]$null, [ref]$payloadErrors)
+        if ($payloadErrors.Count) {
+            throw "Injected fixture did not parse: $($payloadErrors[0].ErrorId)"
+        }
+        # Use CreateProcess argument quoting rather than this host's native
+        # binder: 5.1 strips embedded double quotes, including test assertions
+        # in the payload. Capture stderr as text rather than 5.1 ErrorRecords.
+        $quotedPayload = [regex]::Replace($payload, '(\\*)"', '${1}${1}\"')
+        $quotedPayload = [regex]::Replace($quotedPayload, '(\\+)$', '${1}${1}')
+        $info = [System.Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $script:PsHost
+        $info.Arguments = '-NoProfile -ExecutionPolicy ' + $ExecutionPolicy + ' -NoExit -Command "' + $quotedPayload + '"'
+        if ($ExecutionPolicy -eq 'AllSigned') {
+            # As in the native policy fixture, forbid host startup/trust
+            # prompts before the injected payload can confirm isolation.
+            $info.Arguments = '-NonInteractive ' + $info.Arguments
+        }
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $info.WorkingDirectory = $PWD.ProviderPath
+        if ($ScrubExecutionPolicy) {
+            # Only this policy-focused child loses the parent's Bypass. Other
+            # harness children still need it for their unsigned script payloads.
+            $info.EnvironmentVariables.Remove('PSExecutionPolicyPreference')
+        }
+        # .NET Framework has no StandardInputEncoding setting and its default
+        # writer can emit a BOM during Start. Scope its encoding to this launch.
+        $parentInputEncoding = [Console]::InputEncoding
         try {
-            $ErrorActionPreference = 'Continue'
-            return ($Lines | & $script:PsHost -NoProfile -NoExit -Command $payload 2>&1 | Out-String)
+            [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+            $process = [System.Diagnostics.Process]::Start($info)
         } finally {
-            $ErrorActionPreference = $saved
+            [Console]::InputEncoding = $parentInputEncoding
+        }
+        try {
+            $stderr = $process.StandardError.ReadToEndAsync()
+            # Never queue a test line until the child confirms isolation. A
+            # malformed startup payload with -NoExit otherwise reads stdin
+            # after its parse error, using the real PSReadLine history path.
+            $startupOutput = [Text.StringBuilder]::new()
+            $startupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            while ($true) {
+                $ready = $process.StandardOutput.ReadLineAsync()
+                $remainingMs = [Math]::Max(0, [int]($startupDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+                if (-not $ready.Wait($remainingMs) -or $null -eq $ready.Result) {
+                    if (-not $process.HasExited) { $process.Kill() }
+                    throw "Child did not confirm history isolation before input (policy=$ExecutionPolicy, startupChars=$($startupOutput.Length))"
+                }
+                [void]$startupOutput.AppendLine($ready.Result)
+                # pwsh may prefix redirected output with terminal-mode CSI
+                # sequences; they do not change the acknowledgement text.
+                $readyText = $ready.Result -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+                if ($readyText -eq 'HISTORY-ISOLATED') { break }
+            }
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            foreach ($line in $Lines) { $process.StandardInput.WriteLine($line) }
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(30000)) {
+                # This exact process object is the child just started here.
+                $process.Kill()
+                throw 'Injected PowerShell child timed out'
+            }
+            $output = $startupOutput.ToString() + $stdout.Result + $stderr.Result
+            Assert-True ($output.Contains('HISTORY-ISOLATED')) "Child did not confirm history isolation"
+            return $output
+        } finally {
+            $process.Dispose()
         }
     }
 
     $script:PsHost = $psHost
     $script:ChildInput = $childInput
+
+    # File-based policies must not block the normal bootstrap. AllSigned
+    # deliberately keeps file signature checks, and degrades to one warning.
+    $motwPath = Join-Path $script:TempDir 'motw.ps1'
+    Copy-Item -LiteralPath $script:IntegrationPath -Destination $motwPath
+    Set-Content -LiteralPath $motwPath -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+    $parentPolicyPreference = $env:PSExecutionPolicyPreference
+    foreach ($policyCase in @(
+        @{ Policy = 'Restricted'; Path = $script:IntegrationPath },
+        @{ Policy = 'RemoteSigned'; Path = $motwPath }
+    )) {
+        $policyOut = Invoke-NocttyInjectedChild -ExecutionPolicy $policyCase.Policy -IntegrationPath $policyCase.Path -WithoutPSReadLine -ScrubExecutionPolicy `
+            -Postamble '; ("POLICY" + "CHECK=") + (Microsoft.PowerShell.Security\Get-ExecutionPolicy); '
+        Assert-True ($policyOut.Contains("POLICYCHECK=$($policyCase.Policy)")) "Policy-focused child did not use $($policyCase.Policy): $policyOut"
+        Assert-True ($policyOut.Contains('HELPER-RESOLVED') -and $policyOut.Contains(']133;A;')) "Integration failed under $($policyCase.Policy): $policyOut"
+        Assert-True ($policyOut.Contains(']7;file://') -and $policyOut.Contains('NOCTTYPROBE> ')) "Policy-focused child lost its cwd or user prompt: $policyOut"
+        Assert-True (-not ($policyOut -match 'PSSecurityException|UnauthorizedAccess|cannot be loaded')) "Policy load left an error wall: $policyOut"
+    }
+    Assert-True ($env:PSExecutionPolicyPreference -ceq $parentPolicyPreference) "Policy-focused cases changed the parent's execution policy preference"
+    $signedOut = Invoke-NocttyInjectedChild -ExecutionPolicy AllSigned -WithoutPSReadLine -Preamble '$Error.Clear(); ' `
+        -Postamble '; "ERR" + "COUNT=" + $Error.Count'
+    Assert-True (-not $signedOut.Contains('HELPER-RESOLVED')) "AllSigned loaded an unsigned integration script"
+    Assert-True ($signedOut.Contains('WARNING: noctty PowerShell integration')) "AllSigned gave no concise integration warning: $signedOut"
+    Assert-True ($signedOut.Contains('ERRCOUNT=0') -and -not ($signedOut -match 'PSSecurityException|UnauthorizedAccess')) "AllSigned left a load error behind: $signedOut"
+
+    foreach ($loadCase in @(
+        @{ Policy = 'AllSigned'; Path = $script:IntegrationPath },
+        @{ Policy = 'Bypass'; Path = (Join-Path $script:TempDir 'missing.ps1') }
+    )) {
+        $failedOut = Invoke-NocttyInjectedChild -ExecutionPolicy $loadCase.Policy -IntegrationPath $loadCase.Path -WithoutPSReadLine `
+            -Preamble '$Error.Clear(); Write-Error ''existing error'' -ErrorAction SilentlyContinue; $Global:__noctty_seed_error = $Error[0]; ' `
+            -Postamble '; if ($Error.Count -eq 1 -and [object]::ReferenceEquals($Error[0], $Global:__noctty_seed_error)) { ''ERROR'' + ''-PRESERVED'' }'
+        Assert-True ($failedOut.Contains('ERROR-PRESERVED')) "A failed bootstrap erased or polluted the existing error history: $failedOut"
+    }
+
+    $constrainedOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+        -Preamble '$ExecutionContext.SessionState.LanguageMode = ''ConstrainedLanguage''; '
+    Assert-True ($constrainedOut.Contains('unsupported language mode.') -and -not $constrainedOut.Contains('HELPER-RESOLVED')) "ConstrainedLanguage installed partial hooks or missed its warning: $constrainedOut"
+
+    $driveRootQuoted = ConvertTo-PowerShellLiteralContent $specialDir
+    $driveOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+        -Preamble "New-PSDrive NocttyProbe FileSystem '$driveRootQuoted' | Out-Null; Set-Location 'NocttyProbe:\'; " `
+        -Postamble '; "CWD" + "URI=" + (__ghostty_encode_cwd_uri)'
+    Assert-True ($driveOut.Contains("CWDURI=$cwdUri")) "A real child reported the PSDrive name rather than the filesystem cwd: $driveOut"
+
+    foreach ($point in @(0x27) + @(0x2018..0x201B)) {
+        $quotedDir = Join-Path $script:TempDir ("O" + [char]$point + 'Brien')
+        New-Item -ItemType Directory -Path $quotedDir | Out-Null
+        $quotedPath = Join-Path $quotedDir 'integration.ps1'
+        Copy-Item -LiteralPath $script:IntegrationPath -Destination $quotedPath
+        $quoteOut = Invoke-NocttyInjectedChild -IntegrationPath $quotedPath -WithoutPSReadLine
+        Assert-True ($quoteOut.Contains('HELPER-RESOLVED') -and $quoteOut.Contains('NOCTTYPROBE> ')) "Quoted integration path did not load (U+$('{0:X4}' -f $point)): $quoteOut"
+    }
+
+    # Opt-in local share fixture: do not open an arbitrary network server on
+    # machines without a share. A local authority would make the URI's share
+    # name look like a POSIX cwd, so omit UNC reports and keep the previous cwd.
+    if ($UncPath) {
+        $uncQuoted = ConvertTo-PowerShellLiteralContent $UncPath
+        $uncOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+            -Preamble "Set-Location -LiteralPath '$uncQuoted'; " `
+            -Postamble '; if ($null -eq (__ghostty_encode_cwd_uri)) { "UNC" + "-CWD-SKIPPED" }'
+        Assert-True ($uncOut.Contains('UNC-CWD-SKIPPED') -and -not $uncOut.Contains(']7;')) "A UNC child emitted a misleading OSC 7 cwd: $uncOut"
+        Assert-True ($uncOut.Contains(']133;A;') -and $uncOut.Contains(']133;B')) "UNC suppression dropped prompt marks: $uncOut"
+    }
+
+    # A replaced prompt takes the reader's fallback OSC 7 path. Use the
+    # stand-in reader so this is a real host read without PSReadLine pipe errors.
+    foreach ($providerLocation in $unsupportedLocations) {
+        $providerQuoted = ConvertTo-PowerShellLiteralContent $providerLocation
+        $providerOut = Invoke-NocttyInjectedChild -StandInReader `
+            -Lines @(
+                "Set-Location -LiteralPath '$providerQuoted'; function global:prompt { 'PROVIDER> ' }",
+                '"PROVIDER" + "-READ"',
+                'exit'
+            )
+        $afterProvider = $providerOut.Substring($providerOut.IndexOf('PROVIDER> '))
+        Assert-True (-not $afterProvider.Contains(']7;')) "The fallback reader emitted OSC 7 for an unsupported cwd: $afterProvider"
+        Assert-True ($afterProvider.Contains(']133;P;k=i;redraw=0') -and $afterProvider.Contains(']133;B')) "The provider skip dropped the fallback prompt marks: $afterProvider"
+    }
 
     # Case 1: the plain injected launch.
     # Case 2: the same launch under a profile that enabled Set-StrictMode.
@@ -647,6 +869,32 @@ try {
     $userSshShown = $userSshOut -replace [char]27, '<ESC>'
     Assert-True ($userSshOut.Contains('USER-SSH-SURVIVED')) "Loading with no ssh-* feature destroyed the user's own ssh function: $userSshShown"
     Assert-True ($userSshOut.Contains('ERRCOUNT=0')) "Loading polluted `$Error: $userSshShown"
+
+    $fakeQuoted = ConvertTo-PowerShellLiteralContent $fakeSsh
+    $captureQuoted = ConvertTo-PowerShellLiteralContent $fakeCapture
+    foreach ($existingSsh in @(
+        "function global:ssh { 'mine' }; ",
+        "function global:NocttyUserSsh { 'mine' }; Set-Alias ssh NocttyUserSsh -Scope Global; "
+    )) {
+        $ownedOut = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+            -Preamble ($existingSsh + "`$env:GHOSTTY_SHELL_FEATURES = 'ssh-env'; `$Error.Clear(); ") `
+            -Postamble ("; function global:__ghostty_find_command_application { '$fakeQuoted' }; " + '; if ((ssh) -ceq "mine") { "USER" + "-SSH-SURVIVED" }; "ERR" + "COUNT=" + $Error.Count')
+        Assert-True ($ownedOut.Contains('USER-SSH-SURVIVED') -and $ownedOut.Contains('ERRCOUNT=0')) "ssh-env replaced a profile function or alias: $ownedOut"
+    }
+
+    # Exercise the binder and cleanup after the bootstrap scope has died.
+    $sshChild = Invoke-NocttyInjectedChild -WithoutPSReadLine `
+        -Preamble "`$env:GHOSTTY_SHELL_FEATURES = 'ssh-env'; " `
+        -Postamble ("; function global:__ghostty_find_command_application { '$fakeQuoted' }; " +
+            "`$env:FAKE_SSH_CAPTURE = '$captureQuoted'; " +
+            "Remove-Item Env:TERM,Env:COLORTERM -ErrorAction Ignore -Confirm:`$false; " +
+            "`$ConfirmPreference = 'Low'; `$WhatIfPreference = `$true; `$Error.Clear(); " +
+            "ssh -i k -p 22 -o A=b -E log -v -A host; " +
+            "Get-Content -LiteralPath '$captureQuoted'; " +
+            '$Error.Clear(); ssh host; ' +
+            '"ERR" + "COUNT=" + $Error.Count; "ENV" + "CLEAN=" + ((-not (Test-Path Env:TERM)) -and (-not (Test-Path Env:COLORTERM)))')
+    Assert-True ($sshChild.Contains('ARGS=-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" -i k -p 22 -o A=b -E log -v -A host')) "Child ssh lost unquoted flags: $sshChild"
+    Assert-True ($sshChild.Contains('ERRCOUNT=0') -and $sshChild.Contains('ENVCLEAN=True')) "SSH cleanup prompted, was skipped, or polluted errors: $sshChild"
 
     # With the feature on we DO install a wrapper, and it must be ours rather
     # than the user's function left in place.
@@ -770,7 +1018,7 @@ try {
            Lines = @("function global:prompt { 'RE' + 'PLACED> ' }; cmd /c exit 5",
                      'cmd /c exit 5', 'Get-Date | Out-Null')
            Expect = @(0, 5, 5, 0)
-           Pattern = "REPLACED> $([char]27)\]133;D;5;aid=\d+$([char]7)$([char]27)\]7;file://[^$([char]7)]+$([char]7)$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))" }
+           Pattern = "REPLACED> $([char]27)\]133;D;5;aid=\d+$([char]7)$([char]27)\]7;file://[^$([char]7)]+$([char]7)$([regex]::Escape($modeReset))$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))" }
         # The replacing prompt ran a native of its own, which moved
         # $LASTEXITCODE; the failure can then only report 1.
         @{ Name = 'native failure under a prompt that runs a native'
@@ -799,7 +1047,7 @@ try {
                      'Get-Date | Out-Null', "throw 'x'",
                      '("ERR" + "COUNT=") + $Error.Count')
            Expect = @(0)
-           Pattern = "LOCKED> $([char]27)\]7;file://[^$([char]7)]+$([char]7)$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))"
+           Pattern = "LOCKED> $([char]27)\]7;file://[^$([char]7)]+$([char]7)$([regex]::Escape($modeReset))$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))"
            ErrorCount = 1 }
         # Likewise a deleted prompt, which the wrapper leaves deleted: the
         # host draws its own default prompt on every line.
@@ -809,7 +1057,7 @@ try {
            Lines = @('Remove-Item function:prompt; cmd /c exit 5',
                      'cmd /c exit 5', 'Get-Date | Out-Null')
            Expect = @(0)
-           Pattern = "$([char]27)\]7;file://[^$([char]7)]+$([char]7)$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))" }
+           Pattern = "$([char]27)\]7;file://[^$([char]7)]+$([char]7)$([regex]::Escape($modeReset))$([char]27)\]133;P;k=i;redraw=0$([char]7)$([regex]::Escape($B))" }
         # A script that calls the reader itself (here for `answer`) is not
         # the host's read and gets no D; a D there would end the command
         # that is still running.
@@ -846,7 +1094,7 @@ try {
         }
     }
 
-    Write-Output 'PASS powershell shell integration'
+    Write-Output "PASS powershell shell integration: $script:AssertionCount assertions passed"
 } finally {
     [Console]::SetOut($script:OriginalOut)
     Pop-Location -ErrorAction SilentlyContinue
@@ -862,6 +1110,9 @@ try {
     Remove-Variable -Name '__noctty_test_status', '__noctty_test_next_line' -Scope Global -ErrorAction Ignore
     if ($script:PSReadLineImported) {
         Set-PSReadLineOption -AddToHistoryHandler $script:OriginalAddToHistoryHandler
+    }
+    if ($null -ne $script:OriginalHistoryOptions) {
+        Set-PSReadLineOption @script:OriginalHistoryOptions
     }
     if ($null -eq $script:OriginalFeatures) {
         Remove-Item Env:GHOSTTY_SHELL_FEATURES -ErrorAction SilentlyContinue

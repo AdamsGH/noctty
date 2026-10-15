@@ -814,9 +814,14 @@ fn renderFollowupWindowActive(self: *const Thread) bool {
 fn shouldContinueRenderFollowup(self: *Thread) bool {
     if (apprt.runtime != apprt.win32 or !self.flags.visible) return false;
 
+    // A frame update pacing put off is still owed, dirt or not (a scroll to
+    // the bottom, a blink). The custom-shader draw timer carries it while it
+    // runs (#297); without it only this follow-up will.
+    if (self.frame_update_deferred and !self.draw_active) return true;
+
     self.state.mutex.lock();
     defer self.state.mutex.unlock();
-    return terminal_render_dirty.needsRendererWake(self.state.terminal);
+    return terminal_render_dirty.needsFrame(self.state.terminal, self.state.drawn_undirtied);
 }
 
 fn renderOnce(self: *Thread, from_wakeup: bool) bool {
@@ -1022,6 +1027,7 @@ fn renderCallback(
     switch (renderFollowupDecision(
         t.shouldContinueRenderFollowup(),
         t.renderFollowupWindowActive(),
+        t.state.wakePending(),
     )) {
         .render => if (t.renderOnce(false)) t.scheduleRenderFollowup(),
         .poll => t.scheduleRenderFollowup(),
@@ -1033,9 +1039,14 @@ fn renderCallback(
 
 const RenderFollowupDecision = enum { stop, poll, render };
 
-fn renderFollowupDecision(dirty: bool, window_active: bool) RenderFollowupDecision {
-    if (dirty) return .render;
-    if (window_active) return .poll;
+/// `wake_pending`: a wake has been asked for and its callback has not run
+/// yet. The loop runs a due follow-up timer before that callback, so output
+/// that both made the terminal dirty and asked for the wake reaches the
+/// timer first. The wake renders it; if the timer did too, the wake would
+/// find the paint slot taken and present the same frame again after it.
+fn renderFollowupDecision(dirty: bool, window_active: bool, wake_pending: bool) RenderFollowupDecision {
+    if (dirty and !wake_pending) return .render;
+    if (dirty or window_active) return .poll;
     return .stop;
 }
 
@@ -1217,9 +1228,19 @@ test "cursor blink timer disarms for a steady cursor" {
 test "render followup does not redraw a clean terminal" {
     const testing = std.testing;
 
-    try testing.expectEqual(RenderFollowupDecision.poll, renderFollowupDecision(false, true));
-    try testing.expectEqual(RenderFollowupDecision.render, renderFollowupDecision(true, true));
-    try testing.expectEqual(RenderFollowupDecision.stop, renderFollowupDecision(false, false));
+    try testing.expectEqual(RenderFollowupDecision.poll, renderFollowupDecision(false, true, false));
+    try testing.expectEqual(RenderFollowupDecision.render, renderFollowupDecision(true, true, false));
+    try testing.expectEqual(RenderFollowupDecision.stop, renderFollowupDecision(false, false, false));
+}
+
+test "render followup leaves dirt to a wake already on its way" {
+    const testing = std.testing;
+
+    try testing.expectEqual(RenderFollowupDecision.render, renderFollowupDecision(true, false, false));
+    try testing.expectEqual(RenderFollowupDecision.poll, renderFollowupDecision(true, true, true));
+    try testing.expectEqual(RenderFollowupDecision.poll, renderFollowupDecision(true, false, true));
+    try testing.expectEqual(RenderFollowupDecision.poll, renderFollowupDecision(false, true, true));
+    try testing.expectEqual(RenderFollowupDecision.stop, renderFollowupDecision(false, false, true));
 }
 
 test "renderer follow-up check tracks visible terminal dirtiness" {

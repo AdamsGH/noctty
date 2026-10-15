@@ -77,6 +77,29 @@ zig build bench:vt-throughput -- --workload=scroll --bytes=4194304 --seed=121 --
 zig build bench:palette-match -- --entries=5000 --keystrokes=5000 --budget-us=2500
 ```
 
+### Scrollback search under streaming output
+
+`bench:search-stream` is a diagnostic, not a CI gate. It fills the scrollback
+with log lines that match the needle, then either drives the search thread's
+`Search` state the way the thread does (`--mode=feed`: the initial search, then
+one refresh per 32 KiB of output) or runs the real search thread while output
+streams in 4 KiB writes under the terminal lock (`--mode=thread`;
+`--rate-mib-s` paces the output, and the writer's time waiting for the lock is
+reported). Recorded 2026-10-11 for PKG-36 on the Ryzen 9 9900X, Windows build
+26300, `ReleaseFast`, with `--lines=100000` (118k matches over 358 pages, 45 x
+140, 200 MiB scrollback); medians:
+
+| Measure                                                                        | Before PKG-36 |  After |
+| ------------------------------------------------------------------------------ | ------------: | -----: |
+| Initial search (`--mode=feed --stream-mib=4 --runs=5`)                         |      3,294 ms | 265 ms |
+| One refresh, `Search.feed` plus `notify` (same run, n = 640)                   |       27.7 ms | 3.8 ms |
+| Writer's lock wait, 8 MiB at 2 MiB/s (`--mode=thread --rate-mib-s=2 --runs=3`) |      2,668 ms | 565 ms |
+
+```powershell
+zig build bench:search-stream -- --mode=feed --lines=100000 --stream-mib=4 --runs=5
+zig build bench:search-stream -- --mode=thread --lines=100000 --stream-mib=8 --rate-mib-s=2 --runs=3
+```
+
 ## Measured interactive baseline
 
 First same-machine interactive baseline, recorded 2026-08-27 from
@@ -223,6 +246,11 @@ machine/display fingerprint, endpoint, observers, and threshold provenance.
   descriptor through that inventory, the still-untouched real DC uses the
   prior depth-constrained `ChoosePixelFormat` request and validates its actual
   described format before the one permitted `SetPixelFormat` call.
+  Every path requires a fixed-point RGBA8 format: exactly 32 colour and 8
+  alpha bits, and `WGL_TYPE_RGBA_ARB` where the extended path can query the
+  type. A float or deeper format is refused rather than ranked lower, because
+  NVIDIA's only accumulation-free window formats are RGBA16F, which a
+  descriptor reports as plain `PFD_TYPE_RGBA` with 64 colour bits (#299).
   Both extended paths require stereo off and full hardware acceleration. Formats
   without accumulation, auxiliary, depth, or stencil attachments rank first,
   but a base-compatible format with those attachments remains usable and its
@@ -233,9 +261,10 @@ machine/display fingerprint, endpoint, observers, and threshold provenance.
   requires `WGL_ARB_multisample`. Absence of the family-compatible query
   capability is recorded explicitly with null sample counts rather than
   presented as a measured zero.
-  Extended selection first requests a bounded inventory of base drawable RGBA
-  matches; acceleration, sRGB, stereo, and multisample rules are applied only
-  after every returned match is queried. Attachment counts remain ranking and
+  Extended selection first requests an inventory of base drawable RGBA matches,
+  bounded, like the classic inventory, at 4096 formats; each returned match is
+  then queried and held to the acceleration, sRGB, stereo, and multisample
+  rules before it is ranked. Attachment counts remain ranking and
   provenance inputs. If that post-filter produces no verified
   format, selection falls back to the classic request and the selected-format
   evidence records what was actually chosen.

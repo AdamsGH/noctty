@@ -6,6 +6,7 @@
 //! `uiautomationcore` from widget code is a bug.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const com = @import("com.zig");
 const constants = @import("constants.zig");
 
@@ -213,6 +214,11 @@ pub const StructureChange = enum {
     }
 };
 
+/// Under test, how many structure changes were asked for on this thread. They
+/// are counted and not raised, so a test sees them whether or not a UIA client
+/// is attached to the machine, and UIA never holds a provider the test frees.
+pub threadlocal var testing_structure_changes: usize = 0;
+
 /// Pass `runtime_id = null` for the bulk / invalidated forms. Empty
 /// slices are also coerced to null so callers can't accidentally raise
 /// a miscoped event with a zero-length runtime id.
@@ -221,6 +227,10 @@ pub fn raiseStructureChanged(
     change: StructureChange,
     runtime_id: ?[]i32,
 ) void {
+    if (builtin.is_test) {
+        testing_structure_changes += 1;
+        return;
+    }
     if (!clientsAreListening()) return;
     const effective: ?[]i32 = if (runtime_id) |slice|
         (if (slice.len == 0) null else slice)

@@ -29,7 +29,12 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             .optimize = cfg.optimize,
             .strip = cfg.strip,
             .omit_frame_pointer = cfg.strip,
-            .unwind_tables = if (cfg.strip) .none else .sync,
+            // Kept when stripped. On x64 Windows these are the .pdata/.xdata
+            // records a debugger unwinds with; a function without one is
+            // taken for a leaf, so a minidump's stacks stop making sense at
+            // the first noctty frame (#299). Measured on ReleaseFast:
+            // +132,096 bytes (0.5%) on noctty.exe.
+            .unwind_tables = .sync,
         }),
         // Crashes on x86_64 self-hosted on 0.15.1
         .use_llvm = true,
@@ -60,7 +65,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                     .optimize = cfg.optimize,
                     .strip = cfg.strip,
                     .omit_frame_pointer = cfg.strip,
-                    .unwind_tables = if (cfg.strip) .none else .sync,
+                    .unwind_tables = .sync,
                 }),
                 .use_llvm = true,
             });

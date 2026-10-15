@@ -4,16 +4,16 @@
 //! standard OLE drag-drop COM interface so Explorer (and any other drag
 //! source) can drop files, text, URLs, and HTML onto a terminal pane.
 //!
-//! Lifetime: caller-owned. The struct is stack- or field-embedded in the
-//! surface; `init` / `deinit` are symmetric. `register` / `revoke` pair
-//! around the HWND lifetime.
+//! Lifetime: heap-allocated and COM-refcounted. The surface owns one
+//! reference, clears its context before revoke, then releases its reference.
+//! Retained COM references keep detached targets alive until final Release.
 //!
 //! Thread safety: all COM callbacks arrive on the thread that called
 //! `RegisterDragDrop`, which MUST be the STA-initialised UI thread.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const windows = std.os.windows;
+const sys = @import("win32/sys.zig");
 const drop = @import("win32_surface_drop.zig");
 const ole_types = @import("win32_ole.zig");
 const win32_types = @import("win32_types.zig");
@@ -36,7 +36,6 @@ const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
 const E_FAIL: HRESULT = @bitCast(@as(u32, 0x80004005));
 const E_UNEXPECTED: HRESULT = @bitCast(@as(u32, 0x8000FFFF));
 
-const DRAGDROP_E_ALREADYREGISTERED: HRESULT = @bitCast(@as(u32, 0x80040101));
 const DRAGDROP_E_NOTREGISTERED: HRESULT = @bitCast(@as(u32, 0x80040100));
 const CO_E_NOTINITIALIZED: HRESULT = @bitCast(@as(u32, 0x800401F0));
 
@@ -105,100 +104,28 @@ comptime {
     }
 }
 
-// ── Runtime-loaded functions ───────────────────────────────────────────
-
-const Ole32Fns = struct {
-    RegisterDragDrop: *const fn (HWND, *IDropTargetObj) callconv(.winapi) HRESULT = undefined,
-    RevokeDragDrop: *const fn (HWND) callconv(.winapi) HRESULT = undefined,
-    CoTaskMemFree: *const fn (?*anyopaque) callconv(.winapi) void = undefined,
-    ReleaseStgMedium: *const fn (*STGMEDIUM) callconv(.winapi) void = undefined,
-};
-
-const Shell32Fns = struct {
-    DragQueryFileW: *const fn (?*anyopaque, UINT, ?[*]u16, UINT) callconv(.winapi) UINT = undefined,
-    DragFinish: *const fn (?*anyopaque) callconv(.winapi) void = undefined,
-};
-
-const Kernel32Fns = struct {
-    GlobalLock: *const fn (?*anyopaque) callconv(.winapi) ?[*]u8 = undefined,
-    GlobalUnlock: *const fn (?*anyopaque) callconv(.winapi) BOOL = undefined,
-    GlobalSize: *const fn (?*anyopaque) callconv(.winapi) usize = undefined,
-};
-
-const User32Fns = struct {
-    RegisterClipboardFormatW: *const fn ([*:0]const u16) callconv(.winapi) UINT = undefined,
-};
-
-var ole32_fns: ?Ole32Fns = null;
-var shell32_fns: ?Shell32Fns = null;
-var kernel32_fns: ?Kernel32Fns = null;
-var user32_fns: ?User32Fns = null;
-
-/// Registered format IDs (process-local, cached on first use).
-var cf_html_id: UINT = 0;
+/// Registered URL format ID, used only on the STA UI thread.
 var cf_shellurl_id: UINT = 0;
 
-fn loadOle32() ?Ole32Fns {
-    if (ole32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("ole32.dll")) orelse return null;
-    var fns: Ole32Fns = .{};
-    fns.RegisterDragDrop = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "RegisterDragDrop") orelse return null));
-    fns.RevokeDragDrop = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "RevokeDragDrop") orelse return null));
-    fns.CoTaskMemFree = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "CoTaskMemFree") orelse return null));
-    fns.ReleaseStgMedium = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "ReleaseStgMedium") orelse return null));
-    ole32_fns = fns;
-    return fns;
-}
-
-fn loadShell32() ?Shell32Fns {
-    if (shell32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("shell32.dll")) orelse return null;
-    var fns: Shell32Fns = .{};
-    fns.DragQueryFileW = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "DragQueryFileW") orelse return null));
-    fns.DragFinish = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "DragFinish") orelse return null));
-    shell32_fns = fns;
-    return fns;
-}
-
-fn loadKernel32() ?Kernel32Fns {
-    if (kernel32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("kernel32.dll")) orelse return null;
-    var fns: Kernel32Fns = .{};
-    fns.GlobalLock = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalLock") orelse return null));
-    fns.GlobalUnlock = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalUnlock") orelse return null));
-    fns.GlobalSize = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalSize") orelse return null));
-    kernel32_fns = fns;
-    return fns;
-}
-
-fn loadUser32() ?User32Fns {
-    if (user32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("user32.dll")) orelse return null;
-    var fns: User32Fns = .{};
-    fns.RegisterClipboardFormatW = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "RegisterClipboardFormatW") orelse return null));
-    user32_fns = fns;
-    return fns;
-}
-
 fn ensureCustomFormats() void {
-    if (cf_html_id != 0) return;
-    const u32fns = loadUser32() orelse return;
-    cf_html_id = u32fns.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("HTML Format"));
-    cf_shellurl_id = u32fns.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("UniformResourceLocator"));
+    _ = ole_types.htmlFormat();
+    if (cf_shellurl_id == 0) {
+        cf_shellurl_id = sys.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("UniformResourceLocator"));
+    }
 }
 
 // ── DropTarget (public API) ────────────────────────────────────────────
 
 pub const PayloadFn = *const fn (surface_ctx: *anyopaque, payload: []const u8) void;
 
-pub const RegError = error{ RegisterFailed, OleNotInitialized, RuntimeMissing };
+pub const RegError = error{ RegisterFailed, OleNotInitialized };
 
 pub const DropTarget = struct {
     /// COM object header — MUST be first field so `&self == &self.obj`.
     obj: IDropTargetObj,
     refcount: std.atomic.Value(u32),
     alloc: Allocator,
-    surface_ctx: *anyopaque,
+    surface_ctx: ?*anyopaque,
     on_payload: PayloadFn,
     /// Cached from DragEnter: at least one accepted format was offered.
     has_accepted_format: bool,
@@ -214,7 +141,7 @@ pub const DropTarget = struct {
         .Drop = DropTarget.handleDrop,
     };
 
-    pub fn init(alloc: Allocator, surface_ctx: *anyopaque, on_payload: PayloadFn) DropTarget {
+    fn init(alloc: Allocator, surface_ctx: *anyopaque, on_payload: PayloadFn) DropTarget {
         ensureCustomFormats();
         return .{
             .obj = .{ .vtbl = &vtbl },
@@ -226,31 +153,37 @@ pub const DropTarget = struct {
         };
     }
 
+    pub fn create(alloc: Allocator, surface_ctx: *anyopaque, on_payload: PayloadFn) Allocator.Error!*DropTarget {
+        const self = try alloc.create(DropTarget);
+        self.* = init(alloc, surface_ctx, on_payload);
+        return self;
+    }
+
     pub fn register(self: *DropTarget, hwnd: HWND) RegError!void {
-        const fns = loadOle32() orelse return error.RuntimeMissing;
-        const hr = fns.RegisterDragDrop(hwnd, &self.obj);
-        if (hr == S_OK or hr == DRAGDROP_E_ALREADYREGISTERED) return;
+        const hr = sys.RegisterDragDrop(hwnd, @ptrCast(&self.obj));
+        if (hr == S_OK) return;
         if (hr == CO_E_NOTINITIALIZED) return error.OleNotInitialized;
+        // ALREADYREGISTERED belongs to the existing target, not this object.
         return error.RegisterFailed;
     }
 
+    pub fn detach(self: *DropTarget) void {
+        self.surface_ctx = null;
+        self.has_accepted_format = false;
+    }
+
     pub fn revoke(self: *DropTarget, hwnd: HWND) void {
-        _ = self;
-        const fns = loadOle32() orelse {
-            log.warn("ole32 not loaded during RevokeDragDrop", .{});
-            return;
-        };
-        const hr = fns.RevokeDragDrop(hwnd);
+        self.detach();
+        const hr = sys.RevokeDragDrop(hwnd);
         if (hr != S_OK and hr != DRAGDROP_E_NOTREGISTERED) {
             log.warn("RevokeDragDrop failed: 0x{x}", .{@as(u32, @bitCast(hr))});
         }
     }
 
+    /// Release the surface's reference; clients may still retain this target.
     pub fn deinit(self: *DropTarget) void {
-        if (std.debug.runtime_safety) {
-            const rc = self.refcount.load(.acquire);
-            std.debug.assert(rc == 0 or rc == 1);
-        }
+        self.detach();
+        _ = Release(&self.obj);
     }
 
     fn fromObj(p: *IDropTargetObj) *DropTarget {
@@ -282,7 +215,8 @@ pub const DropTarget = struct {
     fn Release(self_obj: *IDropTargetObj) callconv(.winapi) ULONG {
         const self = fromObj(self_obj);
         const prev = self.refcount.fetchSub(1, .acq_rel);
-        // Caller-owned lifetime: do NOT auto-free when refcount hits 0.
+        std.debug.assert(prev > 0);
+        if (prev == 1) self.alloc.destroy(self);
         return prev - 1;
     }
 
@@ -296,8 +230,15 @@ pub const DropTarget = struct {
         pdwEffect: *DWORD,
     ) callconv(.winapi) HRESULT {
         const self = fromObj(self_obj);
-        self.has_accepted_format = probeFormats(data_object);
-        pdwEffect.* = if (self.has_accepted_format) DROPEFFECT_COPY else DROPEFFECT_NONE;
+        _ = AddRef(self_obj);
+        defer _ = Release(self_obj);
+        if (self.surface_ctx == null) {
+            pdwEffect.* = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        const accepted = probeFormats(data_object);
+        self.has_accepted_format = self.surface_ctx != null and accepted;
+        pdwEffect.* = if (self.surface_ctx != null and self.has_accepted_format) DROPEFFECT_COPY else DROPEFFECT_NONE;
         return S_OK;
     }
 
@@ -308,7 +249,7 @@ pub const DropTarget = struct {
         pdwEffect: *DWORD,
     ) callconv(.winapi) HRESULT {
         const self = fromObj(self_obj);
-        pdwEffect.* = if (self.has_accepted_format) DROPEFFECT_COPY else DROPEFFECT_NONE;
+        pdwEffect.* = if (self.surface_ctx != null and self.has_accepted_format) DROPEFFECT_COPY else DROPEFFECT_NONE;
         return S_OK;
     }
 
@@ -326,35 +267,44 @@ pub const DropTarget = struct {
         pdwEffect: *DWORD,
     ) callconv(.winapi) HRESULT {
         const self = fromObj(self_obj);
+        // GetData and the payload callback can reenter surface destruction.
+        _ = AddRef(self_obj);
+        defer _ = Release(self_obj);
         defer self.has_accepted_format = false;
+        pdwEffect.* = DROPEFFECT_NONE;
+        if (self.surface_ctx == null) return S_OK;
 
         const mods = modifiersFromKeyState(grfKeyState);
 
         // Try formats in priority order.
         if (self.tryExtractHdrop(data_object, mods)) |payload| {
             defer self.alloc.free(payload);
-            self.on_payload(self.surface_ctx, payload);
+            const ctx = self.surface_ctx orelse return S_OK;
+            self.on_payload(ctx, payload);
             pdwEffect.* = DROPEFFECT_COPY;
             return S_OK;
         }
 
         if (self.tryExtractUnicodeText(data_object, mods)) |payload| {
             defer self.alloc.free(payload);
-            self.on_payload(self.surface_ctx, payload);
+            const ctx = self.surface_ctx orelse return S_OK;
+            self.on_payload(ctx, payload);
             pdwEffect.* = DROPEFFECT_COPY;
             return S_OK;
         }
 
         if (self.tryExtractHtml(data_object, mods)) |payload| {
             defer self.alloc.free(payload);
-            self.on_payload(self.surface_ctx, payload);
+            const ctx = self.surface_ctx orelse return S_OK;
+            self.on_payload(ctx, payload);
             pdwEffect.* = DROPEFFECT_COPY;
             return S_OK;
         }
 
         if (self.tryExtractShellUrl(data_object)) |payload| {
             defer self.alloc.free(payload);
-            self.on_payload(self.surface_ctx, payload);
+            const ctx = self.surface_ctx orelse return S_OK;
+            self.on_payload(ctx, payload);
             pdwEffect.* = DROPEFFECT_COPY;
             return S_OK;
         }
@@ -366,10 +316,6 @@ pub const DropTarget = struct {
     // ── Format extraction helpers ───────────────────────────────────────
 
     fn tryExtractHdrop(self: *DropTarget, data_object: *IDataObject, mods: drop.Modifiers) ?[]u8 {
-        const sh32 = loadShell32() orelse return null;
-        const k32 = loadKernel32() orelse return null;
-        const ole = loadOle32() orelse return null;
-
         var fmt = FORMATETC{
             .cfFormat = CF_HDROP,
             .ptd = null,
@@ -380,48 +326,18 @@ pub const DropTarget = struct {
         var stg: STGMEDIUM = std.mem.zeroes(STGMEDIUM);
 
         if (data_object.vtbl.GetData(data_object, &fmt, &stg) != S_OK) return null;
-        defer ole.ReleaseStgMedium(&stg);
+        defer sys.ReleaseStgMedium(&stg);
 
         const hDrop = stg.u.hGlobal orelse return null;
-        const file_count = sh32.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
-        if (file_count == 0) return null;
-
-        // Collect UTF-8 paths.
-        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer {
-            for (paths.items) |p| self.alloc.free(p);
-            paths.deinit(self.alloc);
+        const payload = ole_types.extractHdrop(self.alloc, hDrop, mods) catch return null;
+        if (payload.len == 0) {
+            self.alloc.free(payload);
+            return null;
         }
-
-        for (0..file_count) |i| {
-            const idx: UINT = @intCast(i);
-            const wchar_len = sh32.DragQueryFileW(hDrop, idx, null, 0);
-            if (wchar_len == 0) continue;
-
-            const buf = self.alloc.alloc(u16, wchar_len + 1) catch continue;
-            defer self.alloc.free(buf);
-            _ = sh32.DragQueryFileW(hDrop, idx, buf.ptr, wchar_len + 1);
-
-            // Convert UTF-16 to UTF-8.
-            const utf8 = std.unicode.utf16LeToUtf8Alloc(self.alloc, buf[0..wchar_len]) catch continue;
-            paths.append(self.alloc, utf8) catch {
-                self.alloc.free(utf8);
-                continue;
-            };
-        }
-
-        if (paths.items.len == 0) return null;
-
-        // Use GlobalLock just to satisfy the borrow — already extracted via DragQueryFileW.
-        _ = k32;
-
-        return drop.formatFilePayload(self.alloc, paths.items, mods) catch null;
+        return payload;
     }
 
     fn tryExtractUnicodeText(self: *DropTarget, data_object: *IDataObject, mods: drop.Modifiers) ?[]u8 {
-        const k32 = loadKernel32() orelse return null;
-        const ole = loadOle32() orelse return null;
-
         var fmt = FORMATETC{
             .cfFormat = CF_UNICODETEXT,
             .ptd = null,
@@ -432,33 +348,34 @@ pub const DropTarget = struct {
         var stg: STGMEDIUM = std.mem.zeroes(STGMEDIUM);
 
         if (data_object.vtbl.GetData(data_object, &fmt, &stg) != S_OK) return null;
-        defer ole.ReleaseStgMedium(&stg);
+        defer sys.ReleaseStgMedium(&stg);
 
         const hGlobal = stg.u.hGlobal orelse return null;
-        const locked: [*]const u16 = @ptrCast(@alignCast(k32.GlobalLock(hGlobal) orelse return null));
-        defer _ = k32.GlobalUnlock(hGlobal);
+        const locked: [*]const u16 = @ptrCast(@alignCast(sys.GlobalLock(hGlobal) orelse return null));
+        defer _ = sys.GlobalUnlock(hGlobal);
 
         // Find the null terminator or use GlobalSize.
-        const byte_size = k32.GlobalSize(hGlobal);
+        const byte_size = sys.GlobalSize(hGlobal);
         const max_u16 = byte_size / 2;
         var len: usize = 0;
         while (len < max_u16 and locked[len] != 0) : (len += 1) {}
 
         if (len == 0) return null;
 
-        const utf8 = std.unicode.utf16LeToUtf8Alloc(self.alloc, locked[0..len]) catch return null;
+        // A lone surrogate becomes U+FFFD rather than refusing the drop,
+        // as on the clipboard paste path.
+        const utf8 = std.unicode.wtf16LeToWtf8Alloc(self.alloc, locked[0..len]) catch return null;
         defer self.alloc.free(utf8);
+        std.unicode.wtf8ToUtf8Lossy(utf8, utf8) catch unreachable; // WTF-16 always gives WTF-8
 
         return drop.formatTextPayload(self.alloc, utf8, mods) catch null;
     }
 
     fn tryExtractHtml(self: *DropTarget, data_object: *IDataObject, mods: drop.Modifiers) ?[]u8 {
-        if (cf_html_id == 0) return null;
-        const k32 = loadKernel32() orelse return null;
-        const ole = loadOle32() orelse return null;
+        if (ole_types.htmlFormat() == 0) return null;
 
         var fmt = FORMATETC{
-            .cfFormat = @intCast(cf_html_id),
+            .cfFormat = @intCast(ole_types.htmlFormat()),
             .ptd = null,
             .dwAspect = DVASPECT_CONTENT,
             .lindex = -1,
@@ -467,13 +384,13 @@ pub const DropTarget = struct {
         var stg: STGMEDIUM = std.mem.zeroes(STGMEDIUM);
 
         if (data_object.vtbl.GetData(data_object, &fmt, &stg) != S_OK) return null;
-        defer ole.ReleaseStgMedium(&stg);
+        defer sys.ReleaseStgMedium(&stg);
 
         const hGlobal = stg.u.hGlobal orelse return null;
-        const locked: [*]const u8 = @ptrCast(k32.GlobalLock(hGlobal) orelse return null);
-        defer _ = k32.GlobalUnlock(hGlobal);
+        const locked: [*]const u8 = @ptrCast(sys.GlobalLock(hGlobal) orelse return null);
+        defer _ = sys.GlobalUnlock(hGlobal);
 
-        const byte_size = k32.GlobalSize(hGlobal);
+        const byte_size = sys.GlobalSize(hGlobal);
         if (byte_size == 0) return null;
 
         // CF_HTML is UTF-8 encoded with a header. Extract the fragment.
@@ -485,8 +402,6 @@ pub const DropTarget = struct {
 
     fn tryExtractShellUrl(self: *DropTarget, data_object: *IDataObject) ?[]u8 {
         if (cf_shellurl_id == 0) return null;
-        const k32 = loadKernel32() orelse return null;
-        const ole = loadOle32() orelse return null;
 
         var fmt = FORMATETC{
             .cfFormat = @intCast(cf_shellurl_id),
@@ -498,13 +413,13 @@ pub const DropTarget = struct {
         var stg: STGMEDIUM = std.mem.zeroes(STGMEDIUM);
 
         if (data_object.vtbl.GetData(data_object, &fmt, &stg) != S_OK) return null;
-        defer ole.ReleaseStgMedium(&stg);
+        defer sys.ReleaseStgMedium(&stg);
 
         const hGlobal = stg.u.hGlobal orelse return null;
-        const locked: [*]const u8 = @ptrCast(k32.GlobalLock(hGlobal) orelse return null);
-        defer _ = k32.GlobalUnlock(hGlobal);
+        const locked: [*]const u8 = @ptrCast(sys.GlobalLock(hGlobal) orelse return null);
+        defer _ = sys.GlobalUnlock(hGlobal);
 
-        const byte_size = k32.GlobalSize(hGlobal);
+        const byte_size = sys.GlobalSize(hGlobal);
         if (byte_size == 0) return null;
 
         const url = drop.extractShellUrl(locked[0..byte_size]);
@@ -547,7 +462,7 @@ fn probeFormats(data_object: *IDataObject) bool {
             while (e.vtbl.Next(e, 1, @ptrCast(&fmt), null) == S_OK) {
                 if (fmt.cfFormat == CF_HDROP) return true;
                 if (fmt.cfFormat == CF_UNICODETEXT) return true;
-                if (cf_html_id != 0 and fmt.cfFormat == @as(WORD, @intCast(cf_html_id))) return true;
+                if (ole_types.htmlFormat() != 0 and fmt.cfFormat == @as(WORD, @intCast(ole_types.htmlFormat()))) return true;
                 if (cf_shellurl_id != 0 and fmt.cfFormat == @as(WORD, @intCast(cf_shellurl_id))) return true;
             }
             return false;
@@ -559,7 +474,7 @@ fn probeFormats(data_object: *IDataObject) bool {
     // no enumeration needed.
     return queryGetDataForFormat(data_object, CF_HDROP) or
         queryGetDataForFormat(data_object, CF_UNICODETEXT) or
-        (cf_html_id != 0 and queryGetDataForFormat(data_object, @as(WORD, @intCast(cf_html_id)))) or
+        (ole_types.htmlFormat() != 0 and queryGetDataForFormat(data_object, @as(WORD, @intCast(ole_types.htmlFormat())))) or
         (cf_shellurl_id != 0 and queryGetDataForFormat(data_object, @as(WORD, @intCast(cf_shellurl_id))));
 }
 
@@ -584,7 +499,8 @@ test "DropTarget QueryInterface returns IDropTarget on the known IID" {
     const noop = struct {
         fn cb(_: *anyopaque, _: []const u8) void {}
     }.cb;
-    var dt = DropTarget.init(std.testing.allocator, @ptrFromInt(0x1), noop);
+    const dt = try DropTarget.create(std.testing.allocator, @ptrFromInt(0x1), noop);
+    defer dt.deinit();
 
     var out: ?*anyopaque = null;
     const hr = DropTarget.QueryInterface(&dt.obj, &IID_IDropTarget, &out);
@@ -612,17 +528,128 @@ test "DropTarget AddRef/Release refcount is atomic" {
     const noop = struct {
         fn cb(_: *anyopaque, _: []const u8) void {}
     }.cb;
-    var dt = DropTarget.init(std.testing.allocator, @ptrFromInt(0x1), noop);
+    const dt = try DropTarget.create(std.testing.allocator, @ptrFromInt(0x1), noop);
+    defer dt.deinit();
 
     // init sets refcount to 1.
     try std.testing.expectEqual(@as(u32, 2), DropTarget.AddRef(&dt.obj));
     try std.testing.expectEqual(@as(u32, 3), DropTarget.AddRef(&dt.obj));
     try std.testing.expectEqual(@as(u32, 2), DropTarget.Release(&dt.obj));
     try std.testing.expectEqual(@as(u32, 1), DropTarget.Release(&dt.obj));
-    try std.testing.expectEqual(@as(u32, 0), DropTarget.Release(&dt.obj));
+    // The deferred deinit releases the final owning reference.
+}
 
-    // Caller-owned: no auto-free on 0. Refcount is now 0.
-    try std.testing.expectEqual(@as(u32, 0), dt.refcount.load(.acquire));
+test "retained DropTarget final Release frees its allocation" {
+    const noop = struct {
+        fn cb(_: *anyopaque, _: []const u8) void {}
+    }.cb;
+    const dt = try std.testing.allocator.create(DropTarget);
+    dt.* = DropTarget.init(std.testing.allocator, @ptrFromInt(0x1), noop);
+    try std.testing.expectEqual(@as(u32, 2), DropTarget.AddRef(&dt.obj));
+    // The surface drops its reference while an OLE client still owns one.
+    try std.testing.expectEqual(@as(u32, 1), DropTarget.Release(&dt.obj));
+    _ = DropTarget.DragLeave(&dt.obj);
+    try std.testing.expectEqual(@as(u32, 0), DropTarget.Release(&dt.obj));
+    // testing.allocator verifies that the final COM Release freed storage.
+}
+
+test "retained detached DropTarget rejects every drag callback" {
+    const noop = struct {
+        fn cb(_: *anyopaque, _: []const u8) void {
+            @panic("detached target delivered a payload");
+        }
+    }.cb;
+    const dt = try DropTarget.create(std.testing.allocator, @ptrFromInt(1), noop);
+    _ = DropTarget.AddRef(&dt.obj);
+    dt.deinit(); // The surface is gone; the retained client is still alive.
+    defer _ = DropTarget.Release(&dt.obj);
+    var data: IDataObject = .{ .vtbl = undefined }; // Must never be called.
+    var effect: DWORD = DROPEFFECT_COPY;
+    try std.testing.expectEqual(S_OK, DropTarget.DragEnter(&dt.obj, &data, 0, .{ .x = 0, .y = 0 }, &effect));
+    try std.testing.expectEqual(DROPEFFECT_NONE, effect);
+    dt.has_accepted_format = true; // Guard context even with stale cached state.
+    effect = DROPEFFECT_COPY;
+    try std.testing.expectEqual(S_OK, DropTarget.DragOver(&dt.obj, 0, .{ .x = 0, .y = 0 }, &effect));
+    try std.testing.expectEqual(DROPEFFECT_NONE, effect);
+    effect = DROPEFFECT_COPY;
+    try std.testing.expectEqual(S_OK, DropTarget.handleDrop(&dt.obj, &data, 0, .{ .x = 0, .y = 0 }, &effect));
+    try std.testing.expectEqual(DROPEFFECT_NONE, effect);
+    try std.testing.expectEqual(S_OK, DropTarget.DragLeave(&dt.obj));
+}
+
+test "DropTarget GetData reentry can destroy the surface before payload delivery" {
+    const Source = struct {
+        obj: IDataObject,
+        target: *DropTarget,
+        const source_vtbl: ole_types.IDataObjectVtbl = .{
+            .QueryInterface = undefined,
+            .AddRef = undefined,
+            .Release = undefined,
+            .GetData = getData,
+            .GetDataHere = undefined,
+            .QueryGetData = undefined,
+            .GetCanonicalFormatEtc = undefined,
+            .SetData = undefined,
+            .EnumFormatEtc = undefined,
+            .DAdvise = undefined,
+            .DUnadvise = undefined,
+            .EnumDAdvise = undefined,
+        };
+        fn getData(obj: *IDataObject, fmt: *const FORMATETC, medium: *STGMEDIUM) callconv(.winapi) HRESULT {
+            if (fmt.cfFormat != CF_UNICODETEXT) return E_FAIL;
+            const self: *@This() = @fieldParentPtr("obj", obj);
+            const text = std.unicode.utf8ToUtf16LeStringLiteral("payload");
+            const bytes = std.mem.sliceAsBytes(text[0 .. text.len + 1]);
+            const handle = sys.GlobalAlloc(2, bytes.len) orelse return E_FAIL;
+            const locked: [*]u8 = @ptrCast(sys.GlobalLock(handle) orelse {
+                _ = sys.GlobalFree(handle);
+                return E_FAIL;
+            });
+            @memcpy(locked[0..bytes.len], bytes);
+            _ = sys.GlobalUnlock(handle);
+            medium.* = .{ .tymed = TYMED_HGLOBAL, .u = .{ .hGlobal = handle }, .pUnkForRelease = null };
+            self.target.deinit(); // Releases the only surface reference mid-call.
+            return S_OK;
+        }
+        fn payload(_: *anyopaque, _: []const u8) void {
+            @panic("GetData delivered to a destroyed surface");
+        }
+    };
+    const dt = try DropTarget.create(std.testing.allocator, @ptrFromInt(1), Source.payload);
+    var source: Source = .{ .obj = .{ .vtbl = &Source.source_vtbl }, .target = dt };
+    var effect: DWORD = DROPEFFECT_COPY;
+    try std.testing.expectEqual(S_OK, DropTarget.handleDrop(&dt.obj, &source.obj, 0, .{ .x = 0, .y = 0 }, &effect));
+    try std.testing.expectEqual(DROPEFFECT_NONE, effect);
+    // The callback's temporary ref kept it alive; its return freed the target.
+}
+
+test "OLE STA initialization allows DropTarget registration on an unshown window" {
+    const Fixture = struct {
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = check();
+        }
+        fn payload(_: *anyopaque, _: []const u8) void {}
+        fn check() !void {
+            const hr = sys.OleInitialize(null);
+            try std.testing.expect(hr == S_OK or hr == 1);
+            defer sys.OleUninitialize();
+            const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.WindowCreationFailed;
+            defer _ = sys.DestroyWindow(hwnd);
+            const dt = try DropTarget.create(std.testing.allocator, @ptrFromInt(1), payload);
+            defer dt.deinit();
+            try dt.register(hwnd);
+            defer dt.revoke(hwnd);
+            // A failed second registration must not acquire ownership of the HWND.
+            const other = try DropTarget.create(std.testing.allocator, @ptrFromInt(1), payload);
+            defer other.deinit();
+            try std.testing.expectError(error.RegisterFailed, other.register(hwnd));
+        }
+    };
+    var fixture: Fixture = .{};
+    const thread = try std.Thread.spawn(.{}, Fixture.run, .{&fixture});
+    thread.join();
+    try fixture.result;
 }
 
 test "Modifier extraction from key_state maps shift/ctrl/alt correctly" {
@@ -661,7 +688,8 @@ test "DragLeave resets has_accepted_format" {
     const noop = struct {
         fn cb(_: *anyopaque, _: []const u8) void {}
     }.cb;
-    var dt = DropTarget.init(std.testing.allocator, @ptrFromInt(0x1), noop);
+    const dt = try DropTarget.create(std.testing.allocator, @ptrFromInt(0x1), noop);
+    defer dt.deinit();
     dt.has_accepted_format = true;
 
     _ = DropTarget.DragLeave(&dt.obj);

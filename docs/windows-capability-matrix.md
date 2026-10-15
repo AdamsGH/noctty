@@ -161,6 +161,16 @@ that:
   command marks and exit codes. Noctty does not activate Clink. Without the
   loaded Clink script, prompt/cwd marks still work but command-finish marks and
   exit codes are unavailable.
+- Working-directory reports drive tab titles and the directory new tabs and
+  splits start in. OSC 7 must be a URL (`file://`, or the `kitty-shell-cwd://`
+  noctty's own cmd integration sends) whose host is `localhost` or this machine
+  (NetBIOS, DNS host or fully qualified name, in any letter case, with or
+  without a trailing dot), so Git Bash, WSL, fish and nushell reports count and
+  an ssh session's does not. OSC 9;9, the form Windows Terminal documents and
+  oh-my-posh's `osc99` and nushell send, also takes a plain drive-absolute path
+  (`C:\Users\me`, quoted or not) or the `\\wsl.localhost\Distro\...` path
+  `wslpath -w` prints, with no host to check. Network shares, device paths and
+  paths with control bytes are ignored in both.
 
 ### Terminfo
 
@@ -231,9 +241,44 @@ non-US keyboard has not been used.
 Kitty and modifyOtherKeys encodings survive the pseudo console byte for byte
 on the two sources measured here — the in-box conhost of Windows
 `10.0.26200.0` and the bundled OpenConsole `1.24.260710001`; older in-box
-conhosts are unmeasured. noctty does not implement Win32 input mode
-(`CSI ?9001h`), which ConPTY requests at the start of every session. See the
-[key encoding differential](windows-vt-conformance.md#measured-master-to-child-key-encoding-differential).
+conhosts are unmeasured. noctty implements Win32 input mode (`CSI ?9001h`),
+which ConPTY requests at the start of every session: while it is set and no
+application has asked for the Kitty keyboard protocol, every key event goes to
+ConPTY as a `KEY_EVENT_RECORD` with the real virtual key, scan code,
+character, control-key state and repeat count, so console-API readers such as
+PSReadLine see Shift+Enter, Ctrl+Enter, Ctrl+punctuation, AltGr chords and
+F13-F24 as Windows reports them (Shift+Enter adds a PSReadLine continuation
+line instead of running the line). Measured against a real console window on
+the same keys in
+[windows-vt-conformance.md](windows-vt-conformance.md#measured-win32-input-mode-records):
+every measured record agrees with conhost's except a latched dead key's
+release, where conhost emits the accent twice and Windows Terminal and noctty
+once; a physical non-US keyboard, IME composition and the in-box conhost as
+the pty are not measured. An application that reads VT bytes and asked for
+Kitty keeps those bytes; every other VT-input child, modifyOtherKeys included
+(conhost does not implement it), receives conhost's re-encoding of the
+records, as under Windows Terminal.
+
+Mouse input for console-API children goes the other way: a child that sets
+`ENABLE_MOUSE_INPUT` makes the bundled ConPTY ask noctty for SGR mouse
+reporting (`CSI ?1003;1006h`, `VtIo::Writer::WriteSGR1006`) and decode
+noctty's reports into `MOUSE_EVENT` records, which a `ReadConsoleInputW`
+reader receives (measured, `test/windows/hidden-win11-herdr-mouse.ps1`). herdr
+0.8.2 in its default client/server mode reads those and its pane focus follows
+clicks under noctty (`pane current`: `w1:p1`, `w1:p2`, `w1:p1`) and under
+WezTerm (`w1:p1`, `w1:p2`, `w1:p3`, with the split's pane reported as `w1:p3`
+there; herdr's own input trace shows the same clicks at the same cells under
+both). Its `--no-session` (monolithic) mode ignores clicks under both
+terminals: it leaves the console in mode 0x98 (crossterm's
+`EnableMouseCapture` on Windows sets the console mode and emits no
+`CSI ?1000h`) and reads stdin as bytes, which a console never fills from
+`MOUSE_EVENT` records. That is the audit's G019 observation and it is herdr's,
+not noctty's. The same observer under WezTerm 20240203's own OpenConsole
+receives no mouse records at all, with or without
+`ENABLE_VIRTUAL_TERMINAL_INPUT` and also when it writes `CSI ?1003;1006h`
+itself (its focus records arrive, so it is attached and read), which fits an
+OpenConsole built before ConPTY's mouse support (inferred from the release
+dates, not checked against WezTerm's vendored source).
 
 `key-remap` changes modifier state before focused or in-app keybind matching
 and terminal encoding; it does not change physical key identity. `global:`
@@ -256,9 +301,10 @@ it — see the [screen-reader matrix](accessibility-matrix.md).
 ### Renderer
 
 Terminal presentation is owned by WGL `SwapBuffers`. A separate
-D3D11/DirectComposition shell pipeline owns recoverable top-level targets and
-transparent DPI-sized D2D surfaces; host banner and operation text is the
-first DirectWrite production zone, with per-paint GDI fallback. That pipeline
+D3D11/DirectComposition shell pipeline (recoverable top-level targets,
+transparent DPI-sized D2D surfaces, DirectWrite host banner text) exists in
+the source but is not started: `App.init` gives its backend no driver, so
+chrome text is drawn with GDI. That pipeline
 does not replace or call the terminal renderer. The terminal path has a hard
 OpenGL 4.3-via-WGL floor and no software fallback; below it, noctty shows a
 startup diagnostic naming the detected version and does not launch.
@@ -288,7 +334,8 @@ a composition swapchain for the terminal, so the OpenGL content is not
 flattened opaque on its way through DWM. Enabling `background-blur` logs one
 warning instead, at startup or when a config reload turns it on; like every
 other log line in this runtime it goes to stderr, so it is visible where stderr
-is captured.
+is captured. The Settings window shows the checkbox disabled, labelled "not
+supported on Windows", so nobody there toggles it and waits for a change.
 
 ### Universal palette
 

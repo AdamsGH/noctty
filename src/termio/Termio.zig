@@ -792,16 +792,25 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update the size of our pty. A pty that refuses (a pseudo console whose
+    // host is gone, a handoff session whose signal pipe closed) must not
+    // keep the grid and the renderer at the old size: the surface has the
+    // new size either way. A mode 2048 report below then says the new size
+    // while the pty may keep the old one until a later resize succeeds.
+    self.backend.resize(grid_size, size.terminal()) catch |err| {
+        log.warn("pty resize failed, resizing the terminal anyway err={}", .{err});
+    };
 
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+
+        // The stream handler reads this under the same lock (DECCOLM's
+        // mode 3 reset, size reports).
+        self.size = size;
 
         // Update the size of our terminal state
         try self.terminal.resize(
@@ -1010,7 +1019,10 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
         self.renderer_state.mutex.lock();
         if (trace_lock) lock_acquired = std.time.Instant.now() catch null;
         defer self.renderer_state.mutex.unlock();
-        const had_render_work = terminal_render_dirty.needsRendererWake(&self.terminal);
+        // Typing at a prompt often echoes only a cursor move (Left is a BS
+        // or CUB), which marks nothing dirty but must still be drawn.
+        const drawn = self.renderer_state.drawn_undirtied;
+        const had_render_work = terminal_render_dirty.needsFrame(&self.terminal, drawn);
         const was_synchronized_output = self.terminal.modes.get(.synchronized_output);
         self.terminal_stream.handler.semantic_output.begin(semantic_output_epoch != null);
         const processing = self.processOutputLocked(buf);
@@ -1019,7 +1031,7 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
             self.renderer_state.noteBenchmarkEndMarker();
         }
         const semantic_output = self.terminal_stream.handler.semantic_output.finish();
-        const has_render_work = terminal_render_dirty.needsRendererWake(&self.terminal);
+        const has_render_work = terminal_render_dirty.needsFrame(&self.terminal, drawn);
         const synchronized_output_active = self.terminal.modes.get(.synchronized_output);
         const ended_synchronized_output =
             was_synchronized_output and !synchronized_output_active;
@@ -1034,6 +1046,10 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
             ended_synchronized_output,
             completed_synchronized_output_batch,
         );
+        // Record the wake before the lock lets the renderer see this state:
+        // its follow-up leaves dirt to a recorded wake, and would otherwise
+        // draw it here and then again for the wake (`renderFollowupDecision`).
+        if (should_render) self.renderer_state.noteWakeSource(.io_output);
         break :render .{
             .should_render = should_render,
             .queued_renderer_message = processing.queued_renderer_message,

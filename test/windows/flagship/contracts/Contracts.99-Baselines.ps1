@@ -11,13 +11,13 @@ $reviewedArtifactDigests = @{
     'src/apprt/win32_session_state.zig' =
         '45630c3270cdd6bf2d8659471d796ed6e8733e5a2f10f2ef8461b3d12dac9f0b'
 
-    # Reviewed in full after the Noctty rebrand while retaining the cleanup's
-    # redirected-text CLI sibling pinned to the staged portable executable.
+    # Reviewed in full after the Noctty rebrand and for PKG-35's packaged DLL
+    # load/allocator smoke, retaining the staged portable CLI siblings.
     # This combined artifact intentionally differs from origin/main; its exact
     # SHA remains fail-closed tamper evidence, taken over the LF-canonical
     # bytes that .gitattributes now guarantees on every checkout.
     'test/windows/package-portable-cli.ps1' =
-        'edc0919e5e2951aba80f461be21cf8ba19911810454af00e6508c6c6af0b6f2b'
+        'e835bc487ce36413b95dd1eaea79b96b98a125547e3fc1297dce298d55448ff4'
 }
 foreach ($baselinePath in Get-ChildItem -LiteralPath (Join-Path $root 'baselines') -Filter '*.json') {
     Assert-JsonDocument `

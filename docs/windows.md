@@ -141,7 +141,7 @@ the normal packaged app environment.
 | Path                                       | Purpose                                                                                                                                                                                                                                                           |
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                                             |
-| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved on exit except in safe mode, when elevated through UAC, when started with `-e` / `initial-command`, `initial-window = false` or the startup profile picker, or with `window-save-state = never`. |
+| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`.                              |
 | `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                                                 |
 | `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                                                        |
 | `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                                                        |
@@ -212,7 +212,7 @@ With OSC 133 shell integration active, the command palette also offers:
 
 - `jump_to_prompt:-1` / `jump_to_prompt:1` (`Ctrl+Shift+PageUp` /
   `Ctrl+Shift+PageDown`): previous / next prompt.
-- `copy_last_command_output` (`Ctrl+Shift+Y`): copy the last completed
+- `copy_last_command_output` (no default keybind): copy the last completed
   command's output. Needs OSC 133;C and OSC 133;D boundaries.
 - `insert_last_command` (no default keybind): put the last recoverable
   single-line command back on the prompt without submitting it. Needs OSC
@@ -387,10 +387,30 @@ refuses to proceed when the proxy DLL is missing, or when
 The three shared Microsoft `ITerminalHandoff` Interface mappings are
 snapshotted before noctty changes them. Unregistration restores each prior
 raw value only while that mapping still points to noctty's proxy, so a newer
-terminal's registration is preserved. It restores the `DelegationTerminal`
+terminal's registration is preserved. A mapping that did not exist before
+registration is removed again, together with the `Interface\{IID}` key
+registration created for it, but only when nothing else has been added to
+those keys. It restores the `DelegationTerminal`
 value saved at registration only when noctty is still selected, then removes
 noctty's per-user COM registration. It never overwrites a default-terminal
-choice made after noctty was registered.
+choice made after noctty was registered. Registration state written by an
+earlier build did not record which keys it created, so unregistering it
+leaves those keys in place, as before; registering again does not add the
+record while noctty's mapping is still in place.
+
+An adopted console starts with the title and show state its client asked for.
+The window title is the startup title (usually the program's path) until the
+console sets another one, so cmd's `title`, PowerShell and full-screen
+programs name the window as they do anywhere else. When the client set
+`STARTF_USESHOWWINDOW`, `start /min` and `Start-Process -WindowStyle
+Minimized` open the window minimized without taking focus, `SW_SHOWNOACTIVATE`
+opens it without taking focus, and a maximized start opens it maximized.
+`powershell.exe -WindowStyle Hidden` is different: PowerShell hides its own
+console window after it starts, which noctty does not follow. A title set in
+the configuration stays in force. A client that asked
+for a hidden console gets a minimized window that takes no focus: Windows
+hands every such console to the terminal, and a window nobody can bring back
+would be worse. Only `CREATE_NO_WINDOW` keeps a console from being delegated.
 
 noctty implements the terminal half of Windows console delegation and needs
 a Windows Terminal OpenConsole installation to remain selected as the console
@@ -689,9 +709,10 @@ is not dropped: ConPTY hands the child the same bytes noctty wrote. Older
 in-box conhosts, including Windows 10 build 19045, were not measured. See the
 [key encoding differential](windows-vt-conformance.md#measured-master-to-child-key-encoding-differential).
 
-`F6` and `Shift+F6` run `cycle_focus_region` and move keyboard focus
-between the terminal pane, the tab strip, the docked search query, and the
-host banner, skipping whatever is not on screen. `Esc` returns to the
+`Ctrl+F6` and `Ctrl+Shift+F6` run `cycle_focus_region` and move keyboard
+focus between the terminal pane, the tab strip, the docked search query, and
+the host banner, skipping whatever is not on screen. A bare `F6` is left to
+the program in the pane (htop, Midnight Commander). `Esc` returns to the
 terminal. In the tab strip, Left/Right/Home/End move between tabs,
 Enter or Space activates one, `Delete` closes one, `F2` renames, and Ctrl
 with an arrow or Home/End moves the tab. These chrome keys are fixed:
@@ -825,6 +846,24 @@ shell's startup repaint cannot destroy it. Engaging `toggle_secure_input`
 once excludes that pane from snapshots for the rest of the session, even if
 the indicator is later turned off.
 
+One noctty process owns the saved session: the first one started normally,
+which restores it (or opens its first window when there is nothing to
+restore). Only that process saves it, on exit, at sign-out, shutdown or
+reboot, and when the display configuration changes. The save at sign-out,
+shutdown or reboot is the last one and never deletes the file, even with no
+windows left: the sign-out also ends the shells, so an empty window list
+then says nothing about what was closed on purpose. A launch that forwards
+to a running noctty, a window opened with `--working-directory` (Explorer's
+"Open noctty here" and the jump list's recent folders) or with `-e` or
+`initial-command`, the startup profile picker, a `--launch-layout` or
+`initial-window = false` run, a default terminal handoff and a second
+instance under `single-instance = false` start without the saved session and
+leave it untouched when they exit. When one of these is the first noctty
+running, windows later forwarded into it are not saved either, and the saved
+session stays as it was until a normally started noctty owns it again. The
+owner holds `session-state.json.lock` while it runs, so a second instance
+does not restore the same windows again.
+
 If the session-state file is unreadable, noctty moves it aside to a sibling
 with a `.corrupt` suffix, logs the failure, and starts with a fresh window.
 When an earlier quarantine file already exists, a numeric suffix is added
@@ -904,7 +943,10 @@ auto-update = check
 ```
 
 The updater checks the configured release feed when the app starts, unless a
-check succeeded in the last 24 hours, and never replaces binaries silently. The feed defaults to noctty's GitHub
+check succeeded in the last 24 hours, and never replaces binaries silently. A
+copy that stays open re-runs the same check every six hours while a window is
+open and no staged update is waiting; the 24 hour limit and a dismissed version
+still apply, so most of those ticks make no request. The feed defaults to noctty's GitHub
 Releases API and can be changed with `auto-update-feed-url`; checksum,
 Authenticode, and pinned-publisher-key verification stay mandatory whatever
 the feed host. For tests and diagnostics, `NOCTTY_UPDATE_FEED_URL` overrides
@@ -942,6 +984,14 @@ path. Every other PE keeps the publisher pin.
 See
 [ADR 0005](adr/0005-pin-updater-publisher-public-keys.md) for the pinning
 and key-rotation rules.
+
+Only a setup-managed copy or one with the `noctty.portable` marker stages
+anything. A copy installed another way (Scoop, a ZIP extracted without the
+marker) cannot apply a staged update, so `download` mode downloads nothing for
+it and its notice opens the release page. A version that is already staged and
+still verifies is reused instead of downloaded again, whether the check was
+forced or answered from the 24 hour cache, and dismissing the notice for a
+staged update keeps the staged files and records the dismissal.
 
 For installer-managed installs, the update notice can launch the verified
 staged installer. Applying an update is always user-initiated: it
@@ -1024,6 +1074,20 @@ normal `keybind = copy_mode/...` entries. `copy_mode` is one mode, not a
 re-enterable table: activating it again from a nested table does not stack a
 second copy mode, and leaving copy mode unwinds every table pushed on top of
 it.
+
+## Mouse input
+
+Right-click follows `right-click-action`. With its default `context-menu`,
+mouse-reporting applications receive the click; hold Shift to use the terminal
+menu unless the application is configured to capture Shift. `ignore`, `copy`,
+`paste`, and `copy-or-paste` perform their configured action without opening a
+menu.
+
+Wheel reports use the position carried by the wheel event. The number of
+reports per notch retains the Windows scroll-lines setting and the configured
+multiplier. If a mouse-reporting TUI scrolls too quickly, try
+`mouse-scroll-multiplier = discrete:1`; this also slows normal viewport
+scrolling.
 
 ## Quick terminal and global hotkeys
 
@@ -1215,7 +1279,9 @@ are. Measured on Windows 11 with Neovim 0.10.4, 0.11.7 and 0.12.5:
   `'ttimeoutlen'` of 50 leaked every time (13 of 13, from 1 KB to 200 KB).
   With an emulated round trip of 40 ms or less, none of 6 leaked, and with
   `clipboard-read = allow` or Allow clicked within 300 ms, none of 17 leaked
-  at a 60 to 100 ms round trip.
+  at a 60 to 100 ms round trip. (That was measured before the prompt began
+  ignoring Allow for its first half second; an answer that quick is no
+  longer possible.)
 
 With the default `'ttimeoutlen'` of 50, nothing leaked natively, in WSL, or
 over SSH to a host on the same machine, for clipboards from 64 KB to 700 KB.

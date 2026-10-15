@@ -99,27 +99,52 @@ Save, then press `Ctrl+Shift+,` to reload without restarting.
 `noctty +show-config --default --docs | more` lists every option with its
 docs, including the keybind grammar.
 
+When the config has a mistake (an unknown key, a value that does not parse, an
+include that is missing, a theme or font that is not installed), noctty shows
+an error banner with the number of problems and the first one, and the banner
+stays until you close it. **Config problems** in the command palette opens
+Settings > Advanced, which lists the problems with their file and line where
+noctty knows them, and shows the file Settings saves to. When the list does not
+fit, or a line is cut short, `noctty +validate-config` prints the problems in
+the config files in full in a terminal.
+
 ## Keybindings
 
 Defaults are Ctrl chords, mostly the same as Ghostty's non-macOS defaults.
 Pane focus on `Alt+Arrow` is Windows-specific.
 
-| Action                   | Binding                       |
-| ------------------------ | ----------------------------- |
-| Copy                     | `Ctrl+Shift+C`                |
-| Paste                    | `Ctrl+Shift+V`                |
-| New tab                  | `Ctrl+Shift+T`                |
-| Close tab                | `Ctrl+Shift+W`                |
-| Next / previous tab      | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
-| Split pane right         | `Ctrl+Shift+\`                |
-| Split pane down          | `Ctrl+Shift+E`                |
-| Move between panes       | `Alt+Arrow`                   |
-| Command palette          | `Ctrl+Shift+P`                |
-| Quick select             | `Ctrl+Shift+Space`            |
-| Copy mode                | `Ctrl+Shift+X`                |
-| Start search             | `Ctrl+Shift+F`                |
-| Increase / decrease font | `Ctrl+=` / `Ctrl+-`           |
-| Reload config            | `Ctrl+Shift+,`                |
+| Action                      | Binding                             |
+| --------------------------- | ----------------------------------- |
+| Copy                        | `Ctrl+Shift+C` or `Ctrl+Insert`     |
+| Paste                       | `Ctrl+Shift+V` or `Shift+Insert`    |
+| New tab                     | `Ctrl+Shift+T`                      |
+| Close tab                   | `Ctrl+Shift+W`                      |
+| Undo / redo                 | `Ctrl+Shift+Z` / `Ctrl+Shift+Y`     |
+| Next / previous tab         | `Ctrl+Tab` / `Ctrl+Shift+Tab`       |
+| Split pane right            | `Ctrl+Shift+\`                      |
+| Split pane down             | `Ctrl+Shift+E`                      |
+| Move between panes          | `Alt+Arrow`                         |
+| Move focus to the tab strip | `Ctrl+F6` / `Ctrl+Shift+F6`         |
+| Command palette             | `Ctrl+Shift+P`                      |
+| Quick select                | `Ctrl+Shift+Space`                  |
+| Copy mode                   | `Ctrl+Shift+X`                      |
+| Start search                | `Ctrl+Shift+F`                      |
+| Next / previous match       | `F3` / `Shift+F3`                   |
+| Full screen                 | `F11`                               |
+| Increase / decrease font    | `Ctrl+=` / `Ctrl+-`                 |
+| Reload config               | `Ctrl+Shift+,`                      |
+
+`F6`, `Ctrl+Enter` and `Alt+Enter` are not bound, so they go to the program in
+the pane (`F6` is htop's and Midnight Commander's). `F3`, `Shift+F3` and the
+undo chords act only when there is a search to step through or something to
+undo (a closed tab or split, `clear_screen`, `reset`); otherwise they reach
+the program too. `Ctrl+F6` moves keyboard focus between the terminal, the tab
+strip, the docked search and the host banner; `Esc` returns to the terminal.
+
+`Ctrl+Shift+Y` now redoes an action; **Copy Last Command Output** remains in
+the command palette and can be given a custom `copy_last_command_output`
+keybind. Fullscreen moved from `Ctrl+Enter` to `F11`, and the focus cycle
+moved from `F6` / `Shift+F6` to `Ctrl+F6` / `Ctrl+Shift+F6`.
 
 `noctty +list-keybinds` prints the full list. `Ctrl+Shift+O` also splits
 right; the docs use `Ctrl+Shift+\` because Narrator can reserve O-based

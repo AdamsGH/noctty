@@ -108,6 +108,101 @@ if ($releaseWindowsJob -match 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24') {
 }
 $windowsArmWorkflow = Join-Path $repoRoot '.github\workflows\windows-arm64.yml'
 $windowsArmWorkflowText = Get-Content -LiteralPath $windowsArmWorkflow -Raw
+$windowsHostedJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows' -Source $testWorkflow
+foreach ($shellCase in @(
+        @{ Name = 'PowerShell shell integration tests (PowerShell 7)'; Shell = 'pwsh'; Script = 'powershell-shell-integration' },
+        @{ Name = 'PowerShell shell integration tests (Windows PowerShell 5.1)'; Shell = 'powershell'; Script = 'powershell-shell-integration' },
+        @{ Name = 'Bash shell integration tests (Git Bash)'; Shell = 'pwsh'; Script = 'bash-shell-integration' }
+    )) {
+    $step = Get-YamlStepBlock -Content $windowsHostedJob -Name $shellCase.Name -Source $testWorkflow
+    # Step fields sit at eight spaces; the lines of a `run: |` body sit deeper,
+    # so a script name in a comment or string there does not count.
+    if ($step -notmatch ('(?m)^ {8}shell: ' + $shellCase.Shell + '\s*$') -or
+        $step -notmatch ('(?m)^ {8}run: \./test/windows/' + $shellCase.Script + '\.ps1\s*$')) {
+        throw "Missing behavioural shell-integration coverage: $($shellCase.Name)"
+    }
+}
+$hintsStep = Get-YamlStepBlock -Content $windowsHostedJob -Name 'Interactive hints contract checks' -Source $testWorkflow
+if ($hintsStep -notmatch 'run: ./test/windows/Test-InteractiveWin11HintsContracts\.ps1') {
+    throw 'Hosted CI must run the hints contracts.'
+}
+$libVtJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows-lib-vt' -Source $testWorkflow
+$libVtStep = Get-YamlStepBlock -Content $libVtJob -Name 'Run libghostty-vt and C API tests' -Source $testWorkflow
+if ($libVtStep -notmatch 'run: zig build test-lib-vt -Demit-lib-vt=true --summary all') {
+    throw 'CI must run the separate libghostty-vt graph and report its test count.'
+}
+# Required coverage must execute and propagate failures at both YAML levels.
+# The experimental ConPTY job is intentionally excluded from this contract.
+function Test-MandatoryWorkflowCoverage {
+    param(
+        [Parameter(Mandatory)] [string] $JobText,
+        [Parameter(Mandatory)] [string[]] $StepNames
+    )
+
+    if ($JobText -match '(?m)^    [''"]?(?:if|continue-on-error)[''"]?[ \t]*:') { return $false }
+    foreach ($name in $StepNames) {
+        $step = Get-YamlStepBlock -Content $JobText -Name $name -Source 'required coverage'
+        if ($step -match '(?m)^        [''"]?(?:if|continue-on-error)[''"]?[ \t]*:') { return $false }
+    }
+    return $true
+}
+$coverageMutationCount = 0
+foreach ($coverage in @(
+        @{ Job = $windowsHostedJob; Steps = @(
+                'PowerShell shell integration tests (PowerShell 7)',
+                'PowerShell shell integration tests (Windows PowerShell 5.1)',
+                'Bash shell integration tests (Git Bash)',
+                'Interactive hints contract checks'
+            ) },
+        @{ Job = $libVtJob; Steps = @('Run libghostty-vt and C API tests') }
+    )) {
+    if (-not (Test-MandatoryWorkflowCoverage -JobText $coverage.Job -StepNames $coverage.Steps)) {
+        throw 'Required shell, hints, and library coverage must be unconditional and fail closed.'
+    }
+    foreach ($setting in @(
+            'if: false', 'continue-on-error: true',
+            "'if': false", "'continue-on-error': true",
+            '"if": false', '"continue-on-error": true',
+            'if : false', 'continue-on-error : true'
+        )) {
+        $mutations = @($coverage.Job.Replace('    steps:', "    $setting`n    steps:"))
+        foreach ($name in $coverage.Steps) {
+            $mutations += $coverage.Job.Replace("      - name: $name", "      - name: $name`n        $setting")
+        }
+        foreach ($mutation in $mutations) {
+            if (Test-MandatoryWorkflowCoverage -JobText $mutation -StepNames $coverage.Steps) {
+                throw "Required coverage accepted a disabled or ignored mutation: $setting"
+            }
+            $coverageMutationCount++
+        }
+    }
+}
+Write-Host "Required workflow coverage: $coverageMutationCount/$coverageMutationCount disabling mutations rejected"
+$conptyJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows-conpty-probes' -Source $testWorkflow
+$conptyStep = Get-YamlStepBlock -Content $conptyJob -Name 'Run opt-in ConPTY transport and key input probes' -Source $testWorkflow
+if ($conptyJob -notmatch '(?m)^    continue-on-error: true\s*$' -or
+    $conptyJob -notmatch '(?m)^    timeout-minutes: 20\s*$' -or
+    $conptyStep -notmatch '(?m)^        timeout-minutes: 15\s*$' -or
+    $conptyStep -notmatch '-Dtest-filter=ConPTY --summary all') {
+    throw 'Experimental ConPTY coverage must be optional, bounded, and retain the child dispatch test.'
+}
+foreach ($probeVariable in @('NOCTTY_RUN_CONPTY_TRANSPORT_TEST', 'NOCTTY_CONPTY_TRANSPORT_PROBE', 'NOCTTY_CONPTY_KEY_INPUT_PROBE')) {
+    if ($conptyStep -notmatch ($probeVariable + ": '1'")) { throw "Missing scoped probe variable: $probeVariable" }
+    if ($windowsHostedJob -match $probeVariable) { throw 'ConPTY probe variables must stay out of the required Windows job.' }
+}
+$armTestStep = Get-YamlStepBlock -Content $windowsArmWorkflowText -Name 'Run ARM64 Zig tests' -Source $windowsArmWorkflow
+$armBuildStep = Get-YamlStepBlock -Content $windowsArmWorkflowText -Name 'Build and package ARM64 binaries' -Source $windowsArmWorkflow
+if ($armTestStep -notmatch '-Dcustom-shaders=true.*?--summary all' -or
+    $armBuildStep -notmatch '-Optimize ReleaseFast') {
+    throw 'ARM64 CI must test shaders and compile the release optimization mode.'
+}
+$releaseTests = Get-YamlStepBlock -Content $releaseWindowsJob -Name 'Run full test suite' -Source $releaseWorkflow
+if ($releaseTests -notmatch '-Dcustom-shaders=true --summary all') {
+    throw 'Release tests must use shipped shader support and report the test count.'
+}
+if ($releaseWindowsJob -notmatch 'choco install innosetup --version=6\.7\.1 --no-progress -y') {
+    throw 'The installer compiler version must remain pinned.'
+}
 Invoke-ContractTable -Contracts @(
     @{
         File = $windowsArmWorkflow

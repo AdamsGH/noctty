@@ -834,6 +834,12 @@ pub fn cursorDownScroll(self: *Screen) !void {
                 self.cursor.page_row,
                 page.getCells(self.cursor.page_row),
             );
+
+            // The row is a fresh blank row now and must not retain
+            // metadata (wrap state, semantic prompt) from the
+            // discarded content.
+            self.cursor.page_row.reset();
+
             self.cursorMarkDirty();
         } else {
             // The call to `eraseRow` will move the tracked cursor pin up by one
@@ -1123,6 +1129,11 @@ fn cursorScrollAboveRotate(self: *Screen) !void {
         &cur_rows[self.cursor.page_pin.y],
         cur_page.getCells(&cur_rows[self.cursor.page_pin.y]),
     );
+
+    // The recycled storage becomes the new blank cursor row and must
+    // not retain metadata (wrap state, semantic prompt) from the row
+    // whose content was moved to the next page.
+    cur_rows[self.cursor.page_pin.y].reset();
 
     // Mark the whole page as dirty.
     //
@@ -1791,6 +1802,10 @@ pub const Resize = struct {
     /// currently at a prompt. This detects OSC133 prompts lines and clears
     /// them. If set to `.last`, only the most recent prompt line is cleared.
     prompt_redraw: osc.semantic_prompt.Redraw = .false,
+
+    /// Whether the resize may pull rows out of scrollback back into the
+    /// active area. See PageList.Resize for details.
+    pull_scrollback: bool = true,
 };
 
 /// Resize the screen. The rows or cols can be bigger or smaller.
@@ -1934,6 +1949,7 @@ pub inline fn resize(
             .y = self.cursor.y,
             .pin = self.cursor.page_pin,
         },
+        .pull_scrollback = opts.pull_scrollback,
     });
 
     // If we have no scrollback and we shrunk our rows, we must explicitly
@@ -4895,6 +4911,102 @@ test "Screen: scrolling with a single-row screen with scrollback" {
     }
 }
 
+test "Screen: cursorScrollAbove cross-page recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 10 });
+    defer s.deinit();
+
+    // Get the cursor page and the last page to differ so that
+    // cursorScrollAbove takes the cross-page rotate path.
+    const first_page_size = s.pages.pages.first.?.data.capacity.rows;
+    s.pages.pages.first.?.data.pauseIntegrityChecks(true);
+    for (0..first_page_size - 3) |_| try s.testWriteString("\n");
+    s.pages.pages.first.?.data.pauseIntegrityChecks(false);
+    try s.testWriteString("1A\n2B\n3C\n4D\n5E");
+    s.cursorAbsolute(0, 1);
+    try testing.expect(s.cursor.page_pin.node == s.pages.pages.first.?);
+    try testing.expect(s.pages.pages.first.?.next != null);
+
+    // The last row of the cursor page is the Row storage that gets
+    // recycled as the new blank row below the cursor after its content
+    // is moved down to the next page.
+    {
+        const rac = s.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    try s.cursorScrollAbove();
+
+    // One row scrolled into history, so the blank row is at active
+    // y=1 (just below the cursor's original row).
+    {
+        const rac = s.pages.getCell(.{ .active = .{ .y = 1 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("2B\n\n3C\n4D\n5E", contents);
+    }
+}
+
+test "Screen: cursorDownScroll no scrollback recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{} }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    s.cursorAbsolute(0, 2);
+    try s.cursorDownScroll();
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Screen: cursorDownScroll single row no scrollback resets metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 1, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD");
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{} }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    try s.cursorDownScroll();
+
+    {
+        const rac = s.pages.getCell(.{ .active = .{} }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
 test "Screen: scrolling across pages preserves style" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -6706,6 +6818,229 @@ test "Screen: resize (no reflow) more rows with scrollback cursor end" {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
         try testing.expectEqualStrings(str, contents);
+    }
+}
+
+test "Screen: resize (no reflow) more rows no scrollback pull" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 7, .rows = 3, .max_scrollback = 2 });
+    defer s.deinit();
+    const str = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+    try s.testWriteString(str);
+
+    // Cursor is at the bottom so this would normally pull scrollback.
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.y);
+    try s.resize(.{
+        .cols = 7,
+        .rows = 10,
+        .reflow = false,
+        .pull_scrollback = false,
+    });
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3IJKL\n4ABCD\n5EFGH", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings(str, contents);
+    }
+}
+
+test "Screen: resize more cols no scrollback pull" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 2 });
+    defer s.deinit();
+    try s.testWriteString("1AAAA\n2BBBB\n3CCCCDD\n4E");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3CCCC\nDD\n4E", contents);
+    }
+
+    // The wrapped line in the active area unwraps, freeing up a row. This
+    // would normally pull "2BBBB" back but we should get a blank row at
+    // the bottom instead.
+    try s.resize(.{ .cols = 10, .rows = 3, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3CCCCDD\n4E", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1AAAA\n2BBBB\n3CCCCDD\n4E", contents);
+    }
+}
+
+test "Screen: resize more cols no scrollback pull wrap straddles scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 2 });
+    defer s.deinit();
+    try s.testWriteString("1AAAA\n2BBBBXX\n3C\n4D");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("XX\n3C\n4D", contents);
+    }
+
+    // The line isn't fully in scrollback so it is allowed to unwrap
+    // back into view, but nothing above it is.
+    try s.resize(.{ .cols = 10, .rows = 3, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("2BBBBXX\n3C\n4D", contents);
+    }
+}
+
+test "Screen: resize more cols and rows no scrollback pull" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 2 });
+    defer s.deinit();
+    try s.testWriteString("1AAAA\n2BBBB\n3CCCCDD\n4E");
+
+    try s.resize(.{ .cols = 10, .rows = 5, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 1), s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3CCCCDD\n4E", contents);
+    }
+}
+
+test "Screen: resize less cols no scrollback pull" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = 2 });
+    defer s.deinit();
+    try s.testWriteString("0Z\n1AAAA\n2BBBBXX\n3C");
+
+    // Wrapping needs more rows than we have so the top of the active
+    // area still scrolls off as usual.
+    try s.resize(.{ .cols = 5, .rows = 3, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("2BBBB\nXX\n3C", contents);
+    }
+}
+
+test "Screen: resize less rows no scrollback pull keeps the cursor row when the rows below it do not fit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A footer under the cursor, as a TUI or PSReadLine's list draws one.
+    var s = try init(alloc, .{ .cols = 5, .rows = 6, .max_scrollback = 10 });
+    defer s.deinit();
+    try s.testWriteString("1\n2\n3\n4\n5\n6");
+    s.cursorAbsolute(0, 1);
+
+    // Pushing three rows into history would push the cursor's row out with
+    // them. Only the row above it goes; what doesn't fit below goes.
+    try s.resize(.{ .cols = 5, .rows = 3, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 0), s.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 0), s.cursor.y);
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("2\n3\n4", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1\n2\n3\n4", contents);
+    }
+
+    // The next print lands on the cursor's row.
+    try s.testWriteString("X");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("X\n3\n4", contents);
+    }
+}
+
+test "Screen: resize less rows without reflow no scrollback pull keeps the cursor row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 6, .max_scrollback = 10 });
+    defer s.deinit();
+    try s.testWriteString("1\n2\n3\n4\n5\n6");
+    s.cursorAbsolute(2, 2);
+
+    try s.resize(.{ .cols = 5, .rows = 2, .reflow = false, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 0), s.cursor.y);
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3\n4", contents);
+    }
+}
+
+test "Screen: resize less cols no scrollback pull keeps the cursor row when wrapped rows below it do not fit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 6, .rows = 4, .max_scrollback = 10 });
+    defer s.deinit();
+    try s.testWriteString("1\n2AAAA\n3BBBB\n4CCCC");
+    s.cursorAbsolute(0, 1);
+
+    // Each row below the cursor wraps in two at 3 columns. Keeping them
+    // would push the cursor's row into history.
+    try s.resize(.{ .cols = 3, .rows = 4, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 0), s.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 0), s.cursor.y);
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("2AA\nAA\n3BB\nBB", contents);
+    }
+}
+
+test "Screen: resize less rows no scrollback pull with the cursor at the bottom still pushes history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 6, .max_scrollback = 10 });
+    defer s.deinit();
+    try s.testWriteString("1\n2\n3\n4\n5\n6");
+
+    try s.resize(.{ .cols = 5, .rows = 3, .pull_scrollback = false });
+    try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.y);
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("4\n5\n6", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1\n2\n3\n4\n5\n6", contents);
     }
 }
 

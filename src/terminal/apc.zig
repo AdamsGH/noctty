@@ -12,6 +12,14 @@ const log = std.log.scoped(.terminal_apc);
 pub const Handler = struct {
     state: State = .inactive,
 
+    /// Maximum bytes each APC protocol can buffer. This is to prevent
+    /// malicious input from causing us to allocate too much memory.
+    /// If you want to be lazy and set a single value for all protocols,
+    /// use `.initFull`.
+    max_bytes: std.EnumMap(Protocol, usize) = .initFullWith(.{
+        .kitty = Protocol.defaultMaxBytes(.kitty),
+    }),
+
     pub fn deinit(self: *Handler) void {
         self.state.deinit();
     }
@@ -34,7 +42,11 @@ pub const Handler = struct {
                 switch (byte) {
                     // Kitty graphics protocol
                     'G' => self.state = if (comptime build_options.kitty_graphics)
-                        .{ .kitty = kitty_gfx.CommandParser.init(alloc) }
+                        .{ .kitty = .init(
+                            alloc,
+                            self.max_bytes.get(.kitty) orelse
+                                Protocol.defaultMaxBytes(.kitty),
+                        ) }
                     else
                         .ignore,
 
@@ -107,8 +119,22 @@ pub const State = union(enum) {
     }
 };
 
+/// Possible APC command types.
+pub const Protocol = enum {
+    kitty,
+
+    /// Returns the default maximum bytes for the given protocol.
+    pub fn defaultMaxBytes(self: Protocol) usize {
+        return switch (self) {
+            // Kitty graphics payloads can be very large (e.g. full images
+            // encoded as base64), so the default is set to 65 MiB.
+            .kitty => 65 * 1024 * 1024,
+        };
+    }
+};
+
 /// Possible APC commands.
-pub const Command = union(enum) {
+pub const Command = union(Protocol) {
     kitty: if (build_options.kitty_graphics)
         kitty_gfx.Command
     else
@@ -184,6 +210,126 @@ test "kitty feed error deinits parser" {
     h.start();
     for ("Ga=p,i=10000000000;") |c| h.feed(alloc, c);
     try testing.expect(h.state == .ignore);
+}
+
+/// A test allocator that records the most bytes it ever had live, and
+/// refuses to go past `ceiling` so a missing cap fails the test instead
+/// of taking the machine's memory.
+const HighWaterAllocator = struct {
+    child: Allocator,
+    ceiling: usize,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *HighWaterAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn grow(self: *HighWaterAllocator, old_len: usize, new_len: usize) bool {
+        const live = self.live - old_len + new_len;
+        if (live > self.ceiling) return false;
+        self.live = live;
+        self.peak = @max(self.peak, live);
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.grow(0, len)) return null;
+        return self.child.rawAlloc(len, a, ra) orelse {
+            self.live -= len;
+            return null;
+        };
+    }
+
+    fn resize(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        const live = self.live;
+        if (!self.grow(mem.len, new_len)) return false;
+        if (self.child.rawResize(mem, a, new_len, ra)) return true;
+        self.live = live;
+        return false;
+    }
+
+    fn remap(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        const live = self.live;
+        if (!self.grow(mem.len, new_len)) return null;
+        return self.child.rawRemap(mem, a, new_len, ra) orelse {
+            self.live = live;
+            return null;
+        };
+    }
+
+    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *HighWaterAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(mem, a, ra);
+        self.live -= mem.len;
+    }
+};
+
+test "kitty max bytes exceeded" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var h: Handler = .{ .max_bytes = .init(.{ .kitty = 4 }) };
+    defer h.deinit();
+    h.start();
+    // 'G' identifies kitty, 'a=t;' moves to data state, then feed exceeds max_bytes.
+    for ("Ga=t;") |c| h.feed(alloc, c);
+    try testing.expect(h.state != .ignore);
+    for ("abcd") |c| h.feed(alloc, c);
+    try testing.expect(h.state != .ignore);
+    // The 5th data byte exceeds the 4-byte limit.
+    h.feed(alloc, 'e');
+    try testing.expect(h.state == .ignore);
+}
+
+test "kitty unterminated 512 MiB payload stays under the cap" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const mib = 1024 * 1024;
+
+    // The cap a terminal gets by default.
+    try testing.expectEqual(@as(?usize, 65 * mib), (Handler{}).max_bytes.get(.kitty));
+
+    // A smaller cap keeps the test light; the input is what a hostile
+    // remote would send, 512 MiB with no terminator.
+    const cap = mib;
+    var hw: HighWaterAllocator = .{
+        .child = std.heap.page_allocator,
+        .ceiling = 256 * mib,
+    };
+    const alloc = hw.allocator();
+
+    var h: Handler = .{ .max_bytes = .init(.{ .kitty = cap }) };
+    defer h.deinit();
+    h.start();
+    for ("Ga=t;") |c| h.feed(alloc, c);
+    for (0..cap) |_| h.feed(alloc, 'A');
+    try testing.expect(h.state != .ignore);
+
+    // One byte past the cap drops the command and frees its buffer.
+    h.feed(alloc, 'A');
+    try testing.expect(h.state == .ignore);
+    try testing.expectEqual(@as(usize, 0), hw.live);
+
+    // The rest of the sequence costs nothing.
+    for (cap + 1..512 * mib) |_| h.feed(alloc, 'A');
+    try testing.expectEqual(@as(usize, 0), hw.live);
+    try testing.expect(h.end() == null);
+
+    // The payload list grows by half again, and the old buffer is still
+    // live while it is copied, so the peak stays under 2.5 times the cap.
+    try testing.expect(hw.peak <= cap * 5 / 2);
 }
 
 test "valid Kitty command" {

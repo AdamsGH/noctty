@@ -933,6 +933,20 @@ pub const Resize = struct {
     /// resize/reflow behavior depends on the cursor position.
     cursor: ?Cursor = null,
 
+    /// Whether the resize may pull rows out of scrollback back into the
+    /// active area. If false, growing rows always appends blank rows at the
+    /// bottom and a column reflow keeps the top of the active area on the
+    /// same content, so a line that is fully in scrollback stays there.
+    /// A wrapped line with at least one row still in the active area may
+    /// still unwrap back into view. And a shrink that would push the
+    /// cursor's row (cursor.pin) into scrollback drops the rows below the
+    /// cursor that don't fit instead, as such a pty does.
+    ///
+    /// This should be false for ptys that keep their own screen buffer
+    /// without scrollback (e.g. Windows ConPTY), since they can't pull
+    /// rows back and would otherwise get out of sync with us.
+    pull_scrollback: bool = true,
+
     pub const Cursor = struct {
         x: size.CellCountInt,
         y: size.CellCountInt,
@@ -983,7 +997,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         .gt => {
             // We grow rows after cols so that we can do our unwrapping/reflow
             // before we do a no-reflow grow.
-            try self.resizeCols(cols, opts.cursor);
+            try self.resizeCols(cols, opts);
             try self.resizeWithoutReflow(opts);
         },
 
@@ -995,7 +1009,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
                 copy.cols = self.cols;
                 break :opts copy;
             });
-            try self.resizeCols(cols, opts.cursor);
+            try self.resizeCols(cols, opts);
         },
     }
 
@@ -1014,9 +1028,20 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
 fn resizeCols(
     self: *PageList,
     cols: size.CellCountInt,
-    cursor: ?Resize.Cursor,
+    opts: Resize,
 ) Allocator.Error!void {
     assert(cols != self.cols);
+    const cursor = opts.cursor;
+
+    // The active area is always the last `rows` rows, so a reflow that
+    // changes the number of rows our text needs slides the active area
+    // over the content. If we aren't allowed to pull scrollback then we
+    // track the top of the active area so we can restore it afterwards.
+    const active_top: ?*Pin = if (!opts.pull_scrollback)
+        try self.trackPin(self.getTopLeft(.active))
+    else
+        null;
+    defer if (active_top) |p| self.untrackPin(p);
 
     // If we have a cursor position (x,y), then we try under any col resizing
     // to keep the same number remaining active rows beneath it. This is a
@@ -1171,6 +1196,23 @@ fn resizeCols(
         .pin => if (self.pinIsActive(self.viewport_pin.*)) {
             self.viewport = .active;
         },
+    }
+
+    // If we can't pull scrollback then pad the bottom with blank rows until
+    // the old top of the active area is back at the top. If the reflow
+    // instead pushed it into scrollback (the text needs more rows than
+    // we have) then there is nothing to do. This subsumes the preserved
+    // cursor logic below since that also only exists to avoid a pull.
+    if (active_top) |p| {
+        // Rows below the cursor that wrapped may have pushed the cursor's
+        // own row into history. Like the pty, keep it and lose what doesn't
+        // fit below it.
+        if (preserved_cursor) |c| self.keepRowActive(c.tracked_pin);
+
+        if (self.pointFromPin(.active, p.*)) |pt| {
+            for (0..pt.active.y) |_| _ = try self.grow();
+        }
+        return;
     }
 
     // See preserved_cursor setup for why.
@@ -1856,8 +1898,9 @@ const ReflowCursor = struct {
             }
         }
 
-        // Clear the row from the old page and truncate it.
-        old_page.clearCells(old_row, 0, old_page.size.cols);
+        // Reset the row on the old page and truncate it. The retired
+        // storage must be left in the default state (see resetRow).
+        old_page.resetRow(old_row);
         old_page.size.rows -= 1;
 
         // If that was the last row in that page
@@ -2156,6 +2199,12 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 // If we didn't trim enough, just modify our row count and this
                 // will create additional history.
                 self.rows = rows;
+
+                // A pty without scrollback keeps the cursor's row instead
+                // and loses what doesn't fit below it.
+                if (!opts.pull_scrollback) {
+                    if (opts.cursor) |c| if (c.pin) |p| self.keepRowActive(p);
+                }
             },
 
             // Making rows larger we adjust our row count, and then grow
@@ -2165,12 +2214,18 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 // we want to try to preserve the y value of the old cursor.
                 // In other words, we don't want to "pull down" scrollback.
                 // This is purely a UX feature.
-                if (opts.cursor) |cursor| cursor: {
-                    if (cursor.y >= self.rows - 1) break :cursor;
-
-                    // Cursor is not at the bottom, so we just grow our
-                    // rows and we're done. Cursor does NOT change for this
-                    // since we're not pulling down scrollback.
+                //
+                // If we're not allowed to pull scrollback at all then we
+                // always do this regardless of the cursor.
+                const pull = pull: {
+                    if (!opts.pull_scrollback) break :pull false;
+                    const cursor = opts.cursor orelse break :pull true;
+                    break :pull cursor.y >= self.rows - 1;
+                };
+                if (!pull) {
+                    // We just grow our rows and we're done. Cursor does
+                    // NOT change for this since we're not pulling down
+                    // scrollback.
                     const delta = rows - self.rows;
                     self.pauseIntegrityChecks(true);
                     defer self.pauseIntegrityChecks(false);
@@ -2349,11 +2404,7 @@ fn resizeWithoutReflowGrowCols(
         const prev_page = &prev.?.data;
         const prev_size = prev_page.size.rows - prev_copied;
         const prev_rows = prev_page.rows.ptr(prev_page.memory)[prev_size..prev_page.size.rows];
-        for (prev_rows) |*row| prev_page.clearCells(
-            row,
-            0,
-            prev_page.size.cols,
-        );
+        for (prev_rows) |*row| prev_page.resetRow(row);
         prev_page.size.rows = prev_size;
     };
 
@@ -2433,6 +2484,81 @@ fn resizeWithoutReflowGrowCols(
     self.destroyNode(chunk.node);
 }
 
+/// If a resize left `p`'s row above the active area, erase rows from the
+/// bottom of the screen until that row is the top of the active area.
+///
+/// A shrink pushes rows into history from the top, so with enough content
+/// below the cursor (a TUI footer, a PSReadLine list) it pushes out the
+/// cursor's own row. A pty without scrollback (ConPTY) keeps that row and
+/// loses what doesn't fit below it instead, so we do the same when we can't
+/// pull scrollback; otherwise the cursor would land on an unrelated line.
+fn keepRowActive(self: *PageList, p: *const Pin) void {
+    if (self.pointFromPin(.active, p.*) != null) return;
+    const row = self.pointFromPin(.screen, p.*) orelse return;
+    const top = self.pointFromPin(.screen, self.getTopLeft(.active)) orelse return;
+    if (row.screen.y >= top.screen.y) return;
+    self.eraseTrailingRows(top.screen.y - row.screen.y);
+
+    // A viewport pinned between that row and the old top is now in the
+    // active area without a full screen below it.
+    switch (self.viewport) {
+        .pin => if (self.pinIsActive(self.viewport_pin.*)) {
+            self.viewport = .active;
+        },
+        .active, .top => {},
+    }
+}
+
+/// Remove the last `n` rows of the screen, content and all. Tracked pins in
+/// them move to the new last row. The caller keeps at least `rows` rows.
+fn eraseTrailingRows(self: *PageList, n: usize) void {
+    assert(self.total_rows - n >= self.rows);
+    var remaining = n;
+    while (remaining > 0) {
+        const node = self.pages.last.?;
+        const page = &node.data;
+        const take: size.CellCountInt = @intCast(@min(remaining, page.size.rows));
+        const keep = page.size.rows - take;
+
+        const dest_node, const dest_y = if (keep > 0)
+            .{ node, keep - 1 }
+        else
+            .{ node.prev.?, node.prev.?.data.size.rows - 1 };
+        for (self.tracked_pins.keys()) |tracked| {
+            if (tracked.node != node or tracked.y < keep) continue;
+            tracked.node = dest_node;
+            tracked.y = dest_y;
+        }
+
+        // Free what the rows hold and reset their flags, since a later
+        // grow() hands the same memory back out.
+        const rows = page.rows.ptr(page.memory);
+        for (rows[keep..page.size.rows]) |*row| page.resetRow(row);
+
+        if (keep == 0) {
+            self.erasePage(node);
+        } else {
+            page.size.rows = keep;
+            page.assertIntegrity();
+        }
+        self.total_rows -= take;
+        remaining -= take;
+    }
+
+    // The new last row may have wrapped into a row that is gone: it ends
+    // its line now, or a later row would reflow into it.
+    const last = self.pages.last.?;
+    const last_page = &last.data;
+    const last_row = last_page.getRow(last_page.size.rows - 1);
+    if (last_row.wrap) {
+        last_row.wrap = false;
+        const cells = last_page.getCells(last_row);
+        if (cells[cells.len - 1].wide == .spacer_head) {
+            last_page.clearCells(last_row, cells.len - 1, cells.len);
+        }
+    }
+}
+
 /// Trims up to max trailing blank rows from the pagelist and returns the
 /// number of rows trimmed. A blank row is any row with no text (but may
 /// have styling).
@@ -2463,9 +2589,12 @@ fn trimTrailingBlankRows(
             return trimmed;
         }
 
-        // No text, we can trim this row. Because it has
-        // no text we can also be sure it has no styling
-        // so we don't need to worry about memory.
+        // No text, we can trim this row. The row can still carry
+        // metadata (e.g. a blank prompt continuation line) and
+        // background-colored cells. The retired storage is re-exposed by
+        // the grow() fast path without any clearing, so it must be left
+        // in the default state.
+        row_pin.node.data.resetRow(row_pin.rowAndCell().row);
         row_pin.node.data.size.rows -= 1;
         if (row_pin.node.data.size.rows == 0) {
             self.erasePage(row_pin.node);
@@ -2958,13 +3087,11 @@ pub fn split(
         // p.x remains the same since we're copying the row as-is
     }
 
-    // Clear our rows
+    // Reset our rows. They are retired into unused page capacity,
+    // which the grow() fast path re-exposes without any clearing, so
+    // they must be left in the default state.
     for (page.rows.ptr(page.memory)[y_start..y_end]) |*row| {
-        page.clearCells(
-            row,
-            0,
-            page.size.cols,
-        );
+        page.resetRow(row);
     }
     page.size.rows -= y_end - y_start;
 
@@ -3145,7 +3272,12 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
     const last = self.pages.last.?;
     if (last.data.capacity.rows > last.data.size.rows) {
-        // Fast path: we have capacity in the last page.
+        // Fast path: we have capacity in the last page. The exposed
+        // row requires no clearing work here: rows in unused page
+        // capacity are always in the default state, either because the
+        // page memory was never used (pool buffers are zeroed) or
+        // because whatever retired the row reset it (see Page.resetRow,
+        // which leaves only the dirty bit set).
         last.data.size.rows += 1;
         last.data.assertIntegrity();
 
@@ -3582,8 +3714,10 @@ pub fn eraseRow(
         }
     }
 
-    // Clear the final row which was rotated from the top of the page.
-    node.data.clearCells(&rows[node.data.size.rows - 1], 0, node.data.size.cols);
+    // Reset the final row which was rotated from the top of the page.
+    // A full reset (not just clearing cells) so no metadata from the
+    // erased row is retained by the new blank row.
+    node.data.resetRow(&rows[node.data.size.rows - 1]);
 }
 
 /// A variant of eraseRow that shifts only a bounded number of following
@@ -3613,7 +3747,7 @@ pub fn eraseRowBounded(
     // page, then we clear the row, rotate it to the end of the boundary limit
     // and update our pins.
     if (node.data.size.rows - pn.y > limit) {
-        node.data.clearCells(&rows[pn.y], 0, node.data.size.cols);
+        node.data.resetRow(&rows[pn.y]);
         fastmem.rotateOnce(Row, rows[pn.y..][0 .. limit + 1]);
 
         // Mark the whole page as dirty.
@@ -3713,7 +3847,7 @@ pub fn eraseRowBounded(
         // The logic here is very similar to the one before the loop.
         const shifted_limit = limit - shifted;
         if (node.data.size.rows > shifted_limit) {
-            node.data.clearCells(&rows[0], 0, node.data.size.cols);
+            node.data.resetRow(&rows[0]);
             fastmem.rotateOnce(Row, rows[0 .. shifted_limit + 1]);
 
             // Mark the whole page as dirty.
@@ -3779,9 +3913,9 @@ pub fn eraseRowBounded(
         }
     }
 
-    // We reached the end of the page list before the limit, so we clear
+    // We reached the end of the page list before the limit, so we reset
     // the final row since it was rotated down from the top of this page.
-    node.data.clearCells(&rows[node.data.size.rows - 1], 0, node.data.size.cols);
+    node.data.resetRow(&rows[node.data.size.rows - 1]);
 }
 
 /// Erase all history rows, optionally up to a bottom-left bound.
@@ -3868,15 +4002,12 @@ fn eraseRows(
             dst.dirty = true;
         }
 
-        // Clear our remaining cells that we didn't shift or swapped
-        // in case we grow back into them.
+        // Reset our remaining rows that we didn't shift or swapped.
+        // These are retired into unused page capacity, which the
+        // grow() fast path re-exposes without any clearing, so they
+        // must be left in the default state.
         for (scroll_amount..chunk.node.data.size.rows) |i| {
-            const row: *Row = &rows[i];
-            chunk.node.data.clearCells(
-                row,
-                0,
-                chunk.node.data.size.cols,
-            );
+            chunk.node.data.resetRow(&rows[i]);
         }
 
         // Update any tracked pins to shift their y. If it was in the erased
@@ -9812,6 +9943,161 @@ test "PageList eraseRowBounded full rows two pages" {
     try testing.expectEqual(@as(usize, 0), p_out.x);
 }
 
+test "PageList eraseRow recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 5, 3, 0);
+    defer s.deinit();
+
+    // Simulate the top row being part of a soft-wrapped, prompt-marked
+    // line. Erasing it recycles its Row storage as the new blank
+    // bottom row, which must not retain any of this metadata.
+    {
+        const rac = s.getCell(.{ .active = .{} }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    try s.eraseRow(.{ .active = .{} });
+
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "PageList eraseRowBounded recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A limit smaller than the remaining rows in the page exercises
+    // the bounded-rotate branch; a larger limit exercises the fallback
+    // branch that clears the final row after a full rotation.
+    for ([_]usize{ 1, 10 }) |limit| {
+        var s = try init(alloc, 5, 3, 0);
+        defer s.deinit();
+
+        {
+            const rac = s.getCell(.{ .active = .{} }).?;
+            rac.row.wrap = true;
+            rac.row.wrap_continuation = true;
+            rac.row.semantic_prompt = .prompt;
+        }
+
+        try s.eraseRowBounded(.{ .active = .{} }, limit);
+
+        const recycled_y = @min(limit, 2);
+        const rac = s.getCell(.{ .active = .{ .y = @intCast(recycled_y) } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "PageList eraseActive regrown rows have default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 5, 3, 0);
+    defer s.deinit();
+
+    // Mark the rows that will be erased. eraseActive retires their
+    // storage into unused page capacity and then regrows the active
+    // area, re-exposing the same Row storage via the grow() fast path.
+    for (0..2) |y| {
+        const rac = s.getCell(.{ .active = .{ .y = @intCast(y) } }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    s.eraseActive(1);
+
+    for (0..3) |y| {
+        const rac = s.getCell(.{ .active = .{ .y = @intCast(y) } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "PageList split retired rows have default state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 5, 10, 0);
+    defer s.deinit();
+
+    // Put metadata and a background-colored (non-zero, but text-free)
+    // cell on a row that the split will move to the new page. The
+    // retired Row storage on the source page goes back into unused
+    // capacity that grow() re-exposes without clearing.
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 7 } }).?;
+        rac.row.wrap = true;
+        rac.row.semantic_prompt = .prompt;
+        rac.cell.* = .{
+            .content_tag = .bg_color_palette,
+            .content = .{ .color_palette = 42 },
+        };
+    }
+
+    const node = s.pages.first.?;
+    try s.split(s.pin(.{ .active = .{ .y = 5 } }).?);
+
+    // The source page was truncated to 5 rows; peek at the retired
+    // storage beyond size.rows.
+    const page = &node.data;
+    try testing.expectEqual(@as(usize, 5), page.size.rows);
+    const rows = page.rows.ptr(page.memory.ptr);
+    for (5..10) |y| {
+        const row = rows[y];
+        try testing.expect(!row.wrap);
+        try testing.expect(!row.wrap_continuation);
+        try testing.expectEqual(.none, row.semantic_prompt);
+        const cells = row.cells.ptr(page.memory.ptr)[0..page.size.cols];
+        for (cells) |cell| try testing.expect(cell.isZero());
+    }
+}
+
+test "PageList resize trimmed rows have default state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 5, 5, 0);
+    defer s.deinit();
+
+    // A trailing blank row has no text, so shrinking rows trims it,
+    // but it can still carry metadata (e.g. a blank prompt
+    // continuation line) and background-colored cells. Trimming
+    // retires the storage into unused capacity that grow()
+    // re-exposes without clearing.
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 4 } }).?;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt_continuation;
+        rac.cell.* = .{
+            .content_tag = .bg_color_palette,
+            .content = .{ .color_palette = 42 },
+        };
+    }
+
+    try s.resize(.{ .rows = 4, .reflow = false });
+    try s.resize(.{ .rows = 5, .reflow = false });
+
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 4 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+        try testing.expect(rac.cell.isZero());
+    }
+}
+
 test "PageList clone" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -13390,6 +13676,116 @@ test "PageList resize reflow less cols cursor not on last line preserves locatio
     try testing.expectEqual(@as(usize, 10), s.totalRows());
 
     // Our cursor should move to the first row
+    try testing.expectEqual(point.Point{ .active = .{
+        .x = 0,
+        .y = 0,
+    } }, s.pointFromPin(.active, p.*).?);
+}
+
+test "PageList erase trailing rows across pages moves pins and frees styles" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 4, null);
+    defer s.deinit();
+
+    // Enough rows for a second page, the last of them styled and wrapped
+    // into each other, with a pin on one that will go.
+    const first_rows = s.pages.first.?.data.capacity.rows;
+    try s.growRows(first_rows + 2);
+    try testing.expect(s.pages.first != s.pages.last);
+    {
+        const page = &s.pages.last.?.data;
+        const style: stylepkg.Style = .{ .flags = .{ .bold = true } };
+        const id = try page.styles.add(page.memory, style);
+        for (0..page.size.rows) |y| {
+            const rac = page.getRowAndCell(0, y);
+            rac.row.styled = true;
+            rac.row.wrap = true;
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'x' },
+                .style_id = id,
+            };
+            page.styles.use(page.memory, id);
+        }
+        // `add` implies one `use`.
+        page.styles.release(page.memory, id);
+
+        // On the page that survives, the one row that goes is styled too,
+        // and the row that will end the screen wraps into it through a
+        // spacer head.
+        const first = &s.pages.first.?.data;
+        const first_id = try first.styles.add(first.memory, style);
+        const doomed_rac = first.getRowAndCell(0, first.size.rows - 1);
+        doomed_rac.row.styled = true;
+        doomed_rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = 'y' },
+            .style_id = first_id,
+        };
+        const end_row = first.getRow(first.size.rows - 2);
+        end_row.wrap = true;
+        first.getCells(end_row)[s.cols - 1] = .{ .wide = .spacer_head };
+    }
+    const doomed = try s.trackPin(s.pin(.{ .active = .{ .y = 3 } }).?);
+    defer s.untrackPin(doomed);
+
+    // Erase every row of the last page and one more.
+    const last_rows = s.pages.last.?.data.size.rows;
+    const total = s.totalRows();
+    s.eraseTrailingRows(last_rows + 1);
+    try testing.expectEqual(total - last_rows - 1, s.totalRows());
+    try testing.expect(s.pages.first == s.pages.last);
+
+    // The pin moved to the new last row, which no longer wraps and lost
+    // its spacer head; the erased row's style went with it.
+    const page = &s.pages.last.?.data;
+    try testing.expect(doomed.node == s.pages.last.?);
+    try testing.expectEqual(page.size.rows - 1, doomed.y);
+    const end_row = page.getRow(page.size.rows - 1);
+    try testing.expect(!end_row.wrap);
+    try testing.expect(page.getCells(end_row)[s.cols - 1].wide != .spacer_head);
+    try testing.expectEqual(@as(usize, 0), page.styles.count());
+    try page.verifyIntegrity(alloc);
+}
+
+test "PageList resize reflow less cols no scrollback pull blank active" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 5, 5, 1);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+    for (0..s.rows) |y| {
+        for (0..2) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = @intCast(x) },
+            };
+        }
+    }
+
+    // Grow blank rows to push our rows back into scrollback
+    try s.growRows(5);
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+
+    const p = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = 0 } }).?);
+    defer s.untrackPin(p);
+
+    // Resize with no cursor. Normally the trailing blank rows would be
+    // trimmed and the active area would slide up over our history.
+    try s.resize(.{
+        .cols = 4,
+        .reflow = true,
+        .pull_scrollback = false,
+    });
+    try testing.expectEqual(@as(usize, 4), s.cols);
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+
+    // The top of the active area should not move
     try testing.expectEqual(point.Point{ .active = .{
         .x = 0,
         .y = 0,

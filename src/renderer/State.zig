@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
+const render_dirty = @import("../terminal/render_dirty.zig");
 const inputpkg = @import("../input.zig");
 
 /// The mutex that must be held while reading any of the data in the
@@ -40,6 +41,12 @@ last_render_wakeup_notify_ms: std.atomic.Value(u64) = .init(0),
 /// thread swaps this to zero when it picks the wake up and hands the set to
 /// the apprt, which is the only place that can name why a frame happened.
 wake_sources: std.atomic.Value(u32) = .init(0),
+
+/// The cursor and colors as of the last frame update, or null before the
+/// first: what output can change in a frame without marking it dirty (see
+/// `render_dirty.Undirtied`). Written by the renderer and compared by termio
+/// and the render follow-up, all under `mutex`.
+drawn_undirtied: ?render_dirty.Undirtied = null,
 
 /// Monotonic progress recorded after each parsed PTY output chunk. These
 /// fields are protected by `mutex` and let presentation diagnostics prove
@@ -124,6 +131,12 @@ pub fn noteWakeSource(self: *@This(), source: WakeSource) void {
 /// Take and clear the accumulated wake sources.
 pub fn takeWakeSources(self: *@This()) u32 {
     return self.wake_sources.swap(0, .acq_rel);
+}
+
+/// Whether a recorded wake has not been picked up yet. Every source is
+/// recorded before its notify, so its wakeup callback is still to come.
+pub fn wakePending(self: *const @This()) bool {
+    return self.wake_sources.load(.acquire) != 0;
 }
 
 pub fn renderWakeupNotifiedRecently(self: *const @This(), window_ms: u64) bool {

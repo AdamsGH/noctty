@@ -34,6 +34,7 @@ pub const Mailbox = union(enum) {
     pub fn deinit(self: *Mailbox, alloc: Allocator) void {
         switch (self.*) {
             .spsc => |*v| {
+                while (v.queue.pop()) |msg| msg.deinit();
                 v.queue.destroy(alloc);
                 v.wakeup.deinit();
             },
@@ -103,3 +104,14 @@ pub const Mailbox = union(enum) {
         }
     }
 };
+
+test "deinit frees the messages it never delivered" {
+    const alloc = std.testing.allocator;
+    var mailbox = try Mailbox.initSPSC(alloc);
+
+    // The write outgrows the inline buffer, so the message owns an allocation.
+    const msg = try Message.writeReq(alloc, "x" ** 64);
+    try std.testing.expect(msg == .write_alloc);
+    mailbox.send(msg, null, null);
+    mailbox.deinit(alloc);
+}

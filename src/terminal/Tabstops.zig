@@ -94,13 +94,13 @@ pub fn unset(self: *Tabstops, col: usize) void {
     const i = entry(col);
     const idx = index(col);
     if (i < prealloc_count) {
-        self.prealloc_stops[i] ^= masks[idx];
+        self.prealloc_stops[i] &= ~masks[idx];
         return;
     }
 
     const dynamic_i = i - prealloc_count;
     assert(dynamic_i < self.dynamic_stops.len);
-    self.dynamic_stops[dynamic_i] ^= masks[idx];
+    self.dynamic_stops[dynamic_i] &= ~masks[idx];
 }
 
 /// Get the value of a tabstop at a specific column. The columns are 0-indexed.
@@ -202,6 +202,10 @@ test "Tabstops: basic" {
     try testing.expect(t.get(4));
     t.unset(4);
     try testing.expect(!t.get(4));
+
+    // Unsetting a column with no tabstop should be a no-op, not a toggle.
+    t.unset(4);
+    try testing.expect(!t.get(4));
 }
 
 test "Tabstops: dynamic allocations" {
@@ -215,6 +219,10 @@ test "Tabstops: dynamic allocations" {
     // Set something that was out of range of the first
     t.set(cap + 5);
     try testing.expect(t.get(cap + 5));
+    try testing.expect(!t.get(cap + 4));
+
+    // Unsetting a column with no tabstop should be a no-op, not a toggle.
+    t.unset(cap + 4);
     try testing.expect(!t.get(cap + 4));
 
     // Prealloc still works

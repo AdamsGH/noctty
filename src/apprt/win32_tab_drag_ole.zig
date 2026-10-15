@@ -8,12 +8,12 @@
 //! allocate, call `doDragDrop`, release.
 //!
 //! Thread safety: `doDragDrop` and all COM callbacks run on the STA-
-//! initialised UI thread. The apprt arranges `CoInitializeEx(STA)` in
+//! initialised UI thread. The apprt arranges `OleInitialize` in
 //! `App.init`; callers must not invoke from a background thread.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const windows = std.os.windows;
+const sys = @import("win32/sys.zig");
 const ole_types = @import("win32_ole.zig");
 const tab_drag = @import("win32_tab_drag.zig");
 const win32_types = @import("win32_types.zig");
@@ -88,8 +88,7 @@ var cf_noctty_tab_id: UINT = 0;
 
 fn ensureClipboardFormat() UINT {
     if (cf_noctty_tab_id != 0) return cf_noctty_tab_id;
-    const u32fns = loadUser32() orelse return 0;
-    cf_noctty_tab_id = u32fns.RegisterClipboardFormatW(
+    cf_noctty_tab_id = sys.RegisterClipboardFormatW(
         std.unicode.utf8ToUtf16LeStringLiteral(tab_drag.clipboard_format_name),
     );
     return cf_noctty_tab_id;
@@ -135,63 +134,6 @@ comptime {
             .{ @sizeOf(IDropSourceVtbl), ds_expected },
         ));
     }
-}
-
-// ── Runtime-loaded functions ───────────────────────────────────────────
-
-const Ole32Fns = struct {
-    DoDragDrop: *const fn (*IDataObjectObj, *IDropSourceObj, DWORD, *DWORD) callconv(.winapi) HRESULT = undefined,
-    ReleaseStgMedium: *const fn (*STGMEDIUM) callconv(.winapi) void = undefined,
-    CoTaskMemFree: *const fn (?*anyopaque) callconv(.winapi) void = undefined,
-};
-
-const Kernel32Fns = struct {
-    GlobalAlloc: *const fn (UINT, usize) callconv(.winapi) ?*anyopaque = undefined,
-    GlobalFree: *const fn (?*anyopaque) callconv(.winapi) ?*anyopaque = undefined,
-    GlobalLock: *const fn (?*anyopaque) callconv(.winapi) ?[*]u8 = undefined,
-    GlobalUnlock: *const fn (?*anyopaque) callconv(.winapi) BOOL = undefined,
-    GlobalSize: *const fn (?*anyopaque) callconv(.winapi) usize = undefined,
-};
-
-const User32Fns = struct {
-    RegisterClipboardFormatW: *const fn ([*:0]const u16) callconv(.winapi) UINT = undefined,
-};
-
-var ole32_fns: ?Ole32Fns = null;
-var kernel32_fns: ?Kernel32Fns = null;
-var user32_fns: ?User32Fns = null;
-
-fn loadOle32() ?Ole32Fns {
-    if (ole32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("ole32.dll")) orelse return null;
-    var fns: Ole32Fns = .{};
-    fns.DoDragDrop = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "DoDragDrop") orelse return null));
-    fns.ReleaseStgMedium = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "ReleaseStgMedium") orelse return null));
-    fns.CoTaskMemFree = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "CoTaskMemFree") orelse return null));
-    ole32_fns = fns;
-    return fns;
-}
-
-fn loadKernel32() ?Kernel32Fns {
-    if (kernel32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("kernel32.dll")) orelse return null;
-    var fns: Kernel32Fns = .{};
-    fns.GlobalAlloc = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalAlloc") orelse return null));
-    fns.GlobalFree = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalFree") orelse return null));
-    fns.GlobalLock = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalLock") orelse return null));
-    fns.GlobalUnlock = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalUnlock") orelse return null));
-    fns.GlobalSize = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "GlobalSize") orelse return null));
-    kernel32_fns = fns;
-    return fns;
-}
-
-fn loadUser32() ?User32Fns {
-    if (user32_fns) |fns| return fns;
-    const dll = windows.kernel32.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("user32.dll")) orelse return null;
-    var fns: User32Fns = .{};
-    fns.RegisterClipboardFormatW = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(dll, "RegisterClipboardFormatW") orelse return null));
-    user32_fns = fns;
-    return fns;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -521,17 +463,16 @@ pub const DataObject = struct {
 
         if (!formatEtcMatches(pformatetc, self.cf_id)) return DV_E_FORMATETC;
 
-        const k32 = loadKernel32() orelse return E_OUTOFMEMORY;
         const size = @sizeOf(Payload);
-        const hGlobal = k32.GlobalAlloc(GMEM_MOVEABLE, size) orelse return E_OUTOFMEMORY;
+        const hGlobal = sys.GlobalAlloc(GMEM_MOVEABLE, size) orelse return E_OUTOFMEMORY;
 
-        const locked = k32.GlobalLock(hGlobal) orelse {
-            _ = k32.GlobalFree(hGlobal);
+        const locked: [*]u8 = @ptrCast(sys.GlobalLock(hGlobal) orelse {
+            _ = sys.GlobalFree(hGlobal);
             return E_OUTOFMEMORY;
-        };
+        });
         const src_bytes = std.mem.asBytes(&self.payload);
         @memcpy(locked[0..size], src_bytes);
-        _ = k32.GlobalUnlock(hGlobal);
+        _ = sys.GlobalUnlock(hGlobal);
 
         pmedium.tymed = TYMED_HGLOBAL;
         pmedium.u = .{ .hGlobal = hGlobal };
@@ -622,7 +563,6 @@ pub const DataObject = struct {
 pub const DoDragError = error{
     DataObjectInitFailed,
     DoDragDropFailed,
-    RuntimeMissing,
 };
 
 pub const DragResult = enum {
@@ -636,20 +576,18 @@ pub const DragResult = enum {
 /// Blocks until the user drops or cancels. Returns the drag outcome;
 /// `drop_effect` receives the negotiated `DROPEFFECT` on success.
 ///
-/// Requires the calling thread to have `CoInitializeEx(STA)`, which the
+/// Requires the calling thread to have `OleInitialize`, which the
 /// apprt arranges in `App.init`.
 pub fn doDragDrop(alloc: Allocator, payload: Payload, drop_effect: *DWORD) DoDragError!DragResult {
-    const ole = loadOle32() orelse return error.RuntimeMissing;
-
     var dataobj = DataObject.init(alloc, payload) orelse return error.DataObjectInitFailed;
     defer dataobj.deinit();
 
     var source = DragSource.init(alloc);
     defer source.deinit();
 
-    const hr = ole.DoDragDrop(
-        &dataobj.obj,
-        &source.obj,
+    const hr = sys.DoDragDrop(
+        @ptrCast(&dataobj.obj),
+        @ptrCast(&source.obj),
         DROPEFFECT_MOVE | DROPEFFECT_COPY,
         drop_effect,
     );
@@ -754,8 +692,6 @@ test "QueryGetData returns S_OK for matching format, DV_E_FORMATETC otherwise" {
 }
 
 test "GetData allocates HGLOBAL with correct payload bytes" {
-    const k32 = loadKernel32() orelse return error.SkipZigTest;
-
     const payload = makeTestPayload();
     var dobj = DataObject.initWithFormat(testing.allocator, payload, TEST_CF);
 
@@ -774,15 +710,15 @@ test "GetData allocates HGLOBAL with correct payload bytes" {
     try testing.expect(stg.u.hGlobal != null);
 
     // Verify contents.
-    const locked = k32.GlobalLock(stg.u.hGlobal) orelse return error.SkipZigTest;
-    defer _ = k32.GlobalUnlock(stg.u.hGlobal);
+    const locked: [*]u8 = @ptrCast(sys.GlobalLock(stg.u.hGlobal) orelse return error.SkipZigTest);
+    defer _ = sys.GlobalUnlock(stg.u.hGlobal);
 
     const expected = std.mem.asBytes(&payload);
     const actual = locked[0..@sizeOf(Payload)];
     try testing.expectEqualSlices(u8, expected, actual);
 
     // Clean up.
-    _ = k32.GlobalFree(stg.u.hGlobal);
+    _ = sys.GlobalFree(stg.u.hGlobal);
 }
 
 test "GetData rejects unsupported FORMATETC variants before allocating" {

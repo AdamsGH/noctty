@@ -40,6 +40,22 @@ jobs:
         shell: pwsh
         run: ./test/windows/flagship/Test-VerificationContracts.ps1
 
+      - name: Interactive hints contract checks
+        shell: pwsh
+        run: ./test/windows/Test-InteractiveWin11HintsContracts.ps1
+
+      - name: PowerShell shell integration tests (PowerShell 7)
+        shell: pwsh
+        run: ./test/windows/powershell-shell-integration.ps1
+
+      - name: PowerShell shell integration tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./test/windows/powershell-shell-integration.ps1
+
+      - name: Bash shell integration tests (Git Bash)
+        shell: pwsh
+        run: ./test/windows/bash-shell-integration.ps1
+
       - name: Site copy checks
         shell: pwsh
         run: ./scripts/check-site-copy.ps1
@@ -191,6 +207,46 @@ jobs:
       - name: Verify ARM64 source build stages the pinned ConPTY
         shell: pwsh
         run: ./test/windows/source-build-conpty.ps1 -Architecture arm64
+
+  windows-lib-vt:
+    name: Windows libghostty-vt Tests
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+      - name: Run libghostty-vt and C API tests
+        run: zig build test-lib-vt -Demit-lib-vt=true --summary all
+
+  windows-conpty-probes:
+    name: Windows ConPTY Probes (experimental)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+      - name: Run opt-in ConPTY transport and key input probes
+        timeout-minutes: 15
+        env:
+          NOCTTY_RUN_CONPTY_TRANSPORT_TEST: '1'
+          NOCTTY_CONPTY_TRANSPORT_PROBE: '1'
+          NOCTTY_CONPTY_KEY_INPUT_PROBE: '1'
+        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true -Dtest-filter=ConPTY --summary all
 
   windows-portable-smoke:
     name: Windows x64 Portable Package Smoke

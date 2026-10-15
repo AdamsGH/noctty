@@ -316,19 +316,31 @@ pub fn open(
     // This does double allocate some memory but for errors I think that's
     // fine.
     it.reset();
-    while (try it.next()) |loc| {
-        const path = try std.fs.path.join(arena_alloc, &.{ loc.dir, theme });
-        try diags.append(arena_alloc, .{
-            .message = try std.fmt.allocPrintSentinel(
-                arena_alloc,
-                "theme \"{s}\" not found, tried path \"{s}\"",
-                .{ theme, path },
-                0,
-            ),
-        });
-    }
+    try appendNotFound(arena_alloc, theme, &it, diags);
 
     return null;
+}
+
+/// One diagnostic for a theme no directory has, naming every path tried. A
+/// diagnostic per directory made a single misspelled name count as several
+/// config problems.
+fn appendNotFound(
+    arena_alloc: Allocator,
+    theme: []const u8,
+    it: *LocationIterator,
+    diags: *cli_diags.DiagnosticList,
+) error{OutOfMemory}!void {
+    var message: std.Io.Writer.Allocating = .init(arena_alloc);
+    message.writer.print("theme \"{s}\" not found", .{theme}) catch return error.OutOfMemory;
+    var tried: usize = 0;
+    while (try it.next()) |loc| : (tried += 1) {
+        const path = try std.fs.path.join(arena_alloc, &.{ loc.dir, theme });
+        message.writer.print("{s} \"{s}\"", .{ if (tried == 0) ", tried path" else ",", path }) catch return error.OutOfMemory;
+    }
+    if (tried == 0) message.writer.writeAll(": there is no theme directory") catch return error.OutOfMemory;
+    try diags.append(arena_alloc, .{
+        .message = try message.toOwnedSliceSentinel(0),
+    });
 }
 
 /// Open the given theme from an absolute path. If there are any errors
@@ -445,4 +457,23 @@ test "issue149 user theme locations prefer noctty before legacy ghostty" {
         "ghostty",
         std.fs.path.basename(std.fs.path.dirname(legacy_user.dir).?),
     );
+}
+
+test "a theme no directory has is one diagnostic that names every path tried" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diags: cli_diags.DiagnosticList = .{};
+    const found = try open(arena.allocator(), "no-such-theme-pkg22", &diags);
+    try std.testing.expect(found == null);
+
+    // One misspelled name used to count as one problem per directory searched.
+    try std.testing.expectEqual(@as(usize, 1), diags.items().len);
+    const message = diags.items()[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, message, "theme \"no-such-theme-pkg22\" not found") != null);
+
+    var it: LocationIterator = .{ .arena_alloc = arena.allocator() };
+    while (try it.next()) |loc| {
+        try std.testing.expect(std.mem.indexOf(u8, message, loc.dir) != null);
+    }
 }

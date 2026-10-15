@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$checksPassed = 0
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $harnessPath = Join-Path $repoRoot 'test\windows\interactive-win11-hints.ps1'
@@ -57,6 +58,7 @@ try {
         $unsafe.ArtifactName -ne 'interactive-win11-hints-unsafe-paste.json') {
         throw 'UnsafePaste scenario plan must isolate only the protected-paste arm.'
     }
+    $checksPassed += 2
 }
 finally {
     Remove-Item -LiteralPath Function:\Get-HintsScenarioPlan -ErrorAction SilentlyContinue
@@ -136,6 +138,7 @@ try {
     if ($events.Count -ne 1 -or $events[0].char -ne 65) {
         throw 'Input reader must retry a transient writer-held sharing violation.'
     }
+    $checksPassed++
 
     $eventB = '{"char":66,"key":"B","modifiers":""}'
     $sharedWriter = [HintsHeldInputWriterProbe]::OpenShared($inputPath)
@@ -144,11 +147,13 @@ try {
     if ($events.Count -ne 1 -or $events[0].char -ne 65) {
         throw 'Input reader must retain completed records while ignoring a bounded incomplete tail.'
     }
+    $checksPassed++
     $sharedWriter.Write($eventB.Substring(9) + "`r`n")
     $events = @(Get-HintsInputEvents -Path $inputPath)
     if ($events.Count -ne 2 -or $events[1].char -ne 66) {
         throw 'Input reader must observe a trailing record once its held writer completes it.'
     }
+    $checksPassed++
     $sharedWriter.Dispose()
     $sharedWriter = $null
 
@@ -165,6 +170,7 @@ try {
     if (-not $malformedFailed) {
         throw 'Input reader must fail hard on malformed completed JSONL records.'
     }
+    $checksPassed++
 }
 finally {
     if ($null -ne $lease) {
@@ -178,4 +184,4 @@ finally {
     }
 }
 
-Write-Host 'interactive-win11 hints static contracts: PASS'
+Write-Host "interactive-win11 hints static contracts: $checksPassed/6 checks passed"

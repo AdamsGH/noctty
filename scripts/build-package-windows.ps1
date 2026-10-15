@@ -33,6 +33,9 @@ $runtimeFiles = @(
 
 Push-Location $repoRoot
 try {
+    if ([string]::IsNullOrWhiteSpace($Optimize)) {
+        Write-Warning "-Optimize was omitted; packaging a Debug build. Pass -Optimize ReleaseFast for release parity."
+    }
     $buildArgs = @(
         "build",
         "-Demit-exe=true",
