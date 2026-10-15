@@ -59,6 +59,8 @@ pub const SW_FORCEMINIMIZE = 11;
 pub const SW_RESTORE = 9;
 pub const SW_MAXIMIZE = 3;
 pub const SW_HIDE = 0;
+/// `WINDOWPLACEMENT.flags`: a minimized window restores to maximized.
+pub const WPF_RESTORETOMAXIMIZED = 0x0002;
 const WM_APP = 0x8000;
 pub const WM_ACTIVATE = 0x0006;
 pub const WA_INACTIVE = 0;
