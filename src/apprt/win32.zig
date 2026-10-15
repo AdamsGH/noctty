@@ -4298,6 +4298,10 @@ pub const App = struct {
     /// another attempt: nothing else re-arms the jump list's timer when a
     /// worker hangs or cannot deliver.
     profile_discovery_watchdog_id: ?UINT_PTR = null,
+    /// The host inside `Host.requestProfiles`. With no worker the discovery
+    /// runs synchronously within that call, and the host re-checks its list
+    /// itself instead of being called back from inside its own chrome sync.
+    profiles_requesting_host: ?*Host = null,
     /// Numbers each worker, so a late result from an abandoned one leaves the
     /// running state and watchdog of the attempt that replaced it alone.
     profile_discovery_attempt: u64 = 0,
@@ -5690,9 +5694,16 @@ pub const App = struct {
         delivery.close();
         while (delivery.pop()) |value| {
             var payload = value;
-            if (payload == .uia_disconnect) {
-                processDeferredUiaDisconnect(null, payload.uia_disconnect);
-            } else payload.deinit();
+            switch (payload) {
+                .uia_disconnect => |pending| processDeferredUiaDisconnect(null, pending),
+                .jump_list => |job| {
+                    // The Shell already reset its removed list for this
+                    // commit; record the removals before the state is saved.
+                    if (self.jump_list) |*jump_list| jump_list.completeRebuild(job);
+                    payload.deinit();
+                },
+                else => payload.deinit(),
+            }
         }
         delivery.update_running.store(false, .release);
         delivery.profiles_running.store(false, .release);
@@ -7285,7 +7296,7 @@ pub const App = struct {
             for (self.hosts.items) |host| {
                 if (!host.profiles_requested) continue;
                 host.profiles_requested = false;
-                host.profilesArrived(host.profiles != null);
+                if (host != self.profiles_requesting_host) host.profilesArrived(host.profiles != null);
             }
             return;
         };
@@ -7300,7 +7311,7 @@ pub const App = struct {
             _ = host.applyProfileDiscovery(.{ .profiles = profiles, .complete = discovery.complete }) catch |err| {
                 log.warn("deferred profile discovery failed err={}", .{err});
             };
-            host.profilesArrived(had_profiles);
+            if (host != self.profiles_requesting_host) host.profilesArrived(had_profiles);
         }
     }
 
@@ -7309,12 +7320,6 @@ pub const App = struct {
             if (host.profiles_requested) return true;
         }
         return false;
-    }
-
-    /// A discovery runs on the worker, or its result is still queued.
-    fn profileDiscoveryRunning(self: *const App) bool {
-        const delivery = self.delivery orelse return false;
-        return delivery.profiles_running.load(.acquire);
     }
 
     /// The synchronous path, for when no thread can run it.
@@ -8174,11 +8179,14 @@ pub const App = struct {
                         if (ssh_config_hosts_changed) self.profiles_generation +%= 1;
                         const jump_list_profiles_pending = ssh_config_hosts_changed and self.jump_list != null;
                         if (jump_list_profiles_pending) self.jump_list.?.updateProfiles(&.{});
+                        // Drop every list before asking for a new one: each drop
+                        // bumps the generation, which would make a discovery
+                        // started in between stale.
+                        if (ssh_config_hosts_changed) {
+                            for (self.hosts.items) |host| host.invalidateProfiles();
+                        }
                         for (self.hosts.items) |host| {
-                            if (ssh_config_hosts_changed) {
-                                host.invalidateProfiles();
-                                if (host.overlay_mode == .profile) host.requestProfiles();
-                            }
+                            if (ssh_config_hosts_changed and host.overlay_mode == .profile) host.requestProfiles();
                             if (host.overlay_mode == .command_palette) host.rebuildPaletteList();
                         }
                         if (jump_list_profiles_pending) {
@@ -9200,7 +9208,7 @@ pub const App = struct {
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
-        try child.spawn();
+        try internal_os.windows.spawnChildHoldingInheritLock(&child);
         return true;
     }
 
@@ -18525,16 +18533,14 @@ const Host = struct {
         _ = try self.setSelectedProfileIndex(self.selected_profile);
     }
 
-    /// For actions that need a list now. Borrows another window's list
-    /// first; discovers on this thread only when the worker is not already
-    /// at it, since a second discovery would hold the UI thread and race
-    /// the worker for the SSH config.
+    /// For actions that need a list now (open a profile by key or index,
+    /// pin a quick slot). Borrows another window's list, complete or not,
+    /// and discovers on this thread only when no window has one.
     fn ensureProfiles(self: *Host) !bool {
-        if (self.profiles == null and !self.adoptProfilesFromAnotherHost()) {
-            if (self.app.profileDiscoveryRunning()) {
-                self.profiles_requested = true;
-                return false;
-            }
+        if (self.profiles == null and
+            !self.adoptProfilesFromAnotherHost(true) and
+            !self.adoptProfilesFromAnotherHost(false))
+        {
             return try self.reloadProfiles();
         }
         const profiles = self.profiles.?;
@@ -18547,7 +18553,7 @@ const Host = struct {
     /// the UI thread. With none loaded it borrows another window's, else
     /// asks the discovery worker and answers false until that list lands.
     fn profilesForChrome(self: *Host) bool {
-        if (self.profiles == null and !self.adoptProfilesFromAnotherHost()) {
+        if (self.profiles == null and !self.adoptProfilesFromAnotherHost(true)) {
             self.requestProfiles();
             // With no worker to run it, the discovery ran on this thread.
             if (self.profiles == null) return false;
@@ -18560,17 +18566,21 @@ const Host = struct {
 
     fn requestProfiles(self: *Host) void {
         self.profiles_requested = true;
+        const previous = self.app.profiles_requesting_host;
+        self.app.profiles_requesting_host = self;
+        defer self.app.profiles_requesting_host = previous;
         self.app.startProfileDiscovery();
     }
 
-    /// Copy a complete list another window already has. The copy is no
-    /// newer than a discovery in flight, so it leaves the generation alone.
-    fn adoptProfilesFromAnotherHost(self: *Host) bool {
+    /// Copy a list another window already has (`complete_only`: only a
+    /// complete one). The copy is no newer than a discovery in flight, so it
+    /// leaves the generation alone.
+    fn adoptProfilesFromAnotherHost(self: *Host, complete_only: bool) bool {
         for (self.app.hosts.items) |other| {
-            if (other == self or !other.profiles_complete) continue;
+            if (other == self or (complete_only and !other.profiles_complete)) continue;
             const source = other.profiles orelse continue;
             const copy = windows_shell.cloneProfiles(self.app.core_app.alloc, source) catch return false;
-            _ = self.applyProfiles(.{ .profiles = copy, .complete = true }) catch |err| {
+            _ = self.applyProfiles(.{ .profiles = copy, .complete = other.profiles_complete }) catch |err| {
                 log.warn("profile list copy failed err={}", .{err});
             };
             return self.profiles != null;
@@ -18676,8 +18686,9 @@ const Host = struct {
         // Each opening refreshes the list, so a shell installed meanwhile
         // shows up, but on the discovery worker: until it answers the
         // picker shows the list it has, or says it is detecting one.
+        const had_list = self.profiles != null;
         _ = self.profilesForChrome();
-        self.requestProfiles();
+        if (had_list) self.requestProfiles();
         const initial = self.overlayInitialText(.profile);
         defer if (initial) |value| self.app.core_app.alloc.free(value);
         self.hideOverlay();

@@ -899,15 +899,6 @@ test "ssh config bounds file opens away from the caller" {
         slowRead,
     )) == null);
 
-    // The timed-out read still owns the slot, so a second read is busy,
-    // not empty.
-    try testing.expectError(error.SshConfigReadBusy, readSshConfigFileBounded(
-        alloc,
-        path,
-        std.time.ns_per_s,
-        readFile,
-    ));
-
     const wait_started = std.time.nanoTimestamp();
     while (ssh_config_read_in_progress.load(.acquire)) {
         if (std.time.nanoTimestamp() - wait_started > std.time.ns_per_s) {
@@ -930,6 +921,9 @@ test "ssh config load reports a read skipped for a concurrent one" {
     // Another discovery's read holds the single slot.
     try testing.expect(ssh_config_read_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) == null);
     defer ssh_config_read_in_progress.store(false, .release);
+    const config_path = try std.fs.path.join(alloc, &.{ home, ".ssh", "config" });
+    defer alloc.free(config_path);
+    try testing.expectError(error.SshConfigReadBusy, readSshConfigFileBounded(alloc, config_path, std.time.ns_per_s, readFile));
     try testing.expectError(error.SshConfigReadBusy, loadFromHome(alloc, home));
 }
 

@@ -1250,7 +1250,7 @@ fn probeWslExecutable(alloc: Allocator, exe_path: []const u8) !bool {
     child.stderr_behavior = .Ignore;
     child.create_no_window = true;
 
-    spawnHoldingInheritLock(&child) catch |err| {
+    win32.spawnChildHoldingInheritLock(&child) catch |err| {
         log.warn("failed to probe wsl responsiveness exe={s} err={}", .{ exe_path, err });
         return false;
     };
@@ -1569,15 +1569,6 @@ const WslOutputDrain = struct {
     }
 };
 
-/// `std.process.Child` creates inheritable ends for its pipes and closes them
-/// in this process after `CreateProcessW`. Holding the lock across that keeps
-/// a concurrent shell spawn from inheriting them.
-fn spawnHoldingInheritLock(child: *std.process.Child) !void {
-    win32.inheritable_spawn_lock.lock();
-    defer win32.inheritable_spawn_lock.unlock();
-    try child.spawn();
-}
-
 fn listWslDistros(alloc: Allocator, exe_path: []const u8) ![][]u8 {
     var child = std.process.Child.init(&.{ exe_path, "-l", "-q" }, alloc);
     child.stdin_behavior = .Ignore;
@@ -1585,7 +1576,7 @@ fn listWslDistros(alloc: Allocator, exe_path: []const u8) ![][]u8 {
     child.stderr_behavior = .Ignore;
     child.create_no_window = true;
 
-    try spawnHoldingInheritLock(&child);
+    try win32.spawnChildHoldingInheritLock(&child);
     var child_running = true;
     errdefer {
         if (child_running) _ = child.kill() catch {};

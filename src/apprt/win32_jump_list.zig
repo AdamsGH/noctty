@@ -1275,6 +1275,9 @@ pub const JumpList = struct {
     }
 
     fn finishUseGuards(self: *JumpList, persisted: bool) void {
+        // A commit in flight was built with these guards; its removals are
+        // applied against them when it lands.
+        if (self.rebuild_in_flight != null) return;
         if (self.use_guards_rebuild_committed and persisted) {
             self.pending_recent_uses.deinit(self.alloc);
             self.pending_profile_uses.deinit(self.alloc);
@@ -1540,7 +1543,12 @@ pub const JumpList = struct {
         if (self.rebuild_in_flight) |in_flight| {
             // Its completion re-checks `rebuild_seq`. One that never ends
             // must not keep the list from updating again.
-            if (sys.GetTickCount64() -| in_flight.started_ms < rebuild_abandon_ms) return;
+            if (sys.GetTickCount64() -| in_flight.started_ms < rebuild_abandon_ms) {
+                // Look again later: a commit that hangs, or whose result is
+                // lost, is otherwise only replaced by a change after 10 s.
+                self.schedule();
+                return;
+            }
             log.warn("jump list rebuild unfinished after {d} ms; starting another", .{rebuild_abandon_ms});
         }
         const job = self.snapshotRebuild() catch |err| {
@@ -1716,8 +1724,10 @@ pub const RebuildJob = struct {
     pub fn runInOwnApartment(self: *RebuildJob) void {
         const hr = sys.CoInitializeEx(null, COINIT_APARTMENTTHREADED);
         if (hr < 0) {
+            // Retried like any failed commit; ComNotInitialized would turn
+            // the jump list off for the whole process.
             log.warn("jump list rebuild apartment unavailable hr=0x{x}", .{@as(u32, @bitCast(hr))});
-            self.result = error.ComNotInitialized;
+            self.result = error.RebuildApartmentUnavailable;
             return;
         }
         defer sys.CoUninitialize();
@@ -2853,6 +2863,20 @@ test "jump_list a finished rebuild marks the list clean only for the current cop
     current.id = 3;
     jump.completeRebuild(current);
     try std.testing.expect(jump.rebuild_dirty);
+}
+
+test "jump_list keeps use guards while a rebuild built with them is in flight" {
+    const alloc = std.testing.allocator;
+    var jump = try testJumpListWithExe(alloc);
+    defer jump.deinit();
+    try std.testing.expect(try jump.pending_recent_uses.insert(alloc, "C:\\used"));
+    jump.use_guards_rebuild_committed = true;
+    jump.rebuild_in_flight = .{ .id = 1, .started_ms = 0 };
+    jump.finishUseGuards(true);
+    try std.testing.expectEqual(@as(usize, 1), jump.pending_recent_uses.items.items.len);
+    jump.rebuild_in_flight = null;
+    jump.finishUseGuards(true);
+    try std.testing.expectEqual(@as(usize, 0), jump.pending_recent_uses.items.items.len);
 }
 
 test "jump_list a finished rebuild records the user's removals in the model" {
