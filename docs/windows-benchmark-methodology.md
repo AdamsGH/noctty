@@ -246,6 +246,11 @@ machine/display fingerprint, endpoint, observers, and threshold provenance.
   descriptor through that inventory, the still-untouched real DC uses the
   prior depth-constrained `ChoosePixelFormat` request and validates its actual
   described format before the one permitted `SetPixelFormat` call.
+  Every path requires a fixed-point RGBA8 format: exactly 32 colour and 8
+  alpha bits, and `WGL_TYPE_RGBA_ARB` where the extended path can query the
+  type. A float or deeper format is refused rather than ranked lower, because
+  NVIDIA's only accumulation-free window formats are RGBA16F, which a
+  descriptor reports as plain `PFD_TYPE_RGBA` with 64 colour bits (#299).
   Both extended paths require stereo off and full hardware acceleration. Formats
   without accumulation, auxiliary, depth, or stencil attachments rank first,
   but a base-compatible format with those attachments remains usable and its
@@ -256,9 +261,10 @@ machine/display fingerprint, endpoint, observers, and threshold provenance.
   requires `WGL_ARB_multisample`. Absence of the family-compatible query
   capability is recorded explicitly with null sample counts rather than
   presented as a measured zero.
-  Extended selection first requests a bounded inventory of base drawable RGBA
-  matches; acceleration, sRGB, stereo, and multisample rules are applied only
-  after every returned match is queried. Attachment counts remain ranking and
+  Extended selection first requests an inventory of base drawable RGBA matches,
+  bounded, like the classic inventory, at 4096 formats; each returned match is
+  then queried and held to the acceleration, sRGB, stereo, and multisample
+  rules before it is ranked. Attachment counts remain ranking and
   provenance inputs. If that post-filter produces no verified
   format, selection falls back to the classic request and the selected-format
   evidence records what was actually chosen.
