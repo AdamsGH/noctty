@@ -3173,6 +3173,21 @@ fn settingsIncludesOpenable(disk: *const configpkg.Config) win32_settings.SaveEr
     };
 }
 
+/// Whether the loaded `disk` config holds an edit that conflicts with the
+/// draft, or an error when it is not the whole config: the save's own reload
+/// would apply the same partial load, so a locked include stops the save
+/// whether or not an edited setting conflicts.
+fn settingsDiskVerdict(
+    original: *const configpkg.Config,
+    pending: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    state: configpkg.ConditionalState,
+    user_edited: SettingsEditedKeySet,
+) win32_settings.SaveError!bool {
+    try settingsIncludesOpenable(disk);
+    return settingsDiskEditConflict(original, pending, disk, state, user_edited);
+}
+
 fn settingsDiskValueDiffers(
     known: *const configpkg.Config,
     disk: *const configpkg.Config,
@@ -11123,8 +11138,7 @@ pub const App = struct {
             return error.ReloadFailed;
         };
         defer disk.deinit();
-        if (!settingsDiskEditConflict(original, pending, &disk, self.core_app.config_conditional_state, user_edited)) return;
-        try settingsIncludesOpenable(&disk);
+        if (!try settingsDiskVerdict(original, pending, &disk, self.core_app.config_conditional_state, user_edited)) return;
         log.info("settings save: the config file changed on disk under an edited setting; offering the choice", .{});
         self.core_app.updateConfig(self, &disk) catch |err| {
             log.warn("settings save: applying the changed config file failed err={}", .{err});
@@ -26827,6 +26841,15 @@ test "win32 settings disk check stops at a config file it cannot open, not at a 
     try settingsIncludesOpenable(&config);
     try config.@"config-file".parseCLI(arena, missing_path);
     try std.testing.expectError(error.ReloadFailed, settingsIncludesOpenable(&config));
+
+    // The verdict asks for it even when no edited setting conflicts: the
+    // save's own reload would apply the partial load too.
+    var same = try configpkg.Config.default(std.testing.allocator);
+    defer same.deinit();
+    const edited: SettingsEditedKeySet = .initEmpty();
+    const state: configpkg.ConditionalState = .{};
+    try std.testing.expectError(error.ReloadFailed, settingsDiskVerdict(&same, &same, &config, state, edited));
+    try std.testing.expect(!try settingsDiskVerdict(&same, &same, &same, state, edited));
 }
 
 test "win32 settings save target stops at the child command boundary" {
