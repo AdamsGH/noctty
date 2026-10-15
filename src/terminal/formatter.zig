@@ -339,14 +339,33 @@ pub const TerminalFormatter = struct {
         screen_formatter.extra = self.extra.screen;
         screen_formatter.pin_map = self.pin_map;
 
-        // The cursor position is emitted last, below: the scrolling region
-        // and the tab stops that follow the screen move the cursor.
+        // The cursor position is emitted last, below: the tab stops and the
+        // scrolling region that follow the screen move the cursor.
         screen_formatter.extra.cursor = false;
         try screen_formatter.format(writer);
 
         // Extra terminal state to emit after the screen contents so that
         // it doesn't impact the emitted contents.
         if (self.opts.emit == .vt) {
+            // Emit tabstop positions. Before the scrolling region: in origin
+            // mode, which the modes above restore, CHA counts from the left
+            // margin and stops at the right one, so with the margins already
+            // set the stops would land in the wrong columns.
+            if (self.extra.tabstops) {
+                // Clear all tabs (CSI 3 g)
+                try writer.print("\x1b[3g", .{});
+
+                // Set each configured tabstop by moving cursor and using HTS
+                for (0..self.terminal.cols) |col| {
+                    if (self.terminal.tabstops.get(col)) {
+                        // Move cursor to the column (1-indexed)
+                        try writer.print("\x1b[{d}G", .{col + 1});
+                        // Set tab (HTS)
+                        try writer.print("\x1bH", .{});
+                    }
+                }
+            }
+
             // Emit scrolling region using DECSTBM and DECSLRM
             if (self.extra.scrolling_region) {
                 const region = &self.terminal.scrolling_region;
@@ -361,22 +380,6 @@ pub const TerminalFormatter = struct {
                 // Only emit if not the full width
                 if (region.left != 0 or region.right != self.terminal.cols - 1) {
                     try writer.print("\x1b[{d};{d}s", .{ region.left + 1, region.right + 1 });
-                }
-            }
-
-            // Emit tabstop positions
-            if (self.extra.tabstops) {
-                // Clear all tabs (CSI 3 g)
-                try writer.print("\x1b[3g", .{});
-
-                // Set each configured tabstop by moving cursor and using HTS
-                for (0..self.terminal.cols) |col| {
-                    if (self.terminal.tabstops.get(col)) {
-                        // Move cursor to the column (1-indexed)
-                        try writer.print("\x1b[{d}G", .{col + 1});
-                        // Set tab (HTS)
-                        try writer.print("\x1bH", .{});
-                    }
                 }
             }
 
@@ -5206,6 +5209,13 @@ test "Terminal vt with every extra restores the cursor in origin mode" {
         try testing.expect(t2.modes.get(.origin));
         try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
         try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+
+        // Setting a tab stop moves the cursor with CHA, which origin mode
+        // makes relative to the left margin: the stops go out while the
+        // margins are still the whole screen.
+        for (0..20) |col| {
+            try testing.expectEqual(t.tabstops.get(col), t2.tabstops.get(col));
+        }
     }
 }
 
