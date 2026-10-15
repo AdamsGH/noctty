@@ -9758,14 +9758,15 @@ pub const App = struct {
                 }
                 if (stored_entry.payload.close_tab.tab) |*tab| tab.clearRedoHistory();
                 if (host.activeSurface()) |replacement| {
-                    // A background tab closed from its button leaves the
-                    // active tab as it was, which activation then skips
-                    // laying out: close the gap in the tab strip here.
                     if (current_idx != previous_active) {
+                        // A background tab closed from its button leaves
+                        // the active tab as it was: close the gap in the
+                        // strip here, since activation skips layout then,
+                        // and leave focus and window visibility alone.
                         runUiActionOrLog("tab close layout failed", host.layout());
                         runUiActionOrLog("tab close chrome refresh failed", host.refreshChrome());
-                    }
-                    self.activateSurface(replacement);
+                        self.activateSurfaceNoFocus(replacement);
+                    } else self.activateSurface(replacement);
                 } else {
                     host.refocusHostWindow();
                     runUiActionOrLog("tab close layout failed", host.layout());
@@ -13523,11 +13524,18 @@ const Host = struct {
 
         switch (entry.payload) {
             .close_tab => |*value| {
+                const shown = self.activeSurface();
                 if (!(try self.redoClosedTabEntry(value))) {
                     _ = self.discardNewestStructuralUndo();
                     return null;
                 }
                 if (self.activeSurface()) |surface| {
+                    // A background tab closed again leaves the active tab
+                    // as it was, whose activation skips layout.
+                    if (surface == shown) {
+                        runUiActionOrLog("redo close layout failed", self.layout());
+                        runUiActionOrLog("redo close chrome refresh failed", self.refreshChrome());
+                    }
                     self.app.activateSurface(surface);
                 } else {
                     self.refocusHostWindow();
@@ -16036,11 +16044,20 @@ const Host = struct {
     /// undo and never asks.
     fn closeTabInPlace(self: *Host, index: usize) bool {
         if (index >= self.tabs.items.len) return false;
-        const surface = self.tabs.items[index].focusedSurface() orelse return false;
-        return self.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
+        const tab = &self.tabs.items[index];
+        const surface = tab.focusedSurface() orelse return false;
+        // Delete on a focused background tab destroys the focused button;
+        // the keyboard stays in the tab strip rather than jumping away.
+        const button_focused = index != self.active_tab and
+            tab.button_hwnd != null and sys.GetFocus() == tab.button_hwnd;
+        const closed = self.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
             log.warn("tab close failed err={}", .{err});
             return false;
         };
+        if (closed and button_focused) {
+            if (self.tabStripFocusHwnd()) |next| _ = sys.SetFocus(next);
+        }
+        return closed;
     }
 
     test "a background tab close that fails puts the tab back with its button" {
@@ -16086,6 +16103,83 @@ const Host = struct {
         try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
         try std.testing.expectEqual(@as(usize, 1), host.active_tab);
         try std.testing.expect(host.tabs.items[0].button_hwnd != null);
+    }
+
+    test "a background tab close or its redo lays out the strip and leaves focus and hidden windows alone" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(backgroundCloseStripTestBody);
+    }
+
+    fn backgroundCloseStripTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var surface_c: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 2 }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+                .{ .storage = &surface_c, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+                .{ .host = &host, .surface = &surface_c, .id = 3 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        // Wide enough to show all three tab buttons side by side.
+        _ = sys.MoveWindow(window.parent, 0, 0, 1200, 300, 0);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        try host.refreshChrome();
+        try host.layout();
+        const first_left = host.tabs.items[0].button_placement.rect.left;
+        try std.testing.expect(host.tabs.items[1].button_placement.visible);
+        try std.testing.expect(host.tabs.items[1].button_placement.rect.left > first_left);
+        // C is in front with focus, so activating it again changes nothing.
+        // Layout repaints the active tab's panes, which need windows.
+        surface_a.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_b.hwnd = try createTestChromeChild(window.parent, prompt_label_class);
+        surface_c.hwnd = window.pane;
+        defer for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+            surface.hwnd = null;
+        };
+        surface_c.window_visible = true;
+        surface_c.window_focused = true;
+
+        // Delete on A's focused button while the windows are hidden: the
+        // strip closes the gap, the keyboard stays in the strip, and
+        // nothing shows the windows.
+        _ = sys.SetFocus(host.tabs.items[0].button_hwnd.?);
+        app.windows_hidden = true;
+        try std.testing.expect(host.closeTabInPlace(0));
+        try std.testing.expect(app.windows_hidden);
+        app.windows_hidden = false;
+        try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+        try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
+        try std.testing.expectEqual(host.tabStripFocusHwnd(), sys.GetFocus());
+
+        // Undo brings A back in front; with C in front again, redo closes
+        // A in the background and the strip closes the gap again.
+        _ = try host.applyLatestStructuralUndo();
+        try std.testing.expectEqual(@as(?*Surface, &surface_a), host.activeSurface());
+        app.activateSurface(&surface_c);
+        surface_c.window_visible = true;
+        surface_c.window_focused = true;
+        try std.testing.expect(host.tabs.items[0].button_placement.rect.left == first_left);
+        try std.testing.expect(host.tabs.items[1].button_placement.rect.left != first_left);
+        _ = try host.applyLatestStructuralRedo();
+        try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+        try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
     }
 
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
