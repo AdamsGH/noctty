@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const com = @import("com.zig");
+const object = @import("object.zig");
 const constants = @import("constants.zig");
 const events = @import("events.zig");
 const terminal_text = @import("text.zig");
@@ -205,13 +206,17 @@ pub const TerminalState = struct {
 
 pub const TerminalSnapshot = struct {
     document_text: []u8,
-    visible_text: []u8,
     visible_range: terminal_text.OffsetRange,
     caret_offset: usize = 0,
     selection_range: terminal_text.OffsetRange = .{ .start = 0, .end = 0 },
     terminal_selection_range: ?terminal_text.OffsetRange = null,
     terminal_selection_active_offset: ?usize = null,
     geometry: ?TerminalRangeGeometry = null,
+
+    /// Requires the UTF-8 range normalized by TerminalProvider.terminalSnapshot.
+    pub fn visibleText(self: *const TerminalSnapshot) []const u8 {
+        return self.document_text[self.visible_range.start..self.visible_range.end];
+    }
 };
 
 pub const TerminalRangeGeometry = struct {
@@ -225,6 +230,44 @@ pub const TerminalRangeGeometry = struct {
 };
 
 pub const PaletteListProvider = struct {
+    const Object = object.ComObject(PaletteListProvider, queryObject, releaseObject);
+
+    fn queryObject(self: *PaletteListProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+        out.* = null;
+        if (iidEqual(iid, &com.IID_IUnknown) or
+            iidEqual(iid, &com.IID_IRawElementProviderSimple))
+        {
+            out.* = @ptrCast(&self.base);
+            _ = self.refcount.fetchAdd(1, .monotonic);
+            return com.S_OK;
+        }
+        if (iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
+            out.* = @ptrCast(&self.fragment_root);
+            _ = self.refcount.fetchAdd(1, .monotonic);
+            return com.S_OK;
+        }
+        if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
+            out.* = @ptrCast(&self.fragment);
+            _ = self.refcount.fetchAdd(1, .monotonic);
+            return com.S_OK;
+        }
+        if (iidEqual(iid, &com.IID_ISelectionProvider)) {
+            out.* = @ptrCast(&self.selection_iface);
+            _ = self.refcount.fetchAdd(1, .monotonic);
+            return com.S_OK;
+        }
+        return com.E_NOINTERFACE;
+    }
+
+    fn releaseObject(self: *PaletteListProvider) u32 {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return prev - 1;
+    }
+
     base: com.IRawElementProviderSimple,
     fragment: com.IRawElementProviderFragment,
     fragment_root: com.IRawElementProviderFragmentRoot,
@@ -429,52 +472,11 @@ pub const PaletteListProvider = struct {
         return callback(self.state.ctx, index);
     }
 
-    pub fn QueryInterface(
-        self_base: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        const self = fromBase(self_base);
-        out.* = null;
-        if (iidEqual(iid, &com.IID_IUnknown) or
-            iidEqual(iid, &com.IID_IRawElementProviderSimple))
-        {
-            out.* = @ptrCast(&self.base);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
-            out.* = @ptrCast(&self.fragment_root);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
-            out.* = @ptrCast(&self.fragment);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_ISelectionProvider)) {
-            out.* = @ptrCast(&self.selection_iface);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        return com.E_NOINTERFACE;
-    }
+    pub const QueryInterface = Object.Interface("base").QueryInterface;
 
-    pub fn AddRef(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    pub const AddRef = Object.Interface("base").AddRef;
 
-    pub fn Release(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        const prev = self.refcount.fetchSub(1, .acq_rel);
-        if (prev == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return prev - 1;
-    }
+    pub const Release = Object.Interface("base").Release;
 
     fn get_ProviderOptions(
         self_base: *com.IRawElementProviderSimple,
@@ -501,21 +503,11 @@ pub const PaletteListProvider = struct {
         return com.S_OK;
     }
 
-    fn SelectionQueryInterface(
-        self_selection: *com.ISelectionProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromSelection(self_selection).base, iid, out);
-    }
+    const SelectionQueryInterface = Object.Interface("selection_iface").QueryInterface;
 
-    fn SelectionAddRef(self_selection: *com.ISelectionProvider) callconv(.winapi) u32 {
-        return AddRef(&fromSelection(self_selection).base);
-    }
+    const SelectionAddRef = Object.Interface("selection_iface").AddRef;
 
-    fn SelectionRelease(self_selection: *com.ISelectionProvider) callconv(.winapi) u32 {
-        return Release(&fromSelection(self_selection).base);
-    }
+    const SelectionRelease = Object.Interface("selection_iface").Release;
 
     fn SelectionGetSelection(
         self_selection: *com.ISelectionProvider,
@@ -570,7 +562,7 @@ pub const PaletteListProvider = struct {
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(self_base);
         out.* = com.VARIANT.empty();
-        if (self.detached.load(.acquire)) return @bitCast(@as(u32, 0x80040201));
+        if (self.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
 
         switch (prop_id) {
             constants.UIA_ControlTypePropertyId => {
@@ -592,11 +584,7 @@ pub const PaletteListProvider = struct {
                 ) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             constants.UIA_IsEnabledPropertyId,
@@ -623,42 +611,22 @@ pub const PaletteListProvider = struct {
         const self = fromBase(self_base);
         if (self.detached.load(.acquire)) {
             out.* = null;
-            return @bitCast(@as(u32, 0x80040201));
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
         }
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 
-    fn FragmentQueryInterface(
-        self_fragment: *com.IRawElementProviderFragment,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromFragment(self_fragment).base, iid, out);
-    }
+    const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
 
-    fn FragmentAddRef(self_fragment: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return AddRef(&fromFragment(self_fragment).base);
-    }
+    const FragmentAddRef = Object.Interface("fragment").AddRef;
 
-    fn FragmentRelease(self_fragment: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return Release(&fromFragment(self_fragment).base);
-    }
+    const FragmentRelease = Object.Interface("fragment").Release;
 
-    fn FragmentRootQueryInterface(
-        self_root: *com.IRawElementProviderFragmentRoot,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromFragmentRoot(self_root).base, iid, out);
-    }
+    const FragmentRootQueryInterface = Object.Interface("fragment_root").QueryInterface;
 
-    fn FragmentRootAddRef(self_root: *com.IRawElementProviderFragmentRoot) callconv(.winapi) u32 {
-        return AddRef(&fromFragmentRoot(self_root).base);
-    }
+    const FragmentRootAddRef = Object.Interface("fragment_root").AddRef;
 
-    fn FragmentRootRelease(self_root: *com.IRawElementProviderFragmentRoot) callconv(.winapi) u32 {
-        return Release(&fromFragmentRoot(self_root).base);
-    }
+    const FragmentRootRelease = Object.Interface("fragment_root").Release;
 
     fn FragmentNavigate(
         self_fragment: *com.IRawElementProviderFragment,
@@ -788,6 +756,8 @@ fn validPaletteBounds(bounds: com.UiaRect) bool {
 }
 
 const PaletteRowProvider = struct {
+    const Object = object.ComObject(PaletteRowProvider, query, release);
+
     base: com.IRawElementProviderSimple,
     fragment: com.IRawElementProviderFragment,
     selection_item: com.ISelectionItemProvider,
@@ -876,33 +846,17 @@ const PaletteRowProvider = struct {
         _ = self.refcount.fetchAdd(1, .monotonic);
         return com.S_OK;
     }
-    fn QueryInterface(p: *com.IRawElementProviderSimple, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return fromBase(p).query(iid, out);
-    }
-    fn FragmentQueryInterface(p: *com.IRawElementProviderFragment, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return fromFragment(p).query(iid, out);
-    }
-    fn SelectionQueryInterface(p: *com.ISelectionItemProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return fromSelection(p).query(iid, out);
-    }
-    fn InvokeQueryInterface(p: *com.IInvokeProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return fromInvoke(p).query(iid, out);
-    }
+    const QueryInterface = Object.Interface("base").QueryInterface;
+    const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
+    const SelectionQueryInterface = Object.Interface("selection_item").QueryInterface;
+    const InvokeQueryInterface = Object.Interface("invoke_item").QueryInterface;
     fn addRef(self: *PaletteRowProvider) u32 {
         return self.refcount.fetchAdd(1, .monotonic) + 1;
     }
-    fn AddRef(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).addRef();
-    }
-    fn FragmentAddRef(p: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return fromFragment(p).addRef();
-    }
-    fn SelectionAddRef(p: *com.ISelectionItemProvider) callconv(.winapi) u32 {
-        return fromSelection(p).addRef();
-    }
-    fn InvokeAddRef(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return fromInvoke(p).addRef();
-    }
+    const AddRef = Object.Interface("base").AddRef;
+    const FragmentAddRef = Object.Interface("fragment").AddRef;
+    const SelectionAddRef = Object.Interface("selection_item").AddRef;
+    const InvokeAddRef = Object.Interface("invoke_item").AddRef;
     fn release(self: *PaletteRowProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
@@ -912,18 +866,10 @@ const PaletteRowProvider = struct {
         }
         return previous - 1;
     }
-    pub fn Release(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).release();
-    }
-    fn FragmentRelease(p: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return fromFragment(p).release();
-    }
-    fn SelectionRelease(p: *com.ISelectionItemProvider) callconv(.winapi) u32 {
-        return fromSelection(p).release();
-    }
-    fn InvokeRelease(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return fromInvoke(p).release();
-    }
+    pub const Release = Object.Interface("base").Release;
+    const FragmentRelease = Object.Interface("fragment").Release;
+    const SelectionRelease = Object.Interface("selection_item").Release;
+    const InvokeRelease = Object.Interface("invoke_item").Release;
     fn getProviderOptions(p: *com.IRawElementProviderSimple, out: *i32) callconv(.winapi) com.HRESULT {
         const self = fromBase(p);
         out.* = com.ProviderOptions_ServerSideProvider |
@@ -993,27 +939,11 @@ const PaletteRowProvider = struct {
         const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        const array = com.SafeArrayCreateVector(com.VT_I4, 0, 3) orelse return com.E_OUTOFMEMORY;
-        var first: i32 = com.UiaAppendRuntimeId;
-        var low: i32 = @bitCast(@as(u32, @truncate(self.id)));
-        var high: i32 = @bitCast(@as(u32, @truncate(self.id >> 32)));
-        var i: i32 = 0;
-        if (com.SafeArrayPutElement(array, &i, &first) != com.S_OK) {
-            _ = com.SafeArrayDestroy(array);
-            return com.E_OUTOFMEMORY;
-        }
-        i = 1;
-        if (com.SafeArrayPutElement(array, &i, &low) != com.S_OK) {
-            _ = com.SafeArrayDestroy(array);
-            return com.E_OUTOFMEMORY;
-        }
-        i = 2;
-        if (com.SafeArrayPutElement(array, &i, &high) != com.S_OK) {
-            _ = com.SafeArrayDestroy(array);
-            return com.E_OUTOFMEMORY;
-        }
-        out.* = array;
-        return com.S_OK;
+        return object.runtimeId(&.{
+            com.UiaAppendRuntimeId,
+            @bitCast(@as(u32, @truncate(self.id))),
+            @bitCast(@as(u32, @truncate(self.id >> 32))),
+        }, out);
     }
     fn GetBoundingRectangle(p: *com.IRawElementProviderFragment, out: *com.UiaRect) callconv(.winapi) com.HRESULT {
         const self = fromFragment(p);
@@ -1098,6 +1028,33 @@ pub const settings_section_count = 7;
 /// Stable provider for native STATIC controls that this custom settings
 /// window otherwise exposes as generic Panes through the system bridge.
 pub const SettingsControlProvider = struct {
+    const Object = object.ComObject(SettingsControlProvider, queryObject, releaseObject);
+
+    fn queryObject(self: *SettingsControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+        out.* = null;
+        if (iidEqual(iid, &com.IID_IUnknown) or
+            iidEqual(iid, &com.IID_IRawElementProviderSimple))
+        {
+            out.* = @ptrCast(&self.base);
+        } else if (self.role == .edit and iidEqual(iid, &com.IID_IValueProvider)) {
+            out.* = @ptrCast(&self.value_iface);
+        } else if (self.role == .button and iidEqual(iid, &com.IID_IInvokeProvider)) {
+            out.* = @ptrCast(&self.invoke_iface);
+        } else return com.E_NOINTERFACE;
+        _ = AddRef(&self.base);
+        return com.S_OK;
+    }
+
+    fn releaseObject(self: *SettingsControlProvider) u32 {
+        const previous = self.refcount.fetchSub(1, .acq_rel);
+        if (previous == 1) {
+            if (self.labeled_by) |label| _ = label.vtbl.Release(label);
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return previous - 1;
+    }
+
     pub const Role = enum {
         text,
         /// Text that a reader speaks when it changes, such as the status line
@@ -1261,72 +1218,23 @@ pub const SettingsControlProvider = struct {
         return !self.detached.load(.acquire) and IsWindow(self.hwnd) != 0;
     }
 
-    fn QueryInterface(
-        p: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        out.* = null;
-        const self = fromBase(p);
-        if (iidEqual(iid, &com.IID_IUnknown) or
-            iidEqual(iid, &com.IID_IRawElementProviderSimple))
-        {
-            out.* = @ptrCast(p);
-        } else if (self.role == .edit and iidEqual(iid, &com.IID_IValueProvider)) {
-            out.* = @ptrCast(&self.value_iface);
-        } else if (self.role == .button and iidEqual(iid, &com.IID_IInvokeProvider)) {
-            out.* = @ptrCast(&self.invoke_iface);
-        } else return com.E_NOINTERFACE;
-        _ = AddRef(p);
-        return com.S_OK;
-    }
+    const QueryInterface = Object.Interface("base").QueryInterface;
 
-    fn ValueQueryInterface(
-        p: *com.IValueProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromValue(p).base, iid, out);
-    }
+    const ValueQueryInterface = Object.Interface("value_iface").QueryInterface;
 
-    fn InvokeQueryInterface(
-        p: *com.IInvokeProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromInvoke(p).base, iid, out);
-    }
+    const InvokeQueryInterface = Object.Interface("invoke_iface").QueryInterface;
 
-    fn AddRef(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const AddRef = Object.Interface("base").AddRef;
 
-    fn ValueAddRef(p: *com.IValueProvider) callconv(.winapi) u32 {
-        return AddRef(&fromValue(p).base);
-    }
+    const ValueAddRef = Object.Interface("value_iface").AddRef;
 
-    fn InvokeAddRef(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return AddRef(&fromInvoke(p).base);
-    }
+    const InvokeAddRef = Object.Interface("invoke_iface").AddRef;
 
-    pub fn Release(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(p);
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            if (self.labeled_by) |label| _ = label.vtbl.Release(label);
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
-    }
+    pub const Release = Object.Interface("base").Release;
 
-    fn ValueRelease(p: *com.IValueProvider) callconv(.winapi) u32 {
-        return Release(&fromValue(p).base);
-    }
+    const ValueRelease = Object.Interface("value_iface").Release;
 
-    fn InvokeRelease(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return Release(&fromInvoke(p).base);
-    }
+    const InvokeRelease = Object.Interface("invoke_iface").Release;
 
     fn getProviderOptions(
         _: *com.IRawElementProviderSimple,
@@ -1403,11 +1311,7 @@ pub const SettingsControlProvider = struct {
                 _ = label.vtbl.AddRef(label);
                 out.* = com.VARIANT.fromUnknown(@ptrCast(label));
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             => out.* = com.VARIANT.fromBool(self.role != .layout_pane),
@@ -1521,7 +1425,7 @@ pub const SettingsControlProvider = struct {
         const self = fromBase(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 };
 
@@ -1540,6 +1444,17 @@ pub fn returnSettingsControlProvider(
 /// The section providers retain this object; it only borrows their pointers while
 /// attached, so teardown cannot form a COM reference cycle.
 pub const SettingsSectionGroupProvider = struct {
+    const Object = object.ComObject(SettingsSectionGroupProvider, queryInterface, releaseObject);
+
+    fn releaseObject(self: *SettingsSectionGroupProvider) u32 {
+        const previous = self.refcount.fetchSub(1, .acq_rel);
+        if (previous == 1) {
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return previous - 1;
+    }
+
     base: com.IRawElementProviderSimple,
     selection_iface: com.ISelectionProvider,
     refcount: std.atomic.Value(u32),
@@ -1647,27 +1562,11 @@ pub const SettingsSectionGroupProvider = struct {
         return com.S_OK;
     }
 
-    fn QueryInterface(
-        p: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromBase(p).queryInterface(iid, out);
-    }
+    const QueryInterface = Object.Interface("base").QueryInterface;
 
-    fn AddRef(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const AddRef = Object.Interface("base").AddRef;
 
-    pub fn Release(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(p);
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
-    }
+    pub const Release = Object.Interface("base").Release;
 
     fn getProviderOptions(
         _: *com.IRawElementProviderSimple,
@@ -1701,11 +1600,7 @@ pub const SettingsSectionGroupProvider = struct {
         out.* = com.VARIANT.empty();
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         switch (property) {
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             => out.* = com.VARIANT.fromBool(true),
@@ -1723,24 +1618,14 @@ pub const SettingsSectionGroupProvider = struct {
         const self = fromBase(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 
-    fn SelectionQueryInterface(
-        p: *com.ISelectionProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromSelection(p).queryInterface(iid, out);
-    }
+    const SelectionQueryInterface = Object.Interface("selection_iface").QueryInterface;
 
-    fn SelectionAddRef(p: *com.ISelectionProvider) callconv(.winapi) u32 {
-        return fromSelection(p).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const SelectionAddRef = Object.Interface("selection_iface").AddRef;
 
-    fn SelectionRelease(p: *com.ISelectionProvider) callconv(.winapi) u32 {
-        return Release(&fromSelection(p).base);
-    }
+    const SelectionRelease = Object.Interface("selection_iface").Release;
 
     fn GetSelection(
         p: *com.ISelectionProvider,
@@ -1825,6 +1710,18 @@ pub const SettingsSectionMarker = enum(u8) {
 /// The system UIA bridge reports these push-like BUTTON HWNDs as generic Panes,
 /// so Narrator otherwise loses both their radio role and selection semantics.
 pub const SettingsSectionProvider = struct {
+    const Object = object.ComObject(SettingsSectionProvider, queryInterface, releaseObject);
+
+    fn releaseObject(self: *SettingsSectionProvider) u32 {
+        const previous = self.refcount.fetchSub(1, .acq_rel);
+        if (previous == 1) {
+            _ = SettingsSectionGroupProvider.Release(&self.container.base);
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return previous - 1;
+    }
+
     base: com.IRawElementProviderSimple,
     selection_iface: com.ISelectionItemProvider,
     refcount: std.atomic.Value(u32),
@@ -1949,28 +1846,11 @@ pub const SettingsSectionProvider = struct {
         return com.S_OK;
     }
 
-    fn QueryInterface(
-        p: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromBase(p).queryInterface(iid, out);
-    }
+    const QueryInterface = Object.Interface("base").QueryInterface;
 
-    fn AddRef(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const AddRef = Object.Interface("base").AddRef;
 
-    pub fn Release(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(p);
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            _ = SettingsSectionGroupProvider.Release(&self.container.base);
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
-    }
+    pub const Release = Object.Interface("base").Release;
 
     fn getProviderOptions(
         _: *com.IRawElementProviderSimple,
@@ -2013,11 +1893,7 @@ pub const SettingsSectionProvider = struct {
                 const bstr = allocBstrFromUtf8(self.alloc, self.markerState().itemStatus()) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             constants.UIA_IsKeyboardFocusablePropertyId,
@@ -2038,24 +1914,14 @@ pub const SettingsSectionProvider = struct {
         const self = fromBase(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 
-    fn SelectionQueryInterface(
-        p: *com.ISelectionItemProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromSelection(p).queryInterface(iid, out);
-    }
+    const SelectionQueryInterface = Object.Interface("selection_iface").QueryInterface;
 
-    fn SelectionAddRef(p: *com.ISelectionItemProvider) callconv(.winapi) u32 {
-        return fromSelection(p).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const SelectionAddRef = Object.Interface("selection_iface").AddRef;
 
-    fn SelectionRelease(p: *com.ISelectionItemProvider) callconv(.winapi) u32 {
-        return Release(&fromSelection(p).base);
-    }
+    const SelectionRelease = Object.Interface("selection_iface").Release;
 
     fn isSelected(self: *const SettingsSectionProvider) bool {
         return !self.container.detached.load(.acquire) and
@@ -2172,6 +2038,36 @@ pub const ChromeRangeValue = struct {
 /// creation; live names, selection, toggles, and scrollbar values are queried
 /// from their owner only while the provider remains attached.
 pub const ChromeControlProvider = struct {
+    const Object = object.ComObject(ChromeControlProvider, queryObject, releaseObject);
+
+    fn queryObject(self: *ChromeControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+        out.* = null;
+        if (iidEqual(iid, &com.IID_IUnknown) or iidEqual(iid, &com.IID_IRawElementProviderSimple)) {
+            out.* = @ptrCast(&self.base);
+        } else if ((self.state.role == .button) and iidEqual(iid, &com.IID_IInvokeProvider)) {
+            out.* = @ptrCast(&self.invoke_iface);
+        } else if (self.state.role == .toggle and iidEqual(iid, &com.IID_IToggleProvider)) {
+            out.* = @ptrCast(&self.toggle_iface);
+        } else if (self.state.role == .scrollbar and iidEqual(iid, &com.IID_IRangeValueProvider)) {
+            out.* = @ptrCast(&self.range_iface);
+        } else if (self.state.role == .tab_container and iidEqual(iid, &com.IID_ISelectionProvider)) {
+            out.* = @ptrCast(&self.selection_iface);
+        } else if (self.state.role == .tab_item and iidEqual(iid, &com.IID_ISelectionItemProvider)) {
+            out.* = @ptrCast(&self.selection_item_iface);
+        } else return com.E_NOINTERFACE;
+        _ = AddRef(&self.base);
+        return com.S_OK;
+    }
+
+    fn releaseObject(self: *ChromeControlProvider) u32 {
+        const previous = self.refcount.fetchSub(1, .acq_rel);
+        if (previous == 1) {
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return previous - 1;
+    }
+
     base: com.IRawElementProviderSimple,
     invoke_iface: com.IInvokeProvider,
     toggle_iface: com.IToggleProvider,
@@ -2373,43 +2269,11 @@ pub const ChromeControlProvider = struct {
         return @fieldParentPtr("selection_item_iface", p);
     }
 
-    fn QueryInterface(
-        self_base: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        const self = fromBase(self_base);
-        out.* = null;
-        if (iidEqual(iid, &com.IID_IUnknown) or iidEqual(iid, &com.IID_IRawElementProviderSimple)) {
-            out.* = @ptrCast(&self.base);
-        } else if ((self.state.role == .button) and iidEqual(iid, &com.IID_IInvokeProvider)) {
-            out.* = @ptrCast(&self.invoke_iface);
-        } else if (self.state.role == .toggle and iidEqual(iid, &com.IID_IToggleProvider)) {
-            out.* = @ptrCast(&self.toggle_iface);
-        } else if (self.state.role == .scrollbar and iidEqual(iid, &com.IID_IRangeValueProvider)) {
-            out.* = @ptrCast(&self.range_iface);
-        } else if (self.state.role == .tab_container and iidEqual(iid, &com.IID_ISelectionProvider)) {
-            out.* = @ptrCast(&self.selection_iface);
-        } else if (self.state.role == .tab_item and iidEqual(iid, &com.IID_ISelectionItemProvider)) {
-            out.* = @ptrCast(&self.selection_item_iface);
-        } else return com.E_NOINTERFACE;
-        _ = AddRef(&self.base);
-        return com.S_OK;
-    }
+    const QueryInterface = Object.Interface("base").QueryInterface;
 
-    pub fn AddRef(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(self_base).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    pub const AddRef = Object.Interface("base").AddRef;
 
-    pub fn Release(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
-    }
+    pub const Release = Object.Interface("base").Release;
 
     fn get_ProviderOptions(
         self_base: *com.IRawElementProviderSimple,
@@ -2473,11 +2337,7 @@ pub const ChromeControlProvider = struct {
                 const value = allocBstrFromUtf8(self.alloc, status) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(value);
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                out.* = com.VARIANT.fromBstr(com.SysAllocString(
-                    std.unicode.utf8ToUtf16LeStringLiteral("Win32"),
-                ) orelse return com.E_OUTOFMEMORY);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             => out.* = com.VARIANT.fromBool(self.state.role != .decorative),
@@ -2538,18 +2398,12 @@ pub const ChromeControlProvider = struct {
         const self = fromBase(self_base);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 
-    fn InvokeQueryInterface(p: *com.IInvokeProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromInvoke(p).base, iid, out);
-    }
-    fn InvokeAddRef(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return AddRef(&fromInvoke(p).base);
-    }
-    fn InvokeRelease(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return Release(&fromInvoke(p).base);
-    }
+    const InvokeQueryInterface = Object.Interface("invoke_iface").QueryInterface;
+    const InvokeAddRef = Object.Interface("invoke_iface").AddRef;
+    const InvokeRelease = Object.Interface("invoke_iface").Release;
     fn Invoke(p: *com.IInvokeProvider) callconv(.winapi) com.HRESULT {
         const self = fromInvoke(p);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
@@ -2557,15 +2411,9 @@ pub const ChromeControlProvider = struct {
         return postButtonClicked(self.hwnd);
     }
 
-    fn ToggleQueryInterface(p: *com.IToggleProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromToggle(p).base, iid, out);
-    }
-    fn ToggleAddRef(p: *com.IToggleProvider) callconv(.winapi) u32 {
-        return AddRef(&fromToggle(p).base);
-    }
-    fn ToggleRelease(p: *com.IToggleProvider) callconv(.winapi) u32 {
-        return Release(&fromToggle(p).base);
-    }
+    const ToggleQueryInterface = Object.Interface("toggle_iface").QueryInterface;
+    const ToggleAddRef = Object.Interface("toggle_iface").AddRef;
+    const ToggleRelease = Object.Interface("toggle_iface").Release;
     fn Toggle(p: *com.IToggleProvider) callconv(.winapi) com.HRESULT {
         const self = fromToggle(p);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
@@ -2581,15 +2429,9 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
 
-    fn RangeQueryInterface(p: *com.IRangeValueProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromRange(p).base, iid, out);
-    }
-    fn RangeAddRef(p: *com.IRangeValueProvider) callconv(.winapi) u32 {
-        return AddRef(&fromRange(p).base);
-    }
-    fn RangeRelease(p: *com.IRangeValueProvider) callconv(.winapi) u32 {
-        return Release(&fromRange(p).base);
-    }
+    const RangeQueryInterface = Object.Interface("range_iface").QueryInterface;
+    const RangeAddRef = Object.Interface("range_iface").AddRef;
+    const RangeRelease = Object.Interface("range_iface").Release;
     fn range(self: *ChromeControlProvider) ?ChromeRangeValue {
         if (!self.available() or self.state.role != .scrollbar) return null;
         return (self.state.range_value orelse return null)(self.state.ctx);
@@ -2636,15 +2478,9 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
 
-    fn SelectionQueryInterface(p: *com.ISelectionProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromSelection(p).base, iid, out);
-    }
-    fn SelectionAddRef(p: *com.ISelectionProvider) callconv(.winapi) u32 {
-        return AddRef(&fromSelection(p).base);
-    }
-    fn SelectionRelease(p: *com.ISelectionProvider) callconv(.winapi) u32 {
-        return Release(&fromSelection(p).base);
-    }
+    const SelectionQueryInterface = Object.Interface("selection_iface").QueryInterface;
+    const SelectionAddRef = Object.Interface("selection_iface").AddRef;
+    const SelectionRelease = Object.Interface("selection_iface").Release;
     fn GetSelection(p: *com.ISelectionProvider, out: *?*com.SAFEARRAY) callconv(.winapi) com.HRESULT {
         const self = fromSelection(p);
         out.* = null;
@@ -2676,15 +2512,9 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
 
-    fn SelectionItemQueryInterface(p: *com.ISelectionItemProvider, iid: *const com.GUID, out: *?*anyopaque) callconv(.winapi) com.HRESULT {
-        return QueryInterface(&fromSelectionItem(p).base, iid, out);
-    }
-    fn SelectionItemAddRef(p: *com.ISelectionItemProvider) callconv(.winapi) u32 {
-        return AddRef(&fromSelectionItem(p).base);
-    }
-    fn SelectionItemRelease(p: *com.ISelectionItemProvider) callconv(.winapi) u32 {
-        return Release(&fromSelectionItem(p).base);
-    }
+    const SelectionItemQueryInterface = Object.Interface("selection_item_iface").QueryInterface;
+    const SelectionItemAddRef = Object.Interface("selection_item_iface").AddRef;
+    const SelectionItemRelease = Object.Interface("selection_item_iface").Release;
     fn Select(p: *com.ISelectionItemProvider) callconv(.winapi) com.HRESULT {
         const self = fromSelectionItem(p);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
@@ -2744,6 +2574,8 @@ pub fn returnChromeControlProvider(
 }
 
 pub const TerminalProvider = struct {
+    const Object = object.ComObject(TerminalProvider, queryInterface, release);
+
     base: com.IRawElementProviderSimple,
     value_iface: com.IValueProvider,
     text_iface: com.ITextProvider,
@@ -2854,39 +2686,13 @@ pub const TerminalProvider = struct {
         return @fieldParentPtr("text2_iface", p);
     }
 
-    pub fn QueryInterface(
-        self_base: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        const self = fromBase(self_base);
-        return self.queryInterface(iid, out);
-    }
+    pub const QueryInterface = Object.Interface("base").QueryInterface;
 
-    fn TextQueryInterface(
-        self_text: *com.ITextProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        const self = fromText(self_text);
-        return self.queryInterface(iid, out);
-    }
+    const TextQueryInterface = Object.Interface("text_iface").QueryInterface;
 
-    fn Text2QueryInterface(
-        self_text: *com.ITextProvider2,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromText2(self_text).queryInterface(iid, out);
-    }
+    const Text2QueryInterface = Object.Interface("text2_iface").QueryInterface;
 
-    fn ValueQueryInterface(
-        self_value: *com.IValueProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromValue(self_value).queryInterface(iid, out);
-    }
+    const ValueQueryInterface = Object.Interface("value_iface").QueryInterface;
 
     fn queryInterface(
         self: *TerminalProvider,
@@ -2919,41 +2725,21 @@ pub const TerminalProvider = struct {
         return com.E_NOINTERFACE;
     }
 
-    pub fn AddRef(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    pub const AddRef = Object.Interface("base").AddRef;
 
-    fn TextAddRef(self_text: *com.ITextProvider) callconv(.winapi) u32 {
-        const self = fromText(self_text);
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const TextAddRef = Object.Interface("text_iface").AddRef;
 
-    fn ValueAddRef(self_value: *com.IValueProvider) callconv(.winapi) u32 {
-        return fromValue(self_value).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const ValueAddRef = Object.Interface("value_iface").AddRef;
 
-    fn Text2AddRef(self_text: *com.ITextProvider2) callconv(.winapi) u32 {
-        return fromText2(self_text).refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const Text2AddRef = Object.Interface("text2_iface").AddRef;
 
-    pub fn Release(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        return self.release();
-    }
+    pub const Release = Object.Interface("base").Release;
 
-    fn TextRelease(self_text: *com.ITextProvider) callconv(.winapi) u32 {
-        const self = fromText(self_text);
-        return self.release();
-    }
+    const TextRelease = Object.Interface("text_iface").Release;
 
-    fn ValueRelease(self_value: *com.IValueProvider) callconv(.winapi) u32 {
-        return fromValue(self_value).release();
-    }
+    const ValueRelease = Object.Interface("value_iface").Release;
 
-    fn Text2Release(self_text: *com.ITextProvider2) callconv(.winapi) u32 {
-        return fromText2(self_text).release();
-    }
+    const Text2Release = Object.Interface("text2_iface").Release;
 
     fn release(self: *TerminalProvider) u32 {
         const prev = self.refcount.fetchSub(1, .acq_rel);
@@ -3026,11 +2812,7 @@ pub const TerminalProvider = struct {
                 const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_HelpTextPropertyId => {
                 const literal = switch (self.state.role) {
                     .terminal => std.unicode.utf8ToUtf16LeStringLiteral("Read-only terminal text"),
@@ -3075,9 +2857,9 @@ pub const TerminalProvider = struct {
         const self = fromBase(self_base);
         if (self.detached.load(.acquire)) {
             out.* = null;
-            return @bitCast(@as(u32, 0x80040201));
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
         }
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 
     fn allocCurrentValueBstr(self: *TerminalProvider) com.BSTR {
@@ -3140,7 +2922,6 @@ pub const TerminalProvider = struct {
             error.ElementNotAvailable => com.UIA_E_ELEMENTNOTAVAILABLE,
             else => com.E_OUTOFMEMORY,
         };
-        defer self.alloc.free(snapshot.visible_text);
         // ITextProvider::GetSelection is documented to return a degenerate
         // range at the insertion point when a control has a caret but no
         // selection; an empty array is only correct for a control with no
@@ -3285,7 +3066,6 @@ pub const TerminalProvider = struct {
             error.ElementNotAvailable => com.UIA_E_ELEMENTNOTAVAILABLE,
             else => com.E_OUTOFMEMORY,
         };
-        defer self.alloc.free(terminal_snapshot.visible_text);
 
         const caret_offset = if (self.state.role == .terminal)
             terminal_snapshot.terminal_selection_active_offset orelse terminal_snapshot.caret_offset
@@ -3351,7 +3131,6 @@ pub const TerminalProvider = struct {
             error.ElementNotAvailable => com.UIA_E_ELEMENTNOTAVAILABLE,
             else => com.E_OUTOFMEMORY,
         };
-        defer self.alloc.free(terminal_snapshot.visible_text);
         return self.createRangeFromSnapshot(&terminal_snapshot, terminal_snapshot.visible_range, out);
     }
 
@@ -3364,7 +3143,6 @@ pub const TerminalProvider = struct {
             error.ElementNotAvailable => com.UIA_E_ELEMENTNOTAVAILABLE,
             else => com.E_OUTOFMEMORY,
         };
-        defer self.alloc.free(terminal_snapshot.visible_text);
         return self.createRangeFromSnapshot(
             &terminal_snapshot,
             .{ .start = 0, .end = terminal_snapshot.document_text.len },
@@ -3382,7 +3160,6 @@ pub const TerminalProvider = struct {
             error.ElementNotAvailable => com.UIA_E_ELEMENTNOTAVAILABLE,
             else => com.E_OUTOFMEMORY,
         };
-        defer self.alloc.free(terminal_snapshot.visible_text);
 
         const document_offset = self.byteOffsetForScreenPoint(&terminal_snapshot, point);
         return self.createRangeFromSnapshot(
@@ -3394,37 +3171,22 @@ pub const TerminalProvider = struct {
 
     fn terminalSnapshot(self: *TerminalProvider) !TerminalSnapshot {
         if (self.detached.load(.acquire)) return error.ElementNotAvailable;
-        var raw_snapshot = if (self.state.snapshot) |snapshot_fn| snapshot: {
+        const raw_snapshot = if (self.state.snapshot) |snapshot_fn| snapshot: {
             break :snapshot try snapshot_fn(self.state.ctx, self.alloc);
         } else snapshot: {
             const document_text = try self.state.value(self.state.ctx, self.alloc);
-            errdefer self.alloc.free(document_text);
 
-            const visible_text = try self.alloc.dupe(u8, document_text);
             break :snapshot TerminalSnapshot{
                 .document_text = document_text,
-                .visible_text = visible_text,
                 .visible_range = .{ .start = 0, .end = document_text.len },
                 .caret_offset = document_text.len,
             };
         };
 
-        errdefer self.alloc.free(raw_snapshot.document_text);
-        errdefer self.alloc.free(raw_snapshot.visible_text);
-        errdefer if (raw_snapshot.geometry) |geometry| self.alloc.free(geometry.cell_for_byte);
-
         const raw_start = @min(raw_snapshot.visible_range.start, raw_snapshot.document_text.len);
         const raw_end = @min(@max(raw_start, raw_snapshot.visible_range.end), raw_snapshot.document_text.len);
         const visible_start = utf8BoundaryAtOrBefore(raw_snapshot.document_text, raw_start);
         const visible_end = utf8BoundaryAtOrBefore(raw_snapshot.document_text, raw_end);
-        if (visible_start != raw_start or visible_end != raw_end) {
-            const normalized_visible_text = try self.alloc.dupe(
-                u8,
-                raw_snapshot.document_text[visible_start..visible_end],
-            );
-            self.alloc.free(raw_snapshot.visible_text);
-            raw_snapshot.visible_text = normalized_visible_text;
-        }
         const caret_offset = utf8BoundaryAtOrBefore(
             raw_snapshot.document_text,
             @min(raw_snapshot.caret_offset, raw_snapshot.document_text.len),
@@ -3460,7 +3222,6 @@ pub const TerminalProvider = struct {
             null;
         return .{
             .document_text = raw_snapshot.document_text,
-            .visible_text = raw_snapshot.visible_text,
             .visible_range = .{ .start = visible_start, .end = visible_end },
             .caret_offset = caret_offset,
             .selection_range = .{
@@ -3496,7 +3257,7 @@ pub const TerminalProvider = struct {
             );
         }
 
-        const visible_offset = byteOffsetForClientPoint(snapshot.visible_text, client_rect, client_point);
+        const visible_offset = byteOffsetForClientPoint(snapshot.visibleText(), client_rect, client_point);
         return visibleOffsetToDocumentOffset(snapshot.document_text, snapshot.visible_range, visible_offset);
     }
 
@@ -3527,6 +3288,31 @@ pub const TerminalProvider = struct {
 };
 
 const TerminalTextRangeProvider = struct {
+    const Object = object.ComObject(TerminalTextRangeProvider, queryObject, releaseObject);
+
+    fn queryObject(self: *TerminalTextRangeProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+        out.* = null;
+        if (iidEqual(iid, &com.IID_IUnknown) or
+            iidEqual(iid, &com.IID_ITextRangeProvider))
+        {
+            out.* = @ptrCast(&self.base);
+            _ = self.refcount.fetchAdd(1, .monotonic);
+            return com.S_OK;
+        }
+        return com.E_NOINTERFACE;
+    }
+
+    fn releaseObject(self: *TerminalTextRangeProvider) u32 {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            self.snapshot.release();
+            _ = TerminalProvider.Release(&self.parent.base);
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return prev - 1;
+    }
+
     base: com.ITextRangeProvider,
     refcount: std.atomic.Value(u32),
     alloc: std.mem.Allocator,
@@ -3656,39 +3442,11 @@ const TerminalTextRangeProvider = struct {
         return .{ .start = start, .end = end };
     }
 
-    fn QueryInterface(
-        self_base: *com.ITextRangeProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        const self = fromBase(self_base);
-        out.* = null;
-        if (iidEqual(iid, &com.IID_IUnknown) or
-            iidEqual(iid, &com.IID_ITextRangeProvider))
-        {
-            out.* = @ptrCast(&self.base);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        return com.E_NOINTERFACE;
-    }
+    const QueryInterface = Object.Interface("base").QueryInterface;
 
-    fn AddRef(self_base: *com.ITextRangeProvider) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    const AddRef = Object.Interface("base").AddRef;
 
-    fn Release(self_base: *com.ITextRangeProvider) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        const prev = self.refcount.fetchSub(1, .acq_rel);
-        if (prev == 1) {
-            self.snapshot.release();
-            _ = TerminalProvider.Release(&self.parent.base);
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return prev - 1;
-    }
+    const Release = Object.Interface("base").Release;
 
     fn Clone(
         self_base: *com.ITextRangeProvider,
@@ -5139,27 +4897,25 @@ test "TerminalProvider TextProvider2 exposes active degenerate caret range" {
 }
 
 test "TerminalProvider TextProvider2 keeps caret outputs safe on range allocation failure" {
-    var state_data = TestTerminalStateData{ .caret_offset = 6 };
-    var provider = try TerminalProvider.create(
-        std.testing.allocator,
-        @ptrFromInt(0x1),
-        testTerminalState(&state_data),
-    );
-    defer _ = TerminalProvider.Release(&provider.base);
-
-    const original_alloc = provider.alloc;
-    defer provider.alloc = original_alloc;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
-    provider.alloc = failing.allocator();
-
-    var active: com.BOOL = 1;
-    var caret: ?*com.ITextRangeProvider = @ptrFromInt(0x10);
-    try std.testing.expectEqual(
-        com.E_OUTOFMEMORY,
-        TerminalProvider.GetCaretRange(&provider.text2_iface, &active, &caret),
-    );
-    try std.testing.expectEqual(@as(com.BOOL, 0), active);
-    try std.testing.expect(caret == null);
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var state_data = TestTerminalStateData{ .caret_offset = 6 };
+            var provider = try TerminalProvider.create(alloc, @ptrFromInt(0x1), testTerminalState(&state_data));
+            defer _ = TerminalProvider.Release(&provider.base);
+            var active: com.BOOL = 1;
+            var caret: ?*com.ITextRangeProvider = @ptrFromInt(0x10);
+            const result = TerminalProvider.GetCaretRange(&provider.text2_iface, &active, &caret);
+            if (result == com.E_OUTOFMEMORY) {
+                try std.testing.expectEqual(@as(com.BOOL, 0), active);
+                try std.testing.expect(caret == null);
+                return error.OutOfMemory;
+            }
+            try std.testing.expectEqual(com.S_OK, result);
+            defer _ = TerminalTextRangeProvider.Release(caret.?);
+            try std.testing.expectEqual(@as(com.BOOL, 1), active);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "TerminalProvider refcount and state retain balance across text provider refs" {
@@ -5345,7 +5101,6 @@ test "TerminalProvider retained TextPattern returns fresh immutable document ran
     defer _ = TerminalTextRangeProvider.Release(original_range.?);
 
     state_data.value_text = "new output";
-    state_data.visible_value_text = "new output";
     state_data.visible_range = .{ .start = 0, .end = state_data.value_text.len };
     var refreshed_range: ?*com.ITextRangeProvider = null;
     try std.testing.expectEqual(
@@ -6003,7 +5758,6 @@ test "TerminalProvider RangeFromPoint returns a degenerate text range" {
 test "TerminalProvider RangeFromPoint returns document-coordinate offsets" {
     var state_data = TestTerminalStateData{
         .value_text = "scrollback\nvisible",
-        .visible_value_text = "visible",
         .visible_range = .{ .start = 11, .end = 18 },
     };
     const state = testTerminalState(&state_data);
@@ -6156,7 +5910,6 @@ const TestTerminalStateData = struct {
     retains: u32 = 0,
     releases: u32 = 0,
     value_text: []const u8 = "hello\nworld",
-    visible_value_text: []const u8 = "visible",
     visible_range: terminal_text.OffsetRange = .{ .start = 0, .end = 7 },
     caret_offset: usize = 0,
     terminal_selection_range: ?terminal_text.OffsetRange = null,
@@ -6198,7 +5951,6 @@ const TestEditStateData = struct {
                 errdefer alloc.free(document_text);
                 return .{
                     .document_text = document_text,
-                    .visible_text = try alloc.dupe(u8, data.value()),
                     .visible_range = .{ .start = 0, .end = data.value_len },
                     .caret_offset = data.selection_range.end,
                     .selection_range = data.selection_range,
@@ -6279,7 +6031,6 @@ test "terminal role rejects direct Value vtable calls" {
 test "TerminalProvider normalizes visible range to UTF-8 boundaries" {
     var data = TestTerminalStateData{
         .value_text = "A🔥B界C",
-        .visible_value_text = "🔥B",
         .visible_range = .{ .start = 2, .end = 8 },
     };
     var provider = try TerminalProvider.create(
@@ -6288,6 +6039,11 @@ test "TerminalProvider normalizes visible range to UTF-8 boundaries" {
         testTerminalState(&data),
     );
     defer _ = TerminalProvider.Release(&provider.base);
+
+    const snapshot = try provider.terminalSnapshot();
+    defer std.testing.allocator.free(snapshot.document_text);
+    defer if (snapshot.geometry) |geometry| std.testing.allocator.free(geometry.cell_for_byte);
+    try std.testing.expectEqualStrings("🔥B", snapshot.visibleText());
 
     var range: ?*com.ITextRangeProvider = null;
     try std.testing.expectEqual(com.S_OK, provider.createVisibleRange(&range));
@@ -6426,7 +6182,6 @@ test "edit provider exposes one mutable text selection" {
 test "terminal provider exposes an active read-only selection" {
     var data = TestTerminalStateData{
         .value_text = "hello world",
-        .visible_value_text = "hello world",
         .visible_range = .{ .start = 0, .end = 11 },
         .caret_offset = 11,
         .terminal_selection_range = .{ .start = 0, .end = 5 },
@@ -6544,7 +6299,7 @@ test "detached terminal provider rejects late host provider queries" {
 
     var host: ?*com.IRawElementProviderSimple = undefined;
     const hr = TerminalProvider.get_HostRawElementProvider(&provider.base, &host);
-    try std.testing.expectEqual(@as(com.HRESULT, @bitCast(@as(u32, 0x80040201))), hr);
+    try std.testing.expectEqual(@as(com.HRESULT, com.UIA_E_ELEMENTNOTAVAILABLE), hr);
     try std.testing.expectEqual(@as(?*com.IRawElementProviderSimple, null), host);
 
     var active: com.BOOL = 1;
@@ -8308,10 +8063,8 @@ fn testTerminalState(data: *TestTerminalStateData) TerminalState {
 
             const document_text = try alloc.dupe(u8, d.value_text);
             errdefer alloc.free(document_text);
-            const visible_text = try alloc.dupe(u8, d.visible_value_text);
             return .{
                 .document_text = document_text,
-                .visible_text = visible_text,
                 .visible_range = d.visible_range,
                 .caret_offset = d.caret_offset,
                 .terminal_selection_range = d.terminal_selection_range,

@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const com = @import("com.zig");
+const object = @import("object.zig");
 const constants = @import("constants.zig");
 const root = @import("root.zig");
 const text = @import("text.zig");
@@ -65,6 +66,7 @@ test {
     // discoverable from the UIA module entry.
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(com);
+    std.testing.refAllDecls(object);
     std.testing.refAllDecls(constants);
     std.testing.refAllDecls(root);
     std.testing.refAllDecls(text);

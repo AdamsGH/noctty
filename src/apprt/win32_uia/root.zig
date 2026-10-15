@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const com = @import("com.zig");
+const object = @import("object.zig");
 const constants = @import("constants.zig");
 const events = @import("events.zig");
 
@@ -98,6 +99,17 @@ pub const CaptionButtonsState = struct {
 };
 
 pub const RootProvider = struct {
+    const Object = object.ComObject(RootProvider, query, releaseObject);
+
+    fn releaseObject(self: *RootProvider) u32 {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            self.alloc.destroy(self);
+            return 0;
+        }
+        return prev - 1;
+    }
+
     // COM interface shape MUST be first so &self.base == &self (COM layout).
     base: com.IRawElementProviderSimple,
     fragment: com.IRawElementProviderFragment,
@@ -294,60 +306,23 @@ pub const RootProvider = struct {
         return com.S_OK;
     }
 
-    pub fn QueryInterface(
-        self_base: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromBase(self_base).query(iid, out);
-    }
+    pub const QueryInterface = Object.Interface("base").QueryInterface;
 
-    fn FragmentQueryInterface(
-        p: *com.IRawElementProviderFragment,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromFragment(p).query(iid, out);
-    }
+    const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
 
-    fn FragmentRootQueryInterface(
-        p: *com.IRawElementProviderFragmentRoot,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromFragmentRoot(p).query(iid, out);
-    }
+    const FragmentRootQueryInterface = Object.Interface("fragment_root").QueryInterface;
 
-    pub fn AddRef(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
+    pub const AddRef = Object.Interface("base").AddRef;
 
-    fn FragmentAddRef(p: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return AddRef(&fromFragment(p).base);
-    }
+    const FragmentAddRef = Object.Interface("fragment").AddRef;
 
-    fn FragmentRootAddRef(p: *com.IRawElementProviderFragmentRoot) callconv(.winapi) u32 {
-        return AddRef(&fromFragmentRoot(p).base);
-    }
+    const FragmentRootAddRef = Object.Interface("fragment_root").AddRef;
 
-    pub fn Release(self_base: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        const self = fromBase(self_base);
-        const prev = self.refcount.fetchSub(1, .acq_rel);
-        if (prev == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return prev - 1;
-    }
+    pub const Release = Object.Interface("base").Release;
 
-    fn FragmentRelease(p: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return Release(&fromFragment(p).base);
-    }
+    const FragmentRelease = Object.Interface("fragment").Release;
 
-    fn FragmentRootRelease(p: *com.IRawElementProviderFragmentRoot) callconv(.winapi) u32 {
-        return Release(&fromFragmentRoot(p).base);
-    }
+    const FragmentRootRelease = Object.Interface("fragment_root").Release;
 
     // ── IRawElementProviderSimple ───────────────────────────────────────
 
@@ -394,11 +369,7 @@ pub const RootProvider = struct {
                 const bstr = allocBstrFromLiteral(literal) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = allocBstrFromLiteral(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             constants.UIA_IsEnabledPropertyId,
@@ -425,7 +396,7 @@ pub const RootProvider = struct {
         // stock caption when the window still has one, and the
         // window-level accessibility tree come through unchanged. We do
         // NOT hold onto the returned provider — the client does.
-        return com.UiaHostProviderFromHwnd(self.hwnd, out);
+        return object.hostProvider(self.hwnd, out);
     }
 
     // ── IRawElementProviderFragment (the window fragment) ───────────────
@@ -557,6 +528,8 @@ fn rectContains(rect: com.UiaRect, x: f64, y: f64) bool {
 /// not land on it, and claiming otherwise would contradict the focus
 /// events a reader actually receives.
 pub const CaptionButtonProvider = struct {
+    const Object = object.ComObject(CaptionButtonProvider, query, release);
+
     base: com.IRawElementProviderSimple,
     fragment: com.IRawElementProviderFragment,
     invoke_iface: com.IInvokeProvider,
@@ -640,40 +613,16 @@ pub const CaptionButtonProvider = struct {
         _ = self.refcount.fetchAdd(1, .monotonic);
         return com.S_OK;
     }
-    pub fn QueryInterface(
-        p: *com.IRawElementProviderSimple,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromBase(p).query(iid, out);
-    }
-    fn FragmentQueryInterface(
-        p: *com.IRawElementProviderFragment,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromFragment(p).query(iid, out);
-    }
-    fn InvokeQueryInterface(
-        p: *com.IInvokeProvider,
-        iid: *const com.GUID,
-        out: *?*anyopaque,
-    ) callconv(.winapi) com.HRESULT {
-        return fromInvoke(p).query(iid, out);
-    }
+    pub const QueryInterface = Object.Interface("base").QueryInterface;
+    const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
+    const InvokeQueryInterface = Object.Interface("invoke_iface").QueryInterface;
 
     fn addRef(self: *CaptionButtonProvider) u32 {
         return self.refcount.fetchAdd(1, .monotonic) + 1;
     }
-    pub fn AddRef(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).addRef();
-    }
-    fn FragmentAddRef(p: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return fromFragment(p).addRef();
-    }
-    fn InvokeAddRef(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return fromInvoke(p).addRef();
-    }
+    pub const AddRef = Object.Interface("base").AddRef;
+    const FragmentAddRef = Object.Interface("fragment").AddRef;
+    const InvokeAddRef = Object.Interface("invoke_iface").AddRef;
 
     fn release(self: *CaptionButtonProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
@@ -685,15 +634,9 @@ pub const CaptionButtonProvider = struct {
         }
         return previous - 1;
     }
-    pub fn Release(p: *com.IRawElementProviderSimple) callconv(.winapi) u32 {
-        return fromBase(p).release();
-    }
-    fn FragmentRelease(p: *com.IRawElementProviderFragment) callconv(.winapi) u32 {
-        return fromFragment(p).release();
-    }
-    fn InvokeRelease(p: *com.IInvokeProvider) callconv(.winapi) u32 {
-        return fromInvoke(p).release();
-    }
+    pub const Release = Object.Interface("base").Release;
+    const FragmentRelease = Object.Interface("fragment").Release;
+    const InvokeRelease = Object.Interface("invoke_iface").Release;
 
     fn get_ProviderOptions(
         p: *com.IRawElementProviderSimple,
@@ -735,11 +678,7 @@ pub const CaptionButtonProvider = struct {
                 const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
-            constants.UIA_FrameworkIdPropertyId => {
-                const literal = std.unicode.utf8ToUtf16LeStringLiteral("Win32");
-                const bstr = com.SysAllocString(literal) orelse return com.E_OUTOFMEMORY;
-                out.* = com.VARIANT.fromBstr(bstr);
-            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
             constants.UIA_IsControlElementPropertyId,
             constants.UIA_IsContentElementPropertyId,
             constants.UIA_IsEnabledPropertyId,
@@ -802,17 +741,7 @@ pub const CaptionButtonProvider = struct {
         const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        const array = com.SafeArrayCreateVector(com.VT_I4, 0, 3) orelse return com.E_OUTOFMEMORY;
-        var values = [_]i32{ com.UiaAppendRuntimeId, caption_runtime_id_tag, @intFromEnum(self.kind) };
-        for (&values, 0..) |*value, slot| {
-            var index: i32 = @intCast(slot);
-            if (com.SafeArrayPutElement(array, &index, value) != com.S_OK) {
-                _ = com.SafeArrayDestroy(array);
-                return com.E_OUTOFMEMORY;
-            }
-        }
-        out.* = array;
-        return com.S_OK;
+        return object.runtimeId(&.{ com.UiaAppendRuntimeId, caption_runtime_id_tag, @intFromEnum(self.kind) }, out);
     }
 
     pub fn GetBoundingRectangle(
