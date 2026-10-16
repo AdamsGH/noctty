@@ -18,9 +18,8 @@ scoop install noctty/noctty
 Or install with WinGet: `winget install --id AmanThanvi.noctty -e`.
 
 The installer does not add `noctty` to `PATH`. To run the `noctty +...` commands
-below from a shell, add the install folder to `PATH` or run `.
-octty.com` from
-that folder.
+below from a shell, add the install folder to `PATH` or run `.\noctty.com`
+from that folder.
 
 For a direct installer or portable ZIP, run the checksum and signature checks
 on the
