@@ -12886,6 +12886,10 @@ const Host = struct {
     edit_brush: HBRUSH = null,
     status_brush: HBRUSH = null,
     current_dpi: u32 = 96,
+    /// Set by `WM_GETDPISCALEDSIZE`, cleared once `WM_DPICHANGED` has put in
+    /// the new DPI's font. In between, the terminals keep their grid: see
+    /// `Surface.syncCoreSizeFromClientRect`.
+    dpi_change_pending: bool = false,
     /// The last client rect with an area, which layout keeps using while the
     /// window is minimized. See `chrome_layout.hostLayoutClientRect`.
     last_layout_client_rect: ?RECT = null,
@@ -22617,6 +22621,16 @@ const Host = struct {
         self.forceHostCompositionPaint();
     }
 
+    fn syncVisibleSurfaceContentScales(self: *Host) void {
+        if (self.activeTab()) |tab| {
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                if (!entry.view.window_visible) continue;
+                entry.view.syncContentScaleToHostDpi();
+            }
+        }
+    }
+
     fn syncVisibleSurfaceCoreSizesFromClientRects(self: *Host) void {
         if (self.activeTab()) |tab| {
             var it = tab.tree.iterator();
@@ -27529,6 +27543,42 @@ test "win32 DPI suggestions preserve a quick terminal tween but resize ordinary 
     host.restore_placing = false;
     try std.testing.expect(!host.quick_terminal_placing);
     try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
+}
+
+test "win32 a DPI change holds the terminal grid from WM_GETDPISCALEDSIZE to WM_DPICHANGED" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const core = try CoreApp.create(std.testing.allocator);
+    defer core.destroy();
+    var app: App = undefined;
+    try app.init(core, .{ .safe_mode = true });
+    const hinstance = app.hinstance;
+    defer {
+        app.terminate();
+        _ = sys.UnregisterClassW(host_class_name, hinstance);
+        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+    }
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, true);
+    const hwnd = host.hwnd.?;
+    var size: extern struct { cx: i32, cy: i32 } = .{ .cx = 900, .cy = 600 };
+    const size_param: LPARAM = @bitCast(@intFromPtr(&size));
+
+    // FALSE keeps Windows' linear scaling and leaves the proposed size alone.
+    try std.testing.expect(!host.dpi_change_pending);
+    try std.testing.expectEqual(@as(LRESULT, 0), hostWindowProc(hwnd, c.WM_GETDPISCALEDSIZE, 144, size_param));
+    try std.testing.expect(host.dpi_change_pending);
+    try std.testing.expectEqual(@as(i32, 900), size.cx);
+
+    // WM_DPICHANGED releases the hold once it has run.
+    var rect: RECT = undefined;
+    try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
+    _ = hostWindowProc(hwnd, c.WM_DPICHANGED, 0, @bitCast(@intFromPtr(&rect)));
+    try std.testing.expect(!host.dpi_change_pending);
+
+    // So does the end of a drag that never delivered one.
+    _ = hostWindowProc(hwnd, c.WM_GETDPISCALEDSIZE, 144, size_param);
+    _ = hostWindowProc(hwnd, c.WM_EXITSIZEMOVE, 0, 0);
+    try std.testing.expect(!host.dpi_change_pending);
 }
 
 /// Runs `body` on a thread attached to a desktop of its own, so a test can
@@ -32600,8 +32650,18 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
+        c.WM_GETDPISCALEDSIZE => {
+            // Sent before the resize Windows makes for a DPI change, which
+            // then reaches us ahead of `WM_DPICHANGED` (measured in real
+            // drags). Hold the terminals' grid from here; see
+            // `dpi_change_pending`. FALSE keeps Windows' linear scaling.
+            if (host) |v| v.dpi_change_pending = true;
+            return 0;
+        },
         c.WM_DPICHANGED => {
             if (host) |v| {
+                // Also held when no `WM_GETDPISCALEDSIZE` came first.
+                v.dpi_change_pending = true;
                 const new_dpi = sys.GetDpiForWindow(hwnd);
                 if (new_dpi > 0) v.current_dpi = new_dpi;
                 v.recreateChromeFont();
@@ -32624,8 +32684,16 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, flags | c.SWP_NOMOVE | c.SWP_NOSIZE);
                 }
 
+                // The new font before the new size, so the terminals reflow
+                // once, into the grid they end up with. Building the font
+                // can take longer than termio's 25 ms resize coalescing, and
+                // a size sent ahead of it was applied in the old font.
+                v.syncVisibleSurfaceContentScales();
+                v.dpi_change_pending = false;
+
                 // Relayout and repaint
                 runUiActionOrLog("DPI update layout failed", v.layout());
+                v.syncVisibleSurfaceCoreSizesFromClientRects();
                 v.app.resizeShellCompositorWindow(hwnd);
                 if (chromeTextNeedsFullInvalidation(Host.statusBarHeight())) {
                     v.invalidateChromeText();
@@ -33045,6 +33113,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
 
         c.WM_EXITSIZEMOVE => {
             if (host) |v| {
+                // A drag that ends without the `WM_DPICHANGED` its
+                // `WM_GETDPISCALEDSIZE` announced must not hold the grid; the
+                // forced sync below catches it up.
+                v.dpi_change_pending = false;
                 v.is_live_resize.store(false, .release);
                 v.defer_surface_repaints_until_flush = true;
                 runUiActionOrLog("resize completion layout failed", v.layout());
@@ -39330,6 +39402,13 @@ pub const Surface = struct {
     /// core is initialized this only records the size; `Surface.init` hands
     /// the core whatever it missed as soon as init finishes.
     fn syncCoreSizeFromClientRect(self: *Surface) void {
+        // A drag onto a monitor of another DPI resizes the window to its new
+        // size before `WM_DPICHANGED` changes the font, and the core would
+        // lay the old font out in that size: on 144 -> 96 DPI, about 66
+        // columns, which wraps long lines and can push them into scrollback.
+        // Hold the size until the new font is in; the `WM_DPICHANGED` arm
+        // syncs it afterwards. Nothing is recorded, so that sync sees it.
+        if (self.host) |host| if (host.dpi_change_pending) return;
         const hwnd = self.hwnd orelse return;
         const next_size = self.app.clientSize(hwnd) catch return;
         if (!surfacePixelSizeChanged(self.size, next_size)) return;
@@ -52471,6 +52550,31 @@ test "win32 surfacePixelSizeChanged only trips on width or height deltas" {
     try std.testing.expect(!surfacePixelSizeChanged(stable, .{ .width = 800, .height = 600 }));
     try std.testing.expect(surfacePixelSizeChanged(stable, .{ .width = 801, .height = 600 }));
     try std.testing.expect(surfacePixelSizeChanged(stable, .{ .width = 800, .height = 601 }));
+}
+
+test "win32 a pending DPI change holds the surface size and the next sync catches up" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    var app: App = undefined;
+    var host: Host = undefined;
+    host.dpi_change_pending = true;
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.host = &host;
+    surface.hwnd = hwnd;
+    surface.core_initialized = false;
+    surface.size = .{ .width = 0, .height = 0 };
+
+    surface.syncCoreSizeFromClientRect();
+    try std.testing.expectEqual(apprt.SurfaceSize{ .width = 0, .height = 0 }, surface.size);
+
+    // Nothing was recorded while held, so the sync after the font change
+    // still sees the new size.
+    host.dpi_change_pending = false;
+    surface.syncCoreSizeFromClientRect();
+    try std.testing.expectEqual(apprt.SurfaceSize{ .width = 320, .height = 240 }, surface.size);
 }
 
 test "win32 scaleInitialClientSize converts logical initial size to physical pixels" {
