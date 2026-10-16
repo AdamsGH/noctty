@@ -107,7 +107,6 @@ pub const AppendError = error{
 pub const MergeReadyError = error{
     OutputBufferTooSmall,
     TargetAttemptMissing,
-    ReadyBeforeStart,
 };
 
 pub fn validate(record: StartupAttemptRecord) ValidationError!void {
@@ -285,8 +284,11 @@ pub fn mergeMarkReady(
 ) (ValidationError || MergeReadyError)!StartupAttemptRecord {
     const merged = try mergeRecords(disk, memory, out);
     const attempt = try findAttempt(out[0..merged.attempts.len], target_started_at_unix_ms);
-    if (ready_at_unix_ms < attempt.started_at_unix_ms) return error.ReadyBeforeStart;
-    attempt.ready_at_unix_ms = ready_at_unix_ms;
+    // A start can lie ahead of the clock: it is moved past the previous
+    // attempt's (see win32.zig `beginRecoveryStartupAtPath`), and the clock can
+    // be set back. Readiness must still land, or a healthy launch would count
+    // as a failure once the clock catches up.
+    attempt.ready_at_unix_ms = @max(ready_at_unix_ms, attempt.started_at_unix_ms);
     attempt.phase = .ready;
     attempt.last_win32_error = null;
     return merged;
@@ -435,6 +437,20 @@ test "win32 recovery ready merge preserves a concurrent attempt" {
     try std.testing.expectEqual(@as(?u64, 250), merged.attempts[1].ready_at_unix_ms);
     try std.testing.expectEqual(@as(u64, 300), merged.attempts[2].started_at_unix_ms);
     try std.testing.expectEqual(@as(?u64, null), merged.attempts[2].ready_at_unix_ms);
+}
+
+test "win32 recovery ready marker lands on a start ahead of the clock" {
+    // The clock was set back: this launch started at max(now, last + 1).
+    const attempts = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 1000, .ready_at_unix_ms = 1100 },
+        .{ .started_at_unix_ms = 1101 },
+    };
+    var out: [max_attempts]StartupAttempt = undefined;
+    const merged = try mergeMarkReady(.{ .attempts = &attempts }, .{ .attempts = &attempts }, 1101, 600, &out);
+    try std.testing.expectEqual(@as(?u64, 1101), merged.attempts[1].ready_at_unix_ms);
+    try std.testing.expectEqual(StartupPhase.ready, merged.attempts[1].phase);
+    // Resolved, so it never counts as a failure once the clock catches up.
+    try std.testing.expectEqual(@as(usize, 0), recentFailureCount(merged, 5000, 10_000));
 }
 
 test "win32 recovery merge carries failed persistence diagnosis into next startup" {

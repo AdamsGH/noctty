@@ -3457,7 +3457,9 @@ fn markRecoveryAttemptAtPath(
 /// Move a saved session aside that the last launches all ended restoring, so
 /// the next normal launch starts fresh instead of ending again. A rename into
 /// a free slot, never a delete or a replace; skipped while another live process
-/// owns the session. Returns whether the session was moved.
+/// owns the session, and for any file this build would not restore (a newer
+/// build's, an oversized or unreadable one, or one the restore path quarantines
+/// as `.corrupt` anyway). Returns whether the session was moved.
 fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
     const owner = SessionOwnerLock.acquire(alloc, state_path) catch |err| {
         log.warn("win32 recovery: session not set aside, ownership lock unavailable err={}", .{err});
@@ -3467,6 +3469,18 @@ fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
         return false;
     };
     defer owner.release();
+    {
+        var current = win32_session_persistence.loadAlloc(
+            alloc,
+            state_path,
+            win32_session_persistence.default_max_state_bytes,
+        );
+        defer current.deinit();
+        if (current != .loaded) {
+            if (current != .missing) log.warn("win32 recovery: session not set aside, not one this build restores ({s})", .{@tagName(current)});
+            return false;
+        }
+    }
     const destination = win32_session_persistence.quarantineFileAlloc(
         alloc,
         state_path,
@@ -51969,7 +51983,8 @@ test "win32 recovery sets the session aside after failures that all began restor
     defer std.testing.allocator.free(target);
     const session = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
     defer std.testing.allocator.free(session);
-    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "saved" });
+    const saved = "{\"schema_version\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
 
     // Three launches in a row ended after they began restoring the session
     // and before the restore finished: safe mode alone would only reset the
@@ -51991,10 +52006,10 @@ test "win32 recovery sets the session aside after failures that all began restor
     try std.testing.expect(restoring.session_set_aside);
     const moved = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ recovery_set_aside_suffix, 64);
     defer std.testing.allocator.free(moved);
-    try std.testing.expectEqualStrings("saved", moved);
+    try std.testing.expectEqualStrings(saved, moved);
 
     // One of the three finished its restore before it ended: safe mode only.
-    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "saved again" });
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
     try win32_session_persistence.writeFileInPlace(target,
         \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200,"session_restore_at_unix_ms":210,"phase":"window_created"},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
     );
@@ -52063,7 +52078,18 @@ test "win32 recovery sets a crashed session aside without deleting it" {
     // Nothing to move.
     try std.testing.expect(!setAsideCrashedSessionState(std.testing.allocator, state_path));
 
-    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "saved" });
+    // A newer build's session is not this build's to move.
+    const newer = "{\"schema_version\":2,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = newer });
+    try std.testing.expect(!setAsideCrashedSessionState(std.testing.allocator, state_path));
+    try tmp.dir.access("session-state.json", .{});
+    // Nor is one this build would quarantine as `.corrupt` when restoring it.
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "not json" });
+    try std.testing.expect(!setAsideCrashedSessionState(std.testing.allocator, state_path));
+    try tmp.dir.access("session-state.json", .{});
+
+    const saved = "{\"schema_version\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
     // A live owner keeps it where it is.
     {
         const owner = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
@@ -52076,7 +52102,7 @@ test "win32 recovery sets a crashed session aside without deleting it" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
     const moved = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ recovery_set_aside_suffix, 64);
     defer std.testing.allocator.free(moved);
-    try std.testing.expectEqualStrings("saved", moved);
+    try std.testing.expectEqualStrings(saved, moved);
     // The lock is free again for the next normal launch.
     const next = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
     next.release();
