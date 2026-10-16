@@ -73,10 +73,14 @@ try {
     $requiredMetadata = @(
         'id',
         'version',
+        'packageSourceUrl',
         'title',
         'authors',
         'owners',
         'projectUrl',
+        'projectSourceUrl',
+        'docsUrl',
+        'bugTrackerUrl',
         'licenseUrl',
         'iconUrl',
         'requireLicenseAcceptance',
@@ -101,6 +105,33 @@ try {
     }
     if ($metadataNode.SelectSingleNode('n:requireLicenseAcceptance', $namespaceManager).InnerText -cne 'false') {
         throw 'Generated nuspec must not require license acceptance.'
+    }
+
+    # Chocolatey package-validator rules a first submission must pass:
+    # CPMR0076 (an icon from GitHub is a Requirement failure), CPMR0050 (title
+    # equal to the id), CPMR0041 (project source URL equal to the project URL).
+    $iconUri = [Uri] $metadataNode.SelectSingleNode('n:iconUrl', $namespaceManager).InnerText
+    if ($iconUri.Host -match '(?i)(^|\.)(github\.com|githubusercontent\.com|rawgit\.com)$') {
+        throw "Generated nuspec iconUrl must not be served from GitHub: $iconUri"
+    }
+    if ($iconUri.AbsoluteUri -ceq 'https://noctty.com/assets/favicon.svg' -and
+        -not (Test-Path -LiteralPath (Join-Path $repoRoot 'site/assets/favicon.svg') -PathType Leaf)) {
+        throw 'Generated nuspec iconUrl names site/assets/favicon.svg, which the site no longer ships.'
+    }
+    $releaseSourceUrl = "https://github.com/amanthanvi/noctty/blob/v$Version/scripts/package-package-managers.ps1"
+    if ($metadataNode.SelectSingleNode('n:packageSourceUrl', $namespaceManager).InnerText -cne $releaseSourceUrl) {
+        throw "Generated nuspec packageSourceUrl must name the release tag's generator: $releaseSourceUrl"
+    }
+    if ($metadataNode.SelectSingleNode('n:title', $namespaceManager).InnerText -ceq 'noctty') {
+        throw 'Generated nuspec title must not equal the package id.'
+    }
+    if ($metadataNode.SelectSingleNode('n:projectSourceUrl', $namespaceManager).InnerText -ceq
+        $metadataNode.SelectSingleNode('n:projectUrl', $namespaceManager).InnerText) {
+        throw 'Generated nuspec projectSourceUrl must differ from projectUrl.'
+    }
+    $licenseCopyright = (Get-Content -LiteralPath (Join-Path $repoRoot 'LICENSE') | Where-Object { $_ -like 'Copyright*' } | Select-Object -First 1)
+    if ($metadataNode.SelectSingleNode('n:copyright', $namespaceManager).InnerText -cne $licenseCopyright) {
+        throw "Generated nuspec copyright must match the LICENSE: $licenseCopyright"
     }
 
     $installScript = Get-Content -LiteralPath $installScriptPath -Raw
@@ -157,6 +188,28 @@ try {
             throw "Expected one .nupkg from choco pack; found $($packages.Count)."
         }
         Write-Host "choco pack produced: $($packages[0].FullName)"
+    }
+
+    # A moderation fix repacks a published version with a newer generator, and
+    # the package must then name that generator's commit, not the release tag.
+    $resubmitOutputRelative = Join-Path $scratchRelative 'resubmit'
+    & $packageScript `
+        -Version $Version `
+        -Architectures @($Architecture) `
+        -ArtifactRoot $artifactRelative `
+        -OutputRoot $resubmitOutputRelative `
+        -PackageSourceRef '0123456789abcdef0123456789abcdef01234567' | Out-Null
+    $resubmitNuspec = [System.Xml.XmlDocument]::new()
+    $resubmitNuspec.Load((Join-Path $repoRoot (Join-Path $resubmitOutputRelative 'chocolatey\noctty.nuspec')))
+    $resubmitNamespaces = [System.Xml.XmlNamespaceManager]::new($resubmitNuspec.NameTable)
+    $resubmitNamespaces.AddNamespace('n', $nuspecNamespace)
+    $resubmitSourceUrl = $resubmitNuspec.SelectSingleNode('/n:package/n:metadata/n:packageSourceUrl', $resubmitNamespaces).InnerText
+    if ($resubmitSourceUrl -cne 'https://github.com/amanthanvi/noctty/blob/0123456789abcdef0123456789abcdef01234567/scripts/package-package-managers.ps1') {
+        throw "A repacked nuspec must name the generator commit it was built with, got: $resubmitSourceUrl"
+    }
+    if ($resubmitNuspec.SelectSingleNode('/n:package/n:metadata/n:releaseNotes', $resubmitNamespaces).InnerText -cne
+        "https://github.com/amanthanvi/noctty/releases/tag/v$Version") {
+        throw 'A repacked nuspec must keep pointing at the original release.'
     }
 
     Write-Host "Chocolatey package validation: PASS (version=$Version, architecture=$Architecture)"

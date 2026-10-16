@@ -123,14 +123,23 @@ $pushExitCode = $LASTEXITCODE
 $pushText = ($pushOutput | Out-String)
 Write-Host $pushText
 if ($pushExitCode -ne 0) {
-    # Only the duplicate-version response is tolerated, and only because it
-    # means the intended end state already holds. Every other failure stays a
-    # failure.
-    if ($pushText -match 'already exists' -or
-        $pushText -match 'A package with the ID.*and version.*already exists' -or
-        $pushText -match '409') {
-        Write-Host "Chocolatey reported $packageName $Version as already published; treating the push as complete."
+    # Only "this version is already there" is tolerated, because the intended
+    # end state then holds. The status code cannot say that on its own: the
+    # feed also answers 409 Conflict for a package that fails its basic
+    # validation, so ask the feed again instead of reading the response.
+    if (Test-ChocolateyVersionPublished `
+            -Name $packageName `
+            -PackageVersion $Version `
+            -Source $QuerySource) {
+        Write-Host "Chocolatey already has $packageName $Version; treating the push as complete."
+        # GitHub's pwsh wrapper exits with the last native exit code, which is
+        # still the failed push's.
+        $global:LASTEXITCODE = 0
         return
+    }
+    if ($pushText -match '\b403\b') {
+        # https://docs.chocolatey.org/en-us/community-repository/maintainers/common-errors/
+        throw "choco push was refused with 403. Chocolatey answers 403 for an invalid API key, a package owned by another account, too many versions in moderation, and while a version is in moderation and none has been approved yet, which can last weeks after the first submission (docs/chocolatey-publishing.md)."
     }
     throw "choco push failed with exit code $pushExitCode."
 }

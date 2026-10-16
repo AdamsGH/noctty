@@ -219,7 +219,116 @@ function New-TemporaryPfxFile {
     return $path
 }
 
+# Microsoft.ArtifactSigning.Client, the signtool dlib for Azure Artifact
+# Signing. Pinned by version and by the SHA-512 that nuget.org's catalog
+# records for it, so the code that receives the signing token cannot change
+# under a release.
+$artifactSigningClientVersion = "1.0.146"
+$artifactSigningClientSha512 = "/G0hG/VDIS6psW23b5t1V/ORIgn0PVAOtGj9w+hkPmAuI4pempfwlW50E2GtHscnz9+5Qz3hbC4mcb7ej2Yn1A=="
+# Microsoft documents the dlib as unsupported with older SignTool builds,
+# naming the 20348 SDK.
+$artifactSigningMinimumSignToolVersion = [version]"10.0.22621.755"
+
+function Remove-ArtifactSigningTemporaryRoot {
+    param([string]$Path)
+
+    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $resolved = [System.IO.Path]::GetFullPath($Path)
+    if ([System.IO.Path]::GetDirectoryName($resolved) -ne $tempRoot -or
+        [System.IO.Path]::GetFileName($resolved) -notmatch '\Anoctty-artifact-signing-[0-9a-f]{32}\z') {
+        throw "Refusing to remove an unexpected Artifact Signing temporary path: $resolved"
+    }
+    if (Test-Path -LiteralPath $resolved) {
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}
+
+function Get-ArtifactSigningConfig {
+    param([pscustomobject]$Configuration)
+
+    $signToolPath = Find-SignTool -PreferredPath $preferredSignToolPath
+    if (-not $signToolPath) {
+        throw "signtool.exe was not found. Install the Windows SDK or set WINDOWS_CODESIGN_SIGNTOOL_PATH."
+    }
+    Assert-PeMachine -PathToCheck $signToolPath -ExpectedArchitecture x64
+    $signToolInfo = (Get-Item -LiteralPath $signToolPath).VersionInfo
+    $signToolVersion = [version]::new($signToolInfo.FileMajorPart, $signToolInfo.FileMinorPart, $signToolInfo.FileBuildPart, $signToolInfo.FilePrivatePart)
+    if ($signToolVersion -lt $artifactSigningMinimumSignToolVersion) {
+        throw "Azure Artifact Signing needs signtool.exe $artifactSigningMinimumSignToolVersion or newer; $signToolPath is $signToolVersion."
+    }
+
+    $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-artifact-signing-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+    try {
+        $packagePath = Join-Path $temporaryRoot "client.nupkg"
+        $clientRoot = Join-Path $temporaryRoot "client"
+        Invoke-WebRequest `
+            -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/$artifactSigningClientVersion/microsoft.artifactsigning.client.$artifactSigningClientVersion.nupkg" `
+            -OutFile $packagePath `
+            -UseBasicParsing
+        $packageSha512 = [Convert]::ToBase64String(
+            [System.Security.Cryptography.SHA512]::HashData([System.IO.File]::ReadAllBytes($packagePath))
+        )
+        if ($packageSha512 -cne $artifactSigningClientSha512) {
+            throw "Microsoft.ArtifactSigning.Client $artifactSigningClientVersion does not match its pinned SHA-512 (got $packageSha512)."
+        }
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($packagePath, $clientRoot)
+        $dlibPath = Join-Path $clientRoot "bin\x64\Azure.CodeSigning.Dlib.dll"
+        if (-not (Test-Path -LiteralPath $dlibPath -PathType Leaf)) {
+            throw "Microsoft.ArtifactSigning.Client $artifactSigningClientVersion has no x64 dlib at $dlibPath."
+        }
+
+        # Only the workload-identity credential may answer: it reads the
+        # GitHub OIDC token Invoke-SignFile writes, and nothing else on the
+        # runner (an Azure CLI login, a managed identity) can stand in for the
+        # release job.
+        $metadataPath = Join-Path $temporaryRoot "metadata.json"
+        [ordered]@{
+            Endpoint = $Configuration.Endpoint
+            CodeSigningAccountName = $Configuration.AccountName
+            CertificateProfileName = $Configuration.CertificateProfileName
+            CorrelationId = "noctty-$Version-windows-$Architecture"
+            ExcludeCredentials = @(
+                "EnvironmentCredential",
+                "ManagedIdentityCredential",
+                "SharedTokenCacheCredential",
+                "VisualStudioCredential",
+                "VisualStudioCodeCredential",
+                "AzureCliCredential",
+                "AzurePowerShellCredential",
+                "AzureDeveloperCliCredential",
+                "InteractiveBrowserCredential"
+            )
+        } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding utf8
+    }
+    catch {
+        Remove-ArtifactSigningTemporaryRoot -Path $temporaryRoot
+        throw
+    }
+
+    return @{
+        SignToolPath = $signToolPath
+        DlibPath = $dlibPath
+        MetadataPath = $metadataPath
+        FederatedTokenPath = Join-Path $temporaryRoot "github-oidc.jwt"
+        TenantId = $Configuration.TenantId
+        ClientId = $Configuration.ClientId
+        # Leaf certificates last three days, so the timestamp is what keeps a
+        # signature valid; preflight requires WINDOWS_CODESIGN_TIMESTAMP_URL.
+        TimestampUrl = $signingTimestampUrl
+        Description = $signingDescription
+        Url = $signingUrl
+        TemporaryRoot = $temporaryRoot
+        Label = "Azure Artifact Signing ($($Configuration.AccountName)/$($Configuration.CertificateProfileName))"
+    }
+}
+
 function Get-SigningConfig {
+    $artifactSigning = Get-ArtifactSigningConfiguration
+    if ($artifactSigning) {
+        return Get-ArtifactSigningConfig -Configuration $artifactSigning
+    }
+
     $hasPath = -not [string]::IsNullOrWhiteSpace($signingPfxPath)
     $hasBase64 = -not [string]::IsNullOrWhiteSpace($signingPfxBase64)
 
@@ -289,10 +398,13 @@ function Invoke-SignFile {
 
     $signArgs = @(
         "sign",
-        "/fd", "SHA256",
-        "/f", $SigningConfig.PfxPath,
-        "/p", $SigningConfig.PfxPassword
+        "/fd", "SHA256"
     )
+    if ($SigningConfig.DlibPath) {
+        $signArgs += @("/dlib", $SigningConfig.DlibPath, "/dmdf", $SigningConfig.MetadataPath)
+    } else {
+        $signArgs += @("/f", $SigningConfig.PfxPath, "/p", $SigningConfig.PfxPassword)
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($SigningConfig.TimestampUrl)) {
         # RFC 3161 timestamp (not legacy Authenticode /t) so the signature
@@ -306,7 +418,37 @@ function Invoke-SignFile {
         $PathToSign
     )
 
-    & $SigningConfig.SignToolPath @signArgs
+    if (-not $SigningConfig.DlibPath) {
+        & $SigningConfig.SignToolPath @signArgs
+    } else {
+        # A fresh GitHub OIDC token for every call: the dlib exchanges it for
+        # an Entra token through the federated credential, and GitHub's tokens
+        # expire within minutes while one package step runs for half an hour.
+        if (-not $env:ACTIONS_ID_TOKEN_REQUEST_URL -or -not $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
+            throw "Azure Artifact Signing signs as the release job's GitHub OIDC identity; run it in a GitHub Actions job with id-token: write."
+        }
+        $audience = [System.Uri]::EscapeDataString("api://AzureADTokenExchange")
+        $oidc = Invoke-RestMethod `
+            -Uri "$($env:ACTIONS_ID_TOKEN_REQUEST_URL)&audience=$audience" `
+            -Headers @{ Authorization = "bearer $($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)" }
+        if ([string]::IsNullOrWhiteSpace([string]$oidc.value)) {
+            throw "GitHub returned no OIDC token for Azure Artifact Signing."
+        }
+        $environmentNames = @("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_FEDERATED_TOKEN_FILE")
+        try {
+            [System.IO.File]::WriteAllText($SigningConfig.FederatedTokenPath, [string]$oidc.value)
+            $env:AZURE_TENANT_ID = $SigningConfig.TenantId
+            $env:AZURE_CLIENT_ID = $SigningConfig.ClientId
+            $env:AZURE_FEDERATED_TOKEN_FILE = $SigningConfig.FederatedTokenPath
+            & $SigningConfig.SignToolPath @signArgs
+        }
+        finally {
+            foreach ($name in $environmentNames) {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $SigningConfig.FederatedTokenPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     if ($LASTEXITCODE -ne 0) {
         throw "signtool.exe failed for $PathToSign with exit code $LASTEXITCODE."
@@ -338,6 +480,9 @@ function Assert-ValidSignature {
 
     if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
         throw "Expected a valid Authenticode signature on $PathToCheck, but got $($signature.Status): $($signature.StatusMessage)"
+    }
+    if ($SigningConfig -and $SigningConfig.DlibPath -and $null -eq $signature.TimeStamperCertificate) {
+        throw "Expected an RFC 3161 timestamp on $PathToCheck; an Artifact Signing certificate expires three days after it is issued."
     }
 }
 
@@ -403,6 +548,7 @@ function Write-PortablePayloadManifest {
 
 $signingConfig = $null
 $temporarySigningPfxPath = $null
+$temporarySigningRoot = $null
 
 try {
     Write-Host "Signing config: loading"
@@ -410,7 +556,8 @@ try {
     Write-Host "Signing config: loaded"
     if ($signingConfig) {
         $temporarySigningPfxPath = $signingConfig.TemporaryPfxPath
-        Write-Host "Code signing : enabled"
+        $temporarySigningRoot = $signingConfig.TemporaryRoot
+        Write-Host "Code signing : enabled$(if ($signingConfig.Label) { " via $($signingConfig.Label)" })"
         if ($signingConfig.TrustSelfSigned) {
             Write-Host "Signing trust: validating self-signed signatures by expected signer thumbprint"
             Write-Host "Timestamping : disabled for self-signed signing (ADR-0005: pin-based verification ignores expiry; public TSA stalled packaging on 2026-04-30)"
@@ -553,7 +700,12 @@ try {
 
     Write-Host "Packaging phase: create portable payload manifest"
     Write-PortablePayloadManifest -PayloadRoot $portableRoot -OutputPath $manifestPath
-    if ($signingConfig) {
+    if ($signingConfig -and $signingConfig.DlibPath) {
+        # No local private key exists for Set-AuthenticodeSignature here;
+        # signtool signs the .ps1 through Windows' PowerShell SIP instead.
+        Invoke-SignFile -SigningConfig $signingConfig -PathToSign $manifestPath
+        Assert-ValidSignature -PathToCheck $manifestPath -SigningConfig $signingConfig
+    } elseif ($signingConfig) {
         $manifestSigningParameters = @{
             LiteralPath = $manifestPath
             Certificate = $signingConfig.Certificate
@@ -643,5 +795,8 @@ try {
 finally {
     if ($temporarySigningPfxPath -and (Test-Path -LiteralPath $temporarySigningPfxPath)) {
         Remove-Item -LiteralPath $temporarySigningPfxPath -Force
+    }
+    if ($temporarySigningRoot) {
+        Remove-ArtifactSigningTemporaryRoot -Path $temporarySigningRoot
     }
 }

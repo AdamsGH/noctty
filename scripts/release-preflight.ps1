@@ -342,6 +342,16 @@ function Assert-WingetArchitectureCoverage {
 
 if ($RequireSigning) {
     $timestampStatus = Assert-TimestampUrlConfigured -TrustSelfSigned $trustSelfSigned
+    $artifactSigning = Get-ArtifactSigningConfiguration
+}
+if ($RequireSigning -and $artifactSigning) {
+    Assert-UpdaterAcceptsArtifactSigning -UpdaterSourcePath (Join-Path $repoRoot 'src/update/github_releases.zig')
+    Write-Status -Label "Code signing" -Value "enabled"
+    Write-Status -Label "Signing source" -Value "Azure Artifact Signing (GitHub OIDC)"
+    Write-Status -Label "Signing account" -Value "$($artifactSigning.AccountName) / $($artifactSigning.CertificateProfileName)"
+    Write-Status -Label "Signing endpoint" -Value $artifactSigning.Endpoint
+    Write-Status -Label "Timestamp URL" -Value $timestampStatus
+} elseif ($RequireSigning) {
     $hasPfxBase64 = Test-EnvPresent -Name "WINDOWS_CODESIGN_PFX_BASE64"
     $hasPfxPath = Test-EnvPresent -Name "WINDOWS_CODESIGN_PFX_PATH"
     if ($hasPfxBase64 -and $hasPfxPath) {

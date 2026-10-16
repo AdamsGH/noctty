@@ -61,9 +61,9 @@ $releasePreflightStepSha256 =
 $readinessPreflightStepSha256 =
     '153aa1d2b13ac09f38ba3269bc78840e57a93c98e54b99168a5d937b8dab7989'
 $releaseWorkflowSha256 =
-    'fb4989d35a3042271f76959f65882143c6bad446c7618baa215f34de59e9aed3'
+    'd2225c101d9dbabcb19b24a390a373b95b2d33a4143c5be462ddf17ab040c49d'
 $readinessWorkflowSha256 =
-    '7c66f756a0219af4e791bccef9824c7373050e41aa753836f6f95577a5a1edc5'
+    'f27f5559902fdb83ca8f2c7e93e3175c8363dc6094599d760b2d760b1164c9db'
 # Full-file pins deliberately make every workflow edit a semantic-review event,
 # including triggers, permissions, inherited job metadata, and unprotected steps.
 foreach ($workflow in @(

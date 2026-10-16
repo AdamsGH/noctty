@@ -46,15 +46,23 @@ other key.
 | Certificate subject | `CN=winghostty Local Dev Signing`                                  |
 | SPKI SHA-256        | `671ec822c41f39b1d79c31d27169b37486333c008c7a038261b4fae53818ce2a` |
 
-**Planned, not yet done.** The project intends to move to a certificate from a
-publicly trusted certificate authority; the options and the recommendation are
-in [ADR 0006](adr/0006-code-signing-certificate-decision.md). Under that
-arrangement the private key would be non-exportable and held in a
-FIPS-validated hardware or cloud key store operated by the issuing service,
-not in a PFX, and the GitHub Actions secrets would be signing-service
-credentials rather than a key. Until that migration ships, everything above
-describes the live state. The migration itself follows
-[the rotation runbook](signing-rotation-runbook.md).
+**Prepared, not yet switched on.** The project is moving to Azure Artifact
+Signing, a publicly trusted service that puts the maintainer's verified name on
+the signature; the options and the reasons are in
+[ADR 0006](adr/0006-code-signing-certificate-decision.md). The release workflow
+already contains that signing path, and it is dormant: it runs only once the
+`release` environment defines its five `ARTIFACT_SIGNING_*` variables, and
+release preflight refuses it until the in-app updater has learned to trust
+Artifact Signing's daily-rotating certificates. Under it, the private key is
+generated and kept inside Microsoft's FIPS 140 Level 3 hardware and cannot be
+exported, so there is no PFX and no signing secret anywhere. The release job
+signs as its own GitHub OIDC identity, which Microsoft Entra accepts only
+through a federated credential bound to this repository's `release`
+environment, and only that identity holds the signer role on the certificate
+profile. Until the switch, everything above describes the live state.
+[The Artifact Signing runbook](artifact-signing-runbook.md) lists the steps,
+and [the rotation runbook](signing-rotation-runbook.md) covers the overlap
+release that has to come first.
 
 ## What is signed
 

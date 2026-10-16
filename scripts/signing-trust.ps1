@@ -426,3 +426,76 @@ function Assert-CodeSigningCertificatePolicy {
         SelfSigned = $Certificate.Subject -eq $Certificate.Issuer
     }
 }
+
+# Azure Artifact Signing (ADR 0006) is dormant: it is selected only when the
+# release environment defines all of these variables, and otherwise signing
+# stays on the PFX path untouched. A partial set, or one next to a PFX or the
+# self-signed switch, is a configuration error rather than a fallback, so a
+# half-finished migration can never quietly sign with the old key.
+$script:ArtifactSigningVariableNames = @(
+    'ARTIFACT_SIGNING_ENDPOINT',
+    'ARTIFACT_SIGNING_ACCOUNT_NAME',
+    'ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME',
+    'ARTIFACT_SIGNING_TENANT_ID',
+    'ARTIFACT_SIGNING_CLIENT_ID'
+)
+
+function Get-ArtifactSigningConfiguration {
+    $values = [ordered]@{}
+    foreach ($name in $script:ArtifactSigningVariableNames) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $values[$name] = $value.Trim()
+        }
+    }
+    if ($values.Count -eq 0) {
+        return $null
+    }
+
+    $missing = @($script:ArtifactSigningVariableNames | Where-Object { -not $values.Contains($_) })
+    if ($missing.Count -ne 0) {
+        throw "Azure Artifact Signing is partly configured; also set: $($missing -join ', ')."
+    }
+    foreach ($name in @('WINDOWS_CODESIGN_PFX_BASE64', 'WINDOWS_CODESIGN_PFX_PATH', 'WINDOWS_CODESIGN_PFX_PASSWORD', 'WINDOWS_CODESIGN_TRUST_SELF_SIGNED')) {
+        if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+            throw "Azure Artifact Signing is configured, so $name must be removed from the release environment."
+        }
+    }
+    # The dlib sends a bearer token to this host; accept only the regional
+    # Artifact Signing endpoints Microsoft documents.
+    if ($values['ARTIFACT_SIGNING_ENDPOINT'] -notmatch '\Ahttps://[a-z0-9]+\.codesigning\.azure\.net/?\z') {
+        throw "ARTIFACT_SIGNING_ENDPOINT must be a regional endpoint such as https://eus.codesigning.azure.net, got '$($values['ARTIFACT_SIGNING_ENDPOINT'])'."
+    }
+    foreach ($name in @('ARTIFACT_SIGNING_TENANT_ID', 'ARTIFACT_SIGNING_CLIENT_ID')) {
+        $guid = [guid]::Empty
+        if (-not [guid]::TryParse($values[$name], [ref]$guid)) {
+            throw "$name must be a GUID."
+        }
+    }
+
+    return [pscustomobject]@{
+        Endpoint = $values['ARTIFACT_SIGNING_ENDPOINT']
+        AccountName = $values['ARTIFACT_SIGNING_ACCOUNT_NAME']
+        CertificateProfileName = $values['ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME']
+        TenantId = $values['ARTIFACT_SIGNING_TENANT_ID']
+        ClientId = $values['ARTIFACT_SIGNING_CLIENT_ID']
+    }
+}
+
+# Artifact Signing issues a new leaf certificate every day, so the updater's
+# leaf-SPKI pin rejects every installer it signs. ADR 0006 replaces that pin
+# with the issuing PCA plus the subscriber's 1.3.6.1.4.1.311.97.* EKU, and the
+# change that teaches the updater (and Assert-ReleaseSignature) that rule
+# declares pinned_publisher_artifact_signing_ekus. Until a release carrying it
+# has shipped, signing with Artifact Signing would strand every install.
+function Assert-UpdaterAcceptsArtifactSigning {
+    param(
+        [Parameter(Mandatory)]
+        [string] $UpdaterSourcePath
+    )
+
+    $source = [System.IO.File]::ReadAllText($UpdaterSourcePath)
+    if ($source -notmatch '\bpinned_publisher_artifact_signing_ekus\b') {
+        throw "The updater does not accept Azure Artifact Signing yet: $UpdaterSourcePath pins only the leaf key and declares no pinned_publisher_artifact_signing_ekus, so every installed copy would reject this release. Ship the ADR 0006 pin rule in a release signed by the current key first (docs/artifact-signing-runbook.md, step 8)."
+    }
+}

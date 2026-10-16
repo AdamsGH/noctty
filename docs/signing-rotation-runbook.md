@@ -27,12 +27,16 @@ It is **not**, on its own, the migration to
 [ADR 0006](adr/0006-code-signing-certificate-decision.md)'s recommendation.
 Azure Artifact Signing has no PFX to load, no stable leaf public key to pin,
 and no `/f` argument. Steps 1, 2, and the `release`-secret commands in step 5
-do not apply to it. Migrating there needs three repository changes to land
-first — the `/dlib` + `/dmdf` signing mode, OIDC credentials in place of the
-PFX secrets, and the pin rule rewritten to require the issuing PCA plus the
-subscriber's custom EKU — and then steps 3, 4, 6, and 7 carry the rollout, with
-"the new pin" meaning that PCA-plus-EKU rule rather than an SPKI hash. ADR 0006
-lists those changes; none of them exist yet.
+do not apply to it. Migrating there needs three repository changes. Two have
+landed and are dormant: the `/dlib` + `/dmdf` signing mode in
+`scripts/package-windows.ps1`, and GitHub OIDC in place of the PFX secrets,
+both selected only by the `ARTIFACT_SIGNING_*` variables. The third has not:
+the pin rule rewritten to require the issuing PCA plus the certificate
+profile's custom EKU, which release preflight waits for before it lets
+Artifact Signing sign. Steps 3, 4, 6, and 7 then carry the rollout, with "the
+new pin" meaning that PCA-plus-EKU rule rather than an SPKI hash.
+[The Artifact Signing runbook](artifact-signing-runbook.md) has the whole
+sequence.
 
 ## 0. Before you start
 

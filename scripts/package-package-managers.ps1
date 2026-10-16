@@ -27,7 +27,13 @@ param(
 
     [string]$WingetPackageIdentifier = "AmanThanvi.noctty",
 
-    [string]$ScoopPackageName = "noctty"
+    [string]$ScoopPackageName = "noctty",
+
+    # The revision of this script the Chocolatey package names as its source.
+    # A release packs with the script at its own tag; a moderation fix repacks
+    # an older version with a newer script and must name that commit.
+    [ValidatePattern('\A[0-9A-Za-z][0-9A-Za-z._/-]*\z')]
+    [string]$PackageSourceRef
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,6 +66,10 @@ $projectUrl = "https://github.com/$Repo"
 $releaseUrl = "$projectUrl/releases/tag/$tagValue"
 $licenseUrl = "$projectUrl/blob/$tagValue/LICENSE"
 $iconUrl = "$releaseBaseUrl/$iconName"
+# Chocolatey's validator rejects an icon served from GitHub (CPMR0076), so the
+# package points at the website's copy of the square mark
+# (site/assets/favicon.svg) instead of the release asset.
+$chocolateyIconUrl = "https://noctty.com/assets/favicon.svg"
 $packageDescription = @"
 noctty is a Windows terminal emulator that reuses Ghostty's terminal core under a native Win32 front end.
 "@.Trim()
@@ -256,17 +266,21 @@ $chocolateyNuspec = @"
   <metadata>
     <id>noctty</id>
     <version>$Version</version>
-    <title>noctty</title>
+    <packageSourceUrl>$projectUrl/blob/$(if ($PackageSourceRef) { $PackageSourceRef } else { $tagValue })/scripts/package-package-managers.ps1</packageSourceUrl>
+    <title>Noctty</title>
     <authors>Aman Thanvi</authors>
     <owners>Aman Thanvi</owners>
     <projectUrl>$projectUrl</projectUrl>
+    <projectSourceUrl>$projectUrl/tree/$tagValue</projectSourceUrl>
+    <docsUrl>$projectUrl/blob/$tagValue/docs/getting-started.md</docsUrl>
+    <bugTrackerUrl>$projectUrl/issues</bugTrackerUrl>
     <licenseUrl>$licenseUrl</licenseUrl>
-    <iconUrl>$iconUrl</iconUrl>
+    <iconUrl>$chocolateyIconUrl</iconUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <summary>$escapedDescription</summary>
     <description>$escapedDescription</description>
     <releaseNotes>$releaseUrl</releaseNotes>
-    <copyright>Copyright Aman Thanvi</copyright>
+    <copyright>Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors</copyright>
     <tags>noctty terminal emulator windows ghostty</tags>
   </metadata>
   <files>
