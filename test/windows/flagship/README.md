@@ -26,6 +26,22 @@ pwsh -NoProfile -File test/windows/flagship/Test-VerificationContracts.ps1
 Both forms resolve fragments relative to the entry point, independent of the
 caller's current directory.
 
+### Zig fixtures
+
+Fragments register the Zig tests they depend on with `Register-ZigFixture` (or
+`Register-ZigTestsDiscoveredAndRun`, which also pins declared names). Nothing
+runs while a fragment loads. After the last fragment, a local run builds the
+test executable once with every registered `-Dtest-filter` (a filtered build
+compiles the whole tree, so one build replaces one per fixture), runs the
+executable from its own install prefix (`.zig-cache\flagship-fixtures`, so a
+full-suite `zig-out\bin\ghostty-test.exe` is not replaced) and attributes each
+filter from the qualified test names it prints: a filter that matches no test,
+an expected test that did not run exactly once, a failed test, any nonzero
+exit, and a test that matches no filter (an unfiltered executable) are each
+reported. CI skips the build because the
+mandatory full Zig suite in the same job covers it, but it still runs the
+judge on synthetic output at the end of `Contracts.20-Zig.ps1`.
+
 ## Regenerating protected workflow digests
 
 `contracts/Contracts.80-Release.ps1` freezes eight canonical SHA-256 values:

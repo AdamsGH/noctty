@@ -37,6 +37,18 @@ foreach ($fragment in $fragments) {
     }
 }
 
+# Every fixture the fragments registered shares one filtered Zig build (CI skips it).
+$script:CurrentContractFragment = 'Zig fixture batch'
+try {
+    Invoke-ZigFixtureBatch -RepoRoot $repoRoot
+}
+catch {
+    Add-ContractFailure `
+        -Description $_.Exception.Message `
+        -SourceFragment $script:CurrentContractFragment `
+        -Detail $_.InvocationInfo.PositionMessage
+}
+
 if ($null -eq $script:FlagshipScenarioIds) {
     Add-ContractFailure `
         -Description 'Foundation contract did not publish FlagshipScenarioIds.' `

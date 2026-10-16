@@ -69,9 +69,8 @@ function Assert-TextContract {
     if ($Content -notmatch $Pattern) { throw "Contract missing: $Description ($Context)" }
 }
 
-function Assert-ZigTestsDiscoveredAndRun {
+function Register-ZigTestsDiscoveredAndRun {
     param(
-        [Parameter(Mandatory)] [string] $RepoRoot,
         [Parameter(Mandatory)] [hashtable] $Sources,
         [Parameter(Mandatory)] [string[]] $ExpectedNames,
         [Parameter(Mandatory)] [string] $Filter
@@ -96,9 +95,7 @@ function Assert-ZigTestsDiscoveredAndRun {
         }
     }
 
-    Invoke-ZigFixture `
-        -RepoRoot $RepoRoot `
-        -Filter $Filter
+    Register-ZigFixture -Filter $Filter -ExpectedNames $ExpectedNames
 }
 
 function Get-YamlJobText {
@@ -175,29 +172,203 @@ function Test-FlagshipZigFixtureExecutionEnabled {
     return $env:GITHUB_ACTIONS -ne 'true'
 }
 
-function Invoke-ZigFixture {
+function Register-ZigFixture {
     param(
-        [Parameter(Mandatory)] [string] $RepoRoot,
-        [Parameter(Mandatory)] [string] $Filter
+        [Parameter(Mandatory)] [string] $Filter,
+        [string[]] $ExpectedNames = @()
     )
 
+    if ($null -eq $script:ZigFixtures) {
+        $script:ZigFixtures = [Collections.Generic.List[object]]::new()
+    }
+    $script:ZigFixtures.Add([pscustomobject]@{
+        Filter = $Filter
+        ExpectedNames = @($ExpectedNames)
+    })
+}
+
+# Judges one batched run of the test executable. A filtered build compiles the
+# whole tree (about a minute), so every registered fixture shares one build,
+# and repeated -Dtest-filter flags are an OR: the pass count cannot say which
+# filter matched. The executable run by hand prints, per test, a header
+# `N/M <qualified name>...`, whatever the test logs, and then `OK`, `SKIP` or
+# `FAIL (<error>)` (on its own line after a log or an assertion message), so
+# each filter is attributed from the names and outcomes themselves.
+# Returns the problems found; an empty array means every fixture ran.
+function Get-ZigFixtureProblems {
+    param(
+        [Parameter(Mandatory)] [object[]] $Fixtures,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Output,
+        [Parameter(Mandatory)] [int] $ExitCode
+    )
+
+    $problems = [Collections.Generic.List[string]]::new()
+    # The runner numbers its headers 1/M, 2/M, ...; a line a test prints that
+    # looks like a header (`3/5 items done...`) is not one unless it is next.
+    $headers = [Collections.Generic.List[object]]::new()
+    $nextIndex = 1
+    $runTotal = $null
+    foreach ($candidate in [regex]::Matches(
+            $Output,
+            '(?m)^(?<index>\d+)/(?<total>\d+) (?<name>[^\r\n]+?)\.\.\.')) {
+        $total = [int]$candidate.Groups['total'].Value
+        if ([int]$candidate.Groups['index'].Value -ne $nextIndex -or
+            ($null -ne $runTotal -and $total -ne $runTotal)) {
+            continue
+        }
+        $headers.Add($candidate)
+        $nextIndex++
+        $runTotal = $total
+    }
+    $tests = @(
+        for ($i = 0; $i -lt $headers.Count; $i++) {
+            $header = $headers[$i]
+            $bodyStart = $header.Index + $header.Length
+            $bodyEnd = if ($i + 1 -lt $headers.Count) { $headers[$i + 1].Index } else { $Output.Length }
+            $rest = $Output.Substring($bodyStart, $bodyEnd - $bodyStart)
+            # The runner writes the outcome last, after anything the test logged.
+            $outcome = [regex]::Match(
+                $rest,
+                '(?m)^(?<outcome>OK|SKIP|FAIL)\b',
+                [Text.RegularExpressions.RegexOptions]::RightToLeft)
+            [pscustomobject]@{
+                Name = $header.Groups['name'].Value
+                Total = [int]$header.Groups['total'].Value
+                Outcome = if ($outcome.Success) { $outcome.Groups['outcome'].Value } else { 'UNFINISHED' }
+                Detail = ($rest -split '\r?\n' | Select-Object -First 25) -join "`n"
+            }
+        }
+    )
+    # Zig exempts unnamed tests (`<path>.test_<n>`) from -Dtest-filter; the
+    # named ones are `<path>.test.<name>`.
+    $namedTests = @($tests | Where-Object { $_.Name -notmatch '\.test_\d+$' })
+    $filters = @($Fixtures | ForEach-Object { $_.Filter })
+
+    if ($tests.Count -eq 0) {
+        $problems.Add('The Zig test executable listed no tests; it ran nothing or its output was not captured.')
+    }
+    elseif ($tests[$tests.Count - 1].Total -ne $tests.Count -and $ExitCode -eq 0) {
+        $problems.Add("The Zig test executable announced $($tests[$tests.Count - 1].Total) tests but listed $($tests.Count).")
+    }
+    foreach ($test in $namedTests) {
+        $matchesAFilter = $false
+        foreach ($filter in $filters) {
+            if ($test.Name.Contains($filter, [StringComparison]::Ordinal)) { $matchesAFilter = $true; break }
+        }
+        if (-not $matchesAFilter) {
+            $problems.Add(
+                "Test '$($test.Name)' ran although it matches none of the fixture filters; the batch did not run the filtered build."
+            )
+            break
+        }
+    }
+    foreach ($fixture in $Fixtures) {
+        $filter = $fixture.Filter
+        $matched = @($namedTests | Where-Object { $_.Name.Contains($filter, [StringComparison]::Ordinal) })
+        if ($matched.Count -eq 0) {
+            $problems.Add("Zig fixture filter '$filter' matched no test; Zig accepts a zero-match filter, so nothing was verified.")
+        }
+        elseif (@($matched | Where-Object { $_.Outcome -ceq 'OK' }).Count -eq 0 -and
+            @($matched | Where-Object { $_.Outcome -ceq 'FAIL' }).Count -eq 0) {
+            $problems.Add("Zig fixture filter '$filter' matched $($matched.Count) tests but none passed (all skipped or unfinished), so nothing was verified.")
+        }
+        foreach ($expectedName in $fixture.ExpectedNames) {
+            $ran = @($tests | Where-Object {
+                $_.Name.EndsWith(".test.$expectedName", [StringComparison]::Ordinal)
+            })
+            if ($ran.Count -ne 1) {
+                $problems.Add("Zig fixture '$filter' expected exactly one run of test '$expectedName'; found $($ran.Count).")
+            }
+            elseif ($ran[0].Outcome -cne 'OK' -and $ran[0].Outcome -cne 'FAIL') {
+                $problems.Add("Zig fixture '$filter' expected test '$expectedName' to pass, but it ended as $($ran[0].Outcome).")
+            }
+        }
+        foreach ($failed in @($matched | Where-Object { $_.Outcome -ceq 'FAIL' })) {
+            $problems.Add("Zig fixture '$filter' failed: $($failed.Name)`n$($failed.Detail)")
+        }
+    }
+    # Any failing test fails the run, including the unnamed ones no filter
+    # claims and a leak, which the runner reports only through its exit code.
+    if ($ExitCode -ne 0) {
+        $unattributed = @($tests | Where-Object {
+            $test = $_
+            $_.Outcome -ceq 'FAIL' -and
+                -not @($filters | Where-Object { $test.Name.Contains($_, [StringComparison]::Ordinal) }).Count
+        })
+        $unfinished = @($tests | Where-Object { $_.Outcome -ceq 'UNFINISHED' })
+        $reason = if ($unattributed.Count -gt 0) {
+            "failed: $($unattributed.Name -join ', ')`n$($unattributed[0].Detail)"
+        }
+        elseif ($unfinished.Count -gt 0) {
+            "did not finish test $($unfinished[0].Name)`n$($unfinished[0].Detail)"
+        }
+        elseif (@($tests | Where-Object { $_.Outcome -ceq 'FAIL' }).Count -gt 0) {
+            'see the failed fixtures above'
+        }
+        else {
+            'without reporting a failed test (a leak or an error-level log is reported only through the exit code)'
+        }
+        $problems.Add("The Zig test executable exited with code ${ExitCode}: $reason")
+    }
+    $problems
+}
+
+function Invoke-ZigFixtureBatch {
+    param([Parameter(Mandatory)] [string] $RepoRoot)
+
+    $fixtures = @($script:ZigFixtures)
+    $script:ZigFixtures = $null
+    if ($fixtures.Count -eq 0) { return }
     if (-not (Test-FlagshipZigFixtureExecutionEnabled)) {
-        Write-Host "ZIG-FIXTURE-EXECUTION-SKIPPED [$Filter]: deferred to mandatory full Zig suite in the same Windows job."
+        foreach ($fixture in $fixtures) {
+            Write-Host "ZIG-FIXTURE-EXECUTION-SKIPPED [$($fixture.Filter)]: deferred to mandatory full Zig suite in the same Windows job."
+        }
         return
     }
-    $filterArgument = "-Dtest-filter=$Filter"
-    $zigExitCode = 1
+
+    $filterArguments = @($fixtures | ForEach-Object { "-Dtest-filter=$($_.Filter)" })
+    # Install into a prefix of its own: the filtered executable must not replace
+    # a full-suite one in zig-out\bin.
+    $installPrefix = Join-Path $RepoRoot '.zig-cache\flagship-fixtures'
+    $testExecutable = Join-Path $installPrefix 'bin\ghostty-test.exe'
+    $problems = [Collections.Generic.List[string]]::new()
+    $buildExitCode = 1
+    $runExitCode = 1
+    $runOutput = ''
+    Remove-Item -LiteralPath $testExecutable -Force -ErrorAction Ignore
     Push-Location $RepoRoot
     try {
         & (Join-Path $RepoRoot 'scripts\dev-windows.cmd') `
-            zig build test $filterArgument
-        $zigExitCode = $LASTEXITCODE
+            zig build -Demit-test-exe=true -Demit-exe=false --prefix $installPrefix @filterArguments | Out-Host
+        $buildExitCode = $LASTEXITCODE
+        if ($buildExitCode -eq 0) {
+            # The runner writes UTF-8 and test names are not all ASCII.
+            $previousEncoding = [Console]::OutputEncoding
+            try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+            try {
+                $runOutput = (& $testExecutable 2>&1 | ForEach-Object { "$_" }) -join "`n"
+                $runExitCode = $LASTEXITCODE
+            }
+            finally {
+                try { [Console]::OutputEncoding = $previousEncoding } catch { }
+            }
+        }
     }
     finally {
         Pop-Location
     }
-    if ($zigExitCode -ne 0) {
-        throw "Zig semantic fixture '$Filter' failed with exit code $zigExitCode."
+    if ($buildExitCode -ne 0) {
+        $problems.Add("The batched Zig fixture build failed with exit code $buildExitCode (filters: $($fixtures.Filter -join ', ')).")
+    }
+    else {
+        foreach ($problem in (Get-ZigFixtureProblems -Fixtures $fixtures -Output $runOutput -ExitCode $runExitCode)) {
+            $problems.Add($problem)
+        }
+    }
+    foreach ($problem in $problems) {
+        Add-ContractFailure `
+            -Description $problem `
+            -SourceFragment $script:CurrentContractFragment
     }
 }
 
