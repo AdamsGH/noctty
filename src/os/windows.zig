@@ -28,12 +28,16 @@ pub const OpenFile = windows.OpenFile;
 pub const CloseHandle = windows.CloseHandle;
 pub const GetCurrentProcessId = windows.GetCurrentProcessId;
 pub const SetHandleInformation = windows.SetHandleInformation;
+pub const BOOL = windows.BOOL;
+pub const COORD = windows.COORD;
 pub const DWORD = windows.DWORD;
 pub const FILE_ATTRIBUTE_NORMAL = windows.FILE_ATTRIBUTE_NORMAL;
 pub const FILE_FLAG_OVERLAPPED = windows.FILE_FLAG_OVERLAPPED;
 pub const FILE_SHARE_READ = windows.FILE_SHARE_READ;
 pub const GENERIC_READ = windows.GENERIC_READ;
 pub const HANDLE = windows.HANDLE;
+pub const HRESULT = windows.HRESULT;
+pub const HWND = windows.HWND;
 pub const HMODULE = windows.HMODULE;
 pub const HANDLE_FLAG_INHERIT = windows.HANDLE_FLAG_INHERIT;
 pub const INFINITE = windows.INFINITE;
@@ -474,6 +478,20 @@ pub const exp = struct {
     pub const ClosePseudoConsoleFn = *const fn (
         hPC: HPCON,
     ) callconv(.winapi) void;
+    // Exported by the bundled conpty.dll only (conpty-static.h).
+    pub const ClearPseudoConsoleFn = *const fn (
+        hPC: HPCON,
+        keepCursorRow: windows.BOOL,
+    ) callconv(.winapi) windows.HRESULT;
+    pub const ShowHidePseudoConsoleFn = *const fn (
+        hPC: HPCON,
+        show: windows.BOOL,
+    ) callconv(.winapi) windows.HRESULT;
+    pub const ReparentPseudoConsoleFn = *const fn (
+        hPC: HPCON,
+        newParent: windows.HWND,
+    ) callconv(.winapi) windows.HRESULT;
+    pub const PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH = 0x10;
 
     pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
     pub const CREATE_SUSPENDED = 0x00000004;

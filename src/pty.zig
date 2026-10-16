@@ -98,6 +98,27 @@ pub const winsize = extern struct {
     ws_ypixel: u16 = 600,
 };
 
+/// How the pseudo console measures text, named after ConPTY's
+/// `--textMeasurement`. It must agree with the terminal's own width model:
+/// console programs (cmd's line editor, PSReadLine) place the cursor with the
+/// widths ConPTY measured, so a line holding an emoji or a ZWJ sequence lands
+/// on different columns when the two disagree. Other platforms ignore it.
+pub const TextMeasurement = enum {
+    /// Grapheme clusters, ConPTY's default (`grapheme-width-method = unicode`).
+    graphemes,
+    /// Per code point, as wcswidth (`grapheme-width-method = legacy`).
+    wcswidth,
+};
+
+pub const OpenOptions = struct {
+    text_measurement: TextMeasurement = .graphemes,
+    /// The terminal's top-level window (an HWND) that hosts the new pseudo
+    /// console. Its window is given this owner and this window's visibility
+    /// before the child starts, as Windows Terminal does, so a console
+    /// program never sees an unowned or hidden console window. Windows only.
+    console_owner: ?*anyopaque = null,
+};
+
 pub const Pty = switch (builtin.os.tag) {
     .windows => WindowsPty,
     .ios => NullPty,
@@ -156,8 +177,9 @@ const NullPty = struct {
 
     pub const OpenError = error{};
 
-    pub fn open(size: winsize) OpenError!Pty {
+    pub fn open(size: winsize, options: OpenOptions) OpenError!Pty {
         _ = size;
+        _ = options;
         return .{ .master = 0, .slave = 0 };
     }
 
@@ -221,7 +243,8 @@ const PosixPty = struct {
     pub const OpenError = error{OpenptyFailed};
 
     /// Open a new PTY with the given initial size.
-    pub fn open(size: winsize) OpenError!Pty {
+    pub fn open(size: winsize, options: OpenOptions) OpenError!Pty {
+        _ = options;
         // Need to copy so that it becomes non-const.
         var sizeCopy = size;
 
@@ -432,6 +455,23 @@ const WindowsConPty = struct {
         create: windows.exp.CreatePseudoConsoleFn,
         resize: windows.exp.ResizePseudoConsoleFn,
         close: windows.exp.ClosePseudoConsoleFn,
+        // Optional: only the bundled conpty.dll exports these, and an older
+        // one may lack any of them. Null means the call is skipped.
+        clear: ?windows.exp.ClearPseudoConsoleFn = null,
+        show_hide: ?windows.exp.ShowHidePseudoConsoleFn = null,
+        reparent: ?windows.exp.ReparentPseudoConsoleFn = null,
+
+        /// `CreatePseudoConsole` flags for `measurement`. Only the bundled
+        /// pair is known to accept the glyph width flags, and the in-box
+        /// kernel32 is never handed a flag it may reject: a failed creation
+        /// there fails the open. Graphemes stay 0, ConPTY's default.
+        fn createFlags(self: *const Functions, measurement: TextMeasurement) windows.DWORD {
+            if (self.source != .bundled) return 0;
+            return switch (measurement) {
+                .graphemes => 0,
+                .wcswidth => windows.exp.PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH,
+            };
+        }
 
         fn info(self: *const Functions) ConPtyInfo {
             return .{
@@ -659,6 +699,9 @@ const WindowsConPty = struct {
             .create = create,
             .resize = resize,
             .close = close,
+            .clear = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(module, "ConptyClearPseudoConsole"))),
+            .show_hide = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(module, "ConptyShowHidePseudoConsole"))),
+            .reparent = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(module, "ConptyReparentPseudoConsole"))),
         };
     }
 
@@ -705,6 +748,12 @@ const WindowsConPty = struct {
         live_bundled_hpcons.store(0, .release);
         fallback_banner_pending.store(false, .release);
     }
+};
+
+const user32 = struct {
+    extern "user32" fn IsWindowVisible(hwnd: windows.HWND) callconv(.winapi) windows.BOOL;
+    extern "user32" fn IsIconic(hwnd: windows.HWND) callconv(.winapi) windows.BOOL;
+    extern "user32" fn GetDesktopWindow() callconv(.winapi) windows.HWND;
 };
 
 /// Windows PTY creation and management.
@@ -854,7 +903,7 @@ const WindowsPty = struct {
     }
 
     /// Open a new PTY with the given initial size.
-    pub fn open(size: winsize) OpenError!Pty {
+    pub fn open(size: winsize, options: OpenOptions) OpenError!Pty {
         var pty = try openPipes(size);
         errdefer pty.closePipes();
 
@@ -865,6 +914,7 @@ const WindowsPty = struct {
         const Creation = struct {
             pty: *const Pty,
             size: winsize,
+            text_measurement: TextMeasurement,
             pseudo_console: *windows.exp.HPCON,
 
             fn attempt(
@@ -878,7 +928,7 @@ const WindowsPty = struct {
                     },
                     self.pty.in_pipe_pty.?,
                     self.pty.out_pipe_pty.?,
-                    0,
+                    conpty.createFlags(self.text_measurement),
                     self.pseudo_console,
                 ) == windows.S_OK;
             }
@@ -886,6 +936,7 @@ const WindowsPty = struct {
         const creation: Creation = .{
             .pty = &pty,
             .size = size,
+            .text_measurement = options.text_measurement,
             .pseudo_console = &pseudo_console,
         };
         const conpty = WindowsConPty.selectBackend(&creation) catch |err| switch (err) {
@@ -897,6 +948,20 @@ const WindowsPty = struct {
             .handle = pseudo_console,
             .conpty = conpty,
         } };
+        // Not worth failing the terminal over: the window is only cosmetic.
+        // Visibility is read here, on the IO thread just before the child
+        // starts, because a new window is shown while its pty is created.
+        if (options.console_owner) |owner_ptr| {
+            const owner: windows.HWND = @ptrCast(owner_ptr);
+            pty.reparentPseudoConsole(owner) catch |err| {
+                log.warn("pseudo console owner signal failed err={}", .{err});
+            };
+            if (user32.IsWindowVisible(owner) != 0 and user32.IsIconic(owner) == 0) {
+                pty.showPseudoConsole(true) catch |err| {
+                    log.warn("pseudo console visibility signal failed err={}", .{err});
+                };
+            }
+        }
         return pty;
     }
 
@@ -991,6 +1056,55 @@ const WindowsPty = struct {
                 }
             },
         }
+    }
+
+    pub const PseudoConsoleSignalError = error{SignalFailed};
+
+    /// Clear ConPTY's own buffer after the terminal cleared its screen
+    /// without the child seeing it (an off-prompt clear, a reset). ConPTY
+    /// places console programs' output by its own cursor, so a buffer left
+    /// behind puts the next prompt on the old row. `keep_cursor_row` makes
+    /// the cursor's row the top row, as `Screen.eraseActive` does, but ConPTY
+    /// drops the rows below it where `eraseActive` moves them up too; they
+    /// are usually blank while output runs at the bottom. Otherwise
+    /// everything goes and the cursor homes, as a reset does.
+    ///
+    /// A no-op for the in-box conhost (no such export) and for adopted
+    /// sessions, whose console host may predate the signal: conhost ends the
+    /// session on a signal it does not know (PtySignalInputThread.cpp).
+    pub fn clearPseudoConsole(self: *Pty, keep_cursor_row: bool) PseudoConsoleSignalError!void {
+        const pc = switch (self.control) {
+            .pseudo_console => |pc| pc,
+            .handoff => return,
+        };
+        const clear = pc.conpty.clear orelse return;
+        if (clear(pc.handle, @intFromBool(keep_cursor_row)) != windows.S_OK) return error.SignalFailed;
+    }
+
+    /// Tell ConPTY whether its hosting window is shown, so a console
+    /// program's `IsIconic(GetConsoleWindow())` follows the terminal's
+    /// window. Same scope as `clearPseudoConsole`; adopted sessions use
+    /// `setAdoptedVisibility`.
+    pub fn showPseudoConsole(self: *Pty, visible: bool) PseudoConsoleSignalError!void {
+        const pc = switch (self.control) {
+            .pseudo_console => |pc| pc,
+            .handoff => return,
+        };
+        const show_hide = pc.conpty.show_hide orelse return;
+        if (show_hide(pc.handle, @intFromBool(visible)) != windows.S_OK) return error.SignalFailed;
+    }
+
+    /// Make the terminal's top-level window the owner of ConPTY's pseudo
+    /// window, so dialogs a console program parents to `GetConsoleWindow()`
+    /// belong to the terminal (conhost sets `GWLP_HWNDPARENT`, which moves
+    /// neither focus nor the foreground). Same scope as `clearPseudoConsole`.
+    fn reparentPseudoConsole(self: *Pty, owner: windows.HWND) PseudoConsoleSignalError!void {
+        const pc = switch (self.control) {
+            .pseudo_console => |pc| pc,
+            .handoff => return,
+        };
+        const reparent = pc.conpty.reparent orelse return;
+        if (reparent(pc.handle, owner) != windows.S_OK) return error.SignalFailed;
     }
 
     /// Close a pipe handle that a caller may already have taken from this
@@ -1321,7 +1435,7 @@ test "Windows ConPTY resolver selects inbox and default auto backends" {
     // The user asked for it, so there is nothing to warn about.
     try testing.expect(!hasPendingConPtyFallbackBanner());
     {
-        var inbox_pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 });
+        var inbox_pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
         defer inbox_pty.deinit();
         try inbox_pty.setSize(.{ .ws_row = 40, .ws_col = 120 });
         try testing.expectEqual(@as(u16, 40), (try inbox_pty.getSize()).ws_row);
@@ -1336,7 +1450,7 @@ test "Windows ConPTY resolver selects inbox and default auto backends" {
     // An automatic fallback is never silent.
     try testing.expectEqual(auto.source == .inbox, hasPendingConPtyFallbackBanner());
     {
-        var auto_pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 });
+        var auto_pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
         defer auto_pty.deinit();
         try auto_pty.setSize(.{ .ws_row = 50, .ws_col = 100 });
         try testing.expectEqual(@as(u16, 100), (try auto_pty.getSize()).ws_col);
@@ -1536,10 +1650,10 @@ test "Windows ConPTY live bundled count follows real pseudo console open and clo
     installFakeBundledBackendForTest();
     try testing.expectEqual(@as(u32, 0), WindowsConPty.live_bundled_hpcons.load(.acquire));
 
-    var first = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 });
+    var first = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
     try testing.expectEqual(ConPtySource.bundled, first.control.pseudo_console.conpty.source);
     try testing.expectEqual(@as(u32, 1), WindowsConPty.live_bundled_hpcons.load(.acquire));
-    var second = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 });
+    var second = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
     try testing.expectEqual(@as(u32, 2), WindowsConPty.live_bundled_hpcons.load(.acquire));
 
     first.deinit();
@@ -1574,6 +1688,196 @@ test "Windows ConPTY live bundled count follows real pseudo console open and clo
     var adopted = try WindowsPty.openAdopted(.{}, signal_write, server_process, reference);
     adopted.deinit();
     try testing.expectEqual(@as(u32, 0), WindowsConPty.live_bundled_hpcons.load(.acquire));
+}
+
+/// Stand-ins for the bundled exports: they record what they were given and
+/// create real pseudo consoles through kernel32, always with flags 0, so a
+/// test can see the flags noctty asked for without kernel32 judging them.
+const RecordingConPty = struct {
+    var create_flags: ?windows.DWORD = null;
+    var clear_args: ?struct { handle: windows.exp.HPCON, keep: windows.BOOL } = null;
+    var show_args: ?struct { handle: windows.exp.HPCON, show: windows.BOOL } = null;
+    var reparent_args: ?struct { handle: windows.exp.HPCON, owner: windows.HWND } = null;
+    var result: windows.HRESULT = windows.S_OK;
+
+    fn create(
+        size: windows.COORD,
+        input: windows.HANDLE,
+        output: windows.HANDLE,
+        flags: windows.DWORD,
+        handle: *windows.exp.HPCON,
+    ) callconv(.winapi) windows.HRESULT {
+        create_flags = flags;
+        return windows.exp.kernel32.CreatePseudoConsole(size, input, output, 0, handle);
+    }
+
+    fn clear(handle: windows.exp.HPCON, keep: windows.BOOL) callconv(.winapi) windows.HRESULT {
+        clear_args = .{ .handle = handle, .keep = keep };
+        return result;
+    }
+
+    fn showHide(handle: windows.exp.HPCON, show: windows.BOOL) callconv(.winapi) windows.HRESULT {
+        show_args = .{ .handle = handle, .show = show };
+        return result;
+    }
+
+    fn reparent(handle: windows.exp.HPCON, owner: windows.HWND) callconv(.winapi) windows.HRESULT {
+        reparent_args = .{ .handle = handle, .owner = owner };
+        return result;
+    }
+
+    fn install() void {
+        installFakeBundledBackendForTest();
+        WindowsConPty.bundled_functions.create = &create;
+        WindowsConPty.bundled_functions.clear = &clear;
+        WindowsConPty.bundled_functions.show_hide = &showHide;
+        WindowsConPty.bundled_functions.reparent = &reparent;
+        create_flags = null;
+        clear_args = null;
+        show_args = null;
+        reparent_args = null;
+        result = windows.S_OK;
+    }
+};
+
+fn restoreConPtyEnvForTest(original: ?[:0]const u8) void {
+    WindowsConPty.resetForTest();
+    if (original) |value| {
+        _ = internal_os.setenv("NOCTTY_CONPTY", value);
+    } else {
+        _ = internal_os.unsetenv("NOCTTY_CONPTY");
+    }
+}
+
+test "Windows ConPTY measures text the terminal's way, on the bundled backend only" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const original_raw = std.process.getEnvVarOwned(testing.allocator, "NOCTTY_CONPTY") catch null;
+    defer if (original_raw) |value| testing.allocator.free(value);
+    const original = if (original_raw) |value| try testing.allocator.dupeZ(u8, value) else null;
+    defer if (original) |value| testing.allocator.free(value);
+    defer restoreConPtyEnvForTest(original);
+
+    WindowsConPty.resetForTest();
+    RecordingConPty.install();
+    {
+        // `grapheme-width-method = legacy`.
+        var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{ .text_measurement = .wcswidth });
+        defer pty.deinit();
+        try testing.expectEqual(@as(?windows.DWORD, windows.exp.PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH), RecordingConPty.create_flags);
+    }
+    {
+        // The default keeps the flags it always had: ConPTY measures
+        // graphemes unless told otherwise.
+        var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
+        defer pty.deinit();
+        try testing.expectEqual(@as(?windows.DWORD, 0), RecordingConPty.create_flags);
+    }
+
+    // kernel32 is never handed a glyph width flag: it may not know it, and
+    // a failed in-box creation fails the open.
+    const inbox = WindowsConPty.inbox_functions;
+    try testing.expectEqual(@as(windows.DWORD, 0), inbox.createFlags(.wcswidth));
+    try testing.expectEqual(@as(windows.DWORD, 0), inbox.createFlags(.graphemes));
+}
+
+test "Windows ConPTY optional exports reach the creating backend and are skipped when missing" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const original_raw = std.process.getEnvVarOwned(testing.allocator, "NOCTTY_CONPTY") catch null;
+    defer if (original_raw) |value| testing.allocator.free(value);
+    const original = if (original_raw) |value| try testing.allocator.dupeZ(u8, value) else null;
+    defer if (original) |value| testing.allocator.free(value);
+    defer restoreConPtyEnvForTest(original);
+
+    const owner: windows.HWND = @ptrFromInt(0x1234);
+
+    WindowsConPty.resetForTest();
+    RecordingConPty.install();
+    {
+        // A host that is not shown (no such window) owns a hidden console.
+        var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{ .console_owner = owner });
+        defer pty.deinit();
+        try testing.expectEqual(owner, (RecordingConPty.reparent_args orelse return error.OwnerNotSetAtOpen).owner);
+        try testing.expect(RecordingConPty.show_args == null);
+    }
+    {
+        // The hosting window is set before `open` returns, so before any
+        // child can start and ask for it. The desktop window is always shown.
+        const shown_owner = user32.GetDesktopWindow();
+        var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{ .console_owner = shown_owner });
+        defer pty.deinit();
+        const handle = pty.pseudoConsole().?;
+        const created_owned = RecordingConPty.reparent_args orelse return error.OwnerNotSetAtOpen;
+        try testing.expectEqual(handle, created_owned.handle);
+        try testing.expectEqual(shown_owner, created_owned.owner);
+        const created_shown = RecordingConPty.show_args orelse return error.VisibilityNotSetAtOpen;
+        try testing.expectEqual(handle, created_shown.handle);
+        try testing.expectEqual(@as(windows.BOOL, 1), created_shown.show);
+
+        try pty.clearPseudoConsole(true);
+        const kept = RecordingConPty.clear_args orelse return error.ClearNotForwarded;
+        try testing.expectEqual(handle, kept.handle);
+        try testing.expectEqual(@as(windows.BOOL, 1), kept.keep);
+        try pty.clearPseudoConsole(false);
+        try testing.expectEqual(@as(windows.BOOL, 0), RecordingConPty.clear_args.?.keep);
+
+        try pty.showPseudoConsole(false);
+        const shown = RecordingConPty.show_args orelse return error.ShowHideNotForwarded;
+        try testing.expectEqual(handle, shown.handle);
+        try testing.expectEqual(@as(windows.BOOL, 0), shown.show);
+
+        try pty.reparentPseudoConsole(owner);
+        const owned = RecordingConPty.reparent_args orelse return error.ReparentNotForwarded;
+        try testing.expectEqual(handle, owned.handle);
+        try testing.expectEqual(owner, owned.owner);
+
+        // A signal ConPTY could not deliver is reported, not hidden.
+        RecordingConPty.result = @bitCast(@as(u32, 0x80004005)); // E_FAIL
+        try testing.expectError(error.SignalFailed, pty.clearPseudoConsole(true));
+        try testing.expectError(error.SignalFailed, pty.showPseudoConsole(true));
+        try testing.expectError(error.SignalFailed, pty.reparentPseudoConsole(owner));
+    }
+
+    // The in-box conhost has none of them: every call is a no-op.
+    WindowsConPty.resetForTest();
+    try testing.expectEqual(@as(c_int, 0), internal_os.setenv("NOCTTY_CONPTY", "inbox"));
+    {
+        var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{ .text_measurement = .wcswidth });
+        defer pty.deinit();
+        try testing.expectEqual(ConPtySource.inbox, pty.control.pseudo_console.conpty.source);
+        try pty.clearPseudoConsole(true);
+        try pty.showPseudoConsole(true);
+        try pty.reparentPseudoConsole(owner);
+    }
+
+    // Nor does an adopted session get them: an OpenConsole that does not
+    // know a signal ends the session, so nothing reaches its signal pipe.
+    var signal_read: windows.HANDLE = undefined;
+    var signal_write: windows.HANDLE = undefined;
+    try testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
+    defer _ = windows.CloseHandle(signal_read);
+    var adopted: WindowsPty = .{
+        .out_pipe = undefined,
+        .in_pipe = undefined,
+        .out_pipe_pty = null,
+        .in_pipe_pty = null,
+        .control = .{ .handoff = .{
+            .signal = signal_write,
+            .server_process = windows.INVALID_HANDLE_VALUE,
+            .reference = windows.INVALID_HANDLE_VALUE,
+        } },
+        .size = .{},
+    };
+    defer adopted.closeAdoptedSignal();
+    try adopted.clearPseudoConsole(true);
+    try adopted.showPseudoConsole(true);
+    try adopted.reparentPseudoConsole(owner);
+    var available: windows.DWORD = 0;
+    try testing.expect(windows.exp.kernel32.PeekNamedPipe(signal_read, null, 0, null, &available, null) != 0);
+    try testing.expectEqual(@as(windows.DWORD, 0), available);
 }
 
 test "Windows ConPTY bundled loader rejects a DLL without create symbol" {
@@ -1643,7 +1947,7 @@ test {
         .ws_ypixel = 1,
     };
 
-    var pty = try Pty.open(ws);
+    var pty = try Pty.open(ws, .{});
     defer pty.deinit();
 
     // Initialize size should match what we gave it

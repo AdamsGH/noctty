@@ -409,11 +409,24 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
 }
 
 /// Called on the IO thread with the hosting window's visibility, including
-/// minimize/restore. Ordinary spawned sessions do not use handoff signals.
+/// minimize/restore. Only adopted sessions use handoff signals.
 pub fn ptyVisibility(self: *Exec, visible: bool) !void {
     if (comptime builtin.os.tag != .windows) return;
-    if (self.subprocess.adopted_client_process == null) return;
-    if (self.subprocess.pty) |*pty| try pty.setAdoptedVisibility(visible);
+    const pty = if (self.subprocess.pty) |*value| value else return;
+    if (self.subprocess.adopted_client_process != null) {
+        try pty.setAdoptedVisibility(visible);
+    } else {
+        try pty.showPseudoConsole(visible);
+    }
+}
+
+/// Called on the IO thread after the terminal cleared its screen locally.
+pub fn ptyClear(self: *Exec, keep_cursor_row: bool) void {
+    if (comptime builtin.os.tag != .windows) return;
+    const pty = if (self.subprocess.pty) |*value| value else return;
+    pty.clearPseudoConsole(keep_cursor_row) catch |err| {
+        log.warn("pty clear signal failed err={}", .{err});
+    };
 }
 
 pub fn focusGained(
@@ -783,6 +796,8 @@ pub const Config = struct {
     shell_integration: configpkg.Config.ShellIntegration = .detect,
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
     utf8_console: configpkg.Utf8Console = .auto,
+    /// How to create the pty: ConPTY's text measurement and hosting window.
+    pty_options: ptypkg.OpenOptions = .{},
     cursor_blink: ?bool = null,
     working_directory: ?[]const u8 = null,
     working_directory_home: bool = false,
@@ -809,6 +824,7 @@ const Subprocess = struct {
     windows_cmd_shell: bool,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
+    pty_options: ptypkg.OpenOptions = .{},
     pty: ?Pty = null,
     process: ?Process = null,
     adopted_client_process: if (builtin.os.tag == .windows) ?windows.HANDLE else void = if (builtin.os.tag == .windows) null else {},
@@ -1193,6 +1209,7 @@ const Subprocess = struct {
             .cwd = cwd,
             .args = exec_command.args,
             .windows_cmd_shell = exec_command.windows_cmd_shell,
+            .pty_options = cfg.pty_options,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -1251,7 +1268,7 @@ const Subprocess = struct {
             .ws_col = @intCast(self.grid_size.columns),
             .ws_xpixel = @intCast(self.screen_size.width),
             .ws_ypixel = @intCast(self.screen_size.height),
-        });
+        }, self.pty_options);
         self.pty = pty;
         errdefer if (!in_child) {
             if (comptime builtin.os.tag != .windows) {

@@ -74,9 +74,14 @@ pub const Message = union(enum) {
     focused: bool,
 
     /// The hosting window is shown/restored or hidden/minimized. This keeps
-    /// an adopted OpenConsole pseudo HWND synchronized; it is not tab or
-    /// renderer occlusion, and has no effect on ordinary spawned sessions.
+    /// the pseudo console's HWND synchronized (an adopted OpenConsole's, or
+    /// the bundled ConPTY's); it is not tab or renderer occlusion.
     pty_visibility: bool,
+
+    /// The terminal changed its screen without the pty seeing it (a reset
+    /// the user started), so a pty that keeps its own copy of the screen
+    /// (ConPTY) must clear it too. See `Pty.clearPseudoConsole`.
+    pty_clear: struct { keep_cursor_row: bool },
 
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,

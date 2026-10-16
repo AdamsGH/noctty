@@ -17336,7 +17336,7 @@ const Host = struct {
         const console_visible = sys.IsWindowVisible(hwnd) != 0 and sys.IsIconic(hwnd) == 0;
         for (self.tabs.items) |*tab| {
             var it = tab.tree.iterator();
-            while (it.next()) |entry| entry.view.syncAdoptedConsoleVisibility(console_visible);
+            while (it.next()) |entry| entry.view.syncConsoleVisibility(console_visible);
         }
         const state = win32_power.queryHostVisibility(
             hwnd,
@@ -33909,6 +33909,9 @@ pub const Surface = struct {
     core_initialized: bool = false,
     adopted_session: ?ptypkg.AdoptedSession = null,
     adopted_console: bool = false,
+    /// Set once the core has asked for the pty's hosting window
+    /// (`consoleOwner`); until then there is no console window to keep in step.
+    console_window_attached: bool = false,
     console_window_visible: ?bool = null,
     destroy_on_wm_destroy: bool = false,
     content_scale: apprt.ContentScale = .{ .x = 1, .y = 1 },
@@ -35141,11 +35144,17 @@ pub const Surface = struct {
             },
 
             .reset => {
+                // The reset action itself: it keeps the Win32 input mode
+                // ConPTY asked for and clears ConPTY's buffer too. Capture is
+                // suspended, so it records no undo entry of its own.
+                _ = self.core_surface.performBindingAction(.reset) catch |err| {
+                    log.warn("redo reset failed err={}", .{err});
+                    return false;
+                };
                 var scrollbar: terminal.Scrollbar = .zero;
                 {
                     self.core_surface.renderer_state.mutex.lock();
                     defer self.core_surface.renderer_state.mutex.unlock();
-                    self.core_surface.renderer_state.terminal.fullReset();
                     scrollbar = self.core_surface.renderer_state.terminal.screens.active.pages.scrollbar();
                 }
 
@@ -35883,8 +35892,21 @@ pub const Surface = struct {
         _ = sys.PostMessageW(hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, @intFromBool(visible), 0);
     }
 
-    fn syncAdoptedConsoleVisibility(self: *Surface, visible: bool) void {
-        if (!self.adopted_console or !self.core_initialized) return;
+    /// The core asks this as it creates the pty: the host owns the pseudo
+    /// console's window, as in Windows Terminal, so a dialog a console program
+    /// parents to `GetConsoleWindow()` belongs to this window instead of an
+    /// unowned hidden one. A surface never moves to another host, so once is
+    /// enough; visibility changes after that follow `syncConsoleVisibility`.
+    pub fn consoleOwner(self: *Surface) ?*anyopaque {
+        const hwnd = (self.host orelse return null).hwnd orelse return null;
+        self.console_window_attached = true;
+        return hwnd;
+    }
+
+    /// Every pseudo console's window, adopted or spawned, follows the host:
+    /// a console program asks it whether the terminal is shown.
+    fn syncConsoleVisibility(self: *Surface, visible: bool) void {
+        if (!self.core_initialized or !self.console_window_attached) return;
         if (self.console_window_visible == visible) return;
         self.console_window_visible = visible;
         self.core_surface.ptyVisibilityCallback(visible);
@@ -35920,6 +35942,7 @@ pub const Surface = struct {
         defer background.core_surface.io.mailbox.deinit(core_app.alloc);
         for ([_]*Surface{ &first, &background }) |surface| {
             surface.adopted_console = true;
+            surface.console_window_attached = true;
             surface.core_initialized = true;
             surface.window_visible = false;
             surface.core_surface.readonly = false;
@@ -35985,6 +36008,79 @@ pub const Surface = struct {
         try first.core_surface.handleMessage(.{ .window_visibility = false });
         var message: MSG = undefined;
         try std.testing.expect(sys.PeekMessageW(&message, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0);
+    }
+
+    test "a spawned pseudo console is owned by its host and follows its visibility" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try Host.runOnPrivateDesktop(spawnedConsoleWindowTestBody);
+    }
+
+    fn spawnedConsoleWindowTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var first: Surface = undefined;
+        var later: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{ .{ .storage = &first, .host = &host }, .{ .storage = &later, .host = &host } },
+            .tabs = &.{ .{ .host = &host, .surface = &first, .id = 1 }, .{ .host = &host, .surface = &later, .id = 2 } },
+        });
+        defer session.deinit();
+        const hwnd = try createTestHostWindow();
+        defer _ = sys.DestroyWindow(hwnd);
+        host.hwnd = hwnd;
+        const termio = @import("../termio.zig");
+        for ([_]*Surface{ &first, &later }) |surface| {
+            surface.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
+            surface.window_visible = false;
+            surface.core_surface.rt_surface = surface;
+        }
+        defer for ([_]*Surface{ &first, &later }) |surface| surface.core_surface.io.mailbox.deinit(core_app.alloc);
+        defer {
+            first.core_initialized = false;
+            later.core_initialized = false;
+        }
+        const Queue = struct {
+            fn expectNext(surface: *Surface) !termio.Message {
+                return surface.core_surface.io.mailbox.spsc.queue.pop() orelse error.MissingPtyMessage;
+            }
+            fn expectEmpty(surface: *Surface) !void {
+                try std.testing.expect(surface.core_surface.io.mailbox.spsc.queue.pop() == null);
+            }
+        };
+
+        // The pty of a surface is created owned by its host, and hears the
+        // host's visibility from then on.
+        first.core_initialized = true;
+        host.refreshSurfaceVisibility();
+        try Queue.expectEmpty(&first);
+        try std.testing.expectEqual(@as(?*anyopaque, hwnd), first.consoleOwner());
+        _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+        host.surfaces_visible = win32_power.queryHostVisibility(hwnd, false, null).visible;
+        host.refreshSurfaceVisibility();
+        try std.testing.expect((try Queue.expectNext(&first)).pty_visibility);
+        try Queue.expectEmpty(&first);
+
+        // So does a tab added to a host already on screen.
+        try std.testing.expectEqual(@as(?*anyopaque, hwnd), later.consoleOwner());
+        later.core_initialized = true;
+        host.refreshSurfaceVisibility();
+        try std.testing.expect((try Queue.expectNext(&later)).pty_visibility);
+        try Queue.expectEmpty(&later);
+        try Queue.expectEmpty(&first);
+
+        // Every tab's pseudo console hears of a minimize, not only an
+        // adopted one's.
+        _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+        host.refreshSurfaceVisibility();
+        for ([_]*Surface{ &first, &later }) |surface| {
+            try std.testing.expect(!(try Queue.expectNext(surface)).pty_visibility);
+            try Queue.expectEmpty(surface);
+        }
     }
 
     fn setTitle(self: *Surface, title: []const u8) !void {

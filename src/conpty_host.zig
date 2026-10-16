@@ -377,7 +377,7 @@ fn serve(alloc: Allocator, args: []const [:0]u8) !void {
     const stats_context = try std.heap.page_allocator.create(StatsContext);
     stats_context.* = .{ .ring = ring };
 
-    var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80 });
+    var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
     var command: Command = .{
         .path = "pwsh.exe",
         .args = &.{ "pwsh.exe", "-NoLogo", "-NoProfile" },
