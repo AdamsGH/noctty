@@ -2827,7 +2827,8 @@ const TestIpcServer = struct {
     app: App = undefined,
     class_buf: [96:0]u8 = undefined,
 
-    fn start(self: *TestIpcServer) !void {
+    /// Set up the App without starting its server.
+    fn prepare(self: *TestIpcServer) !void {
         const alloc = std.testing.allocator;
         self.core_app.alloc = alloc;
         self.app.core_app = &self.core_app;
@@ -2845,6 +2846,11 @@ const TestIpcServer = struct {
         self.app.ipc_thread = null;
         self.app.ipc_stop_event = null;
         self.app.ipc_stop_requested = .init(false);
+    }
+
+    fn start(self: *TestIpcServer) !void {
+        try self.prepare();
+        errdefer self.app.config.deinit();
         try std.testing.expect(!try startIpcServer(&self.app));
         try std.testing.expect(self.app.ipc_thread != null);
     }
@@ -2902,17 +2908,29 @@ test "win32 IPC server thread does not run while it waits for a client" {
     try std.testing.expectEqual(cycles, try testThreadCycles(thread));
 }
 
-test "win32 IPC server serves the next client after one leaves unserved" {
+test "win32 IPC server replaces an instance whose client left before it was accepted" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var server: TestIpcServer = .{};
-    try server.start();
+    try server.prepare();
     defer server.stop();
+    const app = &server.app;
 
-    // A client that connects and leaves before the server picks it up must
-    // not leave the server waiting on that dead instance.
+    // Claim the name as startIpcServer does, and let a client connect to the
+    // first instance and leave before the server thread exists, so that its
+    // first accept finds the client already gone.
+    app.ipc_pipe_name = try allocIpcPipeName(std.testing.allocator, app.config.class, false);
+    var security = win32_elevation.adoptPipeSecurityDescriptor(try allocIpcPipeSecurityDescriptor());
+    var security_owned = true;
+    defer if (security_owned) security.deinit();
+    const first_pipe = createIpcServerPipe(app.ipc_pipe_name.?, security.securityAttributes(), true);
+    try std.testing.expect(first_pipe != windows.INVALID_HANDLE_VALUE);
+    var first_pipe_owned = true;
+    defer if (first_pipe_owned) {
+        _ = windows.CloseHandle(first_pipe);
+    };
     const gone = windows.kernel32.CreateFileW(
-        server.app.ipc_pipe_name.?.ptr,
+        app.ipc_pipe_name.?.ptr,
         windows.GENERIC_READ | windows.GENERIC_WRITE,
         0,
         null,
@@ -2922,6 +2940,21 @@ test "win32 IPC server serves the next client after one leaves unserved" {
     );
     try std.testing.expect(gone != windows.INVALID_HANDLE_VALUE);
     _ = windows.CloseHandle(gone);
+
+    const io_event = createIpcServerEvent().?;
+    var io_event_owned = true;
+    defer if (io_event_owned) {
+        _ = windows.CloseHandle(io_event);
+    };
+    app.ipc_stop_event = createIpcServerEvent().?;
+    app.ipc_thread = try std.Thread.spawn(
+        .{},
+        ipcServerMain,
+        .{ app, first_pipe, security, io_event, app.ipc_stop_event.? },
+    );
+    security_owned = false;
+    first_pipe_owned = false;
+    io_event_owned = false;
 
     // The next client is served: a request with a bad wire version is
     // answered with a failure ack before anything reaches the mailbox.
