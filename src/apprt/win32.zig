@@ -2043,6 +2043,54 @@ fn isPortableModeActive(alloc: Allocator) bool {
     return true;
 }
 
+/// Every noctty shares one AUMID (`win32_aumid.aumid_utf8`), and with it two
+/// pieces of per-user state: the AppUserModelId keys that name and badge its
+/// toasts, and the taskbar jump list, which the Shell stores per AUMID. A
+/// portable copy keeps the AUMID, so its toasts and the single-instance pipe
+/// work as before, but leaves the installed copy's state alone (D12): it gets
+/// no jump list, whose commit replaced the installed copy's on every launch,
+/// and it only creates the registration where none exists, since without one
+/// its toasts would not show. This is the one place both are decided. Returns
+/// the jump list this copy drives, null when it leaves the Shell's list alone.
+fn claimSharedIdentity(
+    alloc: Allocator,
+    portable: bool,
+    register: *const fn (Allocator, bool) void,
+    jump_list_state: ?[]const u8,
+) ?win32_jump_list.JumpList {
+    register(alloc, portable);
+    if (portable) return null;
+    const path = jump_list_state orelse return null;
+    return win32_jump_list.JumpList.init(alloc, path) catch |err| {
+        log.warn("jump list state init failed err={}", .{err});
+        return null;
+    };
+}
+
+test "a portable copy gets no jump list and registers only as portable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state = try std.fs.path.join(alloc, &.{ root, win32_jump_list.state_filename });
+    defer alloc.free(state);
+    const Registration = struct {
+        var calls: [2]usize = .{ 0, 0 };
+        fn register(_: Allocator, portable: bool) void {
+            calls[@intFromBool(portable)] += 1;
+        }
+    };
+
+    try std.testing.expect(claimSharedIdentity(alloc, true, &Registration.register, state) == null);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, Registration.calls);
+
+    var installed = claimSharedIdentity(alloc, false, &Registration.register, state) orelse
+        return error.TestUnexpectedResult;
+    defer installed.deinit();
+    try std.testing.expectEqual([2]usize{ 1, 1 }, Registration.calls);
+}
+
 /// How this copy of noctty gets updated. A setup-managed copy applies a
 /// staged installer and a portable-marker copy a staged ZIP. Anything else
 /// (Scoop, a ZIP extracted without its marker) was put there by someone else
@@ -2985,11 +3033,22 @@ pub const App = struct {
         }
         // AUMID registration MUST precede any HWND creation so
         // taskbar-grouping / toast attribution picks up our identity
-        // on the first window. Both calls swallow failures (warn +
+        // on the first window. Both swallow failures (warn +
         // continue) — toasts and taskbar grouping are non-essential
         // for basic terminal function.
         win32_aumid.setProcessAumid();
-        win32_aumid.registerAumidDisplayName(core_app.alloc);
+        {
+            const state = localAppDataPathAlloc(core_app.alloc, win32_jump_list.state_filename);
+            defer if (state) |path| core_app.alloc.free(path);
+            // Not `isPortableModeActive`, which answers "installed" when
+            // copying the root fails; this cached answer cannot fail.
+            self.jump_list = claimSharedIdentity(
+                core_app.alloc,
+                internal_os.xdg.portableModeActive(),
+                &win32_aumid.registerAumidDisplayName,
+                state,
+            );
+        }
 
         // Be asked to end before the shells under it. Every process starts at
         // the default level 0x280, and Windows ends processes on one level
@@ -3064,13 +3123,6 @@ pub const App = struct {
             std.log.warn("taskbar progress init failed err={}; falling back to title-only progress", .{err});
             break :blk null;
         };
-        if (localAppDataPathAlloc(core_app.alloc, win32_jump_list.state_filename)) |path| {
-            defer core_app.alloc.free(path);
-            self.jump_list = win32_jump_list.JumpList.init(core_app.alloc, path) catch |err| blk: {
-                log.warn("jump list state init failed err={}", .{err});
-                break :blk null;
-            };
-        }
         self.refreshSystemWheelSettings();
         self.refreshSystemScrollbarPreference();
         self.resolved_theme = resolveTheme(&self.config);

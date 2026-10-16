@@ -79,6 +79,13 @@ pub fn portableRoot(alloc: Allocator) !?[]u8 {
     return try alloc.dupe(u8, portable_root_cache.path[0..portable_root_cache.len]);
 }
 
+/// The cached answer `portableRoot` gives, without copying the path, so a
+/// caller cannot see a different one when that copy fails.
+pub fn portableModeActive() bool {
+    portable_root_once.call();
+    return portable_root_cache.present;
+}
+
 fn portablePath(alloc: Allocator, root: []const u8, subdir: ?[]const u8) ![]u8 {
     const requested = subdir orelse return try alloc.dupe(u8, root);
     const relative = if (std.mem.startsWith(u8, requested, "noctty/"))
