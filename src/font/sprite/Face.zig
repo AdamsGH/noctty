@@ -586,8 +586,9 @@ test "sprite face centres a cursor that is shorter or taller than the cell" {
     // `Metrics.calc` starts `cursor_height` at the cell height, so only a
     // changed height exercises the centring. The offset is the glyph's
     // height plus half the difference to the cell, truncated toward zero, so
-    // with an odd difference the cursor lands half a pixel nearer the bottom
-    // of the cell than an exact centring would put it.
+    // with an odd difference a shorter cursor sits half a pixel lower and a
+    // taller cursor half a pixel higher than an exact centring would put it
+    // (`offset_y` runs from the bottom of the cell to the top of the glyph).
     const cases = [_]struct { cursor_height: u32, offset_y: i32 }{
         .{ .cursor_height = 36, .offset_y = 36 }, // the cell height itself
         .{ .cursor_height = 24, .offset_y = 30 }, // shorter, even difference
