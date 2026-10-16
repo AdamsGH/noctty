@@ -35,6 +35,10 @@ pub const Entry = struct {
     timestamp_ms: u64,
     sequence_id: u64 = 0,
 
+    /// Pty clear generation when the snapshot was captured. Only a later
+    /// successful clear makes its saved cursor stale relative to ConPTY.
+    pty_clear_generation: u64 = 0,
+
     /// Owned-byte footprint used for cap accounting.
     pub fn byteSize(self: Entry) usize {
         return switch (self.snapshot) {

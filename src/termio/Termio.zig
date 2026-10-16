@@ -418,6 +418,10 @@ config: DerivedConfig,
 /// just stores internal state about a grid.
 terminal: terminalpkg.Terminal,
 
+/// Successful local clears of the pty since startup. Undo snapshots from
+/// before a clear must keep the live cursor. Protected by renderer_state.mutex.
+pty_clear_generation: u64 = 0,
+
 /// The shared render state
 renderer_state: *renderer.State,
 
@@ -1140,8 +1144,13 @@ pub fn ptyVisibility(self: *Termio, visible: bool) !void {
 
 /// The screen was cleared behind the pty's back; see `Pty.clearPseudoConsole`.
 pub fn ptyClear(self: *Termio, keep_cursor_row: bool) void {
-    switch (self.backend) {
+    const cleared = switch (self.backend) {
         .exec => |*exec| exec.ptyClear(keep_cursor_row),
+    };
+    if (cleared) {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.pty_clear_generation +%= 1;
     }
 }
 
