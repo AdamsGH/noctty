@@ -942,13 +942,15 @@ built-in config, no session restore. `noctty --safe-mode` picks it for one
 launch. Safe mode never overwrites your config or quarantined state.
 
 Each launch records in `startup-attempts.json` the noctty version that started
-it and whether it began restoring the saved session. When all three failures
-began a restore, safe mode alone would only postpone the next three, so the
-safe-mode launch also renames `session-state.json` to
-`session-state.json.restore-failed` (with the same numbered slots as
-`.corrupt`) and its notice says so; the next normal launch starts with a fresh
-window. Nothing is deleted: rename the file back to try that session again. A
-session another running noctty owns is left where it is.
+it, when it began restoring the saved session and whether that restore
+finished. When all three failures ended during a restore, safe mode alone would
+only postpone the next three, so the safe-mode launch also renames
+`session-state.json` to `session-state.json.restore-failed` (or `.1` up to
+`.4` if earlier ones exist) and its notice says so; the next normal launch
+starts with a fresh window. Nothing is deleted or replaced: rename the file
+back to try that session again. A session another running noctty owns, or one
+with all five `.restore-failed` names already taken, is left where it is, and
+that safe-mode launch says only that the session was not loaded.
 
 ## Named layouts
 

@@ -19,7 +19,8 @@ build patched with a measurement AUMID only: the script deletes the jump-list
 file such a build creates during the run, and nothing else.
 
 Per build, five launches with the hook set: three that die restoring, the
-safe-mode launch the ledger then selects, and one more. Results hold exit codes,
+safe-mode launch the ledger then selects, and one more; then a sixth without
+it, which restores whatever session is left. Results hold exit codes,
 the ledger's attempts, the session files' hashes, the safe-mode notice text and
 assertions. Exits 1 when a check fails, so it can be run against a build that
 still loops.
@@ -300,6 +301,8 @@ try {
         $runs = @()
         for ($i = 1; $i -le 5; $i++) { $runs += (Launch-Once $label $dir $i) }
         Remove-Item Env:\NOCTTY_DEBUG_CRASH_SESSION_RESTORE
+        $runs += (Launch-Once $label $dir 6)
+        Check $label 'launch 6, without the fault, restores and reaches ready' ($runs[5].HostWindow -and $runs[5].ExitCode -ne 3) 'window' @{ Exit=$runs[5].ExitCode; Window=$runs[5].HostWindow }
 
         for ($i = 0; $i -lt 3; $i++) {
             Check $label "launch $($i+1) ends during restore (exit 3, no window ready)" ($runs[$i].ExitCode -eq 3 -and -not $runs[$i].HostWindow) 3 @{ Exit=$runs[$i].ExitCode; Window=$runs[$i].HostWindow }
@@ -311,6 +314,8 @@ try {
             Check $label 'safe-mode launch moved the session aside unchanged' ($null -eq $runs[3].SessionHash -and $runs[3].SetAside.Count -eq 1 -and $runs[3].SetAside[0].Hash -eq $sessionHash) $sessionHash @{ Session=$runs[3].SessionHash; SetAside=$runs[3].SetAside }
             Check $label 'safe-mode notice names the moved session' ($null -ne $runs[3].Notice -and $runs[3].Notice.Contains('.restore-failed')) '.restore-failed' $runs[3].Notice
             Check $label 'launch 5 starts normally with a fresh window' ($runs[4].HostWindow -and $runs[4].ExitCode -ne 3) 'window' @{ Exit=$runs[4].ExitCode; Window=$runs[4].HostWindow }
+            $sixth = @($runs[5].Attempts)[-1]
+            Check $label 'launch 6 recorded its restore and its version' ($null -ne $sixth.restore -and $sixth.version -and $null -ne $sixth.ready) 'restore, version, ready' $sixth
         } else {
             Check $label 'safe-mode launch leaves the session in place' ($runs[3].SessionHash -eq $sessionHash -and $runs[3].SetAside.Count -eq 0) $sessionHash @{ Session=$runs[3].SessionHash; SetAside=$runs[3].SetAside }
             Check $label 'launch 5 restores the same session and ends again' ($runs[4].ExitCode -eq 3 -and -not $runs[4].HostWindow) 3 @{ Exit=$runs[4].ExitCode; Window=$runs[4].HostWindow }

@@ -152,9 +152,9 @@ dumps, and SSH host cache go there.
   Downloaded updates, and the installer log of an update you apply, go in
   `updates\`.
 - **Startup record:** `startup-attempts.json` holds the times, error codes and
-  Noctty version of up to 16 recent launches, and whether each began restoring
-  the saved session, so Noctty can start in safe mode after repeated failed
-  starts.
+  Noctty version of up to 16 recent launches, and when each began restoring
+  the saved session and whether it finished, so Noctty can start in safe mode
+  after repeated failed starts.
 - **Crash dumps:** `crash\`, written only when Noctty crashes. A dump is a
   snapshot of parts of Noctty's memory and can include fragments of what was
   on screen, file paths, and other text. `noctty +crash-report` lists them.
@@ -193,7 +193,8 @@ dumps, and SSH host cache go there.
 - **Housekeeping:** `.lock` files beside some of these, a `.corrupt` copy of
   any session or layout file Noctty could not read, and a `.restore-failed`
   copy of a saved session that repeatedly stopped Noctty while restoring it
-  (up to five copies of each).
+  (up to five copies of each; older `.restore-failed` copies are never
+  replaced).
 
 Noctty writes these registry entries:
 
