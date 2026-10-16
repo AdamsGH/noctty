@@ -12321,6 +12321,12 @@ fn openWindowMenuAt(hwnd: HWND, lParam: LPARAM) void {
     const bits: u32 = @truncate(@as(u64, @bitCast(lParam)));
     const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(bits))));
     const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
+    // Track a fresh copy of the window menu. Measured on build 26300, on an
+    // active window the copy the first `GetSystemMenu(hwnd, FALSE)` returns
+    // passes `IsMenu` but `TrackPopupMenu` rejects it with
+    // ERROR_INVALID_MENU_HANDLE, so a real right-click opened nothing; the
+    // copy taken after reverting it tracks. Nothing customizes this menu.
+    _ = sys.GetSystemMenu(hwnd, 1);
     const menu = sys.GetSystemMenu(hwnd, 0) orelse return;
     const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE))));
     const state = windowMenuState(style);
@@ -32605,9 +32611,19 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 // QT placement/tween frames own their physical-pixel rect.
                 // Keep scale and layout updates even when the OS's resized
                 // suggestion would override that rect on a DPI crossing.
+                // SWP_FRAMECHANGED either way: in a drag across monitors
+                // Windows resizes the window before this message, so
+                // `WM_NCCALCSIZE` laid the frame out at the old DPI (22x11 px,
+                // 144 DPI's, on a 96 DPI monitor whose frame is 16x8), and the
+                // suggestion is that same rect. Without a fresh layout the
+                // client stayed that far off, and the configured grid size
+                // resized from the stale frame.
+                const flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_FRAMECHANGED;
                 if (!v.quick_terminal_placing and !v.restore_placing and v.quick_terminal_animation == null) {
                     const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
-                    _ = sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+                    _ = sys.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, flags);
+                } else {
+                    _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, flags | c.SWP_NOMOVE | c.SWP_NOSIZE);
                 }
 
                 // Relayout and repaint
