@@ -18542,10 +18542,10 @@ const Host = struct {
     /// children of the Selection container, so the host's root is told its
     /// children changed.
     fn notifyTabListUiaChanged(self: *Host) void {
-        if (!self.shouldShowTabBar()) return;
         for (self.tabs.items) |tab| {
             if (tab.uia_provider) |provider| provider.syncCloseChild();
         }
+        if (!self.shouldShowTabBar()) return;
         if (self.root_uia_provider) |provider| provider.raiseChildrenInvalidated();
     }
 
@@ -20537,9 +20537,10 @@ const Host = struct {
 
     fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        if (self.tabs.items.len <= 1) return null;
+        if (self.tabs.items.len <= 1 or !self.shouldShowTabBar()) return null;
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return null;
         const hwnd = self.tabs.items[index].button_hwnd orelse return null;
+        if (sys.IsWindowVisible(hwnd) == 0) return null;
         var rect: RECT = undefined;
         if (sys.GetWindowRect(hwnd, &rect) == 0) return null;
         // Same close zone as the pointer path, always at full alpha. An
@@ -20555,9 +20556,10 @@ const Host = struct {
 
     fn tabCloseUiaInvoke(ctx: *anyopaque, tab_id: usize) bool {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        if (self.tabs.items.len <= 1) return false;
+        if (self.tabs.items.len <= 1 or !self.shouldShowTabBar()) return false;
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return false;
         const hwnd = self.tabs.items[index].button_hwnd orelse return false;
+        if (sys.IsWindowVisible(hwnd) == 0) return false;
         return sys.PostMessageW(hwnd, win32_uia.widgets.tab_close_message, tab_id, 0) != 0;
     }
 
@@ -20603,6 +20605,7 @@ const Host = struct {
         defer session.deinit();
         const window = try BannerTestWindow.init(&host);
         defer window.deinit(&host);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
         const button = try createTestChromeChild(window.parent, prompt_button_class);
         host.tabs.items[1].button_hwnd = button;
         defer host.tabs.items[1].button_hwnd = null;
@@ -20622,10 +20625,40 @@ const Host = struct {
         var queued: sys.MSG = undefined;
         try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
         try std.testing.expectEqual(@as(usize, 2), queued.wParam);
-        host.tabs.items.len = 1;
-        defer host.tabs.items.len = 2;
+        _ = sys.ShowWindow(button, c.SW_HIDE);
         try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
         try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
+        _ = sys.ShowWindow(button, c.SW_SHOWNOACTIVATE);
+        const provider = try win32_uia.ChromeControlProvider.create(std.testing.allocator, button, state);
+        defer _ = provider.base.vtbl.Release(&provider.base);
+        host.tabs.items[1].uia_provider = provider;
+        defer host.tabs.items[1].uia_provider = null;
+        host.notifyTabListUiaChanged();
+        try std.testing.expect(provider.close_child_present);
+        const show_tab_bar = app.config.@"window-show-tab-bar";
+        app.config.@"window-show-tab-bar" = .never;
+        defer app.config.@"window-show-tab-bar" = show_tab_bar;
+        try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
+        try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
+        host.notifyTabListUiaChanged();
+        try std.testing.expect(!provider.close_child_present);
+        app.config.@"window-show-tab-bar" = show_tab_bar;
+        // Execute stale queued messages through the production handler. A
+        // mismatched ID after reorder and a newly sole tab must be harmless.
+        setWindowData(button, &host);
+        const tab_id = host.tabs.items[1].id;
+        host.tabs.items[1].id = 99;
+        _ = tabButtonProc(button, win32_uia.widgets.tab_close_message, tab_id, 0);
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        host.tabs.items[1].id = tab_id;
+        host.tabs.items.len = 1;
+        defer host.tabs.items.len = 2;
+        host.tabs.items[0].button_hwnd = button;
+        defer host.tabs.items[0].button_hwnd = null;
+        try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
+        try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
+        _ = tabButtonProc(button, win32_uia.widgets.tab_close_message, 1, 0);
+        try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
     }
 
     fn activeTabUiaProvider(ctx: *anyopaque) ?*win32_uia.ChromeControlProvider {
@@ -35437,10 +35470,11 @@ fn terminalAccessibilityScroll(ctx: *anyopaque, request: win32_uia.widgets.Scrol
     const core = &surface.core_surface;
     if (!core.renderer_state.mutex.tryLock()) return error.WouldBlock;
     const scrolled = @import("win32_uia/text.zig").scrollFrozenRange(
-        std.heap.page_allocator,
+        core.alloc,
         core.renderer_state.terminal,
         request.token,
-        request.row,
+        request.document_window,
+        request.absolute_row,
         request.align_to_top,
     ) catch |err| {
         core.renderer_state.mutex.unlock();

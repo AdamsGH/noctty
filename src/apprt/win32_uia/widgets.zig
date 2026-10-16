@@ -211,10 +211,11 @@ pub const TerminalState = struct {
 };
 
 /// Pointer-free request. The UI thread validates the frozen document token
-/// under the renderer lock before applying this viewport-relative delta.
+/// under the renderer lock before aligning this absolute document row.
 pub const ScrollRequest = struct {
     token: u64,
-    row: i32,
+    document_window: terminal_text.DocumentWindow = .{},
+    absolute_row: usize,
     align_to_top: bool,
 };
 
@@ -235,6 +236,8 @@ pub const TerminalSnapshot = struct {
 
 pub const TerminalRangeGeometry = struct {
     scroll_token: ?u64 = null,
+    viewport_y: usize = 0,
+    document_window: terminal_text.DocumentWindow = .{},
     cell_for_byte: []terminal_text.TerminalCellPosition,
     viewport_rows: u32,
     viewport_columns: u32,
@@ -2984,6 +2987,18 @@ test "PKG71 close child navigation identity bounds names events and detach" {
     try std.testing.expect(child != null);
     defer _ = child.?.vtbl.Release(child.?);
     const close = TabCloseProvider.fromFragment(child.?);
+    var hit: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.S_OK, parent.fragment_root.vtbl.ElementProviderFromPoint(&parent.fragment_root, 90, 20, &hit));
+    {
+        defer if (hit) |value| {
+            _ = value.vtbl.Release(value);
+        };
+        try std.testing.expect(hit != null and hit != &parent.fragment);
+        try std.testing.expect(TabCloseProvider.fromFragment(hit.?).parent == parent);
+    }
+    try std.testing.expectEqual(com.S_OK, parent.fragment_root.vtbl.ElementProviderFromPoint(&parent.fragment_root, 79, 20, &hit));
+    try std.testing.expect(hit == &parent.fragment);
+    _ = hit.?.vtbl.Release(hit.?);
     var last: ?*com.IRawElementProviderFragment = null;
     try std.testing.expectEqual(com.S_OK, parent.fragment.vtbl.Navigate(&parent.fragment, com.NavigateDirection_LastChild, &last));
     defer _ = last.?.vtbl.Release(last.?);
@@ -3022,6 +3037,9 @@ test "PKG71 close child navigation identity bounds names events and detach" {
     try std.testing.expectEqual(@as(usize, 1), ctx.calls);
     ctx.closable = false;
     parent.syncCloseChild();
+    try std.testing.expectEqual(com.S_OK, parent.fragment_root.vtbl.ElementProviderFromPoint(&parent.fragment_root, 90, 20, &hit));
+    try std.testing.expect(hit == &parent.fragment);
+    _ = hit.?.vtbl.Release(hit.?);
     try std.testing.expectEqual(events_before + 2, events.testing_structure_changes);
     try std.testing.expectEqual(com.S_OK, parent.fragment.vtbl.Navigate(&parent.fragment, com.NavigateDirection_FirstChild, &link));
     try std.testing.expect(link == null);
@@ -4253,9 +4271,12 @@ const TerminalTextRangeProvider = struct {
             @min(self.range.start, self.text.len - 1)
         else
             @min(self.range.end -| 1, self.text.len - 1);
+        const absolute_row = @as(i64, @intCast(geometry.viewport_y)) + geometry.cell_for_byte[offset].row;
+        if (absolute_row < 0) return com.UIA_E_INVALIDOPERATION;
         scroll(self.parent.state.ctx, .{
             .token = token,
-            .row = geometry.cell_for_byte[offset].row,
+            .document_window = geometry.document_window,
+            .absolute_row = @intCast(absolute_row),
             .align_to_top = align_to_top != 0,
         }) catch |err| return if (err == error.ElementNotAvailable) com.UIA_E_ELEMENTNOTAVAILABLE else com.UIA_E_INVALIDOPERATION;
         return com.S_OK;
@@ -6883,6 +6904,8 @@ test "PKG71 ScrollIntoView dispatches frozen endpoint and alignment without sele
     const range = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "ab"), .{ .start = 0, .end = 2 }, .{
         .cell_for_byte = try std.testing.allocator.dupe(terminal_text.TerminalCellPosition, &cells),
         .scroll_token = 7,
+        .viewport_y = 100,
+        .document_window = .{ .top = 98, .bottom = 102 },
         .viewport_rows = 3,
         .viewport_columns = 5,
         .cell_width = 1,
@@ -6893,10 +6916,11 @@ test "PKG71 ScrollIntoView dispatches frozen endpoint and alignment without sele
     defer _ = TerminalTextRangeProvider.Release(&range.base);
     try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 1));
     try std.testing.expect(Hook.request != null);
-    try std.testing.expectEqual(@as(i32, -2), Hook.request.?.row);
+    try std.testing.expectEqual(@as(usize, 98), Hook.request.?.absolute_row);
+    try std.testing.expectEqual(@as(u32, 98), Hook.request.?.document_window.top);
     try std.testing.expect(Hook.request.?.align_to_top);
     try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 0));
-    try std.testing.expectEqual(@as(i32, -1), Hook.request.?.row);
+    try std.testing.expectEqual(@as(usize, 99), Hook.request.?.absolute_row);
     try std.testing.expect(!Hook.request.?.align_to_top);
     try std.testing.expectEqual(com.UIA_E_INVALIDOPERATION, range.base.vtbl.Select(&range.base));
 }

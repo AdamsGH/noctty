@@ -23,13 +23,14 @@ pub fn raiseFocusChanged(provider: *com.IRawElementProviderSimple) void {
     logIfFailed("UIA_AutomationFocusChangedEventId", hr);
 }
 
+/// Count invoked events without calling UIA during provider unit tests.
+pub threadlocal var testing_invocations: usize = 0;
+
 /// Announce that an `IInvokeProvider.Invoke` was carried out. UIA asks
 /// providers to raise this before `Invoke` returns, so it is the one
 /// event raised from inside a provider call rather than from a message
 /// handler; the providers that do so are COM-threaded, which puts the
 /// raise on the window's own thread.
-pub threadlocal var testing_invocations: usize = 0;
-
 pub fn raiseInvoked(provider: *com.IRawElementProviderSimple) void {
     if (builtin.is_test) {
         testing_invocations += 1;

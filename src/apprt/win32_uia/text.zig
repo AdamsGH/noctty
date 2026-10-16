@@ -16,6 +16,12 @@ pub const TerminalCellPosition = struct {
     width: u8,
 };
 
+/// Inclusive absolute rows of the bounded document captured by a range.
+pub const DocumentWindow = struct {
+    top: u32 = 0,
+    bottom: u32 = 0,
+};
+
 /// Bounded, pointer-free document snapshot for UIA. Rows before the viewport
 /// use negative coordinates; rows inside the viewport start at zero.
 pub const AccessibleTextSnapshot = struct {
@@ -29,6 +35,8 @@ pub const AccessibleTextSnapshot = struct {
     viewport_rows: u32,
     viewport_columns: u32,
     scroll_token: ?u64 = null,
+    viewport_y: usize = 0,
+    document_window: DocumentWindow = .{},
 
     pub fn deinit(self: *AccessibleTextSnapshot) void {
         self.alloc.free(self.cell_for_byte);
@@ -90,6 +98,14 @@ pub fn snapshotTerminalAccessiblePlainText(
     alloc: std.mem.Allocator,
     terminal_state: *const terminal.Terminal,
 ) !AccessibleTextSnapshot {
+    return snapshotDocumentWindow(alloc, terminal_state, null);
+}
+
+fn snapshotDocumentWindow(
+    alloc: std.mem.Allocator,
+    terminal_state: *const terminal.Terminal,
+    frozen_window: ?DocumentWindow,
+) !AccessibleTextSnapshot {
     var text_writer: std.Io.Writer.Allocating = .init(alloc);
     defer text_writer.deinit();
 
@@ -114,7 +130,7 @@ pub fn snapshotTerminalAccessiblePlainText(
     // window entirely and leave `visible_range` empty while a full screen of
     // text is on display. Slide the same-sized window up to the viewport
     // instead of growing it; the off-window caret degrades to the document end.
-    const document_top = if (viewport_top.isBetween(history_top, active_bottom))
+    var document_top = if (viewport_top.isBetween(history_top, active_bottom))
         history_top
     else
         viewport_top;
@@ -127,10 +143,23 @@ pub fn snapshotTerminalAccessiblePlainText(
         pin.x = active_bottom.x;
         break :blk pin;
     };
-    const document_bottom = if (budget_bottom.isBetween(document_top, active_bottom))
+    var document_bottom = if (budget_bottom.isBetween(document_top, active_bottom))
         budget_bottom
     else
         active_bottom;
+
+    // Revalidate the original bounded document, even when pure viewport motion
+    // would make a new UIA capture slide its history window elsewhere.
+    if (frozen_window) |window| {
+        if (window.bottom < window.top or window.bottom - window.top >= budget_rows)
+            return error.StaleDocument;
+        document_top = pages.pin(.{ .screen = .{ .y = window.top } }) orelse return error.StaleDocument;
+        document_bottom = pages.pin(.{ .screen = .{ .x = pages.cols - 1, .y = window.bottom } }) orelse return error.StaleDocument;
+    }
+    const document_window: DocumentWindow = .{
+        .top = (pages.pointFromPin(.screen, document_top) orelse return error.UnknownPoint).screen.y,
+        .bottom = (pages.pointFromPin(.screen, document_bottom) orelse return error.UnknownPoint).screen.y,
+    };
 
     var formatter = terminal.formatter.PageListFormatter.init(pages, .plain);
     formatter.top_left = document_top;
@@ -148,15 +177,16 @@ pub fn snapshotTerminalAccessiblePlainText(
     const viewport_y: i64 = @intCast(viewport_screen.screen.y);
 
     // Include page provenance as well as content. Recycling a page, trimming
-    // history, switching screens, resizing, or moving the viewport invalidates
-    // frozen relative rows even when the rendered text happens to be equal.
+    // history, switching screens, or resizing invalidates frozen anchors even
+    // when text happens to be equal. Pure viewport motion is geometry only.
     var hash = std.hash.Wyhash.init(0);
     hash.update(text);
     const provenance = [_]u64{
         @intFromEnum(terminal_state.screens.active_key), pages.page_serial,
         pages.page_serial_min,                           pages.pages.first.?.serial,
-        pages.total_rows,                                @intCast(viewport_y),
-        pages.rows,                                      pages.cols,
+        pages.total_rows,                                document_window.top,
+        document_window.bottom,                          pages.rows,
+        pages.cols,
     };
     hash.update(std.mem.sliceAsBytes(&provenance));
 
@@ -174,7 +204,7 @@ pub fn snapshotTerminalAccessiblePlainText(
         // Hash canonical scalar fields together, with no struct padding and
         // no second per-byte pass while the renderer lock is held.
         const position = cell_for_byte[index];
-        const canonical = [3]u32{ @bitCast(position.row), position.column, position.width };
+        const canonical = [3]u32{ @intCast(screen_y), position.column, position.width };
         hash.update(std.mem.sliceAsBytes(&canonical));
         if (pin.isBetween(viewport_top, viewport_bottom)) {
             if (visible_start == null) visible_start = index;
@@ -206,6 +236,8 @@ pub fn snapshotTerminalAccessiblePlainText(
         .viewport_rows = @intCast(pages.rows),
         .viewport_columns = @intCast(pages.cols),
         .scroll_token = hash.final(),
+        .viewport_y = viewport_screen.screen.y,
+        .document_window = document_window,
     };
 }
 
@@ -215,13 +247,19 @@ pub fn scrollFrozenRange(
     alloc: std.mem.Allocator,
     state: *terminal.Terminal,
     token: u64,
-    row: i32,
+    document_window: DocumentWindow,
+    absolute_row: usize,
     align_to_top: bool,
 ) !bool {
-    var live = try snapshotTerminalAccessiblePlainText(alloc, state);
+    var live = snapshotDocumentWindow(alloc, state, document_window) catch |err| switch (err) {
+        error.StaleDocument => return false,
+        else => return err,
+    };
     defer live.deinit();
     if (token != live.scroll_token.?) return false;
-    const delta: isize = @as(isize, row) - if (align_to_top) @as(isize, 0) else @as(isize, live.viewport_rows -| 1);
+    if (absolute_row < document_window.top or absolute_row > document_window.bottom) return false;
+    const delta: isize = @as(isize, @intCast(absolute_row)) - @as(isize, @intCast(live.viewport_y)) -
+        (if (align_to_top) @as(isize, 0) else @as(isize, live.viewport_rows -| 1));
     state.scrollViewport(.{ .delta = delta });
     return true;
 }
@@ -363,7 +401,7 @@ fn caretOffsetForGridPosition(
     return row_end orelse text.len;
 }
 
-test "PKG71 frozen scroll aligns top and bottom and refuses changed viewports" {
+test "PKG71 frozen scroll reuses the same range after scrolling and mouse viewport motion" {
     const alloc = std.testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .cols = 20, .rows = 3, .max_scrollback = 100_000 });
     defer t.deinit(alloc);
@@ -371,19 +409,24 @@ test "PKG71 frozen scroll aligns top and bottom and refuses changed viewports" {
     var frozen = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer frozen.deinit();
     const index = std.mem.indexOf(u8, frozen.text, "two").?;
-    const row = frozen.cell_for_byte[index].row;
-    try std.testing.expect(row < 0);
-    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, row, true));
+    try std.testing.expect(frozen.cell_for_byte[index].row < 0);
+    const row: usize = @intCast(@as(i64, @intCast(frozen.viewport_y)) + frozen.cell_for_byte[index].row);
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, frozen.document_window, row, true));
     var top = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer top.deinit();
     try std.testing.expectEqual(@as(i32, 0), top.cell_for_byte[std.mem.indexOf(u8, top.text, "two").?].row);
-    // The same frozen relative row is no longer safe after a viewport move.
-    try std.testing.expect(!try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, row, false));
+    // A held range remains useful after its own first successful scroll.
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, frozen.document_window, row, false));
+    var reused = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer reused.deinit();
+    try std.testing.expectEqual(@as(i32, 2), reused.cell_for_byte[std.mem.indexOf(u8, reused.text, "two").?].row);
+    // Mouse-wheel motion must not invalidate unchanged document content.
+    t.scrollViewport(.{ .delta = 1 });
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, frozen.document_window, row, true));
     t.scrollViewport(.bottom);
     var bottom_source = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer bottom_source.deinit();
-    const bottom_row = bottom_source.cell_for_byte[std.mem.indexOf(u8, bottom_source.text, "two").?].row;
-    try std.testing.expect(try scrollFrozenRange(alloc, &t, bottom_source.scroll_token.?, bottom_row, false));
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, bottom_source.scroll_token.?, bottom_source.document_window, row, false));
     var bottom = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer bottom.deinit();
     try std.testing.expectEqual(@as(i32, 2), bottom.cell_for_byte[std.mem.indexOf(u8, bottom.text, "two").?].row);
@@ -398,20 +441,42 @@ test "PKG71 frozen scroll rejects output resize screen switch and history recycl
     var original = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer original.deinit();
     try t.printString("new");
-    try std.testing.expect(!try scrollFrozenRange(alloc, &t, original.scroll_token.?, -1, true));
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, original.scroll_token.?, original.document_window, 0, true));
     var before_resize = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer before_resize.deinit();
     try t.resize(alloc, 15, 4);
-    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_resize.scroll_token.?, -1, true));
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_resize.scroll_token.?, before_resize.document_window, 0, true));
     var before_switch = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer before_switch.deinit();
     _ = try t.switchScreen(.alternate);
-    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_switch.scroll_token.?, -1, true));
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_switch.scroll_token.?, before_switch.document_window, 0, true));
     _ = try t.switchScreen(.primary);
     var before_trim = try snapshotTerminalAccessiblePlainText(alloc, &t);
     defer before_trim.deinit();
     for (0..1000) |_| try t.printString("repeat\r\n");
-    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_trim.scroll_token.?, -1, false));
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_trim.scroll_token.?, before_trim.document_window, 0, false));
+}
+
+test "PKG71 held scroll range survives motion beyond the bounded history window" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3, .max_scrollback = 100_000 });
+    defer t.deinit(alloc);
+    for (0..650) |_| try t.printString("history\r\n");
+    var frozen = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer frozen.deinit();
+    const row = frozen.document_window.top;
+    try std.testing.expect(row > 2);
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, frozen.document_window, row, false));
+    try std.testing.expectEqual(row - 2, (t.screens.active.pages.pointFromPin(.screen, t.screens.active.pages.getTopLeft(.viewport)).?).screen.y);
+    // This viewport has slid a newly acquired document window earlier.
+    var moved = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer moved.deinit();
+    try std.testing.expect(moved.document_window.top < frozen.document_window.top);
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, frozen.document_window, row, true));
+    t.scrollViewport(.top);
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, frozen.document_window, row, false));
+    try std.testing.expectEqual(row - 2, (t.screens.active.pages.pointFromPin(.screen, t.screens.active.pages.getTopLeft(.viewport)).?).screen.y);
+    try std.testing.expect(t.screens.active.selection == null);
 }
 
 test "snapshotTerminalAccessiblePlainText bounds history and maps viewport" {
