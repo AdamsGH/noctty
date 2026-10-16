@@ -595,6 +595,7 @@ const StatusNote = enum {
     /// "Discard changes" threw the draft away.
     discarded,
     discard_failed,
+    editor_open_failed,
     resolve_first,
     conflict_not_resolved,
     disk_value_not_adopted,
@@ -617,6 +618,7 @@ const StatusNote = enum {
             .close_failed => "Could not close the settings window; your edits are kept.",
             .discarded => "Changes discarded.",
             .discard_failed => "Could not discard the changes; they are kept.",
+            .editor_open_failed => @import("../os/windows_text_editor.zig").failure_message,
             .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
             .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
             .disk_value_not_adopted => "Could not take the value from disk; your edit is kept.",
@@ -1815,6 +1817,9 @@ pub const SettingsWindow = struct {
     transaction: ?SettingsTransaction = null,
     local_revision: u64 = 1,
     close_prompt_visible: bool = false,
+    /// The existing inline prompt can discard the draft without closing.
+    discard_prompt: bool = false,
+    discard_prompt_count: usize = 0,
     close_after_save: bool = false,
     close_posted: bool = false,
     close_notified: bool = false,
@@ -2130,6 +2135,23 @@ pub const SettingsWindow = struct {
         return false;
     }
 
+    fn pendingFieldCount(self: *const SettingsWindow) usize {
+        var fields = [_]bool{false} ** setting_field_count;
+        if (self.transaction) |transaction| for (transaction.entries) |entry| {
+            fields[@intFromEnum(entry.field)] = entry.dirty or entry.conflict;
+        };
+        inline for (comptime std.enums.values(RawScalarField)) |field| {
+            if (self.raw_scalar_dirty[@intFromEnum(field)])
+                fields[@intFromEnum(@field(SettingField, @tagName(field)))] = true;
+        }
+        var count: usize = 0;
+        for (fields) |changed| count += @intFromBool(changed);
+        for (self.owned_text_changed, self.owned_dirty, self.owned_conflict) |text, dirty, conflict| {
+            count += @intFromBool(text or dirty or conflict);
+        }
+        return count;
+    }
+
     fn updateSaveEnabled(self: *SettingsWindow) void {
         const enabled = self.validation_control == null and
             !self.hasRawScalarEdits() and
@@ -2158,6 +2180,10 @@ pub const SettingsWindow = struct {
         self.setStatus(note.text());
     }
 
+    pub fn editorOpenFailed(self: *SettingsWindow) void {
+        self.setNote(.editor_open_failed);
+    }
+
     /// `setNote` for a failed save: when the sentence names a file, the app
     /// says which.
     fn setSaveFailureNote(self: *SettingsWindow, err: SaveError) void {
@@ -2184,7 +2210,7 @@ pub const SettingsWindow = struct {
     fn idleStatusText(self: *const SettingsWindow) []const u8 {
         switch (self.status_note) {
             // A save's result stays up whatever the draft looks like now.
-            .saved, .discarded => return self.status_note.text(),
+            .saved, .discarded, .editor_open_failed => return self.status_note.text(),
             .saved_overridden => return self.noteText(),
             // These are about edits that are still there to be saved.
             .save_failed,
@@ -4515,40 +4541,70 @@ pub const SettingsWindow = struct {
 
     fn resetClosePromptState(self: *SettingsWindow) void {
         self.close_prompt_visible = false;
+        self.discard_prompt = false;
         self.close_after_save = false;
         self.close_posted = false;
         self.close_prior_focus = null;
     }
 
     fn updateClosePromptActions(self: *SettingsWindow) void {
+        if (self.discard_prompt and !self.hasPendingChanges()) {
+            // A field can become clean while it is still being edited. Keep
+            // typing there; restore focus only when the prompt owned it.
+            const focused = sys.GetFocus();
+            const restore_focus = focused != null and (focused == self.btn_close_save or
+                focused == self.btn_close_discard or focused == self.btn_close_keep_editing);
+            self.dismissPrompt(false, restore_focus);
+            return;
+        }
         const actions = closePromptActions(self.close_prompt_visible, self.close_posted);
-        if (self.btn_close_save) |button| _ = sys.EnableWindow(button, @intFromBool(actions.save));
+        if (self.btn_close_save) |button| _ = sys.EnableWindow(button, @intFromBool(actions.save and !self.discard_prompt));
         if (self.btn_close_discard) |button| _ = sys.EnableWindow(button, @intFromBool(actions.discard));
         if (self.btn_close_keep_editing) |button| {
             _ = sys.EnableWindow(button, @intFromBool(actions.keep_editing));
         }
+        if (self.discard_prompt and self.pendingFieldCount() != self.discard_prompt_count) {
+            self.syncClosePromptText(false);
+            layoutChildren(self);
+        }
+    }
+
+    fn promptText(self: *const SettingsWindow, buffer: []u8) []const u8 {
+        if (!self.discard_prompt) return closePromptText(self.quit_after_close);
+        const count = self.pendingFieldCount();
+        return std.fmt.bufPrint(buffer, "Discard unsaved changes to {d} {s}?", .{
+            count, if (count == 1) @as([]const u8, "field") else "fields",
+        }) catch "Discard unsaved changes?";
     }
 
     fn syncClosePromptText(self: *SettingsWindow, announce: bool) void {
         const text = self.text_close_prompt orelse return;
-        setWindowTextUtf8(text, closePromptText(self.quit_after_close));
+        var buffer: [128]u8 = undefined;
+        setWindowTextUtf8(text, self.promptText(&buffer));
+        self.discard_prompt_count = self.pendingFieldCount();
+        self.close_prompt_measure_height = 0;
         if (announce) self.announceText(text_close_prompt_index);
     }
 
     fn showClosePrompt(self: *SettingsWindow) void {
-        if (self.close_prompt_visible) {
+        self.showPrompt(false);
+    }
+
+    fn showPrompt(self: *SettingsWindow, discard: bool) void {
+        if (self.close_prompt_visible and self.discard_prompt == discard) {
             if (self.btn_close_keep_editing) |button| _ = sys.SetFocus(button);
             return;
         }
+        if (!self.close_prompt_visible) self.close_prior_focus = sys.GetFocus();
         self.close_prompt_visible = true;
-        self.close_prior_focus = sys.GetFocus();
+        self.discard_prompt = discard;
         if (self.text_status) |text| _ = sys.ShowWindow(text, SW_HIDE);
         if (self.btn_conflict_keep) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.btn_conflict_use_disk) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.btn_discard_changes) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.btn_save) |button| _ = sys.ShowWindow(button, SW_HIDE);
         if (self.text_close_prompt) |text| _ = sys.ShowWindow(text, SW_SHOWNORMAL);
-        if (self.btn_close_save) |button| _ = sys.ShowWindow(button, SW_SHOWNORMAL);
+        if (self.btn_close_save) |button| _ = sys.ShowWindow(button, if (discard) SW_HIDE else SW_SHOWNORMAL);
         if (self.btn_close_discard) |button| _ = sys.ShowWindow(button, SW_SHOWNORMAL);
         if (self.btn_close_keep_editing) |button| _ = sys.ShowWindow(button, SW_SHOWNORMAL);
         self.syncClosePromptText(true);
@@ -4571,7 +4627,7 @@ pub const SettingsWindow = struct {
         _ = SetForegroundWindow(hwnd);
         self.quit_after_close = true;
         // An open prompt still says "closing"; say "quitting" instead.
-        if (self.close_prompt_visible) {
+        if (self.close_prompt_visible and !self.discard_prompt) {
             self.syncClosePromptText(true);
             layoutChildren(self);
         }
@@ -4585,10 +4641,15 @@ pub const SettingsWindow = struct {
     }
 
     fn cancelClosePrompt(self: *SettingsWindow) void {
+        self.dismissPrompt(true, true);
+    }
+
+    fn dismissPrompt(self: *SettingsWindow, announce_status: bool, restore_focus: bool) void {
         if (!closePromptCanCancel(self.close_prompt_visible, self.close_posted)) return;
         const prior_focus = self.close_prior_focus;
         self.quit_after_close = false;
         self.close_prompt_visible = false;
+        self.discard_prompt = false;
         self.close_after_save = false;
         self.close_prior_focus = null;
         if (self.text_close_prompt) |text| _ = ShowWindow(text, SW_HIDE);
@@ -4602,8 +4663,9 @@ pub const SettingsWindow = struct {
         layoutChildren(self);
         // What came up while the prompt hid the line (an error, or the failure
         // of a Save and close) was not spoken.
-        if (self.statusAnnounces()) self.announceText(text_status_index);
+        if (announce_status and self.statusAnnounces()) self.announceText(text_status_index);
 
+        if (!restore_focus) return;
         if (prior_focus) |control| {
             const belongs_to_settings = if (self.hwnd) |settings_hwnd|
                 control == settings_hwnd or sys.IsChild(settings_hwnd, control) != 0
@@ -4618,7 +4680,7 @@ pub const SettingsWindow = struct {
     }
 
     fn saveAndClose(self: *SettingsWindow) void {
-        if (!self.close_prompt_visible or self.close_posted) return;
+        if (!self.close_prompt_visible or self.close_posted or self.discard_prompt) return;
         self.close_after_save = true;
         self.save();
         if (self.close_posted) {
@@ -4639,17 +4701,28 @@ pub const SettingsWindow = struct {
 
     fn discardAndClose(self: *SettingsWindow) void {
         if (!self.close_prompt_visible or self.close_posted) return;
+        if (self.discard_prompt) {
+            self.dismissPrompt(false, true);
+            self.discardChangesNow();
+            return;
+        }
         self.close_after_save = false;
         self.postCloseNow();
     }
 
-    /// "Discard changes": throw the draft away and show what is saved, with
-    /// the window still open: `adoptConfig` from this window's own snapshot of
-    /// the saved config, which rolls every live preview back on the way.
     fn discardChanges(self: *SettingsWindow) void {
-        // Not while the button is hidden: UIA can invoke it there.
         const button = self.btn_discard_changes orelse return;
         if (sys.IsWindowVisible(button) == 0 or self.close_posted or !self.hasPendingChanges()) return;
+        self.showPrompt(true);
+    }
+
+    /// After confirmation, throw the draft away and show what is saved, with
+    /// the window still open: `adoptConfig` from this window's own snapshot of
+    /// the saved config, which rolls every live preview back on the way.
+    fn discardChangesNow(self: *SettingsWindow) void {
+        // The request validates the visible button before asking. Once the
+        // user confirms, a new external conflict must not cancel the discard.
+        if (self.close_posted or !self.hasPendingChanges()) return;
         const saved = &(self.current orelse return);
         self.freeNoteText();
         // From this window's own snapshot of what is saved, not from
@@ -4662,6 +4735,9 @@ pub const SettingsWindow = struct {
             return;
         };
         self.refreshAllControls();
+        // A conflict may have arrived while confirmation was open. The clean
+        // draft must restore the ordinary actions after its conflict is gone.
+        self.surfaceNextValidation(false);
         // The Advanced page lists the pending changes.
         self.refreshNativeSectionText();
         if (self.active_section == .advanced) layoutChildren(self);
@@ -5760,16 +5836,21 @@ const ActionRowGeometry = struct {
 };
 
 fn closeActionRowGeometry(available_width: i32, available_height: i32, dpi: u32) ActionRowGeometry {
+    return promptActionRowGeometry(available_width, available_height, dpi, false);
+}
+
+fn promptActionRowGeometry(available_width: i32, available_height: i32, dpi: u32, discard: bool) ActionRowGeometry {
     const gap = scaleForDpi(settings_action_gap, dpi);
-    const preferred_first = scaleForDpi(120, dpi);
+    const preferred_first = if (discard) 0 else scaleForDpi(120, dpi);
     const preferred_second = scaleForDpi(128, dpi);
     const preferred_third = scaleForDpi(112, dpi);
     const preferred_height = scaleForDpi(settings_control_height, dpi);
-    const preferred_total = preferred_first + preferred_second + preferred_third + 2 * gap;
+    const button_count: i32 = if (discard) 2 else 3;
+    const preferred_total = preferred_first + preferred_second + preferred_third + (button_count - 1) * gap;
     if (available_width >= preferred_total) return .{
         .first_x = available_width - preferred_total,
         .first_width = preferred_first,
-        .second_x = available_width - preferred_total + preferred_first + gap,
+        .second_x = available_width - preferred_total + if (discard) @as(i32, 0) else preferred_first + gap,
         .second_y = 0,
         .second_width = preferred_second,
         .third_x = available_width - preferred_third,
@@ -5783,16 +5864,16 @@ fn closeActionRowGeometry(available_width: i32, available_height: i32, dpi: u32)
     // pane is shorter than 3 px (the closed prompt asks with a height of 0).
     const width: i32 = @max(0, available_width);
     const height: i32 = @max(0, available_height);
-    const vertical_gap = @min(scaleForDpi(6, dpi), @divTrunc(@max(0, height - 3), 2));
-    const button_height = @min(preferred_height, @divTrunc(@max(0, height - 2 * vertical_gap), 3));
+    const vertical_gap = @min(scaleForDpi(6, dpi), @divTrunc(@max(0, height - button_count), button_count - 1));
+    const button_height = @min(preferred_height, @divTrunc(@max(0, height - (button_count - 1) * vertical_gap), button_count));
     return .{
         .first_x = 0,
-        .first_width = width,
+        .first_width = if (discard) 0 else width,
         .second_x = 0,
-        .second_y = button_height + vertical_gap,
+        .second_y = if (discard) 0 else button_height + vertical_gap,
         .second_width = width,
         .third_x = 0,
-        .third_y = 2 * (button_height + vertical_gap),
+        .third_y = (button_count - 1) * (button_height + vertical_gap),
         .third_width = width,
         .button_height = button_height,
         .stacked = true,
@@ -5947,6 +6028,26 @@ fn saveCommandCanDispatch(
     button_visible: bool,
 ) bool {
     return !prompt_visible and !close_posted and button_enabled and button_visible;
+}
+
+test "SET Discard count includes invalid raw text and owned edits once per field" {
+    const config = try Config.default(std.testing.allocator);
+    var settings: SettingsWindow = .{
+        .handle = modelOnlyHandle(),
+        .original = config,
+        .pending = try config.clone(std.testing.allocator),
+    };
+    defer settings.clearPending();
+    settings.initTransaction();
+    try std.testing.expectEqual(@as(usize, 0), settings.pendingFieldCount());
+    settings.pending.?.@"font-size" = 16;
+    settings.trackEdit(.font_size, false);
+    settings.markRawScalarEdit(.font_size);
+    try std.testing.expectEqual(@as(usize, 1), settings.pendingFieldCount());
+    settings.markRawScalarEdit(.window_padding_x);
+    settings.owned_text_changed[@intFromEnum(OwnedSettingField.command)] = true;
+    settings.owned_conflict[@intFromEnum(OwnedSettingField.command)] = true;
+    try std.testing.expectEqual(@as(usize, 3), settings.pendingFieldCount());
 }
 
 test "settings dirty close transition is conservative and idempotent" {
@@ -6707,7 +6808,7 @@ test "settings an invalid field marks its rail section, the title and UIA" {
             try std.testing.expectEqual(Marker.none, settings.sectionProvider(.appearance).?.markerState());
 
             // The mark follows the section's own state through a discard.
-            settings.discardChanges();
+            settings.discardChangesNow();
             try std.testing.expectEqual(Marker.none, settings.sectionProvider(.terminal).?.markerState());
             try std.testing.expectEqualStrings("noctty settings", try titleOf(hwnd));
         }
@@ -6800,7 +6901,7 @@ test "settings status and close prompt are live regions" {
             settings.cancelClosePrompt();
             try std.testing.expectEqual(@as(usize, 3), events.testing_live_regions);
             // The outcome of a discard.
-            settings.discardChanges();
+            settings.discardChangesNow();
             try std.testing.expectEqual(@as(usize, 4), events.testing_live_regions);
         }
     }.body);
@@ -6842,7 +6943,7 @@ test "settings a Discard that cannot copy the saved config leaves the draft and 
             const real = settings.handle.alloc;
             var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
             settings.handle.alloc = failing.allocator();
-            settings.discardChanges();
+            settings.discardChangesNow();
             settings.handle.alloc = real;
 
             // Still a draft that asks before closing, still previewed.
@@ -6852,7 +6953,7 @@ test "settings a Discard that cannot copy the saved config leaves the draft and 
             try std.testing.expectEqualStrings("Could not discard the changes; they are kept.", try statusTextOf(settings, &buf));
 
             // And the next try, with memory, does it.
-            settings.discardChanges();
+            settings.discardChangesNow();
             try std.testing.expect(!settings.hasPendingChanges());
             try std.testing.expectEqual(@as(f32, 12), fixture.config.@"font-size");
         }
@@ -6921,7 +7022,7 @@ test "settings offers accent-follow-system as a checkbox that previews the theme
             try std.testing.expect(std.mem.indexOf(u8, settings.pendingDiffText(&diff), "Follow Windows accent color: On -> Off") != null);
 
             // Discard puts the box back, and the preview with it.
-            settings.discardChanges();
+            settings.discardChangesNow();
             try std.testing.expect(sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
             try std.testing.expect(fixture.config.@"accent-follow-system");
             try std.testing.expect(settings.pending.?.@"accent-follow-system");
@@ -6930,6 +7031,163 @@ test "settings offers accent-follow-system as a checkbox that previews the theme
             const keywords = paletteDescriptor(.accent_follow_system).item.keywords;
             try std.testing.expect(std.mem.indexOf(u8, keywords, "accent-follow-system") != null);
             try std.testing.expect(std.mem.indexOf(u8, keywords, "accent color") != null);
+        }
+    }.body);
+}
+
+test "SET Discard asks before losing edits and supports keyboard cancellation" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            fixture.live_previews = true;
+            typeInto(settings.edit_font_size.?, "16");
+            _ = sys.SetFocus(settings.btn_discard_changes.?);
+            _ = sys.SendMessageW(settings.btn_discard_changes.?, BM_CLICK, 0, 0);
+            try std.testing.expect(settings.hasPendingChanges());
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
+            var text_buf: [128]u8 = undefined;
+            try std.testing.expectEqualStrings("Discard unsaved changes to 1 field?", readEditUtf8(settings.text_close_prompt.?, &text_buf).?);
+            try std.testing.expect(sys.IsWindowVisible(settings.btn_close_save.?) == 0);
+            try std.testing.expectEqual(settings.btn_close_keep_editing.?, sys.GetFocus().?);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expect(settings.hasPendingChanges());
+            try std.testing.expectEqual(settings.btn_discard_changes.?, sys.GetFocus().?);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+        }
+    }.body);
+}
+
+test "SET UI Automation can request and accept Discard without closing Settings" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            typeInto(settings.edit_font_size.?, "16");
+            const request = &settings.control_uia_providers[34].?.invoke_iface;
+            try std.testing.expectEqual(@as(HRESULT, 0), request.vtbl.Invoke(request));
+            dialog_test.pump();
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expect(settings.discard_prompt);
+            try std.testing.expect(settings.hasPendingChanges());
+            // The hidden Save and close action cannot turn Discard into a save.
+            settings.saveAndClose();
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+            const accept = &settings.control_uia_providers[32].?.invoke_iface;
+            try std.testing.expectEqual(@as(HRESULT, 0), accept.vtbl.Invoke(accept));
+            dialog_test.pump();
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expect(sys.IsWindow(fixture.hwnd()) != 0);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+        }
+    }.body);
+}
+
+test "SET confirmed Discard adopts an external conflict and a reverted draft dismisses the prompt" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            typeInto(settings.edit_font_size.?, "16");
+            settings.discardChanges();
+            fixture.config.@"font-size" = 18;
+            settings.externalConfigChanged(&fixture.config, 2);
+            try std.testing.expectEqual(@as(usize, 1), settings.conflictCount());
+            settings.discardAndClose();
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expectEqual(@as(f32, 18), settings.pending.?.@"font-size");
+            try std.testing.expectEqual(StatusNote.discarded, settings.status_note);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+
+            // Reverting the only edit while the prompt is open needs no answer.
+            typeInto(settings.edit_font_size.?, "20");
+            _ = sys.SetFocus(settings.btn_discard_changes.?);
+            settings.discardChanges();
+            try std.testing.expect(settings.discard_prompt);
+            try std.testing.expectEqual(settings.btn_discard_changes.?, settings.close_prior_focus.?);
+            _ = sys.SetFocus(settings.edit_font_size.?);
+            typeInto(settings.edit_font_size.?, "18");
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+        }
+    }.body);
+}
+
+test "SET reverting the last edit dismisses Discard without moving field focus" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            typeInto(settings.edit_font_size.?, "16");
+            _ = sys.SetFocus(settings.btn_discard_changes.?);
+            settings.discardChanges();
+            try std.testing.expect(settings.discard_prompt);
+            try std.testing.expectEqual(settings.btn_discard_changes.?, settings.close_prior_focus.?);
+            _ = sys.SetFocus(settings.edit_font_size.?);
+            typeInto(settings.edit_font_size.?, "12");
+            try std.testing.expect(!settings.hasPendingChanges());
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+        }
+    }.body);
+}
+
+test "SET close and quit switch the Discard prompt in place and preserve cancellation" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const events = win32_uia.events;
+            var buffer: [128]u8 = undefined;
+            typeInto(settings.edit_font_size.?, "16");
+            _ = sys.SetFocus(settings.btn_discard_changes.?);
+            settings.discardChanges();
+            events.testing_live_regions = 0;
+            _ = sys.SendMessageW(fixture.hwnd(), WM_CLOSE, 0, 0);
+            try std.testing.expect(!settings.discard_prompt);
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expectEqual(@as(usize, 1), events.testing_live_regions);
+            try std.testing.expectEqualStrings(closePromptText(false), readEditUtf8(settings.text_close_prompt.?, &buffer).?);
+            try std.testing.expect(sys.IsWindowVisible(settings.btn_close_save.?) != 0);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expectEqual(settings.btn_discard_changes.?, sys.GetFocus().?);
+            settings.discardChanges();
+            events.testing_live_regions = 0;
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(!settings.discard_prompt);
+            try std.testing.expectEqual(@as(usize, 1), events.testing_live_regions);
+            try std.testing.expectEqualStrings(closePromptText(true), readEditUtf8(settings.text_close_prompt.?, &buffer).?);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(!settings.takeQuitAfterClose());
+            try std.testing.expect(settings.hasPendingChanges());
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+        }
+    }.body);
+}
+
+test "SET editor open errors are visible and announced with no pending edits" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var buffer: [256]u8 = undefined;
+            const events = win32_uia.events;
+            events.testing_live_regions = 0;
+            settings.editorOpenFailed();
+            try std.testing.expectEqualStrings(StatusNote.editor_open_failed.text(), try statusTextOf(settings, &buffer));
+            try std.testing.expectEqual(@as(usize, 1), events.testing_live_regions);
+            settings.updateSaveEnabled();
+            try std.testing.expectEqualStrings(StatusNote.editor_open_failed.text(), try statusTextOf(settings, &buffer));
         }
     }.body);
 }
@@ -6966,6 +7224,11 @@ test "settings Discard changes throws the draft away and keeps the window" {
 
             _ = sys.SetFocus(discard);
             _ = sys.SendMessageW(discard, BM_CLICK, 0, 0);
+            try std.testing.expect(settings.hasPendingChanges());
+            var prompt_buf: [128]u8 = undefined;
+            try std.testing.expectEqualStrings("Discard unsaved changes to 2 fields?", readEditUtf8(settings.text_close_prompt.?, &prompt_buf).?);
+            _ = sys.SetFocus(settings.btn_close_discard.?);
+            try std.testing.expect(fixture.pumpKey(0x0D));
 
             // Everything is back to what is saved, the window is open, and the
             // button that was pressed is no longer where the keyboard sits.
@@ -7128,6 +7391,20 @@ test "settings close actions stack inside narrow high DPI panes" {
     try std.testing.expect(!wide.stacked);
     try std.testing.expectEqual(@as(i32, 500), wide.third_x + wide.third_width);
     try std.testing.expect(wide.first_x >= 0);
+}
+
+test "SET Discard prompt reserves space for its two visible actions" {
+    var settings: SettingsWindow = .{ .handle = undefined, .close_prompt_visible = true };
+    const close = closePromptLayoutGeometry(&settings, 180, 520);
+    settings.discard_prompt = true;
+    const discard = closePromptLayoutGeometry(&settings, 180, 520);
+    try std.testing.expect(discard.actions.stacked);
+    try std.testing.expectEqual(@as(i32, 0), discard.actions.first_width);
+    try std.testing.expectEqual(@as(i32, 0), discard.actions.second_y);
+    try std.testing.expect(discard.bar_height < close.bar_height);
+    const wide = closePromptLayoutGeometry(&settings, 600, 520);
+    try std.testing.expect(!wide.actions.stacked);
+    try std.testing.expectEqual(wide.actions.first_x, wide.actions.second_x);
 }
 
 test "settings action bar pins normal conflict prompt and stacked actions" {
@@ -7418,7 +7695,8 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     }
 
     var text_w: [256]u16 = undefined;
-    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.quit_after_close)));
+    var text_buf: [128]u8 = undefined;
+    const text = std.mem.span(utf8ToW(&text_w, self.promptText(&text_buf)));
     var measure = RECT{
         .left = 0,
         .top = 0,
@@ -7561,10 +7839,11 @@ fn closePromptLayoutGeometry(self: *SettingsWindow, pane_width: i32, client_heig
     }
 
     const padding = @min(desired_padding, @divTrunc(available_height, 4));
-    const actions = closeActionRowGeometry(
+    const actions = promptActionRowGeometry(
         pane_width,
         @max(0, available_height - 2 * padding),
         self.dpi,
+        self.discard_prompt,
     );
     const action_span = if (actions.stacked)
         actions.third_y + actions.button_height
@@ -9034,7 +9313,7 @@ test "settings rail marks draw for unsaved and invalid sections at 100% and 150%
             const Mode = enum { light, dark, high_contrast };
 
             for ([_]Mode{ .light, .dark, .high_contrast }) |mode| for ([_]u32{ 96, 144 }) |dpi| {
-                settings.discardChanges();
+                settings.discardChangesNow();
                 settings.handle.themeColors = if (mode == .dark) &darkColors else null;
                 settings.handle.highContrast = if (mode == .high_contrast) &highContrast else null;
                 settings.themeChanged();
@@ -9086,7 +9365,7 @@ test "settings rail marks draw for unsaved and invalid sections at 100% and 150%
                 );
 
                 // Nothing is marked once the draft is thrown away.
-                settings.discardChanges();
+                settings.discardChangesNow();
                 dialog_test.flushPaint(hwnd);
                 const discarded = try dialog_test.Capture.take(hwnd);
                 defer discarded.deinit();
