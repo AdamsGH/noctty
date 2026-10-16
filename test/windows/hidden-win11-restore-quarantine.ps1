@@ -15,8 +15,10 @@ the hash and time of its startup state file are read, before and after. Every
 process starts on a private desktop named explicitly in STARTUPINFO, inside a
 job this script owns. Nothing is typed and nothing can copy; the clipboard
 sequence number is logged before and after and a change fails the run. Launch a
-build patched with a measurement AUMID only: the script deletes the jump-list
-file such a build creates during the run, and nothing else.
+build patched with a measurement AUMID only. -MeasureJumpListName names that
+AUMID's jump-list file (`<hash>.customDestinations-ms`); the script deletes that
+one file, and only when it did not exist before the run and was written during
+it. Any other file that appears there is reported, never deleted.
 
 Per build, five launches with the hook set: three that die restoring, the
 safe-mode launch the ledger then selects, and one more; then a sixth without
@@ -33,6 +35,7 @@ param(
     [switch] $Driver,
     [string] $Desktop,
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 600,
+    [ValidatePattern('^[0-9a-f]{16}\.customDestinations-ms$')] [string] $MeasureJumpListName,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
 )
@@ -199,15 +202,16 @@ if (-not $Driver) {
         if($pi) { [void][Rq]::CloseHandle($pi.thread); [void][Rq]::CloseHandle($pi.process) }
         [void][Rq]::CloseDesktop($desktop)
         $batchEnd = [DateTimeOffset]::UtcNow
-        # Only a jump-list file that did not exist before this batch and was
-        # written during it can be the measurement build's. Not its creation
-        # time: NTFS tunnelling gives a file recreated under a name deleted
-        # less than 15 s earlier the old file's creation time.
-        $removed = @()
+        # Only the measurement AUMID's file, and only if this batch created it:
+        # absent before and written during it. Not its creation time: NTFS
+        # tunnelling gives a file recreated under a name deleted less than 15 s
+        # earlier the old file's creation time.
+        $removed = @(); $otherNew = @()
         foreach ($f in Jump-List-Files) {
-            if ($jumpBefore -notcontains $f.Path -and $f.Written -ge $batchStart -and $f.Written -le $batchEnd) {
-                Remove-Item -LiteralPath $f.Path; $removed += (Split-Path -Leaf $f.Path)
-            }
+            if ($jumpBefore -contains $f.Path -or $f.Written -lt $batchStart -or $f.Written -gt $batchEnd) { continue }
+            if ($MeasureJumpListName -and (Split-Path -Leaf $f.Path) -eq $MeasureJumpListName) {
+                Remove-Item -LiteralPath $f.Path; $removed += $MeasureJumpListName
+            } else { $otherNew += (Split-Path -Leaf $f.Path) }
         }
         $after=Startup-Fingerprint
         $historyAfter = History-Metadata
@@ -215,7 +219,7 @@ if (-not $Driver) {
         Write-Host "Clipboard sequence after: $clipboardAfter"
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
         $historyUnchanged=$historyBefore.Exists -eq $historyAfter.Exists -and $historyBefore.Length -eq $historyAfter.Length -and $historyBefore.Modified -eq $historyAfter.Modified
-        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=$historyUnchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter; JumpListFilesRemoved=$removed; BatchStartUtc=$batchStart.ToString('o'); BatchEndUtc=$batchEnd.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=$historyUnchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter; JumpListFilesRemoved=$removed; OtherNewJumpListFiles=$otherNew; BatchStartUtc=$batchStart.ToString('o'); BatchEndUtc=$batchEnd.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
         if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if ($clipboardBefore -ne $clipboardAfter) { throw "Clipboard sequence number changed ($clipboardBefore -> $clipboardAfter); stop launches and report it." }
         if (-not $historyUnchanged) { throw 'Real PowerShell history metadata changed; stop launches and report it.' }

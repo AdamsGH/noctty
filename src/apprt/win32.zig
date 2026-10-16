@@ -3893,10 +3893,12 @@ fn warnPortableIgnoredLocalData(alloc: Allocator) void {
     );
 }
 
-fn beginRecoveryStartup(alloc: Allocator) RecoveryStartup {
+/// `session_state_excluded` is the elevation exclusion: such a process stays
+/// out of the saved session, so it never sets one aside either.
+fn beginRecoveryStartup(alloc: Allocator, session_state_excluded: bool) RecoveryStartup {
     const path = localAppDataPathAlloc(alloc, "startup-attempts.json") orelse return .{};
     defer alloc.free(path);
-    const session_path = localAppDataPathAlloc(alloc, "session-state.json");
+    const session_path = if (session_state_excluded) null else localAppDataPathAlloc(alloc, "session-state.json");
     defer if (session_path) |value| alloc.free(value);
     return beginRecoveryStartupAtPath(alloc, path, session_path, unixMillis(), recovery_ledger_lock_wait_ms);
 }
@@ -4630,8 +4632,6 @@ pub const App = struct {
         opts: struct { safe_mode: bool = false },
     ) !void {
         const embedding_mode = win32_terminal_handoff.isEmbeddingProcess(core_app.alloc);
-        const recovery_startup = if (embedding_mode) RecoveryStartup{} else beginRecoveryStartup(core_app.alloc);
-        const safe_mode = opts.safe_mode or recovery_startup.decision != .normal;
         const is_elevated = win32_elevation.isProcessElevated() catch |err| elevated: {
             log.warn(
                 "failed to query TokenElevation; treating process as elevated for title and IPC isolation err={}",
@@ -4652,6 +4652,11 @@ pub const App = struct {
                 elevation_type,
             );
         } else false;
+        const recovery_startup = if (embedding_mode)
+            RecoveryStartup{}
+        else
+            beginRecoveryStartup(core_app.alloc, session_state_excluded_for_elevation);
+        const safe_mode = opts.safe_mode or recovery_startup.decision != .normal;
         self.* = .{
             .core_app = core_app,
             .config = if (safe_mode) config: {
@@ -51969,9 +51974,18 @@ test "win32 recovery sets the session aside after failures that all began restor
     // Three launches in a row ended after they began restoring the session
     // and before the restore finished: safe mode alone would only reset the
     // streak for the next three.
-    try win32_session_persistence.writeFileInPlace(target,
+    const ledger_restoring =
         \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200,"session_restore_at_unix_ms":210},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
-    );
+    ;
+    // Without a session path (an elevated process excluded from session
+    // state) the decision stands but nothing moves.
+    try win32_session_persistence.writeFileInPlace(target, ledger_restoring);
+    const excluded = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.quarantine_session, excluded.decision);
+    try std.testing.expect(!excluded.session_set_aside);
+    try tmp.dir.access("session-state.json", .{});
+
+    try win32_session_persistence.writeFileInPlace(target, ledger_restoring);
     const restoring = beginRecoveryStartupAtPath(std.testing.allocator, target, session, 400, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.quarantine_session, restoring.decision);
     try std.testing.expect(restoring.session_set_aside);
