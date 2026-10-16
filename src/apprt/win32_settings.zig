@@ -2250,10 +2250,8 @@ pub const SettingsWindow = struct {
 
     fn finishRawScalarEdit(self: *SettingsWindow, field: RawScalarField) void {
         const index = @intFromEnum(field);
-        self.raw_scalar_dirty[index] = false;
         self.raw_scalar_error[index] = null;
         self.raw_scalar_shown[index] = false;
-        if (!self.hasRawScalarEdits()) self.killValidationTimer();
         if (self.active_raw_validation == field) {
             self.active_raw_validation = null;
             // The remaining errors go to the status line. Moving the user to
@@ -2263,6 +2261,11 @@ pub const SettingsWindow = struct {
             // is disabled while one exists).
             self.surfaceNextValidation(false);
         }
+        // That status refresh must still see an edit: the caller transfers
+        // the parsed value to the typed transaction immediately after this.
+        // Only its final update can decide whether Discard is now unnecessary.
+        self.raw_scalar_dirty[index] = false;
+        if (!self.hasRawScalarEdits()) self.killValidationTimer();
     }
 
     fn shouldRefreshRawScalar(self: *const SettingsWindow, field: RawScalarField) bool {
@@ -7136,6 +7139,59 @@ test "SET reverting the last edit dismisses Discard without moving field focus" 
             try std.testing.expect(!settings.hasPendingChanges());
             try std.testing.expect(!settings.close_prompt_visible);
             try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+        }
+    }.body);
+}
+
+test "SET correcting shown invalid scalars preserves Discard for unsaved values" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const cases = [_]struct { field: RawScalarField, edit: HWND, value: []const u8 }{
+                .{ .field = .font_size, .edit = settings.edit_font_size.?, .value = "16" },
+                .{ .field = .background_opacity, .edit = settings.edit_bg_opacity.?, .value = "0.5" },
+                .{ .field = .scrollback_limit, .edit = settings.edit_scrollback.?, .value = "12345" },
+                .{ .field = .window_padding_x, .edit = settings.edit_pad_x.?, .value = "9" },
+                .{ .field = .window_padding_y, .edit = settings.edit_pad_y.?, .value = "11" },
+            };
+            for (cases) |case| {
+                settings.setActiveSection(settings.rawScalarDestination(case.field).section);
+                var saved_buffer: [128]u8 = undefined;
+                const saved = readEditUtf8(case.edit, &saved_buffer).?;
+                typeInto(case.edit, "");
+                settings.showRawScalarErrors(null);
+                try std.testing.expectEqual(case.field, settings.active_raw_validation.?);
+                settings.discardChanges();
+                try std.testing.expect(settings.discard_prompt);
+
+                // Clearing raw validation must not briefly hide this question
+                // before the valid value reaches the typed transaction.
+                typeInto(case.edit, case.value);
+                try std.testing.expect(settings.hasPendingChanges());
+                try std.testing.expect(!settings.hasRawScalarEdits());
+                try std.testing.expect(settings.validation_control == null);
+                try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+                try std.testing.expect(settings.discard_prompt);
+                try std.testing.expectEqual(@as(usize, 1), settings.pendingFieldCount());
+                settings.discardAndClose();
+                try std.testing.expect(!settings.hasPendingChanges());
+                try std.testing.expect(!settings.close_prompt_visible);
+                try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+
+                // A correction back to the saved value really is clean, and
+                // may dismiss the question without taking focus from typing.
+                typeInto(case.edit, "");
+                settings.showRawScalarErrors(null);
+                settings.discardChanges();
+                try std.testing.expect(settings.discard_prompt);
+                _ = sys.SetFocus(case.edit);
+                typeInto(case.edit, saved);
+                try std.testing.expect(!settings.hasPendingChanges());
+                try std.testing.expect(!settings.close_prompt_visible);
+                try std.testing.expectEqual(case.edit, sys.GetFocus().?);
+            }
         }
     }.body);
 }
