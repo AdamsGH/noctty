@@ -1421,6 +1421,14 @@ verify the distribution starts in a normal PowerShell session first.
 
 ### Neovim types base64 after an OSC 52 paste
 
+With `clipboard-read = ask` (the default), choosing Cancel or pressing
+Escape in a read prompt sends an empty OSC 52 response for the selection
+the program requested. Neovim can finish waiting immediately, but a paste
+from that empty response can report an empty register. Configured
+`clipboard-read = deny` sends no response. A prompt dismissed because
+another overlay replaced it, or because its tab was detached or closed,
+also sends no response; the program keeps its own timeout in those cases.
+
 Neovim's OSC 52 clipboard pastes by asking the terminal for the clipboard.
 Neovim uses it when `vim.g.clipboard = 'osc52'` is set, and falls back to it
 when it finds no other clipboard tool and `'clipboard'` is empty, which is

@@ -2419,6 +2419,9 @@ keybind: Keybinds = .{},
 /// received, so keys you were typing when it appeared cannot approve it.
 /// A program's request never replaces a prompt, or the command palette,
 /// search or a rename, that is already open: it is declined instead.
+/// Explicitly choosing Cancel (including Escape) for a read sends an empty
+/// OSC 52 response with the requested selection. Configured `deny` stays
+/// silent, as does a prompt dismissed by displacement or tab teardown.
 ///
 @"clipboard-read": ClipboardAccess = .ask,
 @"clipboard-write": ClipboardAccess = .allow,

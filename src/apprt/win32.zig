@@ -12512,6 +12512,8 @@ fn tabsCloseConfirmCount(tabs: []Tab) usize {
     return count;
 }
 
+const ConfirmCancelReason = enum { explicit, dismissed };
+
 /// Payload for a non-modal confirm overlay. The callbacks receive the
 /// `userdata` pointer passed at construction time so the issuer can
 /// bind state (e.g. which Surface's close is pending). Callbacks are
@@ -12536,7 +12538,7 @@ const ConfirmPayload = struct {
     /// the user's own action raised.
     armed_at_ms: u64 = 0,
     on_accept: *const fn (userdata: ?*anyopaque) void,
-    on_cancel: ?*const fn (userdata: ?*anyopaque) void = null,
+    on_cancel: ?*const fn (userdata: ?*anyopaque, reason: ConfirmCancelReason) void = null,
     userdata: ?*anyopaque = null,
 
     fn deinit(self: *ConfirmPayload, alloc: std.mem.Allocator) void {
@@ -19520,15 +19522,10 @@ const Host = struct {
         // snapshot their callback data before reaching this point and
         // dispatch only after hideOverlay returns.
         //
-        // A confirm closed by anything but its Allow is answered as
-        // Cancel, once the overlay is down: its Cancel and Escape, and
-        // equally a new confirm, the palette, search or a rename opening
-        // over it. Before, those dropped it without its `on_cancel`, and
-        // its clipboard op stayed parked on its Surface until that
-        // Surface's next request. Allow and an owner's teardown clear
-        // `on_cancel` first. The callers of hideOverlay go on using the
-        // Host, so an `on_cancel` must not destroy it; today's two only
-        // free that op.
+        // Displacement still releases the pending operation, but is not
+        // the user's explicit Cancel. Allow, explicit Cancel and owner
+        // teardown clear `on_cancel` first. The callers of hideOverlay
+        // go on using Host, so dismissal callbacks must not destroy it.
         const dropped_cancel = if (self.confirm_payload) |p| p.on_cancel else null;
         const dropped_userdata = if (self.confirm_payload) |p| p.userdata else null;
         if (self.confirm_payload) |*p| {
@@ -19567,7 +19564,7 @@ const Host = struct {
         // `setBanner(.none, null)` above does nothing when only the update
         // notice is up, and not every caller relayouts after this.
         self.syncBannerChild();
-        if (dropped_cancel) |cancel| cancel(dropped_userdata);
+        if (dropped_cancel) |cancel| cancel(dropped_userdata, .dismissed);
     }
 
     fn invalidateOverlayTransitionPlacementCache(self: *Host) void {
@@ -19596,7 +19593,7 @@ const Host = struct {
         self: *Host,
         prompt: ConfirmPrompt,
         on_accept: *const fn (userdata: ?*anyopaque) void,
-        on_cancel: ?*const fn (userdata: ?*anyopaque) void,
+        on_cancel: ?*const fn (userdata: ?*anyopaque, reason: ConfirmCancelReason) void,
         userdata: ?*anyopaque,
     ) !void {
         const alloc = self.app.core_app.alloc;
@@ -19624,7 +19621,7 @@ const Host = struct {
 
         // Close any previous overlay so we don't stack. `hideOverlay`
         // frees an existing `confirm_payload` via its own deinit
-        // branch, so we don't leak here, and answers it as Cancel. That
+        // branch, so we don't leak here, and dismisses it. That
         // cannot undo the new request when it comes from the same
         // Surface: a requester commits its pending op only after this
         // returns.
@@ -19683,9 +19680,18 @@ const Host = struct {
         cb(userdata);
     }
 
-    /// hideOverlay runs the confirm's `on_cancel` once the overlay is down.
+    /// Explicit Cancel/Escape. Consume the callback before hiding, just
+    /// like Allow, and dispatch only once the overlay is down.
     fn invokeConfirmCancel(self: *Host) void {
+        const captured = self.confirm_payload orelse {
+            self.hideOverlay();
+            return;
+        };
+        const cb = captured.on_cancel;
+        const userdata = captured.userdata;
+        self.confirm_payload.?.on_cancel = null;
         self.hideOverlay();
+        if (cb) |cancel| cancel(userdata, .explicit);
     }
 
     /// Cancel a confirm that a terminal in `tab` asked for.
@@ -19694,7 +19700,7 @@ const Host = struct {
         const userdata = payload.userdata orelse return;
         var it = tab.tree.iterator();
         while (it.next()) |entry| {
-            if (@as(*anyopaque, @ptrCast(entry.view)) == userdata) return self.invokeConfirmCancel();
+            if (@as(*anyopaque, @ptrCast(entry.view)) == userdata) return self.hideOverlay();
         }
     }
 
@@ -27195,11 +27201,22 @@ fn surfaceConfirmPasteAccept(userdata: ?*anyopaque) void {
     };
 }
 
-fn surfaceConfirmPasteCancel(userdata: ?*anyopaque) void {
+fn surfaceConfirmPasteCancel(userdata: ?*anyopaque, reason: ConfirmCancelReason) void {
     const ud = userdata orelse return;
     const surface: *Surface = @ptrCast(@alignCast(ud));
-    if (surface.pending_clipboard_op) |*op| op.deinit(surface.app.core_app.alloc);
+    var op = surface.pending_clipboard_op orelse return;
+    const alloc = surface.app.core_app.alloc;
     surface.pending_clipboard_op = null;
+    defer op.deinit(alloc);
+    if (reason != .explicit or op != .paste or
+        op.paste.request != .osc_52_read or !surface.core_initialized or
+        surface.core_surface.config.clipboard_read == .deny) return;
+
+    // Finish this read without revealing clipboard contents. Reuse the
+    // OSC 52 serializer so the reply echoes the requested selection.
+    surface.core_surface.completeClipboardRequest(op.paste.request, "", true) catch |err| {
+        log.warn("pending clipboard read cancel reply failed err={}", .{err});
+    };
 }
 
 /// Accept callback for a deferred clipboard-write confirm. Mirrors
@@ -27244,7 +27261,7 @@ fn surfaceConfirmWriteAccept(userdata: ?*anyopaque) void {
     }
 }
 
-fn surfaceConfirmWriteCancel(userdata: ?*anyopaque) void {
+fn surfaceConfirmWriteCancel(userdata: ?*anyopaque, _: ConfirmCancelReason) void {
     const ud = userdata orelse return;
     const surface: *Surface = @ptrCast(@alignCast(ud));
     if (surface.pending_clipboard_op) |*op| op.deinit(surface.app.core_app.alloc);
@@ -40107,7 +40124,8 @@ pub const Surface = struct {
     /// surface-owned storage, parks it as a `PendingClipboardOp.paste`,
     /// and shows the non-modal `HostOverlayMode.confirm` overlay. On
     /// accept `surfaceConfirmPasteAccept` completes the paste; on
-    /// cancel `surfaceConfirmPasteCancel` frees the payload.
+    /// cancel `surfaceConfirmPasteCancel` frees the payload and, only for
+    /// an explicit OSC 52 read cancellation, sends an empty response.
     ///
     /// Queues a non-modal clipboard confirmation.
     fn requestPasteConfirm(
@@ -42500,6 +42518,157 @@ test "win32 an install waits for unsaved Settings edits, also when the notice ca
     try std.testing.expect(!app.settingsHoldInstall());
 }
 
+/// A headless prompt with the real outbound IO mailbox. Only the core fields
+/// used by OSC 52 completion and the deny gate are initialized; no renderer,
+/// process or system clipboard is started. The pane stays hidden throughout.
+const ClipboardReplyFixture = struct {
+    core_app: CoreApp = undefined,
+    app: App = undefined,
+    host: Host = undefined,
+    surface: Surface = undefined,
+    session: TestSession = .{},
+
+    fn init(self: *ClipboardReplyFixture) !void {
+        try self.session.init(.{
+            .core_app = &self.core_app,
+            .app = &self.app,
+            .hosts = &.{.{ .storage = &self.host, .register = true }},
+            .surfaces = &.{.{ .storage = &self.surface, .host = &self.host, .register = true, .window_visible = false }},
+            .tabs = &.{.{ .host = &self.host, .surface = &self.surface, .id = 1 }},
+        });
+        errdefer self.session.deinit();
+        const core = &self.surface.core_surface;
+        core.alloc = self.core_app.alloc;
+        core.config.clipboard_read = .ask;
+        core.readonly = false;
+        core.rt_surface = &self.surface;
+        core.io.mailbox = try @import("../termio.zig").Mailbox.initSPSC(self.core_app.alloc);
+        self.surface.core_initialized = true;
+    }
+
+    fn deinit(self: *ClipboardReplyFixture) void {
+        self.host.hideOverlay();
+        self.surface.core_initialized = false;
+        if (self.surface.pending_clipboard_op) |*op| op.deinit(self.core_app.alloc);
+        self.surface.pending_clipboard_op = null;
+        self.surface.core_surface.io.mailbox.deinit(self.core_app.alloc);
+        self.session.deinit();
+    }
+
+    fn expectSilent(self: *ClipboardReplyFixture) !void {
+        const message = self.surface.core_surface.io.mailbox.spsc.queue.pop();
+        if (message) |value| value.deinit();
+        try std.testing.expect(message == null);
+    }
+
+    fn expectReply(self: *ClipboardReplyFixture, expected: []const u8) !void {
+        const message = self.surface.core_surface.io.mailbox.spsc.queue.pop() orelse return error.MissingClipboardReply;
+        defer message.deinit();
+        switch (message) {
+            .write_small => |v| try std.testing.expectEqualStrings(expected, v.data[0..v.len]),
+            .write_stable => |v| try std.testing.expectEqualStrings(expected, v),
+            .write_alloc => |v| try std.testing.expectEqualStrings(expected, v.data),
+            else => return error.UnexpectedClipboardReply,
+        }
+        try self.expectSilent();
+    }
+};
+
+test "win32 OSC 52 read explicit Cancel replies empty once with the requested selection" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const cases = .{
+        .{ apprt.Clipboard.standard, "\x1b]52;c;\x1b\\" },
+        .{ apprt.Clipboard.selection, "\x1b]52;s;\x1b\\" },
+        .{ apprt.Clipboard.primary, "\x1b]52;p;\x1b\\" },
+    };
+    inline for (cases) |case| {
+        try fixture.surface.requestPasteConfirm(.{ .osc_52_read = case[0] }, "secret");
+        const captured = fixture.host.confirm_payload.?;
+        fixture.host.invokeConfirmCancel();
+        try std.testing.expect(fixture.surface.pending_clipboard_op == null);
+        try fixture.expectReply(case[1]);
+        fixture.host.invokeConfirmCancel();
+        // A callback arriving after its pending operation was consumed is inert.
+        captured.on_cancel.?(captured.userdata, .explicit);
+        try fixture.expectSilent();
+    }
+}
+
+test "win32 OSC 52 read deny remains silent" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.surface.core_surface.config.clipboard_read = .deny;
+    try fixture.surface.core_surface.handleMessage(.{ .clipboard_read = .standard });
+    try std.testing.expectEqual(HostOverlayMode.none, fixture.host.overlay_mode);
+    try fixture.expectSilent();
+
+    // A config reload can deny reads while the prompt is already open.
+    fixture.surface.core_surface.config.clipboard_read = .ask;
+    try fixture.surface.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    fixture.surface.core_surface.config.clipboard_read = .deny;
+    fixture.host.invokeConfirmCancel();
+    try std.testing.expect(fixture.surface.pending_clipboard_op == null);
+    try fixture.expectSilent();
+}
+
+test "win32 OSC 52 read displacement detach and owner teardown remain silent" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+
+    try fixture.surface.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    fixture.host.hideOverlay();
+    try std.testing.expect(fixture.surface.pending_clipboard_op == null);
+    try fixture.expectSilent();
+
+    try fixture.surface.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    try fixture.surface.requestPasteConfirm(.paste, "user\npaste");
+    try fixture.expectSilent();
+    fixture.host.invokeConfirmCancel(); // Cancel the user's paste, never OSC 52.
+    try fixture.expectSilent();
+
+    try fixture.surface.requestWriteConfirm(.standard, &.{.{ .mime = "text/plain", .data = "secret" }});
+    fixture.host.invokeConfirmCancel(); // A program's write Cancel stays silent too.
+    try std.testing.expect(fixture.surface.pending_clipboard_op == null);
+    try fixture.expectSilent();
+
+    try fixture.surface.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    var entry = fixture.host.detachTabForUndo(0).?;
+    defer entry.dispose(&fixture.host, .host_destroy) catch {};
+    try std.testing.expect(fixture.surface.pending_clipboard_op == null);
+    try fixture.expectSilent();
+    try std.testing.expect(try fixture.host.restoreClosedTabEntryNative(&entry.payload.close_tab));
+
+    try fixture.surface.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
+    fixture.host.cancelConfirmIfOwnedBy(@ptrCast(&fixture.surface));
+    // Owner teardown clears the prompt before disposing its pending state.
+    fixture.surface.pending_clipboard_op.?.deinit(fixture.core_app.alloc);
+    fixture.surface.pending_clipboard_op = null;
+    fixture.host.invokeConfirmCancel(); // A late UI action after close is inert.
+    try fixture.expectSilent();
+}
+
+test "win32 OSC 52 read Allow still replies with the approved contents" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.surface.requestPasteConfirm(.{ .osc_52_read = .primary }, "hello");
+    const captured = fixture.host.confirm_payload.?;
+    fixture.host.confirm_payload.?.armed_at_ms = 0;
+    fixture.host.invokeConfirmAccept();
+    try fixture.expectReply("\x1b]52;p;aGVsbG8=\x1b\\");
+    fixture.host.invokeConfirmCancel();
+    captured.on_cancel.?(captured.userdata, .explicit);
+    try fixture.expectSilent();
+}
+
 test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -42588,7 +42757,7 @@ test "win32 a program's clipboard request asks in its own words and cannot be an
     try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
 }
 
-test "win32 a prompt that replaces another answers it as Cancel" {
+test "win32 a prompt that replaces another dismisses it" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var core_app: CoreApp = undefined;
@@ -42633,7 +42802,7 @@ test "win32 a prompt that replaces another answers it as Cancel" {
     host.invokeConfirmCancel();
     try std.testing.expect(surface_b.pending_clipboard_op == null);
 
-    // Anything else that closes a confirm answers it as Cancel too: the
+    // Anything else that closes a confirm dismisses it too: the
     // palette, search and rename hide the open overlay first.
     try surface_a.requestPasteConfirm(.{ .osc_52_read = .standard }, "secret");
     host.hideOverlay();
