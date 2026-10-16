@@ -12245,6 +12245,12 @@ fn openWindowMenuAt(hwnd: HWND, lParam: LPARAM) void {
     const bits: u32 = @truncate(@as(u64, @bitCast(lParam)));
     const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(bits))));
     const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
+    // Track a fresh copy of the window menu. Measured on build 26300, on an
+    // active window the copy the first `GetSystemMenu(hwnd, FALSE)` returns
+    // passes `IsMenu` but `TrackPopupMenu` rejects it with
+    // ERROR_INVALID_MENU_HANDLE, so a real right-click opened nothing; the
+    // copy taken after reverting it tracks. Nothing customizes this menu.
+    _ = sys.GetSystemMenu(hwnd, 1);
     const menu = sys.GetSystemMenu(hwnd, 0) orelse return;
     const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE))));
     const state = windowMenuState(style);
