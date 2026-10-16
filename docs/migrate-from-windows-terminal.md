@@ -24,7 +24,11 @@ scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty
 scoop install noctty/noctty
 ```
 
-The `AmanThanvi.noctty` WinGet package is pending bootstrap.
+Or install with WinGet: `winget install --id AmanThanvi.noctty -e`.
+
+The installer does not add `noctty` to `PATH`. To run the `noctty +...` commands
+below from a shell, add the install folder to `PATH` or run `.\noctty.com`
+from that folder.
 
 For a direct download, run the checksum and signature checks on the
 [Why Noctty and verification page](https://noctty.com/why-noctty.html#verify).
