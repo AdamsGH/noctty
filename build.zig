@@ -41,6 +41,23 @@ pub fn build(b: *std.Build) !void {
         b,
         file_version orelse app_zon_version,
     );
+
+    // lld-link defaults to /OPT:NOREF,NOICF when it writes a PDB (/DEBUG), so a
+    // release image that keeps its symbols (-Dstrip=false) would keep every
+    // unreferenced function: +2 MB on noctty.exe against the stripped release,
+    // none of it the debug info. Zig has no option for it on COFF, but lld
+    // (the in-process one included) reads extra arguments from _LINK_, and
+    // every compile step runs with this environment. REF gives back what a
+    // stripped link drops; ICF adds nothing on top (measured). The two DLLs
+    // were already linked with /DEBUG, so they lose their dead code as well.
+    // Zig's cache key does not see the environment, so Config feeds the same
+    // condition into the build options: that is what keeps a link cached
+    // without the flag from being reused.
+    if (config.release_symbols) {
+        const inherited = b.graph.env_map.get("_LINK_") orelse "";
+        try b.graph.env_map.put("_LINK_", b.fmt("{s} -OPT:REF", .{inherited}));
+    }
+
     const test_filters = b.option(
         [][]const u8,
         "test-filter",

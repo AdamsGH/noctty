@@ -8,6 +8,7 @@ const process_shared = @import("process_shared.zig");
 const state = &@import("global.zig").state;
 
 pub const std_options: std.Options = process_shared.std_options;
+pub const panic = process_shared.panic;
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

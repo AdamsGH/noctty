@@ -62,9 +62,20 @@ then produces:
 The symbols ZIP holds one `symbols` folder with `noctty.pdb`,
 `noctty-command.pdb` (for `noctty.com`), `ghostty-vt.pdb` and
 `noctty-terminal-handoff-proxy.pdb`. Release builds therefore pass
-`-Dstrip=false` (`scripts/build-package-windows.ps1` does), and
-`-Dstrip=false` leaves ReleaseFast codegen alone: frame pointers are still
-omitted and unwind tables are kept, so the PDBs describe the binary users run.
+`-Dstrip=false` (`scripts/build-package-windows.ps1` does). Left alone,
+that would have grown `noctty.exe` by 2.1 MB and `noctty.com` by 1.4 MB, so
+three things keep the shipped binaries the size of a stripped release: frame
+pointers are still omitted and unwind tables kept (`src/build/Config.zig`);
+`build.zig` adds `-OPT:REF` to lld's `_LINK_` environment variable, because
+lld-link defaults to `/OPT:NOREF` when it writes a PDB and Zig has no COFF
+switch for it (this is the 2 MB of dead code); and release builds panic with
+the message and a trap instead of Zig's default handler (`panic` in
+`src/process_shared.zig`), which would drag std.debug's whole symbolizer into
+any image that keeps debug info (about 114 KB). The PDBs then describe the
+binary users run, and the images are within about 2 KB of a stripped build.
+They are not byte-identical: LLVM generates a few dozen instructions
+differently when it keeps debug info (99 more in a 3.1 million instruction
+`noctty.exe`).
 The PDBs stay out of the portable ZIP and the installer (the packager stages
 an explicit file list). `scripts/symbols-verification.ps1` reads each shipped
 PE's CodeView record and the PDB's info stream and requires the same GUID and

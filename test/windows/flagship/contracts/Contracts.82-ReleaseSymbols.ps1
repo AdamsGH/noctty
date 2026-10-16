@@ -21,6 +21,14 @@ $proxyBuild82 = Join-Path $repoRoot 'src\build\TerminalHandoffProxy.zig'
 $proxyBuildText82 = Get-Content -LiteralPath $proxyBuild82 -Raw
 $buildConfig82 = Join-Path $repoRoot 'src\build\Config.zig'
 $buildConfigText82 = Get-Content -LiteralPath $buildConfig82 -Raw
+$buildZig82 = Join-Path $repoRoot 'build.zig'
+$buildZigText82 = Get-Content -LiteralPath $buildZig82 -Raw
+$processShared82 = Join-Path $repoRoot 'src\process_shared.zig'
+$processSharedText82 = Get-Content -LiteralPath $processShared82 -Raw
+$mainZig82 = Join-Path $repoRoot 'src\main.zig'
+$mainZigText82 = Get-Content -LiteralPath $mainZig82 -Raw
+$mainCommandZig82 = Join-Path $repoRoot 'src\main_noctty_command.zig'
+$mainCommandZigText82 = Get-Content -LiteralPath $mainCommandZig82 -Raw
 
 Invoke-ContractTable -Contracts @(
     @{
@@ -78,6 +86,41 @@ Invoke-ContractTable -Contracts @(
         Pattern = '(?s)config\.omit_frame_pointer = switch \(optimize\) \{\s*\.Debug, \.ReleaseSafe => false,\s*\.ReleaseFast, \.ReleaseSmall => true,'
         Kind = 'Text'
         Description = 'frame-pointer omission follows the optimize mode, not -Dstrip, so the shipped PDB describes release codegen'
+    }
+    @{
+        File = $buildZig82
+        Content = { $buildZigText82 }
+        Pattern = '(?s)if \(config\.release_symbols\) \{\s*const inherited = b\.graph\.env_map\.get\("_LINK_"\).*?b\.graph\.env_map\.put\("_LINK_", b\.fmt\("\{s\} -OPT:REF", \.\{inherited\}\)\)'
+        Kind = 'Text'
+        Description = 'a Windows release build that keeps its PDB links with /OPT:REF, which lld-link drops once /DEBUG is on'
+    }
+    @{
+        File = $buildConfig82
+        Content = { $buildConfigText82 }
+        Pattern = '(?s)config\.release_symbols = config\.omit_frame_pointer and\s+!config\.strip and\s+config\.target\.result\.os\.tag == \.windows;.*?step\.addOption\(bool, "release_symbols", self\.release_symbols\);'
+        Kind = 'Text'
+        Description = 'the /OPT:REF condition is also a build option, so a cached link without the flag is never reused'
+    }
+    @{
+        File = $processShared82
+        Content = { $processSharedText82 }
+        Pattern = '(?s)pub const panic = switch \(builtin\.mode\) \{\s*\.Debug, \.ReleaseSafe => std\.debug\.FullPanic\(std\.debug\.defaultPanic\),\s*\.ReleaseFast, \.ReleaseSmall => std\.debug\.FullPanic\(releasePanic\),\s*\};.*?fn releasePanic\(msg: \[\]const u8, _: \?usize\) noreturn \{.*?@trap\(\);'
+        Kind = 'Text'
+        Description = 'release panics print the message and trap instead of linking std.debug''s symbolizer into an image that keeps debug info'
+    }
+    @{
+        File = $mainZig82
+        Content = { $mainZigText82 }
+        Pattern = '(?s)pub const panic = if \(build_config\.exe_entrypoint == \.ghostty\)\s+@import\("process_shared\.zig"\)\.panic'
+        Kind = 'Text'
+        Description = 'noctty.exe uses the shared release panic'
+    }
+    @{
+        File = $mainCommandZig82
+        Content = { $mainCommandZigText82 }
+        Pattern = 'pub const panic = process_shared\.panic;'
+        Kind = 'Text'
+        Description = 'noctty.com uses the shared release panic'
     }
     @{
         File = $proxyBuild82

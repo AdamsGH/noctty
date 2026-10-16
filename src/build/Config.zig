@@ -39,6 +39,7 @@ version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 pie: bool = false,
 strip: bool = false,
 omit_frame_pointer: bool = false,
+release_symbols: bool = false,
 
 /// Artifacts
 emit_bench: bool = false,
@@ -243,6 +244,14 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
         .ReleaseFast, .ReleaseSmall => true,
     };
 
+    // A Windows release image that keeps its PDB. build.zig links it with
+    // /OPT:REF, and the value is also a build option (below) so that a link
+    // cached from a build without the flag is never reused for it: Zig's
+    // cache key does not see the environment.
+    config.release_symbols = config.omit_frame_pointer and
+        !config.strip and
+        config.target.result.os.tag == .windows;
+
     //---------------------------------------------------------------
     // Artifacts to Emit
 
@@ -399,6 +408,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(bool, "simd", self.simd);
     step.addOption(bool, "i18n", self.i18n);
     step.addOption(bool, "custom_shaders", self.custom_shaders);
+    step.addOption(bool, "release_symbols", self.release_symbols);
     step.addOption(bool, "d3d11", self.d3d11);
     step.addOption(bool, "renderer_test_tools", self.renderer_test_tools);
     step.addOption(ApprtRuntime, "app_runtime", self.app_runtime);
