@@ -1053,7 +1053,8 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
-    {
+    // Whether the rows above the cursor were erased; null at a prompt.
+    const erased_off_prompt: ?bool = clear: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
@@ -1071,7 +1072,8 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
 
         // If we're not at a prompt, we just delete above the cursor.
         if (!self.terminal.cursorIsAtPrompt()) {
-            if (self.terminal.screens.active.cursor.y > 0) {
+            const erased = self.terminal.screens.active.cursor.y > 0;
+            if (erased) {
                 self.terminal.screens.active.eraseActive(
                     self.terminal.screens.active.cursor.y - 1,
                 );
@@ -1085,12 +1087,22 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
                 .{ .all = true },
             );
 
-            return;
+            break :clear erased;
         }
 
         // At a prompt, we want to first fully clear the screen, and then after
         // send a FF (0x0C) to the shell so that it can repaint the screen.
         self.terminal.eraseDisplay(.complete, false);
+        break :clear null;
+    };
+
+    // Off a prompt nothing tells the child: ConPTY still holds the erased
+    // rows and its cursor stays below them, so the next line a console
+    // program draws by ConPTY's cursor lands that many rows down. ConPTY
+    // makes the cursor's row its top row too.
+    if (erased_off_prompt) |erased| {
+        if (erased) self.ptyClear(true);
+        return;
     }
 
     // If we reached here it means we're at a prompt, so we send a form-feed.
@@ -1118,11 +1130,18 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     try self.renderer_wakeup.notify();
 }
 
-/// Synchronize the adopted console's pseudo HWND with its hosting window.
+/// Synchronize the console's pseudo HWND with its hosting window.
 /// This is independent of per-tab renderer visibility and focus events.
 pub fn ptyVisibility(self: *Termio, visible: bool) !void {
     switch (self.backend) {
         .exec => |*exec| try exec.ptyVisibility(visible),
+    }
+}
+
+/// The screen was cleared behind the pty's back; see `Pty.clearPseudoConsole`.
+pub fn ptyClear(self: *Termio, keep_cursor_row: bool) void {
+    switch (self.backend) {
+        .exec => |*exec| exec.ptyClear(keep_cursor_row),
     }
 }
 

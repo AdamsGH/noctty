@@ -602,7 +602,7 @@ pub fn runParentIfRequested() !void {
             var pty = try ptypkg.Pty.open(.{
                 .ws_row = 25,
                 .ws_col = 80,
-            });
+            }, .{});
             defer pty.deinit();
 
             var command: Command = .{
@@ -845,7 +845,7 @@ test "Windows ConPTY transport probe reports APC and DCS survival" {
             var pty = try ptypkg.Pty.open(.{
                 .ws_row = 24,
                 .ws_col = 200,
-            });
+            }, .{});
             defer pty.deinit();
 
             var command: Command = .{
@@ -1034,7 +1034,7 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
             defer child_env.deinit();
             try child_env.put(child_env_name, key_input_child_mode);
 
-            var pty = try ptypkg.Pty.open(.{ .ws_row = 25, .ws_col = 200 });
+            var pty = try ptypkg.Pty.open(.{ .ws_row = 25, .ws_col = 200 }, .{});
             defer pty.deinit();
 
             var command: Command = .{

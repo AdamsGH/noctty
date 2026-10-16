@@ -1090,6 +1090,16 @@ pub fn init(
             .shell_integration = config.@"shell-integration",
             .shell_integration_features = config.@"shell-integration-features",
             .utf8_console = config.@"utf8-console",
+            .pty_options = .{
+                .text_measurement = switch (config.@"grapheme-width-method") {
+                    .unicode => .graphemes,
+                    .legacy => .wcswidth,
+                },
+                .console_owner = if (builtin.os.tag == .windows)
+                    rt_surface.consoleOwner()
+                else
+                    null,
+            },
             .cursor_blink = config.@"cursor-style-blink",
             .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
             .working_directory_home = if (config.@"working-directory") |wd| wd == .home else false,
@@ -7193,16 +7203,20 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     }
                 };
             }
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            const t = self.renderer_state.terminal;
-            // The pty does not see this reset. ConPTY asks for Win32 input
-            // mode once per session and again only after a RIS it parsed
-            // itself (adaptDispatch.cpp `HardReset`, `InjectionType::RIS`),
-            // so the mode it asked for survives a reset the user started.
-            const win32_input = t.modes.get(.win32_input);
-            t.fullReset();
-            t.modes.set(.win32_input, win32_input);
+            {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                const t = self.renderer_state.terminal;
+                // The pty does not see this reset. ConPTY asks for Win32 input
+                // mode once per session and again only after a RIS it parsed
+                // itself (adaptDispatch.cpp `HardReset`, `InjectionType::RIS`),
+                // so the mode it asked for survives a reset the user started.
+                const win32_input = t.modes.get(.win32_input);
+                t.fullReset();
+                t.modes.set(.win32_input, win32_input);
+            }
+            // ConPTY's own buffer still holds the old screen and cursor.
+            self.queueIo(.{ .pty_clear = .{ .keep_cursor_row = false } }, .unlocked);
         },
 
         .start_search => {
