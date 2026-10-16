@@ -30282,8 +30282,6 @@ const effectiveBackgroundOpacity = labels.effectiveBackgroundOpacity;
 
 const alphaByteForOpacity = labels.alphaByteForOpacity;
 
-const hiddenScrollbarAlphaByte = labels.hiddenScrollbarAlphaByte;
-
 fn splitTreeEquivalent(a: *const SplitTreeSurface, b: *const SplitTreeSurface) bool {
     if (a.zoomed != b.zoomed) return false;
     if (a.nodes.len != b.nodes.len) return false;
@@ -37633,7 +37631,10 @@ pub const Surface = struct {
 
     fn syncScrollbarWindowNow(self: *Surface, now_ms: u64) !void {
         const host = self.host orelse return;
-        const was_needing_heartbeat = self.scrollbarNeedsHeartbeat();
+        // Callers change the state before they sync (output, the wheel, a
+        // press), so a bar that needs the heartbeat starts it here; the
+        // tick stops it once no bar needs it.
+        defer if (self.scrollbarNeedsHeartbeat()) host.ensureScrollbarTimer();
         const policy = self.scrollbarPolicy();
         const should_exist = self.window_visible and self.scrollbarScrollable() and
             self.placement.rect_known and self.placement.visible;
@@ -37648,9 +37649,6 @@ pub const Surface = struct {
             if (self.scrollbar_hwnd) |hwnd| {
                 _ = applyChildVisibility(hwnd, &self.scrollbar_placement, false);
             }
-            if (was_needing_heartbeat != self.scrollbarNeedsHeartbeat()) {
-                host.refreshScrollbarTimerState();
-            }
             return;
         }
 
@@ -37658,11 +37656,6 @@ pub const Surface = struct {
         const scrollbar_hwnd = self.scrollbar_hwnd.?;
         const child_rect = self.scrollbarChildRect(self.placement.rect);
         _ = applyChildRect(scrollbar_hwnd, &self.scrollbar_placement, child_rect);
-        if (applyChildVisibility(scrollbar_hwnd, &self.scrollbar_placement, true)) {
-            // Created after its pane, the bar starts below it, where the
-            // pane hides it (measured: the bar at index 6, its pane at 0).
-            if (self.hwnd) |pane| stackChildAbove(scrollbar_hwnd, pane);
-        }
 
         const marker_budget = scrollbarMarkerBudgetForHeight(child_rect.bottom - child_rect.top);
         if (marker_budget != self.scrollbar_marker_budget) {
@@ -37679,16 +37672,8 @@ pub const Surface = struct {
             .never => unreachable,
         }
 
-        const alpha: BYTE = switch (policy) {
-            .never => 0,
-            .always => 255,
-            .dynamic => alphaByteForOpacity(if (scrollbarAnimationsEnabled())
-                @as(f64, @floatCast(self.scrollbar_state.alpha(now_ms)))
-            else if (self.scrollbar_state.visibility == .hidden)
-                @as(f64, @floatFromInt(hiddenScrollbarAlphaByte())) / 255.0
-            else
-                1),
-        };
+        // Without animations the settled state is fully shown or hidden.
+        const alpha = alphaByteForOpacity(self.scrollbar_state.alpha(now_ms));
         const paint_key = self.scrollbarPaintKey(child_rect);
         const paint_changed = scrollbarPaintKeyChanged(self.scrollbar_paint_cache, paint_key);
         if (alpha != self.scrollbar_alpha_cache) {
@@ -37702,13 +37687,18 @@ pub const Surface = struct {
             }
             self.scrollbar_alpha_cache = alpha;
         }
+        // A hidden bar is a hidden window, not a transparent one over the
+        // pane. Hover comes from the pane's right-edge proxy either way.
+        const shown = self.scrollbar_state.visibility != .hidden;
+        if (applyChildVisibility(scrollbar_hwnd, &self.scrollbar_placement, shown) and shown) {
+            // Created after its pane, the bar starts below it, where the
+            // pane hides it (measured: the bar at index 6, its pane at 0).
+            if (self.hwnd) |pane| stackChildAbove(scrollbar_hwnd, pane);
+        }
 
         if (paint_changed) {
             self.scrollbar_paint_cache = paint_key;
             self.invalidateScrollbarWindow();
-        }
-        if (was_needing_heartbeat != self.scrollbarNeedsHeartbeat()) {
-            host.refreshScrollbarTimerState();
         }
     }
 
@@ -52557,6 +52547,82 @@ test "win32 scrollbarNeedsHeartbeatForState skips stable hidden dynamic bars" {
     try std.testing.expect(scrollbarNeedsHeartbeatForState(.dynamic, true, true, .fading_in));
     try std.testing.expect(scrollbarNeedsHeartbeatForState(.dynamic, true, true, .visible));
     try std.testing.expect(scrollbarNeedsHeartbeatForState(.dynamic, true, true, .fading_out));
+}
+
+test "win32 output starts the scrollbar's heartbeat, and a hidden bar hides its window" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // High Contrast always shows the bar: no heartbeat and nothing to hide.
+    if (isHighContrastActive()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var core = try CoreApp.create(alloc);
+    defer core.destroy();
+    var app: App = undefined;
+    try app.init(core, .{ .safe_mode = true });
+    const hinstance = app.hinstance;
+    defer {
+        app.terminate();
+        _ = sys.UnregisterClassW(host_class_name, hinstance);
+        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+    }
+    // The dynamic policy whatever this machine's "Always show scrollbars".
+    app.system_dynamic_scrollbars = true;
+    // The host stays hidden, so the test never touches the foreground.
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, false);
+    var surface: Surface = .{
+        .app = &app,
+        .host = host,
+        .window_visible = true,
+        .placement = .{ .rect = .{ .left = 0, .top = 0, .right = 400, .bottom = 300 }, .rect_known = true, .visible = true, .visible_known = true },
+        .scrollbar = .{ .total = 100, .offset = 80, .len = 20 },
+    };
+    // The test binary has no manifest for layered child windows, so the
+    // bar's own `CreateWindowEx` fails here. A plain child stands in, and
+    // the alpha cache is primed with the alpha each sync computes, so the
+    // stand-in is never asked for layered attributes.
+    surface.scrollbar_hwnd = try createTestChromeChild(host.hwnd.?, prompt_label_class);
+    defer surface.destroyScrollbarWindow();
+    const bar = surface.scrollbar_hwnd.?;
+    const style = struct {
+        fn visible(hwnd: HWND) bool {
+            return (@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE))) & c.WS_VISIBLE) != 0;
+        }
+    };
+    const fade_ms = win32_scrollbar_geometry.auto_hide_fade_ms;
+
+    // Output moved the viewport, before any timer runs: the state changes,
+    // then the window is synced, in `setScrollbar`'s order (the wheel and a
+    // press do the same). The heartbeat used to start only for a change
+    // made inside the sync, so it never ran and the bar stayed on screen.
+    // A fade's length later the bar is fully shown with or without
+    // animations.
+    var now_ms: u64 = 1_000_000;
+    surface.noteScrollbarActivity(now_ms);
+    surface.scrollbar_alpha_cache = 255;
+    try surface.syncScrollbarWindowNow(now_ms + fade_ms);
+    try std.testing.expect(host.scrollbar_timer_active);
+    try std.testing.expect(style.visible(bar));
+
+    // The heartbeat fades it out. Hidden, it is no window over the pane at
+    // all, rather than a layered one left on screen at alpha 1 or 0.
+    while (surface.scrollbar_state.visibility != .hidden) {
+        now_ms += 2000;
+        _ = surface.scrollbar_state.tick(now_ms);
+    }
+    surface.scrollbar_alpha_cache = 0;
+    try surface.syncScrollbarWindowNow(now_ms);
+    try std.testing.expect(!style.visible(bar));
+
+    // With the heartbeat stopped (the tick stops it once nothing needs it),
+    // the next scroll shows the bar and starts it again.
+    host.killScrollbarTimer();
+    now_ms += 2000;
+    surface.noteScrollbarActivity(now_ms);
+    surface.scrollbar_alpha_cache = 255;
+    try surface.syncScrollbarWindowNow(now_ms + fade_ms);
+    try std.testing.expect(host.scrollbar_timer_active);
+    try std.testing.expect(style.visible(bar));
 }
 
 test "win32 scrollbarPaintKeyChanged only trips on visible scrollbar paint inputs" {

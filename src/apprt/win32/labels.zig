@@ -918,14 +918,6 @@ pub fn alphaByteForOpacity(value: f64) u8 {
     return @intFromFloat(@round(normalizedBackgroundOpacity(value) * 255.0));
 }
 
-pub fn hiddenScrollbarAlphaByte() u8 {
-    // Keep the layered child hit-testable while visually hidden.
-    // Windows won't deliver real hover input to an alpha-0 layered
-    // child, so a true zero here strands the dynamic scrollbar in the
-    // hidden state until some non-mouse activity wakes it up.
-    return 1;
-}
-
 pub fn resizeSplitFallbackDelta(value: apprt.action.ResizeSplit) ResizeSplitFallbackDelta {
     const amount: i32 = @intCast(value.amount);
     return switch (value.direction) {
@@ -3236,7 +3228,6 @@ test "win32 effectiveBackgroundOpacity respects opaque override" {
     try std.testing.expectEqual(@as(f64, 0.4), effectiveBackgroundOpacity(0.4, false));
     try std.testing.expectEqual(@as(f64, 1.0), effectiveBackgroundOpacity(0.4, true));
     try std.testing.expectEqual(@as(u8, 128), alphaByteForOpacity(0.5));
-    try std.testing.expectEqual(@as(u8, 1), hiddenScrollbarAlphaByte());
 }
 
 test "win32 resizeSplitFallbackDelta maps directions to window deltas" {
