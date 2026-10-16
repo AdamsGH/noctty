@@ -24588,7 +24588,7 @@ const RestoredTerminalUndoState = struct {
     scrollbar: terminal.Scrollbar = .zero,
 };
 
-const undo_snapshot_magic = "WUH1";
+const undo_snapshot_magic = "WUH3";
 
 fn sessionScrollbackLineAllowed(line: []const u8) bool {
     const view = std.unicode.Utf8View.init(line) catch return false;
@@ -24857,6 +24857,17 @@ fn restoreTerminalScrollbackSnapshot(
     return restored_lines;
 }
 
+fn terminalUndoTrailingBlankRows(terminal_state: *const terminal.Terminal) usize {
+    var rows: usize = 0;
+    var it = terminal_state.screens.active.pages.getBottomRight(.screen).?.rowIterator(.left_up, null);
+    while (it.next()) |pin| {
+        // Match the formatter's trailing-row trimming predicate.
+        if (terminal.page.Cell.hasTextAny(pin.cells(.all))) break;
+        rows += 1;
+    }
+    return rows;
+}
+
 fn captureTerminalUndoStateBytes(
     alloc: Allocator,
     terminal_state: *const terminal.Terminal,
@@ -24883,23 +24894,183 @@ fn captureTerminalUndoStateBytes(
     try buf.writer.writeAll(undo_snapshot_magic);
     try buf.writer.writeInt(u32, @intCast(title.len), .little);
     try buf.writer.writeInt(u32, @intCast(pwd.len), .little);
+    try buf.writer.writeInt(u32, terminal_state.cols, .little);
+    // The formatter trims trailing blank rows, and replay may prune older
+    // history at different page boundaries. Anchor the cursor to the last
+    // text row so neither changes which content is shifted to the live row.
+    try buf.writer.writeInt(i64, @as(i64, terminal_state.screens.active.cursor.y) -
+        @as(i64, terminal_state.rows - 1) +
+        @as(i64, @intCast(terminalUndoTrailingBlankRows(terminal_state))), .little);
     try buf.writer.writeAll(title);
     try buf.writer.writeAll(pwd);
     try buf.writer.writeAll(vt_bytes);
     return try buf.toOwnedSlice();
 }
 
+test "win32 terminal undo shifts restored rows to the live ConPTY cursor" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+
+    // An off-prompt clear keeps the cursor column; reset homes it too.
+    for ([_]terminal.size.CellCountInt{ 0, 4 }) |live_x| {
+        t.fullReset();
+        t.screens.active.cursorAbsolute(live_x, 0);
+        _ = restoreTerminalUndoState(&t, snapshot, true);
+        try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+        try std.testing.expectEqual(live_x, t.screens.active.cursor.x);
+        const plain = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(plain);
+        try std.testing.expect(std.mem.indexOf(u8, plain, "one\ntwo\nthree\nfour") != null);
+        const active = try t.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(active);
+        try std.testing.expect(std.mem.startsWith(u8, active, "four"));
+
+        // Absolute moves after undo use the live console's coordinate space.
+        stream.nextSlice("\x1b[2;3HX");
+        try std.testing.expectEqual(@as(terminal.size.CellCountInt, 1), t.screens.active.cursor.y);
+        try std.testing.expectEqual(@as(terminal.size.CellCountInt, 3), t.screens.active.cursor.x);
+    }
+}
+
+test "win32 terminal undo keeps nonzero live rows, wrap and snapshot margins" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 6 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\x1b[2;5r\x1b[4;5H");
+    const region = t.scrolling_region;
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+
+    // Output can arrive between a clear and undo. Both upward and downward
+    // shifts use the live row and scroll the whole screen despite margins.
+    for ([_]terminal.size.CellCountInt{ 1, 4 }) |live_y| {
+        t.fullReset();
+        t.screens.active.cursorAbsolute(11, live_y);
+        t.screens.active.cursor.pending_wrap = true;
+        _ = restoreTerminalUndoState(&t, snapshot, true);
+        try std.testing.expectEqual(live_y, t.screens.active.cursor.y);
+        try std.testing.expectEqual(@as(terminal.size.CellCountInt, 11), t.screens.active.cursor.x);
+        try std.testing.expect(t.screens.active.cursor.pending_wrap);
+        try std.testing.expectEqual(region, t.scrolling_region);
+        const row = t.screens.active.cursor.page_row;
+        const cells = t.screens.active.cursor.page_pin.node.data.getCells(row);
+        try std.testing.expectEqual(@as(u21, 'f'), cells[0].codepoint());
+    }
+}
+
+test "win32 terminal undo keeps alternate screen rows while preserving the live cursor" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049hone\r\ntwo\r\nthree\r\nfour");
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+    t.fullReset();
+    _ = restoreTerminalUndoState(&t, snapshot, true);
+    try std.testing.expect(t.screens.active_key == .alternate);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.x);
+    const active = try t.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+    defer alloc.free(active);
+    try std.testing.expect(std.mem.startsWith(u8, active, "one\ntwo\nthree\nfour"));
+}
+
+test "win32 terminal undo anchors a cursor above or below the last text row" {
+    const alloc = std.testing.allocator;
+    for ([_]terminal.size.CellCountInt{ 1, 5 }) |saved_y| {
+        var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 6 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+        t.screens.active.cursorAbsolute(0, saved_y);
+        const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+        defer alloc.free(snapshot);
+        t.fullReset();
+        _ = restoreTerminalUndoState(&t, snapshot, true);
+        const row = t.screens.active.cursor.page_row;
+        const cells = t.screens.active.cursor.page_pin.node.data.getCells(row);
+        try std.testing.expectEqual(@as(u21, if (saved_y == 1) 't' else 0), cells[0].codepoint());
+        try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+    }
+}
+
+test "win32 terminal undo aligns content after replay prunes history" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 5, .max_scrollback = 16 * 1024 * 1024 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    const history_lines = @as(usize, t.screens.active.pages.pages.first.?.data.capacity.rows) * 4;
+    for (0..history_lines) |_| stream.nextSlice("history\r\n");
+    stream.nextSlice("\x1b[4;1H\x1b[Jprompt");
+    const captured_rows = t.screens.active.pages.total_rows;
+    try std.testing.expect(captured_rows > history_lines);
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+    // Replay can retain fewer history rows due to page packing at the cap.
+    // A smaller cap makes that pruning deterministic without relying on a
+    // particular page's style/grapheme allocation layout.
+    t.screens.active.pages.explicit_max_size = 0;
+    t.fullReset();
+    _ = restoreTerminalUndoState(&t, snapshot, true);
+    try std.testing.expect(t.screens.active.pages.total_rows < captured_rows);
+    const row = t.screens.active.cursor.page_row;
+    const cells = t.screens.active.cursor.page_pin.node.data.getCells(row);
+    try std.testing.expectEqual(@as(u21, 'p'), cells[0].codepoint());
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+}
+
+test "win32 terminal undo aligns content with scrollback and trailing blank rows" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\x1b[4;1H\x1b[Jprompt");
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+    t.fullReset();
+    _ = restoreTerminalUndoState(&t, snapshot, true);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+    const row = t.screens.active.cursor.page_row;
+    const cells = t.screens.active.cursor.page_pin.node.data.getCells(row);
+    try std.testing.expectEqual(@as(u21, 'p'), cells[0].codepoint());
+    const all = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "1\n2\n3\n4\n5\nprompt") != null);
+}
+
 fn restoreTerminalUndoState(
     terminal_state: *terminal.Terminal,
     state_bytes: []const u8,
+    preserve_cursor: bool,
 ) RestoredTerminalUndoState {
+    const live_x = terminal_state.screens.active.cursor.x;
+    const live_y = terminal_state.screens.active.cursor.y;
+    const live_wrap = terminal_state.screens.active.cursor.pending_wrap;
     var title_bytes: []const u8 = "";
     var pwd_bytes: []const u8 = "";
     var vt_bytes = state_bytes;
-    if (state_bytes.len >= 12 and std.mem.eql(u8, state_bytes[0..4], undo_snapshot_magic)) {
+    var cursor_from_last_text: ?i64 = null;
+    if (state_bytes.len >= 24 and std.mem.eql(u8, state_bytes[0..4], undo_snapshot_magic)) {
         const title_len: usize = std.mem.readInt(u32, state_bytes[4..8], .little);
         const pwd_len: usize = std.mem.readInt(u32, state_bytes[8..12], .little);
-        const title_start = 12;
+        const captured_cols = std.mem.readInt(u32, state_bytes[12..16], .little);
+        if (captured_cols == terminal_state.cols) {
+            cursor_from_last_text = std.mem.readInt(i64, state_bytes[16..24], .little);
+        }
+        const title_start = 24;
         const pwd_start = title_start + title_len;
         const vt_start = pwd_start + pwd_len;
         if (vt_start <= state_bytes.len) {
@@ -24913,6 +25084,45 @@ fn restoreTerminalUndoState(
     var stream = terminal_state.vtStream();
     defer stream.deinit();
     stream.nextSlice(vt_bytes);
+    if (preserve_cursor) {
+        // ConPTY cannot restore a snapshot. Keep its live coordinate space:
+        // move the saved cursor's row to the live row, with displaced rows
+        // above the screen retained in scrollback. Ignore the snapshot's
+        // margins while shifting the whole screen, then put them back.
+        const saved_y: u64 = if (cursor_from_last_text) |offset| row: {
+            const last_text_y = @as(i64, terminal_state.rows - 1) -
+                @as(i64, @intCast(terminalUndoTrailingBlankRows(terminal_state)));
+            break :row @intCast(@max(0, last_text_y + offset));
+        } else terminal_state.screens.active.cursor.y;
+        const region = terminal_state.scrolling_region;
+        terminal_state.scrolling_region = .{
+            .top = 0,
+            .bottom = terminal_state.rows - 1,
+            .left = 0,
+            .right = terminal_state.cols - 1,
+        };
+        // Alternate screens have no scrollback to retain shifted-out rows.
+        // Preserve their full-screen picture for the application's redraws.
+        const shift_rows = terminal_state.screens.active_key == .primary;
+        if (shift_rows and saved_y > live_y) {
+            // Trailing blanks can put the saved line beyond the replayed
+            // active area. SU clamps to one screen, so scroll in chunks.
+            var remaining = saved_y - live_y;
+            while (remaining > 0) {
+                const count = @min(remaining, terminal_state.rows);
+                terminal_state.scrollUp(@intCast(count)) catch |err| {
+                    log.warn("undo snapshot shift failed err={}", .{err});
+                    break;
+                };
+                remaining -= count;
+            }
+        } else if (shift_rows and saved_y < live_y) {
+            terminal_state.scrollDown(@intCast(live_y - saved_y));
+        }
+        terminal_state.scrolling_region = region;
+        terminal_state.screens.active.cursorAbsolute(live_x, live_y);
+        terminal_state.screens.active.cursor.pending_wrap = live_wrap;
+    }
     if (title_bytes.len > 0) {
         terminal_state.setTitle(title_bytes) catch |err| {
             log.warn("undo snapshot title restore failed err={}", .{err});
@@ -34990,7 +35200,18 @@ pub const Surface = struct {
         if (self.undo_capture_suspended) return;
 
         self.undo_stack.discardExpired(self.app.undoCutoffTimestampMs());
-        const state_bytes = try self.captureTerminalStateBytes();
+        const captured = captured: {
+            self.core_surface.renderer_state.mutex.lock();
+            defer self.core_surface.renderer_state.mutex.unlock();
+            break :captured .{
+                .bytes = try captureTerminalUndoStateBytes(
+                    self.app.core_app.alloc,
+                    self.core_surface.renderer_state.terminal,
+                ),
+                .generation = self.core_surface.io.pty_clear_generation,
+            };
+        };
+        const state_bytes = captured.bytes;
         // Ownership moves into `entry` below.
 
         var entry: win32_undo.Entry = .{
@@ -35001,18 +35222,10 @@ pub const Surface = struct {
             },
             .timestamp_ms = sys.GetTickCount64(),
             .sequence_id = self.app.nextUndoSequence(),
+            .pty_clear_generation = captured.generation,
         };
         errdefer entry.deinit(self.app.core_app.alloc);
         try self.pushUndoEntryAndInvalidateRedo(entry);
-    }
-
-    fn captureTerminalStateBytes(self: *Surface) ![]u8 {
-        self.core_surface.renderer_state.mutex.lock();
-        defer self.core_surface.renderer_state.mutex.unlock();
-        return try captureTerminalUndoStateBytes(
-            self.app.core_app.alloc,
-            self.core_surface.renderer_state.terminal,
-        );
     }
 
     fn captureSessionScrollback(
@@ -35080,6 +35293,7 @@ pub const Surface = struct {
             restored = restoreTerminalUndoState(
                 self.core_surface.renderer_state.terminal,
                 state_bytes,
+                entry.pty_clear_generation != self.core_surface.io.pty_clear_generation,
             );
         }
 
@@ -44063,7 +44277,7 @@ test "win32 terminal undo snapshot restores terminal state" {
 
     t.fullReset();
 
-    const restored = restoreTerminalUndoState(&t, snapshot);
+    const restored = restoreTerminalUndoState(&t, snapshot, false);
 
     // The snapshot sets the tab stops after the cursor position, which used
     // to leave the cursor on the last stop (column 8 of 12).

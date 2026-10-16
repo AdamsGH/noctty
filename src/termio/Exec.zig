@@ -421,12 +421,15 @@ pub fn ptyVisibility(self: *Exec, visible: bool) !void {
 }
 
 /// Called on the IO thread after the terminal cleared its screen locally.
-pub fn ptyClear(self: *Exec, keep_cursor_row: bool) void {
-    if (comptime builtin.os.tag != .windows) return;
-    const pty = if (self.subprocess.pty) |*value| value else return;
+pub fn ptyClear(self: *Exec, keep_cursor_row: bool) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    const pty = if (self.subprocess.pty) |*value| value else return false;
+    if (!pty.hasSynchronizedClear()) return false;
     pty.clearPseudoConsole(keep_cursor_row) catch |err| {
         log.warn("pty clear signal failed err={}", .{err});
+        return false;
     };
+    return true;
 }
 
 pub fn focusGained(

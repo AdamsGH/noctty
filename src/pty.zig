@@ -1060,6 +1060,15 @@ const WindowsPty = struct {
 
     pub const PseudoConsoleSignalError = error{SignalFailed};
 
+    /// Whether local clears also move this backend's cursor. Undo must
+    /// keep that live coordinate space rather than replay a saved cursor.
+    pub fn hasSynchronizedClear(self: *const Pty) bool {
+        return switch (self.control) {
+            .pseudo_console => |pc| pc.conpty.clear != null,
+            .handoff => false,
+        };
+    }
+
     /// Clear ConPTY's own buffer after the terminal cleared its screen
     /// without the child seeing it (an off-prompt clear, a reset). ConPTY
     /// places console programs' output by its own cursor, so a buffer left
@@ -1810,6 +1819,7 @@ test "Windows ConPTY optional exports reach the creating backend and are skipped
         var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{ .console_owner = shown_owner });
         defer pty.deinit();
         const handle = pty.pseudoConsole().?;
+        try testing.expect(pty.hasSynchronizedClear());
         const created_owned = RecordingConPty.reparent_args orelse return error.OwnerNotSetAtOpen;
         try testing.expectEqual(handle, created_owned.handle);
         try testing.expectEqual(shown_owner, created_owned.owner);
@@ -1848,6 +1858,7 @@ test "Windows ConPTY optional exports reach the creating backend and are skipped
         var pty = try WindowsPty.open(.{ .ws_row = 24, .ws_col = 80 }, .{ .text_measurement = .wcswidth });
         defer pty.deinit();
         try testing.expectEqual(ConPtySource.inbox, pty.control.pseudo_console.conpty.source);
+        try testing.expect(!pty.hasSynchronizedClear());
         try pty.clearPseudoConsole(true);
         try pty.showPseudoConsole(true);
         try pty.reparentPseudoConsole(owner);
@@ -1872,6 +1883,7 @@ test "Windows ConPTY optional exports reach the creating backend and are skipped
         .size = .{},
     };
     defer adopted.closeAdoptedSignal();
+    try testing.expect(!adopted.hasSynchronizedClear());
     try adopted.clearPseudoConsole(true);
     try adopted.showPseudoConsole(true);
     try adopted.reparentPseudoConsole(owner);
