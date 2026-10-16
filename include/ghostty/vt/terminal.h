@@ -750,7 +750,9 @@ typedef enum {
    * soft-wrapped line with at least one row still in the active area may
    * still unwrap back into view. A shrink that would push the cursor's row
    * into scrollback drops the rows below the cursor that do not fit
-   * instead, as such a pty does.
+   * instead, as such a pty does. Saved cursor coordinates also remain
+   * unchanged through resize and are clamped to the screen on restore,
+   * rather than following reflowed text.
    *
    * Set this to false when the pty keeps its own screen buffer without
    * scrollback, since it cannot pull rows back and will otherwise disagree
@@ -762,7 +764,8 @@ typedef enum {
    * A NULL value pointer resets to the built-in default of true.
    *
    * The number matches upstream libghostty-vt. Upstream's option does not
-   * do the cursor-row part above; this fork does it for ConPTY.
+   * do the cursor-row or saved-cursor parts above; this fork does them for
+   * ConPTY.
    *
    * Input type: bool*
    */

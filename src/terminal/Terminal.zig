@@ -114,7 +114,9 @@ flags: packed struct {
     /// Whether a resize may pull rows out of scrollback back into the
     /// active area. This should be false if the pty keeps its own screen
     /// buffer without scrollback (e.g. Windows ConPTY) so that we stay in
-    /// sync with it. See PageList.Resize for details. This is configuration
+    /// sync with it. When false, saved cursor coordinates also stay fixed
+    /// through resize and are clamped on restore, as in ConPTY. See
+    /// PageList.Resize for details. This is configuration
     /// rather than terminal state so it is preserved across a full reset.
     resize_pull_scrollback: bool = true,
 
@@ -13744,6 +13746,69 @@ test "Terminal: resize with reflow and saved cursor" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u32, 'B'), cell.content.codepoint);
     }
+}
+
+test "Terminal: ConPTY saved cursor keeps coordinates through an unwrap" {
+    const alloc = testing.allocator;
+    for ([_]bool{ false, true }) |conpty| {
+        for ([_]bool{ false, true }) |alternate| {
+            var t = try init(alloc, .{ .cols = 10, .rows = 4 });
+            defer t.deinit(alloc);
+            t.flags.resize_pull_scrollback = !conpty;
+            try t.printString("abcdefghijklmno\n");
+            if (alternate) {
+                try t.switchScreenMode(.@"1049", true);
+            } else {
+                t.saveCursor();
+            }
+
+            try t.resize(alloc, 20, 8);
+            if (alternate) {
+                try t.switchScreenMode(.@"1049", false);
+            } else {
+                t.restoreCursor();
+            }
+            try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.x);
+            try testing.expectEqual(@as(size.CellCountInt, if (conpty) 2 else 1), t.screens.active.cursor.y);
+        }
+    }
+}
+
+test "Terminal: ConPTY saved cursor clamps only when restored on either screen" {
+    const alloc = testing.allocator;
+    for ([_]bool{ false, true }) |alternate| {
+        var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+        defer t.deinit(alloc);
+        t.flags.resize_pull_scrollback = false;
+        if (alternate) try t.switchScreenMode(.@"1049", true);
+        t.setCursorPos(5, 10);
+        t.saveCursor();
+
+        try t.resize(alloc, 5, 3);
+        t.restoreCursor();
+        try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.x);
+        try testing.expectEqual(@as(size.CellCountInt, 2), t.screens.active.cursor.y);
+        // A second resize must still use the original saved coordinates,
+        // even after they temporarily fell outside the smaller screen.
+        try t.resize(alloc, 10, 5);
+        t.restoreCursor();
+        try testing.expectEqual(@as(size.CellCountInt, 9), t.screens.active.cursor.x);
+        try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.y);
+    }
+}
+
+test "Terminal: ConPTY saved cursor keeps pending wrap through a resize" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 2, .rows = 3 });
+    defer t.deinit(alloc);
+    t.flags.resize_pull_scrollback = false;
+    try t.printString("1A2B");
+    t.saveCursor();
+    try t.resize(alloc, 5, 3);
+    t.restoreCursor();
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+    try testing.expect(t.screens.active.cursor.pending_wrap);
 }
 
 test "Terminal: resize with reflow and saved cursor pending wrap" {

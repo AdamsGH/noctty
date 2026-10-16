@@ -1,0 +1,15 @@
+# A wrapped command followed by CRLF leaves the saved cursor on row 2.
+# Conhost restores those coordinates after an alternate-screen resize,
+# even though widening unwraps the preceding command into a single row.
+size 10 4
+pty conpty
+send abcdefghijklmno\r\n\e[?1049h\e[HALT SCREEN
+resize 20 8
+send \e[?1049l
+cursor 0 2
+send prompt>
+expect
+|abcdefghijklmno
+|
+|prompt>
+end

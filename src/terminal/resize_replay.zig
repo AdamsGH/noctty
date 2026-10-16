@@ -51,6 +51,10 @@ test "resize replay: conpty leave the alternate screen after a grow" {
     try runCase("conpty-altscreen-grow.vt");
 }
 
+test "resize replay: conpty saved cursor after an alternate screen unwrap" {
+    try runCase("conpty-altscreen-unwrap.vt");
+}
+
 test "resize replay: conpty shrink rows with content below the cursor" {
     try runCase("conpty-shrink-rows-below-cursor.vt");
 }
