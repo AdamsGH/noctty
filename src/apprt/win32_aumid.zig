@@ -263,7 +263,7 @@ test "aumid registration names the app and points at the icon beside the exe" {
     // Exercise the actual registry writer, only under a unique scratch key.
     var random: [16]u8 = undefined;
     std.crypto.random.bytes(&random);
-    const subkey_utf8 = try std.fmt.allocPrint(alloc, "Software\noctty-aumid-test-{x}", .{random});
+    const subkey_utf8 = try std.fmt.allocPrint(alloc, "Software\\noctty-aumid-test-{x}", .{random});
     defer alloc.free(subkey_utf8);
     const subkey = try std.unicode.utf8ToUtf16LeAllocZ(alloc, subkey_utf8);
     defer alloc.free(subkey);

@@ -3038,9 +3038,11 @@ pub const App = struct {
         {
             const state = localAppDataPathAlloc(core_app.alloc, win32_jump_list.state_filename);
             defer if (state) |path| core_app.alloc.free(path);
+            // Not `isPortableModeActive`, which answers "installed" when its
+            // allocation fails: here portable is the answer that writes less.
             self.jump_list = claimSharedIdentity(
                 core_app.alloc,
-                isPortableModeActive(core_app.alloc),
+                internal_os.xdg.portableModeActive(),
                 &win32_aumid.registerAumidDisplayName,
                 state,
             );
