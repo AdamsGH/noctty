@@ -3642,6 +3642,9 @@ pub fn eraseRow(
 ) !void {
     defer self.assertIntegrity();
     const pn = self.pin(pt).?;
+    // Row rotation changes absolute anchors even when page serials survive.
+    // Invalidate before mutation, including a later clone allocation failure.
+    self.row_generation +%= 1;
 
     var node = pn.node;
     var rows = node.data.rows.ptr(node.data.memory.ptr);
@@ -3743,6 +3746,7 @@ pub fn eraseRowBounded(
     // this function are for where it differs from eraseRow.
 
     const pn = self.pin(pt).?;
+    self.row_generation +%= 1;
 
     var node: *List.Node = pn.node;
     var rows = node.data.rows.ptr(node.data.memory.ptr);

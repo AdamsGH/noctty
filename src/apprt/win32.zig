@@ -20661,6 +20661,93 @@ const Host = struct {
         try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
     }
 
+    test "PKG71 queued close rejects a tab hidden after Invoke" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(struct {
+            fn run() !void {
+                try queuedCloseHiddenTestBody(false);
+            }
+        }.run);
+    }
+
+    test "PKG71 queued close rejects a strip hidden after Invoke" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(struct {
+            fn run() !void {
+                try queuedCloseHiddenTestBody(true);
+            }
+        }.run);
+    }
+
+    fn queuedCloseHiddenTestBody(hide_strip: bool) !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        try app.ensurePaletteListClass();
+        defer _ = sys.UnregisterClassW(palette_list_class_name, app.hinstance);
+        defer for ([_]*?[:0]const u8{
+            &host.cached_overlay_edit,
+            &host.cached_overlay_label,
+            &host.cached_overlay_hint,
+            &host.cached_overlay_preview,
+            &host.cached_overlay_accept,
+            &host.cached_overlay_cancel,
+            &host.cached_window_title,
+        }) |slot| {
+            if (slot.*) |value| std.testing.allocator.free(value);
+            slot.* = null;
+        };
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        defer host.invokeConfirmCancel();
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        const button = try createTestChromeChild(window.parent, prompt_button_class);
+        setWindowData(button, &host);
+        host.tabs.items[1].button_hwnd = button;
+        defer host.tabs.items[1].button_hwnd = null;
+        app.config.@"undo-timeout" = .{ .duration = 0 };
+        // A read-only fixture core safely asks before closing: observing the
+        // prompt proves whether the production close path was reached.
+        surface_b.core_surface.readonly = true;
+        surface_b.core_initialized = true;
+        defer surface_b.core_initialized = false;
+        try std.testing.expect(tabCloseUiaInvoke(&host, 2));
+        var queued: sys.MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
+        const show_tab_bar = app.config.@"window-show-tab-bar";
+        if (hide_strip) app.config.@"window-show-tab-bar" = .never else _ = sys.ShowWindow(button, c.SW_HIDE);
+        _ = tabButtonProc(button, queued.message, queued.wParam, queued.lParam);
+        try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 0), host.active_tab);
+        // Positive control: a newly queued close on the visible tab reaches
+        // the ordinary confirmation path.
+        app.config.@"window-show-tab-bar" = show_tab_bar;
+        _ = sys.ShowWindow(button, c.SW_SHOWNOACTIVATE);
+        try std.testing.expect(tabCloseUiaInvoke(&host, 2));
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
+        _ = tabButtonProc(button, queued.message, queued.wParam, queued.lParam);
+        try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+        host.invokeConfirmCancel();
+    }
+
     fn activeTabUiaProvider(ctx: *anyopaque) ?*win32_uia.ChromeControlProvider {
         const self: *Host = @ptrCast(@alignCast(ctx));
         return if (self.activeTab()) |tab| tab.uia_provider else null;
@@ -33189,9 +33276,11 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
             }
             switch (msg) {
                 win32_uia.widgets.tab_close_message => {
-                    // The tab may have moved or become the sole tab while
-                    // Invoke waited in the queue. Revalidate its stable ID.
-                    if (v.tabs.items.len > 1 and v.tabs.items[index].id == wParam) {
+                    // Revalidate closability after Invoke waited in the queue:
+                    // the tab may have moved, scrolled out, or become hidden.
+                    if (v.tabs.items.len > 1 and v.tabs.items[index].id == wParam and
+                        v.shouldShowTabBar() and sys.IsWindowVisible(hwnd) != 0)
+                    {
                         _ = v.closeTabInPlace(index);
                     }
                     return 0;

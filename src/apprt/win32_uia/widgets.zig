@@ -7055,6 +7055,35 @@ test "PKG71 held range rectangles follow scrolling wheel motion and current metr
     try std.testing.expectEqual(com.S_OK, visible.base.vtbl.ScrollIntoView(&visible.base, 1));
     try Hook.expectBounds(&visible.base, screen_y + 6, 8, 16);
     try std.testing.expectEqual(com.UIA_E_INVALIDOPERATION, range.base.vtbl.Select(&range.base));
+
+    // Exercise the real no-scrollback erasure path with a held COM range,
+    // rather than only synthesizing a changed provenance field above.
+    const terminal = @import("../../terminal/main.zig");
+    for ([_]bool{ false, true }) |bounded| {
+        var t = try terminal.Terminal.init(std.testing.allocator, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(std.testing.allocator);
+        _ = try t.switchScreen(.alternate);
+        try t.printString("a\r\nb\r\nc");
+        ctx = Hook{ .viewport_y = 0, .numbering = terminal_text.rowNumbering(&t) };
+        var held_geometry = visible_geometry;
+        held_geometry.cell_for_byte = try std.testing.allocator.dupe(terminal_text.TerminalCellPosition, &.{.{ .row = 1, .column = 0, .width = 1 }});
+        held_geometry.viewport_y = 0;
+        held_geometry.row_numbering = ctx.numbering;
+        const held = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "b"), .{ .start = 0, .end = 1 }, held_geometry);
+        defer _ = TerminalTextRangeProvider.Release(&held.base);
+        try Hook.expectBounds(&held.base, screen_y + 22, 8, 16);
+        if (bounded)
+            try t.screens.active.pages.eraseRowBounded(.{ .active = .{} }, 1)
+        else
+            try t.screens.active.cursorDownScroll();
+        ctx.numbering = terminal_text.rowNumbering(&t);
+        var rects: ?*com.SAFEARRAY = null;
+        try std.testing.expectEqual(com.S_OK, held.base.vtbl.GetBoundingRectangles(&held.base, &rects));
+        defer _ = com.SafeArrayDestroy(rects.?);
+        var upper: i32 = 0;
+        try std.testing.expectEqual(com.S_OK, com.SafeArrayGetUBound(rects.?, 1, &upper));
+        try std.testing.expectEqual(@as(i32, -1), upper);
+    }
 }
 
 test "PKG71 ScrollIntoView dispatches frozen endpoint and alignment without selecting" {

@@ -502,6 +502,36 @@ test "PKG71 frozen scroll rejects erased history regrown with identical text" {
     try std.testing.expect(!try scrollFrozenRange(alloc, &t, before.scroll_token.?, before.document_window, 0, true));
 }
 
+test "PKG71 held row numbering rejects no-scrollback row erasure" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    defer t.deinit(alloc);
+    _ = try t.switchScreen(.alternate);
+    try std.testing.expect(t.screens.active.no_scrollback);
+    try t.printString("old\r\nnext\r\ntail");
+    var held = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer held.deinit();
+    // cursorDownScroll rotates rows through eraseRow, without allocating a
+    // new page or changing the document dimensions.
+    try t.screens.active.cursorDownScroll();
+    const current = rowNumbering(&t);
+    try std.testing.expectEqual(held.row_numbering.?.first_page_serial, current.first_page_serial);
+    try std.testing.expect(!std.meta.eql(held.row_numbering.?, current));
+}
+
+test "PKG71 held row numbering rejects bounded row erasure" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    defer t.deinit(alloc);
+    try t.printString("old\r\nnext\r\ntail");
+    var held = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer held.deinit();
+    try t.screens.active.pages.eraseRowBounded(.{ .active = .{} }, 1);
+    const current = rowNumbering(&t);
+    try std.testing.expectEqual(held.row_numbering.?.first_page_serial, current.first_page_serial);
+    try std.testing.expect(!std.meta.eql(held.row_numbering.?, current));
+}
+
 test "PKG71 row numbering rejects alternate screen replacement after reset" {
     const alloc = std.testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3 });
