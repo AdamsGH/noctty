@@ -331,4 +331,4 @@ try {
     @{ Checks=$script:checks; Launches=$script:launches; Limit='The restore failure is a Debug-only ExitProcess(3) after restore begins, not a real crash; one window, one pane; no input.' } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'quarantine-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
-if($failed.Count){exit 1}
+if($failed.Count -or $script:checks.Count -eq 0){exit 1}
