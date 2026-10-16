@@ -908,9 +908,11 @@ layouts, or `?` for help. The native Settings window stages edits until Save
 patches your config without rewriting unrelated text. Its "Open in default
 editor" button, and `noctty +edit-config` when neither `VISUAL` nor `EDITOR`
 is set, open the config through the `.txt` association rather than the
-file's own; they refuse a network, mapped or reparse-point path, Settings
-also still refuses an executable-type extension, and a failure shows in
-Settings' status line (a banner from the app, stderr from the CLI).
+file's own; they refuse a network or mapped-drive path and a link (symlink
+or junction) whose target is not a local file, but follow a checked local
+link. Settings also still refuses an executable-type extension, and a
+failure shows in Settings' status line (a banner from the app, stderr from
+the CLI).
 Details for both
 are in the [capability matrix notes](windows-capability-matrix.md#notes).
 
