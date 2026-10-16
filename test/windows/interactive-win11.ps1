@@ -241,4 +241,25 @@ Assert-Equal (
 ) ($windowsPowerShellModules -join ';') 'a Windows PowerShell module path should pass through unchanged'
 Remove-Item -LiteralPath $moduleScratch -Recurse -Force -ErrorAction SilentlyContinue
 
+$conptyScratch = Join-Path $env:TEMP 'noctty-interactive-win11-conpty-preflight-test'
+Remove-Item -LiteralPath $conptyScratch -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $conptyScratch | Out-Null
+$conptyExe = Join-Path $conptyScratch 'noctty.exe'
+Set-Content -Path $conptyExe -Value 'stub'
+Assert-InteractiveWin11ExeExists -ExePath $conptyExe -AllowInboxConPty
+foreach ($missing in @('conpty.dll', 'OpenConsole.exe')) {
+    $missingBlocked = $false
+    try {
+        Assert-InteractiveWin11ExeExists -ExePath $conptyExe
+    }
+    catch {
+        $missingBlocked = $true
+        Assert-True ($_.Exception.Message -like "*$missing*") "a missing $missing should be named"
+    }
+    Assert-True $missingBlocked "an exe without $missing beside it should be refused"
+    Set-Content -Path (Join-Path $conptyScratch $missing) -Value 'stub'
+}
+Assert-InteractiveWin11ExeExists -ExePath $conptyExe
+Remove-Item -LiteralPath $conptyScratch -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host 'interactive-win11 helper tests: PASS'

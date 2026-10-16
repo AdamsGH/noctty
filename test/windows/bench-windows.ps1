@@ -1688,7 +1688,7 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commitSha)) { throw 'g
 
 if ($Target -eq 'noctty') {
     Invoke-InteractiveWin11Build -RepoRoot $repoRoot -Optimize ReleaseFast
-    Assert-InteractiveWin11ExeExists -ExePath $script:adapter.ExePath
+    Assert-InteractiveWin11ExeExists -ExePath $script:adapter.ExePath -AllowInboxConPty
     $script:adapter = Get-BenchTargetAdapter -Name $Target
 }
 

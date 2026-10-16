@@ -184,6 +184,10 @@ public static class NocttyAccessibilityNative {
     public static extern bool PostMessageW(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")]
     public static extern IntPtr SendMessageW(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern int GetScrollPos(IntPtr hwnd, int bar);
+    [DllImport("user32.dll")]
+    public static extern bool IsChild(IntPtr parent, IntPtr hwnd);
     [DllImport("user32.dll", SetLastError=true)]
     static extern IntPtr SendMessageTimeoutW(
         IntPtr hwnd,
@@ -1599,7 +1603,9 @@ function Invoke-AccessibilityInactiveTabFirstReadProof(
             -Keys @([uint16]0x11, [uint16]0x10, [uint16]0x57) `
             -Description 'inactive-output close tab B' `
             -Process $Process
-        Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description 'inactive-output tab A restoration' -Condition {
+        # A closed tab's surface stays, hidden, until `undo-timeout` (5 s by
+        # default) runs out, so a 5 s wait left only the chord's settle time.
+        Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(15)) -Description 'inactive-output tab A restoration' -Condition {
             $script:inactiveRestoredAll = @(
                 [NocttyAccessibilityNative]::TerminalChildren($Process.MainWindowHandle)
             )
@@ -3285,6 +3291,19 @@ function Start-AccessibilityProcessWithEnvironment {
             )
         }
     }
+}
+
+# What a Settings element shows: a form element scrolled partly out of the
+# viewport is still on screen, but only the rows inside the viewport are seen.
+function Get-AccessibilitySettingsVisibleBounds($Element, [IntPtr] $Viewport, $ViewportRect) {
+    $bounds = $Element.Current.BoundingRectangle
+    $top = $bounds.Top
+    $bottom = $bounds.Bottom
+    if ([NocttyAccessibilityNative]::IsChild($Viewport, [IntPtr]$Element.Current.NativeWindowHandle)) {
+        $top = [Math]::Max($top, $ViewportRect.top)
+        $bottom = [Math]::Min($bottom, $ViewportRect.bottom)
+    }
+    return [pscustomobject]@{ Left = $bounds.Left; Top = $top; Right = $bounds.Right; Bottom = $bottom }
 }
 
 function Test-AccessibilityAncestor($Ancestor, $Descendant) {
@@ -5003,6 +5022,15 @@ try {
             $script:paletteToggleTerminalHwnds -contains $script:paletteToggleFocusedHwnd
     }
 
+    # The docked search drops its toggles, then previous/next, in a pane too
+    # narrow for them (#387), and a half of this 1280 px window is that narrow
+    # from about 175 % scaling. Zoom the focused pane for the search checks so
+    # they do not depend on the display's scale.
+    $searchZoomPaneCount = [NocttyAccessibilityNative]::VisibleTerminalChildCount($process.MainWindowHandle)
+    Send-AccessibilityChord -Keys @([uint16]0x11, [uint16]0x10, [uint16]0x0D) -Description 'Ctrl+Shift+Enter zoom the focused pane for docked search' -Process $process
+    Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description 'zoomed pane for docked search' -Condition {
+        return [NocttyAccessibilityNative]::VisibleTerminalChildCount($process.MainWindowHandle) -eq 1
+    }
     Send-AccessibilityChord -Keys @([uint16]0x11, [uint16]0x10, [uint16]0x46) -Description 'Ctrl+Shift+F open docked search' -Process $process
     Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description 'docked search query Edit' -Condition {
         $script:searchQueryEdit = @($root.FindAll(
@@ -5388,6 +5416,10 @@ try {
         (Get-AccessibilityWindowShape -Hwnd $process.MainWindowHandle) + '.'
     }
     $searchInvokeEvidence['Close search'] = 'hidden; terminal focus restored'
+    Send-AccessibilityChord -Keys @([uint16]0x11, [uint16]0x10, [uint16]0x0D) -Description 'Ctrl+Shift+Enter restore the split after docked search' -Process $process
+    Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description 'split restored after docked search' -Condition {
+        return [NocttyAccessibilityNative]::VisibleTerminalChildCount($process.MainWindowHandle) -eq $searchZoomPaneCount
+    }
 
     $settingsCycles = @()
     $themePreviewEvidence = $null
@@ -5658,47 +5690,114 @@ try {
                 throw "Settings section '$sectionName' header roles were '$($headerRoles -join ', ')'; expected a visible UIA Text header."
             }
 
-            $visibleSectionElements = @($settingsElement.FindAll(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                [System.Windows.Automation.Condition]::TrueCondition
-            ) | Where-Object {
-                -not $_.Current.IsOffscreen -and
-                $_.Current.BoundingRectangle.Width -gt 0 -and
-                $_.Current.BoundingRectangle.Height -gt 0
-            })
-            $namedSettingsText = @($visibleSectionElements | Where-Object {
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
-                -not [string]::IsNullOrWhiteSpace($_.Current.Name)
-            })
+            # The form scrolls when the window is shorter than its content
+            # (a work area under about 620 DIP), and a field scrolled out of
+            # the viewport is offscreen. Check the section a page at a time
+            # from the top, and count each element once.
+            $settingsViewport = @([NocttyAccessibilityNative]::VisibleChildrenByClass(
+                $settingsHwnd,
+                'noctty.win32.settings.viewport'
+            ))[0]
+            if ($null -eq $settingsViewport) { throw 'Settings exposes no form viewport.' }
+            $settingsViewportRect = [NocttyAccessibilityNative]::ClientRectOnScreen($settingsViewport)
+            [void][NocttyAccessibilityNative]::SendMessageW($settingsViewport, 0x0115, [UIntPtr]::new(6), [IntPtr]::Zero)
+            $sectionTextById = [ordered]@{}
+            $sectionControlById = [ordered]@{}
+            $settingsPages = 0
+            do {
+                $settingsPages++
+                $visibleSectionElements = @($settingsElement.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    [System.Windows.Automation.Condition]::TrueCondition
+                ) | Where-Object {
+                    -not $_.Current.IsOffscreen -and
+                    $_.Current.BoundingRectangle.Width -gt 0 -and
+                    $_.Current.BoundingRectangle.Height -gt 0
+                })
+                $namedSettingsText = @($visibleSectionElements | Where-Object {
+                    $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
+                    -not [string]::IsNullOrWhiteSpace($_.Current.Name)
+                })
+                for ($leftTextIndex = 0; $leftTextIndex -lt $namedSettingsText.Count; $leftTextIndex++) {
+                    $leftTextBounds = Get-AccessibilitySettingsVisibleBounds $namedSettingsText[$leftTextIndex] $settingsViewport $settingsViewportRect
+                    for ($rightTextIndex = $leftTextIndex + 1; $rightTextIndex -lt $namedSettingsText.Count; $rightTextIndex++) {
+                        $rightTextBounds = Get-AccessibilitySettingsVisibleBounds $namedSettingsText[$rightTextIndex] $settingsViewport $settingsViewportRect
+                        $overlapWidth = [Math]::Min($leftTextBounds.Right, $rightTextBounds.Right) - [Math]::Max($leftTextBounds.Left, $rightTextBounds.Left)
+                        $overlapHeight = [Math]::Min($leftTextBounds.Bottom, $rightTextBounds.Bottom) - [Math]::Max($leftTextBounds.Top, $rightTextBounds.Top)
+                        $settingsLabelOverlapComparisons++
+                        if ($overlapWidth -gt 2 -and $overlapHeight -gt 2) {
+                            throw "Settings section '$sectionName' has overlapping visible labels '$($namedSettingsText[$leftTextIndex].Current.Name)' and '$($namedSettingsText[$rightTextIndex].Current.Name)' (${overlapWidth}x${overlapHeight}px)."
+                        }
+                    }
+                }
+                $interactiveSettingsControls = @($visibleSectionElements | Where-Object {
+                    $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -or
+                    $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox -or
+                    $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -or
+                    $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button
+                })
+                $unnamedSettingsControls = @($interactiveSettingsControls | Where-Object {
+                    [string]::IsNullOrWhiteSpace($_.Current.Name)
+                })
+                if ($unnamedSettingsControls.Count -ne 0) {
+                    throw "Settings section '$sectionName' exposes $($unnamedSettingsControls.Count) unnamed visible content controls."
+                }
+                foreach ($labelElement in $namedSettingsText) {
+                    $labelBounds = Get-AccessibilitySettingsVisibleBounds $labelElement $settingsViewport $settingsViewportRect
+                    foreach ($controlElement in $interactiveSettingsControls) {
+                        $controlBounds = Get-AccessibilitySettingsVisibleBounds $controlElement $settingsViewport $settingsViewportRect
+                        $overlapWidth = [Math]::Min($labelBounds.Right, $controlBounds.Right) - [Math]::Max($labelBounds.Left, $controlBounds.Left)
+                        $overlapHeight = [Math]::Min($labelBounds.Bottom, $controlBounds.Bottom) - [Math]::Max($labelBounds.Top, $controlBounds.Top)
+                        $settingsOverlapComparisons++
+                        if ($overlapWidth -gt 2 -and $overlapHeight -gt 2) {
+                            throw "Settings section '$sectionName' has overlapping label '$($labelElement.Current.Name)' and $($controlElement.Current.ControlType.ProgrammaticName) '$($controlElement.Current.Name)' (${overlapWidth}x${overlapHeight}px)."
+                        }
+                    }
+                }
+                $settingsLayoutControls = @($sectionButtons) + @($interactiveSettingsControls)
+                $containedElements = @($namedSettingsText) + @($settingsLayoutControls)
+                foreach ($containedElement in $containedElements) {
+                    $bounds = Get-AccessibilitySettingsVisibleBounds $containedElement $settingsViewport $settingsViewportRect
+                    $settingsContainmentChecks++
+                    if ($bounds.Left -lt ($settingsClientRect.left - 3) -or
+                        $bounds.Top -lt ($settingsClientRect.top - 3) -or
+                        $bounds.Right -gt ($settingsClientRect.right + 3) -or
+                        $bounds.Bottom -gt ($settingsClientRect.bottom + 3)) {
+                        throw "Settings section '$sectionName' element '$($containedElement.Current.Name)' ($($containedElement.Current.ControlType.ProgrammaticName)) escapes the client bounds: element=$bounds client=[$($settingsClientRect.left),$($settingsClientRect.top),$($settingsClientRect.right),$($settingsClientRect.bottom)]."
+                    }
+                }
+                for ($leftControlIndex = 0; $leftControlIndex -lt $settingsLayoutControls.Count; $leftControlIndex++) {
+                    $leftControl = $settingsLayoutControls[$leftControlIndex]
+                    $leftControlBounds = Get-AccessibilitySettingsVisibleBounds $leftControl $settingsViewport $settingsViewportRect
+                    for ($rightControlIndex = $leftControlIndex + 1; $rightControlIndex -lt $settingsLayoutControls.Count; $rightControlIndex++) {
+                        $rightControl = $settingsLayoutControls[$rightControlIndex]
+                        if ((Test-AccessibilityAncestor -Ancestor $leftControl -Descendant $rightControl) -or
+                            (Test-AccessibilityAncestor -Ancestor $rightControl -Descendant $leftControl)) {
+                            continue
+                        }
+                        $rightControlBounds = Get-AccessibilitySettingsVisibleBounds $rightControl $settingsViewport $settingsViewportRect
+                        $overlapWidth = [Math]::Min($leftControlBounds.Right, $rightControlBounds.Right) - [Math]::Max($leftControlBounds.Left, $rightControlBounds.Left)
+                        $overlapHeight = [Math]::Min($leftControlBounds.Bottom, $rightControlBounds.Bottom) - [Math]::Max($leftControlBounds.Top, $rightControlBounds.Top)
+                        $settingsControlOverlapComparisons++
+                        if ($overlapWidth -gt 2 -and $overlapHeight -gt 2) {
+                            throw "Settings section '$sectionName' has overlapping controls '$($leftControl.Current.Name)' and '$($rightControl.Current.Name)' (${overlapWidth}x${overlapHeight}px)."
+                        }
+                    }
+                }
+                foreach ($element in $namedSettingsText) { $sectionTextById[($element.GetRuntimeId() -join '.')] = $element }
+                foreach ($element in $interactiveSettingsControls) { $sectionControlById[($element.GetRuntimeId() -join '.')] = $element }
+                $settingsScrollBefore = [NocttyAccessibilityNative]::GetScrollPos($settingsViewport, 1)
+                [void][NocttyAccessibilityNative]::SendMessageW($settingsViewport, 0x0115, [UIntPtr]::new(3), [IntPtr]::Zero)
+                if ($settingsPages -ge 50) { throw "Settings section '$sectionName' was still scrolling after $settingsPages pages." }
+            } while ([NocttyAccessibilityNative]::GetScrollPos($settingsViewport, 1) -ne $settingsScrollBefore)
+            [void][NocttyAccessibilityNative]::SendMessageW($settingsViewport, 0x0115, [UIntPtr]::new(6), [IntPtr]::Zero)
+            $namedSettingsText = @($sectionTextById.Values)
+            $interactiveSettingsControls = @($sectionControlById.Values)
             if ($namedSettingsText.Count -lt 3) {
                 throw "Settings section '$sectionName' exposes only $($namedSettingsText.Count) named, visible UIA text labels."
             }
             if ($sectionName -eq 'Appearance' -and $namedSettingsText.Count -lt 10) {
                 throw "Settings Appearance section exposes only $($namedSettingsText.Count) named, visible UIA text labels; expected at least 10."
-            }
-            for ($leftTextIndex = 0; $leftTextIndex -lt $namedSettingsText.Count; $leftTextIndex++) {
-                $leftTextBounds = $namedSettingsText[$leftTextIndex].Current.BoundingRectangle
-                for ($rightTextIndex = $leftTextIndex + 1; $rightTextIndex -lt $namedSettingsText.Count; $rightTextIndex++) {
-                    $rightTextBounds = $namedSettingsText[$rightTextIndex].Current.BoundingRectangle
-                    $overlapWidth = [Math]::Min($leftTextBounds.Right, $rightTextBounds.Right) - [Math]::Max($leftTextBounds.Left, $rightTextBounds.Left)
-                    $overlapHeight = [Math]::Min($leftTextBounds.Bottom, $rightTextBounds.Bottom) - [Math]::Max($leftTextBounds.Top, $rightTextBounds.Top)
-                    $settingsLabelOverlapComparisons++
-                    if ($overlapWidth -gt 2 -and $overlapHeight -gt 2) {
-                        throw "Settings section '$sectionName' has overlapping visible labels '$($namedSettingsText[$leftTextIndex].Current.Name)' and '$($namedSettingsText[$rightTextIndex].Current.Name)' (${overlapWidth}x${overlapHeight}px)."
-                    }
-                }
-            }
-            $interactiveSettingsControls = @($visibleSectionElements | Where-Object {
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -or
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox -or
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -or
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button
-            })
-            $unnamedSettingsControls = @($interactiveSettingsControls | Where-Object {
-                [string]::IsNullOrWhiteSpace($_.Current.Name)
-            })
-            if ($unnamedSettingsControls.Count -ne 0) {
-                throw "Settings section '$sectionName' exposes $($unnamedSettingsControls.Count) unnamed visible content controls."
             }
             $expectedControls = @($settingsExpectedControls[$sectionName])
             foreach ($expectedControl in $expectedControls) {
@@ -5716,54 +5815,13 @@ try {
                 })
                 throw "Settings section '$sectionName' exposes $($interactiveSettingsControls.Count) visible content controls; expected $($expectedControls.Count). Observed: $($observedControls -join ', ')."
             }
-            foreach ($labelElement in $namedSettingsText) {
-                $labelBounds = $labelElement.Current.BoundingRectangle
-                foreach ($controlElement in $interactiveSettingsControls) {
-                    $controlBounds = $controlElement.Current.BoundingRectangle
-                    $overlapWidth = [Math]::Min($labelBounds.Right, $controlBounds.Right) - [Math]::Max($labelBounds.Left, $controlBounds.Left)
-                    $overlapHeight = [Math]::Min($labelBounds.Bottom, $controlBounds.Bottom) - [Math]::Max($labelBounds.Top, $controlBounds.Top)
-                    $settingsOverlapComparisons++
-                    if ($overlapWidth -gt 2 -and $overlapHeight -gt 2) {
-                        throw "Settings section '$sectionName' has overlapping label '$($labelElement.Current.Name)' and $($controlElement.Current.ControlType.ProgrammaticName) '$($controlElement.Current.Name)' (${overlapWidth}x${overlapHeight}px)."
-                    }
-                }
-            }
-            $settingsLayoutControls = @($sectionButtons) + @($interactiveSettingsControls)
-            $containedElements = @($namedSettingsText) + @($settingsLayoutControls)
-            foreach ($containedElement in $containedElements) {
-                $bounds = $containedElement.Current.BoundingRectangle
-                $settingsContainmentChecks++
-                if ($bounds.Left -lt ($settingsClientRect.left - 3) -or
-                    $bounds.Top -lt ($settingsClientRect.top - 3) -or
-                    $bounds.Right -gt ($settingsClientRect.right + 3) -or
-                    $bounds.Bottom -gt ($settingsClientRect.bottom + 3)) {
-                    throw "Settings section '$sectionName' element '$($containedElement.Current.Name)' ($($containedElement.Current.ControlType.ProgrammaticName)) escapes the client bounds: element=$bounds client=[$($settingsClientRect.left),$($settingsClientRect.top),$($settingsClientRect.right),$($settingsClientRect.bottom)]."
-                }
-            }
-            for ($leftControlIndex = 0; $leftControlIndex -lt $settingsLayoutControls.Count; $leftControlIndex++) {
-                $leftControl = $settingsLayoutControls[$leftControlIndex]
-                $leftControlBounds = $leftControl.Current.BoundingRectangle
-                for ($rightControlIndex = $leftControlIndex + 1; $rightControlIndex -lt $settingsLayoutControls.Count; $rightControlIndex++) {
-                    $rightControl = $settingsLayoutControls[$rightControlIndex]
-                    if ((Test-AccessibilityAncestor -Ancestor $leftControl -Descendant $rightControl) -or
-                        (Test-AccessibilityAncestor -Ancestor $rightControl -Descendant $leftControl)) {
-                        continue
-                    }
-                    $rightControlBounds = $rightControl.Current.BoundingRectangle
-                    $overlapWidth = [Math]::Min($leftControlBounds.Right, $rightControlBounds.Right) - [Math]::Max($leftControlBounds.Left, $rightControlBounds.Left)
-                    $overlapHeight = [Math]::Min($leftControlBounds.Bottom, $rightControlBounds.Bottom) - [Math]::Max($leftControlBounds.Top, $rightControlBounds.Top)
-                    $settingsControlOverlapComparisons++
-                    if ($overlapWidth -gt 2 -and $overlapHeight -gt 2) {
-                        throw "Settings section '$sectionName' has overlapping controls '$($leftControl.Current.Name)' and '$($rightControl.Current.Name)' (${overlapWidth}x${overlapHeight}px)."
-                    }
-                }
-            }
             $settingsNamedTextTotal += $namedSettingsText.Count
             $settingsSectionEvidence += [ordered]@{
                 name = $sectionName
                 selected = $true
                 visible_named_text = $namedSettingsText.Count
                 visible_content_controls = $interactiveSettingsControls.Count
+                pages = $settingsPages
             }
         }
         $selectedBeforeFocus = @($sectionButtons | Where-Object {
