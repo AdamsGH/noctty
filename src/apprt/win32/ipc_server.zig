@@ -2882,7 +2882,7 @@ fn testProcessHandleCount() !u32 {
     return count;
 }
 
-test "win32 IPC server thread does not run while it waits for a client" {
+test "win32 IPC server thread does not busy-poll while it waits for a client" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var server: TestIpcServer = .{};
@@ -2890,22 +2890,21 @@ test "win32 IPC server thread does not run while it waits for a client" {
     defer server.stop();
     const thread = server.app.ipc_thread.?.getHandle();
 
-    // A thread blocked in a wait accrues no cycles. Let the server reach its
-    // wait first; a server that polls never settles.
+    // Require a full idle window, not a short "settled" sample: a thread
+    // delayed during startup can look idle before it reaches the pipe wait.
+    // Allow a bounded startup/retry budget for that or an incidental wakeup.
+    // A 5 ms poll keeps accruing cycles in every 300 ms window and fails.
     var cycles = try testThreadCycles(thread);
-    var settled = false;
-    for (0..40) |_| {
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+    var cycle_deltas: [10]u64 = undefined;
+    for (&cycle_deltas) |*delta| {
+        std.Thread.sleep(300 * std.time.ns_per_ms);
         const now = try testThreadCycles(thread);
-        if (now == cycles) {
-            settled = true;
-            break;
-        }
+        delta.* = now - cycles;
+        if (now == cycles) return;
         cycles = now;
     }
-    try std.testing.expect(settled);
-    std.Thread.sleep(300 * std.time.ns_per_ms);
-    try std.testing.expectEqual(cycles, try testThreadCycles(thread));
+    std.debug.print("IPC server thread cycle deltas across 300 ms windows: {any}\n", .{cycle_deltas});
+    return error.TestUnexpectedResult;
 }
 
 test "win32 IPC server replaces an instance whose client left before it was accepted" {
