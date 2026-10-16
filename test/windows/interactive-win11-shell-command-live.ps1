@@ -106,6 +106,12 @@ public static class Win11ShellCommandLiveNative {
     public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
     [DllImport("user32.dll")]
+    public static extern bool GetKeyboardState(byte[] lpKeyState);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetKeyboardState(byte[] lpKeyState);
+
+    [DllImport("user32.dll")]
     public static extern bool BringWindowToTop(IntPtr hWnd);
 
     [DllImport("user32.dll")]
@@ -158,6 +164,7 @@ $VK_CONTROL = 0x11
 $VK_MENU = 0x12
 $VK_RETURN = 0x0D
 $VK_SHIFT = 0x10
+$LEFT_MODIFIER_VK = @{ 0x10 = 0xA0; 0x11 = 0xA2; 0x12 = 0xA4 }
 $WM_CHAR = 0x0102
 $WM_KEYDOWN = 0x0100
 $WM_KEYUP = 0x0101
@@ -440,19 +447,56 @@ function Send-ModifiedChar {
     if ($modifierMask -band 0x04) { $modifiers += [uint16] $VK_MENU }
     if ($modifierMask -band 0x01) { $modifiers += [uint16] $VK_SHIFT }
 
-    foreach ($modifier in $modifiers) {
-        Send-KeyMessage -Hwnd $Hwnd -VirtualKey $modifier -Deadline $Deadline -Process $Process
-    }
-
-    try {
+    if ($modifiers.Count -eq 0) {
         Send-KeyMessage -Hwnd $Hwnd -VirtualKey $virtualKey -CharCode ([uint16] [int] $Character) -Deadline $Deadline -Process $Process
         Send-KeyMessage -Hwnd $Hwnd -VirtualKey $virtualKey -KeyUp -Deadline $Deadline -Process $Process
+        return
+    }
+
+    # A sent modifier message never reaches GetKeyboardState, and noctty reads
+    # a key's text from the keyboard state (ToUnicode) for the Win32 input
+    # records it sends ConPTY, so Shift+. would type '.'. Share the window's
+    # input queue for this key and hold the modifiers in the keyboard state, as
+    # the real keyboard would, then restore the exact old state and detach.
+    $targetProcessId = [uint32] 0
+    $targetThread = [Win11ShellCommandLiveNative]::GetWindowThreadProcessId($Hwnd, [ref] $targetProcessId)
+    if ($targetThread -eq 0) {
+        throw "GetWindowThreadProcessId found no thread for window $Hwnd while typing '$Character'"
+    }
+    $thisThread = [Win11ShellCommandLiveNative]::GetCurrentThreadId()
+    if (-not [Win11ShellCommandLiveNative]::AttachThreadInput($thisThread, $targetThread, $true)) {
+        throw "AttachThreadInput failed for character '$Character'"
+    }
+    $savedState = New-Object byte[] 256
+    [void] [Win11ShellCommandLiveNative]::GetKeyboardState($savedState)
+    try {
+        $state = [byte[]] $savedState.Clone()
+        foreach ($modifier in $modifiers) {
+            $state[$modifier] = 0x80
+            $state[$LEFT_MODIFIER_VK[[int] $modifier]] = 0x80
+        }
+        if (-not [Win11ShellCommandLiveNative]::SetKeyboardState($state)) {
+            throw "SetKeyboardState failed for character '$Character'"
+        }
+
+        foreach ($modifier in $modifiers) {
+            Send-KeyMessage -Hwnd $Hwnd -VirtualKey $modifier -Deadline $Deadline -Process $Process
+        }
+
+        try {
+            Send-KeyMessage -Hwnd $Hwnd -VirtualKey $virtualKey -CharCode ([uint16] [int] $Character) -Deadline $Deadline -Process $Process
+            Send-KeyMessage -Hwnd $Hwnd -VirtualKey $virtualKey -KeyUp -Deadline $Deadline -Process $Process
+        }
+        finally {
+            for ($i = $modifiers.Count - 1; $i -ge 0; $i -= 1) {
+                $modifier = $modifiers[$i]
+                Send-KeyMessage -Hwnd $Hwnd -VirtualKey $modifier -KeyUp -Deadline $Deadline -Process $Process
+            }
+        }
     }
     finally {
-        for ($i = $modifiers.Count - 1; $i -ge 0; $i -= 1) {
-            $modifier = $modifiers[$i]
-            Send-KeyMessage -Hwnd $Hwnd -VirtualKey $modifier -KeyUp -Deadline $Deadline -Process $Process
-        }
+        [void] [Win11ShellCommandLiveNative]::SetKeyboardState($savedState)
+        [void] [Win11ShellCommandLiveNative]::AttachThreadInput($thisThread, $targetThread, $false)
     }
 }
 
@@ -817,7 +861,7 @@ if ($ConfiguredScenariosOnly) {
         -Name 'quoted' `
         -ConfigPath $quotedConfigPath `
         -ExpectedText @('CONFIG_QUOTED_A', 'CONFIG_QUOTED_B') `
-        -RejectedText @('Ghostty failed to launch the requested command:') `
+        -RejectedText @('noctty failed to launch the requested command:') `
         -CapturePath $quotedCapturePath `
         -StdoutPath $quotedStdoutPath `
         -StderrPath $quotedStderrPath
@@ -826,7 +870,7 @@ if ($ConfiguredScenariosOnly) {
         -Name 'abnormal' `
         -ConfigPath $abnormalConfigPath `
         -ExpectedText @(
-            'Ghostty failed to launch the requested command:',
+            'noctty failed to launch the requested command:',
             'cmd.exe /d /c "exit /b 37"',
             'Exit Code: 37',
             'Press any key to close the window.'

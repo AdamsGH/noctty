@@ -216,4 +216,29 @@ catch {
 
 Assert-True $conflictingFlagsBlocked 'rebuild and no-build together should throw'
 
+$moduleScratch = Join-Path $env:TEMP 'noctty-interactive-win11-module-path-test'
+Remove-Item -LiteralPath $moduleScratch -Recurse -Force -ErrorAction SilentlyContinue
+$fakePwshHome = Join-Path $moduleScratch 'PowerShell\7'
+New-Item -ItemType Directory -Force -Path (Join-Path $fakePwshHome 'Modules') | Out-Null
+Set-Content -Path (Join-Path $fakePwshHome 'pwsh.exe') -Value 'stub'
+$windowsPowerShellModules = @(
+    (Join-Path $moduleScratch 'WindowsPowerShell\Modules'),
+    (Join-Path $moduleScratch 'system32\WindowsPowerShell\v1.0\Modules')
+)
+$inheritedModulePath = @(
+    (Join-Path ([System.Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'),
+    ((Join-Path $env:ProgramFiles 'PowerShell\Modules') + '\'),
+    (Join-Path $fakePwshHome 'Modules').ToLowerInvariant(),
+    '',
+    $windowsPowerShellModules[0],
+    $windowsPowerShellModules[1]
+) -join ';'
+Assert-Equal (
+    Get-InteractiveWin11WindowsPowerShellModulePath -ModulePath $inheritedModulePath
+) ($windowsPowerShellModules -join ';') 'Windows PowerShell children should not inherit PowerShell 7 module folders'
+Assert-Equal (
+    Get-InteractiveWin11WindowsPowerShellModulePath -ModulePath ($windowsPowerShellModules -join ';')
+) ($windowsPowerShellModules -join ';') 'a Windows PowerShell module path should pass through unchanged'
+Remove-Item -LiteralPath $moduleScratch -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host 'interactive-win11 helper tests: PASS'
