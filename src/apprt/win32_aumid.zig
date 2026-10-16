@@ -107,7 +107,7 @@ fn register(
         return error.RegistryOpenFailed;
     defer _ = sys.RegCloseKey(parent_key);
     if (!portable) {
-        try registerForExe(alloc, parent_key, name, exe_path);
+        _ = try registerForExe(alloc, parent_key, name, exe_path);
         return true;
     }
 
@@ -115,7 +115,9 @@ fn register(
     // it. Where there is none, it fills a complete key under a private name
     // and renames it into place. The rename fails once the name exists, so
     // of copies starting together only the first registers, and an
-    // installed copy, which always writes, overwrites it afterwards.
+    // installed copy, which always writes, overwrites it afterwards. A copy
+    // with no icon beside it publishes nothing: later copies could not add
+    // the icon to a registration that exists.
     var existing: HKEY = undefined;
     if (sys.RegOpenKeyExW(parent_key, name, 0, KEY_QUERY_VALUE, &existing) == ERROR_SUCCESS) {
         _ = sys.RegCloseKey(existing);
@@ -129,8 +131,8 @@ fn register(
     defer alloc.free(pending_w);
     @memcpy(pending_w[0..name.len], name);
     for (suffix, pending_w[name.len..]) |c, *w| w.* = c;
-    const published = if (registerForExe(alloc, parent_key, pending_w, exe_path))
-        RegRenameKey(parent_key, pending_w, name) == ERROR_SUCCESS
+    const published = if (registerForExe(alloc, parent_key, pending_w, exe_path)) |wrote_icon|
+        wrote_icon and RegRenameKey(parent_key, pending_w, name) == ERROR_SUCCESS
     else |_|
         false;
     if (!published) _ = RegDeleteKeyW(parent_key, pending_w);
@@ -140,7 +142,8 @@ fn register(
 extern "advapi32" fn RegRenameKey(key: HKEY, sub_key: ?LPCWSTR, new_name: LPCWSTR) callconv(.winapi) i32;
 extern "advapi32" fn RegDeleteKeyW(key: HKEY, sub_key: LPCWSTR) callconv(.winapi) i32;
 
-fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_path: []const u8) !void {
+/// Returns whether `IconUri` was written (there was an icon beside the exe).
+fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_path: []const u8) !bool {
     var hkey: HKEY = undefined;
     const open_rc = sys.RegCreateKeyExW(
         root,
@@ -161,6 +164,7 @@ fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_pat
 
     // Every write is attempted; a failed one is reported at the end.
     var complete = true;
+    var wrote_icon = false;
     const display_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty");
     const set_rc = writeRegSz(hkey, std.unicode.utf8ToUtf16LeStringLiteral("DisplayName"), display_name);
     if (set_rc != ERROR_SUCCESS) {
@@ -187,7 +191,9 @@ fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_pat
                 defer alloc.free(icon_uri);
 
                 const icon_rc = writeRegSz(hkey, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), icon_uri);
-                if (icon_rc != ERROR_SUCCESS) {
+                if (icon_rc == ERROR_SUCCESS) {
+                    wrote_icon = true;
+                } else {
                     std.log.warn("AUMID: write IconUri failed rc={d}", .{icon_rc});
                     complete = false;
                 }
@@ -212,6 +218,7 @@ fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_pat
         complete = false;
     }
     if (!complete) return error.RegistryWriteFailed;
+    return wrote_icon;
 }
 
 fn writeRegSz(hkey: HKEY, value_name: LPCWSTR, value: [:0]const u16) i32 {
@@ -397,6 +404,16 @@ test "aumid registration: installed copies always write, portable copies only cr
     {
         const reg = try TestRegistry.init(alloc);
         defer reg.deinit(alloc);
+        // A portable copy with no icon beside it creates nothing, so the next
+        // one can still register with its icon.
+        try std.testing.expect(!try register(alloc, reg.parent, TestRegistry.name, bare, true));
+        {
+            const parent = try reg.open(null);
+            defer _ = sys.RegCloseKey(parent);
+            var subkeys: DWORD = 99;
+            try std.testing.expectEqual(ERROR_SUCCESS, TestRegistry.RegQueryInfoKeyW(parent, null, null, null, &subkeys, null, null, null, null, null, null, null));
+            try std.testing.expectEqual(@as(DWORD, 0), subkeys);
+        }
         try std.testing.expect(try register(alloc, reg.parent, TestRegistry.name, p1, true));
         const key = try reg.open(TestRegistry.name);
         defer _ = sys.RegCloseKey(key);
