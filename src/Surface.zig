@@ -200,6 +200,10 @@ inspector: ?*inspectorpkg.Inspector = null,
 /// All our sizing information.
 size: rendererpkg.Size,
 
+/// Holds the terminal's resizes while the apprt changes the font and the
+/// size together. See `beginResizeBatch`.
+resize_batch: ResizeBatch = .{},
+
 /// The configuration derived from the main config. We "derive" it so that
 /// we don't have a shared pointer hanging around that we need to worry about
 /// the lifetime of. This makes updating config at runtime easier.
@@ -3920,6 +3924,61 @@ test "Surface: typing redraws only what it changed on screen" {
     try testing.expect(Probe.rendered(surface));
 }
 
+/// Nesting count and pending flag for `beginResizeBatch`.
+const ResizeBatch = struct {
+    depth: u8 = 0,
+    pending: bool = false,
+
+    /// Whether a resize must wait for the batch to end.
+    fn hold(self: *ResizeBatch) bool {
+        if (self.depth == 0) return false;
+        self.pending = true;
+        return true;
+    }
+
+    /// Whether ending one level closes the batch with a resize to send.
+    fn end(self: *ResizeBatch) bool {
+        if (self.depth == 0) return false;
+        self.depth -= 1;
+        if (self.depth > 0 or !self.pending) return false;
+        self.pending = false;
+        return true;
+    }
+};
+
+test "Surface: a resize batch sends one resize when its last level ends" {
+    const testing = std.testing;
+    var batch: ResizeBatch = .{};
+    try testing.expect(!batch.hold());
+    batch.depth += 1;
+    batch.depth += 1;
+    try testing.expect(batch.hold());
+    try testing.expect(batch.hold());
+    try testing.expect(!batch.end());
+    try testing.expect(batch.end());
+    try testing.expect(!batch.end());
+    batch.depth += 1;
+    try testing.expect(!batch.end());
+}
+
+/// Hold the terminal's resizes until `endResizeBatch`, which sends one with
+/// the size as it is then. A DPI change sets the font and then the size,
+/// and each sends a resize; on its own the first is the old pixel size in
+/// the new cells, a grid neither monitor uses, which can wrap lines into
+/// scrollback if termio applies it before the second arrives.
+pub fn beginResizeBatch(self: *Surface) void {
+    self.resize_batch.depth += 1;
+}
+
+pub fn endResizeBatch(self: *Surface) void {
+    if (self.resize_batch.end()) self.queueIo(.{ .resize = self.size }, .unlocked);
+}
+
+fn queueResize(self: *Surface) void {
+    if (self.resize_batch.hold()) return;
+    self.queueIo(.{ .resize = self.size }, .unlocked);
+}
+
 /// Change the cell size for the terminal grid. This can happen as
 /// a result of changing the font size at runtime.
 fn setCellSize(self: *Surface, size: rendererpkg.CellSize) void {
@@ -3929,7 +3988,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) void {
     self.syncBenchmarkMemoryGeometry();
 
     // Notify the terminal
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.queueResize();
 
     // Update our terminal default size if necessary.
     self.recomputeInitialSize(.queue) catch |err| {
@@ -4055,7 +4114,7 @@ fn resizeWithIoMode(self: *Surface, size: rendererpkg.ScreenSize, io_mode: Resiz
     }
 
     if (io_mode == .queue) {
-        self.queueIo(.{ .resize = self.size }, .unlocked);
+        self.queueResize();
     }
 }
 

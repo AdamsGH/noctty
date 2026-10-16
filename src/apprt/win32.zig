@@ -22621,12 +22621,12 @@ const Host = struct {
         self.forceHostCompositionPaint();
     }
 
-    fn syncVisibleSurfaceContentScales(self: *Host) void {
+    fn applyDpiChangeToVisibleSurfaces(self: *Host) void {
         if (self.activeTab()) |tab| {
             var it = tab.tree.iterator();
             while (it.next()) |entry| {
                 if (!entry.view.window_visible) continue;
-                entry.view.syncContentScaleToHostDpi();
+                entry.view.applyDpiChange();
             }
         }
     }
@@ -32684,11 +32684,11 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, flags | c.SWP_NOMOVE | c.SWP_NOSIZE);
                 }
 
-                // The new font before the new size, so the terminals reflow
-                // once, into the grid they end up with. Building the font
-                // can take longer than termio's 25 ms resize coalescing, and
-                // a size sent ahead of it was applied in the old font.
-                v.syncVisibleSurfaceContentScales();
+                // Each terminal takes its new font and size as one resize,
+                // after the frame above has its final layout. Building a
+                // font can outlast termio's 25 ms resize coalescing, so a
+                // size sent ahead of it was laid out in the old font.
+                v.applyDpiChangeToVisibleSurfaces();
                 v.dpi_change_pending = false;
 
                 // Relayout and repaint
@@ -39406,9 +39406,13 @@ pub const Surface = struct {
         // size before `WM_DPICHANGED` changes the font, and the core would
         // lay the old font out in that size: on 144 -> 96 DPI, about 66
         // columns, which wraps long lines and can push them into scrollback.
-        // Hold the size until the new font is in; the `WM_DPICHANGED` arm
-        // syncs it afterwards. Nothing is recorded, so that sync sees it.
+        // Hold the size until the new font is in; `applyDpiChange` syncs it
+        // afterwards. Nothing is recorded, so that sync sees it.
         if (self.host) |host| if (host.dpi_change_pending) return;
+        self.syncCoreSizeNow();
+    }
+
+    fn syncCoreSizeNow(self: *Surface) void {
         const hwnd = self.hwnd orelse return;
         const next_size = self.app.clientSize(hwnd) catch return;
         if (!surfacePixelSizeChanged(self.size, next_size)) return;
@@ -39418,6 +39422,17 @@ pub const Surface = struct {
         self.core_surface.sizeCallback(self.size) catch |err| {
             log.err("win32 size callback failed err={}", .{err});
         };
+    }
+
+    /// The new DPI's font, then the client size, as one terminal resize:
+    /// the core batches the resize each of them sends, so termio never lays
+    /// out the old pixel size in the new cells, however long the font takes.
+    fn applyDpiChange(self: *Surface) void {
+        if (!self.core_initialized) return self.syncContentScaleToHostDpiNow();
+        self.core_surface.beginResizeBatch();
+        defer self.core_surface.endResizeBatch();
+        self.syncContentScaleToHostDpiNow();
+        self.syncCoreSizeNow();
     }
 
     fn windowSizeChanged(self: *Surface) void {
@@ -40007,6 +40022,14 @@ pub const Surface = struct {
     /// Hidden tabs, zoomed panes and undo-retained surfaces catch up when
     /// shown, independently of layouts already completed by other panes.
     fn syncContentScaleToHostDpi(self: *Surface) void {
+        // During a DPI change only `applyDpiChange` puts the font in, inside
+        // the core's resize batch; a layout running in between would change
+        // it outside the batch and send the old pixel size in the new cells.
+        if (self.host) |host| if (host.dpi_change_pending) return;
+        self.syncContentScaleToHostDpiNow();
+    }
+
+    fn syncContentScaleToHostDpiNow(self: *Surface) void {
         self.syncContentScaleToHostDpiWith(
             &self.core_surface,
             CoreSurface.contentScaleCallback,
@@ -52552,7 +52575,7 @@ test "win32 surfacePixelSizeChanged only trips on width or height deltas" {
     try std.testing.expect(surfacePixelSizeChanged(stable, .{ .width = 800, .height = 601 }));
 }
 
-test "win32 a pending DPI change holds the surface size and the next sync catches up" {
+test "win32 a pending DPI change holds the surface size and font, and the next sync catches up" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const hwnd = try createTestHostWindow();
@@ -52560,21 +52583,29 @@ test "win32 a pending DPI change holds the surface size and the next sync catche
     var app: App = undefined;
     var host: Host = undefined;
     host.dpi_change_pending = true;
+    host.current_dpi = 144;
+    host.surfaces_visible = true;
     var surface: Surface = undefined;
     surface.app = &app;
     surface.host = &host;
     surface.hwnd = hwnd;
     surface.core_initialized = false;
+    surface.window_visible = true;
     surface.size = .{ .width = 0, .height = 0 };
+    surface.content_scale = .{ .x = 1, .y = 1 };
 
     surface.syncCoreSizeFromClientRect();
+    surface.syncContentScaleToHostDpi();
     try std.testing.expectEqual(apprt.SurfaceSize{ .width = 0, .height = 0 }, surface.size);
+    try std.testing.expectEqual(@as(f32, 1), surface.content_scale.x);
 
     // Nothing was recorded while held, so the sync after the font change
     // still sees the new size.
     host.dpi_change_pending = false;
     surface.syncCoreSizeFromClientRect();
+    surface.syncContentScaleToHostDpi();
     try std.testing.expectEqual(apprt.SurfaceSize{ .width = 320, .height = 240 }, surface.size);
+    try std.testing.expectEqual(@as(f32, 1.5), surface.content_scale.x);
 }
 
 test "win32 scaleInitialClientSize converts logical initial size to physical pixels" {
