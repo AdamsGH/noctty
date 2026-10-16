@@ -142,6 +142,9 @@ Each release publishes signed Windows artifacts for x64 and ARM64:
   installer.
 - `noctty-<version>-windows-<arch>-portable.manifest.ps1`: signed hashes
   for the exact portable payload.
+- `noctty-<version>-windows-<arch>-symbols.zip` (v1.3.133 and later): the
+  debug symbols (PDBs) for that architecture's binaries, for reading crash
+  dumps. They are not in the installer or the portable ZIP.
 - `SHA256SUMS-windows-<arch>.txt`: architecture-specific checksums.
 
 The installer, portable manifest, and binaries inside the portable ZIP are
@@ -1407,6 +1410,27 @@ noctty +diagnostic-bundle --output=noctty-diagnostics
 
 `+crash-report` reads whatever is there. Dumps can contain sensitive memory
 from the crashed process; review them before sharing.
+
+To read a dump, use the symbols zip of the same release and architecture
+(v1.3.133 and later). Release binaries keep their unwind tables, so a debugger
+can walk noctty's stacks without symbols, but only the PDBs turn frames into
+function names and source lines. Extract the zip and add its `symbols` folder
+to the debugger's symbol path. A debugger accepts a PDB only when its GUID and
+age equal the ones recorded in the binary, so a PDB from another build is
+rejected rather than misread. With `cdb` or WinDbg, and the dump from
+`%LOCALAPPDATA%\noctty\crash` (`noctty-<pid>-<timestamp>.dmp`):
+
+```text
+cdb -z <dump>.dmp -y <extracted folder>\symbols -i <folder that holds the release's noctty.exe>
+0:000> .reload /f
+0:000> ~*k
+```
+
+`-i` is the image path: a minidump holds no module images, and the debugger
+needs the release's own `noctty.exe` (from the portable ZIP of the same
+release and architecture) for its unwind tables. The release workflow checks,
+before and after publishing, that every PDB in the zip has the GUID and age of
+the matching binary in the portable ZIP.
 
 `+diagnostic-bundle` writes a local-only, inspectable support bundle.
 Terminal content, commands, environment, working directories, and config

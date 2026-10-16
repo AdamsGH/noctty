@@ -5098,6 +5098,26 @@ test "checksum parser rejects duplicate installer entries" {
     );
 }
 
+test "checksum parser ignores the symbols zip entry beside the installer and portable zip" {
+    // From v1.3.133 each architecture's checksum file, and the x64 legacy
+    // SHA256SUMS.txt copy older clients read, also lists the symbols zip.
+    const checksums =
+        \\1111111111111111111111111111111111111111111111111111111111111111 *noctty-1.3.133-windows-x64-portable.zip
+        \\2222222222222222222222222222222222222222222222222222222222222222 *noctty-1.3.133-windows-x64-setup.exe
+        \\3333333333333333333333333333333333333333333333333333333333333333 *noctty-1.3.133-windows-x64-symbols.zip
+    ;
+    const installer = try parseExpectedSha256(checksums, "noctty-1.3.133-windows-x64-setup.exe");
+    try std.testing.expectEqualStrings(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        &std.fmt.bytesToHex(installer, .lower),
+    );
+    const portable = try parseExpectedSha256(checksums, "noctty-1.3.133-windows-x64-portable.zip");
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        &std.fmt.bytesToHex(portable, .lower),
+    );
+}
+
 test "http status mapping distinguishes update response failures" {
     try requireOkHttpStatus("test", "https://example.invalid/ok", .ok);
     try std.testing.expectError(
@@ -5496,6 +5516,56 @@ test "release parser selects windows install candidate when checksum metadata is
     const checksum_url = try std.fmt.allocPrint(alloc, "https://example.invalid/{s}", .{checksum_name});
     defer alloc.free(checksum_url);
     try std.testing.expectEqualStrings(checksum_url, windows_install.checksums_url);
+}
+
+test "release parser ignores the symbols zip among the release assets" {
+    const alloc = std.testing.allocator;
+    const installer_name = try std.fmt.allocPrint(
+        alloc,
+        "noctty-1.3.133-windows-{s}-setup.exe",
+        .{windowsInstallerArch()},
+    );
+    defer alloc.free(installer_name);
+    const symbols_name = try std.fmt.allocPrint(
+        alloc,
+        "noctty-1.3.133-windows-{s}-symbols.zip",
+        .{windowsInstallerArch()},
+    );
+    defer alloc.free(symbols_name);
+    const checksum_name = windowsChecksumsAssetName();
+    const body = try std.fmt.allocPrint(
+        alloc,
+        \\{{
+        \\  "tag_name": "v1.3.133",
+        \\  "html_url": "https://github.com/amanthanvi/noctty/releases/tag/v1.3.133",
+        \\  "assets": [
+        \\    {{
+        \\      "name": "{s}",
+        \\      "browser_download_url": "https://example.invalid/symbols.zip"
+        \\    }},
+        \\    {{
+        \\      "name": "{s}",
+        \\      "browser_download_url": "https://example.invalid/setup.exe"
+        \\    }},
+        \\    {{
+        \\      "name": "{s}",
+        \\      "browser_download_url": "https://example.invalid/checksums.txt"
+        \\    }}
+        \\  ]
+        \\}}
+    ,
+        .{ symbols_name, installer_name, checksum_name },
+    );
+    defer alloc.free(body);
+
+    var release = try parseLatestStableReleaseResponse(alloc, body);
+    defer release.deinit(alloc);
+
+    try std.testing.expect(release.windows_install != null);
+    const windows_install = release.windows_install.?;
+    try std.testing.expectEqualStrings("https://example.invalid/setup.exe", windows_install.installer_url);
+    try std.testing.expectEqualStrings("https://example.invalid/checksums.txt", windows_install.checksums_url);
+    try std.testing.expect(windows_install.portable_url == null);
 }
 
 test "release parser prefers architecture checksum metadata over legacy x64 metadata" {

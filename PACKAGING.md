@@ -6,9 +6,11 @@ Releases. The public packaging targets are:
 - `noctty-<version>-windows-x64-setup.exe`
 - `noctty-<version>-windows-x64-portable.zip`
 - `noctty-<version>-windows-x64-portable.manifest.ps1`
+- `noctty-<version>-windows-x64-symbols.zip`
 - `noctty-<version>-windows-arm64-setup.exe`
 - `noctty-<version>-windows-arm64-portable.zip`
 - `noctty-<version>-windows-arm64-portable.manifest.ps1`
+- `noctty-<version>-windows-arm64-symbols.zip`
 - `SHA256SUMS-windows-x64.txt`
 - `SHA256SUMS-windows-arm64.txt`
 - `SHA256SUMS.txt` legacy alias for existing x64 auto-update clients
@@ -52,9 +54,42 @@ then produces:
 1. An Inno Setup installer
 2. A portable ZIP
 3. An Authenticode-signed manifest covering every portable payload file
-4. SHA256 checksums for published assets
-5. A release icon asset
-6. Generated package-manager metadata
+4. A symbols ZIP: the PDBs of the shipped binaries, from the same build
+5. SHA256 checksums for published assets
+6. A release icon asset
+7. Generated package-manager metadata
+
+The symbols ZIP holds one `symbols` folder with `noctty.pdb`,
+`noctty-command.pdb` (for `noctty.com`), `ghostty-vt.pdb` and
+`noctty-terminal-handoff-proxy.pdb`. Release builds therefore pass
+`-Dstrip=false` (`scripts/build-package-windows.ps1` does). Left alone,
+that would have grown `noctty.exe` by 2.1 MB and `noctty.com` by 1.4 MB, so
+three things keep the shipped binaries the size of a stripped release: frame
+pointers are still omitted and unwind tables kept (`src/build/Config.zig`);
+`build.zig` adds `-OPT:REF` to lld's `_LINK_` environment variable, because
+lld-link defaults to `/OPT:NOREF` when it writes a PDB and Zig has no COFF
+switch for it (this is the 2 MB of dead code); and release builds panic with
+the message and a trap instead of Zig's default handler (`panic` in
+`src/process_shared.zig`), which would drag std.debug's whole symbolizer into
+any image that keeps debug info (about 114 KB). The PDBs then describe the
+binary users run, and the images are within about 2 KB of a stripped build.
+They are not byte-identical: LLVM generates a few dozen instructions
+differently when it keeps debug info (99 more in a 3.1 million instruction
+`noctty.exe`).
+The PDBs stay out of the portable ZIP and the installer (the packager stages
+an explicit file list). `scripts/symbols-verification.ps1` reads each shipped
+PE's CodeView record and the PDB's info stream and requires the same GUID and
+age; the packager, `scripts/release-verify-artifacts.ps1` (against the ZIP
+that will be published) and `scripts/verify-published-release.ps1` (against the
+downloaded release) all run it, and the symbols ZIP is listed in
+`SHA256SUMS-windows-<arch>.txt` and attested like the other assets. Release
+`SHA256SUMS.txt` is a copy of the x64 file, so it lists the x64 symbols ZIP
+too; the in-app updater looks a file up by name and ignores the extra line.
+Scoop and WinGet read only the setup and portable entries.
+
+Pass `-RequireSymbols` to make a build without symbols fatal; the Release
+workflow always does. Without it, packaging a stripped build warns and omits
+the symbols ZIP.
 
 Local unsigned packaging is allowed for smoke validation, but the GitHub
 Release workflow requires signing and fails closed when signing is absent.
@@ -103,6 +138,12 @@ Then stage release assets:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Version 1.3.100
 ```
+
+The packager builds with `-Dstrip=false`. To package an existing build with
+`-SkipBuild`, build it the same way
+(`zig build -Demit-exe=true -Demit-lib-vt=true -Doptimize=ReleaseFast -Dstrip=false ...`),
+or the symbols ZIP is skipped with a warning (`-RequireSymbols` makes that
+fatal).
 
 The packaging script caches the verified NuGet package outside the source tree
 under `%LOCALAPPDATA%\noctty\cache\conpty\<version>`. A valid cached package is
@@ -263,10 +304,11 @@ Recommended order:
    - portable ZIP
    - `noctty-<version>-windows-x64-portable.manifest.ps1`
    - `noctty-<version>-windows-arm64-portable.manifest.ps1`
+   - `noctty-<version>-windows-<arch>-symbols.zip`
    - `SHA256SUMS-windows-<arch>.txt`
    - legacy x64 `SHA256SUMS.txt`
    - GitHub Release notes/assets
-7. Confirm build provenance for the nine non-icon assets.
+7. Confirm build provenance for the eleven non-icon assets.
 8. Confirm follow-on publishes:
    - Scoop manifest update
    - WinGet submission

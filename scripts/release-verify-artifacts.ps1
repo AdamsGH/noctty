@@ -21,6 +21,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-architecture.ps1')
 . (Join-Path $PSScriptRoot 'signing-trust.ps1')
 . (Join-Path $PSScriptRoot 'portable-manifest-verification.ps1')
+. (Join-Path $PSScriptRoot 'symbols-verification.ps1')
 
 $repoRoot = Get-RepoRoot
 if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
@@ -73,13 +74,19 @@ foreach ($architecture in (Get-WindowsPackageArchitectures)) {
             -Architecture $architecture `
             -Kind manifest
     )
+    $symbols = Join-Path $artifactDirectory (
+        New-WindowsPackageArtifactName `
+            -Version $Version `
+            -Architecture $architecture `
+            -Kind symbols
+    )
     $checksums = Join-Path $artifactDirectory (
         New-WindowsPackageArtifactName `
             -Version $Version `
             -Architecture $architecture `
             -Kind checksums
     )
-    foreach ($path in @($setup, $portable, $manifest, $checksums)) {
+    foreach ($path in @($setup, $portable, $manifest, $symbols, $checksums)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Missing required release asset: $path"
         }
@@ -88,15 +95,16 @@ foreach ($architecture in (Get-WindowsPackageArchitectures)) {
     $checksumEntries = Get-ChecksumEntries -Path $checksums
     $expectedChecksumNames = @(
         [System.IO.Path]::GetFileName($setup),
-        [System.IO.Path]::GetFileName($portable)
+        [System.IO.Path]::GetFileName($portable),
+        [System.IO.Path]::GetFileName($symbols)
     )
     if ($checksumEntries.Count -ne $expectedChecksumNames.Count -or
         @($expectedChecksumNames | Where-Object {
             -not $checksumEntries.Contains($_)
         }).Count -gt 0) {
-        throw "$([System.IO.Path]::GetFileName($checksums)) must contain exactly the setup and portable assets for $architecture."
+        throw "$([System.IO.Path]::GetFileName($checksums)) must contain exactly the setup, portable and symbols assets for $architecture."
     }
-    foreach ($path in @($setup, $portable)) {
+    foreach ($path in @($setup, $portable, $symbols)) {
         $name = [System.IO.Path]::GetFileName($path)
         $hash = Get-FileSha256Lower -Path $path
         if (-not $checksumEntries.Contains($name) -or
@@ -125,6 +133,20 @@ foreach ($architecture in (Get-WindowsPackageArchitectures)) {
         -ManifestPath $manifest `
         -PayloadRoot (Join-Path $extractDirectory 'noctty') `
         -Label "Portable manifest $architecture"
+
+    # The PDBs must belong to the very PEs in the portable ZIP, signed copies
+    # included: the GUID and age live in a debug directory that signing
+    # leaves untouched.
+    $symbolsExtractDirectory = Join-Path $ExtractionRoot "noctty-release-verify-symbols-$architecture"
+    if (Test-Path -LiteralPath $symbolsExtractDirectory) {
+        Remove-Item -LiteralPath $symbolsExtractDirectory -Recurse -Force
+    }
+    [void](Assert-SymbolsArchiveMatchesPortable `
+        -SymbolsZip $symbols `
+        -PayloadRoot (Join-Path $extractDirectory 'noctty') `
+        -ExtractRoot $symbolsExtractDirectory `
+        -Label "Symbols $architecture")
+
     foreach ($relativePath in (Get-WindowsSignedRuntimePayloads)) {
         [void](Assert-ReleaseSignature `
             -Path (Join-Path $extractDirectory $relativePath) `

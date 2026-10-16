@@ -6,11 +6,15 @@ Every release publishes, for `<arch>` = `x64` and `arm64`:
 - `noctty-<version>-windows-<arch>-portable.zip`, the portable build
 - `noctty-<version>-windows-<arch>-portable.manifest.ps1`, signed hashes of
   every file inside the portable ZIP
+- `noctty-<version>-windows-<arch>-symbols.zip` (v1.3.133 and later), the
+  debug symbols for the binaries in the portable ZIP
 - `SHA256SUMS-windows-<arch>.txt`, checksums for the assets above
 
 The installer, the manifest, and the binaries inside the ZIP are
-Authenticode-signed. The ZIP container is not; it is covered by its checksum
-and by GitHub build provenance.
+Authenticode-signed. The ZIP containers are not; they are covered by their
+checksums and by GitHub build provenance. The symbols zip is not executable
+code: the verifier below additionally checks that each PDB in it carries the
+GUID and age of the matching signed binary in the portable ZIP.
 
 Three checks answer three different questions. None replaces another.
 
@@ -48,8 +52,9 @@ gh attestation verify .\noctty-<version>-windows-<arch>-portable.zip `
 The repository verifier runs every check above for a whole release: it
 downloads each asset, compares GitHub digests and checksum entries, verifies
 the provenance attestations, validates the signed portable manifest and its
-payload hashes, and requires that every embedded Authenticode signature come
-from one signer whose public key matches the pin compiled into the updater.
+payload hashes, checks the symbols against the binaries (v1.3.133 and later),
+and requires that every embedded Authenticode signature come from one signer
+whose public key matches the pin compiled into the updater.
 
 It accepts v1.3.124 and later. Run it in PowerShell 7:
 

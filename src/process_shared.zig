@@ -208,6 +208,28 @@ pub const std_options: std.Options = .{
     .logFn = logFn,
 };
 
+/// The `panic` of noctty.exe and noctty.com. Debug and ReleaseSafe keep Zig's
+/// default: the message and a symbolized stack trace. ReleaseFast and
+/// ReleaseSmall print the message and trap, because the default handler pulls
+/// std.debug's whole PDB/DWARF symbolizer into any image that keeps debug
+/// info (-Dstrip=false, which is how the release symbols zip is built): about
+/// 114 KB of .text that a stripped build replaces with "Unable to dump stack
+/// trace: debug info stripped". The trap raises an exception, so the minidump
+/// filter still writes a dump, and the dump is what the symbols zip reads.
+pub const panic = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => std.debug.FullPanic(std.debug.defaultPanic),
+    .ReleaseFast, .ReleaseSmall => std.debug.FullPanic(releasePanic),
+};
+
+fn releasePanic(msg: []const u8, _: ?usize) noreturn {
+    @branchHint(.cold);
+    const stderr = std.fs.File.stderr();
+    stderr.writeAll("panic: ") catch {};
+    stderr.writeAll(msg) catch {};
+    stderr.writeAll("\n") catch {};
+    @trap();
+}
+
 // The attach must never disturb a handle that already works, or redirection
 // (`noctty.exe +version > out.txt`) and the noctty.com launcher would break.
 // The test runner's own stdout is a live handle, so it stands in for both.

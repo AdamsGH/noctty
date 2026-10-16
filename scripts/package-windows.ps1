@@ -13,13 +13,16 @@ param(
 
     [switch]$RequireSigning,
 
-    [switch]$RequireConPty
+    [switch]$RequireConPty,
+
+    [switch]$RequireSymbols
 )
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 . (Join-Path $PSScriptRoot "common.ps1")
 . (Join-Path $PSScriptRoot "windows-architecture.ps1")
+. (Join-Path $PSScriptRoot "symbols-verification.ps1")
 . (Join-Path $PSScriptRoot "signing-trust.ps1")
 . (Join-Path $PSScriptRoot "windows-build-capabilities.ps1")
 . (Join-Path $PSScriptRoot "conpty-redist.ps1")
@@ -47,6 +50,8 @@ $portableRoot = Join-Path $stageBase "noctty"
 $zipPath = Join-Path $stageBase (New-WindowsPackageArtifactName -Version $Version -Architecture $Architecture -Kind portable)
 $manifestPath = Join-Path $stageBase (New-WindowsPackageArtifactName -Version $Version -Architecture $Architecture -Kind manifest)
 $installerPath = Join-Path $stageBase (New-WindowsPackageArtifactName -Version $Version -Architecture $Architecture -Kind setup)
+$symbolsPath = Join-Path $stageBase (New-WindowsPackageArtifactName -Version $Version -Architecture $Architecture -Kind symbols)
+$symbolsRoot = Join-Path $stageBase "symbols"
 $checksumsPath = Join-Path $stageBase (New-WindowsPackageArtifactName -Version $Version -Architecture $Architecture -Kind checksums)
 $releaseIconPath = Join-Path $stageBase "noctty-icon.svg"
 $zigOutBin = Join-Path $repoRoot "zig-out/bin"
@@ -572,7 +577,8 @@ try {
         Push-Location $repoRoot
         try {
             Remove-Item -LiteralPath $buildCapabilitiesPath -Force -ErrorAction SilentlyContinue
-            & zig build -Demit-exe=true -Demit-lib-vt=true -Doptimize=ReleaseFast "-Dtarget=$zigTarget" -Dcpu=baseline -Dcustom-shaders=true "-Dversion-string=$Version"
+            # -Dstrip=false keeps the debug info the symbols zip is made from.
+            & zig build -Demit-exe=true -Demit-lib-vt=true -Doptimize=ReleaseFast -Dstrip=false "-Dtarget=$zigTarget" -Dcpu=baseline -Dcustom-shaders=true "-Dversion-string=$Version"
             if ($LASTEXITCODE -ne 0) {
                 throw "Zig build failed with exit code $LASTEXITCODE."
             }
@@ -719,6 +725,49 @@ try {
         Assert-ValidSignature -PathToCheck $manifestPath -SigningConfig $signingConfig
     }
 
+    # The PDBs come from the same zig build as the staged binaries and stay
+    # out of the portable tree and the installer: they live in a stage
+    # directory of their own and ship as one zip.
+    Write-Host "Packaging phase: create symbols zip"
+    $symbolsProduced = $false
+    if ($null -eq (Get-PeCodeViewIdentity -Path (Join-Path $portableRoot "noctty.exe"))) {
+        $symbolsSkipReason = "noctty.exe has no CodeView record, so this is a stripped build; build with -Dstrip=false."
+        if ($RequireSymbols) {
+            throw "Symbols are required, but $symbolsSkipReason"
+        }
+        Write-Warning "Skipping the symbols zip: $symbolsSkipReason"
+    }
+    else {
+        New-Item -ItemType Directory -Path $symbolsRoot -Force | Out-Null
+        foreach ($binaryName in (Get-WindowsSymbolBinaryNames)) {
+            $identity = Get-PeCodeViewIdentity -Path (Join-Path $portableRoot $binaryName)
+            if ($null -eq $identity) { continue }
+            $pdbSource = Join-Path $zigOutBin $identity.PdbName
+            if (-not (Test-Path -LiteralPath $pdbSource -PathType Leaf)) {
+                throw "Expected build output was not found: $pdbSource (named by $binaryName)."
+            }
+            Copy-Item -LiteralPath $pdbSource -Destination (Join-Path $symbolsRoot $identity.PdbName) -Force
+        }
+        $symbolEvidence = Assert-SymbolsMatchBinaries `
+            -SymbolsRoot $symbolsRoot `
+            -PayloadRoot $portableRoot `
+            -Label "Symbols $Architecture"
+        foreach ($item in $symbolEvidence) {
+            Write-Host ("Symbols match: {0} <- {1} (GUID {2}, age {3})" -f $item.Binary, $item.Pdb, $item.Guid, $item.Age)
+        }
+        if (Test-Path -LiteralPath $symbolsPath) {
+            Remove-Item -LiteralPath $symbolsPath -Force
+        }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $symbolsRoot,
+            $symbolsPath,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $true
+        )
+        Remove-TreeIfPresent -PathToRemove $symbolsRoot
+        $symbolsProduced = $true
+    }
+
     Write-Host "Packaging phase: build installer"
     $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
     if (-not $iscc) {
@@ -778,6 +827,13 @@ try {
         }
     }
 
+    if ($symbolsProduced) {
+        $hashTargets += @{
+            Name = [System.IO.Path]::GetFileName($symbolsPath)
+            Path = $symbolsPath
+        }
+    }
+
     $hashLines = foreach ($target in $hashTargets) {
         $hash = Get-FileSha256Lower -Path $target.Path
         "$hash *$($target.Name)"
@@ -789,6 +845,9 @@ try {
     Write-Host "Manifest    : $manifestPath"
     if (Test-Path -LiteralPath $installerPath) {
         Write-Host "Installer    : $installerPath"
+    }
+    if ($symbolsProduced) {
+        Write-Host "Symbols      : $symbolsPath"
     }
     Write-Host "Checksums    : $checksumsPath"
 }

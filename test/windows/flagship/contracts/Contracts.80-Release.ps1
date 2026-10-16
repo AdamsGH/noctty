@@ -61,7 +61,7 @@ $releasePreflightStepSha256 =
 $readinessPreflightStepSha256 =
     '153aa1d2b13ac09f38ba3269bc78840e57a93c98e54b99168a5d937b8dab7989'
 $releaseWorkflowSha256 =
-    'd2225c101d9dbabcb19b24a390a373b95b2d33a4143c5be462ddf17ab040c49d'
+    '72ea2f529573b098452bbc6941c4c7e80fe0cc0eeb1ff7da34fe784338777cdf'
 $readinessWorkflowSha256 =
     'f27f5559902fdb83ca8f2c7e93e3175c8363dc6094599d760b2d760b1164c9db'
 # Full-file pins deliberately make every workflow edit a semantic-review event,
@@ -1389,10 +1389,12 @@ $expectedAttestationSubjects = @(
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-x64/noctty-${{ steps.meta.outputs.version }}-windows-x64-setup.exe',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-x64/noctty-${{ steps.meta.outputs.version }}-windows-x64-portable.zip',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-x64/noctty-${{ steps.meta.outputs.version }}-windows-x64-portable.manifest.ps1',
+    'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-x64/noctty-${{ steps.meta.outputs.version }}-windows-x64-symbols.zip',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-x64/SHA256SUMS-windows-x64.txt',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-arm64/noctty-${{ steps.meta.outputs.version }}-windows-arm64-setup.exe',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-arm64/noctty-${{ steps.meta.outputs.version }}-windows-arm64-portable.zip',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-arm64/noctty-${{ steps.meta.outputs.version }}-windows-arm64-portable.manifest.ps1',
+    'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-arm64/noctty-${{ steps.meta.outputs.version }}-windows-arm64-symbols.zip',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-arm64/SHA256SUMS-windows-arm64.txt',
     'dist/artifacts/noctty-${{ steps.meta.outputs.version }}-windows-x64/SHA256SUMS.txt'
 )
@@ -1408,11 +1410,11 @@ $actualAttestationSubjects = @(
         ForEach-Object { $_.Trim() } |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 )
-if ($actualAttestationSubjects.Count -ne 9 -or
+if ($actualAttestationSubjects.Count -ne 11 -or
     @($expectedAttestationSubjects | Where-Object { $_ -notin $actualAttestationSubjects }).Count -gt 0 -or
     @($actualAttestationSubjects | Where-Object { $_ -notin $expectedAttestationSubjects }).Count -gt 0 -or
     $releaseAttestationStep.Contains('noctty-icon.svg', [StringComparison]::Ordinal)) {
-    throw 'Release attestation subjects must be exactly the nine non-icon published assets.'
+    throw 'Release attestation subjects must be exactly the eleven non-icon published assets.'
 }
 $releaseGithubPublisher = Join-Path $repoRoot 'scripts\release-publish-github.ps1'
 $releaseGithubPublisherText = Get-Content -LiteralPath $releaseGithubPublisher -Raw
@@ -1446,7 +1448,7 @@ $protectedReleaseScriptSpecs = @(
         Context = $releaseGithubPublisher
         Content = $releaseGithubPublisherText
         ExpectedSha256 =
-            '704f06449994762ac43977a7e01005c5b335bc2e06d0e6bdc89c1af76541b173'
+            'f529c6f226f88dd456f057f8603a24ef731099435da571e710a1e3763f1cf004'
         CriticalStatement = '& gh release view $Tag --repo $Repository *> $null'
     }
     [pscustomobject] @{
@@ -1764,14 +1766,14 @@ $checksumMembershipIndex = $releaseArtifactVerifierText.IndexOf(
     [StringComparison]::Ordinal
 )
 $checksumHashLoopIndex = $releaseArtifactVerifierText.IndexOf(
-    'foreach ($path in @($setup, $portable))',
+    'foreach ($path in @($setup, $portable, $symbols))',
     [StringComparison]::Ordinal
 )
 if ($releaseArtifactVerifierText -notmatch
-        '(?ms)\$expectedChecksumNames = @\(.*?GetFileName\(\$setup\).*?GetFileName\(\$portable\).*?\$checksumEntries\.Count -ne \$expectedChecksumNames\.Count.*?Where-Object\s*\{\s*-not \$checksumEntries\.Contains\(\$_\)' -or
+        '(?ms)\$expectedChecksumNames = @\(.*?GetFileName\(\$setup\).*?GetFileName\(\$portable\).*?GetFileName\(\$symbols\).*?\$checksumEntries\.Count -ne \$expectedChecksumNames\.Count.*?Where-Object\s*\{\s*-not \$checksumEntries\.Contains\(\$_\)' -or
     $checksumMembershipIndex -lt 0 -or
     $checksumHashLoopIndex -le $checksumMembershipIndex) {
-    throw 'Local artifact verification must require exactly the setup and portable checksum entries before comparing hashes.'
+    throw 'Local artifact verification must require exactly the setup, portable and symbols checksum entries before comparing hashes.'
 }
 if ($releaseGithubPublisherText -notmatch
         '(?m)^\s*& gh release edit \$Tag --repo \$Repository --title \$Title "--prerelease=\$Prerelease" @latestArgs\s*$') {
@@ -1900,6 +1902,6 @@ Invoke-ContractTable -Contracts @(
         Content = { $releaseWorkflowText }
         Pattern = '(?ms)^    permissions:.*?contents: write.*?actions: read.*?id-token: write.*?attestations: write.*?Prepare build provenance attestation.*?ATTEST_REPOSITORY.*?amanthanvi/noctty.*?ACTIONS_ID_TOKEN_REQUEST_URL.*?ACTIONS_ID_TOKEN_REQUEST_TOKEN.*?Attest published release artifacts.*?actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8.*?portable\.manifest\.ps1.*?SHA256SUMS\.txt'
         Kind = 'Text'
-        Description = 'release provenance is job-scoped, canonical-repository guarded, pinned, and covers the nine non-icon assets'
+        Description = 'release provenance is job-scoped, canonical-repository guarded, pinned, and covers the eleven non-icon assets'
     }
 )

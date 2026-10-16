@@ -13,6 +13,7 @@ install_step: *std.Build.Step.InstallArtifact,
 /// Console launcher that shells resolve before noctty.exe.
 command_exe: ?*std.Build.Step.Compile = null,
 command_install_step: ?*std.Build.Step.InstallFile = null,
+command_pdb_install_step: ?*std.Build.Step.InstallFile = null,
 
 /// `noctty.ico` next to the exe. The AUMID registration points the toast
 /// `IconUri` at it (src/apprt/win32_aumid.zig), and the packaging script
@@ -28,7 +29,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             .target = cfg.target,
             .optimize = cfg.optimize,
             .strip = cfg.strip,
-            .omit_frame_pointer = cfg.strip,
+            .omit_frame_pointer = cfg.omit_frame_pointer,
             // Kept when stripped. On x64 Windows these are the .pdata/.xdata
             // records a debugger unwinds with; a function without one is
             // taken for a leaf, so a minidump's stacks stop making sense at
@@ -42,6 +43,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     const install_step = b.addInstallArtifact(exe, .{});
     var command_exe: ?*std.Build.Step.Compile = null;
     var command_install_step: ?*std.Build.Step.InstallFile = null;
+    var command_pdb_install_step: ?*std.Build.Step.InstallFile = null;
     var icon_install_step: ?*std.Build.Step.InstallFile = null;
 
     // Set PIE if requested
@@ -64,7 +66,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                     .target = cfg.target,
                     .optimize = cfg.optimize,
                     .strip = cfg.strip,
-                    .omit_frame_pointer = cfg.strip,
+                    .omit_frame_pointer = cfg.omit_frame_pointer,
                     .unwind_tables = .sync,
                 }),
                 .use_llvm = true,
@@ -73,6 +75,12 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             _ = try deps.add(command);
             command_exe = command;
             command_install_step = b.addInstallBinFile(command.getEmittedBin(), "noctty.com");
+            // The compiled name is noctty-command, so noctty.com's CodeView
+            // record asks for noctty-command.pdb. Installing the exe alone
+            // would leave that PDB in the build cache.
+            if (command.producesPdbFile()) {
+                command_pdb_install_step = b.addInstallBinFile(command.getEmittedPdb(), "noctty-command.pdb");
+            }
             icon_install_step = b.addInstallBinFile(b.path("dist/windows/noctty.ico"), "noctty.ico");
         },
 
@@ -84,6 +92,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         .install_step = install_step,
         .command_exe = command_exe,
         .command_install_step = command_install_step,
+        .command_pdb_install_step = command_pdb_install_step,
         .icon_install_step = icon_install_step,
     };
 }
@@ -93,6 +102,7 @@ pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
     if (self.command_install_step) |step| b.getInstallStep().dependOn(&step.step);
+    if (self.command_pdb_install_step) |step| b.getInstallStep().dependOn(&step.step);
     if (self.icon_install_step) |step| b.getInstallStep().dependOn(&step.step);
 }
 

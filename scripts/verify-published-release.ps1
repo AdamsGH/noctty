@@ -17,10 +17,12 @@ $repository = if ([string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) {
 }
 $firstAttestedVersion = [version]'1.3.124'
 $firstPortableManifestVersion = [version]'1.3.124'
+$firstSymbolsVersion = [version]'1.3.133'
 $minimumGhAttestationVersion = [version]'2.93.0'
 . (Join-Path $PSScriptRoot 'windows-architecture.ps1')
 . (Join-Path $PSScriptRoot 'signing-trust.ps1')
 . (Join-Path $PSScriptRoot 'portable-manifest-verification.ps1')
+. (Join-Path $PSScriptRoot 'symbols-verification.ps1')
 
 function Test-GhAttestationAvailable {
     $versionOutput = @(& gh --version 2>&1)
@@ -104,6 +106,7 @@ if ($release.tagName -ne $tag -or $release.isDraft -or $release.isPrerelease) {
 $releaseVersion = [version]$Version
 $requiresAttestation = ($releaseVersion -ge $firstAttestedVersion)
 $requiresPortableManifests = ($releaseVersion -ge $firstPortableManifestVersion)
+$requiresSymbols = ($releaseVersion -ge $firstSymbolsVersion)
 $verifyAttestations = if ($requiresAttestation) {
     Test-GhAttestationAvailable
 } else {
@@ -118,12 +121,18 @@ foreach ($architecture in (Get-WindowsPackageArchitectures)) {
     if ($requiresPortableManifests) {
         $expectedNames.Add((New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind manifest))
     }
+    if ($requiresSymbols) {
+        $expectedNames.Add((New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind symbols))
+    }
     $expectedNames.Add((New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind checksums))
 }
 $expectedNames.Add((New-WindowsPackageArtifactName -Version $Version -Architecture x64 -Kind legacy-checksums))
 $expectedNames.Add('noctty-icon.svg')
 $expectedAttestationNames = @($expectedNames | Where-Object { $_ -ne 'noctty-icon.svg' })
 $expectedAssetCount = if ($requiresPortableManifests) { 10 } else { 8 }
+if ($requiresSymbols) { $expectedAssetCount += 2 }
+# Everything but the static icon is attested.
+$expectedAttestationCount = $expectedAssetCount - 1
 if ($expectedNames.Count -ne $expectedAssetCount) {
     throw "Published release contract must require exactly $expectedAssetCount assets; generated $($expectedNames.Count)."
 }
@@ -186,9 +195,9 @@ try {
         }
     }
     if ($verifyAttestations -and
-        ($expectedAttestationNames.Count -ne 9 -or
+        ($expectedAttestationNames.Count -ne $expectedAttestationCount -or
          $attestationEvidenceCount -ne $expectedAttestationNames.Count)) {
-        throw "Published release must contain exactly nine verified build provenance attestations; found $attestationEvidenceCount."
+        throw "Published release must contain exactly $expectedAttestationCount verified build provenance attestations; found $attestationEvidenceCount."
     }
 
     $legacyPath = Join-Path $DownloadDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture x64 -Kind legacy-checksums)
@@ -205,12 +214,14 @@ try {
         $setupName = New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind setup
         $portableName = New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind portable
         $manifestName = New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind manifest
+        $symbolsName = New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind symbols
         $checksumsName = New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind checksums
         $checksums = Get-ChecksumEntries -Path (Join-Path $DownloadDirectory $checksumsName)
         $expectedChecksumNames = @($setupName, $portableName)
+        if ($requiresSymbols) { $expectedChecksumNames += $symbolsName }
         if ($checksums.Count -ne $expectedChecksumNames.Count -or
             @($expectedChecksumNames | Where-Object { -not $checksums.Contains($_) }).Count -gt 0) {
-            throw "$checksumsName must contain exactly the setup and portable assets for $architecture."
+            throw "$checksumsName must contain exactly the $($expectedChecksumNames.Count) expected assets for ${architecture}: $($expectedChecksumNames -join ', ')."
         }
         foreach ($name in $expectedChecksumNames) {
             $actualHash = Get-FileSha256Lower -Path (Join-Path $DownloadDirectory $name)
@@ -239,6 +250,13 @@ try {
                 -ManifestPath (Join-Path $DownloadDirectory $manifestName) `
                 -PayloadRoot (Join-Path $extractDirectory 'noctty') `
                 -Label "Portable manifest $architecture"
+        }
+        if ($requiresSymbols) {
+            [void](Assert-SymbolsArchiveMatchesPortable `
+                -SymbolsZip (Join-Path $DownloadDirectory $symbolsName) `
+                -PayloadRoot (Join-Path $extractDirectory 'noctty') `
+                -ExtractRoot (Join-Path $DownloadDirectory "extract-symbols-$architecture") `
+                -Label "Symbols $architecture")
         }
         # Microsoft's bundled ConPTY pair is intentionally outside
         # Get-WindowsSignedRuntimePayloads: it is never re-signed by us, so it

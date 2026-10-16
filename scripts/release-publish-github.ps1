@@ -82,6 +82,7 @@ foreach ($architecture in $architectures) {
         (Join-Path $artifactDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind setup)),
         (Join-Path $artifactDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind portable)),
         (Join-Path $artifactDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind manifest)),
+        (Join-Path $artifactDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind symbols)),
         (Join-Path $artifactDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind checksums))
     )
 }

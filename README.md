@@ -128,7 +128,11 @@ any folder without installing.
 Each release also includes signed manifests of the portable ZIP contents
 (`noctty-1.3.132-windows-x64-portable.manifest.ps1` and
 `noctty-1.3.132-windows-arm64-portable.manifest.ps1`) and `SHA256SUMS.txt`, an
-alias of the x64 checksum file kept for older auto-update clients.
+alias of the x64 checksum file kept for older auto-update clients. Newer
+releases also publish a symbols zip per architecture,
+`noctty-<version>-windows-<arch>-symbols.zip`, for reading crash dumps;
+[docs/windows.md](docs/windows.md#crash-reports-and-diagnostics) says which
+releases have it.
 
 Scoop puts `noctty` on your `PATH`. WinGet runs the installer, and neither the
 installer nor the portable ZIP adds it.

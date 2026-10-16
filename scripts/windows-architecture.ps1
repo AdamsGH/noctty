@@ -90,7 +90,7 @@ function New-WindowsPackageArtifactName {
     param(
         [string]$Version,
         [string]$Architecture,
-        [ValidateSet("portable", "manifest", "setup", "checksums", "legacy-checksums")]
+        [ValidateSet("portable", "manifest", "setup", "symbols", "checksums", "legacy-checksums")]
         [string]$Kind
     )
 
@@ -99,6 +99,7 @@ function New-WindowsPackageArtifactName {
         "portable" { return "noctty-$Version-windows-$arch-portable.zip" }
         "manifest" { return "noctty-$Version-windows-$arch-portable.manifest.ps1" }
         "setup" { return "noctty-$Version-windows-$arch-setup.exe" }
+        "symbols" { return "noctty-$Version-windows-$arch-symbols.zip" }
         "checksums" { return "SHA256SUMS-windows-$arch.txt" }
         "legacy-checksums" { return "SHA256SUMS.txt" }
     }
