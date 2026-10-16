@@ -24588,7 +24588,7 @@ const RestoredTerminalUndoState = struct {
     scrollbar: terminal.Scrollbar = .zero,
 };
 
-const undo_snapshot_magic = "WUH2";
+const undo_snapshot_magic = "WUH3";
 
 fn sessionScrollbackLineAllowed(line: []const u8) bool {
     const view = std.unicode.Utf8View.init(line) catch return false;
@@ -24857,6 +24857,17 @@ fn restoreTerminalScrollbackSnapshot(
     return restored_lines;
 }
 
+fn terminalUndoTrailingBlankRows(terminal_state: *const terminal.Terminal) usize {
+    var rows: usize = 0;
+    var it = terminal_state.screens.active.pages.getBottomRight(.screen).?.rowIterator(.left_up, null);
+    while (it.next()) |pin| {
+        // Match the formatter's trailing-row trimming predicate.
+        if (terminal.page.Cell.hasTextAny(pin.cells(.all))) break;
+        rows += 1;
+    }
+    return rows;
+}
+
 fn captureTerminalUndoStateBytes(
     alloc: Allocator,
     terminal_state: *const terminal.Terminal,
@@ -24884,11 +24895,12 @@ fn captureTerminalUndoStateBytes(
     try buf.writer.writeInt(u32, @intCast(title.len), .little);
     try buf.writer.writeInt(u32, @intCast(pwd.len), .little);
     try buf.writer.writeInt(u32, terminal_state.cols, .little);
-    // The formatter trims trailing blank rows. With scrollback, replay
-    // can therefore place the cursor's content below its saved screen row.
-    // Keep its absolute line so shifted undo aligns the content too.
-    try buf.writer.writeInt(u64, terminal_state.screens.active.pages.total_rows -
-        terminal_state.rows + terminal_state.screens.active.cursor.y, .little);
+    // The formatter trims trailing blank rows, and replay may prune older
+    // history at different page boundaries. Anchor the cursor to the last
+    // text row so neither changes which content is shifted to the live row.
+    try buf.writer.writeInt(i64, @as(i64, terminal_state.screens.active.cursor.y) -
+        @as(i64, terminal_state.rows - 1) +
+        @as(i64, @intCast(terminalUndoTrailingBlankRows(terminal_state))), .little);
     try buf.writer.writeAll(title);
     try buf.writer.writeAll(pwd);
     try buf.writer.writeAll(vt_bytes);
@@ -24973,6 +24985,52 @@ test "win32 terminal undo keeps alternate screen rows while preserving the live 
     try std.testing.expect(std.mem.startsWith(u8, active, "one\ntwo\nthree\nfour"));
 }
 
+test "win32 terminal undo anchors a cursor above or below the last text row" {
+    const alloc = std.testing.allocator;
+    for ([_]terminal.size.CellCountInt{ 1, 5 }) |saved_y| {
+        var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 6 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+        t.screens.active.cursorAbsolute(0, saved_y);
+        const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+        defer alloc.free(snapshot);
+        t.fullReset();
+        _ = restoreTerminalUndoState(&t, snapshot, true);
+        const row = t.screens.active.cursor.page_row;
+        const cells = t.screens.active.cursor.page_pin.node.data.getCells(row);
+        try std.testing.expectEqual(@as(u21, if (saved_y == 1) 't' else 0), cells[0].codepoint());
+        try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+    }
+}
+
+test "win32 terminal undo aligns content after replay prunes history" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 5, .max_scrollback = 16 * 1024 * 1024 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    const history_lines = @as(usize, t.screens.active.pages.pages.first.?.data.capacity.rows) * 4;
+    for (0..history_lines) |_| stream.nextSlice("history\r\n");
+    stream.nextSlice("\x1b[4;1H\x1b[Jprompt");
+    const captured_rows = t.screens.active.pages.total_rows;
+    try std.testing.expect(captured_rows > history_lines);
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+    // Replay can retain fewer history rows due to page packing at the cap.
+    // A smaller cap makes that pruning deterministic without relying on a
+    // particular page's style/grapheme allocation layout.
+    t.screens.active.pages.explicit_max_size = 0;
+    t.fullReset();
+    _ = restoreTerminalUndoState(&t, snapshot, true);
+    try std.testing.expect(t.screens.active.pages.total_rows < captured_rows);
+    const row = t.screens.active.cursor.page_row;
+    const cells = t.screens.active.cursor.page_pin.node.data.getCells(row);
+    try std.testing.expectEqual(@as(u21, 'p'), cells[0].codepoint());
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+}
+
 test "win32 terminal undo aligns content with scrollback and trailing blank rows" {
     const alloc = std.testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 5 });
@@ -25004,13 +25062,13 @@ fn restoreTerminalUndoState(
     var title_bytes: []const u8 = "";
     var pwd_bytes: []const u8 = "";
     var vt_bytes = state_bytes;
-    var cursor_line: ?u64 = null;
+    var cursor_from_last_text: ?i64 = null;
     if (state_bytes.len >= 24 and std.mem.eql(u8, state_bytes[0..4], undo_snapshot_magic)) {
         const title_len: usize = std.mem.readInt(u32, state_bytes[4..8], .little);
         const pwd_len: usize = std.mem.readInt(u32, state_bytes[8..12], .little);
         const captured_cols = std.mem.readInt(u32, state_bytes[12..16], .little);
         if (captured_cols == terminal_state.cols) {
-            cursor_line = std.mem.readInt(u64, state_bytes[16..24], .little);
+            cursor_from_last_text = std.mem.readInt(i64, state_bytes[16..24], .little);
         }
         const title_start = 24;
         const pwd_start = title_start + title_len;
@@ -25031,11 +25089,11 @@ fn restoreTerminalUndoState(
         // move the saved cursor's row to the live row, with displaced rows
         // above the screen retained in scrollback. Ignore the snapshot's
         // margins while shifting the whole screen, then put them back.
-        const history_rows = terminal_state.screens.active.pages.total_rows - terminal_state.rows;
-        const saved_y = if (cursor_line) |line|
-            line -| history_rows
-        else
-            terminal_state.screens.active.cursor.y;
+        const saved_y: u64 = if (cursor_from_last_text) |offset| row: {
+            const last_text_y = @as(i64, terminal_state.rows - 1) -
+                @as(i64, @intCast(terminalUndoTrailingBlankRows(terminal_state)));
+            break :row @intCast(@max(0, last_text_y + offset));
+        } else terminal_state.screens.active.cursor.y;
         const region = terminal_state.scrolling_region;
         terminal_state.scrolling_region = .{
             .top = 0,
