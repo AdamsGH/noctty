@@ -1257,6 +1257,7 @@ test "metrics" {
         .overline_position = 0,
         .overline_thickness = 2,
         .box_thickness = 2,
+        .cursor_thickness = 2,
         .cursor_height = 34,
         .icon_height = 33.568,
         .icon_height_single = 24.48,

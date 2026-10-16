@@ -381,9 +381,10 @@ pub const Message = union(enum) {
     start_command,
 
     /// A command has finished in the shell, stop the timer and send out
-    /// notifications as appropriate. The optional u8 is the exit code
-    /// of the command.
-    stop_command: ?u8,
+    /// notifications as appropriate. The optional i32 is the exit code
+    /// of the command. Windows exit codes are 32 bits wide (NTSTATUS
+    /// crashes, installer codes), so nothing narrower can carry them.
+    stop_command: ?i32,
 
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,

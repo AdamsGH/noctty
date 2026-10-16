@@ -2710,18 +2710,15 @@ pub fn scroll(self: *PageList, behavior: Scroll) void {
             if (n < midpoint) {
                 // Iterate forward from the first node.
                 var node_it = self.pages.first;
-                var rem: size.CellCountInt = std.math.cast(
-                    size.CellCountInt,
-                    n,
-                ) orelse {
-                    self.viewport = .active;
-                    break :row;
-                };
+                var rem: usize = n;
                 while (node_it) |node| : (node_it = node.next) {
                     if (rem < node.data.size.rows) {
                         self.viewport_pin.* = .{
                             .node = node,
-                            .y = rem,
+                            .y = std.math.cast(size.CellCountInt, rem) orelse {
+                                self.viewport = .active;
+                                break :row;
+                            },
                         };
                         break :row;
                     }
@@ -2731,18 +2728,15 @@ pub fn scroll(self: *PageList, behavior: Scroll) void {
             } else {
                 // Iterate backwards from the last node.
                 var node_it = self.pages.last;
-                var rem: size.CellCountInt = std.math.cast(
-                    size.CellCountInt,
-                    self.total_rows - n,
-                ) orelse {
-                    self.viewport = .active;
-                    break :row;
-                };
+                var rem: usize = self.total_rows - n;
                 while (node_it) |node| : (node_it = node.prev) {
                     if (rem <= node.data.size.rows) {
                         self.viewport_pin.* = .{
                             .node = node,
-                            .y = node.data.size.rows - rem,
+                            .y = std.math.cast(size.CellCountInt, node.data.size.rows - rem) orelse {
+                                self.viewport = .active;
+                                break :row;
+                            },
                         };
                         break :row;
                     }
@@ -6643,6 +6637,36 @@ test "PageList scroll to row in scrollback" {
         .offset = 5,
         .len = s.rows,
     }, s.scrollbar());
+}
+
+test "PageList scroll to row far from both ends of a long scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // More than 2 * 65535 rows, so a row near the middle is further than a
+    // u16 can count from the top and from the bottom. A scrollbar drag lands
+    // here, and used to snap the viewport to the active area instead.
+    var s = try init(alloc, 10, 24, null);
+    defer s.deinit();
+    try s.growRows(150_000);
+
+    // 70_000 and 66_000 are past 65535 from the top (the forward walk),
+    // 80_000 and the midpoint are past it from the bottom (the backward
+    // walk). Scrolling to the top first keeps each one off the shortcut
+    // a viewport that is already pinned takes, which never reaches either.
+    for ([_]usize{ s.total_rows / 2, 70_000, 80_000, 66_000, 100_000 }) |target| {
+        s.scroll(.top);
+        s.scroll(.{ .row = target });
+        try testing.expect(s.viewport == .pin);
+        try testing.expectEqual(Scrollbar{
+            .total = s.total_rows,
+            .offset = target,
+            .len = s.rows,
+        }, s.scrollbar());
+        // `Cell.screenPoint` counts rows in a u16, so ask the list.
+        const pt = s.pointFromPin(.screen, s.getTopLeft(.viewport)).?;
+        try testing.expectEqual(@as(u32, @intCast(target)), pt.screen.y);
+    }
 }
 
 test "PageList scroll to row in middle" {

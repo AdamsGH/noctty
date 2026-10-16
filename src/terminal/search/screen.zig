@@ -1028,7 +1028,7 @@ pub const ScreenSearch = struct {
 
         const active_len = self.active_results.items.len;
         const history_len = self.history_results.items.len;
-        const next_idx = if (prev.idx != 0) prev.idx - 1 else active_len - 1 + history_len;
+        const next_idx = if (prev.idx != 0) prev.idx - 1 else active_len + history_len - 1;
 
         const hl: FlattenedHighlight = if (next_idx < active_len)
             self.active_results.items[active_len - 1 - next_idx]
@@ -1659,6 +1659,41 @@ test "select prev with history" {
             .y = 1,
         } }, t.screens.active.pages.pointFromPin(.active, sel.end).?);
     }
+}
+
+test "select prev wraps when every match is in history" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(alloc, .{
+        .cols = 10,
+        .rows = 2,
+        .max_scrollback = std.math.maxInt(usize),
+    });
+    defer t.deinit(alloc);
+    const list: *PageList = &t.screens.active.pages;
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The only match scrolls into history and the active area has none, so
+    // wrapping from the first match computed `active_len - 1` on zero.
+    s.nextSlice("Fizz\r\n");
+    while (list.totalPages() < 3) s.nextSlice("\r\n");
+    for (0..list.rows) |_| s.nextSlice("\r\n");
+    s.nextSlice("Buzz.");
+
+    var search: ScreenSearch = try .init(alloc, t.screens.active, "Fizz");
+    defer search.deinit();
+    try search.searchAll();
+    try testing.expectEqual(@as(usize, 0), search.active_results.items.len);
+    try testing.expectEqual(@as(usize, 1), search.history_results.items.len);
+
+    _ = try search.select(.prev);
+    _ = try search.select(.prev);
+    const sel = search.selectedMatch().?.untracked();
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 0,
+    } }, t.screens.active.pages.pointFromPin(.screen, sel.start).?);
 }
 
 test "screen search no scrollback has no history" {

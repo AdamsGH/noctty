@@ -284,6 +284,116 @@ test "termio output trace aggregates Windows PTY hot-path timings in memory" {
     try std.testing.expectEqual(@as(u64, 37), trace.renderer_mutex_hold_max_ns);
 }
 
+/// Whether any handle to `path` is still open, measured by asking for the
+/// file with no sharing at all: that fails while another handle exists.
+fn fileHeldOpen(alloc: Allocator, path: []const u8) !bool {
+    const k32 = windows.kernel32;
+    const path_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(path_w);
+    const h = k32.CreateFileW(
+        path_w.ptr,
+        windows.GENERIC_READ,
+        0,
+        null,
+        windows.OPEN_EXISTING,
+        windows.FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (h == windows.INVALID_HANDLE_VALUE) {
+        return k32.GetLastError() == .SHARING_VIOLATION;
+    }
+    _ = windows.CloseHandle(h);
+    return false;
+}
+
+test "termio input files are closed after prepareInput fails part way" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "first.txt", .data = "one" });
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const first = try std.fs.path.join(alloc, &.{ dir, "first.txt" });
+    defer alloc.free(first);
+    const missing = try std.fs.path.join(alloc, &.{ dir, "missing.txt" });
+    defer alloc.free(missing);
+
+    var state: ThreadEnterState = .{
+        .arena = ArenaAllocator.init(alloc),
+        .input = .{},
+    };
+    defer state.destroy();
+    const arena_alloc = state.arena.allocator();
+    try state.input.list.append(arena_alloc, .{ .path = try arena_alloc.dupeZ(u8, first) });
+    try state.input.list.append(arena_alloc, .{ .path = try arena_alloc.dupeZ(u8, missing) });
+
+    // Positive control: the probe sees a handle that is open.
+    {
+        const held = try std.fs.openFileAbsolute(first, .{});
+        defer held.close();
+        try testing.expect(try fileHeldOpen(alloc, first));
+    }
+
+    try testing.expectError(error.InputNotFound, state.prepareInput());
+    try testing.expect(!try fileHeldOpen(alloc, first));
+}
+
+test "termio input files are closed and read buffers freed once queued" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.txt", .data = "echo hi\r" });
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "in.txt" });
+    defer alloc.free(path);
+
+    var state: ThreadEnterState = .{
+        .arena = ArenaAllocator.init(alloc),
+        .input = .{},
+    };
+    defer state.destroy();
+    const arena_alloc = state.arena.allocator();
+    try state.input.list.append(arena_alloc, .{ .path = try arena_alloc.dupeZ(u8, path) });
+    const inputs = try state.prepareInput();
+    try testing.expect(try fileHeldOpen(alloc, path));
+
+    // An exited process drops writes, which is all the queueing needs to
+    // run: the testing allocator then fails the test if the buffer the
+    // file was read into is not freed.
+    var td: ThreadData = .{
+        .alloc = alloc,
+        .loop = undefined,
+        .renderer_state = undefined,
+        .surface_mailbox = undefined,
+        .backend = .{ .exec = .{
+            .start = undefined,
+            .exited = true,
+            .write_stream = undefined,
+            .process = null,
+            .read_thread = undefined,
+            .read_thread_pipe = undefined,
+            .read_thread_fd = undefined,
+            .stopping = undefined,
+            .termios_timer = undefined,
+            .write_pool = .init(alloc),
+        } },
+        .mailbox = undefined,
+    };
+    defer td.backend.exec.write_pool.deinit();
+    var io: Termio = undefined;
+    io.alloc = alloc;
+    io.backend = .{ .exec = undefined };
+    try io.queueInputs(&td, inputs);
+
+    ThreadEnterState.closeInputs(inputs);
+    try testing.expect(!try fileHeldOpen(alloc, path));
+}
+
 test {
     // The benchmark end-marker matcher lives in its own module so the
     // benchmark boundary is visible in the file list, not buried in
@@ -408,6 +518,10 @@ const ThreadEnterState = struct {
             Input,
             self.input.list.items.len,
         );
+        // The arena frees memory but never closes a handle, so a failure
+        // part way through must close the files already opened.
+        var opened: usize = 0;
+        errdefer closeInputs(input[0..opened]);
         for (self.input.list.items, 0..) |item, i| {
             input[i] = switch (item) {
                 .raw => |v| .{ .string = try alloc.dupe(u8, v) },
@@ -426,9 +540,18 @@ const ThreadEnterState = struct {
                     break :file .{ .file = f };
                 },
             };
+            opened = i + 1;
         }
 
         return input;
+    }
+
+    /// Close the files `prepareInput` opened.
+    fn closeInputs(inputs: []const Input) void {
+        for (inputs) |input| switch (input) {
+            .string => {},
+            .file => |f| f.close(),
+        };
     }
 
     const Input = union(enum) {
@@ -648,6 +771,7 @@ pub fn threadEnter(
         try v.prepareInput()
     else
         null;
+    defer if (inputs) |v| ThreadEnterState.closeInputs(v);
 
     data.* = .{
         .alloc = self.alloc,
@@ -663,24 +787,34 @@ pub fn threadEnter(
     errdefer self.backend.threadExit(data);
 
     // If we have inputs, then queue them all up.
-    for (inputs orelse &.{}) |input| switch (input) {
+    try self.queueInputs(data, inputs orelse &.{});
+}
+
+/// Queue the prepared inputs for the subprocess. The backend copies what
+/// it is given, so the buffer an input file is read into is ours to free.
+fn queueInputs(
+    self: *Termio,
+    data: *ThreadData,
+    inputs: []const ThreadEnterState.Input,
+) !void {
+    for (inputs) |input| switch (input) {
         .string => |v| self.queueWrite(data, v, false) catch |err| {
             log.warn("failed to queue input string err={}", .{err});
             return error.InputFailed;
         },
-        .file => |f| self.queueWrite(
-            data,
-            f.readToEndAlloc(
+        .file => |f| {
+            const bytes = f.readToEndAlloc(
                 self.alloc,
                 10 * 1024 * 1024, // 10 MiB max
             ) catch |err| {
                 log.warn("failed to read input file err={}", .{err});
                 return error.InputFailed;
-            },
-            false,
-        ) catch |err| {
-            log.warn("failed to queue input file err={}", .{err});
-            return error.InputFailed;
+            };
+            defer self.alloc.free(bytes);
+            self.queueWrite(data, bytes, false) catch |err| {
+                log.warn("failed to queue input file err={}", .{err});
+                return error.InputFailed;
+            };
         },
     };
 }
