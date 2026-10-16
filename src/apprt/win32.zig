@@ -32684,15 +32684,14 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, flags | c.SWP_NOMOVE | c.SWP_NOSIZE);
                 }
 
-                // Each terminal takes its new font and size as one resize,
-                // after the frame above has its final layout. Building a
-                // font can outlast termio's 25 ms resize coalescing, so a
-                // size sent ahead of it was laid out in the old font.
+                // Lay the children out while still held (a frame change
+                // need not send WM_SIZE), then each terminal takes its new
+                // font and settled size as one resize. Building a font can
+                // outlast termio's 25 ms resize coalescing, so a size sent
+                // ahead of it was laid out in the old font.
+                runUiActionOrLog("DPI update layout failed", v.layout());
                 v.applyDpiChangeToVisibleSurfaces();
                 v.dpi_change_pending = false;
-
-                // Relayout and repaint
-                runUiActionOrLog("DPI update layout failed", v.layout());
                 v.syncVisibleSurfaceCoreSizesFromClientRects();
                 v.app.resizeShellCompositorWindow(hwnd);
                 if (chromeTextNeedsFullInvalidation(Host.statusBarHeight())) {
