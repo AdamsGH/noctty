@@ -12,10 +12,11 @@
 //!   1. Per-process: `SetCurrentProcessExplicitAppUserModelID` — must
 //!      run BEFORE any window creation. Cheap, no disk I/O.
 //!   2. Per-user registry: `HKCU\Software\Classes\AppUserModelId\<aumid>`
-//!      with `DisplayName` + `IconUri` + `ShowInSettings=1`. Written
-//!      only by non-portable launches (`App.claimSharedIdentity`): the key
-//!      is per user, not per install, so a portable copy that wrote it
-//!      would point the installed copy's toasts at its own folder. Kept
+//!      with `DisplayName` + `IconUri` + `ShowInSettings=1`. Installed
+//!      copies write it on every launch. The key is per user, not per
+//!      install, so a portable copy only creates it where nothing has
+//!      registered the AUMID yet, and never changes an existing one
+//!      (D12; with no registration at all a toast is not shown). Kept
 //!      out of the Start Menu-shortcut writer
 //!      because some corporate lockdowns block shortcut creation but
 //!      allow HKCU writes, and the registry entry alone is enough for
@@ -79,22 +80,64 @@ pub fn setProcessAumid() void {
     }
 }
 
-/// Write `HKCU\Software\Classes\AppUserModelId\io.github.amanthanvi.noctty`
-/// with DisplayName + IconUri + ShowInSettings. Portable copies never call
-/// this (`App.claimSharedIdentity`).
-pub fn registerAumidDisplayName(alloc: std.mem.Allocator) void {
+/// Write `HKCU\Software\Classes\AppUserModelId\<aumid>` with DisplayName +
+/// IconUri + ShowInSettings. An installed copy always writes; a portable
+/// copy only creates the key when it does not exist yet
+/// (`App.claimSharedIdentity`).
+pub fn registerAumidDisplayName(alloc: std.mem.Allocator, portable: bool) void {
     const exe_path = std.fs.selfExePathAlloc(alloc) catch return;
     defer alloc.free(exe_path);
-    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
-        "Software\\Classes\\AppUserModelId\\io.github.amanthanvi.noctty",
-    );
-    registerForExe(alloc, subkey, exe_path);
+    const parent = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Classes\\AppUserModelId");
+    const name = std.unicode.utf8ToUtf16LeStringLiteral(aumid_utf8);
+    register(alloc, parent, name, exe_path, portable) catch |err| {
+        std.log.warn("AUMID: registration failed err={}", .{err});
+    };
 }
 
-fn registerForExe(alloc: std.mem.Allocator, subkey: LPCWSTR, exe_path: []const u8) void {
+fn register(
+    alloc: std.mem.Allocator,
+    parent: [:0]const u16,
+    name: [:0]const u16,
+    exe_path: []const u8,
+    portable: bool,
+) !void {
+    var parent_key: HKEY = undefined;
+    if (sys.RegCreateKeyExW(HKEY_CURRENT_USER, parent, 0, null, REG_OPTION_NON_VOLATILE, KEY_WRITE, null, &parent_key, null) != ERROR_SUCCESS)
+        return error.RegistryOpenFailed;
+    defer _ = sys.RegCloseKey(parent_key);
+    if (!portable) return registerForExe(alloc, parent_key, name, exe_path);
+
+    // A portable copy leaves an existing registration alone, whoever wrote
+    // it. Where there is none, it fills a complete key under a private name
+    // and renames it into place. The rename fails once the name exists, so
+    // of copies starting together only the first registers, and an
+    // installed copy, which always writes, overwrites it afterwards.
+    var existing: HKEY = undefined;
+    if (sys.RegOpenKeyExW(parent_key, name, 0, KEY_QUERY_VALUE, &existing) == ERROR_SUCCESS) {
+        _ = sys.RegCloseKey(existing);
+        return;
+    }
+    var random: [8]u8 = undefined;
+    std.crypto.random.bytes(&random);
+    var suffix_buf: [32]u8 = undefined;
+    const suffix = try std.fmt.bufPrint(&suffix_buf, ".pending-{x}", .{random});
+    const pending_w = try alloc.allocSentinel(u16, name.len + suffix.len, 0);
+    defer alloc.free(pending_w);
+    @memcpy(pending_w[0..name.len], name);
+    for (suffix, pending_w[name.len..]) |c, *w| w.* = c;
+    try registerForExe(alloc, parent_key, pending_w, exe_path);
+    if (RegRenameKey(parent_key, pending_w, name) != ERROR_SUCCESS) {
+        _ = RegDeleteKeyW(parent_key, pending_w);
+    }
+}
+
+extern "advapi32" fn RegRenameKey(key: HKEY, sub_key: ?LPCWSTR, new_name: LPCWSTR) callconv(.winapi) i32;
+extern "advapi32" fn RegDeleteKeyW(key: HKEY, sub_key: LPCWSTR) callconv(.winapi) i32;
+
+fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_path: []const u8) !void {
     var hkey: HKEY = undefined;
     const open_rc = sys.RegCreateKeyExW(
-        HKEY_CURRENT_USER,
+        root,
         subkey,
         0,
         null,
@@ -106,7 +149,7 @@ fn registerForExe(alloc: std.mem.Allocator, subkey: LPCWSTR, exe_path: []const u
     );
     if (open_rc != ERROR_SUCCESS) {
         std.log.warn("AUMID: RegCreateKeyExW failed rc={d}", .{open_rc});
-        return;
+        return error.RegistryOpenFailed;
     }
     defer _ = sys.RegCloseKey(hkey);
 
@@ -246,55 +289,168 @@ test "aumid string shape" {
     try testing.expectEqualStrings("io.github.amanthanvi.noctty", aumid_utf8);
 }
 
-test "aumid registration names the app and points at the icon beside the exe" {
+const TestRegistry = struct {
+    const parent_prefix = "Software\\noctty-aumid-test-";
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("app");
+
+    extern "advapi32" fn RegDeleteTreeW(key: HKEY, sub_key: ?LPCWSTR) callconv(.winapi) i32;
+    extern "advapi32" fn RegQueryInfoKeyW(key: HKEY, class: ?[*]u16, class_len: ?*DWORD, reserved: ?*DWORD, sub_keys: ?*DWORD, max_sub_key_len: ?*DWORD, max_class_len: ?*DWORD, values: ?*DWORD, max_value_name_len: ?*DWORD, max_value_len: ?*DWORD, security: ?*DWORD, last_write: ?*u64) callconv(.winapi) i32;
+
+    /// A unique scratch parent under HKCU\Software, deleted with `deinit`.
+    parent: [:0]u16,
+
+    fn init(alloc: std.mem.Allocator) !TestRegistry {
+        var random: [16]u8 = undefined;
+        std.crypto.random.bytes(&random);
+        const utf8 = try std.fmt.allocPrint(alloc, parent_prefix ++ "{x}", .{random});
+        defer alloc.free(utf8);
+        return .{ .parent = try std.unicode.utf8ToUtf16LeAllocZ(alloc, utf8) };
+    }
+
+    fn deinit(self: TestRegistry, alloc: std.mem.Allocator) void {
+        _ = RegDeleteTreeW(HKEY_CURRENT_USER, self.parent);
+        alloc.free(self.parent);
+    }
+
+    fn open(self: TestRegistry, sub_key: ?[:0]const u16) !HKEY {
+        var parent: HKEY = undefined;
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegOpenKeyExW(HKEY_CURRENT_USER, self.parent, 0, KEY_QUERY_VALUE | 0x0008, &parent));
+        const child = sub_key orelse return parent;
+        defer _ = sys.RegCloseKey(parent);
+        var key: HKEY = undefined;
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegOpenKeyExW(parent, child, 0, KEY_QUERY_VALUE, &key));
+        return key;
+    }
+
+    fn expectSz(key: HKEY, value_name: []const u8, expected: []const u8) !void {
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, value_name);
+        defer std.testing.allocator.free(wide);
+        var buf: [512]u16 = undefined;
+        var kind: DWORD = 0;
+        var bytes: DWORD = @sizeOf(@TypeOf(buf));
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, wide, null, &kind, @ptrCast(&buf), &bytes));
+        try std.testing.expectEqual(REG_SZ, kind);
+        const value = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, buf[0 .. bytes / 2 - 1]);
+        defer std.testing.allocator.free(value);
+        try std.testing.expectEqualStrings(expected, value);
+    }
+
+    const Snapshot = struct { icon: [512]u16 = undefined, icon_bytes: DWORD = 1024, written: u64 = 0, siblings: DWORD = 0 };
+
+    /// The registration's icon, its last-write time, and the number of keys
+    /// under the scratch parent (a leftover pending key shows up here).
+    fn snapshot(self: TestRegistry) !Snapshot {
+        const parent = try self.open(null);
+        defer _ = sys.RegCloseKey(parent);
+        const key = try self.open(name);
+        defer _ = sys.RegCloseKey(key);
+        var out: Snapshot = .{};
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), null, null, @ptrCast(&out.icon), &out.icon_bytes));
+        try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(key, null, null, null, null, null, null, null, null, null, null, &out.written));
+        try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(parent, null, null, null, &out.siblings, null, null, null, null, null, null, null));
+        return out;
+    }
+};
+
+test "aumid registration: installed copies always write, portable copies only create" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = icon_file_name, .data = "icon" });
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
-    const exe = try std.fs.path.join(alloc, &.{ root, "noctty.exe" });
-    defer alloc.free(exe);
-    const icon = try siblingIconPath(alloc, exe);
-    defer alloc.free(icon);
-    const bare_exe = try std.fs.path.join(alloc, &.{ root, "bare", "noctty.exe" });
-    defer alloc.free(bare_exe);
-
-    // Exercise the actual registry writer, only under a unique scratch key.
-    var random: [16]u8 = undefined;
-    std.crypto.random.bytes(&random);
-    const subkey_utf8 = try std.fmt.allocPrint(alloc, "Software\\noctty-aumid-test-{x}", .{random});
-    defer alloc.free(subkey_utf8);
-    const subkey = try std.unicode.utf8ToUtf16LeAllocZ(alloc, subkey_utf8);
-    defer alloc.free(subkey);
-    const Reg = struct {
-        extern "advapi32" fn RegDeleteKeyW(key: HKEY, name: LPCWSTR) callconv(.winapi) i32;
-
-        fn expectSz(key: HKEY, name: LPCWSTR, expected: []const u8) !void {
-            var buf: [512]u16 = undefined;
-            var kind: DWORD = 0;
-            var bytes: DWORD = @sizeOf(@TypeOf(buf));
-            try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, name, null, &kind, @ptrCast(&buf), &bytes));
-            try std.testing.expectEqual(REG_SZ, kind);
-            const value = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, buf[0 .. bytes / 2 - 1]);
-            defer std.testing.allocator.free(value);
-            try std.testing.expectEqualStrings(expected, value);
+    var exes: [5][]u8 = undefined;
+    var icons: [5][]u8 = undefined;
+    var icon_buf: [64]u8 = undefined;
+    for (&exes, &icons, [_][]const u8{ "installed", "p1", "p2", "p3", "bare" }) |*exe, *icon, dir| {
+        if (!std.mem.eql(u8, dir, "bare")) {
+            try tmp.dir.makeDir(dir);
+            try tmp.dir.writeFile(.{ .sub_path = try std.fmt.bufPrint(&icon_buf, "{s}/{s}", .{ dir, icon_file_name }), .data = dir });
         }
+        exe.* = try std.fs.path.join(alloc, &.{ root, dir, "noctty.exe" });
+        icon.* = try siblingIconPath(alloc, exe.*);
+    }
+    defer for (exes, icons) |exe, icon| {
+        alloc.free(exe);
+        alloc.free(icon);
     };
-    defer _ = Reg.RegDeleteKeyW(HKEY_CURRENT_USER, subkey);
-    registerForExe(alloc, subkey, exe);
+    const installed, const p1, const p2, const bare = .{ exes[0], exes[1], exes[2], exes[4] };
 
-    var key: HKEY = undefined;
-    try std.testing.expectEqual(ERROR_SUCCESS, sys.RegCreateKeyExW(HKEY_CURRENT_USER, subkey, 0, null, 0, KEY_QUERY_VALUE, null, &key, null));
-    defer _ = sys.RegCloseKey(key);
-    try Reg.expectSz(key, std.unicode.utf8ToUtf16LeStringLiteral("DisplayName"), "noctty");
-    try Reg.expectSz(key, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), icon);
-    var show: u32 = 0;
-    var show_bytes: DWORD = @sizeOf(u32);
-    try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, std.unicode.utf8ToUtf16LeStringLiteral("ShowInSettings"), null, null, @ptrCast(&show), &show_bytes));
-    try std.testing.expectEqual(@as(u32, 1), show);
+    // Absent: a portable copy creates it, once, with its own icon, and no
+    // pending key is left behind.
+    {
+        const reg = try TestRegistry.init(alloc);
+        defer reg.deinit(alloc);
+        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        const key = try reg.open(TestRegistry.name);
+        defer _ = sys.RegCloseKey(key);
+        try TestRegistry.expectSz(key, "DisplayName", "noctty");
+        try TestRegistry.expectSz(key, "IconUri", icons[1]);
+        var show: u32 = 0;
+        var show_bytes: DWORD = @sizeOf(u32);
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, std.unicode.utf8ToUtf16LeStringLiteral("ShowInSettings"), null, null, @ptrCast(&show), &show_bytes));
+        try std.testing.expectEqual(@as(u32, 1), show);
+        const created = try reg.snapshot();
+        try std.testing.expectEqual(@as(DWORD, 1), created.siblings);
 
-    // An exe with no icon beside it leaves the registered icon alone.
-    registerForExe(alloc, subkey, bare_exe);
-    try Reg.expectSz(key, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), icon);
+        // Present: another portable copy changes no value and not even the
+        // key's last-write time, including values it would not have written.
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+        try register(alloc, reg.parent, TestRegistry.name, p2, true);
+        const kept = try reg.snapshot();
+        try std.testing.expectEqualSlices(u16, created.icon[0 .. created.icon_bytes / 2], kept.icon[0 .. kept.icon_bytes / 2]);
+        try std.testing.expectEqual(created.written, kept.written);
+        try std.testing.expectEqual(@as(DWORD, 1), kept.siblings);
+
+        // An installed copy always writes: its own icon replaces the portable
+        // one, and an exe with no icon beside it leaves IconUri alone.
+        try register(alloc, reg.parent, TestRegistry.name, installed, false);
+        try TestRegistry.expectSz(key, "IconUri", icons[0]);
+        try register(alloc, reg.parent, TestRegistry.name, bare, false);
+        try TestRegistry.expectSz(key, "IconUri", icons[0]);
+        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        try TestRegistry.expectSz(key, "IconUri", icons[0]);
+
+        // Not even a registration whose icon has gone is repaired.
+        try tmp.dir.deleteFile("installed/" ++ icon_file_name);
+        const broken = try reg.snapshot();
+        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        try TestRegistry.expectSz(key, "IconUri", icons[0]);
+        try std.testing.expectEqual(broken.written, (try reg.snapshot()).written);
+        try tmp.dir.writeFile(.{ .sub_path = "installed/" ++ icon_file_name, .data = "installed" });
+    }
+
+    // Copies starting together: three portable copies and an installed one.
+    // At most one portable copy publishes, nothing pending is left, and the
+    // installed copy's values win whatever the order.
+    for (0..8) |_| {
+        const reg = try TestRegistry.init(alloc);
+        defer reg.deinit(alloc);
+        const Run = struct {
+            fn run(a: std.mem.Allocator, parent: [:0]const u16, exe: []const u8, portable: bool) void {
+                register(a, parent, TestRegistry.name, exe, portable) catch {};
+            }
+        };
+        var threads: [4]std.Thread = undefined;
+        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Run.run, .{ alloc, reg.parent, exes[i], i != 0 });
+        for (threads) |t| t.join();
+        const key = try reg.open(TestRegistry.name);
+        defer _ = sys.RegCloseKey(key);
+        try TestRegistry.expectSz(key, "IconUri", icons[0]);
+        try std.testing.expectEqual(@as(DWORD, 1), (try reg.snapshot()).siblings);
+    }
+
+    // The guard itself: renaming onto a name that exists fails.
+    {
+        const reg = try TestRegistry.init(alloc);
+        defer reg.deinit(alloc);
+        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        var parent: HKEY = undefined;
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegCreateKeyExW(HKEY_CURRENT_USER, reg.parent, 0, null, 0, KEY_WRITE, null, &parent, null));
+        defer _ = sys.RegCloseKey(parent);
+        const other = std.unicode.utf8ToUtf16LeStringLiteral("other");
+        var created: HKEY = undefined;
+        try std.testing.expectEqual(ERROR_SUCCESS, sys.RegCreateKeyExW(parent, other, 0, null, 0, KEY_WRITE, null, &created, null));
+        _ = sys.RegCloseKey(created);
+        try std.testing.expect(RegRenameKey(parent, other, TestRegistry.name) != ERROR_SUCCESS);
+    }
 }

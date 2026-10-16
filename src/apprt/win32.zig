@@ -2047,19 +2047,19 @@ fn isPortableModeActive(alloc: Allocator) bool {
 /// pieces of per-user state: the AppUserModelId keys that name and badge its
 /// toasts, and the taskbar jump list, which the Shell stores per AUMID. A
 /// portable copy keeps the AUMID, so its toasts and the single-instance pipe
-/// work as before, but writes neither (D12): its jump list replaced the
-/// installed copy's on every launch, and its registration pointed the
-/// installed copy's toasts at an icon in a folder that can go away at any
-/// time. This is the one place both writes are decided. Returns the
-/// jump list this copy drives, null when it leaves the Shell's list alone.
+/// work as before, but leaves the installed copy's state alone (D12): it gets
+/// no jump list, whose commit replaced the installed copy's on every launch,
+/// and it only creates the registration where none exists, since without one
+/// its toasts would not show. This is the one place both are decided. Returns
+/// the jump list this copy drives, null when it leaves the Shell's list alone.
 fn claimSharedIdentity(
     alloc: Allocator,
     portable: bool,
-    register: *const fn (Allocator) void,
+    register: *const fn (Allocator, bool) void,
     jump_list_state: ?[]const u8,
 ) ?win32_jump_list.JumpList {
+    register(alloc, portable);
     if (portable) return null;
-    register(alloc);
     const path = jump_list_state orelse return null;
     return win32_jump_list.JumpList.init(alloc, path) catch |err| {
         log.warn("jump list state init failed err={}", .{err});
@@ -2067,7 +2067,7 @@ fn claimSharedIdentity(
     };
 }
 
-test "a portable copy writes neither the shared registration nor the jump list" {
+test "a portable copy gets no jump list and registers only as portable" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2076,19 +2076,19 @@ test "a portable copy writes neither the shared registration nor the jump list" 
     const state = try std.fs.path.join(alloc, &.{ root, win32_jump_list.state_filename });
     defer alloc.free(state);
     const Registration = struct {
-        var calls: usize = 0;
-        fn register(_: Allocator) void {
-            calls += 1;
+        var calls: [2]usize = .{ 0, 0 };
+        fn register(_: Allocator, portable: bool) void {
+            calls[@intFromBool(portable)] += 1;
         }
     };
 
     try std.testing.expect(claimSharedIdentity(alloc, true, &Registration.register, state) == null);
-    try std.testing.expectEqual(@as(usize, 0), Registration.calls);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, Registration.calls);
 
     var installed = claimSharedIdentity(alloc, false, &Registration.register, state) orelse
         return error.TestUnexpectedResult;
     defer installed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), Registration.calls);
+    try std.testing.expectEqual([2]usize{ 1, 1 }, Registration.calls);
 }
 
 /// How this copy of noctty gets updated. A setup-managed copy applies a
