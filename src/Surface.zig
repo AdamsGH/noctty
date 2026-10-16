@@ -3922,7 +3922,7 @@ test "Surface: typing redraws only what it changed on screen" {
 
 /// Change the cell size for the terminal grid. This can happen as
 /// a result of changing the font size at runtime.
-fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
+fn setCellSize(self: *Surface, size: rendererpkg.CellSize) void {
     // Update our cell size within our size struct
     self.size.cell = size;
     self.balancePaddingIfNeeded();
@@ -3938,12 +3938,15 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
         log.warn("unable to recompute initial window size: {}", .{err});
     };
 
-    // Notify the window
-    _ = try self.rt_app.performAction(
+    // Notify the window. The grid above has already changed, so a failure
+    // here must not fail the font change halfway through it.
+    _ = self.rt_app.performAction(
         .{ .surface = self },
         .cell_size,
         .{ .width = size.width, .height = size.height },
-    );
+    ) catch |err| {
+        log.warn("unable to notify the window of the new cell size: {}", .{err});
+    };
 }
 
 /// Change the font size.
@@ -3960,7 +3963,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     errdefer self.app.font_grid_set.deref(font_grid_key);
 
     // Set our cell size
-    try self.setCellSize(.{
+    self.setCellSize(.{
         .width = font_grid.metrics.cell_width,
         .height = font_grid.metrics.cell_height,
     });
