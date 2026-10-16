@@ -28,6 +28,7 @@ pub const RowNumbering = struct {
     active_key: u64,
     page_serial_min: u64,
     first_page_serial: u64,
+    row_generation: u64 = 0,
     rows: u32,
     columns: u32,
 };
@@ -38,6 +39,7 @@ pub fn rowNumbering(state: *const terminal.Terminal) RowNumbering {
         .active_key = @intFromEnum(state.screens.active_key),
         .page_serial_min = pages.page_serial_min,
         .first_page_serial = pages.pages.first.?.serial,
+        .row_generation = pages.row_generation,
         .rows = pages.rows,
         .columns = pages.cols,
     };
@@ -208,7 +210,7 @@ fn snapshotDocumentWindow(
         pages.page_serial_min,                           pages.pages.first.?.serial,
         pages.total_rows,                                document_window.top,
         document_window.bottom,                          pages.rows,
-        pages.cols,
+        pages.cols,                                      pages.row_generation,
     };
     hash.update(std.mem.sliceAsBytes(&provenance));
 
@@ -454,6 +456,58 @@ test "PKG71 frozen scroll reuses the same range after scrolling and mouse viewpo
     defer bottom.deinit();
     try std.testing.expectEqual(@as(i32, 2), bottom.cell_for_byte[std.mem.indexOf(u8, bottom.text, "two").?].row);
     try std.testing.expect(t.screens.active.selection == null);
+}
+
+test "PKG71 row numbering rejects partial history erasure and regrowth" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3, .max_scrollback = 100_000 });
+    defer t.deinit(alloc);
+    try t.printString("one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    const pages = &t.screens.active.pages;
+    try std.testing.expect(pages.pages.first == pages.pages.last);
+    const before = rowNumbering(&t);
+    const total_before = pages.total_rows;
+    t.eraseDisplay(.scrollback, false);
+    try std.testing.expectEqual(before.first_page_serial, pages.pages.first.?.serial);
+    try std.testing.expect(pages.total_rows < total_before);
+    try std.testing.expect(!std.meta.eql(before, rowNumbering(&t)));
+    // Restoring the old row count must not revive the old absolute anchors.
+    while (pages.total_rows < total_before) try t.printString("\r\nnew");
+    try std.testing.expectEqual(total_before, pages.total_rows);
+    try std.testing.expect(!std.meta.eql(before, rowNumbering(&t)));
+    const appended = rowNumbering(&t);
+    try t.printString("\r\nmore");
+    try std.testing.expectEqualDeep(appended, rowNumbering(&t));
+}
+
+test "PKG71 frozen scroll rejects erased history regrown with identical text" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3, .max_scrollback = 100_000 });
+    defer t.deinit(alloc);
+    try t.printString("same\r\nsame\r\nsame\r\nsame\r\nsame");
+    var before = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer before.deinit();
+    const pages = &t.screens.active.pages;
+    const total = pages.total_rows;
+    const serial = pages.page_serial;
+    t.eraseDisplay(.scrollback, false);
+    while (pages.total_rows < total) try t.printString("\r\nsame");
+    var after = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer after.deinit();
+    try std.testing.expectEqualStrings(before.text, after.text);
+    try std.testing.expectEqual(serial, pages.page_serial);
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before.scroll_token.?, before.document_window, 0, true));
+}
+
+test "PKG71 row numbering rejects resize round trips" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3, .max_scrollback = 100_000 });
+    defer t.deinit(alloc);
+    try t.printString("one\r\ntwo\r\nthree\r\nfour");
+    const before = rowNumbering(&t);
+    try t.resize(alloc, 81, 3);
+    try t.resize(alloc, 80, 3);
+    try std.testing.expect(!std.meta.eql(before, rowNumbering(&t)));
 }
 
 test "PKG71 frozen scroll rejects output resize screen switch and history recycling" {

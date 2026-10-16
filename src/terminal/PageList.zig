@@ -139,6 +139,10 @@ page_serial: u64,
 /// for quick comparisons to find invalid pages in references.
 page_serial_min: u64,
 
+/// Generation of row coordinates after structural edits that can keep page
+/// serials unchanged. Viewport motion and appending rows leave it unchanged.
+row_generation: u64 = 0,
+
 /// Byte size of the total amount of allocated pages. Note this does
 /// not include the total allocated amount in the pool which may be more
 /// than this due to preheating.
@@ -961,6 +965,12 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+
+    // Even a resize back to the original dimensions must invalidate external
+    // row coordinates. Invalidate before mutation, including partial failure.
+    if ((opts.cols orelse self.cols) != self.cols or
+        (opts.rows orelse self.rows) != self.rows)
+        self.row_generation +%= 1;
 
     if (comptime std.debug.runtime_safety) {
         // Resize does not work with 0 values, this should be protected
@@ -4024,6 +4034,10 @@ fn eraseRows(
 
     // Update our total row count
     self.total_rows -= erased;
+
+    // Partial-page erasure shifts rows without changing the page serial.
+    // Keep this independent of total_rows, which later output can regrow.
+    if (erased != 0) self.row_generation +%= 1;
 
     // If we deleted active, we need to regrow because one of our invariants
     // is that we always have full active space.

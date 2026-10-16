@@ -7022,7 +7022,7 @@ test "PKG71 held range rectangles follow scrolling wheel motion and current metr
     // Contention/unavailable geometry and every renumbering cause refuse old
     // rectangles rather than returning coordinates from another document.
     const numbering = ctx.numbering;
-    for (0..6) |cause| {
+    for (0..7) |cause| {
         ctx.numbering = numbering;
         ctx.available = true;
         switch (cause) {
@@ -7032,6 +7032,7 @@ test "PKG71 held range rectangles follow scrolling wheel motion and current metr
             3 => ctx.numbering.first_page_serial += 1,
             4 => ctx.numbering.rows += 1,
             5 => ctx.numbering.columns += 1,
+            6 => ctx.numbering.row_generation += 1,
             else => unreachable,
         }
         var rects: ?*com.SAFEARRAY = null;
