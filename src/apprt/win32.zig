@@ -4422,8 +4422,14 @@ pub const App = struct {
     /// Whether the current core-app tick already spent its one synchronous
     /// renderer paint. See `rendererTickRepaintMode`.
     renderer_sync_paint_spent: bool = false,
-    /// Hyperlink hover-dwell tracker. Reset via `dismiss()` whenever
-    /// focus leaves a surface or a click arrives.
+    /// Hyperlink hover-dwell tracker, meant to be reset via `dismiss()`
+    /// whenever focus leaves a surface or a click arrives.
+    ///
+    /// Not driven yet: initialized here and in a test, but nothing calls
+    /// `onMouseMove`, `tick` or `dismiss` outside its own tests, and the
+    /// core's `mouse_over_link` action is a no-op in `performAction`. There is
+    /// no link-preview tooltip on Windows (docs/status.md, "Link previews");
+    /// wiring one is the work this field waits for.
     link_hover_tracker: win32_link_preview.HoverTracker = undefined,
     /// Windows Action Center toast notifier. `null` when WinRT init
     /// fails (e.g. corporate lockdown, missing combase.dll), in which
@@ -11484,6 +11490,9 @@ pub const App = struct {
             },
             .animation_duration_s = self.config.@"quick-terminal-animation-duration",
             .autohide = self.config.@"quick-terminal-autohide",
+            // Stored but never read: no code follows virtual-desktop switches,
+            // so `quick-terminal-space-behavior` has no Windows effect
+            // (docs/windows-capability-matrix.md).
             .space_behavior = switch (self.config.@"quick-terminal-space-behavior") {
                 .move => .move,
                 // `remain` config value → our module's `.ignore`:

@@ -5,7 +5,7 @@ Windows. Cells stay short; rows with real nuance point into the
 [Notes](#notes) section below. Update rows when Windows behavior changes or
 when upstream docs add or remove a surface that this fork cares about.
 
-Last reviewed: 2026-09-02.
+Last reviewed: 2026-10-15 (renderer, handoff, graphics and inert-settings notes; other rows 2026-09-02).
 
 ## Status legend
 
@@ -18,21 +18,21 @@ Last reviewed: 2026-09-02.
 
 ## Supported
 
-| Ghostty docs surface                                                                                               | noctty note                                                                                                                                                                                                                 |
-| ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Configuration](https://ghostty.org/docs/config) and [option reference](https://ghostty.org/docs/config/reference) | Same config grammar and generated docs. Config lives at `%LOCALAPPDATA%\noctty\config.ghostty`; live reload via `Ctrl+Shift+,`.                                                                                             |
-| [Custom keybindings](https://ghostty.org/docs/config/keybind)                                                      | Same `keybind = trigger=action` grammar and `+list-keybinds` flow; defaults are the shared non-macOS set with Windows-specific exceptions.                                                                                  |
-| [Color Theme](https://ghostty.org/docs/features/theme)                                                             | Built-in themes, separate light/dark themes, custom themes, and `+list-themes` ship on Windows.                                                                                                                             |
-| [Configuration: `background-opacity`](https://ghostty.org/docs/config/reference)                                   | Transparent terminal backgrounds work on Windows and can be toggled live.                                                                                                                                                   |
-| [Terminal API (VT)](https://ghostty.org/docs/vt) and [VT reference](https://ghostty.org/docs/vt/reference)         | The shared Ghostty terminal core carries the documented VT/OSC/Kitty surface. Win32-validated coverage: [windows-vt-conformance.md](windows-vt-conformance.md).                                                             |
-| [Kitty keyboard protocol](https://ghostty.org/docs/vt)                                                             | Win32 supplies press, repeat, release, lock, and sided modifier state to the shared encoder. See [keyboard input](#keyboard-input).                                                                                         |
-| [Features overview: windows, tabs, and splits](https://ghostty.org/docs/features)                                  | Native Win32 windows, tabs, and splits ship today in noctty.                                                                                                                                                                |
-| [Configuration: `scrollbar`](https://ghostty.org/docs/config/reference)                                            | Per-pane graphical scrollbars honor `system` (Windows dynamic-scrollbar preference) or `never`; search matches appear as markers. See [search and scrollbars](#search-and-scrollbars).                                      |
-| [Configuration: `notify-on-command-finish`](https://ghostty.org/docs/config/reference)                             | Focus policy, duration threshold, and bell/`notify` actions are applied; `notify` also needs `desktop-notifications`. See [notifications and progress](#notifications-and-progress).                                        |
-| [Configuration: `clipboard-codepoint-map`](https://ghostty.org/docs/config/reference)                              | Selection copies apply the map before the clipboard write. See [clipboard and drag-drop](#clipboard-and-drag-drop).                                                                                                         |
-| [Configuration: `clipboard-paste-protection`](https://ghostty.org/docs/config/reference)                           | Risky clipboard and dropped-content pastes use a native confirmation that previews the payload. See [clipboard and drag-drop](#clipboard-and-drag-drop).                                                                    |
-| [Action reference: `copy_to_clipboard:html`](https://ghostty.org/docs/config/keybind/reference)                    | HTML copy writes CF_HTML and a plain-text fallback in one clipboard transaction.                                                                                                                                            |
-| Kitty graphics protocol                                                                                            | Parser and renderer support ship, but child APC delivery depends on ConPTY. The bundled source passed the measured payload byte-exactly; the tested in-box fallback stripped it. See [ConPTY transport](#conpty-transport). |
+| Ghostty docs surface                                                                                               | noctty note                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Configuration](https://ghostty.org/docs/config) and [option reference](https://ghostty.org/docs/config/reference) | Same config grammar and generated docs. Config lives at `%LOCALAPPDATA%\noctty\config.ghostty`; live reload via `Ctrl+Shift+,`.                                                                                                                                                                                                                                                                                                        |
+| [Custom keybindings](https://ghostty.org/docs/config/keybind)                                                      | Same `keybind = trigger=action` grammar and `+list-keybinds` flow; defaults are the shared non-macOS set with Windows-specific exceptions.                                                                                                                                                                                                                                                                                             |
+| [Color Theme](https://ghostty.org/docs/features/theme)                                                             | Built-in themes, separate light/dark themes, custom themes, and `+list-themes` ship on Windows.                                                                                                                                                                                                                                                                                                                                        |
+| [Configuration: `background-opacity`](https://ghostty.org/docs/config/reference)                                   | Transparent terminal backgrounds work on Windows and can be toggled live.                                                                                                                                                                                                                                                                                                                                                              |
+| [Terminal API (VT)](https://ghostty.org/docs/vt) and [VT reference](https://ghostty.org/docs/vt/reference)         | The shared Ghostty terminal core carries the documented VT/OSC/Kitty surface. Win32-validated coverage: [windows-vt-conformance.md](windows-vt-conformance.md).                                                                                                                                                                                                                                                                        |
+| [Kitty keyboard protocol](https://ghostty.org/docs/vt)                                                             | Win32 supplies press, repeat, release, lock, and sided modifier state to the shared encoder. See [keyboard input](#keyboard-input).                                                                                                                                                                                                                                                                                                    |
+| [Features overview: windows, tabs, and splits](https://ghostty.org/docs/features)                                  | Native Win32 windows, tabs, and splits ship today in noctty.                                                                                                                                                                                                                                                                                                                                                                           |
+| [Configuration: `scrollbar`](https://ghostty.org/docs/config/reference)                                            | Per-pane graphical scrollbars honor `system` (Windows dynamic-scrollbar preference) or `never`; search matches appear as markers. See [search and scrollbars](#search-and-scrollbars).                                                                                                                                                                                                                                                 |
+| [Configuration: `notify-on-command-finish`](https://ghostty.org/docs/config/reference)                             | Focus policy, duration threshold, and bell/`notify` actions are applied; `notify` also needs `desktop-notifications`. See [notifications and progress](#notifications-and-progress).                                                                                                                                                                                                                                                   |
+| [Configuration: `clipboard-codepoint-map`](https://ghostty.org/docs/config/reference)                              | Selection copies apply the map before the clipboard write. See [clipboard and drag-drop](#clipboard-and-drag-drop).                                                                                                                                                                                                                                                                                                                    |
+| [Configuration: `clipboard-paste-protection`](https://ghostty.org/docs/config/reference)                           | Risky clipboard and dropped-content pastes use a native confirmation that previews the payload. See [clipboard and drag-drop](#clipboard-and-drag-drop).                                                                                                                                                                                                                                                                               |
+| [Action reference: `copy_to_clipboard:html`](https://ghostty.org/docs/config/keybind/reference)                    | HTML copy writes CF_HTML and a plain-text fallback in one clipboard transaction.                                                                                                                                                                                                                                                                                                                                                       |
+| Kitty graphics protocol                                                                                            | Parser and renderer support ship, but child APC delivery depends on ConPTY. The bundled source passed the measured payload byte-exactly; the tested in-box fallback stripped it. Sixel is transported but not decoded or drawn, and the replies to Kitty commands, the memory they can use and `q=2` are covered in [inline graphics](windows.md#inline-graphics-replies-sixel-and-memory). See [ConPTY transport](#conpty-transport). |
 
 ## Partial
 
@@ -55,7 +55,7 @@ Last reviewed: 2026-09-02.
 | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Features overview](https://ghostty.org/docs/features)                            | Upstream docs still say Windows support is planned. noctty ships a native Win32 app on Windows 10/11 x64 and ARM64.                                                                                                  |
 | Elevated windows                                                                  | Separate `runas` windows with integrity-scoped IPC and no elevated session restore. See [Running elevated](windows.md#running-elevated).                                                                             |
-| [Features overview: GPU-accelerated rendering](https://ghostty.org/docs/features) | Terminal content renders with OpenGL 4.3+ via WGL. See [renderer notes](#renderer).                                                                                                                                  |
+| [Features overview: GPU-accelerated rendering](https://ghostty.org/docs/features) | Terminal content renders with OpenGL 4.3+ via WGL by default, or the opt-in D3D11 beta. See [renderer notes](#renderer).                                                                                             |
 | [Configuration](https://ghostty.org/docs/config)                                  | Windows state/config paths live under `%LOCALAPPDATA%\noctty\...`, not the macOS/Linux paths documented upstream.                                                                                                    |
 | Local automation                                                                  | Versioned JSON state and stable local verbs for windows, tabs, splits, focus, policy-allowed actions, and control-free text. See [automation.md](automation.md).                                                     |
 | [Features overview](https://ghostty.org/docs/features)                            | Win32-specific UX: DWM dark caption, high-contrast palette switching, IME, and native context menus.                                                                                                                 |
@@ -305,9 +305,15 @@ D3D11/DirectComposition shell pipeline (recoverable top-level targets,
 transparent DPI-sized D2D surfaces, DirectWrite host banner text) exists in
 the source but is not started: `App.init` gives its backend no driver, so
 chrome text is drawn with GDI. That pipeline
-does not replace or call the terminal renderer. The terminal path has a hard
-OpenGL 4.3-via-WGL floor and no software fallback; below it, noctty shows a
-startup diagnostic naming the detected version and does not launch.
+does not replace or call the terminal renderer. The default terminal renderer
+has a hard OpenGL 4.3-via-WGL floor and no software fallback; below it, noctty
+shows a startup diagnostic naming the detected version and does not launch. The
+opt-in `renderer = d3d11` beta (feature level 11.0, with Microsoft's WARP
+software renderer as its own fallback) is a separate terminal path that does
+not lift that floor for images, custom shaders or background images: those
+switch the surface to OpenGL, and without a working OpenGL 4.3 driver a healthy
+D3D11 surface ignores them. See
+[D3D11 renderer beta](windows.md#d3d11-renderer-beta).
 
 ### Background blur
 
@@ -336,6 +342,33 @@ warning instead, at startup or when a config reload turns it on; like every
 other log line in this runtime it goes to stderr, so it is visible where stderr
 is captured. The Settings window shows the checkbox disabled, labelled "not
 supported on Windows", so nobody there toggles it and waits for a change.
+
+### Settings accepted without effect
+
+noctty keeps the full upstream configuration surface so that a shared config
+file loads, and only `background-blur` (below) logs a warning when it is set.
+Searching `src/` (outside `Config.zig`, the doc generators and the tests'
+deny-lists) on `e6dae0919` finds no code that acts on these keys, so setting
+them changes nothing on Windows:
+
+- `focus-follows-mouse`, `window-inherit-font-size`, `resize-overlay`,
+  `resize-overlay-position` and `resize-overlay-duration`: the Win32 runtime has no code for them (a new
+  window or tab does not inherit an adjusted font size).
+- `bell-features`, `bell-audio-path` and `bell-audio-volume`: a bell, and the
+  bell part of `notify-on-command-finish-action`, always plays the system
+  `MessageBeep`; the attention, title and border features and the custom
+  sound are not implemented.
+- `quick-terminal-space-behavior`: copied into the quick-terminal settings,
+  where nothing reads it.
+- The GTK and X11 keys: `gtk-opengl-debug`, `gtk-single-instance`,
+  `gtk-custom-css`, `gtk-quick-terminal-layer`, `gtk-quick-terminal-namespace`,
+  `gtk-titlebar`, `gtk-titlebar-style`, `gtk-titlebar-hide-when-maximized`,
+  `gtk-toolbar-style`, `gtk-tabs-location`, `gtk-wide-tabs`,
+  `x11-instance-name`, `async-backend` and `_xdg-terminal-exec`.
+
+`background-blur` is the one accepted-but-inert key that does log a warning
+(see [Background blur](#background-blur)). Map a Windows Terminal `bellStyle`
+to nothing: there is no equivalent setting.
 
 ### Universal palette
 

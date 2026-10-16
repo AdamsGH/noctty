@@ -52,7 +52,7 @@ profile inheritance. Copy only the lines you need.
 | `historySize`                | `scrollback-limit`                     | Different unit: WT counts lines, Noctty counts bytes. The default is 10 MB.         |
 | `initialCols`, `initialRows` | `window-width`, `window-height`        | Grid cells, as in WT. Both must be set or both are ignored.                         |
 | `backgroundImage`            | `background-image`                     |                                                                                     |
-| `bellStyle`                  | `bell-features`                        | Different vocabulary; check `noctty +show-config --default --docs`.                 |
+| `bellStyle`                  | (none)                                 | The bell always plays the system sound; `bell-features` has no effect on Windows.   |
 
 A short starting config:
 

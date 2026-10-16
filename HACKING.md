@@ -18,7 +18,7 @@ Use the standard Zig workflow from the repository root:
 | --------------------------------------------------- | ---------------------------------------------- |
 | `zig build`                                         | Build the Win32 app and bundled resources      |
 | `zig build -Demit-exe=true`                         | Force-install `zig-out/bin/noctty.exe`         |
-| `zig build test -Demit-test-exe=true --summary all` | Run the full test suite (about 4,500 tests)    |
+| `zig build test -Demit-test-exe=true --summary all` | Run the full test suite (about 5,300 tests)    |
 | `zig build test -Dtest-filter=<name> --summary all` | Run matching tests while iterating (see below) |
 | `zig build -Demit-lib-vt`                           | Build the retained `libghostty-vt` library     |
 
@@ -115,7 +115,9 @@ manually verify:
 ## Runtime notes
 
 - The application runtime is Win32.
-- The renderer backend is OpenGL on Windows.
+- The default renderer backend is OpenGL on Windows. An opt-in D3D11 beta
+  (`renderer = d3d11`, omitted by `-Dd3d11=false`) falls back to OpenGL; see
+  [docs/windows.md](docs/windows.md#d3d11-renderer-beta).
 - The repo still retains `libghostty-vt` for Zig and C consumers.
 
 ## Project layout (quick map)
@@ -146,8 +148,13 @@ Before importing changes from those areas, read the
 Logging to `stderr` is always available. Debug builds also emit
 additional diagnostic output.
 
-Win32-specific local traces used during bring-up may also write to
-`noctty-win32.log` in the current working directory.
+Opt-in traces are off unless their environment variable is set:
+`NOCTTY_RENDER_TRACE_FILE` and `NOCTTY_TERMIO_TRACE_FILE` name a file that
+receives one JSON document (use an absolute path; the render trace is
+described in [docs/windows.md](docs/windows.md)), and `NOCTTY_HANDOFF_TRACE=1`
+appends to `%LOCALAPPDATA%\noctty\handoff.log`. Other `NOCTTY_*_TRACE_FILE`
+variables serve the benchmark and IME harnesses. No default log file is
+written to the working directory.
 
 ## Formatting
 
