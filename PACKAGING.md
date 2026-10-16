@@ -287,7 +287,8 @@ on first publish and `gh release upload --clobber` on reruns.
 The WinGet package identifier is `AmanThanvi.noctty` and the package is
 published (`microsoft/winget-pkgs/manifests/a/AmanThanvi/noctty`, first version
 1.3.131). The repository variable `WINGET_PACKAGE_IDENTIFIER` is set to it, and
-stable preflight verifies that the manifest folder exists. Users install with
+stable preflight verifies that the manifest folder exists and that the latest
+public manifest covers x64 and arm64. Users install with
 `winget install --id AmanThanvi.noctty -e`. The old
 `AmanThanvi.winghostty` identifier is retired. Keep CI on the truthful
 `update` path; do not switch to `wingetcreate new` for automated releases.

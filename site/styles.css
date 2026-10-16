@@ -890,6 +890,10 @@ code {
   max-width: 46ch;
 }
 
+.nc-close__note code {
+  overflow-wrap: anywhere;
+}
+
 .nc-close .nc-hero__actions {
   margin-top: var(--space-lg);
 }

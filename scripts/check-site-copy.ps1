@@ -17,10 +17,7 @@ $textFiles = Get-ChildItem -Path $siteRoot -Recurse -File | Where-Object {
 
 $forbiddenRules = @(
     @{ Pattern = "(?i)\bscoop install noctty\b(?!/)"; Regex = $true; Reason = "Official Scoop installs should use the bucket-qualified command: scoop install noctty/noctty." },
-    @{ Pattern = "winget install noctty"; Reason = "Official WinGet installs should use the package id: winget install AmanThanvi.noctty." },
-    @{ Pattern = "(?i)winget[^
-]{0,80}(?:pending|bootstrap|planned|not (?:yet )?published)|(?:pending|planned)[^
-]{0,80}winget"; Regex = $true; Reason = "The WinGet package AmanThanvi.noctty is published; do not describe it as pending, planned or unpublished." },
+    @{ Pattern = "winget install noctty"; Reason = "Official WinGet installs should use the package id: winget install --id AmanThanvi.noctty -e." },
     @{ Pattern = "D3D11"; Reason = "The shipping Windows renderer is OpenGL 4.3 via WGL." },
     @{ Pattern = "DirectX 11"; Reason = "The shipping Windows renderer is OpenGL 4.3 via WGL." },
     @{ Pattern = "%APPDATA%\noctty\config"; Reason = "Windows docs use %LOCALAPPDATA%\\noctty\\config.ghostty." },
@@ -100,14 +97,23 @@ $requiredRules = @(
 
 $failures = New-Object System.Collections.Generic.List[string]
 
-# The WinGet package is live, so the docs must not call it pending either.
-$wingetDocFiles = @(
+# The WinGet package AmanThanvi.noctty is published, so neither the site nor the
+# docs may describe it as pending, planned or unpublished again. Matched on the
+# whole file (the docs are hard-wrapped), within one sentence, and not on
+# winget-pkgs, wingetcreate or WINGET_PACKAGE_IDENTIFIER.
+$wingetStateWords = "pending|planned|unpublished|coming soon|not (?:yet )?(?:been )?(?:published|available)|awaiting"
+$wingetPendingPattern = "(?is)\bwinget\b(?![-_]|create)[^.;,]{0,80}?\b(?:$wingetStateWords)\b|\b(?:$wingetStateWords)\b[^.;,]{0,80}?\bwinget\b(?![-_]|create)"
+$wingetPendingReason = "The WinGet package AmanThanvi.noctty is published; do not describe it as pending, planned or unpublished."
+$wingetCopyFiles = @($textFiles.FullName) + @(
     (Join-Path (Get-RepoRoot) "README.md"),
     (Join-Path (Get-RepoRoot) "PACKAGING.md")
 ) + @(Get-ChildItem -Path (Join-Path (Get-RepoRoot) "docs") -Filter "*.md" -File | ForEach-Object FullName)
-$wingetPendingRule = $forbiddenRules | Where-Object { $_.Pattern -like "(?i)winget*" }
-foreach ($match in (Select-String -Path $wingetDocFiles -Pattern $wingetPendingRule.Pattern)) {
-    $failures.Add(('{0}:{1}: forbidden pattern - {2}' -f $match.Path, $match.LineNumber, $wingetPendingRule.Reason))
+foreach ($file in $wingetCopyFiles) {
+    $text = Get-Content -LiteralPath $file -Raw
+    foreach ($m in [regex]::Matches($text, $wingetPendingPattern)) {
+        $line = ($text.Substring(0, $m.Index) -split "`n").Count
+        $failures.Add(('{0}:{1}: forbidden WinGet wording "{2}" - {3}' -f $file, $line, ($m.Value -replace "\s+", " "), $wingetPendingReason))
+    }
 }
 
 foreach ($rule in $forbiddenRules) {

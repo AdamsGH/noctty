@@ -122,8 +122,8 @@ Each release also includes signed manifests of the portable ZIP contents
 `noctty-1.3.131-windows-arm64-portable.manifest.ps1`) and `SHA256SUMS.txt`, an
 alias of the x64 checksum file kept for older auto-update clients.
 
-Scoop puts `noctty` on your `PATH`; WinGet runs the installer, so it, the
-installer and the portable ZIP do not.
+Scoop puts `noctty` on your `PATH`. WinGet runs the installer, and neither the
+installer nor the portable ZIP adds it.
 To run the `noctty` commands in this README, add the install folder to `PATH`
 or run `.\noctty.com` from that folder.
 

@@ -9,8 +9,8 @@ x64 and ARM64, and needs a GPU driver with OpenGL 4.3 or newer.
 winget install --id AmanThanvi.noctty -e
 ```
 
-WinGet runs the release installer. Scoop uses the same release assets and
-checksums and puts `noctty` on PATH:
+WinGet runs the release installer, which does not add `noctty` to PATH. Scoop
+uses the same release assets and checksums and does put `noctty` on PATH:
 
 ```powershell
 scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty
