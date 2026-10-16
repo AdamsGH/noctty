@@ -565,6 +565,53 @@ test "sprite face render all sprites" {
     try std.testing.expect(!diff); // There should be no diffs from reference.
 }
 
+test "sprite face centres a cursor that is shorter or taller than the cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var metrics: font.Metrics = .calc(.{
+        .px_per_em = 16,
+        .cell_width = 12,
+        .ascent = 30,
+        .descent = -6,
+        .line_gap = 0.0,
+        .underline_thickness = 2,
+        .strikethrough_thickness = 2,
+    });
+    try testing.expectEqual(@as(u32, 36), metrics.cell_height);
+
+    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+    defer atlas.deinit(alloc);
+
+    // `Metrics.calc` starts `cursor_height` at the cell height, so only a
+    // changed height exercises the centring. The offset is the glyph's
+    // height plus half the difference to the cell, truncated toward zero, so
+    // with an odd difference a shorter cursor sits half a pixel lower and a
+    // taller cursor half a pixel higher than an exact centring would put it
+    // (`offset_y` runs from the bottom of the cell to the top of the glyph).
+    const cases = [_]struct { cursor_height: u32, offset_y: i32 }{
+        .{ .cursor_height = 36, .offset_y = 36 }, // the cell height itself
+        .{ .cursor_height = 24, .offset_y = 30 }, // shorter, even difference
+        .{ .cursor_height = 25, .offset_y = 30 }, // shorter, odd difference
+        .{ .cursor_height = 40, .offset_y = 38 }, // taller, even difference
+        .{ .cursor_height = 39, .offset_y = 38 }, // taller, odd difference
+    };
+    const sprites = [_]Sprite{ .cursor_rect, .cursor_hollow_rect, .cursor_bar };
+
+    for (cases) |case| {
+        metrics.cursor_height = case.cursor_height;
+        const face: Face = .{ .metrics = metrics };
+        for (sprites) |sprite| {
+            const glyph = try face.renderGlyph(alloc, &atlas, @intFromEnum(sprite), .{
+                .grid_metrics = metrics,
+            });
+            errdefer std.debug.print("sprite {s} cursor_height {d}\n", .{ @tagName(sprite), case.cursor_height });
+            try testing.expectEqual(case.cursor_height, glyph.height);
+            try testing.expectEqual(case.offset_y, glyph.offset_y);
+        }
+    }
+}
+
 // test "sprite face print all sprites" {
 //     std.debug.print("\n\n", .{});
 //     inline for (ranges) |range| {
