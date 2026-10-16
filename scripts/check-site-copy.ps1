@@ -101,7 +101,7 @@ $failures = New-Object System.Collections.Generic.List[string]
 # docs may describe it as pending, planned or unpublished again. Matched on the
 # whole file (the docs are hard-wrapped), within one sentence, and not on
 # winget-pkgs, wingetcreate or WINGET_PACKAGE_IDENTIFIER.
-$wingetStateWords = "pending|planned|unpublished|coming soon|not (?:yet )?(?:been )?(?:published|available)|awaiting"
+$wingetStateWords = "pending|planned|unpublished|coming\s+soon|not\s+(?:yet\s+)?(?:been\s+)?(?:published|available)|awaiting"
 $wingetPendingPattern = "(?is)\bwinget\b(?![-_]|create)[^.;,]{0,80}?\b(?:$wingetStateWords)\b|\b(?:$wingetStateWords)\b[^.;,]{0,80}?\bwinget\b(?![-_]|create)"
 $wingetPendingReason = "The WinGet package AmanThanvi.noctty is published; do not describe it as pending, planned or unpublished."
 $wingetCopyFiles = @($textFiles.FullName) + @(
