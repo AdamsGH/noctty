@@ -23,9 +23,10 @@ pub const DocumentWindow = struct {
 };
 
 /// Provenance for absolute row numbers, independent of viewport and output
-/// appended without pruning. Resize, screen switch and history prune differ.
+/// appended without pruning. Resize, screen replacement and history prune differ.
 pub const RowNumbering = struct {
     active_key: u64,
+    screen_generation: u64 = 0,
     page_serial_min: u64,
     first_page_serial: u64,
     row_generation: u64 = 0,
@@ -37,6 +38,7 @@ pub fn rowNumbering(state: *const terminal.Terminal) RowNumbering {
     const pages = &state.screens.active.pages;
     return .{
         .active_key = @intFromEnum(state.screens.active_key),
+        .screen_generation = state.screens.generation(state.screens.active_key),
         .page_serial_min = pages.page_serial_min,
         .first_page_serial = pages.pages.first.?.serial,
         .row_generation = pages.row_generation,
@@ -206,11 +208,12 @@ fn snapshotDocumentWindow(
     var hash = std.hash.Wyhash.init(0);
     hash.update(text);
     const provenance = [_]u64{
-        @intFromEnum(terminal_state.screens.active_key), pages.page_serial,
-        pages.page_serial_min,                           pages.pages.first.?.serial,
-        pages.total_rows,                                document_window.top,
-        document_window.bottom,                          pages.rows,
-        pages.cols,                                      pages.row_generation,
+        @intFromEnum(terminal_state.screens.active_key),                      pages.page_serial,
+        pages.page_serial_min,                                                pages.pages.first.?.serial,
+        pages.total_rows,                                                     document_window.top,
+        document_window.bottom,                                               pages.rows,
+        pages.cols,                                                           pages.row_generation,
+        terminal_state.screens.generation(terminal_state.screens.active_key),
     };
     hash.update(std.mem.sliceAsBytes(&provenance));
 
@@ -496,6 +499,41 @@ test "PKG71 frozen scroll rejects erased history regrown with identical text" {
     defer after.deinit();
     try std.testing.expectEqualStrings(before.text, after.text);
     try std.testing.expectEqual(serial, pages.page_serial);
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before.scroll_token.?, before.document_window, 0, true));
+}
+
+test "PKG71 row numbering rejects alternate screen replacement after reset" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3 });
+    defer t.deinit(alloc);
+    _ = try t.switchScreen(.alternate);
+    try t.printString("old");
+    const before = rowNumbering(&t);
+    t.fullReset();
+    _ = try t.switchScreen(.alternate);
+    try t.printString("new");
+    const after = rowNumbering(&t);
+    // A newly allocated screen can repeat every page-local counter.
+    try std.testing.expectEqual(before.page_serial_min, after.page_serial_min);
+    try std.testing.expectEqual(before.first_page_serial, after.first_page_serial);
+    try std.testing.expectEqual(before.row_generation, after.row_generation);
+    try std.testing.expect(!std.meta.eql(before, after));
+}
+
+test "PKG71 frozen scroll rejects identical alternate screen replacement after reset" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3 });
+    defer t.deinit(alloc);
+    _ = try t.switchScreen(.alternate);
+    try t.printString("same");
+    var before = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer before.deinit();
+    t.fullReset();
+    _ = try t.switchScreen(.alternate);
+    try t.printString("same");
+    var after = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer after.deinit();
+    try std.testing.expectEqualStrings(before.text, after.text);
     try std.testing.expect(!try scrollFrozenRange(alloc, &t, before.scroll_token.?, before.document_window, 0, true));
 }
 
