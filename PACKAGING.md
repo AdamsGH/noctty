@@ -6,9 +6,11 @@ Releases. The public packaging targets are:
 - `noctty-<version>-windows-x64-setup.exe`
 - `noctty-<version>-windows-x64-portable.zip`
 - `noctty-<version>-windows-x64-portable.manifest.ps1`
+- `noctty-<version>-windows-x64-symbols.zip`
 - `noctty-<version>-windows-arm64-setup.exe`
 - `noctty-<version>-windows-arm64-portable.zip`
 - `noctty-<version>-windows-arm64-portable.manifest.ps1`
+- `noctty-<version>-windows-arm64-symbols.zip`
 - `SHA256SUMS-windows-x64.txt`
 - `SHA256SUMS-windows-arm64.txt`
 - `SHA256SUMS.txt` legacy alias for existing x64 auto-update clients
@@ -52,9 +54,31 @@ then produces:
 1. An Inno Setup installer
 2. A portable ZIP
 3. An Authenticode-signed manifest covering every portable payload file
-4. SHA256 checksums for published assets
-5. A release icon asset
-6. Generated package-manager metadata
+4. A symbols ZIP: the PDBs of the shipped binaries, from the same build
+5. SHA256 checksums for published assets
+6. A release icon asset
+7. Generated package-manager metadata
+
+The symbols ZIP holds one `symbols` folder with `noctty.pdb`,
+`noctty-command.pdb` (for `noctty.com`), `ghostty-vt.pdb` and
+`noctty-terminal-handoff-proxy.pdb`. Release builds therefore pass
+`-Dstrip=false` (`scripts/build-package-windows.ps1` does), and
+`-Dstrip=false` leaves ReleaseFast codegen alone: frame pointers are still
+omitted and unwind tables are kept, so the PDBs describe the binary users run.
+The PDBs stay out of the portable ZIP and the installer (the packager stages
+an explicit file list). `scripts/symbols-verification.ps1` reads each shipped
+PE's CodeView record and the PDB's info stream and requires the same GUID and
+age; the packager, `scripts/release-verify-artifacts.ps1` (against the ZIP
+that will be published) and `scripts/verify-published-release.ps1` (against the
+downloaded release) all run it, and the symbols ZIP is listed in
+`SHA256SUMS-windows-<arch>.txt` and attested like the other assets. Release
+`SHA256SUMS.txt` is a copy of the x64 file, so it lists the x64 symbols ZIP
+too; the in-app updater looks a file up by name and ignores the extra line.
+Scoop and WinGet read only the setup and portable entries.
+
+Pass `-RequireSymbols` to make a build without symbols fatal; the Release
+workflow always does. Without it, packaging a stripped build warns and omits
+the symbols ZIP.
 
 Local unsigned packaging is allowed for smoke validation, but the GitHub
 Release workflow requires signing and fails closed when signing is absent.
@@ -103,6 +127,12 @@ Then stage release assets:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Version 1.3.100
 ```
+
+The packager builds with `-Dstrip=false`. To package an existing build with
+`-SkipBuild`, build it the same way
+(`zig build -Demit-exe=true -Demit-lib-vt=true -Doptimize=ReleaseFast -Dstrip=false ...`),
+or the symbols ZIP is skipped with a warning (`-RequireSymbols` makes that
+fatal).
 
 The packaging script caches the verified NuGet package outside the source tree
 under `%LOCALAPPDATA%\noctty\cache\conpty\<version>`. A valid cached package is
@@ -263,10 +293,11 @@ Recommended order:
    - portable ZIP
    - `noctty-<version>-windows-x64-portable.manifest.ps1`
    - `noctty-<version>-windows-arm64-portable.manifest.ps1`
+   - `noctty-<version>-windows-<arch>-symbols.zip`
    - `SHA256SUMS-windows-<arch>.txt`
    - legacy x64 `SHA256SUMS.txt`
    - GitHub Release notes/assets
-7. Confirm build provenance for the nine non-icon assets.
+7. Confirm build provenance for the eleven non-icon assets.
 8. Confirm follow-on publishes:
    - Scoop manifest update
    - WinGet submission

@@ -164,9 +164,10 @@ foreach ($rule in $forbiddenRules) {
 $architectures = Get-WindowsPackageArchitectures
 $placeholderVersion = "<version>"
 $firstPortableManifestVersion = [version]"1.3.124"
+$firstSymbolsVersion = [version]"1.3.133"
 
 foreach ($arch in $architectures) {
-    foreach ($kind in @("setup", "portable", "manifest", "checksums")) {
+    foreach ($kind in @("setup", "portable", "manifest", "symbols", "checksums")) {
         $placeholderName = New-WindowsPackageArtifactName -Version $placeholderVersion -Architecture $arch -Kind $kind
         Require-Contains -RelativePath "PACKAGING.md" -Needle $placeholderName -Reason "Packaging docs must match scripts/windows-architecture.ps1 artifact naming."
     }
@@ -174,6 +175,13 @@ foreach ($arch in $architectures) {
 
 Require-Contains -RelativePath "PACKAGING.md" -Needle "legacy alias for existing x64 auto-update clients" -Reason "Packaging docs must preserve the x64 compatibility checksum alias."
 Require-Contains -RelativePath "PACKAGING.md" -Needle "Release workflow requires signing" -Reason "Packaging docs must distinguish local unsigned smoke packaging from public signed releases."
+
+# The symbols zip is named without a version in the docs that update-release-copy.ps1
+# rewrites (README, getting-started), so these checks do not depend on the latest release.
+$symbolsPlaceholderName = (New-WindowsPackageArtifactName -Version $placeholderVersion -Architecture "x64" -Kind "symbols").Replace("x64", "<arch>")
+foreach ($symbolsDocPath in @("README.md", "docs/windows.md", "docs/verify-release.md")) {
+    Require-Contains -RelativePath $symbolsDocPath -Needle $symbolsPlaceholderName -Reason "Release docs must list the symbols zip next to the other per-architecture assets."
+}
 
 foreach ($docsPath in @("docs/getting-started.md", "docs/windows.md")) {
     Require-Contains -RelativePath $docsPath -Needle "noctty-<version>-windows-<arch>-setup.exe" -Reason "Install docs should describe both x64 and ARM64 setup artifacts."
@@ -259,6 +267,9 @@ if ($CheckRemoteLatest) {
                 $remoteArtifactKinds = @("setup", "portable", "checksums")
                 if ([version]$latestVersion -ge $firstPortableManifestVersion) {
                     $remoteArtifactKinds += "manifest"
+                }
+                if ([version]$latestVersion -ge $firstSymbolsVersion) {
+                    $remoteArtifactKinds += "symbols"
                 }
                 foreach ($arch in $architectures) {
                     foreach ($kind in $remoteArtifactKinds) {

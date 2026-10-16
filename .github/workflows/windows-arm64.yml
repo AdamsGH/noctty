@@ -81,6 +81,7 @@ jobs:
           -Version $env:NOCTTY_CI_VERSION
           -Architecture arm64
           -Optimize ReleaseFast
+          -RequireSymbols
 
       - name: Run ARM64 CLI smoke
         shell: pwsh

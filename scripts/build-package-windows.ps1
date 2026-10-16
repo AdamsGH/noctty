@@ -12,7 +12,9 @@ param(
 
     [switch]$RequireSigning,
 
-    [switch]$RequireConPty
+    [switch]$RequireConPty,
+
+    [switch]$RequireSymbols
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +44,7 @@ try {
         "-Demit-lib-vt=true",
         "-Dtarget=$($archInfo.ZigTarget)",
         "-Dcpu=baseline",
+        "-Dstrip=false",
         "-Dcustom-shaders=true",
         "-Dversion-string=$Version"
     )
@@ -75,6 +78,9 @@ try {
     }
     if ($RequireConPty) {
         $packageArgs.RequireConPty = $true
+    }
+    if ($RequireSymbols) {
+        $packageArgs.RequireSymbols = $true
     }
 
     Write-Host "Package phase: $($archInfo.Name)"

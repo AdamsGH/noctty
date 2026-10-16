@@ -38,6 +38,7 @@ version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 /// Binary properties
 pie: bool = false,
 strip: bool = false,
+omit_frame_pointer: bool = false,
 
 /// Artifacts
 emit_bench: bool = false,
@@ -230,6 +231,15 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
     ) orelse switch (optimize) {
         .Debug => false,
         .ReleaseSafe => false,
+        .ReleaseFast, .ReleaseSmall => true,
+    };
+
+    // Follows the optimize mode, not `strip`: a release build that keeps its
+    // debug info (-Dstrip=false, which is how the symbols zip is built) must
+    // still generate release code, or the PDB would describe a different
+    // binary from the one users run.
+    config.omit_frame_pointer = switch (optimize) {
+        .Debug, .ReleaseSafe => false,
         .ReleaseFast, .ReleaseSmall => true,
     };
 

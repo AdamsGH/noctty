@@ -1,7 +1,7 @@
 $releaseArtifactVerifier = Join-Path $repoRoot 'scripts\release-verify-artifacts.ps1'
 $releaseArtifactVerifierText = Get-Content -LiteralPath $releaseArtifactVerifier -Raw
 $releaseArtifactVerifierSha256 =
-    'd302619b204e1d68819bb88cf3a75a286ea126e08b2e764f03a515db319965ad'
+    '22804247b157590260c275218dccd738705cecb0a3ed913a30d561910f9fe7e5'
 $canonicalReleaseArtifactVerifier = ConvertTo-CanonicalText `
     -Text $releaseArtifactVerifierText
 if ((Get-CanonicalTextSha256 -Text $canonicalReleaseArtifactVerifier) -cne
@@ -577,14 +577,18 @@ foreach ($requiredPin in $requiredSigningPolicyTestPins) {
 # is release-evidence topology, not incidental implementation cardinality.
 foreach ($contract in @(
     @{ Pattern = '(?s)\$firstPortableManifestVersion = \[version\]''1\.3\.124''.*?\$requiresPortableManifests = \(\$releaseVersion -ge \$firstPortableManifestVersion\)'; Description = 'published verifier executes the signed-manifest boundary at v1.3.124' },
-    @{ Pattern = '\$expectedAssetCount = if \(\$requiresPortableManifests\) \{ 10 \} else \{ 8 \}'; Description = 'published verifier preserves the historical asset set and requires ten assets from v1.3.124' },
+    @{ Pattern = '\$expectedAssetCount = if \(\$requiresPortableManifests\) \{ 10 \} else \{ 8 \}\s*if \(\$requiresSymbols\) \{ \$expectedAssetCount \+= 2 \}'; Description = 'published verifier preserves the historical asset set, requires ten assets from v1.3.124 and twelve from the first symbols release' },
+    @{ Pattern = '(?s)\$firstSymbolsVersion = \[version\]''1\.3\.133''.*?\$requiresSymbols = \(\$releaseVersion -ge \$firstSymbolsVersion\)'; Description = 'published verifier starts requiring the symbols zips at v1.3.133' },
+    @{ Pattern = '(?s)\$requiresSymbols\) \{\s*\$expectedNames\.Add\(\(New-WindowsPackageArtifactName[^\n]*-Kind symbols\)\)\s*\}'; Description = 'published verifier adds the per-architecture symbols zip to the exact asset set' },
+    @{ Pattern = '(?s)\$requiresSymbols\) \{\s*\[void\]\(Assert-SymbolsArchiveMatchesPortable.*?-SymbolsZip.*?-PayloadRoot \(Join-Path \$extractDirectory ''noctty''\)'; Description = 'published verifier matches every downloaded PDB to the downloaded portable binaries by GUID and age' },
     @{ Pattern = '(?s)\$missing = .*?\$unexpected = .*?\$missing\.Count -gt 0 -or \$unexpected\.Count -gt 0.*?asset set mismatch'; Description = 'published verifier rejects missing and unexpected assets' },
     @{ Pattern = '(?s)Get-FileSha256Lower.*?\$digest = .*?\$digest -notmatch.*?\$actualHash -ne \$digest\.Substring\(7\)\.ToLowerInvariant\(\).*?digest mismatch'; Description = 'published verifier compares downloaded bytes with GitHub SHA-256 digests' },
     @{ Pattern = 'SequenceEqual'; Description = 'published verifier preserves byte-identical legacy x64 checksum alias' },
     @{ Pattern = '(?s)\$checksums\.Count -ne \$expectedChecksumNames\.Count.*?\$checksums\.Contains\(\$_\).*?\$checksums\[\$name\] -ne \$actualHash'; Description = 'published verifier enforces exact checksum names, count, and hashes' },
     @{ Pattern = '(?s)\$signatureEvidence\.Add\(\(Assert-ReleaseSignature.*?Setup \$architecture.*?Portable manifest \$architecture.*?Assert-PortableManifestMatchesPayload.*?foreach \(\$relativePath.*?\$signatureEvidence\.Add\(\(Assert-ReleaseSignature.*?\$signedAssetsPerArchitecture = if \(\$requiresPortableManifests\) \{ 2 \} else \{ 1 \}.*?\$expectedSignatureCount =.*?@\(Get-WindowsPackageArchitectures\)\.Count \*.*?\(\$signedAssetsPerArchitecture \+ @\(Get-WindowsSignedRuntimePayloads\)\.Count\).*?\$signatureEvidence\.Count -ne \$expectedSignatureCount'; Description = 'published verifier validates two manifests plus a derived count of every signed portable PE while preserving pre-manifest releases' },
     @{ Pattern = '(?s)gh attestation verify \$Path.*?--repo \$Repository.*?--signer-workflow.*?release\.yml'; Description = 'published verifier binds provenance to the canonical release workflow' },
-    @{ Pattern = '(?s)\$expectedAttestationNames = @\(\$expectedNames \| Where-Object \{ \$_ -ne ''noctty-icon\.svg'' \}\).*?foreach \(\$asset in \$assets\).*?\$expectedAttestationNames -contains \[string\]\$asset\.name.*?\$expectedAttestationNames\.Count -ne 9.*?\$attestationEvidenceCount -ne \$expectedAttestationNames\.Count'; Description = 'published verifier binds the exact nine non-icon asset names to attestation evidence' },
+    @{ Pattern = '(?s)\$expectedAttestationNames = @\(\$expectedNames \| Where-Object \{ \$_ -ne ''noctty-icon\.svg'' \}\).*?foreach \(\$asset in \$assets\).*?\$expectedAttestationNames -contains \[string\]\$asset\.name.*?\$expectedAttestationNames\.Count -ne \$expectedAttestationCount.*?\$attestationEvidenceCount -ne \$expectedAttestationNames\.Count'; Description = 'published verifier binds the exact non-icon asset names (nine, eleven with symbols) to attestation evidence' },
+    @{ Pattern = '\$expectedAttestationCount = \$expectedAssetCount - 1'; Description = 'published verifier attests every asset but the static icon' },
     @{ Pattern = '(?s)\$thumbprints\.Count -ne 1 -or \$pins\.Count -ne 1.*?one consistent certificate'; Description = 'published verifier requires one consistent signer after shared updater-pin verification' },
     @{ Pattern = "Get-WindowsSignedRuntimePayloads"; Description = 'published verifier checks every packaged runtime PE for both architectures' },
     @{ Pattern = '(?s)finally \{.*?\$createdTempDirectory.*?\$DownloadDirectory\.StartsWith\(\$tempRoot.*?for \(\$attempt = 1; \$attempt -le 3; \$attempt\+\+\).*?Remove-Item .*?-ErrorAction Stop.*?Write-Warning'; Description = 'published verifier guards, retries, and reports temporary cleanup' }

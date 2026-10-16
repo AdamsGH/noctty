@@ -8,6 +8,7 @@ const source_root = "src/apprt/win32_terminal_handoff_proxy";
 
 library: *std.Build.Step.Compile,
 install_step: *std.Build.Step.InstallFile,
+pdb_install_step: ?*std.Build.Step.InstallFile,
 
 pub fn init(b: *std.Build, cfg: *const Config) !Proxy {
     const arch_dir = switch (cfg.target.result.cpu.arch) {
@@ -53,10 +54,17 @@ pub fn init(b: *std.Build, cfg: *const Config) !Proxy {
         library.getEmittedBin(),
         name ++ ".dll",
     );
-    return .{ .library = library, .install_step = install_step };
+    // The DLL is installed as a bare file, so its PDB, which the DLL's
+    // CodeView record names, has to be installed explicitly.
+    const pdb_install_step: ?*std.Build.Step.InstallFile = if (library.producesPdbFile())
+        b.addInstallBinFile(library.getEmittedPdb(), name ++ ".pdb")
+    else
+        null;
+    return .{ .library = library, .install_step = install_step, .pdb_install_step = pdb_install_step };
 }
 
 pub fn install(self: *const Proxy) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
+    if (self.pdb_install_step) |step| b.getInstallStep().dependOn(&step.step);
 }
