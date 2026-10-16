@@ -7059,10 +7059,10 @@ test "PKG71 held range rectangles follow scrolling wheel motion and current metr
     // Exercise the real no-scrollback erasure path with a held COM range,
     // rather than only synthesizing a changed provenance field above.
     const terminal = @import("../../terminal/main.zig");
-    for ([_]bool{ false, true }) |bounded| {
+    for (0..5) |path| {
         var t = try terminal.Terminal.init(std.testing.allocator, .{ .cols = 10, .rows = 3 });
         defer t.deinit(std.testing.allocator);
-        _ = try t.switchScreen(.alternate);
+        if (path < 3) _ = try t.switchScreen(.alternate);
         try t.printString("a\r\nb\r\nc");
         ctx = Hook{ .viewport_y = 0, .numbering = terminal_text.rowNumbering(&t) };
         var held_geometry = visible_geometry;
@@ -7072,10 +7072,25 @@ test "PKG71 held range rectangles follow scrolling wheel motion and current metr
         const held = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "b"), .{ .start = 0, .end = 1 }, held_geometry);
         defer _ = TerminalTextRangeProvider.Release(&held.base);
         try Hook.expectBounds(&held.base, screen_y + 22, 8, 16);
-        if (bounded)
-            try t.screens.active.pages.eraseRowBounded(.{ .active = .{} }, 1)
-        else
-            try t.screens.active.cursorDownScroll();
+        switch (path) {
+            0 => try t.screens.active.cursorDownScroll(),
+            1 => try t.screens.active.pages.eraseRowBounded(.{ .active = .{} }, 1),
+            2 => {
+                t.setCursorPos(1, 1);
+                t.reverseIndex();
+            },
+            3 => {
+                t.scrolling_region.top = 1;
+                t.setCursorPos(2, 1);
+                t.deleteLines(1);
+            },
+            4 => {
+                t.scrolling_region.bottom = 1;
+                t.setCursorPos(2, 1);
+                try t.index();
+            },
+            else => unreachable,
+        }
         ctx.numbering = terminal_text.rowNumbering(&t);
         var rects: ?*com.SAFEARRAY = null;
         try std.testing.expectEqual(com.S_OK, held.base.vtbl.GetBoundingRectangles(&held.base, &rects));

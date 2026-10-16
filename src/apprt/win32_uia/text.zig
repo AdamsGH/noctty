@@ -550,6 +550,47 @@ test "PKG71 row numbering rejects alternate screen replacement after reset" {
     try std.testing.expect(!std.meta.eql(before, after));
 }
 
+test "PKG71 held row numbering rejects reverse index" {
+    try testRowShiftInvalidates(.reverse_index);
+}
+
+test "PKG71 held row numbering rejects region line deletion" {
+    try testRowShiftInvalidates(.delete_lines);
+}
+
+test "PKG71 held row numbering rejects scroll above status line" {
+    try testRowShiftInvalidates(.scroll_above);
+}
+
+fn testRowShiftInvalidates(mode: enum { reverse_index, delete_lines, scroll_above }) !void {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 20, .rows = 4, .max_scrollback = 100_000 });
+    defer t.deinit(alloc);
+    if (mode == .reverse_index) _ = try t.switchScreen(.alternate);
+    try t.printString("one\r\ntwo\r\nthree\r\nstatus");
+    var held = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer held.deinit();
+    switch (mode) {
+        .reverse_index => {
+            t.setCursorPos(1, 1);
+            t.reverseIndex();
+        },
+        .delete_lines => {
+            t.scrolling_region.top = 1;
+            t.setCursorPos(2, 1);
+            t.deleteLines(1);
+        },
+        .scroll_above => {
+            t.scrolling_region.bottom = 2;
+            t.setCursorPos(3, 1);
+            try t.index();
+        },
+    }
+    const current = rowNumbering(&t);
+    try std.testing.expectEqual(held.row_numbering.?.first_page_serial, current.first_page_serial);
+    try std.testing.expect(!std.meta.eql(held.row_numbering.?, current));
+}
+
 test "PKG71 frozen scroll rejects identical alternate screen replacement after reset" {
     const alloc = std.testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 3 });
