@@ -126,10 +126,18 @@ try {
         }
 
         if (Test-Path -LiteralPath $resultPath) {
-            $raw = Get-Content -LiteralPath $resultPath -Raw
+            # The payload may still hold the file open, or have written only
+            # part of it; both mean "not ready yet", so read it again next poll.
+            $raw = $null
+            try { $raw = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop }
+            catch [System.IO.IOException] { $raw = $null }
             if (-not [string]::IsNullOrWhiteSpace($raw)) {
-                $result = $raw | ConvertFrom-Json
-                $resultObservedAt = [DateTime]::UtcNow
+                $parsed = $null
+                try { $parsed = $raw | ConvertFrom-Json } catch { $parsed = $null }
+                if ($null -ne $parsed) {
+                    $result = $parsed
+                    $resultObservedAt = [DateTime]::UtcNow
+                }
             }
         }
 

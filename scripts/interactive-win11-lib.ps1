@@ -318,6 +318,35 @@ function Get-InteractiveWin11LaunchArguments {
     )
 }
 
+function Get-InteractiveWin11WindowsPowerShellModulePath {
+    param(
+        [AllowEmptyString()] [string] $ModulePath
+    )
+
+    # PowerShell 7 puts its own module folders on PSModulePath and strips them
+    # only when it starts powershell.exe itself. The bootstrap starts Windows
+    # PowerShell through cmd.exe (dev-windows.cmd), so 5.1 inherits them and
+    # imports PowerShell 7's Microsoft.PowerShell.Utility, which has no
+    # Get-FileHash: the harness then fails with CommandNotFoundException.
+    $sharedPaths = @(
+        (Join-Path ([System.Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'),
+        (Join-Path $env:ProgramFiles 'PowerShell\Modules')
+    ) | ForEach-Object { $_.TrimEnd('\') }
+
+    $kept = foreach ($entry in @($ModulePath -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $trimmed = $entry.Trim().TrimEnd('\')
+        if (@($sharedPaths | Where-Object { $_.Equals($trimmed, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { continue }
+        if ((Split-Path -Leaf $trimmed) -ieq 'Modules') {
+            $parent = Split-Path -Parent $trimmed
+            if ($parent -and (Test-Path -LiteralPath (Join-Path $parent 'pwsh.exe') -PathType Leaf)) { continue }
+        }
+        $entry
+    }
+
+    return (@($kept) -join ';')
+}
+
 function Invoke-InteractiveWin11Bootstrap {
     param(
         [Parameter(Mandatory)] [string] $RepoRoot,
@@ -330,6 +359,8 @@ function Invoke-InteractiveWin11Bootstrap {
     $bootstrapCmd = Join-Path $RepoRoot 'scripts\dev-windows.cmd'
     $childExitCode = 0
     [System.Environment]::SetEnvironmentVariable($EnvironmentVariable, '1', 'Process')
+    $savedModulePath = $env:PSModulePath
+    $env:PSModulePath = Get-InteractiveWin11WindowsPowerShellModulePath -ModulePath $savedModulePath
 
     Push-Location $RepoRoot
     try {
@@ -340,6 +371,7 @@ function Invoke-InteractiveWin11Bootstrap {
     }
     finally {
         Pop-Location
+        $env:PSModulePath = $savedModulePath
         [System.Environment]::SetEnvironmentVariable(
             $EnvironmentVariable,
             $null,
