@@ -113,14 +113,14 @@ An automated readback alone is not a passing visible-desktop check.
 
 Set `renderer` before launch failures pile up. The config file is
 `%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside
-`noctty.exe` in portable mode. After three launches in a row that end before
-the window is ready, noctty starts in safe mode (see
+`noctty.exe` in portable mode. After three launches in a row, within seven
+days, that end before the window is ready, noctty starts in safe mode (see
 [Session restore and recovery](#session-restore-and-recovery)). Safe mode uses
 the built-in defaults and ignores `renderer`, so the failing OpenGL start
 repeats and counts again. If that has happened, move `startup-attempts.json`
-out of the noctty data folder (`%LOCALAPPDATA%\noctty`, or the folder beside
-`noctty.exe` in portable mode; noctty writes a new one) and start noctty
-again. This comes from reading `Policy`, `decide` and
+(and any `startup-attempts.json.pending-*` beside it) out of the noctty data
+folder (`%LOCALAPPDATA%\noctty`, or the folder beside `noctty.exe` in portable
+mode; noctty writes a new one) and start noctty again. This comes from reading `Policy`, `decide` and
 `beginRecoveryStartupAtPath` in the Win32 runtime; it was not run on a machine
 without OpenGL.
 
@@ -1579,8 +1579,10 @@ Win32 or Zig error. On x64, try in order:
 4. On a hybrid-GPU system, force `noctty.exe` to the discrete or integrated
    GPU in Windows Graphics settings.
 5. If OpenGL 4.3 is not available at all, set `renderer = d3d11` (or
-   `renderer = d3d11-warp`) in `%LOCALAPPDATA%\noctty\config.ghostty`. The
-   [D3D11 renderer beta](#d3d11-renderer-beta) draws text without OpenGL.
+   `renderer = d3d11-warp`) in your config file. The
+   [D3D11 renderer beta](#d3d11-renderer-beta) draws text without OpenGL; see
+   [Starting without OpenGL](#starting-without-opengl) for the config path and
+   what to do after repeated failed starts.
 
 Steps 3 and 4 do not apply on an ARM64 PC whose GPU vendor ships no desktop
 OpenGL driver (any Snapdragon PC), where there is no vendor driver to

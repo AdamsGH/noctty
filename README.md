@@ -197,7 +197,8 @@ in [docs/windows.md](docs/windows.md#updates).
 
 - **Won't start?** If a broken config or saved session blocks launch, run
   `noctty --safe-mode`. It starts once with built-in defaults and no session
-  restore, so you can fix the config.
+  restore, so you can fix the config. It still needs OpenGL 4.3; without it,
+  see [Starting without OpenGL](docs/windows.md#starting-without-opengl).
 - **Crashed?** `noctty +crash-report` lists the local crash dumps. For a bug
   report, `noctty +diagnostic-bundle` writes a support bundle that leaves out
   terminal content, commands, and config values by default. Crash dumps can

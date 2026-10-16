@@ -206,6 +206,9 @@ defaults and no session restore:
 noctty --safe-mode
 ```
 
+Safe mode still needs OpenGL 4.3; without it, see
+[Starting without OpenGL](windows.md#starting-without-opengl).
+
 Crash dumps stay local under `%LOCALAPPDATA%\noctty\crash`; read them with
 `noctty +crash-report`. Recovery and diagnostic bundles are in
 [windows.md](windows.md#crash-reports-and-diagnostics).
