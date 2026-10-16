@@ -960,6 +960,9 @@ pub fn cursorScrollAbove(self: *Screen) !void {
     //  lot cheaper in 99% of cases.
 
     const old_pin = self.cursor.page_pin.*;
+    // Rows below the cursor change absolute positions. Invalidate before
+    // grow/rotation so a partial mutation on allocation failure is covered.
+    self.pages.row_generation +%= 1;
     if (try self.pages.grow()) |_| {
         try self.cursorScrollAboveRotate();
     } else {

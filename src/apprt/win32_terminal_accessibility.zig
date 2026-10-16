@@ -2,7 +2,7 @@
 //!
 //! Owns the retained immutable snapshot, provider lifetime, query wakeups,
 //! refresh cadence, event selection, and incremental spoken-output policy.
-//! The Surface supplies one renderer-snapshot callback; renderer and session
+//! The Surface supplies renderer snapshot/geometry callbacks; renderer and session
 //! locks are therefore never held together.
 
 const std = @import("std");
@@ -52,6 +52,8 @@ pub const Ops = struct {
     focused: *const fn (*anyopaque) bool,
     capture: *const fn (*anyopaque, Allocator) anyerror!Capture,
     defer_provider_release: *const fn (*anyopaque, *win32_uia.TerminalProvider) void,
+    scroll: ?*const fn (*anyopaque, win32_uia.widgets.ScrollRequest) anyerror!void = null,
+    viewport: ?*const fn (*anyopaque) anyerror!win32_uia.widgets.TerminalViewportGeometry = null,
 };
 
 pub const Change = enum { unchanged, geometry, caret, text, text_and_caret };
@@ -73,6 +75,14 @@ pub const TerminalAccessibilitySession = struct {
     provider: ?*win32_uia.TerminalProvider = null,
     last_query_ms: std.atomic.Value(u64) = .init(0),
     query_refresh_post_pending: std.atomic.Value(bool) = .init(false),
+    pending_scroll: ?win32_uia.widgets.ScrollRequest = null,
+    scroll_message_inflight: bool = false,
+    scroll_retry_pending: bool = false,
+    cached_scroll_token: ?u64 = null,
+    cached_viewport_y: usize = 0,
+    cached_document_window: @import("win32_uia/text.zig").DocumentWindow = .{},
+    cached_row_numbering: ?@import("win32_uia/text.zig").RowNumbering = null,
+    current_viewport: ?win32_uia.widgets.TerminalViewportGeometry = null,
     last_refresh_ms: u64 = 0,
     refresh_timer_active: bool = false,
     /// Set when a refresh was skipped because the renderer lock was held. The
@@ -184,8 +194,79 @@ pub const TerminalAccessibilitySession = struct {
         self.publish(force, .accumulate);
     }
 
+    /// The window message carries no pointer and the session owns its pending
+    /// value. Surface teardown makes late messages harmless; no caller stack
+    /// or frozen range needs to outlive this asynchronous request.
+    pub fn handleScroll(self: *TerminalAccessibilitySession) void {
+        self.scroll_retry_pending = false;
+        self.mutex.lock();
+        const request = self.pending_scroll;
+        self.pending_scroll = null;
+        self.scroll_message_inflight = false;
+        const attached = self.attached;
+        self.mutex.unlock();
+        if (!attached) return;
+        if (request) |value| {
+            if (self.ops.scroll) |scroll| scroll(self.ops.ctx, value) catch |err| {
+                if (err == error.WouldBlock) {
+                    self.mutex.lock();
+                    // Keep a newer client request if it arrived meanwhile.
+                    if (self.attached and self.pending_scroll == null) self.pending_scroll = value;
+                    self.mutex.unlock();
+                    self.scroll_retry_pending = true;
+                    self.armContentionRetry();
+                }
+                return;
+            };
+            self.publish(true, .discard);
+        }
+    }
+
+    fn providerScroll(ctx: *anyopaque, request: win32_uia.widgets.ScrollRequest) !void {
+        const self: *TerminalAccessibilitySession = @ptrCast(@alignCast(ctx));
+        const hwnd = dispatch: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (!self.attached) return error.ElementNotAvailable;
+            if (self.ops.scroll == null) return error.NotSupported;
+            const hwnd = self.ops.hwnd(self.ops.ctx) orelse return error.ElementNotAvailable;
+            self.pending_scroll = request;
+            if (self.scroll_message_inflight) return;
+            self.scroll_message_inflight = true;
+            break :dispatch hwnd;
+        };
+        // No session or renderer lock may cross a synchronous window call.
+        // Only a by-value request in this retained session survives timeout.
+        var handled: usize = 0;
+        if (sys.SendMessageTimeoutW(hwnd, self.query_message, 2, 0, SMTO_BLOCK | SMTO_ABORTIFHUNG, cold_query_timeout_ms, &handled) != 0 and handled == 1) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.attached) return error.ElementNotAvailable;
+        // A timed-out send may already have started or completed handling.
+        if (self.pending_scroll == null or !self.scroll_message_inflight) return;
+        if (sys.PostMessageW(hwnd, self.query_message, 2, 0) == 0) {
+            self.scroll_message_inflight = false;
+            self.pending_scroll = null;
+            return error.ElementNotAvailable;
+        }
+    }
+
+    /// UI-thread-only, allocation-free geometry capture. Contention must not
+    /// expose old rectangles or block a reentrant renderer owner.
+    pub fn handleViewportRefresh(self: *TerminalAccessibilitySession) void {
+        self.mutex.lock();
+        const attached = self.attached;
+        self.mutex.unlock();
+        if (!attached) return;
+        const viewport = if (self.ops.viewport) |capture| capture(self.ops.ctx) catch null else null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.current_viewport = if (self.attached) viewport else null;
+    }
+
     pub fn handleTimer(self: *TerminalAccessibilitySession) void {
         self.cancelTimer();
+        self.handleScroll();
         self.publish(false, .emit);
     }
 
@@ -201,6 +282,7 @@ pub const TerminalAccessibilitySession = struct {
             self.clearRecentInput();
             self.announcement_normalizer = .{};
             self.mutex.unlock();
+            if (self.scroll_retry_pending) self.armContentionRetry();
             return;
         }
         if (self.provider == null) return;
@@ -318,6 +400,9 @@ pub const TerminalAccessibilitySession = struct {
         self.cancelTimer();
         self.mutex.lock();
         self.attached = false;
+        self.pending_scroll = null;
+        self.scroll_message_inflight = false;
+        self.current_viewport = null;
         self.query_refresh_post_pending.store(false, .release);
         self.mutex.unlock();
         if (self.provider) |provider| {
@@ -333,6 +418,9 @@ pub const TerminalAccessibilitySession = struct {
         force: bool,
         requested_speech_mode: SpeechMode,
     ) void {
+        // Snapshot publication/focus can cancel the shared refresh timer.
+        // Keep a contended scroll alive until it is validated or detached.
+        defer if (self.scroll_retry_pending) self.armContentionRetry();
         const provider = self.provider orelse return;
         const now_ms = sys.GetTickCount64();
         const policy = publishPolicy(
@@ -458,11 +546,19 @@ pub const TerminalAccessibilitySession = struct {
             self.origin_x == capture.origin_x and
             self.origin_y == capture.origin_y and
             cellsEqual(self.cached_cells, cells);
+        const announcement = if (speech_mode == .emit)
+            try self.takePendingAnnouncement()
+        else
+            null;
+        errdefer if (announcement) |value| self.alloc.free(value);
+
+        // Publish provenance only after the last fallible allocation, with
+        // the matching text/cells (or an unchanged equivalent) below.
+        self.cached_scroll_token = snapshot.scroll_token;
+        self.cached_viewport_y = snapshot.viewport_y;
+        self.cached_document_window = snapshot.document_window;
+        self.cached_row_numbering = snapshot.row_numbering;
         if (unchanged) {
-            const announcement = if (speech_mode == .emit)
-                try self.takePendingAnnouncement()
-            else
-                null;
             self.alloc.free(cells);
             self.alloc.free(text);
             if (update_refresh_time) self.last_refresh_ms = sys.GetTickCount64();
@@ -472,12 +568,6 @@ pub const TerminalAccessibilitySession = struct {
                 .announcement_pending = self.hasPendingAnnouncement(),
             };
         }
-
-        const announcement = if (speech_mode == .emit)
-            try self.takePendingAnnouncement()
-        else
-            null;
-        errdefer if (announcement) |value| self.alloc.free(value);
 
         self.alloc.free(self.cached_cells);
         self.alloc.free(self.cached_text);
@@ -634,6 +724,8 @@ pub const TerminalAccessibilitySession = struct {
             .name = providerName,
             .value = providerValue,
             .snapshot = providerSnapshot,
+            .scroll_range = providerScroll,
+            .current_viewport = if (self.ops.viewport != null) providerViewport else null,
             .focused = providerFocused,
         };
     }
@@ -687,6 +779,10 @@ pub const TerminalAccessibilitySession = struct {
             .terminal_selection_range = self.cached_selection_range,
             .terminal_selection_active_offset = self.cached_selection_active_offset,
             .geometry = .{
+                .scroll_token = self.cached_scroll_token,
+                .viewport_y = self.cached_viewport_y,
+                .document_window = self.cached_document_window,
+                .row_numbering = self.cached_row_numbering,
                 .cell_for_byte = cells,
                 .viewport_rows = self.viewport_rows,
                 .viewport_columns = self.viewport_columns,
@@ -696,6 +792,20 @@ pub const TerminalAccessibilitySession = struct {
                 .origin_y = self.origin_y,
             },
         };
+    }
+
+    fn providerViewport(ctx: *anyopaque) !?win32_uia.widgets.TerminalViewportGeometry {
+        const self: *TerminalAccessibilitySession = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        const hwnd = if (self.attached) self.ops.hwnd(self.ops.ctx) else null;
+        self.mutex.unlock();
+        const target = hwnd orelse return error.ElementNotAvailable;
+        var handled: usize = 0;
+        if (sys.SendMessageTimeoutW(target, self.query_message, 3, 0, SMTO_BLOCK | SMTO_ABORTIFHUNG, cold_query_timeout_ms, &handled) == 0 or handled != 1) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.attached) return error.ElementNotAvailable;
+        return self.current_viewport;
     }
 
     fn providerFocused(ctx: *anyopaque) bool {
@@ -777,6 +887,189 @@ pub fn cellsEqual(
         if (a.row != b.row or a.column != b.column or a.width != b.width) return false;
     }
     return true;
+}
+
+test "PKG71 scroll completes on responsive UI thread before returning without holding session lock" {
+    const message: u32 = 0x8000 + 6;
+    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = sys.DestroyWindow(hwnd);
+    const Hook = struct {
+        target: HWND,
+        session: ?*TerminalAccessibilitySession = null,
+        calls: usize = 0,
+        lock_was_held: bool = false,
+        geometry_blocked: bool = false,
+        fn window(ctx: *anyopaque) ?HWND {
+            return (@as(*@This(), @ptrCast(@alignCast(ctx)))).target;
+        }
+        fn scroll(ctx: *anyopaque, _: win32_uia.widgets.ScrollRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+        }
+        fn viewport(ctx: *anyopaque) !win32_uia.widgets.TerminalViewportGeometry {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.geometry_blocked) return error.WouldBlock;
+            return .{
+                .row_numbering = .{ .active_key = 0, .page_serial_min = 1, .first_page_serial = 1, .rows = 3, .columns = 10 },
+                .viewport_y = 42,
+                .cell_width = 8,
+                .cell_height = 16,
+                .origin_x = 4,
+                .origin_y = 6,
+            };
+        }
+        fn proc(window_handle: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(.winapi) win32_types.LRESULT {
+            if (msg == message and (wp == 2 or wp == 3)) {
+                const self: *@This() = @ptrFromInt(@as(usize, @bitCast(sys.GetWindowLongPtrW(window_handle, -21))));
+                const session = self.session.?;
+                if (!session.mutex.tryLock()) {
+                    self.lock_was_held = true;
+                    return 1;
+                }
+                session.mutex.unlock();
+                if (wp == 2) session.handleScroll() else session.handleViewportRefresh();
+                return 1;
+            }
+            return sys.DefWindowProcW(window_handle, msg, wp, lp);
+        }
+    };
+    var ctx = Hook{ .target = hwnd };
+    var ops = TestOps.ops(@ptrCast(&ctx));
+    ops.hwnd = Hook.window;
+    ops.scroll = Hook.scroll;
+    ops.viewport = Hook.viewport;
+    const session = try TerminalAccessibilitySession.create(std.testing.allocator, ops, message, 993);
+    var owned = true;
+    defer if (owned) session.deinit();
+    ctx.session = session;
+    _ = sys.SetWindowLongPtrW(hwnd, -21, @intCast(@intFromPtr(&ctx)));
+    const previous = sys.SetWindowLongPtrW(hwnd, -4, @intCast(@intFromPtr(&Hook.proc)));
+    defer _ = sys.SetWindowLongPtrW(hwnd, -4, previous);
+    try TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{ .token = 1, .absolute_row = 2, .align_to_top = true });
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expect(!ctx.lock_was_held);
+    try std.testing.expect(session.pending_scroll == null);
+    const current = session.state().current_viewport.?;
+    const live = (try current(@ptrCast(session))).?;
+    try std.testing.expectEqual(@as(usize, 42), live.viewport_y);
+    ctx.geometry_blocked = true;
+    try std.testing.expect((try current(@ptrCast(session))) == null);
+    try std.testing.expect(session.current_viewport == null);
+    try std.testing.expect(!ctx.lock_was_held);
+    TerminalAccessibilitySession.retain(@ptrCast(session));
+    defer TerminalAccessibilitySession.release(@ptrCast(session));
+    session.deinit();
+    owned = false;
+    try std.testing.expectError(error.ElementNotAvailable, current(@ptrCast(session)));
+}
+
+test "PKG71 scroll requests cross threads by value and detach cancels pending work" {
+    const message: u32 = 0x8000 + 6;
+    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = sys.DestroyWindow(hwnd);
+    const Context = struct {
+        hwnd_value: HWND,
+        ui_thread: u32,
+        calls: usize = 0,
+        last_row: usize = 0,
+        blocked: bool = true,
+        fn window(ctx: *anyopaque) ?HWND {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.hwnd_value;
+        }
+        fn scroll(ctx: *anyopaque, request: win32_uia.widgets.ScrollRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(self.ui_thread, sys.GetCurrentThreadId());
+            if (self.blocked) return error.WouldBlock;
+            self.calls += 1;
+            self.last_row = request.absolute_row;
+        }
+        fn worker(session: *TerminalAccessibilitySession) void {
+            TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+                .token = 1,
+                .absolute_row = 5,
+                .align_to_top = true,
+            }) catch @panic("failed to post scroll");
+            // Multiple requests coalesce to the newest by-value request.
+            TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+                .token = 1,
+                .absolute_row = 7,
+                .align_to_top = false,
+            }) catch @panic("failed to post scroll");
+        }
+    };
+    var ctx = Context{ .hwnd_value = hwnd, .ui_thread = sys.GetCurrentThreadId() };
+    var ops = TestOps.ops(@ptrCast(&ctx));
+    ops.hwnd = Context.window;
+    ops.scroll = Context.scroll;
+    const session = try TerminalAccessibilitySession.create(std.testing.allocator, ops, message, 991);
+    var owned = true;
+    defer if (owned) session.deinit();
+    const thread = try std.Thread.spawn(.{}, Context.worker, .{session});
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+    var queued: sys.MSG = undefined;
+    try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) != 0);
+    try std.testing.expectEqual(@as(usize, 2), queued.wParam);
+    try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) == 0);
+    session.handleScroll(); // Contention retains the request for the timer.
+    try std.testing.expect(session.pending_scroll != null);
+    ctx.blocked = false;
+    session.handleTimer();
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 7), ctx.last_row);
+    // A provider reference can outlive Surface teardown. Its retained session
+    // refuses callbacks before touching the now-invalid owner context.
+    TerminalAccessibilitySession.retain(@ptrCast(session));
+    defer TerminalAccessibilitySession.release(@ptrCast(session));
+    try TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+        .token = 1,
+        .absolute_row = 8,
+        .align_to_top = true,
+    });
+    session.deinit();
+    owned = false;
+    session.handleScroll();
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectError(error.ElementNotAvailable, TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+        .token = 1,
+        .absolute_row = 0,
+        .align_to_top = true,
+    }));
+}
+
+test "PKG71 new scroll request wakes pending work after retry timer failure" {
+    const message: u32 = 0x8000 + 6;
+    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = sys.DestroyWindow(hwnd);
+    const Context = struct {
+        target: HWND,
+        fn window(ctx: *anyopaque) ?HWND {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.target;
+        }
+        fn scroll(_: *anyopaque, _: win32_uia.widgets.ScrollRequest) !void {
+            return error.WouldBlock;
+        }
+    };
+    var ctx = Context{ .target = hwnd };
+    var ops = TestOps.ops(@ptrCast(&ctx));
+    ops.hwnd = Context.window;
+    ops.scroll = Context.scroll;
+    const session = try TerminalAccessibilitySession.create(std.testing.allocator, ops, message, 992);
+    defer session.deinit();
+    const request = win32_uia.widgets.ScrollRequest{ .token = 1, .absolute_row = 2, .align_to_top = true };
+    try TerminalAccessibilitySession.providerScroll(@ptrCast(session), request);
+    var queued: sys.MSG = undefined;
+    try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) != 0);
+    // Force real SetTimer failure while handling a contended request.
+    ctx.target = @ptrFromInt(1);
+    session.handleScroll();
+    try std.testing.expect(session.pending_scroll != null);
+    try std.testing.expect(!session.refresh_timer_active);
+    ctx.target = hwnd;
+    try TerminalAccessibilitySession.providerScroll(@ptrCast(session), request);
+    try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) != 0);
 }
 
 const TestOps = struct {
@@ -1088,6 +1381,68 @@ test "terminal snapshot does not allocate a second visible text copy" {
     defer if (snapshot.geometry) |geometry| alloc.free(geometry.cell_for_byte);
     const geometry_bytes = snapshot.geometry.?.cell_for_byte.len * @sizeOf(win32_uia.TerminalCellPosition);
     try std.testing.expectEqual(snapshot.document_text.len + geometry_bytes, counted.allocated_bytes);
+}
+
+test "PKG71 announcement OOM preserves coherent cached scroll geometry" {
+    const Hook = struct {
+        context: MutableTestOps.Context = .{ .focused = true, .text = "old" },
+        failing: *std.testing.FailingAllocator,
+        token: u64 = 1,
+        fail_announcement: bool = false,
+
+        fn capture(raw: *anyopaque, alloc: Allocator) !Capture {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result = try MutableTestOps.capture(@ptrCast(&self.context), alloc);
+            result.snapshot.scroll_token = self.token;
+            result.snapshot.viewport_y = @intCast(self.token);
+            result.snapshot.document_window = .{ .top = @intCast(self.token), .bottom = @intCast(self.token + 2) };
+            result.snapshot.row_numbering = .{
+                .active_key = 0,
+                .page_serial_min = 1,
+                .first_page_serial = 1,
+                .row_generation = self.token,
+                .rows = 3,
+                .columns = 10,
+            };
+            // Fail the next allocation after a successful capture, regardless
+            // of how many allocations capture needed.
+            if (self.fail_announcement)
+                self.failing.fail_index = self.failing.alloc_index;
+            return result;
+        }
+    };
+    for ([_]bool{ false, true }) |change_text| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var hook: Hook = .{ .failing = &failing };
+        var ops = TestOps.ops(@ptrCast(&hook));
+        ops.capture = Hook.capture;
+        const session = try TerminalAccessibilitySession.create(failing.allocator(), ops, 0, 0);
+        defer session.deinit();
+        _ = try session.refresh(.discard, false);
+        const old_window = session.cached_document_window;
+        const old_numbering = session.cached_row_numbering;
+        session.enqueuePendingAnnouncements("notice");
+        hook.token = 2;
+        if (change_text) hook.context.text = "new";
+        hook.fail_announcement = true;
+        try std.testing.expectError(error.OutOfMemory, session.refresh(.emit, false));
+        try std.testing.expectEqualStrings("old", session.cached_text);
+        try std.testing.expectEqual(@as(?u64, 1), session.cached_scroll_token);
+        try std.testing.expectEqual(@as(usize, 1), session.cached_viewport_y);
+        try std.testing.expectEqualDeep(old_window, session.cached_document_window);
+        try std.testing.expectEqualDeep(old_numbering, session.cached_row_numbering);
+        try std.testing.expectEqual(@as(usize, 1), session.pending_announcement_count);
+
+        hook.fail_announcement = false;
+        failing.fail_index = std.math.maxInt(usize);
+        const refreshed = try session.refresh(.emit, false);
+        defer if (refreshed.announcement) |value| failing.allocator().free(value);
+        try std.testing.expectEqualStrings(if (change_text) "new" else "old", session.cached_text);
+        try std.testing.expectEqual(@as(?u64, 2), session.cached_scroll_token);
+        try std.testing.expectEqual(@as(usize, 2), session.cached_viewport_y);
+        try std.testing.expectEqual(@as(u64, 2), session.cached_row_numbering.?.row_generation);
+        try std.testing.expectEqualStrings("notice", refreshed.announcement.?);
+    }
 }
 
 test "terminal output announcements are readable bounded increments" {

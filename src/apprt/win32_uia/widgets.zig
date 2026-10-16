@@ -24,6 +24,9 @@ const constants = @import("constants.zig");
 const events = @import("events.zig");
 const terminal_text = @import("text.zig");
 
+/// Private tab-button message. It carries a stable tab ID, never a pointer.
+pub const tab_close_message: u32 = 0x8000 + 16;
+
 const POINT = extern struct {
     x: i32,
     y: i32,
@@ -49,6 +52,8 @@ const GUITHREADINFO = extern struct {
 };
 
 extern "user32" fn GetClientRect(hWnd: com.HWND, lpRect: *RECT) callconv(.winapi) com.BOOL;
+extern "user32" fn GetWindowRect(hWnd: com.HWND, lpRect: *RECT) callconv(.winapi) com.BOOL;
+extern "user32" fn SetFocus(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
 extern "user32" fn GetDlgCtrlID(hWnd: com.HWND) callconv(.winapi) i32;
 extern "user32" fn GetParent(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
 extern "user32" fn IsWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
@@ -202,6 +207,17 @@ pub const TerminalState = struct {
         snapshot_text: []const u8,
         range: terminal_text.OffsetRange,
     ) anyerror!void = null,
+    scroll_range: ?*const fn (*anyopaque, ScrollRequest) anyerror!void = null,
+    current_viewport: ?*const fn (*anyopaque) anyerror!?TerminalViewportGeometry = null,
+};
+
+/// Pointer-free request. The UI thread validates the frozen document token
+/// under the renderer lock before aligning this absolute document row.
+pub const ScrollRequest = struct {
+    token: u64,
+    document_window: terminal_text.DocumentWindow = .{},
+    absolute_row: usize,
+    align_to_top: bool,
 };
 
 pub const TerminalSnapshot = struct {
@@ -220,9 +236,23 @@ pub const TerminalSnapshot = struct {
 };
 
 pub const TerminalRangeGeometry = struct {
+    scroll_token: ?u64 = null,
+    viewport_y: usize = 0,
+    document_window: terminal_text.DocumentWindow = .{},
+    row_numbering: ?terminal_text.RowNumbering = null,
     cell_for_byte: []terminal_text.TerminalCellPosition,
     viewport_rows: u32,
     viewport_columns: u32,
+    cell_width: f64,
+    cell_height: f64,
+    origin_x: f64,
+    origin_y: f64,
+};
+
+/// Compact live geometry; querying it never copies the frozen document/map.
+pub const TerminalViewportGeometry = struct {
+    row_numbering: terminal_text.RowNumbering,
+    viewport_y: usize,
     cell_width: f64,
     cell_height: f64,
     origin_x: f64,
@@ -2016,6 +2046,8 @@ pub const ChromeControlState = struct {
     selected: ?*const fn (*anyopaque, usize) bool = null,
     selected_provider: ?*const fn (*anyopaque) ?*ChromeControlProvider = null,
     selection_container: ?*const fn (*anyopaque) ?*ChromeControlProvider = null,
+    close_bounds: ?*const fn (*anyopaque, usize) ?com.UiaRect = null,
+    close_invoke: ?*const fn (*anyopaque, usize) bool = null,
     toggled: ?*const fn (*anyopaque, usize) bool = null,
     range_value: ?*const fn (*anyopaque) ChromeRangeValue = null,
     /// Overrides the role's default keyboard focusability, for a control
@@ -2054,6 +2086,10 @@ pub const ChromeControlProvider = struct {
             out.* = @ptrCast(&self.selection_iface);
         } else if (self.state.role == .tab_item and iidEqual(iid, &com.IID_ISelectionItemProvider)) {
             out.* = @ptrCast(&self.selection_item_iface);
+        } else if (self.state.role == .tab_item and iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
+            out.* = @ptrCast(&self.fragment);
+        } else if (self.state.role == .tab_item and iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
+            out.* = @ptrCast(&self.fragment_root);
         } else return com.E_NOINTERFACE;
         _ = AddRef(&self.base);
         return com.S_OK;
@@ -2074,6 +2110,9 @@ pub const ChromeControlProvider = struct {
     range_iface: com.IRangeValueProvider,
     selection_iface: com.ISelectionProvider,
     selection_item_iface: com.ISelectionItemProvider,
+    fragment: com.IRawElementProviderFragment,
+    fragment_root: com.IRawElementProviderFragmentRoot,
+    close_child_present: bool = false,
     refcount: std.atomic.Value(u32),
     alloc: std.mem.Allocator,
     hwnd: com.HWND,
@@ -2133,6 +2172,105 @@ pub const ChromeControlProvider = struct {
         .get_IsSelected = GetIsSelected,
         .get_SelectionContainer = GetSelectionContainer,
     };
+    const fragment_vtbl: com.IRawElementProviderFragmentVtbl = .{
+        .QueryInterface = Object.Interface("fragment").QueryInterface,
+        .AddRef = Object.Interface("fragment").AddRef,
+        .Release = Object.Interface("fragment").Release,
+        .Navigate = TabNavigate,
+        .GetRuntimeId = TabRuntimeId,
+        .get_BoundingRectangle = TabBounds,
+        .GetEmbeddedFragmentRoots = TabEmbeddedRoots,
+        .SetFocus = TabSetFocus,
+        .get_FragmentRoot = TabFragmentRoot,
+    };
+    const fragment_root_vtbl: com.IRawElementProviderFragmentRootVtbl = .{
+        .QueryInterface = Object.Interface("fragment_root").QueryInterface,
+        .AddRef = Object.Interface("fragment_root").AddRef,
+        .Release = Object.Interface("fragment_root").Release,
+        .ElementProviderFromPoint = TabFromPoint,
+        .GetFocus = TabFocus,
+    };
+
+    fn closeBounds(self: *ChromeControlProvider) ?com.UiaRect {
+        if (!self.available()) return null;
+        return (self.state.close_bounds orelse return null)(self.state.ctx, self.state.tag);
+    }
+
+    pub fn syncCloseChild(self: *ChromeControlProvider) void {
+        const present = self.closeBounds() != null;
+        if (present == self.close_child_present) return;
+        self.close_child_present = present;
+        events.raiseStructureChanged(&self.base, .children_invalidated, null);
+    }
+
+    fn TabNavigate(p: *com.IRawElementProviderFragment, direction: i32, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
+        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        // UIA supplies HWND parent/siblings through the host provider.
+        if (direction != com.NavigateDirection_FirstChild and direction != com.NavigateDirection_LastChild) return com.S_OK;
+        if (self.closeBounds() == null) return com.S_OK;
+        const child = TabCloseProvider.create(self.alloc, self) catch return com.E_OUTOFMEMORY;
+        out.* = &child.fragment;
+        return com.S_OK;
+    }
+    fn TabRuntimeId(_: *com.IRawElementProviderFragment, out: *?*com.SAFEARRAY) callconv(.winapi) com.HRESULT {
+        out.* = null; // HWND identity is supplied by UIA.
+        return com.S_OK;
+    }
+    fn TabBounds(p: *com.IRawElementProviderFragment, out: *com.UiaRect) callconv(.winapi) com.HRESULT {
+        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        out.* = .{ .left = 0, .top = 0, .width = 0, .height = 0 };
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        var rect: RECT = undefined;
+        if (GetWindowRect(self.hwnd, &rect) != 0) out.* = .{
+            .left = @floatFromInt(rect.left),
+            .top = @floatFromInt(rect.top),
+            .width = @floatFromInt(rect.right - rect.left),
+            .height = @floatFromInt(rect.bottom - rect.top),
+        };
+        return com.S_OK;
+    }
+    fn TabEmbeddedRoots(_: *com.IRawElementProviderFragment, out: *?*com.SAFEARRAY) callconv(.winapi) com.HRESULT {
+        out.* = null;
+        return com.S_OK;
+    }
+    fn TabSetFocus(p: *com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
+        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        _ = SetFocus(self.hwnd);
+        return com.S_OK;
+    }
+    fn TabFragmentRoot(p: *com.IRawElementProviderFragment, out: *?*com.IRawElementProviderFragmentRoot) callconv(.winapi) com.HRESULT {
+        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        _ = AddRef(&self.base);
+        out.* = &self.fragment_root;
+        return com.S_OK;
+    }
+    fn TabFromPoint(p: *com.IRawElementProviderFragmentRoot, x: f64, y: f64, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
+        const self: *ChromeControlProvider = @fieldParentPtr("fragment_root", p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (self.closeBounds()) |rect| {
+            if (x >= rect.left and x < rect.left + rect.width and y >= rect.top and y < rect.top + rect.height)
+                return TabNavigate(&self.fragment, com.NavigateDirection_FirstChild, out);
+        }
+        _ = AddRef(&self.base);
+        out.* = &self.fragment;
+        return com.S_OK;
+    }
+    fn TabFocus(p: *com.IRawElementProviderFragmentRoot, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
+        const self: *ChromeControlProvider = @fieldParentPtr("fragment_root", p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (hwndHasKeyboardFocus(self.hwnd)) {
+            _ = AddRef(&self.base);
+            out.* = &self.fragment;
+        }
+        return com.S_OK;
+    }
 
     pub fn create(
         alloc: std.mem.Allocator,
@@ -2147,6 +2285,8 @@ pub const ChromeControlProvider = struct {
             .range_iface = .{ .vtbl = &range_vtbl },
             .selection_iface = .{ .vtbl = &selection_vtbl },
             .selection_item_iface = .{ .vtbl = &selection_item_vtbl },
+            .fragment = .{ .vtbl = &fragment_vtbl },
+            .fragment_root = .{ .vtbl = &fragment_root_vtbl },
             .refcount = .init(1),
             .alloc = alloc,
             .hwnd = hwnd,
@@ -2180,6 +2320,11 @@ pub const ChromeControlProvider = struct {
     pub fn raiseNameChanged(self: *ChromeControlProvider) void {
         if (!self.available()) return;
         events.raiseNameChanged(&self.base);
+        if (self.closeBounds() != null) {
+            const child = TabCloseProvider.create(self.alloc, self) catch return;
+            defer _ = TabCloseProvider.Release(&child.base);
+            events.raiseNameChanged(&child.base);
+        }
     }
 
     pub fn raiseItemStatusChanged(self: *ChromeControlProvider) void {
@@ -2562,6 +2707,361 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
 };
+
+/// Painted tab close child. Retains the tab provider, whose detachment gates
+/// all owner callbacks. Instances share a stable runtime ID, not a cached BSTR.
+pub const TabCloseProvider = struct {
+    const Object = object.ComObject(TabCloseProvider, query, release);
+
+    base: com.IRawElementProviderSimple,
+    fragment: com.IRawElementProviderFragment,
+    invoke_iface: com.IInvokeProvider,
+    refcount: std.atomic.Value(u32),
+    alloc: std.mem.Allocator,
+    parent: *ChromeControlProvider,
+
+    const simple_vtbl: com.IRawElementProviderSimpleVtbl = .{
+        .QueryInterface = QueryInterface,
+        .AddRef = AddRef,
+        .Release = Release,
+        .get_ProviderOptions = get_ProviderOptions,
+        .GetPatternProvider = GetPatternProvider,
+        .GetPropertyValue = GetPropertyValue,
+        .get_HostRawElementProvider = get_HostRawElementProvider,
+    };
+    const fragment_vtbl: com.IRawElementProviderFragmentVtbl = .{
+        .QueryInterface = FragmentQueryInterface,
+        .AddRef = FragmentAddRef,
+        .Release = FragmentRelease,
+        .Navigate = Navigate,
+        .GetRuntimeId = GetRuntimeId,
+        .get_BoundingRectangle = GetBoundingRectangle,
+        .GetEmbeddedFragmentRoots = GetEmbeddedFragmentRoots,
+        .SetFocus = TabCloseProvider.SetFocus,
+        .get_FragmentRoot = GetFragmentRoot,
+    };
+    const invoke_vtbl: com.IInvokeProviderVtbl = .{
+        .QueryInterface = InvokeQueryInterface,
+        .AddRef = InvokeAddRef,
+        .Release = InvokeRelease,
+        .Invoke = Invoke,
+    };
+
+    pub fn create(
+        alloc: std.mem.Allocator,
+        parent: *ChromeControlProvider,
+    ) !*TabCloseProvider {
+        const self = try alloc.create(TabCloseProvider);
+        _ = ChromeControlProvider.AddRef(&parent.base);
+        self.* = .{
+            .base = .{ .vtbl = &simple_vtbl },
+            .fragment = .{ .vtbl = &fragment_vtbl },
+            .invoke_iface = .{ .vtbl = &invoke_vtbl },
+            .refcount = std.atomic.Value(u32).init(1),
+            .alloc = alloc,
+            .parent = parent,
+        };
+        return self;
+    }
+
+    fn fromBase(p: *com.IRawElementProviderSimple) *TabCloseProvider {
+        return @fieldParentPtr("base", p);
+    }
+    fn fromFragment(p: *com.IRawElementProviderFragment) *TabCloseProvider {
+        return @fieldParentPtr("fragment", p);
+    }
+    fn fromInvoke(p: *com.IInvokeProvider) *TabCloseProvider {
+        return @fieldParentPtr("invoke_iface", p);
+    }
+
+    fn available(self: *const TabCloseProvider) bool {
+        return self.parent.closeBounds() != null;
+    }
+
+    fn query(self: *TabCloseProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+        out.* = null;
+        if (iidEqual(iid, &com.IID_IUnknown) or
+            iidEqual(iid, &com.IID_IRawElementProviderSimple))
+        {
+            out.* = @ptrCast(&self.base);
+        } else if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
+            out.* = @ptrCast(&self.fragment);
+        } else if (iidEqual(iid, &com.IID_IInvokeProvider)) {
+            out.* = @ptrCast(&self.invoke_iface);
+        } else return com.E_NOINTERFACE;
+        _ = self.refcount.fetchAdd(1, .monotonic);
+        return com.S_OK;
+    }
+    pub const QueryInterface = Object.Interface("base").QueryInterface;
+    const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
+    const InvokeQueryInterface = Object.Interface("invoke_iface").QueryInterface;
+
+    fn addRef(self: *TabCloseProvider) u32 {
+        return self.refcount.fetchAdd(1, .monotonic) + 1;
+    }
+    pub const AddRef = Object.Interface("base").AddRef;
+    const FragmentAddRef = Object.Interface("fragment").AddRef;
+    const InvokeAddRef = Object.Interface("invoke_iface").AddRef;
+
+    fn release(self: *TabCloseProvider) u32 {
+        const previous = self.refcount.fetchSub(1, .acq_rel);
+        if (previous == 1) {
+            const parent = self.parent;
+            self.alloc.destroy(self);
+            _ = ChromeControlProvider.Release(&parent.base);
+            return 0;
+        }
+        return previous - 1;
+    }
+    pub const Release = Object.Interface("base").Release;
+    const FragmentRelease = Object.Interface("fragment").Release;
+    const InvokeRelease = Object.Interface("invoke_iface").Release;
+
+    fn get_ProviderOptions(
+        p: *com.IRawElementProviderSimple,
+        out: *i32,
+    ) callconv(.winapi) com.HRESULT {
+        out.* = com.ProviderOptions_ServerSideProvider |
+            (if (fromBase(p).parent.state.use_com_threading) com.ProviderOptions_UseComThreading else @as(i32, 0));
+        return com.S_OK;
+    }
+
+    fn GetPatternProvider(
+        p: *com.IRawElementProviderSimple,
+        pattern_id: i32,
+        out: *?*com.IUnknown,
+    ) callconv(.winapi) com.HRESULT {
+        const self = fromBase(p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (pattern_id != constants.UIA_InvokePatternId) return com.S_OK;
+        out.* = @ptrCast(&self.invoke_iface);
+        _ = self.addRef();
+        return com.S_OK;
+    }
+
+    pub fn GetPropertyValue(
+        p: *com.IRawElementProviderSimple,
+        property_id: i32,
+        out: *com.VARIANT,
+    ) callconv(.winapi) com.HRESULT {
+        const self = fromBase(p);
+        out.* = com.VARIANT.empty();
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        switch (property_id) {
+            constants.UIA_ControlTypePropertyId => {
+                out.* = com.VARIANT.fromI4(constants.UIA_ButtonControlTypeId);
+            },
+            constants.UIA_NamePropertyId => {
+                var title_buf: [512]u8 = undefined;
+                const title = self.parent.state.name(self.parent.state.ctx, self.parent.state.tag, &title_buf);
+                var name_buf: [600]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "Close tab: {s}", .{title}) catch "Close tab";
+                const bstr = allocBstrFromUtf8(self.alloc, name) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
+            },
+            constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
+            constants.UIA_IsControlElementPropertyId,
+            constants.UIA_IsContentElementPropertyId,
+            constants.UIA_IsEnabledPropertyId,
+            => out.* = com.VARIANT.fromBool(true),
+            constants.UIA_IsKeyboardFocusablePropertyId,
+            constants.UIA_HasKeyboardFocusPropertyId,
+            => out.* = com.VARIANT.fromBool(false),
+            constants.UIA_IsOffscreenPropertyId => {
+                out.* = com.VARIANT.fromBool(IsWindowVisible(self.parent.hwnd) == 0);
+            },
+            else => {},
+        }
+        return com.S_OK;
+    }
+
+    fn get_HostRawElementProvider(
+        _: *com.IRawElementProviderSimple,
+        out: *?*com.IRawElementProviderSimple,
+    ) callconv(.winapi) com.HRESULT {
+        out.* = null;
+        return com.S_OK;
+    }
+
+    pub fn Navigate(
+        p: *com.IRawElementProviderFragment,
+        direction: i32,
+        out: *?*com.IRawElementProviderFragment,
+    ) callconv(.winapi) com.HRESULT {
+        const self = fromFragment(p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (direction == com.NavigateDirection_Parent) {
+            out.* = &self.parent.fragment;
+            _ = ChromeControlProvider.AddRef(&self.parent.base);
+            return com.S_OK;
+        }
+        return com.S_OK; // The close button is the tab's only child.
+
+    }
+
+    pub fn GetRuntimeId(
+        p: *com.IRawElementProviderFragment,
+        out: *?*com.SAFEARRAY,
+    ) callconv(.winapi) com.HRESULT {
+        const self = fromFragment(p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        return object.runtimeId(&.{ com.UiaAppendRuntimeId, 0x54434C, @bitCast(@as(u32, @truncate(self.parent.state.tag))) }, out);
+    }
+
+    pub fn GetBoundingRectangle(
+        p: *com.IRawElementProviderFragment,
+        out: *com.UiaRect,
+    ) callconv(.winapi) com.HRESULT {
+        const self = fromFragment(p);
+        out.* = .{ .left = 0, .top = 0, .width = 0, .height = 0 };
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (self.parent.closeBounds()) |rect| out.* = rect;
+        return com.S_OK;
+    }
+
+    fn GetEmbeddedFragmentRoots(
+        _: *com.IRawElementProviderFragment,
+        out: *?*com.SAFEARRAY,
+    ) callconv(.winapi) com.HRESULT {
+        out.* = null;
+        return com.S_OK;
+    }
+
+    fn SetFocus(p: *com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
+        if (!fromFragment(p).available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        return com.E_NOTIMPL;
+    }
+
+    fn GetFragmentRoot(
+        p: *com.IRawElementProviderFragment,
+        out: *?*com.IRawElementProviderFragmentRoot,
+    ) callconv(.winapi) com.HRESULT {
+        const self = fromFragment(p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        out.* = &self.parent.fragment_root;
+        _ = ChromeControlProvider.AddRef(&self.parent.base);
+        return com.S_OK;
+    }
+
+    pub fn Invoke(p: *com.IInvokeProvider) callconv(.winapi) com.HRESULT {
+        const self = fromInvoke(p);
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        const invoke = self.parent.state.close_invoke orelse return com.UIA_E_INVALIDOPERATION;
+        if (!invoke(self.parent.state.ctx, self.parent.state.tag)) return com.UIA_E_INVALIDOPERATION;
+        // Raised only once the command is actually on the window's queue,
+        // and before returning, which is where UIA expects it.
+        events.raiseInvoked(&self.base);
+        return com.S_OK;
+    }
+};
+
+test "PKG71 close child navigation identity bounds names events and detach" {
+    const win32 = @import("../win32/sys.zig");
+    const hwnd = win32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = win32.DestroyWindow(hwnd);
+    const Context = struct {
+        closable: bool = true,
+        calls: usize = 0,
+        fn name(_: *anyopaque, _: usize, _: []u8) []const u8 {
+            return "inactive shell";
+        }
+        fn bounds(ctx: *anyopaque, _: usize) ?com.UiaRect {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.closable) return null;
+            return .{ .left = 80, .top = 10, .width = 20, .height = 24 };
+        }
+        fn invoke(ctx: *anyopaque, _: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return true;
+        }
+    };
+    var ctx = Context{};
+    const parent = try ChromeControlProvider.create(std.testing.allocator, hwnd, .{
+        .ctx = &ctx,
+        .tag = 42,
+        .role = .tab_item,
+        .name = Context.name,
+        .close_bounds = Context.bounds,
+        .close_invoke = Context.invoke,
+    });
+    defer _ = ChromeControlProvider.Release(&parent.base);
+    const events_before = events.testing_structure_changes;
+    parent.syncCloseChild();
+    parent.syncCloseChild();
+    try std.testing.expectEqual(events_before + 1, events.testing_structure_changes);
+    var child: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.S_OK, parent.fragment.vtbl.Navigate(&parent.fragment, com.NavigateDirection_FirstChild, &child));
+    try std.testing.expect(child != null);
+    defer _ = child.?.vtbl.Release(child.?);
+    const close = TabCloseProvider.fromFragment(child.?);
+    var hit: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.S_OK, parent.fragment_root.vtbl.ElementProviderFromPoint(&parent.fragment_root, 90, 20, &hit));
+    {
+        defer if (hit) |value| {
+            _ = value.vtbl.Release(value);
+        };
+        try std.testing.expect(hit != null and hit != &parent.fragment);
+        try std.testing.expect(TabCloseProvider.fromFragment(hit.?).parent == parent);
+    }
+    try std.testing.expectEqual(com.S_OK, parent.fragment_root.vtbl.ElementProviderFromPoint(&parent.fragment_root, 79, 20, &hit));
+    try std.testing.expect(hit == &parent.fragment);
+    _ = hit.?.vtbl.Release(hit.?);
+    var last: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.S_OK, parent.fragment.vtbl.Navigate(&parent.fragment, com.NavigateDirection_LastChild, &last));
+    defer _ = last.?.vtbl.Release(last.?);
+    var id1: ?*com.SAFEARRAY = null;
+    var id2: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(com.S_OK, child.?.vtbl.GetRuntimeId(child.?, &id1));
+    defer _ = com.SafeArrayDestroy(id1.?);
+    try std.testing.expectEqual(com.S_OK, last.?.vtbl.GetRuntimeId(last.?, &id2));
+    defer _ = com.SafeArrayDestroy(id2.?);
+    for (0..3) |i| {
+        var index: i32 = @intCast(i);
+        var a: i32 = 0;
+        var b: i32 = 0;
+        try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(id1.?, &index, &a));
+        try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(id2.?, &index, &b));
+        try std.testing.expectEqual(a, b);
+    }
+    var bounds: com.UiaRect = undefined;
+    try std.testing.expectEqual(com.S_OK, child.?.vtbl.get_BoundingRectangle(child.?, &bounds));
+    try std.testing.expectEqual(@as(f64, 20), bounds.width);
+    var name1 = com.VARIANT.empty();
+    var name2 = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, close.base.vtbl.GetPropertyValue(&close.base, constants.UIA_NamePropertyId, &name1));
+    defer _ = com.VariantClear(&name1);
+    try std.testing.expectEqual(com.S_OK, close.base.vtbl.GetPropertyValue(&close.base, constants.UIA_NamePropertyId, &name2));
+    defer _ = com.VariantClear(&name2);
+    try std.testing.expect(name1.value.bstr != name2.value.bstr);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Close tab: inactive shell"), std.mem.span(name1.value.bstr.?));
+    var link: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.S_OK, child.?.vtbl.Navigate(child.?, com.NavigateDirection_Parent, &link));
+    try std.testing.expect(link == &parent.fragment);
+    _ = link.?.vtbl.Release(link.?);
+    const invoked_before = events.testing_invocations;
+    try std.testing.expectEqual(com.S_OK, close.invoke_iface.vtbl.Invoke(&close.invoke_iface));
+    try std.testing.expectEqual(invoked_before + 1, events.testing_invocations);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    ctx.closable = false;
+    parent.syncCloseChild();
+    try std.testing.expectEqual(com.S_OK, parent.fragment_root.vtbl.ElementProviderFromPoint(&parent.fragment_root, 90, 20, &hit));
+    try std.testing.expect(hit == &parent.fragment);
+    _ = hit.?.vtbl.Release(hit.?);
+    try std.testing.expectEqual(events_before + 2, events.testing_structure_changes);
+    try std.testing.expectEqual(com.S_OK, parent.fragment.vtbl.Navigate(&parent.fragment, com.NavigateDirection_FirstChild, &link));
+    try std.testing.expect(link == null);
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, close.invoke_iface.vtbl.Invoke(&close.invoke_iface));
+    ctx.closable = true;
+    parent.detach();
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, child.?.vtbl.get_BoundingRectangle(child.?, &bounds));
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, close.invoke_iface.vtbl.Invoke(&close.invoke_iface));
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+}
 
 pub fn returnChromeControlProvider(
     hwnd: com.HWND,
@@ -3593,10 +4093,32 @@ const TerminalTextRangeProvider = struct {
         const self = fromBase(self_base);
         out.* = null;
         if (self.parent.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        const geometry = self.geometry orelse {
+        var geometry = self.geometry orelse {
             out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
             return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
         };
+        var row_shift: i64 = 0;
+        if (self.parent.state.current_viewport) |current_viewport| {
+            const current = current_viewport(self.parent.state.ctx) catch |err| {
+                if (err == error.ElementNotAvailable) return com.UIA_E_ELEMENTNOTAVAILABLE;
+                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+            };
+            if (current == null or geometry.row_numbering == null or
+                !std.meta.eql(geometry.row_numbering.?, current.?.row_numbering))
+            {
+                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+            }
+            const live = current.?;
+            row_shift = @as(i64, @intCast(geometry.viewport_y)) - @as(i64, @intCast(live.viewport_y));
+            geometry.viewport_rows = live.row_numbering.rows;
+            geometry.viewport_columns = live.row_numbering.columns;
+            geometry.cell_width = live.cell_width;
+            geometry.cell_height = live.cell_height;
+            geometry.origin_x = live.origin_x;
+            geometry.origin_y = live.origin_y;
+        }
         var screen_origin: POINT = .{ .x = 0, .y = 0 };
         if (ClientToScreen(self.parent.hwnd, &screen_origin) == 0) {
             out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
@@ -3610,6 +4132,7 @@ const TerminalTextRangeProvider = struct {
             self.text,
             self.range,
             geometry,
+            row_shift,
             screen_origin,
             values,
         );
@@ -3769,10 +4292,29 @@ const TerminalTextRangeProvider = struct {
 
     fn ScrollIntoView(
         self_base: *com.ITextRangeProvider,
-        _: com.BOOL,
+        align_to_top: com.BOOL,
     ) callconv(.winapi) com.HRESULT {
-        if (fromBase(self_base).parent.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return com.E_NOTIMPL;
+        const self = fromBase(self_base);
+        if (self.parent.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        const scroll = self.parent.state.scroll_range orelse return com.E_NOTIMPL;
+        const geometry = self.geometry orelse return com.UIA_E_INVALIDOPERATION;
+        const token = geometry.scroll_token orelse return com.UIA_E_INVALIDOPERATION;
+        if (geometry.cell_for_byte.len != self.text.len or self.text.len == 0) return com.UIA_E_INVALIDOPERATION;
+        // End is exclusive. A degenerate range uses the insertion cell (or
+        // the last cell at document end), never the next line of a range.
+        const offset = if (align_to_top != 0 or self.range.start == self.range.end)
+            @min(self.range.start, self.text.len - 1)
+        else
+            @min(self.range.end -| 1, self.text.len - 1);
+        const absolute_row = @as(i64, @intCast(geometry.viewport_y)) + geometry.cell_for_byte[offset].row;
+        if (absolute_row < 0) return com.UIA_E_INVALIDOPERATION;
+        scroll(self.parent.state.ctx, .{
+            .token = token,
+            .document_window = geometry.document_window,
+            .absolute_row = @intCast(absolute_row),
+            .align_to_top = align_to_top != 0,
+        }) catch |err| return if (err == error.ElementNotAvailable) com.UIA_E_ELEMENTNOTAVAILABLE else com.UIA_E_INVALIDOPERATION;
+        return com.S_OK;
     }
 
     fn GetChildren(
@@ -3976,6 +4518,7 @@ fn terminalGridRectangleValues(
     text: []const u8,
     range: terminal_text.OffsetRange,
     geometry: TerminalRangeGeometry,
+    row_shift: i64,
     screen_origin: POINT,
     values: []f64,
 ) usize {
@@ -3992,14 +4535,16 @@ fn terminalGridRectangleValues(
     var min_column: u32 = 0;
     var max_column: u32 = 0;
     for (geometry.cell_for_byte[normalized.start..normalized.end]) |cell| {
-        if (cell.width == 0 or cell.row < 0 or cell.row >= @as(i32, @intCast(geometry.viewport_rows))) continue;
-        if (active_row == null or active_row.? != cell.row) {
+        const shifted_row = @as(i64, cell.row) + row_shift;
+        if (cell.width == 0 or shifted_row < 0 or shifted_row >= geometry.viewport_rows) continue;
+        const cell_row: i32 = @intCast(shifted_row);
+        if (active_row == null or active_row.? != cell_row) {
             if (active_row) |row| {
                 if (written + 4 > values.len) break;
                 writeGridRectangle(values[written..][0..4], screen_origin, geometry, row, min_column, max_column);
                 written += 4;
             }
-            active_row = cell.row;
+            active_row = cell_row;
             min_column = cell.column;
             max_column = cell.column + cell.width;
         } else {
@@ -5720,6 +6265,7 @@ test "terminal text range geometry returns screen rectangles for affected lines"
         text,
         .{ .start = 6, .end = 11 },
         geometry,
+        0,
         .{ .x = 10, .y = 20 },
         &values,
     );
@@ -5731,7 +6277,7 @@ test "terminal text range geometry returns screen rectangles for affected lines"
     try std.testing.expectEqual(@as(f64, 16), values[3]);
     try std.testing.expectEqual(
         @as(usize, 0),
-        terminalGridRectangleValues(text, .{ .start = 6, .end = 6 }, geometry, .{ .x = 10, .y = 20 }, &values),
+        terminalGridRectangleValues(text, .{ .start = 6, .end = 6 }, geometry, 0, .{ .x = 10, .y = 20 }, &values),
     );
 }
 
@@ -6375,6 +6921,248 @@ test "retained terminal range rejects queries after provider detach" {
         TerminalTextRangeProvider.GetChildren(&range.base, &children),
     );
     try std.testing.expect(children == null);
+}
+
+test "PKG71 held range rectangles follow scrolling wheel motion and current metrics" {
+    const win32 = @import("../win32/sys.zig");
+    const hwnd = win32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 100, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = win32.DestroyWindow(hwnd);
+    const Hook = struct {
+        viewport_y: usize = 100,
+        cell_width: f64 = 8,
+        cell_height: f64 = 16,
+        origin_x: f64 = 4,
+        origin_y: f64 = 6,
+        numbering: terminal_text.RowNumbering = .{ .active_key = 0, .page_serial_min = 1, .first_page_serial = 1, .rows = 3, .columns = 10 },
+        available: bool = true,
+        snapshot_calls: usize = 0,
+        fn name(_: *anyopaque, _: []u8) []const u8 {
+            return "terminal";
+        }
+        fn value(_: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            return alloc.dupe(u8, "a");
+        }
+        fn focused(_: *anyopaque) bool {
+            return true;
+        }
+        fn scroll(ctx: *anyopaque, request: ScrollRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.viewport_y = request.absolute_row - if (request.align_to_top) @as(usize, 0) else 2;
+        }
+        fn snapshot(ctx: *anyopaque, _: std.mem.Allocator) !TerminalSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.snapshot_calls += 1;
+            return error.UnexpectedSnapshotCopy;
+        }
+        fn viewport(ctx: *anyopaque) !?TerminalViewportGeometry {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.available) return null;
+            return .{
+                .row_numbering = self.numbering,
+                .viewport_y = self.viewport_y,
+                .cell_width = self.cell_width,
+                .cell_height = self.cell_height,
+                .origin_x = self.origin_x,
+                .origin_y = self.origin_y,
+            };
+        }
+        fn expectBounds(range: *com.ITextRangeProvider, expected_y: f64, expected_width: f64, expected_height: f64) !void {
+            var rects: ?*com.SAFEARRAY = null;
+            try std.testing.expectEqual(com.S_OK, range.vtbl.GetBoundingRectangles(range, &rects));
+            defer if (rects) |array| {
+                _ = com.SafeArrayDestroy(array);
+            };
+            var upper: i32 = -1;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetUBound(rects.?, 1, &upper));
+            try std.testing.expectEqual(@as(i32, 3), upper);
+            var y_index: i32 = 1;
+            var actual: f64 = 0;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(rects.?, &y_index, &actual));
+            try std.testing.expectEqual(expected_y, actual);
+            var width_index: i32 = 2;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(rects.?, &width_index, &actual));
+            try std.testing.expectEqual(expected_width, actual);
+            var height_index: i32 = 3;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(rects.?, &height_index, &actual));
+            try std.testing.expectEqual(expected_height, actual);
+        }
+    };
+    var ctx = Hook{};
+    const provider = try TerminalProvider.create(std.testing.allocator, hwnd, .{ .ctx = &ctx, .name = Hook.name, .value = Hook.value, .focused = Hook.focused, .snapshot = Hook.snapshot, .scroll_range = Hook.scroll, .current_viewport = Hook.viewport });
+    defer _ = TerminalProvider.Release(&provider.base);
+    const cells = try std.testing.allocator.alloc(terminal_text.TerminalCellPosition, 1);
+    cells[0] = .{ .row = -2, .column = 0, .width = 1 };
+    const range = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "a"), .{ .start = 0, .end = 1 }, .{
+        .cell_for_byte = cells,
+        .scroll_token = 7,
+        .viewport_y = 100,
+        .document_window = .{ .top = 98, .bottom = 102 },
+        .row_numbering = ctx.numbering,
+        .viewport_rows = 3,
+        .viewport_columns = 10,
+        .cell_width = 8,
+        .cell_height = 16,
+        .origin_x = 4,
+        .origin_y = 6,
+    });
+    defer _ = TerminalTextRangeProvider.Release(&range.base);
+    var origin: POINT = .{ .x = 0, .y = 0 };
+    try std.testing.expect(ClientToScreen(hwnd, &origin) != 0);
+    const screen_y: f64 = @floatFromInt(origin.y);
+    try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 1));
+    try Hook.expectBounds(&range.base, screen_y + 6, 8, 16);
+    try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 0));
+    try Hook.expectBounds(&range.base, screen_y + 38, 8, 16);
+    ctx.viewport_y = 97;
+    ctx.cell_width = 10;
+    ctx.cell_height = 20;
+    ctx.origin_y = 9;
+    try Hook.expectBounds(&range.base, screen_y + 29, 10, 20);
+    try std.testing.expectEqual(@as(usize, 0), ctx.snapshot_calls);
+    // Contention/unavailable geometry and every renumbering cause refuse old
+    // rectangles rather than returning coordinates from another document.
+    const numbering = ctx.numbering;
+    for (0..8) |cause| {
+        ctx.numbering = numbering;
+        ctx.available = true;
+        switch (cause) {
+            0 => ctx.available = false,
+            1 => ctx.numbering.active_key += 1,
+            2 => ctx.numbering.page_serial_min += 1,
+            3 => ctx.numbering.first_page_serial += 1,
+            4 => ctx.numbering.rows += 1,
+            5 => ctx.numbering.columns += 1,
+            6 => ctx.numbering.row_generation += 1,
+            7 => ctx.numbering.screen_generation += 1,
+            else => unreachable,
+        }
+        var rects: ?*com.SAFEARRAY = null;
+        try std.testing.expectEqual(com.S_OK, range.base.vtbl.GetBoundingRectangles(&range.base, &rects));
+        defer _ = com.SafeArrayDestroy(rects.?);
+        var upper: i32 = 0;
+        try std.testing.expectEqual(com.S_OK, com.SafeArrayGetUBound(rects.?, 1, &upper));
+        try std.testing.expectEqual(@as(i32, -1), upper);
+    }
+    // A captured visible row must also move away from its old on-screen y.
+    ctx = Hook{};
+    const visible_cells = try std.testing.allocator.alloc(terminal_text.TerminalCellPosition, 1);
+    visible_cells[0] = .{ .row = 1, .column = 0, .width = 1 };
+    var visible_geometry = range.geometry.?;
+    visible_geometry.cell_for_byte = visible_cells;
+    const visible = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "a"), .{ .start = 0, .end = 1 }, visible_geometry);
+    defer _ = TerminalTextRangeProvider.Release(&visible.base);
+    try Hook.expectBounds(&visible.base, screen_y + 22, 8, 16);
+    try std.testing.expectEqual(com.S_OK, visible.base.vtbl.ScrollIntoView(&visible.base, 1));
+    try Hook.expectBounds(&visible.base, screen_y + 6, 8, 16);
+    try std.testing.expectEqual(com.UIA_E_INVALIDOPERATION, range.base.vtbl.Select(&range.base));
+
+    // Exercise the real no-scrollback erasure path with a held COM range,
+    // rather than only synthesizing a changed provenance field above.
+    const terminal = @import("../../terminal/main.zig");
+    for (0..5) |path| {
+        var t = try terminal.Terminal.init(std.testing.allocator, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(std.testing.allocator);
+        if (path < 3) _ = try t.switchScreen(.alternate);
+        try t.printString("a\r\nb\r\nc");
+        ctx = Hook{ .viewport_y = 0, .numbering = terminal_text.rowNumbering(&t) };
+        var held_geometry = visible_geometry;
+        held_geometry.cell_for_byte = try std.testing.allocator.dupe(terminal_text.TerminalCellPosition, &.{.{ .row = 1, .column = 0, .width = 1 }});
+        held_geometry.viewport_y = 0;
+        held_geometry.row_numbering = ctx.numbering;
+        const held = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "b"), .{ .start = 0, .end = 1 }, held_geometry);
+        defer _ = TerminalTextRangeProvider.Release(&held.base);
+        try Hook.expectBounds(&held.base, screen_y + 22, 8, 16);
+        switch (path) {
+            0 => try t.screens.active.cursorDownScroll(),
+            1 => try t.screens.active.pages.eraseRowBounded(.{ .active = .{} }, 1),
+            2 => {
+                t.setCursorPos(1, 1);
+                t.reverseIndex();
+            },
+            3 => {
+                t.scrolling_region.top = 1;
+                t.setCursorPos(2, 1);
+                t.deleteLines(1);
+            },
+            4 => {
+                t.scrolling_region.bottom = 1;
+                t.setCursorPos(2, 1);
+                try t.index();
+            },
+            else => unreachable,
+        }
+        ctx.numbering = terminal_text.rowNumbering(&t);
+        var rects: ?*com.SAFEARRAY = null;
+        try std.testing.expectEqual(com.S_OK, held.base.vtbl.GetBoundingRectangles(&held.base, &rects));
+        defer _ = com.SafeArrayDestroy(rects.?);
+        var upper: i32 = 0;
+        try std.testing.expectEqual(com.S_OK, com.SafeArrayGetUBound(rects.?, 1, &upper));
+        try std.testing.expectEqual(@as(i32, -1), upper);
+    }
+}
+
+test "PKG71 ScrollIntoView dispatches frozen endpoint and alignment without selecting" {
+    const Hook = struct {
+        var request: ?ScrollRequest = null;
+        fn scroll(_: *anyopaque, value: ScrollRequest) !void {
+            request = value;
+        }
+    };
+    Hook.request = null;
+    var data = TestTerminalStateData{};
+    var state = testTerminalState(&data);
+    state.scroll_range = Hook.scroll;
+    const provider = try TerminalProvider.create(std.testing.allocator, @ptrFromInt(1), state);
+    defer _ = TerminalProvider.Release(&provider.base);
+    const cells = [_]terminal_text.TerminalCellPosition{
+        .{ .row = -2, .column = 0, .width = 1 },
+        .{ .row = -1, .column = 0, .width = 1 },
+    };
+    const range = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "ab"), .{ .start = 0, .end = 2 }, .{
+        .cell_for_byte = try std.testing.allocator.dupe(terminal_text.TerminalCellPosition, &cells),
+        .scroll_token = 7,
+        .viewport_y = 100,
+        .document_window = .{ .top = 98, .bottom = 102 },
+        .viewport_rows = 3,
+        .viewport_columns = 5,
+        .cell_width = 1,
+        .cell_height = 1,
+        .origin_x = 0,
+        .origin_y = 0,
+    });
+    defer _ = TerminalTextRangeProvider.Release(&range.base);
+    try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 1));
+    try std.testing.expect(Hook.request != null);
+    try std.testing.expectEqual(@as(usize, 98), Hook.request.?.absolute_row);
+    try std.testing.expectEqual(@as(u32, 98), Hook.request.?.document_window.top);
+    try std.testing.expect(Hook.request.?.align_to_top);
+    try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 0));
+    try std.testing.expectEqual(@as(usize, 99), Hook.request.?.absolute_row);
+    try std.testing.expect(!Hook.request.?.align_to_top);
+    try std.testing.expectEqual(com.UIA_E_INVALIDOPERATION, range.base.vtbl.Select(&range.base));
+}
+
+test "PKG71 tab item exposes a fragment root for its close child" {
+    var context: u8 = 0;
+    const Name = struct {
+        fn name(_: *anyopaque, _: usize, _: []u8) []const u8 {
+            return "Tab";
+        }
+    };
+    const provider = try ChromeControlProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .ctx = &context,
+        .role = .tab_item,
+        .tag = 42,
+        .name = Name.name,
+    });
+    defer _ = ChromeControlProvider.Release(&provider.base);
+    var out: ?*anyopaque = null;
+    const hr = provider.base.vtbl.QueryInterface(&provider.base, &com.IID_IRawElementProviderFragmentRoot, &out);
+    defer if (hr == com.S_OK) {
+        _ = ChromeControlProvider.Release(&provider.base);
+    };
+    try std.testing.expectEqual(com.S_OK, hr);
+    try std.testing.expect(out != null);
 }
 
 test "TerminalTextRangeProvider reports unsupported mutation and scrolling honestly" {

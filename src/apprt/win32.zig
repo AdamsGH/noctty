@@ -18542,6 +18542,9 @@ const Host = struct {
     /// children of the Selection container, so the host's root is told its
     /// children changed.
     fn notifyTabListUiaChanged(self: *Host) void {
+        for (self.tabs.items) |tab| {
+            if (tab.uia_provider) |provider| provider.syncCloseChild();
+        }
         if (!self.shouldShowTabBar()) return;
         if (self.root_uia_provider) |provider| provider.raiseChildrenInvalidated();
     }
@@ -20530,6 +20533,219 @@ const Host = struct {
             if (tab.id == tab_id) return index == self.active_tab;
         }
         return false;
+    }
+
+    fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        if (self.tabs.items.len <= 1 or !self.shouldShowTabBar()) return null;
+        const index = self.findTabIndexById(@intCast(tab_id)) orelse return null;
+        const hwnd = self.tabs.items[index].button_hwnd orelse return null;
+        if (sys.IsWindowVisible(hwnd) == 0) return null;
+        var rect: RECT = undefined;
+        if (sys.GetWindowRect(hwnd, &rect) == 0) return null;
+        // Same close zone as the pointer path, always at full alpha. An
+        // inactive tab's fade never changes its accessibility affordance.
+        const width = @min(self.scaled(host_tab_close_zone_width), rect.right - rect.left);
+        return .{
+            .left = @floatFromInt(rect.right - width),
+            .top = @floatFromInt(rect.top),
+            .width = @floatFromInt(width),
+            .height = @floatFromInt(rect.bottom - rect.top),
+        };
+    }
+
+    fn tabCloseUiaInvoke(ctx: *anyopaque, tab_id: usize) bool {
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        if (self.tabs.items.len <= 1 or !self.shouldShowTabBar()) return false;
+        const index = self.findTabIndexById(@intCast(tab_id)) orelse return false;
+        const hwnd = self.tabs.items[index].button_hwnd orelse return false;
+        if (sys.IsWindowVisible(hwnd) == 0) return false;
+        return sys.PostMessageW(hwnd, win32_uia.widgets.tab_close_message, tab_id, 0) != 0;
+    }
+
+    fn tabItemUiaState(self: *Host, tab_id: usize) win32_uia.ChromeControlState {
+        return .{
+            .ctx = @ptrCast(self),
+            .role = .tab_item,
+            .tag = tab_id,
+            .name = &tabItemUiaName,
+            .item_status = &tabItemUiaItemStatus,
+            .selected = &tabItemUiaSelected,
+            .selection_container = &tabContainerUiaProvider,
+            .close_bounds = &tabCloseUiaBounds,
+            .close_invoke = &tabCloseUiaInvoke,
+        };
+    }
+
+    test "PKG71 tab close uses full alpha on inactive tabs and only posts while closable" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(tabCloseUiaTestBody);
+    }
+
+    fn tabCloseUiaTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        const button = try createTestChromeChild(window.parent, prompt_button_class);
+        host.tabs.items[1].button_hwnd = button;
+        defer host.tabs.items[1].button_hwnd = null;
+        const state = host.tabItemUiaState(2);
+        try std.testing.expect(!state.selected.?(state.ctx, state.tag));
+        try std.testing.expectEqual(@as(f32, 0), host.tab_close_hover.alphaAt(0));
+        const bounds = state.close_bounds.?(state.ctx, state.tag).?;
+        var rect: RECT = undefined;
+        try std.testing.expect(sys.GetWindowRect(button, &rect) != 0);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(host.scaled(host_tab_close_zone_width))), bounds.width);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(rect.right)), bounds.left + bounds.width);
+        try std.testing.expect(state.close_invoke.?(state.ctx, state.tag));
+        // Invoke merely queues the same close path; it cannot destroy a tab
+        // inside a provider call, and it preserves the active selection.
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 0), host.active_tab);
+        var queued: sys.MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
+        try std.testing.expectEqual(@as(usize, 2), queued.wParam);
+        _ = sys.ShowWindow(button, c.SW_HIDE);
+        try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
+        try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
+        _ = sys.ShowWindow(button, c.SW_SHOWNOACTIVATE);
+        const provider = try win32_uia.ChromeControlProvider.create(std.testing.allocator, button, state);
+        defer _ = provider.base.vtbl.Release(&provider.base);
+        host.tabs.items[1].uia_provider = provider;
+        defer host.tabs.items[1].uia_provider = null;
+        host.notifyTabListUiaChanged();
+        try std.testing.expect(provider.close_child_present);
+        const show_tab_bar = app.config.@"window-show-tab-bar";
+        app.config.@"window-show-tab-bar" = .never;
+        defer app.config.@"window-show-tab-bar" = show_tab_bar;
+        try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
+        try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
+        host.notifyTabListUiaChanged();
+        try std.testing.expect(!provider.close_child_present);
+        app.config.@"window-show-tab-bar" = show_tab_bar;
+        // Execute stale queued messages through the production handler. A
+        // mismatched ID after reorder and a newly sole tab must be harmless.
+        setWindowData(button, &host);
+        const tab_id = host.tabs.items[1].id;
+        host.tabs.items[1].id = 99;
+        _ = tabButtonProc(button, win32_uia.widgets.tab_close_message, tab_id, 0);
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        host.tabs.items[1].id = tab_id;
+        host.tabs.items.len = 1;
+        defer host.tabs.items.len = 2;
+        host.tabs.items[0].button_hwnd = button;
+        defer host.tabs.items[0].button_hwnd = null;
+        try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
+        try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
+        _ = tabButtonProc(button, win32_uia.widgets.tab_close_message, 1, 0);
+        try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+    }
+
+    test "PKG71 queued close rejects a tab hidden after Invoke" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(struct {
+            fn run() !void {
+                try queuedCloseHiddenTestBody(false);
+            }
+        }.run);
+    }
+
+    test "PKG71 queued close rejects a strip hidden after Invoke" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(struct {
+            fn run() !void {
+                try queuedCloseHiddenTestBody(true);
+            }
+        }.run);
+    }
+
+    fn queuedCloseHiddenTestBody(hide_strip: bool) !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        try app.ensurePaletteListClass();
+        defer _ = sys.UnregisterClassW(palette_list_class_name, app.hinstance);
+        defer for ([_]*?[:0]const u8{
+            &host.cached_overlay_edit,
+            &host.cached_overlay_label,
+            &host.cached_overlay_hint,
+            &host.cached_overlay_preview,
+            &host.cached_overlay_accept,
+            &host.cached_overlay_cancel,
+            &host.cached_window_title,
+        }) |slot| {
+            if (slot.*) |value| std.testing.allocator.free(value);
+            slot.* = null;
+        };
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        defer host.invokeConfirmCancel();
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        const button = try createTestChromeChild(window.parent, prompt_button_class);
+        setWindowData(button, &host);
+        host.tabs.items[1].button_hwnd = button;
+        defer host.tabs.items[1].button_hwnd = null;
+        app.config.@"undo-timeout" = .{ .duration = 0 };
+        // A read-only fixture core safely asks before closing: observing the
+        // prompt proves whether the production close path was reached.
+        surface_b.core_surface.readonly = true;
+        surface_b.core_initialized = true;
+        defer surface_b.core_initialized = false;
+        try std.testing.expect(tabCloseUiaInvoke(&host, 2));
+        var queued: sys.MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
+        const show_tab_bar = app.config.@"window-show-tab-bar";
+        if (hide_strip) app.config.@"window-show-tab-bar" = .never else _ = sys.ShowWindow(button, c.SW_HIDE);
+        _ = tabButtonProc(button, queued.message, queued.wParam, queued.lParam);
+        try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+        try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 0), host.active_tab);
+        // Positive control: a newly queued close on the visible tab reaches
+        // the ordinary confirmation path.
+        app.config.@"window-show-tab-bar" = show_tab_bar;
+        _ = sys.ShowWindow(button, c.SW_SHOWNOACTIVATE);
+        try std.testing.expect(tabCloseUiaInvoke(&host, 2));
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
+        _ = tabButtonProc(button, queued.message, queued.wParam, queued.lParam);
+        try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+        host.invokeConfirmCancel();
     }
 
     fn activeTabUiaProvider(ctx: *anyopaque) ?*win32_uia.ChromeControlProvider {
@@ -24290,15 +24506,7 @@ const Host = struct {
                     null,
                 ) orelse return lastError();
                 self.subclassButton(tab.button_hwnd.?, &tabButtonProc, &tab.button_prev_proc);
-                tab.uia_provider = self.createChromeUiaProvider(tab.button_hwnd.?, .{
-                    .ctx = @ptrCast(self),
-                    .role = .tab_item,
-                    .tag = tab.id,
-                    .name = &tabItemUiaName,
-                    .item_status = &tabItemUiaItemStatus,
-                    .selected = &tabItemUiaSelected,
-                    .selection_container = &tabContainerUiaProvider,
-                });
+                tab.uia_provider = self.createChromeUiaProvider(tab.button_hwnd.?, self.tabItemUiaState(tab.id));
                 button_created = true;
             } else if (label_changed) {
                 try appendOwnedString(self.app.core_app.alloc, &tab.cached_button_label, label);
@@ -33067,6 +33275,16 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                 }
             }
             switch (msg) {
+                win32_uia.widgets.tab_close_message => {
+                    // Revalidate closability after Invoke waited in the queue:
+                    // the tab may have moved, scrolled out, or become hidden.
+                    if (v.tabs.items.len > 1 and v.tabs.items[index].id == wParam and
+                        v.shouldShowTabBar() and sys.IsWindowVisible(hwnd) != 0)
+                    {
+                        _ = v.closeTabInPlace(index);
+                    }
+                    return 0;
+                },
                 c.WM_SETFOCUS => {
                     if (v.tabs.items[index].uia_provider) |provider| {
                         provider.raiseFocusChanged();
@@ -34836,7 +35054,17 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
         c.WM_WINHOSTTY_UIA_QUERY_REFRESH => {
             if (surface) |v| {
                 v.drainTerminalAccessibilityOutput();
-                if (v.terminal_accessibility) |session| session.handleQueryRefresh(wParam != 0);
+                if (v.terminal_accessibility) |session| {
+                    if (wParam == 2) {
+                        session.handleScroll();
+                        return 1;
+                    }
+                    if (wParam == 3) {
+                        session.handleViewportRefresh();
+                        return 1;
+                    }
+                    session.handleQueryRefresh(wParam != 0);
+                }
             }
             return 0;
         },
@@ -35320,6 +35548,25 @@ fn terminalAccessibilityCapture(
     };
 }
 
+fn terminalAccessibilityViewport(ctx: *anyopaque) !win32_uia.widgets.TerminalViewportGeometry {
+    const surface: *Surface = @ptrCast(@alignCast(ctx));
+    if (!surface.core_initialized) return error.ElementNotAvailable;
+    const core = &surface.core_surface;
+    if (!core.renderer_state.mutex.tryLock()) return error.WouldBlock;
+    defer core.renderer_state.mutex.unlock();
+    const state = core.renderer_state.terminal;
+    const pages = &state.screens.active.pages;
+    const viewport = pages.pointFromPin(.screen, pages.getTopLeft(.viewport)) orelse return error.UnknownPoint;
+    return .{
+        .row_numbering = @import("win32_uia/text.zig").rowNumbering(state),
+        .viewport_y = viewport.screen.y,
+        .cell_width = @floatFromInt(core.size.cell.width),
+        .cell_height = @floatFromInt(core.size.cell.height),
+        .origin_x = @floatFromInt(core.size.padding.left),
+        .origin_y = @floatFromInt(core.size.padding.top),
+    };
+}
+
 fn terminalAccessibilityDeferProviderRelease(
     ctx: *anyopaque,
     provider: *win32_uia.TerminalProvider,
@@ -35331,6 +35578,26 @@ fn terminalAccessibilityDeferProviderRelease(
         &terminalDisconnectThunk,
         &terminalReleaseThunk,
     );
+}
+
+fn terminalAccessibilityScroll(ctx: *anyopaque, request: win32_uia.widgets.ScrollRequest) !void {
+    const surface: *Surface = @ptrCast(@alignCast(ctx));
+    if (!surface.core_initialized) return error.ElementNotAvailable;
+    const core = &surface.core_surface;
+    if (!core.renderer_state.mutex.tryLock()) return error.WouldBlock;
+    const scrolled = @import("win32_uia/text.zig").scrollFrozenRange(
+        core.alloc,
+        core.renderer_state.terminal,
+        request.token,
+        request.document_window,
+        request.absolute_row,
+        request.align_to_top,
+    ) catch |err| {
+        core.renderer_state.mutex.unlock();
+        return err;
+    };
+    core.renderer_state.mutex.unlock();
+    if (scrolled) try core.refreshCallback();
 }
 
 fn terminalAccessibilityOutputCallback(
@@ -36269,12 +36536,7 @@ pub const Surface = struct {
                     surface.app.hinstance,
                     null,
                 ) orelse return lastError();
-                tab.uia_provider = owner.createChromeUiaProvider(tab.button_hwnd.?, .{
-                    .ctx = @ptrCast(owner),
-                    .role = .tab_item,
-                    .tag = tab.id,
-                    .name = &Host.tabItemUiaName,
-                });
+                tab.uia_provider = owner.createChromeUiaProvider(tab.button_hwnd.?, owner.tabItemUiaState(tab.id));
                 // Something commits to the shell runtime meanwhile, as an
                 // interleaved focus change can, so the new tab's prepared
                 // transaction no longer applies.
@@ -36878,6 +37140,8 @@ pub const Surface = struct {
                     .name = terminalAccessibilityName,
                     .focused = terminalAccessibilityFocused,
                     .capture = terminalAccessibilityCapture,
+                    .scroll = terminalAccessibilityScroll,
+                    .viewport = terminalAccessibilityViewport,
                     .defer_provider_release = terminalAccessibilityDeferProviderRelease,
                 },
                 c.WM_WINHOSTTY_UIA_QUERY_REFRESH,

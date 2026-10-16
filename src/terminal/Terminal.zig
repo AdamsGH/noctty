@@ -1974,6 +1974,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
         self.screens.active.cursor.x < self.scrolling_region.left or
         self.screens.active.cursor.x > self.scrolling_region.right) return;
 
+    // Moving rows (including partial rows with margins) invalidates frozen
+    // absolute positions even though the backing pages can stay unchanged.
+    self.screens.active.pages.row_generation +%= 1;
+
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
         self.screens.active.kitty_images.dirty = true;
@@ -2182,6 +2186,8 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
         self.screens.active.cursor.y > self.scrolling_region.bottom or
         self.screens.active.cursor.x < self.scrolling_region.left or
         self.screens.active.cursor.x > self.scrolling_region.right) return;
+
+    self.screens.active.pages.row_generation +%= 1;
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
