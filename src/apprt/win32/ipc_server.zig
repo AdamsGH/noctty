@@ -20,17 +20,19 @@ const sys = @import("sys.zig");
 const BOOL = windows.BOOL;
 const scanForwardedToastActivation = win32.scanForwardedToastActivation;
 
+/// Blocking (PIPE_WAIT) mode with overlapped instances: the server thread
+/// waits on an event for a client and for each request's bytes, so an idle
+/// server never runs.
 const ipc_server_pipe_mode = windows.PIPE_TYPE_BYTE |
     c.PIPE_READMODE_BYTE |
-    win32_ipc.pipe_nowait |
     c.PIPE_REJECT_REMOTE_CLIENTS;
+const ipc_server_instance_access = c.PIPE_ACCESS_DUPLEX | windows.FILE_FLAG_OVERLAPPED;
 /// The server claims the pipe NAME once, at startup, and never releases it
 /// while it runs. `FILE_FLAG_FIRST_PIPE_INSTANCE` makes that claim fail if
 /// any other process already owns the name, and every replacement instance
 /// is created BEFORE the previous handle is closed, so the name is never
 /// momentarily unowned for a squatter to take.
-const ipc_server_pipe_access = c.PIPE_ACCESS_DUPLEX | c.FILE_FLAG_FIRST_PIPE_INSTANCE;
-const ipc_poll_interval_ns: u64 = 5 * std.time.ns_per_ms;
+const ipc_server_pipe_access = ipc_server_instance_access | c.FILE_FLAG_FIRST_PIPE_INSTANCE;
 const ipc_pipe_prefix = "\\\\.\\pipe\\noctty.";
 
 const ForwardedArgIterator = struct {
@@ -410,7 +412,7 @@ pub fn sendNewWindowIpc(
     const request = try win32_ipc.encodeNewWindowRequest(alloc, arguments);
     defer alloc.free(request);
 
-    try win32_ipc.writeAll(pipe, request);
+    try win32_ipc.writeAll(.{ .handle = pipe }, request);
     return try win32_ipc.readAckWithTimeout(pipe, response_timeout_ms);
 }
 
@@ -434,7 +436,7 @@ pub fn sendListWindowsIpc(
     );
     defer alloc.free(request);
 
-    try win32_ipc.writeAll(pipe, request);
+    try win32_ipc.writeAll(.{ .handle = pipe }, request);
     return try win32_ipc.readDataResponseWithTimeout(
         alloc,
         pipe,
@@ -478,7 +480,7 @@ fn sendAutomationAckRequest(
         request,
         automationRequestDeadline(response_timeout_ms),
     );
-    try win32_ipc.writeAll(pipe, request);
+    try win32_ipc.writeAll(.{ .handle = pipe }, request);
     return win32_ipc.readAckWithTimeout(pipe, std.math.maxInt(u64));
 }
 
@@ -853,7 +855,7 @@ pub fn sendLaunchLayoutIpc(
         request,
         automationRequestDeadline(response_timeout_ms),
     );
-    try win32_ipc.writeAll(pipe, request);
+    try win32_ipc.writeAll(.{ .handle = pipe }, request);
     return try win32_ipc.readAckWithTimeout(pipe, std.math.maxInt(u64));
 }
 
@@ -1287,7 +1289,7 @@ fn createIpcServerPipe(
 ) windows.HANDLE {
     return sys.CreateNamedPipeW(
         pipe_name.ptr,
-        if (first_instance) ipc_server_pipe_access else c.PIPE_ACCESS_DUPLEX,
+        if (first_instance) ipc_server_pipe_access else ipc_server_instance_access,
         ipc_server_pipe_mode,
         c.PIPE_UNLIMITED_INSTANCES,
         16 * 1024,
@@ -1303,14 +1305,20 @@ fn createIpcServerPipe(
 /// because the claim RESULT is a startup decision: losing it means another
 /// instance already owns this integrity-scoped name, and the loser retries
 /// its startup forward instead of listening. `security_arg` owns the
-/// descriptor every instance is created with and is released here.
+/// descriptor every instance is created with and is released here, and so is
+/// `io_event`, the manual-reset event every connect, read and write on an
+/// instance completes on. `stopIpcServer` sets `stop_event`, which ends any
+/// wait, so it never has to connect to the server to wake it.
 fn ipcServerMain(
     app: *App,
     first_pipe: windows.HANDLE,
     security_arg: win32_elevation.IpcPipeSecurity,
+    io_event: windows.HANDLE,
+    stop_event: windows.HANDLE,
 ) void {
     var security = security_arg;
     defer security.deinit();
+    defer _ = windows.CloseHandle(io_event);
     const security_attributes = security.securityAttributes();
 
     var pipe = first_pipe;
@@ -1318,44 +1326,24 @@ fn ipcServerMain(
 
     const pipe_name = app.ipc_pipe_name orelse return;
 
-    server: while (!app.ipc_stop_requested.load(.acquire)) {
-        connect: while (!app.ipc_stop_requested.load(.acquire)) {
-            const connected = sys.ConnectNamedPipe(pipe, null);
-            if (connected != 0) break :connect;
-            const err = windows.kernel32.GetLastError();
-            switch (err) {
-                .PIPE_CONNECTED => break :connect,
-                .PIPE_LISTENING, .NO_DATA => {
-                    std.Thread.sleep(ipc_poll_interval_ns);
-                    continue;
-                },
-                else => {
-                    if (!app.ipc_stop_requested.load(.acquire)) {
-                        log.warn("failed to connect win32 IPC client err={}", .{err});
-                    }
-                    const replacement = createIpcServerPipe(
-                        pipe_name,
-                        security_attributes,
-                        false,
-                    );
-                    if (replacement == windows.INVALID_HANDLE_VALUE) {
-                        log.warn("failed to preserve win32 IPC pipe ownership err={}", .{
-                            windows.kernel32.GetLastError(),
-                        });
-                        return;
-                    }
-                    _ = windows.CloseHandle(pipe);
-                    pipe = replacement;
-                    continue :server;
-                },
+    while (true) {
+        if (connectIpcClient(pipe, io_event, stop_event)) |connected| {
+            if (!connected) return;
+            if (handleIpcClient(app, .{
+                .handle = pipe,
+                .event = io_event,
+                .stop_event = stop_event,
+            })) |_| {} else |err| if (err != error.IpcStopped) {
+                log.warn("failed to process win32 IPC client err={}", .{err});
             }
+        } else |err| {
+            // Includes a client that connected and left before this instance
+            // was picked up; the instance cannot serve anyone else, so it is
+            // replaced like one that served a request.
+            log.warn("failed to connect win32 IPC client err={}", .{err});
         }
+        if (app.ipc_stop_requested.load(.acquire)) return;
 
-        if (app.ipc_stop_requested.load(.acquire)) break;
-
-        if (handleIpcClient(app, pipe)) |_| {} else |err| {
-            log.warn("failed to process win32 IPC client err={}", .{err});
-        }
         const replacement = createIpcServerPipe(
             pipe_name,
             security_attributes,
@@ -1376,7 +1364,43 @@ fn ipcServerMain(
     }
 }
 
-fn handleIpcClient(app: *App, pipe: windows.HANDLE) !win32_ipc.RequestKind {
+/// Wait for a client to connect to `pipe`. Returns false when the server is
+/// asked to stop first.
+fn connectIpcClient(
+    pipe: windows.HANDLE,
+    io_event: windows.HANDLE,
+    stop_event: windows.HANDLE,
+) !bool {
+    var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    overlapped.hEvent = io_event;
+    if (sys.ConnectNamedPipe(pipe, &overlapped) == 0) switch (windows.kernel32.GetLastError()) {
+        .IO_PENDING => {},
+        // A client opened the instance before this accept was issued.
+        .PIPE_CONNECTED => return true,
+        // ...and has already closed it again.
+        .NO_DATA => return error.EndOfStream,
+        else => |err| return windows.unexpectedError(err),
+    };
+    _ = win32_ipc.awaitOverlapped(pipe, &overlapped, stop_event, std.math.maxInt(u64)) catch |err| switch (err) {
+        error.IpcStopped => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn createIpcServerEvent() ?windows.HANDLE {
+    return windows.CreateEventExW(
+        null,
+        null,
+        windows.CREATE_EVENT_MANUAL_RESET,
+        windows.EVENT_ALL_ACCESS,
+    ) catch |err| {
+        log.warn("failed to create win32 IPC server event; continuing without an IPC server err={}", .{err});
+        return null;
+    };
+}
+
+fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !win32_ipc.RequestKind {
     const kind = win32_ipc.decodeRequestKind(pipe) catch |err| {
         win32_ipc.writeAck(pipe, false) catch {};
         return err;
@@ -1447,7 +1471,7 @@ fn handleIpcClient(app: *App, pipe: windows.HANDLE) !win32_ipc.RequestKind {
     return kind;
 }
 
-fn handleNewWindowIpcClient(app: *App, pipe: windows.HANDLE) !void {
+fn handleNewWindowIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
     const arguments = try win32_ipc.decodeNewWindowPayload(app.core_app.alloc, pipe);
     errdefer win32_ipc.freeOwnedArguments(app.core_app.alloc, arguments);
 
@@ -1483,7 +1507,7 @@ fn newWindowIpcArgumentsAccepted(arguments: ?[]const [:0]const u8) bool {
     };
 }
 
-fn handleListWindowsIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handleListWindowsIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     const deadline_ms = try win32_ipc.decodeListWindowsDeadline(pipe, timed);
     const json = try requestAutomationWindowListJson(
         app,
@@ -1494,7 +1518,7 @@ fn handleListWindowsIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !voi
     try win32_ipc.writeDataResponse(pipe, true, json);
 }
 
-fn handlePerformActionIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handlePerformActionIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     const payload = win32_ipc.decodePerformActionPayload(app.core_app.alloc, pipe, timed) catch |err| switch (err) {
         error.InvalidAutomationAction => {
             try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_invalid_automation_action);
@@ -1523,7 +1547,7 @@ fn handlePerformActionIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !v
     try win32_ipc.writeAck(pipe, true);
 }
 
-fn handleLaunchLayoutIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handleLaunchLayoutIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     const payload = win32_ipc.decodeLaunchLayoutPayload(app.core_app.alloc, pipe, timed) catch |err| {
         log.warn("invalid win32 launch-layout IPC request err={}", .{err});
         try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_invalid_automation_action);
@@ -1558,7 +1582,7 @@ fn handleLaunchLayoutIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !vo
     try win32_ipc.writeAck(pipe, true);
 }
 
-fn handleFocusIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handleFocusIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     const payload = win32_ipc.decodeFocusPayload(pipe, timed) catch |err| switch (err) {
         error.InvalidAutomationTarget => {
             try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_invalid_automation_target);
@@ -1578,7 +1602,7 @@ fn handleFocusIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
     try win32_ipc.writeAck(pipe, true);
 }
 
-fn handleSendTextIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handleSendTextIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     var payload = win32_ipc.decodeSendTextPayload(app.core_app.alloc, pipe, timed) catch |err| switch (err) {
         error.InvalidAutomationText => {
             try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_automation_policy_refused);
@@ -1615,7 +1639,7 @@ fn automationCommandAckStatus(err: anyerror) ?u8 {
     };
 }
 
-fn handleNewTabIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handleNewTabIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     var payload = win32_ipc.decodeNewTabPayload(app.core_app.alloc, pipe, timed) catch |err| {
         const status = automationCommandAckStatus(err) orelse return err;
         try win32_ipc.writeAckStatus(pipe, status);
@@ -1641,7 +1665,7 @@ fn handleNewTabIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
     try win32_ipc.writeAck(pipe, true);
 }
 
-fn handleNewSplitIpcClient(app: *App, pipe: windows.HANDLE, timed: bool) !void {
+fn handleNewSplitIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
     var payload = win32_ipc.decodeNewSplitPayload(app.core_app.alloc, pipe, timed) catch |err| {
         const status = automationCommandAckStatus(err) orelse return err;
         try win32_ipc.writeAckStatus(pipe, status);
@@ -1883,17 +1907,27 @@ pub fn startIpcServer(self: *App) !bool {
         _ = windows.CloseHandle(first_pipe);
     };
 
+    const io_event = createIpcServerEvent() orelse return false;
+    var io_event_owned = true;
+    defer if (io_event_owned) {
+        _ = windows.CloseHandle(io_event);
+    };
+    const stop_event = createIpcServerEvent() orelse return false;
+    errdefer _ = windows.CloseHandle(stop_event);
+
     self.ipc_pipe_name = pipe_name;
     errdefer self.ipc_pipe_name = null;
     self.ipc_stop_requested.store(false, .release);
     self.ipc_thread = try std.Thread.spawn(
         .{},
         ipcServerMain,
-        .{ self, first_pipe, pipe_security },
+        .{ self, first_pipe, pipe_security, io_event, stop_event },
     );
+    self.ipc_stop_event = stop_event;
     first_pipe_owned = false;
     pipe_security_owned = false;
     pipe_name_owned = false;
+    io_event_owned = false;
     return false;
 }
 
@@ -1904,17 +1938,13 @@ fn resolveIpcPipeName(self: *const App, alloc: Allocator) ![:0]const u16 {
 pub fn stopIpcServer(self: *App) void {
     if (self.ipc_thread) |thread| {
         self.ipc_stop_requested.store(true, .release);
-        if (self.ipc_pipe_name) |pipe_name| {
-            if (connectToIpcPipe(
-                self.core_app.alloc,
-                pipe_name,
-                self.is_elevated,
-            )) |pipe| {
-                _ = windows.CloseHandle(pipe);
-            } else |_| {}
-        }
+        _ = sys.SetEvent(self.ipc_stop_event.?);
         thread.join();
         self.ipc_thread = null;
+    }
+    if (self.ipc_stop_event) |event| {
+        _ = windows.CloseHandle(event);
+        self.ipc_stop_event = null;
     }
 
     if (self.ipc_pipe_name) |pipe_name| {
@@ -2813,6 +2843,7 @@ const TestIpcServer = struct {
         self.app.ipc_pipe_name = null;
         self.app.ipc_namespace = null;
         self.app.ipc_thread = null;
+        self.app.ipc_stop_event = null;
         self.app.ipc_stop_requested = .init(false);
         try std.testing.expect(!try startIpcServer(&self.app));
         try std.testing.expect(self.app.ipc_thread != null);
@@ -2896,7 +2927,7 @@ test "win32 IPC server serves the next client after one leaves unserved" {
     // answered with a failure ack before anything reaches the mailbox.
     const client = try server.connect();
     defer _ = windows.CloseHandle(client);
-    try win32_ipc.writeAll(client, &.{ 0, 0, 0, 0, 1 });
+    try win32_ipc.writeAll(.{ .handle = client }, &.{ 0, 0, 0, 0, 1 });
     try std.testing.expectError(error.IPCFailed, win32_ipc.readAck(client));
 }
 
@@ -3020,7 +3051,7 @@ test "win32 handleIpcClient bounds truncated request failures with an ack" {
     try file.seekTo(0);
 
     var app: App = undefined;
-    try std.testing.expectError(error.EndOfStream, handleIpcClient(&app, file.handle));
+    try std.testing.expectError(error.EndOfStream, handleIpcClient(&app, .{ .handle = file.handle }));
 
     try file.seekTo(request.len);
     try std.testing.expectError(

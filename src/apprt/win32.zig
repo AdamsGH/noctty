@@ -2657,6 +2657,8 @@ pub const App = struct {
     /// Effective sanitized namespace captured when the IPC server starts.
     ipc_namespace: ?[]const u8 = null,
     ipc_thread: ?std.Thread = null,
+    /// Set to end the IPC server thread's waits; owned while it runs.
+    ipc_stop_event: ?windows.HANDLE = null,
     ipc_stop_requested: std.atomic.Value(bool) = .init(false),
     global_hotkeys: std.ArrayListUnmanaged(RegisteredGlobalHotkey) = .empty,
     global_hotkeys_dirty: bool = false,
@@ -47668,7 +47670,7 @@ test "automation-action win32 ipc rejects oversized decoded action" {
 
     try std.testing.expectError(
         error.InvalidAutomationAction,
-        win32_ipc.decodePerformActionPayload(std.testing.allocator, file.handle, true),
+        win32_ipc.decodePerformActionPayload(std.testing.allocator, .{ .handle = file.handle }, true),
     );
 }
 
@@ -47684,7 +47686,7 @@ test "automation-action win32 ipc maps specific failure ack" {
     });
     defer file.close();
 
-    try win32_ipc.writeAckStatus(file.handle, win32_ipc.ack_invalid_automation_target);
+    try win32_ipc.writeAckStatus(.{ .handle = file.handle }, win32_ipc.ack_invalid_automation_target);
     try file.seekTo(0);
 
     try std.testing.expectError(
@@ -47782,7 +47784,7 @@ test "win32 win32_ipc.decodeNewWindowPayload rejects oversized argc" {
 
     try std.testing.expectError(
         error.InvalidIpcRequest,
-        win32_ipc.decodeNewWindowPayload(std.testing.allocator, file.handle),
+        win32_ipc.decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -47806,7 +47808,7 @@ test "win32 win32_ipc.decodeNewWindowPayload rejects oversized argument length b
 
     try std.testing.expectError(
         error.InvalidIpcRequest,
-        win32_ipc.decodeNewWindowPayload(std.testing.allocator, file.handle),
+        win32_ipc.decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -47831,7 +47833,7 @@ test "win32 win32_ipc.decodeNewWindowPayload rejects aggregate argument bytes be
 
     try std.testing.expectError(
         error.InvalidIpcRequest,
-        win32_ipc.decodeNewWindowPayload(std.testing.allocator, file.handle),
+        win32_ipc.decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -47857,7 +47859,7 @@ test "win32 win32_ipc.decodeNewWindowPayload cleans up initialized args on parti
 
     try std.testing.expectError(
         error.EndOfStream,
-        win32_ipc.decodeNewWindowPayload(std.testing.allocator, file.handle),
+        win32_ipc.decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -47891,7 +47893,7 @@ test "win32 win32_ipc.writeDataResponse rejects oversized body" {
 
     try std.testing.expectError(
         error.InvalidIpcResponse,
-        win32_ipc.writeDataResponse(file.handle, true, body),
+        win32_ipc.writeDataResponse(.{ .handle = file.handle }, true, body),
     );
 }
 

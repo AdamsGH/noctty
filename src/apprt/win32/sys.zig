@@ -495,6 +495,8 @@ pub extern "kernel32" fn ConnectNamedPipe(
     lpOverlapped: ?*anyopaque,
 ) callconv(.winapi) BOOL;
 
+pub extern "kernel32" fn SetEvent(hEvent: windows.HANDLE) callconv(.winapi) BOOL;
+
 pub extern "kernel32" fn SetNamedPipeHandleState(
     hNamedPipe: windows.HANDLE,
     lpMode: ?*DWORD,
