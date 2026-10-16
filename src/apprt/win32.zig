@@ -2882,6 +2882,7 @@ pub const App = struct {
 
     const DeferredOpen = union(enum) {
         target: []u8,
+        text_editor: struct { path: []u8, from_settings: bool },
         on_screen_keyboard,
         /// Install or Apply, once it is confirmed: `applyStagedUpdate` reaches
         /// `ShellExecuteW`, so it runs from the loop like the opens do.
@@ -2891,6 +2892,7 @@ pub const App = struct {
         fn deinit(self: DeferredOpen, alloc: Allocator) void {
             switch (self) {
                 .target => |target| alloc.free(target),
+                .text_editor => |request| alloc.free(request.path),
                 .elevated_window => |launch| {
                     alloc.free(launch.parameters);
                     if (launch.cwd) |cwd| alloc.free(cwd);
@@ -10127,6 +10129,17 @@ pub const App = struct {
         // Checked again just before dispatch, as when URL opens ran in place.
         switch (request.*) {
             .target => |target| return openWin32Target(self.core_app.alloc, self, target, dispatchOpenTarget),
+            .text_editor => |editor| {
+                openWin32Target(self.core_app.alloc, self, editor.path, dispatchTextEditor) catch |err| {
+                    if (editor.from_settings and self.settings_window.hwnd != null) {
+                        self.settings_window.editorOpenFailed();
+                    } else {
+                        _ = self.showHostBanner(.app, .err, @import("../os/windows_text_editor.zig").failure_message) catch false;
+                    }
+                    return err;
+                };
+                return;
+            },
             // Off the queue now, so a later answer queues again if this one
             // is held or fails.
             .apply_staged_update => self.update_apply_queued = false,
@@ -10134,7 +10147,7 @@ pub const App = struct {
         }
         if (self.test_shell_request) |hook| return hook(self, request);
         switch (request.*) {
-            .target => unreachable,
+            .target, .text_editor => unreachable,
             .apply_staged_update => {
                 if (self.settingsHoldInstall()) return;
                 try self.applyStagedUpdate();
@@ -10215,6 +10228,13 @@ pub const App = struct {
             try recordOpenUrlForTest(self.core_app.alloc, target)) return;
 
         return shellExecuteOpenTarget(self, target);
+    }
+
+    fn dispatchTextEditor(self: *App, path: []const u8) !void {
+        if (self.test_open_target) |hook| return hook(self, path);
+        if (builtin.mode == .Debug and
+            try recordOpenUrlForTest(self.core_app.alloc, path)) return;
+        try @import("../os/windows_text_editor.zig").open(self.core_app.alloc, path);
     }
 
     fn shellExecuteOpenTarget(self: *App, target: []const u8) !void {
@@ -10785,10 +10805,13 @@ pub const App = struct {
         };
     }
 
-    /// The legacy `ShellExecuteW` path. Kept alive for Advanced pane
+    /// Open the configuration as text. Kept alive for Advanced pane
     /// consumption and for users running `open_config` on CI / headless
     /// runs where the settings window is unreachable.
     fn openConfigInEditor(self: *App) !void {
+        errdefer if (self.settings_window.hwnd == null) {
+            _ = self.showHostBanner(.app, .err, @import("../os/windows_text_editor.zig").failure_message) catch false;
+        };
         // If the process was launched with `--config-file=<path>`,
         // that file is the one we Save to from the Settings UI and
         // the one that masks the per-user default on reload. Opening
@@ -10802,7 +10825,136 @@ pub const App = struct {
             break :blk try config_edit.openPath(self.core_app.alloc);
         };
         defer self.core_app.alloc.free(path);
-        try self.openUrl(path);
+        // Keep the existing local-file gates and repeat them at dispatch.
+        // ShellExecuteExW can pump window messages, so the editor, like links,
+        // must run from the message loop, outside the Settings callback.
+        var arena = std.heap.ArenaAllocator.init(self.core_app.alloc);
+        defer arena.deinit();
+        const checked = try prepareWin32LocalFile(arena.allocator(), path) orelse return error.OpenUrlRejected;
+        const owned = try self.core_app.alloc.dupe(u8, checked);
+        errdefer self.core_app.alloc.free(owned);
+        try self.deferShellRequest(.{ .text_editor = .{
+            .path = owned,
+            .from_settings = self.settings_window.hwnd != null,
+        } });
+    }
+
+    test "SET editor request stays deferred, rechecks safety and reports host failure" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .next_tab_id = 2 }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+        const Hook = struct {
+            var calls: usize = 0;
+            var fail = false;
+            var expected: []const u8 = "";
+            fn open(_: *App, path: []const u8) !void {
+                calls += 1;
+                try std.testing.expectEqualStrings(expected, path);
+                if (fail) return error.OpenConfigFailed;
+            }
+        };
+        Hook.calls = 0;
+        Hook.fail = false;
+        app.test_open_target = &Hook.open;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(.{ .sub_path = "config", .data = "font-size = 12\n" });
+        const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config");
+        defer std.testing.allocator.free(path);
+        app.cli_config_override_path = path;
+        defer app.cli_config_override_path = null;
+        Hook.expected = path;
+
+        try app.openConfigInEditor();
+        try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+        try std.testing.expectEqual(@as(usize, 1), app.deferred_opens.items.len);
+        try std.testing.expect(app.deferred_opens.items[0] == .text_editor);
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 1), Hook.calls);
+
+        Hook.fail = true;
+        try app.openConfigInEditor();
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 2), Hook.calls);
+        try std.testing.expectEqual(HostBannerKind.err, host.banner_kind);
+        try std.testing.expect(std.mem.indexOf(u8, host.banner_text.?, "text editor") != null);
+        try std.testing.expectEqual(@as(usize, 0), app.deferred_opens.items.len);
+
+        // A queued document replaced by a PE must fail the same gate used by
+        // the old URL path, before even reaching the test shell hook.
+        try app.openConfigInEditor();
+        try tmp.dir.writeFile(.{ .sub_path = "config", .data = "MZ\x00\x00" });
+        try std.testing.expect(app.runDeferredOpens());
+        try std.testing.expectEqual(@as(usize, 2), Hook.calls);
+        try std.testing.expectError(error.OpenUrlRejected, app.openConfigInEditor());
+    }
+
+    test "SET deferred editor failure reaches Settings live status on a hidden desktop" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnHiddenDesktop(struct {
+            fn body() !void {
+                var core_app: CoreApp = undefined;
+                var app: App = undefined;
+                var session: TestSession = .{};
+                try session.init(.{ .core_app = &core_app, .app = &app });
+                defer session.deinit();
+                app.initComApartment();
+                if (!app.com_initialized) return error.SkipZigTest;
+                defer sys.OleUninitialize();
+                // This test has no app message loop to drain COM teardown.
+                app.settings_window.handle.deferUiaDisconnect = null;
+                const settings_class = comptime std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings");
+                const viewport_class = comptime std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings.viewport");
+                defer {
+                    app.settings_window.deinit();
+                    // Settings fixtures on later private desktops register
+                    // their own classes with this same module instance.
+                    _ = sys.UnregisterClassW(settings_class, app.settings_window.handle.hinstance);
+                    _ = sys.UnregisterClassW(viewport_class, app.settings_window.handle.hinstance);
+                }
+                var tmp = std.testing.tmpDir(.{});
+                defer tmp.cleanup();
+                try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 12\n" });
+                const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.ghostty");
+                defer std.testing.allocator.free(path);
+                app.cli_config_override_path = path;
+                defer app.cli_config_override_path = null;
+                const Hook = struct {
+                    var calls: usize = 0;
+                    fn fail(_: *App, _: []const u8) !void {
+                        calls += 1;
+                        return error.OpenConfigFailed;
+                    }
+                };
+                Hook.calls = 0;
+                app.test_open_target = &Hook.fail;
+                try app.settings_window.open();
+                win32_uia.events.testing_live_regions = 0;
+                // Exercise the real callback, queue, dispatch and status setter.
+                settingsOpenInEditorThunk(&app);
+                try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+                try std.testing.expect(app.runDeferredOpens());
+                try std.testing.expectEqual(@as(usize, 1), Hook.calls);
+                try std.testing.expectEqual(@as(usize, 1), win32_uia.events.testing_live_regions);
+                var text: [256]u16 = undefined;
+                const len = sys.GetWindowTextW(app.settings_window.text_status.?, &text, text.len);
+                try std.testing.expect(len > 0);
+                const actual = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, text[0..@intCast(len)]);
+                defer std.testing.allocator.free(actual);
+                try std.testing.expectEqualStrings(@import("../os/windows_text_editor.zig").failure_message, actual);
+            }
+        }.body);
     }
 
     fn ringBell(self: *App, target: apprt.Target) void {
@@ -26633,6 +26785,7 @@ fn settingsOpenInEditorThunk(ctx: *anyopaque) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     app.openConfigInEditor() catch |err| {
         std.log.warn("settings: open-in-editor failed err={}", .{err});
+        app.settings_window.editorOpenFailed();
     };
 }
 fn settingsCurrentConfigThunk(ctx: *anyopaque) *const configpkg.Config {

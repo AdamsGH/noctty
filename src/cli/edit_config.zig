@@ -8,6 +8,7 @@ const actionpkg = @import("action.zig");
 const configpkg = @import("../config.zig");
 const internal_os = @import("../os/main.zig");
 const Config = configpkg.Config;
+const windows_text_editor = @import("../os/windows_text_editor.zig");
 
 pub const Options = struct {
     pub fn deinit(self: Options) void {
@@ -35,7 +36,7 @@ pub const Options = struct {
 ///
 /// This command prefers the `$VISUAL` environment variable over `$EDITOR`,
 /// if both are set. On Windows, if neither are set, the configuration file
-/// will be opened with the associated editor.
+/// will be opened with the associated text editor, regardless of its extension.
 pub fn run(alloc: Allocator) !u8 {
     // Implementation note (by @mitchellh): I do proper memory cleanup
     // throughout this command, even though we plan on doing `exec`.
@@ -95,11 +96,7 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
             return launchWindowsEditor(alloc, editor, path, stderr, std.process.Child.spawnAndWait);
         }
 
-        openPathWithShell(alloc, path) catch |err| {
-            try stderr.print("Failed to open the configuration in the associated editor: {s}.\n", .{@errorName(err)});
-            return 1;
-        };
-        return 0;
+        return launchWindowsDefaultEditor(alloc, path, stderr, windows_text_editor.open);
     }
 
     // If we don't have `$EDITOR` set then we can't do anything
@@ -290,29 +287,34 @@ test "PKG61 editor launch inherits stdio and reports failures without environmen
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "secret-path") == null);
 }
 
-fn openPathWithShell(
+fn launchWindowsDefaultEditor(
     alloc: Allocator,
     path: []const u8,
-) !void {
-    const path_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-    defer alloc.free(path_w);
-    const verb_w = std.unicode.utf8ToUtf16LeStringLiteral("open");
-    const result = ShellExecuteW(
-        null,
-        verb_w.ptr,
-        path_w.ptr,
-        null,
-        null,
-        1,
-    );
-    if (@intFromPtr(result) <= 32) return error.OpenConfigFailed;
+    stderr: *std.Io.Writer,
+    comptime open_editor: fn (Allocator, []const u8) anyerror!void,
+) !u8 {
+    open_editor(alloc, path) catch |err| {
+        try stderr.print("{s} ({s})\n", .{ windows_text_editor.failure_message, @errorName(err) });
+        return 1;
+    };
+    return 0;
 }
 
-extern "shell32" fn ShellExecuteW(
-    hwnd: ?windows.HWND,
-    lpOperation: ?windows.LPCWSTR,
-    lpFile: ?windows.LPCWSTR,
-    lpParameters: ?windows.LPCWSTR,
-    lpDirectory: ?windows.LPCWSTR,
-    nShowCmd: windows.INT,
-) callconv(.winapi) ?windows.HINSTANCE;
+test "SET default text editor launch reports failure on CLI stderr" {
+    const Fake = struct {
+        fn success(_: Allocator, path: []const u8) !void {
+            try std.testing.expectEqualStrings("private-config-path", path);
+        }
+        fn failure(_: Allocator, _: []const u8) !void {
+            return error.OpenConfigFailed;
+        }
+    };
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try std.testing.expectEqual(@as(u8, 0), try launchWindowsDefaultEditor(std.testing.allocator, "private-config-path", &writer, Fake.success));
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try std.testing.expectEqual(@as(u8, 1), try launchWindowsDefaultEditor(std.testing.allocator, "private-config-path", &writer, Fake.failure));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "OpenConfigFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), windows_text_editor.failure_message) != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "private-config-path") == null);
+}

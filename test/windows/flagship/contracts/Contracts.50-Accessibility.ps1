@@ -1585,8 +1585,8 @@ $settingsSourcePins = @(
         Description = 'settings clipped-control traversal uses the named count'
     },
     @{
-        Pattern = '(?s)fn syncClosePromptText\(self: \*SettingsWindow.*?setWindowTextUtf8\(text, closePromptText\(self\.quit_after_close\)\).*?fn closePromptText\(quitting: bool\) \[\]const u8.*?fn closePromptMeasuredHeight\(self: \*SettingsWindow.*?utf8ToW\(&text_w, closePromptText\(self\.quit_after_close\)\)'
-        Description = 'close prompt display and measurement share closePromptText'
+        Pattern = '(?s)fn promptText\(self: \*const SettingsWindow.*?closePromptText\(self\.quit_after_close\).*?fn syncClosePromptText\(self: \*SettingsWindow.*?setWindowTextUtf8\(text, self\.promptText\(&buffer\)\).*?fn closePromptMeasuredHeight\(self: \*SettingsWindow.*?utf8ToW\(&text_w, self\.promptText\(&text_buf\)\)'
+        Description = 'close and discard prompt display and measurement share promptText'
     },
     @{
         Pattern = '(?s)fn saveIfAllowed\(self: \*SettingsWindow\).*?IsWindowEnabled\(button\).*?IsWindowVisible\(button\).*?saveCommandCanDispatch\(\s*self\.close_prompt_visible,\s*self\.close_posted,\s*button_enabled,\s*button_visible,\s*\).*?self\.save\(\).*?clickedButton\(id, notify, BTN_SAVE\).*?o\.saveIfAllowed\(\)'
