@@ -322,6 +322,9 @@ const TestRegistry = struct {
     }
 
     fn deinit(self: TestRegistry, alloc: std.mem.Allocator) void {
+        // Only ever delete the scratch subtree `init` named.
+        const prefix = std.unicode.utf8ToUtf16LeStringLiteral(parent_prefix);
+        std.debug.assert(self.parent.len > prefix.len and std.mem.startsWith(u16, self.parent, prefix));
         _ = RegDeleteTreeW(HKEY_CURRENT_USER, self.parent);
         alloc.free(self.parent);
     }
