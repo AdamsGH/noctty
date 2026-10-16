@@ -27139,6 +27139,10 @@ const QuickTerminalToggleFixture = struct {
         self.host.quick_terminal = true;
         self.host.hwnd = try createTestHostWindow();
         errdefer _ = sys.DestroyWindow(self.host.hwnd.?);
+        // Showing a tab refreshes the chrome, which creates the tab-strip
+        // container as a layered child; this manifest-less test binary
+        // cannot (AGENTS.md 2026-10-01), so a plain one takes its slot.
+        self.host.tab_container_hwnd = try createTestChromeChild(self.host.hwnd.?, prompt_label_class);
         self.other.hwnd = try createTestHostWindow();
         _ = sys.ShowWindow(self.host.hwnd.?, c.SW_SHOWNOACTIVATE);
         _ = sys.ShowWindow(self.other.hwnd.?, c.SW_SHOWNOACTIVATE);
@@ -27253,8 +27257,7 @@ test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing 
             // The window floats with the tab it shows, so a tab switch or
             // undo does not drop it below other windows.
             try std.testing.expect(fixture.fresh.topmost);
-            // Its chrome windows are not created by this fixture, so showing
-            // it logged a refresh failure that left its title behind.
+            // Showing it refreshed the chrome, which cached the title.
             appendOwnedString(std.testing.allocator, &fixture.host.cached_window_title, null) catch unreachable;
         }
     }.body);
