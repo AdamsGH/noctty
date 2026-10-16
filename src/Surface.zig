@@ -5655,13 +5655,16 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
         return;
     }
 
-    try self.setFontSize(size);
-
     // Update our padding which is dependent on DPI. We only do this for
     // unbalanced padding since balanced padding is not dependent on DPI.
+    // Before the font: its new cell size recomputes the configured window
+    // size from this padding, and the old DPI's padding left a window moved
+    // to another DPI a few pixels off the size it opens at there.
     if (self.config.window_padding_balance == .false) {
         self.size.padding = self.config.scaledPadding(x_dpi, y_dpi);
     }
+
+    try self.setFontSize(size);
 
     // Force a resize event because the change in padding will affect
     // pixel-level changes to the renderer and viewport.
