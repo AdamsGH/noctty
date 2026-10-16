@@ -6639,6 +6639,31 @@ test "PageList scroll to row in scrollback" {
     }, s.scrollbar());
 }
 
+test "PageList scroll to row far from both ends of a long scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // More than 2 * 65535 rows, so a row near the middle is further than a
+    // u16 can count from the top and from the bottom. A scrollbar drag lands
+    // here, and used to snap the viewport to the active area instead.
+    var s = try init(alloc, 10, 24, null);
+    defer s.deinit();
+    try s.growRows(150_000);
+
+    for ([_]usize{ s.total_rows / 2, 70_000, 80_000, 66_000, 100_000 }) |target| {
+        s.scroll(.{ .row = target });
+        try testing.expect(s.viewport == .pin);
+        try testing.expectEqual(Scrollbar{
+            .total = s.total_rows,
+            .offset = target,
+            .len = s.rows,
+        }, s.scrollbar());
+        // `Cell.screenPoint` counts rows in a u16, so ask the list.
+        const pt = s.pointFromPin(.screen, s.getTopLeft(.viewport)).?;
+        try testing.expectEqual(@as(u32, @intCast(target)), pt.screen.y);
+    }
+}
+
 test "PageList scroll to row in middle" {
     const testing = std.testing;
     const alloc = testing.allocator;
