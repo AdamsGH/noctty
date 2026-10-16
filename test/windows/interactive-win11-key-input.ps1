@@ -166,6 +166,12 @@ public static class Win11KeyInputNative {
     public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
     [DllImport("user32.dll")]
+    public static extern bool GetKeyboardState(byte[] lpKeyState);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetKeyboardState(byte[] lpKeyState);
+
+    [DllImport("user32.dll")]
     public static extern bool BringWindowToTop(IntPtr hWnd);
 
     [DllImport("kernel32.dll")]
@@ -341,32 +347,63 @@ function Send-VirtualKeyMessage {
         throw "MapVirtualKeyW returned 0 for VK=$VirtualKey"
     }
 
-    [void](Invoke-InteractiveWin11Message `
-        -Hwnd $Hwnd `
-        -Message $WM_KEYDOWN `
-        -WParam ([UIntPtr]([uint64] $VirtualKey)) `
-        -LParam (New-KeyLParam -ScanCode ([uint16] $scanCode)) `
-        -Deadline $Deadline `
-        -Process $Process `
-        -Description "WM_KEYDOWN vk=$VirtualKey")
-    if ($CharCode -ne 0) {
+    # noctty takes a key's text from ToUnicode with the keyboard state at
+    # key-down, not from the WM_CHAR that follows, so Caps Lock or a held
+    # modifier on this machine would change what a sent 'a' types. Share the
+    # window's input queue and hand it a neutral state for this key, then put
+    # the shared state back and detach (as the live shell harness does).
+    $targetProcessId = [uint32] 0
+    $targetThread = [Win11KeyInputNative]::GetWindowThreadProcessId($Hwnd, [ref] $targetProcessId)
+    if ($targetThread -eq 0) {
+        throw "GetWindowThreadProcessId found no thread for window $Hwnd"
+    }
+    $thisThread = [Win11KeyInputNative]::GetCurrentThreadId()
+    if (-not [Win11KeyInputNative]::AttachThreadInput($thisThread, $targetThread, $true)) {
+        throw "AttachThreadInput failed for VK=$VirtualKey"
+    }
+    $savedState = New-Object byte[] 256
+    [void] [Win11KeyInputNative]::GetKeyboardState($savedState)
+    try {
+        $state = [byte[]] $savedState.Clone()
+        # Shift, Ctrl, Alt (either side), both Windows keys, and Caps Lock's
+        # toggle bit.
+        foreach ($neutral in @(0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)) {
+            $state[$neutral] = 0
+        }
+        if (-not [Win11KeyInputNative]::SetKeyboardState($state)) {
+            throw "SetKeyboardState failed for VK=$VirtualKey"
+        }
         [void](Invoke-InteractiveWin11Message `
             -Hwnd $Hwnd `
-            -Message $WM_CHAR `
-            -WParam ([UIntPtr]([uint64] $CharCode)) `
+            -Message $WM_KEYDOWN `
+            -WParam ([UIntPtr]([uint64] $VirtualKey)) `
             -LParam (New-KeyLParam -ScanCode ([uint16] $scanCode)) `
             -Deadline $Deadline `
             -Process $Process `
-            -Description "WM_CHAR char=$CharCode")
+            -Description "WM_KEYDOWN vk=$VirtualKey")
+        if ($CharCode -ne 0) {
+            [void](Invoke-InteractiveWin11Message `
+                -Hwnd $Hwnd `
+                -Message $WM_CHAR `
+                -WParam ([UIntPtr]([uint64] $CharCode)) `
+                -LParam (New-KeyLParam -ScanCode ([uint16] $scanCode)) `
+                -Deadline $Deadline `
+                -Process $Process `
+                -Description "WM_CHAR char=$CharCode")
+        }
+        [void](Invoke-InteractiveWin11Message `
+            -Hwnd $Hwnd `
+            -Message $WM_KEYUP `
+            -WParam ([UIntPtr]([uint64] $VirtualKey)) `
+            -LParam (New-KeyLParam -ScanCode ([uint16] $scanCode) -KeyUp) `
+            -Deadline $Deadline `
+            -Process $Process `
+            -Description "WM_KEYUP vk=$VirtualKey")
     }
-    [void](Invoke-InteractiveWin11Message `
-        -Hwnd $Hwnd `
-        -Message $WM_KEYUP `
-        -WParam ([UIntPtr]([uint64] $VirtualKey)) `
-        -LParam (New-KeyLParam -ScanCode ([uint16] $scanCode) -KeyUp) `
-        -Deadline $Deadline `
-        -Process $Process `
-        -Description "WM_KEYUP vk=$VirtualKey")
+    finally {
+        [void] [Win11KeyInputNative]::SetKeyboardState($savedState)
+        [void] [Win11KeyInputNative]::AttachThreadInput($thisThread, $targetThread, $false)
+    }
 }
 
 function Send-UnicodeInput {

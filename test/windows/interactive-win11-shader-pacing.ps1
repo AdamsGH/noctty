@@ -21,7 +21,10 @@ param(
 # The oracle is the render trace. `last_swap_process_output_bytes` is the PTY
 # byte count reflected by the most recently presented frame, so it grows only
 # when a frame built from new terminal output reaches the screen. Typing is
-# key messages sent to the terminal surface; nothing takes the foreground.
+# key messages sent to the terminal surface. The window still has to hold the
+# foreground: `custom-shader-animation = true` animates only a focused
+# surface, and without the animation there is nothing for the content path to
+# compete with.
 
 $ErrorActionPreference = 'Stop'
 $script:SHADER_PACING_POLL_MS = 100
@@ -168,6 +171,15 @@ function Request-ShaderPacingTrace {
     throw "Timed out waiting for a fresh render-trace snapshot at $Path"
 }
 
+# Focus has to hold for the whole measurement, not only at its start: an
+# unfocused surface stops the animation, and a round measured without it
+# proves nothing.
+function Assert-ShaderPacingForeground([string] $During) {
+    if ([InteractiveWin11WindowNative]::GetForegroundWindow() -ne $script:ShaderPacingHost) {
+        throw "noctty lost the foreground during $During, which stops the shader animation the measurement needs"
+    }
+}
+
 $exePath = Get-InteractiveWin11ExePath -RepoRoot $repoRoot
 if ($Binary) {
     if ($Rebuild) { throw 'Use either Binary or Rebuild, not both.' }
@@ -175,7 +187,10 @@ if ($Binary) {
     $portableBin = Join-Path $layout.Temp ('portable-' + [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $portableBin)
     Copy-Item -LiteralPath $Binary -Destination (Join-Path $portableBin 'noctty.exe')
-    Copy-Item -LiteralPath (Join-Path (Split-Path $Binary) 'noctty.com') -Destination $portableBin
+    foreach ($name in @('noctty.com', 'conpty.dll', 'OpenConsole.exe')) {
+        $source = Join-Path (Split-Path $Binary) $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination $portableBin }
+    }
     Set-Content -LiteralPath (Join-Path $portableBin 'noctty.portable') -Value 'isolated shader pacing comparison'
     if ((Get-FileHash -LiteralPath $Binary).Hash -ne (Get-FileHash -LiteralPath (Join-Path $portableBin 'noctty.exe')).Hash) { throw 'Copied shader binary differs.' }
     $share = Join-Path (Split-Path (Split-Path $Binary)) 'share'
@@ -218,6 +233,17 @@ try {
     )
     $hostHwnd = Wait-StatefulHost $run $deadline
     $surface = Wait-StatefulSurface $hostHwnd $run $deadline
+    $script:ShaderPacingHost = $hostHwnd
+    Wait-InteractiveWin11Until `
+        -Deadline $deadline `
+        -Description 'the foreground for the noctty window' `
+        -Process $run.Process `
+        -PollMilliseconds $script:SHADER_PACING_POLL_MS `
+        -Condition {
+        if ([InteractiveWin11WindowNative]::GetForegroundWindow() -eq $script:ShaderPacingHost) { return $true }
+        [void] [InteractiveWin11WindowNative]::ForceForeground($script:ShaderPacingHost, $true, $true)
+        return $false
+    }
 
     Wait-InteractiveWin11Until `
         -Deadline $deadline `
@@ -274,10 +300,12 @@ try {
             }
             $presentedMs += [int] ([DateTime]::UtcNow - $sent).TotalMilliseconds
         }
+        Assert-ShaderPacingForeground "round $round"
     }
 
     Start-Sleep -Milliseconds $script:SHADER_PACING_ANIMATION_WINDOW_MS
     $after = Request-ShaderPacingTrace -Hwnd $surface.Hwnd -Path $tracePath -AfterSequence $sequence -Deadline $deadline
+    Assert-ShaderPacingForeground 'the animation window'
     # A rate over the app's own clock (`runtime_ms`), so a stalled runner
     # cannot stretch the window and inflate the count.
     $animationMs = [double] $after.runtime_ms - [double] $typed.runtime_ms

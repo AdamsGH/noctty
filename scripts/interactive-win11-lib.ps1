@@ -554,11 +554,25 @@ function Invoke-InteractiveWin11Build {
 
 function Assert-InteractiveWin11ExeExists {
     param(
-        [Parameter(Mandatory)] [string] $ExePath
+        [Parameter(Mandatory)] [string] $ExePath,
+        # For callers that never open a terminal window (vt-probe) or that
+        # measure whichever backend the binary has (bench).
+        [switch] $AllowInboxConPty
     )
 
     if (-not [System.IO.File]::Exists($ExePath)) {
         throw "Missing noctty.exe at $ExePath"
+    }
+    if ($AllowInboxConPty) { return }
+    # A build that could not stage the bundled ConPTY still succeeds, and
+    # noctty then falls back to the in-box conhost behind an error banner.
+    # That banner is a focus region and changes the output stream, so every
+    # check below would measure a different app.
+    $binDir = [System.IO.Path]::GetDirectoryName($ExePath)
+    foreach ($name in @('conpty.dll', 'OpenConsole.exe')) {
+        if (-not [System.IO.File]::Exists((Join-Path $binDir $name))) {
+            throw "Missing $name beside $ExePath; the build did not stage the bundled ConPTY (see its warning), so noctty would fall back to the in-box conhost."
+        }
     }
 }
 

@@ -21,7 +21,9 @@ if ((Get-InteractiveWin11LaunchAction -ExePath $exe -Rebuild:$Rebuild -BuildInpu
 Assert-InteractiveWin11ExeExists -ExePath $exe
 $configDir = Join-Path $layout.LocalAppData 'noctty'; New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 $configPath = Join-Path $configDir 'config.ghostty'
-[IO.File]::WriteAllText($configPath, "theme = Dracula`r`nwindow-save-state = never`r`n", [Text.UTF8Encoding]::new($false))
+# Close-StatefulHost expects WM_CLOSE to end the process; a close that lands
+# before the shell's first prompt mark would otherwise raise the close prompt.
+[IO.File]::WriteAllText($configPath, "theme = Dracula`r`nwindow-save-state = never`r`nconfirm-close-surface = false`r`n", [Text.UTF8Encoding]::new($false))
 
 function Open-ThemeQuery([IntPtr]$HostHwnd, [string]$Query, [DateTime]$Deadline, $Process) {
     Invoke-StatefulPostedCommand $HostHwnd 1901 $Deadline $Process

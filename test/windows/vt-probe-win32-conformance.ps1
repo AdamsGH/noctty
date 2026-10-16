@@ -46,7 +46,7 @@ if ($launchAction -eq 'build') {
     Invoke-InteractiveWin11Build -RepoRoot $repoRoot
 }
 
-Assert-InteractiveWin11ExeExists -ExePath $exePath
+Assert-InteractiveWin11ExeExists -ExePath $exePath -AllowInboxConPty
 Remove-Item -LiteralPath $stdoutPath, $stderrPath -ErrorAction SilentlyContinue
 
 $process = Start-Process `

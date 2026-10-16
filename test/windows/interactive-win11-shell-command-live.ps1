@@ -447,17 +447,12 @@ function Send-ModifiedChar {
     if ($modifierMask -band 0x04) { $modifiers += [uint16] $VK_MENU }
     if ($modifierMask -band 0x01) { $modifiers += [uint16] $VK_SHIFT }
 
-    if ($modifiers.Count -eq 0) {
-        Send-KeyMessage -Hwnd $Hwnd -VirtualKey $virtualKey -CharCode ([uint16] [int] $Character) -Deadline $Deadline -Process $Process
-        Send-KeyMessage -Hwnd $Hwnd -VirtualKey $virtualKey -KeyUp -Deadline $Deadline -Process $Process
-        return
-    }
-
     # A sent modifier message never reaches GetKeyboardState, and noctty reads
     # a key's text from the keyboard state (ToUnicode) for the Win32 input
-    # records it sends ConPTY, so Shift+. would type '.'. Share the window's
-    # input queue for this key and hold the modifiers in the keyboard state, as
-    # the real keyboard would, then restore the exact old state and detach.
+    # records it sends ConPTY, so Shift+. would type '.', and Caps Lock on this
+    # machine would flip every letter. Share the window's input queue for this
+    # key and hold exactly its modifiers in the keyboard state, as the real
+    # keyboard would, then put the shared state back and detach.
     $targetProcessId = [uint32] 0
     $targetThread = [Win11ShellCommandLiveNative]::GetWindowThreadProcessId($Hwnd, [ref] $targetProcessId)
     if ($targetThread -eq 0) {
@@ -471,6 +466,11 @@ function Send-ModifiedChar {
     [void] [Win11ShellCommandLiveNative]::GetKeyboardState($savedState)
     try {
         $state = [byte[]] $savedState.Clone()
+        # Shift, Ctrl, Alt (either side), both Windows keys, and Caps Lock's
+        # toggle bit.
+        foreach ($neutral in @(0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)) {
+            $state[$neutral] = 0
+        }
         foreach ($modifier in $modifiers) {
             $state[$modifier] = 0x80
             $state[$LEFT_MODIFIER_VK[[int] $modifier]] = 0x80
