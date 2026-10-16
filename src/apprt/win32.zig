@@ -3078,6 +3078,9 @@ const RecoveryStartup = struct {
     attempts: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined,
     count: usize = 0,
     decision: win32_recovery.Decision = .normal,
+    /// The decision set the saved session aside and the move happened; the
+    /// safe-mode notice says so.
+    session_set_aside: bool = false,
 };
 
 const recovery_safe_mode_banner =
@@ -3399,61 +3402,62 @@ fn persistMergedRecoveryReadyAtPath(
     startup.count = persisted.len;
 }
 
-/// Flag this launch's attempt as restoring the saved session, on disk before
-/// the first window is restored: a launch that dies during restore must leave
-/// the flag behind, so `decide` can tell a session that keeps failing to
-/// restore from any other repeated failure. Merged with the disk record under
-/// the ledger lock, like the ready marker. Best effort: an unflagged attempt
-/// only means the session is not set aside.
-fn markRecoverySessionRestoreAtPath(
+/// Record `mark` on this launch's attempt, merged with the disk record under
+/// the ledger lock like the ready marker. Around a session restore: the start
+/// is on disk before the first window is restored, so a launch that ends during
+/// restore leaves it behind, and the finish is on disk before any unrelated
+/// startup work, so `decide` can tell a session that keeps failing to restore
+/// from any other repeated failure. Best effort: an unrecorded start only
+/// means the session is not set aside.
+fn markRecoveryAttemptAtPath(
     alloc: Allocator,
     path: []const u8,
     startup: *RecoveryStartup,
-    now: u64,
+    mark: win32_recovery.AttemptMark,
 ) void {
     if (startup.count == 0) return;
     const memory_attempts = startup.attempts[0..startup.count];
     const target_started_at = memory_attempts[memory_attempts.len - 1].started_at_unix_ms;
 
     var lock = RecoveryLedgerLock.acquire(alloc, path, recovery_ledger_lock_wait_ms) catch |err| {
-        log.warn("win32 recovery: session-restore marker skipped, ledger lock unavailable err={}", .{err});
+        log.warn("win32 recovery: {s} marker skipped, ledger lock unavailable err={}", .{ @tagName(mark), err });
         return;
     } orelse {
-        log.warn("win32 recovery: session-restore marker skipped, ledger lock busy", .{});
+        log.warn("win32 recovery: {s} marker skipped, ledger lock busy", .{@tagName(mark)});
         return;
     };
     defer lock.release();
 
     var disk_record: win32_recovery.StartupAttemptRecord = .{};
-    var ledger = readRecoveryLedgerAlloc(alloc, path, "session-restore marker");
+    var ledger = readRecoveryLedgerAlloc(alloc, path, @tagName(mark));
     defer ledger.deinit();
     if (ledger == .left_alone or ledger == .unreadable) return;
     if (ledger == .record) disk_record = ledger.record.value;
 
     var merged_attempts: [win32_recovery.max_attempts]win32_recovery.StartupAttempt = undefined;
-    const merged = win32_recovery.mergeMarkSessionRestore(
+    const merged = win32_recovery.mergeMarkAttempt(
         disk_record,
         .{ .attempts = memory_attempts },
         target_started_at,
-        now,
+        mark,
         &merged_attempts,
     ) catch |err| {
-        log.warn("win32 recovery: session-restore marker merge failed err={}", .{err});
+        log.warn("win32 recovery: {s} marker merge failed err={}", .{ @tagName(mark), err });
         return;
     };
     persistRecoveryRecordAtPath(alloc, path, merged_attempts[0..merged.attempts.len]) catch |err| {
-        log.warn("win32 recovery: session-restore marker persist failed err={}", .{err});
+        log.warn("win32 recovery: {s} marker persist failed err={}", .{ @tagName(mark), err });
         return;
     };
     // Memory keeps this process's own attempt last: the ready marker targets
     // it, so the merged record is not adopted here.
-    memory_attempts[memory_attempts.len - 1].session_restore_at_unix_ms = now;
+    win32_recovery.applyMark(&memory_attempts[memory_attempts.len - 1], mark);
 }
 
-/// Move a saved session aside that the last launches all died restoring, so
-/// the next normal launch starts fresh instead of dying again. A rename, never
-/// a delete; skipped while another live process owns the session. Returns
-/// whether the session was moved.
+/// Move a saved session aside that the last launches all ended restoring, so
+/// the next normal launch starts fresh instead of ending again. A rename into
+/// a free slot, never a delete or a replace; skipped while another live process
+/// owns the session. Returns whether the session was moved.
 fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
     const owner = SessionOwnerLock.acquire(alloc, state_path) catch |err| {
         log.warn("win32 recovery: session not set aside, ownership lock unavailable err={}", .{err});
@@ -3467,6 +3471,7 @@ fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
         alloc,
         state_path,
         recovery_set_aside_suffix,
+        .keep_source,
     ) catch |err| {
         if (err != error.FileNotFound) {
             log.warn("win32 recovery: session not set aside path={s} err={}", .{ state_path, err });
@@ -3891,7 +3896,9 @@ fn warnPortableIgnoredLocalData(alloc: Allocator) void {
 fn beginRecoveryStartup(alloc: Allocator) RecoveryStartup {
     const path = localAppDataPathAlloc(alloc, "startup-attempts.json") orelse return .{};
     defer alloc.free(path);
-    return beginRecoveryStartupAtPath(alloc, path, unixMillis(), recovery_ledger_lock_wait_ms);
+    const session_path = localAppDataPathAlloc(alloc, "session-state.json");
+    defer if (session_path) |value| alloc.free(value);
+    return beginRecoveryStartupAtPath(alloc, path, session_path, unixMillis(), recovery_ledger_lock_wait_ms);
 }
 
 /// The whole read -> fold -> append -> replace -> cleanup sequence runs under
@@ -3908,6 +3915,7 @@ fn beginRecoveryStartup(alloc: Allocator) RecoveryStartup {
 fn beginRecoveryStartupAtPath(
     alloc: Allocator,
     path: []const u8,
+    session_path: ?[]const u8,
     now: u64,
     lock_wait_ms: u32,
 ) RecoveryStartup {
@@ -4012,9 +4020,21 @@ fn beginRecoveryStartupAtPath(
     // the same lock.
     if (lock == null) return result;
 
+    // Acted on inside the transaction that decided it, so no launch can
+    // record a restore or a ready marker in between.
+    if (result.decision == .quarantine_session) if (session_path) |value| {
+        result.session_set_aside = setAsideCrashedSessionState(alloc, value);
+    };
+
+    // Attempts are told apart by their start; two launches in one
+    // millisecond must not share one.
+    const started_at = if (record.attempts.len > 0)
+        @max(now, record.attempts[record.attempts.len - 1].started_at_unix_ms + 1)
+    else
+        now;
     const appended = win32_recovery.appendBounded(
         record,
-        .{ .started_at_unix_ms = now, .version = .init(build_config.version_string) },
+        .{ .started_at_unix_ms = started_at, .version = .init(build_config.version_string) },
         &result.attempts,
     ) catch |err| {
         log.warn("win32 recovery: attempt append failed err={}", .{err});
@@ -4576,9 +4596,6 @@ pub const App = struct {
     recovery_ready_resolved: bool = false,
     recovery_ready_retry: RecoveryReadyRetry = .{},
     recovery_safe_mode_notice: RecoverySafeModeNotice = .{},
-    /// The startup decision moved the saved session aside, and the move
-    /// happened; the safe-mode notice says so.
-    recovery_session_set_aside: bool = false,
     /// Top-level shell composition only. Terminal child HWNDs retain their
     /// existing WGL/SwapBuffers ownership regardless of this backend state.
     shell_compositor_driver: win32_compositor_native.NativeDriver = undefined,
@@ -4759,12 +4776,6 @@ pub const App = struct {
         });
         if (recovery_startup.decision != .normal and !opts.safe_mode) {
             log.warn("win32 recovery: repeated incomplete startups selected safe mode", .{});
-        }
-        if (recovery_startup.decision == .quarantine_session) {
-            if (self.sessionStatePath()) |path| {
-                defer core_app.alloc.free(path);
-                self.recovery_session_set_aside = setAsideCrashedSessionState(core_app.alloc, path);
-            }
         }
 
         self.initComApartment();
@@ -5703,10 +5714,14 @@ pub const App = struct {
         } orelse return false;
         defer parsed.deinit();
 
-        if (localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json")) |ledger_path| {
-            defer self.core_app.alloc.free(ledger_path);
-            markRecoverySessionRestoreAtPath(self.core_app.alloc, ledger_path, &self.recovery_startup, unixMillis());
+        const ledger_path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json");
+        defer if (ledger_path) |value| self.core_app.alloc.free(value);
+        if (ledger_path) |value| {
+            markRecoveryAttemptAtPath(self.core_app.alloc, value, &self.recovery_startup, .{ .session_restore = unixMillis() });
         }
+        defer if (ledger_path) |value| {
+            markRecoveryAttemptAtPath(self.core_app.alloc, value, &self.recovery_startup, .session_restored);
+        };
         // Debug-only fault for the restore crash-loop harness: the process
         // ends mid-restore, as a release abort does (ExitProcess(3)), without
         // the breakpoint a Debug panic raises.
@@ -5961,7 +5976,7 @@ pub const App = struct {
         // Only now may the safe-mode dialog appear: killing the process while
         // that modal is up must not preserve the failure streak.
         if (self.recovery_safe_mode_notice.release(self.recovery_ready_resolved)) {
-            if (recoverySafeModeNotice(self.recovery_startup.decision, self.recovery_session_set_aside)) |text| {
+            if (recoverySafeModeNotice(self.recovery_startup.decision, self.recovery_startup.session_set_aside)) |text| {
                 self.showRecoverySafeModeNotice(text);
             }
         }
@@ -51803,7 +51818,7 @@ test "win32 recovery next startup folds retained diagnosis before append" {
     try win32_session_persistence.writeFileInPlace(target, disk_json);
     try win32_session_persistence.writeFileInPlace(pending, pending_json);
 
-    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, 200, recovery_ledger_lock_wait_ms);
+    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 200, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.normal, startup.decision);
     try std.testing.expectEqual(@as(usize, 2), startup.count);
     try std.testing.expectEqual(@as(?u64, 150), startup.attempts[0].ready_at_unix_ms);
@@ -51853,7 +51868,7 @@ test "win32 recovery startup leaves another instance's in-flight write temp alon
     try win32_session_persistence.writeFileInPlace(in_flight, in_flight_json);
     try win32_session_persistence.writeFileInPlace(pending, pending_json);
 
-    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, 200, recovery_ledger_lock_wait_ms);
+    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 200, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 2), startup.count);
 
     // The `.pending-` diagnosis is folded and cleaned up.
@@ -51885,7 +51900,7 @@ test "win32 recovery startup keeps a newer build's history and counts one with a
         \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"build":"9"},{"started_at_unix_ms":200,"build":"9"},{"started_at_unix_ms":300,"build":"9"}]}
     ;
     try win32_session_persistence.writeFileInPlace(target, added_field);
-    const counted = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    const counted = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 400, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.safe_mode, counted.decision);
     try std.testing.expectEqual(@as(usize, 4), counted.count);
 
@@ -51894,7 +51909,7 @@ test "win32 recovery startup keeps a newer build's history and counts one with a
         \\{"schema_version":2,"attempts":[{"started_at_unix_ms":100,"phase":"init","where":"x"}],"hist":{}}
     ;
     try win32_session_persistence.writeFileInPlace(target, newer);
-    const skipped = beginRecoveryStartupAtPath(std.testing.allocator, target, 500, recovery_ledger_lock_wait_ms);
+    const skipped = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 500, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.normal, skipped.decision);
     try std.testing.expectEqual(@as(usize, 0), skipped.count);
     const after = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
@@ -51911,7 +51926,7 @@ test "win32 recovery startup keeps a newer build's history and counts one with a
         try file.writeAll("\"}");
     }
     const big_before = try tmp.dir.statFile("startup-attempts.json");
-    const big = beginRecoveryStartupAtPath(std.testing.allocator, target, 600, recovery_ledger_lock_wait_ms);
+    const big = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 600, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 0), big.count);
     const big_after = try tmp.dir.statFile("startup-attempts.json");
     try std.testing.expectEqual(big_before.size, big_after.size);
@@ -51926,7 +51941,7 @@ test "win32 recovery startup keeps a newer build's history and counts one with a
     {
         const held = try tmp.dir.openFile("startup-attempts.json", .{ .mode = .read_write, .lock = .exclusive });
         defer held.close();
-        const blocked = beginRecoveryStartupAtPath(std.testing.allocator, target, 700, recovery_ledger_lock_wait_ms);
+        const blocked = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 700, recovery_ledger_lock_wait_ms);
         try std.testing.expectEqual(@as(usize, 0), blocked.count);
     }
     const unblocked = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
@@ -51947,25 +51962,43 @@ test "win32 recovery sets the session aside after failures that all began restor
     defer std.testing.allocator.free(root);
     const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
     defer std.testing.allocator.free(target);
+    const session = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(session);
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "saved" });
 
-    // Three launches in a row died after they began restoring the session:
-    // safe mode alone would only reset the streak for the next three.
+    // Three launches in a row ended after they began restoring the session
+    // and before the restore finished: safe mode alone would only reset the
+    // streak for the next three.
     try win32_session_persistence.writeFileInPlace(target,
         \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200,"session_restore_at_unix_ms":210},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
     );
-    const restoring = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    const restoring = beginRecoveryStartupAtPath(std.testing.allocator, target, session, 400, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.quarantine_session, restoring.decision);
+    try std.testing.expect(restoring.session_set_aside);
+    const moved = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ recovery_set_aside_suffix, 64);
+    defer std.testing.allocator.free(moved);
+    try std.testing.expectEqualStrings("saved", moved);
+
+    // One of the three finished its restore before it ended: safe mode only.
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "saved again" });
+    try win32_session_persistence.writeFileInPlace(target,
+        \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200,"session_restore_at_unix_ms":210,"phase":"window_created"},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
+    );
+    const finished = beginRecoveryStartupAtPath(std.testing.allocator, target, session, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.safe_mode, finished.decision);
+    try std.testing.expect(!finished.session_set_aside);
+    try tmp.dir.access("session-state.json", .{});
 
     // One of the three died before any restore began, so the session is not
     // what keeps failing: safe mode only.
     try win32_session_persistence.writeFileInPlace(target,
         \\{"schema_version":1,"attempts":[{"started_at_unix_ms":100,"session_restore_at_unix_ms":110},{"started_at_unix_ms":200},{"started_at_unix_ms":300,"session_restore_at_unix_ms":310}]}
     );
-    const mixed = beginRecoveryStartupAtPath(std.testing.allocator, target, 400, recovery_ledger_lock_wait_ms);
+    const mixed = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 400, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.safe_mode, mixed.decision);
 }
 
-test "win32 recovery session-restore marker reaches disk and keeps a concurrent attempt" {
+test "win32 recovery restore markers reach disk and keep a concurrent attempt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
@@ -51973,13 +52006,13 @@ test "win32 recovery session-restore marker reaches disk and keeps a concurrent 
     const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
     defer std.testing.allocator.free(target);
 
-    var startup = beginRecoveryStartupAtPath(std.testing.allocator, target, 100, recovery_ledger_lock_wait_ms);
+    var startup = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 100, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 1), startup.count);
     // Another instance starts while this one is still before its restore.
-    const other = beginRecoveryStartupAtPath(std.testing.allocator, target, 200, recovery_ledger_lock_wait_ms);
+    const other = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 200, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 2), other.count);
 
-    markRecoverySessionRestoreAtPath(std.testing.allocator, target, &startup, 150);
+    markRecoveryAttemptAtPath(std.testing.allocator, target, &startup, .{ .session_restore = 150 });
     // Memory still ends with this process's attempt, which the ready marker
     // targets; the other instance's attempt is only on disk.
     try std.testing.expectEqual(@as(usize, 1), startup.count);
@@ -51993,6 +52026,16 @@ test "win32 recovery session-restore marker reaches disk and keeps a concurrent 
     try std.testing.expectEqual(@as(?u64, 150), disk.value.attempts[0].session_restore_at_unix_ms);
     try std.testing.expectEqual(@as(?u64, null), disk.value.attempts[1].session_restore_at_unix_ms);
     try std.testing.expectEqual(@as(u64, 200), disk.value.attempts[1].started_at_unix_ms);
+
+    // The finish reaches disk too, on this attempt only.
+    markRecoveryAttemptAtPath(std.testing.allocator, target, &startup, .session_restored);
+    try std.testing.expectEqual(win32_recovery.StartupPhase.window_created, startup.attempts[0].phase);
+    const finished_raw = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
+    defer std.testing.allocator.free(finished_raw);
+    var finished = try win32_recovery.parseAlloc(std.testing.allocator, finished_raw);
+    defer finished.deinit();
+    try std.testing.expectEqual(win32_recovery.StartupPhase.window_created, finished.value.attempts[0].phase);
+    try std.testing.expectEqual(win32_recovery.StartupPhase.init, finished.value.attempts[1].phase);
 }
 
 test "win32 recovery sets a crashed session aside without deleting it" {
@@ -52033,7 +52076,7 @@ test "win32 recovery startup records which build wrote the attempt" {
     const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
     defer std.testing.allocator.free(target);
 
-    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, 100, recovery_ledger_lock_wait_ms);
+    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 100, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 1), startup.count);
     const written = try std.fs.cwd().readFileAlloc(std.testing.allocator, target, 64 * 1024);
     defer std.testing.allocator.free(written);
@@ -52099,7 +52142,7 @@ test "win32 recovery startup fails open when the ledger lock is held" {
 
     var held = (try RecoveryLedgerLock.acquire(std.testing.allocator, target, 0)) orelse
         return error.TestUnexpectedResult;
-    const blocked = beginRecoveryStartupAtPath(std.testing.allocator, target, 200, 20);
+    const blocked = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 200, 20);
     held.release();
 
     // Decision still made from the ledger; nothing appended, nothing
@@ -52114,7 +52157,7 @@ test "win32 recovery startup fails open when the ledger lock is held" {
 
     // With the lock free the same launch records itself and folds the
     // retained record.
-    const recorded = beginRecoveryStartupAtPath(std.testing.allocator, target, 200, recovery_ledger_lock_wait_ms);
+    const recorded = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 200, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 4), recorded.count);
     try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(pending, .{}));
 }
@@ -52125,7 +52168,7 @@ const ConcurrentStartupWorker = struct {
     count: usize = 0,
 
     fn run(self: *ConcurrentStartupWorker) void {
-        const startup = beginRecoveryStartupAtPath(std.testing.allocator, self.target, self.now, recovery_ledger_lock_wait_ms);
+        const startup = beginRecoveryStartupAtPath(std.testing.allocator, self.target, null, self.now, recovery_ledger_lock_wait_ms);
         self.count = startup.count;
     }
 };
@@ -52168,6 +52211,10 @@ test "win32 recovery concurrent startups never lose each other's attempt" {
     var parsed = try win32_recovery.parseAlloc(std.testing.allocator, final);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, worker_count), parsed.value.attempts.len);
+    // Same clock reading, distinct attempts: a marker targets one by its start.
+    for (parsed.value.attempts[1..], 1..) |attempt, i| {
+        try std.testing.expect(attempt.started_at_unix_ms > parsed.value.attempts[i - 1].started_at_unix_ms);
+    }
 }
 
 test "win32 recovery fallback failure is consumed by next startup" {
@@ -52214,7 +52261,7 @@ test "win32 recovery fallback failure is consumed by next startup" {
     try std.testing.expectEqual(win32_recovery.StartupPhase.ready_persist_failed, ready_attempts[0].phase);
     try std.testing.expect(ready_attempts[0].last_win32_error != null);
 
-    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, 200, recovery_ledger_lock_wait_ms);
+    const startup = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 200, recovery_ledger_lock_wait_ms);
     try std.testing.expectEqual(win32_recovery.Decision.normal, startup.decision);
     try std.testing.expectEqual(@as(usize, 2), startup.count);
     try std.testing.expectEqual(@as(?u64, 150), startup.attempts[0].ready_at_unix_ms);

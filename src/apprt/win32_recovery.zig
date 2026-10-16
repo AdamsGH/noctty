@@ -5,9 +5,9 @@
 //!   2. Call `decide` before appending the current attempt.
 //!   3. Append the current attempt and persist it (`persistRecoveryRecordAtPath`
 //!      in win32.zig, under the ledger lock).
-//!   4. Flag the attempt with `mergeMarkSessionRestore` before restoring the
-//!      saved session, and mark it with `mergeMarkReady` only after normal
-//!      startup is usable.
+//!   4. Around restoring the saved session, mark the attempt with
+//!      `mergeMarkAttempt` (began, then finished), and mark it with
+//!      `mergeMarkReady` only after normal startup is usable.
 //!
 //! An attempt without `ready_at_unix_ms` is evidence that the process ended
 //! before reaching the ready marker. This module performs no filesystem work.
@@ -27,14 +27,14 @@ pub const Decision = enum {
     normal,
     safe_mode,
     /// Safe mode, and set the saved session aside: the failures that selected
-    /// safe mode all died while restoring it.
+    /// safe mode all ended while restoring it.
     quarantine_session,
 };
 
 pub const StartupPhase = enum {
     init,
-    /// No longer written; kept so ledgers from builds that wrote it, and the
-    /// builds that still do, parse.
+    /// A session restore this attempt began has finished. (Older builds wrote
+    /// it once the first window existed, restore or not.)
     window_created,
     ready,
     ready_persist_failed,
@@ -46,7 +46,7 @@ pub const StartupAttempt = struct {
     phase: StartupPhase = .init,
     last_win32_error: ?u32 = null,
     /// When this attempt began restoring the saved session. Written before the
-    /// first window is restored, so a launch that dies during restore keeps it.
+    /// first window is restored, so a launch that ends during restore keeps it.
     session_restore_at_unix_ms: ?u64 = null,
     /// The build that recorded the attempt.
     version: ?BuildVersion = null,
@@ -292,21 +292,38 @@ pub fn mergeMarkReady(
     return merged;
 }
 
-/// As `mergeMarkReady`, but flag this process's attempt as restoring the
-/// saved session. An attempt flagged earlier keeps its first time.
-pub fn mergeMarkSessionRestore(
+/// What a marker records on this process's attempt around a session restore.
+pub const AttemptMark = union(enum) {
+    /// Began restoring the saved session at this time.
+    session_restore: u64,
+    /// Finished restoring it, whether or not any window came back.
+    session_restored,
+};
+
+/// As `mergeMarkReady`, but record `mark` on this process's attempt. A mark
+/// never moves an attempt back: an earlier restore time stays, and only an
+/// `init` attempt moves to `window_created`.
+pub fn mergeMarkAttempt(
     disk: StartupAttemptRecord,
     memory: StartupAttemptRecord,
     target_started_at_unix_ms: u64,
-    restore_at_unix_ms: u64,
+    mark: AttemptMark,
     out: []StartupAttempt,
 ) (ValidationError || MergeReadyError)!StartupAttemptRecord {
     const merged = try mergeRecords(disk, memory, out);
-    const attempt = try findAttempt(out[0..merged.attempts.len], target_started_at_unix_ms);
-    if (attempt.session_restore_at_unix_ms == null) {
-        attempt.session_restore_at_unix_ms = restore_at_unix_ms;
-    }
+    applyMark(try findAttempt(out[0..merged.attempts.len], target_started_at_unix_ms), mark);
     return merged;
+}
+
+pub fn applyMark(attempt: *StartupAttempt, mark: AttemptMark) void {
+    switch (mark) {
+        .session_restore => |at| if (attempt.session_restore_at_unix_ms == null) {
+            attempt.session_restore_at_unix_ms = at;
+        },
+        .session_restored => if (attempt.phase == .init) {
+            attempt.phase = .window_created;
+        },
+    }
 }
 
 fn findAttempt(attempts: []StartupAttempt, started_at_unix_ms: u64) error{TargetAttemptMissing}!*StartupAttempt {
@@ -338,8 +355,9 @@ pub fn recentFailureCount(
 }
 
 /// Repeated pre-ready failures select safe mode. When the latest of them all
-/// died after they began restoring the saved session, safe mode alone only
-/// postpones the next round: the session is set aside as well.
+/// ended after they began restoring the saved session and before the restore
+/// finished, safe mode alone only postpones the next round: the session is set
+/// aside as well.
 pub fn decide(
     record: StartupAttemptRecord,
     now_unix_ms: u64,
@@ -349,7 +367,7 @@ pub fn decide(
     if (threshold == 0) return .normal;
     if (recentFailureCount(record, now_unix_ms, policy.max_failure_age_ms) < threshold) return .normal;
     for (record.attempts[record.attempts.len - threshold ..]) |attempt| {
-        if (attempt.session_restore_at_unix_ms == null) return .safe_mode;
+        if (attempt.session_restore_at_unix_ms == null or attempt.phase != .init) return .safe_mode;
     }
     return .quarantine_session;
 }
@@ -591,6 +609,14 @@ test "win32 recovery sets the session aside only when the latest failures all re
         decide(.{ .attempts = restoring[2..] }, 500, .{}),
     );
 
+    // One of them finished its restore and ended later: not the session.
+    var finished = restoring;
+    finished[2].phase = .window_created;
+    try std.testing.expectEqual(
+        Decision.safe_mode,
+        decide(.{ .attempts = &finished }, 500, .{}),
+    );
+
     // The newest failure (a safe-mode launch that died) restored nothing.
     const safe_mode_died = [_]StartupAttempt{
         .{ .started_at_unix_ms = 100, .session_restore_at_unix_ms = 110 },
@@ -604,7 +630,7 @@ test "win32 recovery sets the session aside only when the latest failures all re
     );
 }
 
-test "win32 recovery session-restore merge flags this attempt and keeps a concurrent one" {
+test "win32 recovery attempt marks flag this attempt and keep a concurrent one" {
     const memory_attempts = [_]StartupAttempt{
         .{ .started_at_unix_ms = 100, .ready_at_unix_ms = 120 },
         .{ .started_at_unix_ms = 200 },
@@ -615,11 +641,11 @@ test "win32 recovery session-restore merge flags this attempt and keeps a concur
         .{ .started_at_unix_ms = 300 },
     };
     var out: [max_attempts]StartupAttempt = undefined;
-    const merged = try mergeMarkSessionRestore(
+    const merged = try mergeMarkAttempt(
         .{ .attempts = &disk_attempts },
         .{ .attempts = &memory_attempts },
         200,
-        250,
+        .{ .session_restore = 250 },
         &out,
     );
     try std.testing.expectEqual(@as(usize, 3), merged.attempts.len);
@@ -633,8 +659,19 @@ test "win32 recovery session-restore merge flags this attempt and keeps a concur
     try std.testing.expectEqual(@as(?u64, 260), ready.attempts[1].ready_at_unix_ms);
     try std.testing.expectError(
         error.TargetAttemptMissing,
-        mergeMarkSessionRestore(merged, .{}, 999, 1000, &out),
+        mergeMarkAttempt(merged, .{}, 999, .session_restored, &out),
     );
+
+    // Finishing the restore moves `init` on, never a phase already past it,
+    // and a second restore time does not replace the first.
+    var attempt: StartupAttempt = .{ .started_at_unix_ms = 1, .session_restore_at_unix_ms = 5 };
+    applyMark(&attempt, .{ .session_restore = 9 });
+    applyMark(&attempt, .session_restored);
+    try std.testing.expectEqual(@as(?u64, 5), attempt.session_restore_at_unix_ms);
+    try std.testing.expectEqual(StartupPhase.window_created, attempt.phase);
+    attempt.phase = .ready_persist_failed;
+    applyMark(&attempt, .session_restored);
+    try std.testing.expectEqual(StartupPhase.ready_persist_failed, attempt.phase);
 }
 
 test "win32 recovery attempt version round trips and stays bounded" {

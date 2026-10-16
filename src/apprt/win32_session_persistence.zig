@@ -59,40 +59,64 @@ fn loadWithParser(
 }
 
 /// Copies kept per quarantined file and suffix: `<file><suffix>`, then
-/// `<file><suffix>.1` and up. Once every slot is taken, the copy written
-/// longest ago makes room, so a file that keeps failing cannot fill the
+/// `<file><suffix>.1` and up, so a file that keeps failing cannot fill the
 /// directory.
 pub const max_quarantined_copies = 5;
 
+/// What `quarantineFileAlloc` does once every slot is taken.
+pub const WhenFull = enum {
+    /// The copy written longest ago makes room.
+    replace_oldest,
+    /// Nothing moves and `error.QuarantineFull` is returned: for copies that
+    /// may be the only one of something the user wants back.
+    keep_source,
+};
+
 pub fn quarantineCorruptFileAlloc(alloc: Allocator, absolute_path: []const u8) ![]u8 {
-    return quarantineFileAlloc(alloc, absolute_path, ".corrupt");
+    return quarantineFileAlloc(alloc, absolute_path, ".corrupt", .replace_oldest);
 }
 
-/// Move `absolute_path` aside to the first free slot for `suffix`, or over
-/// the oldest one. A failed move leaves the source untouched.
-pub fn quarantineFileAlloc(alloc: Allocator, absolute_path: []const u8, suffix: []const u8) ![]u8 {
+/// Move `absolute_path` aside to the first free slot for `suffix`. A free
+/// slot is taken with a rename that never replaces, so a copy that appears
+/// meanwhile survives. A failed move leaves the source untouched.
+pub fn quarantineFileAlloc(
+    alloc: Allocator,
+    absolute_path: []const u8,
+    suffix: []const u8,
+    when_full: WhenFull,
+) ![]u8 {
     var oldest_index: usize = 0;
     var oldest_mtime: i128 = std.math.maxInt(i128);
     for (0..max_quarantined_copies) |index| {
         const destination = try quarantineSlotPathAlloc(alloc, absolute_path, suffix, index);
         errdefer alloc.free(destination);
-        const stat = std.fs.cwd().statFile(destination) catch |err| switch (err) {
-            error.FileNotFound => {
-                try std.fs.renameAbsolute(absolute_path, destination);
-                return destination;
-            },
+        if (renameNoReplace(absolute_path, destination)) {
+            return destination;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {},
             else => return err,
-        };
-        alloc.free(destination);
-        if (stat.mtime < oldest_mtime) {
-            oldest_index = index;
-            oldest_mtime = stat.mtime;
         }
+        if (when_full == .replace_oldest) {
+            const stat = try std.fs.cwd().statFile(destination);
+            if (stat.mtime < oldest_mtime) {
+                oldest_index = index;
+                oldest_mtime = stat.mtime;
+            }
+        }
+        alloc.free(destination);
     }
+    if (when_full == .keep_source) return error.QuarantineFull;
     const destination = try quarantineSlotPathAlloc(alloc, absolute_path, suffix, oldest_index);
     errdefer alloc.free(destination);
     try std.fs.renameAbsolute(absolute_path, destination);
     return destination;
+}
+
+/// `std.fs.renameAbsolute` replaces an existing target on Windows.
+fn renameNoReplace(old_path: []const u8, new_path: []const u8) !void {
+    const old_w = try std.os.windows.sliceToPrefixedFileW(null, old_path);
+    const new_w = try std.os.windows.sliceToPrefixedFileW(null, new_path);
+    try std.posix.renameatW(std.fs.cwd().fd, old_w.span(), std.fs.cwd().fd, new_w.span(), std.os.windows.FALSE);
 }
 
 fn quarantineSlotPathAlloc(alloc: Allocator, absolute_path: []const u8, suffix: []const u8, index: usize) ![]u8 {
@@ -440,6 +464,42 @@ test "win32 session persistence quarantine keeps a bounded number of copies" {
     var names = tmp.dir.iterate();
     while (try names.next()) |_| count += 1;
     try std.testing.expectEqual(slots.len, count);
+}
+
+test "win32 session persistence quarantine that keeps its source never replaces a copy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const slots = [_][]const u8{
+        "session-state.json.kept",
+        "session-state.json.kept.1",
+        "session-state.json.kept.2",
+        "session-state.json.kept.3",
+        "session-state.json.kept.4",
+    };
+    for (slots) |name| try tmp.dir.writeFile(.{ .sub_path = name, .data = name });
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "current" });
+    const source = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expectError(
+        error.QuarantineFull,
+        quarantineFileAlloc(std.testing.allocator, source, ".kept", .keep_source),
+    );
+    const current = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 64);
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqualStrings("current", current);
+    for (slots) |name| {
+        const kept = try tmp.dir.readFileAlloc(std.testing.allocator, name, 64);
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqualStrings(name, kept);
+    }
+
+    // With a slot free again, it moves there.
+    try tmp.dir.deleteFile("session-state.json.kept.3");
+    const destination = try quarantineFileAlloc(std.testing.allocator, source, ".kept", .keep_source);
+    defer std.testing.allocator.free(destination);
+    try std.testing.expect(std.mem.endsWith(u8, destination, ".kept.3"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
 }
 
 test "win32 session persistence atomic write removes temp after replace failure" {
