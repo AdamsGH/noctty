@@ -22,6 +22,27 @@ pub const DocumentWindow = struct {
     bottom: u32 = 0,
 };
 
+/// Provenance for absolute row numbers, independent of viewport and output
+/// appended without pruning. Resize, screen switch and history prune differ.
+pub const RowNumbering = struct {
+    active_key: u64,
+    page_serial_min: u64,
+    first_page_serial: u64,
+    rows: u32,
+    columns: u32,
+};
+
+pub fn rowNumbering(state: *const terminal.Terminal) RowNumbering {
+    const pages = &state.screens.active.pages;
+    return .{
+        .active_key = @intFromEnum(state.screens.active_key),
+        .page_serial_min = pages.page_serial_min,
+        .first_page_serial = pages.pages.first.?.serial,
+        .rows = pages.rows,
+        .columns = pages.cols,
+    };
+}
+
 /// Bounded, pointer-free document snapshot for UIA. Rows before the viewport
 /// use negative coordinates; rows inside the viewport start at zero.
 pub const AccessibleTextSnapshot = struct {
@@ -37,6 +58,7 @@ pub const AccessibleTextSnapshot = struct {
     scroll_token: ?u64 = null,
     viewport_y: usize = 0,
     document_window: DocumentWindow = .{},
+    row_numbering: ?RowNumbering = null,
 
     pub fn deinit(self: *AccessibleTextSnapshot) void {
         self.alloc.free(self.cell_for_byte);
@@ -238,6 +260,7 @@ fn snapshotDocumentWindow(
         .scroll_token = hash.final(),
         .viewport_y = viewport_screen.screen.y,
         .document_window = document_window,
+        .row_numbering = rowNumbering(terminal_state),
     };
 }
 

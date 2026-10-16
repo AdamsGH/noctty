@@ -208,6 +208,7 @@ pub const TerminalState = struct {
         range: terminal_text.OffsetRange,
     ) anyerror!void = null,
     scroll_range: ?*const fn (*anyopaque, ScrollRequest) anyerror!void = null,
+    current_viewport: ?*const fn (*anyopaque) anyerror!?TerminalViewportGeometry = null,
 };
 
 /// Pointer-free request. The UI thread validates the frozen document token
@@ -238,9 +239,20 @@ pub const TerminalRangeGeometry = struct {
     scroll_token: ?u64 = null,
     viewport_y: usize = 0,
     document_window: terminal_text.DocumentWindow = .{},
+    row_numbering: ?terminal_text.RowNumbering = null,
     cell_for_byte: []terminal_text.TerminalCellPosition,
     viewport_rows: u32,
     viewport_columns: u32,
+    cell_width: f64,
+    cell_height: f64,
+    origin_x: f64,
+    origin_y: f64,
+};
+
+/// Compact live geometry; querying it never copies the frozen document/map.
+pub const TerminalViewportGeometry = struct {
+    row_numbering: terminal_text.RowNumbering,
+    viewport_y: usize,
     cell_width: f64,
     cell_height: f64,
     origin_x: f64,
@@ -4081,10 +4093,32 @@ const TerminalTextRangeProvider = struct {
         const self = fromBase(self_base);
         out.* = null;
         if (self.parent.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        const geometry = self.geometry orelse {
+        var geometry = self.geometry orelse {
             out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
             return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
         };
+        var row_shift: i64 = 0;
+        if (self.parent.state.current_viewport) |current_viewport| {
+            const current = current_viewport(self.parent.state.ctx) catch |err| {
+                if (err == error.ElementNotAvailable) return com.UIA_E_ELEMENTNOTAVAILABLE;
+                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+            };
+            if (current == null or geometry.row_numbering == null or
+                !std.meta.eql(geometry.row_numbering.?, current.?.row_numbering))
+            {
+                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+            }
+            const live = current.?;
+            row_shift = @as(i64, @intCast(geometry.viewport_y)) - @as(i64, @intCast(live.viewport_y));
+            geometry.viewport_rows = live.row_numbering.rows;
+            geometry.viewport_columns = live.row_numbering.columns;
+            geometry.cell_width = live.cell_width;
+            geometry.cell_height = live.cell_height;
+            geometry.origin_x = live.origin_x;
+            geometry.origin_y = live.origin_y;
+        }
         var screen_origin: POINT = .{ .x = 0, .y = 0 };
         if (ClientToScreen(self.parent.hwnd, &screen_origin) == 0) {
             out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
@@ -4098,6 +4132,7 @@ const TerminalTextRangeProvider = struct {
             self.text,
             self.range,
             geometry,
+            row_shift,
             screen_origin,
             values,
         );
@@ -4483,6 +4518,7 @@ fn terminalGridRectangleValues(
     text: []const u8,
     range: terminal_text.OffsetRange,
     geometry: TerminalRangeGeometry,
+    row_shift: i64,
     screen_origin: POINT,
     values: []f64,
 ) usize {
@@ -4499,14 +4535,16 @@ fn terminalGridRectangleValues(
     var min_column: u32 = 0;
     var max_column: u32 = 0;
     for (geometry.cell_for_byte[normalized.start..normalized.end]) |cell| {
-        if (cell.width == 0 or cell.row < 0 or cell.row >= @as(i32, @intCast(geometry.viewport_rows))) continue;
-        if (active_row == null or active_row.? != cell.row) {
+        const shifted_row = @as(i64, cell.row) + row_shift;
+        if (cell.width == 0 or shifted_row < 0 or shifted_row >= geometry.viewport_rows) continue;
+        const cell_row: i32 = @intCast(shifted_row);
+        if (active_row == null or active_row.? != cell_row) {
             if (active_row) |row| {
                 if (written + 4 > values.len) break;
                 writeGridRectangle(values[written..][0..4], screen_origin, geometry, row, min_column, max_column);
                 written += 4;
             }
-            active_row = cell.row;
+            active_row = cell_row;
             min_column = cell.column;
             max_column = cell.column + cell.width;
         } else {
@@ -6227,6 +6265,7 @@ test "terminal text range geometry returns screen rectangles for affected lines"
         text,
         .{ .start = 6, .end = 11 },
         geometry,
+        0,
         .{ .x = 10, .y = 20 },
         &values,
     );
@@ -6238,7 +6277,7 @@ test "terminal text range geometry returns screen rectangles for affected lines"
     try std.testing.expectEqual(@as(f64, 16), values[3]);
     try std.testing.expectEqual(
         @as(usize, 0),
-        terminalGridRectangleValues(text, .{ .start = 6, .end = 6 }, geometry, .{ .x = 10, .y = 20 }, &values),
+        terminalGridRectangleValues(text, .{ .start = 6, .end = 6 }, geometry, 0, .{ .x = 10, .y = 20 }, &values),
     );
 }
 
@@ -6882,6 +6921,138 @@ test "retained terminal range rejects queries after provider detach" {
         TerminalTextRangeProvider.GetChildren(&range.base, &children),
     );
     try std.testing.expect(children == null);
+}
+
+test "PKG71 held range rectangles follow scrolling wheel motion and current metrics" {
+    const win32 = @import("../win32/sys.zig");
+    const hwnd = win32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 100, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = win32.DestroyWindow(hwnd);
+    const Hook = struct {
+        viewport_y: usize = 100,
+        cell_width: f64 = 8,
+        cell_height: f64 = 16,
+        origin_x: f64 = 4,
+        origin_y: f64 = 6,
+        numbering: terminal_text.RowNumbering = .{ .active_key = 0, .page_serial_min = 1, .first_page_serial = 1, .rows = 3, .columns = 10 },
+        available: bool = true,
+        snapshot_calls: usize = 0,
+        fn name(_: *anyopaque, _: []u8) []const u8 {
+            return "terminal";
+        }
+        fn value(_: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            return alloc.dupe(u8, "a");
+        }
+        fn focused(_: *anyopaque) bool {
+            return true;
+        }
+        fn scroll(ctx: *anyopaque, request: ScrollRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.viewport_y = request.absolute_row - if (request.align_to_top) @as(usize, 0) else 2;
+        }
+        fn snapshot(ctx: *anyopaque, _: std.mem.Allocator) !TerminalSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.snapshot_calls += 1;
+            return error.UnexpectedSnapshotCopy;
+        }
+        fn viewport(ctx: *anyopaque) !?TerminalViewportGeometry {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.available) return null;
+            return .{
+                .row_numbering = self.numbering,
+                .viewport_y = self.viewport_y,
+                .cell_width = self.cell_width,
+                .cell_height = self.cell_height,
+                .origin_x = self.origin_x,
+                .origin_y = self.origin_y,
+            };
+        }
+        fn expectBounds(range: *com.ITextRangeProvider, expected_y: f64, expected_width: f64, expected_height: f64) !void {
+            var rects: ?*com.SAFEARRAY = null;
+            try std.testing.expectEqual(com.S_OK, range.vtbl.GetBoundingRectangles(range, &rects));
+            defer if (rects) |array| {
+                _ = com.SafeArrayDestroy(array);
+            };
+            var upper: i32 = -1;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetUBound(rects.?, 1, &upper));
+            try std.testing.expectEqual(@as(i32, 3), upper);
+            var y_index: i32 = 1;
+            var actual: f64 = 0;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(rects.?, &y_index, &actual));
+            try std.testing.expectEqual(expected_y, actual);
+            var width_index: i32 = 2;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(rects.?, &width_index, &actual));
+            try std.testing.expectEqual(expected_width, actual);
+            var height_index: i32 = 3;
+            try std.testing.expectEqual(com.S_OK, com.SafeArrayGetElement(rects.?, &height_index, &actual));
+            try std.testing.expectEqual(expected_height, actual);
+        }
+    };
+    var ctx = Hook{};
+    const provider = try TerminalProvider.create(std.testing.allocator, hwnd, .{ .ctx = &ctx, .name = Hook.name, .value = Hook.value, .focused = Hook.focused, .snapshot = Hook.snapshot, .scroll_range = Hook.scroll, .current_viewport = Hook.viewport });
+    defer _ = TerminalProvider.Release(&provider.base);
+    const cells = try std.testing.allocator.alloc(terminal_text.TerminalCellPosition, 1);
+    cells[0] = .{ .row = -2, .column = 0, .width = 1 };
+    const range = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "a"), .{ .start = 0, .end = 1 }, .{
+        .cell_for_byte = cells,
+        .scroll_token = 7,
+        .viewport_y = 100,
+        .document_window = .{ .top = 98, .bottom = 102 },
+        .row_numbering = ctx.numbering,
+        .viewport_rows = 3,
+        .viewport_columns = 10,
+        .cell_width = 8,
+        .cell_height = 16,
+        .origin_x = 4,
+        .origin_y = 6,
+    });
+    defer _ = TerminalTextRangeProvider.Release(&range.base);
+    var origin: POINT = .{ .x = 0, .y = 0 };
+    try std.testing.expect(ClientToScreen(hwnd, &origin) != 0);
+    const screen_y: f64 = @floatFromInt(origin.y);
+    try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 1));
+    try Hook.expectBounds(&range.base, screen_y + 6, 8, 16);
+    try std.testing.expectEqual(com.S_OK, range.base.vtbl.ScrollIntoView(&range.base, 0));
+    try Hook.expectBounds(&range.base, screen_y + 38, 8, 16);
+    ctx.viewport_y = 97;
+    ctx.cell_width = 10;
+    ctx.cell_height = 20;
+    ctx.origin_y = 9;
+    try Hook.expectBounds(&range.base, screen_y + 29, 10, 20);
+    try std.testing.expectEqual(@as(usize, 0), ctx.snapshot_calls);
+    // Contention/unavailable geometry and every renumbering cause refuse old
+    // rectangles rather than returning coordinates from another document.
+    const numbering = ctx.numbering;
+    for (0..6) |cause| {
+        ctx.numbering = numbering;
+        ctx.available = true;
+        switch (cause) {
+            0 => ctx.available = false,
+            1 => ctx.numbering.active_key += 1,
+            2 => ctx.numbering.page_serial_min += 1,
+            3 => ctx.numbering.first_page_serial += 1,
+            4 => ctx.numbering.rows += 1,
+            5 => ctx.numbering.columns += 1,
+            else => unreachable,
+        }
+        var rects: ?*com.SAFEARRAY = null;
+        try std.testing.expectEqual(com.S_OK, range.base.vtbl.GetBoundingRectangles(&range.base, &rects));
+        defer _ = com.SafeArrayDestroy(rects.?);
+        var upper: i32 = 0;
+        try std.testing.expectEqual(com.S_OK, com.SafeArrayGetUBound(rects.?, 1, &upper));
+        try std.testing.expectEqual(@as(i32, -1), upper);
+    }
+    // A captured visible row must also move away from its old on-screen y.
+    ctx = Hook{};
+    const visible_cells = try std.testing.allocator.alloc(terminal_text.TerminalCellPosition, 1);
+    visible_cells[0] = .{ .row = 1, .column = 0, .width = 1 };
+    var visible_geometry = range.geometry.?;
+    visible_geometry.cell_for_byte = visible_cells;
+    const visible = try TerminalTextRangeProvider.createOwnedWithGeometry(std.testing.allocator, provider, try std.testing.allocator.dupe(u8, "a"), .{ .start = 0, .end = 1 }, visible_geometry);
+    defer _ = TerminalTextRangeProvider.Release(&visible.base);
+    try Hook.expectBounds(&visible.base, screen_y + 22, 8, 16);
+    try std.testing.expectEqual(com.S_OK, visible.base.vtbl.ScrollIntoView(&visible.base, 1));
+    try Hook.expectBounds(&visible.base, screen_y + 6, 8, 16);
+    try std.testing.expectEqual(com.UIA_E_INVALIDOPERATION, range.base.vtbl.Select(&range.base));
 }
 
 test "PKG71 ScrollIntoView dispatches frozen endpoint and alignment without selecting" {

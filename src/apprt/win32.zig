@@ -34966,7 +34966,15 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
             if (surface) |v| {
                 v.drainTerminalAccessibilityOutput();
                 if (v.terminal_accessibility) |session| {
-                    if (wParam == 2) session.handleScroll() else session.handleQueryRefresh(wParam != 0);
+                    if (wParam == 2) {
+                        session.handleScroll();
+                        return 1;
+                    }
+                    if (wParam == 3) {
+                        session.handleViewportRefresh();
+                        return 1;
+                    }
+                    session.handleQueryRefresh(wParam != 0);
                 }
             }
             return 0;
@@ -35448,6 +35456,25 @@ fn terminalAccessibilityCapture(
         .cell_height = @floatFromInt(renderer_size.cell.height),
         .origin_x = @floatFromInt(renderer_size.padding.left),
         .origin_y = @floatFromInt(renderer_size.padding.top),
+    };
+}
+
+fn terminalAccessibilityViewport(ctx: *anyopaque) !win32_uia.widgets.TerminalViewportGeometry {
+    const surface: *Surface = @ptrCast(@alignCast(ctx));
+    if (!surface.core_initialized) return error.ElementNotAvailable;
+    const core = &surface.core_surface;
+    if (!core.renderer_state.mutex.tryLock()) return error.WouldBlock;
+    defer core.renderer_state.mutex.unlock();
+    const state = core.renderer_state.terminal;
+    const pages = &state.screens.active.pages;
+    const viewport = pages.pointFromPin(.screen, pages.getTopLeft(.viewport)) orelse return error.UnknownPoint;
+    return .{
+        .row_numbering = @import("win32_uia/text.zig").rowNumbering(state),
+        .viewport_y = viewport.screen.y,
+        .cell_width = @floatFromInt(core.size.cell.width),
+        .cell_height = @floatFromInt(core.size.cell.height),
+        .origin_x = @floatFromInt(core.size.padding.left),
+        .origin_y = @floatFromInt(core.size.padding.top),
     };
 }
 
@@ -37025,6 +37052,7 @@ pub const Surface = struct {
                     .focused = terminalAccessibilityFocused,
                     .capture = terminalAccessibilityCapture,
                     .scroll = terminalAccessibilityScroll,
+                    .viewport = terminalAccessibilityViewport,
                     .defer_provider_release = terminalAccessibilityDeferProviderRelease,
                 },
                 c.WM_WINHOSTTY_UIA_QUERY_REFRESH,
