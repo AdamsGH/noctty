@@ -523,10 +523,6 @@ pub const TerminalAccessibilitySession = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.cached_scroll_token = snapshot.scroll_token;
-        self.cached_viewport_y = snapshot.viewport_y;
-        self.cached_document_window = snapshot.document_window;
-        self.cached_row_numbering = snapshot.row_numbering;
         if (!self.attached) {
             self.alloc.free(cells);
             self.alloc.free(text);
@@ -550,11 +546,19 @@ pub const TerminalAccessibilitySession = struct {
             self.origin_x == capture.origin_x and
             self.origin_y == capture.origin_y and
             cellsEqual(self.cached_cells, cells);
+        const announcement = if (speech_mode == .emit)
+            try self.takePendingAnnouncement()
+        else
+            null;
+        errdefer if (announcement) |value| self.alloc.free(value);
+
+        // Publish provenance only after the last fallible allocation, with
+        // the matching text/cells (or an unchanged equivalent) below.
+        self.cached_scroll_token = snapshot.scroll_token;
+        self.cached_viewport_y = snapshot.viewport_y;
+        self.cached_document_window = snapshot.document_window;
+        self.cached_row_numbering = snapshot.row_numbering;
         if (unchanged) {
-            const announcement = if (speech_mode == .emit)
-                try self.takePendingAnnouncement()
-            else
-                null;
             self.alloc.free(cells);
             self.alloc.free(text);
             if (update_refresh_time) self.last_refresh_ms = sys.GetTickCount64();
@@ -564,12 +568,6 @@ pub const TerminalAccessibilitySession = struct {
                 .announcement_pending = self.hasPendingAnnouncement(),
             };
         }
-
-        const announcement = if (speech_mode == .emit)
-            try self.takePendingAnnouncement()
-        else
-            null;
-        errdefer if (announcement) |value| self.alloc.free(value);
 
         self.alloc.free(self.cached_cells);
         self.alloc.free(self.cached_text);
@@ -1383,6 +1381,68 @@ test "terminal snapshot does not allocate a second visible text copy" {
     defer if (snapshot.geometry) |geometry| alloc.free(geometry.cell_for_byte);
     const geometry_bytes = snapshot.geometry.?.cell_for_byte.len * @sizeOf(win32_uia.TerminalCellPosition);
     try std.testing.expectEqual(snapshot.document_text.len + geometry_bytes, counted.allocated_bytes);
+}
+
+test "PKG71 announcement OOM preserves coherent cached scroll geometry" {
+    const Hook = struct {
+        context: MutableTestOps.Context = .{ .focused = true, .text = "old" },
+        failing: *std.testing.FailingAllocator,
+        token: u64 = 1,
+        fail_announcement: bool = false,
+
+        fn capture(raw: *anyopaque, alloc: Allocator) !Capture {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result = try MutableTestOps.capture(@ptrCast(&self.context), alloc);
+            result.snapshot.scroll_token = self.token;
+            result.snapshot.viewport_y = @intCast(self.token);
+            result.snapshot.document_window = .{ .top = @intCast(self.token), .bottom = @intCast(self.token + 2) };
+            result.snapshot.row_numbering = .{
+                .active_key = 0,
+                .page_serial_min = 1,
+                .first_page_serial = 1,
+                .row_generation = self.token,
+                .rows = 3,
+                .columns = 10,
+            };
+            // Fail the next allocation after a successful capture, regardless
+            // of how many allocations capture needed.
+            if (self.fail_announcement)
+                self.failing.fail_index = self.failing.alloc_index;
+            return result;
+        }
+    };
+    for ([_]bool{ false, true }) |change_text| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var hook: Hook = .{ .failing = &failing };
+        var ops = TestOps.ops(@ptrCast(&hook));
+        ops.capture = Hook.capture;
+        const session = try TerminalAccessibilitySession.create(failing.allocator(), ops, 0, 0);
+        defer session.deinit();
+        _ = try session.refresh(.discard, false);
+        const old_window = session.cached_document_window;
+        const old_numbering = session.cached_row_numbering;
+        session.enqueuePendingAnnouncements("notice");
+        hook.token = 2;
+        if (change_text) hook.context.text = "new";
+        hook.fail_announcement = true;
+        try std.testing.expectError(error.OutOfMemory, session.refresh(.emit, false));
+        try std.testing.expectEqualStrings("old", session.cached_text);
+        try std.testing.expectEqual(@as(?u64, 1), session.cached_scroll_token);
+        try std.testing.expectEqual(@as(usize, 1), session.cached_viewport_y);
+        try std.testing.expectEqualDeep(old_window, session.cached_document_window);
+        try std.testing.expectEqualDeep(old_numbering, session.cached_row_numbering);
+        try std.testing.expectEqual(@as(usize, 1), session.pending_announcement_count);
+
+        hook.fail_announcement = false;
+        failing.fail_index = std.math.maxInt(usize);
+        const refreshed = try session.refresh(.emit, false);
+        defer if (refreshed.announcement) |value| failing.allocator().free(value);
+        try std.testing.expectEqualStrings(if (change_text) "new" else "old", session.cached_text);
+        try std.testing.expectEqual(@as(?u64, 2), session.cached_scroll_token);
+        try std.testing.expectEqual(@as(usize, 2), session.cached_viewport_y);
+        try std.testing.expectEqual(@as(u64, 2), session.cached_row_numbering.?.row_generation);
+        try std.testing.expectEqualStrings("notice", refreshed.announcement.?);
+    }
 }
 
 test "terminal output announcements are readable bounded increments" {
