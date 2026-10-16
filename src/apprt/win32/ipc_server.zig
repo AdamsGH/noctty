@@ -2786,6 +2786,159 @@ test "security regression win32 IPC server claims the first pipe instance" {
     );
 }
 
+/// An App holding only the state `startIpcServer` and `stopIpcServer` read,
+/// serving a pipe namespace unique to this process and server. No request in
+/// these tests reaches the core mailbox, so `core_app` carries only the
+/// allocator. Keep the value in place once started: `app` points into it.
+const TestIpcServer = struct {
+    var next_id: std.atomic.Value(u32) = .init(0);
+
+    core_app: CoreApp = undefined,
+    app: App = undefined,
+    class_buf: [96:0]u8 = undefined,
+
+    fn start(self: *TestIpcServer) !void {
+        const alloc = std.testing.allocator;
+        self.core_app.alloc = alloc;
+        self.app.core_app = &self.core_app;
+        self.app.config = try configpkg.Config.default(alloc);
+        errdefer self.app.config.deinit();
+        self.app.config.@"single-instance" = .true;
+        self.app.config.class = try std.fmt.bufPrintZ(
+            &self.class_buf,
+            "noctty-test-pkg67-{d}-{d}",
+            .{ sys.GetCurrentProcessId(), next_id.fetchAdd(1, .monotonic) },
+        );
+        self.app.is_elevated = false;
+        self.app.ipc_pipe_name = null;
+        self.app.ipc_namespace = null;
+        self.app.ipc_thread = null;
+        self.app.ipc_stop_requested = .init(false);
+        try std.testing.expect(!try startIpcServer(&self.app));
+        try std.testing.expect(self.app.ipc_thread != null);
+    }
+
+    fn stop(self: *TestIpcServer) void {
+        stopIpcServer(&self.app);
+        self.app.config.deinit();
+    }
+
+    fn connect(self: *TestIpcServer) !windows.HANDLE {
+        return connectToIpcPipe(std.testing.allocator, self.app.ipc_pipe_name.?, false);
+    }
+};
+
+extern "kernel32" fn QueryThreadCycleTime(thread: windows.HANDLE, cycles: *u64) callconv(.winapi) BOOL;
+extern "kernel32" fn GetProcessHandleCount(process: windows.HANDLE, count: *u32) callconv(.winapi) BOOL;
+
+fn testThreadCycles(thread: windows.HANDLE) !u64 {
+    var cycles: u64 = 0;
+    if (QueryThreadCycleTime(thread, &cycles) == 0) return error.TestUnexpectedResult;
+    return cycles;
+}
+
+fn testProcessHandleCount() !u32 {
+    var count: u32 = 0;
+    if (GetProcessHandleCount(windows.kernel32.GetCurrentProcess(), &count) == 0) {
+        return error.TestUnexpectedResult;
+    }
+    return count;
+}
+
+test "win32 IPC server thread does not run while it waits for a client" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var server: TestIpcServer = .{};
+    try server.start();
+    defer server.stop();
+    const thread = server.app.ipc_thread.?.getHandle();
+
+    // A thread blocked in a wait accrues no cycles. Let the server reach its
+    // wait first; a server that polls never settles.
+    var cycles = try testThreadCycles(thread);
+    var settled = false;
+    for (0..40) |_| {
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        const now = try testThreadCycles(thread);
+        if (now == cycles) {
+            settled = true;
+            break;
+        }
+        cycles = now;
+    }
+    try std.testing.expect(settled);
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    try std.testing.expectEqual(cycles, try testThreadCycles(thread));
+}
+
+test "win32 IPC server serves the next client after one leaves unserved" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var server: TestIpcServer = .{};
+    try server.start();
+    defer server.stop();
+
+    // A client that connects and leaves before the server picks it up must
+    // not leave the server waiting on that dead instance.
+    const gone = windows.kernel32.CreateFileW(
+        server.app.ipc_pipe_name.?.ptr,
+        windows.GENERIC_READ | windows.GENERIC_WRITE,
+        0,
+        null,
+        windows.OPEN_EXISTING,
+        win32_ipc.client_pipe_open_flags,
+        null,
+    );
+    try std.testing.expect(gone != windows.INVALID_HANDLE_VALUE);
+    _ = windows.CloseHandle(gone);
+
+    // The next client is served: a request with a bad wire version is
+    // answered with a failure ack before anything reaches the mailbox.
+    const client = try server.connect();
+    defer _ = windows.CloseHandle(client);
+    try win32_ipc.writeAll(client, &.{ 0, 0, 0, 0, 1 });
+    try std.testing.expectError(error.IPCFailed, win32_ipc.readAck(client));
+}
+
+test "win32 IPC server stops promptly while a client holds a request open" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var server: TestIpcServer = .{};
+    try server.start();
+    var stopped = false;
+    defer if (!stopped) server.stop();
+
+    // The client connects and sends nothing, so the server is waiting for
+    // the request's first bytes when it is asked to stop.
+    const client = try server.connect();
+    defer _ = windows.CloseHandle(client);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    const started = sys.GetTickCount64();
+    server.stop();
+    stopped = true;
+    try std.testing.expect(sys.GetTickCount64() - started < 750);
+}
+
+test "win32 IPC server start and stop cycles leak no handles" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // The first cycle loads whatever the pipe and token APIs keep open for
+    // the life of the process.
+    {
+        var server: TestIpcServer = .{};
+        try server.start();
+        server.stop();
+    }
+    const before = try testProcessHandleCount();
+    for (0..50) |_| {
+        var server: TestIpcServer = .{};
+        try server.start();
+        server.stop();
+    }
+    try std.testing.expectEqual(before, try testProcessHandleCount());
+}
+
 test "win32 launch-layout IPC argument scan isolates the layout name" {
     const launch = try scanLaunchLayoutIpcArgument(&.{"--launch-layout=Project Alpha"});
     try std.testing.expectEqualStrings("Project Alpha", launch.name);
