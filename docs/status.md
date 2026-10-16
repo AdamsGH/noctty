@@ -101,9 +101,10 @@ Win32-validated VT protocol coverage is tracked in
   on Windows 11 while the tab bar and decorations are visible
   (`window-show-tab-bar = never` and older builds keep the stock caption).
   On Windows 11, `window-decoration = none` keeps the system frame with no
-  caption (resize edges, shadow, Alt+Space menu) and the window can be dragged
-  by its tab strip; that frame was measured with posted messages on a hidden
-  desktop, not with a real right-click or drag.
+  caption (resize edges, shadow, Alt+Space menu), and while the tab bar is
+  shown the window can be dragged by its tab strip. The drag and the window
+  menu were measured with posted messages on a hidden desktop, not with real
+  mouse input.
 - The tab strip follows the Windows accent colour by default
   (`accent-follow-system`); the rest of the chrome keeps its fixed palette.
 - High-contrast mode detection and palette switching.
@@ -137,8 +138,8 @@ Win32-validated VT protocol coverage is tracked in
   `notify-on-command-finish` and a `notify` action. Command-finish and
   program status ([OSC 7501](windows.md#program-status-osc-7501)) toasts focus
   the originating pane when clicked; OSC 9 / OSC 777 toasts are display-only.
-  Command-finish toasts depend on OSC 133 command marks, which `cmd.exe` does
-  not supply.
+  Command-finish toasts depend on OSC 133 command marks, which plain
+  `cmd.exe` does not supply (Clink with the shipped script does).
 - Taskbar progress for the active pane in each host window, driven by
   terminal progress reports when `progress-style` is enabled.
 - Program status ([OSC 7501](windows.md#program-status-osc-7501)): a program
@@ -155,8 +156,10 @@ Win32-validated VT protocol coverage is tracked in
   working directories, and titles, then launch it in a new window from a
   keybind, the universal palette, or `+new-window --launch-layout=<name>`.
 - Ctrl-based default keybindings, mostly shared with Ghostty's non-macOS
-  defaults. Windows-specific exceptions include `Alt+Arrow` pane focus and
-  `Alt+F4` to close the window.
+  defaults. Windows-specific exceptions include `Alt+Arrow` pane focus,
+  `Alt+F4` to close the window, `F11` for fullscreen, `Ctrl+Shift+Z` and
+  `Ctrl+Shift+Y` for undo and redo, and `Ctrl+F6` for the focus-region cycle
+  (a bare `F6` and `Ctrl+Enter` go to the program).
 - `key-remap` applies to focused and in-app keybinds and to terminal
   encoding, but not to `global:` hotkeys, which register the literal chord.
 - Native settings window (Appearance, Terminal, Shell, Privacy, Updates,
@@ -173,8 +176,8 @@ Win32-validated VT protocol coverage is tracked in
 - Quick select (`Ctrl+Shift+Space`) labels URL, path, git SHA, IP address,
   and UUID matches in the visible viewport for keyboard copy, allowed-scheme
   or local-path open, or protected paste. Paths include drive, `.\` and `..\`
-  forms with an optional `:line:col` suffix, which is recognized but does not
-  open the file at that line; UNC shares are recognized, copied and never
+  forms with an optional `:line:col` or `(line,col)` suffix, which is
+  recognized but does not open the file at that line; UNC shares are recognized, copied and never
   opened.
 - Copy mode (`Ctrl+Shift+X`): modal vi-style selection and scrollback
   navigation, with keyboard copy/cancel and no PTY input leakage.
@@ -204,8 +207,8 @@ Win32-validated VT protocol coverage is tracked in
   [D3D11 renderer beta](windows.md#d3d11-renderer-beta).
 - Window chrome is painted with GDI. The D3D11/DirectComposition +
   DirectWrite shell pipeline is not started at launch (its device graph cost
-  about 156 ms to first swap and 79 driver threads for banner text alone,
-  measured 2026-10-11 on the dev machine, #329 and
+  about 156 ms to first swap and 79 driver threads for banner text alone; a
+  noisy dev-machine measurement for #329, merged 2026-10-11, recorded in
   [ADR 0002](adr/0002-use-directcomposition-shell-with-retained-opengl-terminal.md));
   it never touches the terminal renderer.
 - Presentation is power- and visibility-aware: focused non-saver cadence is
@@ -234,9 +237,9 @@ Win32-validated VT protocol coverage is tracked in
 
 - WinGet package id: `AmanThanvi.noctty` (published; `winget install --id AmanThanvi.noctty -e`).
 - Chocolatey package id: `noctty` (the release workflow builds it, but its
-  publish step is skipped while no `CHOCO_API_KEY` secret is configured, as
-  in 1.3.132; community.chocolatey.org had no `noctty` package on
-  2026-10-16).
+  publish script skips the push while no `CHOCO_API_KEY` secret is
+  configured, as in 1.3.132; community.chocolatey.org had no `noctty` package
+  on 2026-10-16).
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
 
 ### Crash reports
@@ -267,8 +270,7 @@ picker without package identity, and it implements no `IConsoleHandoff`, so
 Windows Terminal must stay selected as the console half. A handoff is served
 by a separate `-Embedding` noctty process that opens its own window and has
 no single-instance IPC, jump list or global hotkeys; it never reaches the
-noctty you already have open, and a console at a different integrity level
-(an elevated one) is refused. Details in
+noctty you already have open, and elevated consoles were not verified. Details in
 [windows.md](windows.md#default-terminal).
 
 ### Windows UI Automation (accessibility)
@@ -287,8 +289,9 @@ that bounded snapshot, and real selections. In deeper scrollback the
 viewport remains available, but the off-window live caret is reported at
 the document end. A text range's `ScrollIntoView` scrolls the terminal, and
 each closable tab has a "Close tab" Button child; both are covered by unit
-tests, and neither the interactive UI Automation harness nor the
-screen-reader matrix exercises them yet (#394).
+tests (and a one-off UI Automation client run recorded in #394), and neither
+the interactive UI Automation harness nor the screen-reader matrix exercises
+them.
 
 Not yet covered: the profile picker and tab-overview overlay rows, context
 menus, toasts, the tab drag preview, and quick-terminal chrome. `Ctrl+F6` and
@@ -364,6 +367,12 @@ lands incrementally.
 - Direct3D 11 beta: physical GPU reset, monitor hotplug, real DPI changes and
   Remote Desktop were not measured, and its visible-desktop check used posted
   messages, not real input (#303).
+- Alt+Space still sends ESC SPACE to the program as well as opening the
+  window menu (#381). Once conhost has seen a Win32 input record it holds a
+  lone ESC back until more input arrives, as under Windows Terminal (#335).
+- A Japanese IME commit of 【】 freezes input in a `wslc exec -it` session
+  (#395); reading wslc's source points at `wslc.exe` itself, not noctty (not
+  reproduced with a real IME or container).
 - Power- and visibility-aware render pacing has not been exercised on a
   machine with a battery (forced saver pacing, `power-saver-rendering = on`,
   has been measured, #297), and the DWM cloak/uncloak WinEvent path has not
