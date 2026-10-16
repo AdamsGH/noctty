@@ -817,7 +817,7 @@ if ($ConfiguredScenariosOnly) {
         -Name 'quoted' `
         -ConfigPath $quotedConfigPath `
         -ExpectedText @('CONFIG_QUOTED_A', 'CONFIG_QUOTED_B') `
-        -RejectedText @('Ghostty failed to launch the requested command:') `
+        -RejectedText @('noctty failed to launch the requested command:') `
         -CapturePath $quotedCapturePath `
         -StdoutPath $quotedStdoutPath `
         -StderrPath $quotedStderrPath
@@ -826,7 +826,7 @@ if ($ConfiguredScenariosOnly) {
         -Name 'abnormal' `
         -ConfigPath $abnormalConfigPath `
         -ExpectedText @(
-            'Ghostty failed to launch the requested command:',
+            'noctty failed to launch the requested command:',
             'cmd.exe /d /c "exit /b 37"',
             'Exit Code: 37',
             'Press any key to close the window.'
