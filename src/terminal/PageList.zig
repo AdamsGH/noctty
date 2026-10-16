@@ -6650,7 +6650,12 @@ test "PageList scroll to row far from both ends of a long scrollback" {
     defer s.deinit();
     try s.growRows(150_000);
 
+    // 70_000 and 66_000 are past 65535 from the top (the forward walk),
+    // 80_000 and the midpoint are past it from the bottom (the backward
+    // walk). Scrolling to the top first keeps each one off the shortcut
+    // a viewport that is already pinned takes, which never reaches either.
     for ([_]usize{ s.total_rows / 2, 70_000, 80_000, 66_000, 100_000 }) |target| {
+        s.scroll(.top);
         s.scroll(.{ .row = target });
         try testing.expect(s.viewport == .pin);
         try testing.expectEqual(Scrollbar{

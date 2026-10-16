@@ -329,6 +329,13 @@ test "termio input files are closed after prepareInput fails part way" {
     try state.input.list.append(arena_alloc, .{ .path = try arena_alloc.dupeZ(u8, first) });
     try state.input.list.append(arena_alloc, .{ .path = try arena_alloc.dupeZ(u8, missing) });
 
+    // Positive control: the probe sees a handle that is open.
+    {
+        const held = try std.fs.openFileAbsolute(first, .{});
+        defer held.close();
+        try testing.expect(try fileHeldOpen(alloc, first));
+    }
+
     try testing.expectError(error.InputNotFound, state.prepareInput());
     try testing.expect(!try fileHeldOpen(alloc, first));
 }
