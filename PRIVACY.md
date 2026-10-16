@@ -145,7 +145,9 @@ dumps, and SSH host cache go there.
   jump list, and the profiles you launched, including SSH host aliases, with
   timestamps. Noctty builds the taskbar jump list from it and from the
   profiles it detects, which can include SSH aliases from your SSH config.
-  Windows keeps its own copy of the jump list.
+  Windows keeps its own copy of the jump list. From 1.3.133 a portable copy
+  builds no jump list and writes no `jump-list-recents.json`; earlier portable
+  copies did both.
 - **Command palette history:** `palette-mru.txt` holds the last 5 commands you
   ran from the command palette, including any arguments you typed.
 - **Updates:** `update-state.json` records when Noctty last checked, the feed
@@ -156,7 +158,8 @@ dumps, and SSH host cache go there.
 - **Startup record:** `startup-attempts.json` holds the times, error codes and
   Noctty version of up to 16 recent launches, and when each began restoring
   the saved session and whether it finished, so Noctty can start in safe mode
-  after repeated failed starts.
+  after repeated failed starts. From 1.3.133 a launch that ended because OpenGL
+  could not start also records when, and does not count toward safe mode.
 - **Crash dumps:** `crash\`, written only when Noctty crashes. A dump is a
   snapshot of parts of Noctty's memory and can include fragments of what was
   on screen, file paths, and other text. `noctty +crash-report` lists them.
@@ -203,8 +206,12 @@ Noctty writes these registry entries:
 - **App identity:**
   `HKCU\Software\Classes\AppUserModelId\io.github.amanthanvi.noctty` holds
   the app's name, the path of its icon, and a flag that lists it in Windows'
-  notification settings. Noctty writes it at every start, including in
-  portable mode.
+  notification settings. An installed Noctty writes it at every start. From
+  1.3.133 a portable copy writes it only if the key does not exist yet (and the
+  copy has its `noctty.ico` beside it), and never changes an existing one;
+  earlier portable copies write it at every start like an installed one. A
+  portable start that is cut off at the wrong moment can leave a
+  `io.github.amanthanvi.noctty.pending-<hex>` key beside it.
 - **Installer:** Start menu (and optional desktop) shortcuts, the "Open noctty
   here" Explorer menu, the default-terminal handoff classes, and its uninstall
   entry. The uninstaller removes them.
@@ -243,7 +250,8 @@ installer created. It does not remove your data. To remove everything:
    folders in the same places too if Noctty is the only program that used
    them.
 3. Delete the registry key
-   `HKCU\Software\Classes\AppUserModelId\io.github.amanthanvi.noctty`.
+   `HKCU\Software\Classes\AppUserModelId\io.github.amanthanvi.noctty`, and
+   any `io.github.amanthanvi.noctty.pending-<hex>` key beside it.
    Windows may also keep Noctty's notification settings under
    `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\io.github.amanthanvi.noctty`.
 4. In the `.terminfo` folder in your home directory, delete

@@ -79,8 +79,13 @@ to four channel levels in the default corrected-linear mode. D3D11 does not
 add per-pixel translucency or custom HLSL effects. Its flip-model swap chain is
 composed through DirectComposition beneath the terminal HWND's children, with
 the existing host/sibling clipping. Framebuffer alpha remains ignored; the host
-still owns whole-window opacity. Overlay ordering, opacity, and visible OpenGL
-handoff require the maintainer desktop check below. GPU loss injection in
+still owns whole-window opacity. While the notice banner is on screen (about
+5 s by default, Windows' notification time), PresentMon on one machine
+(RTX 5070 Ti) showed the pane presented as `Composed: Flip`; the banner is a
+non-layered child over the pane, which the measurement points to as the
+cause. Once it was gone the pane's presents were `Hardware Composed:
+Independent Flip`, whether the overlay scrollbar was shown, hidden or absent. Overlay ordering, opacity,
+and visible OpenGL handoff require the maintainer desktop check below. GPU loss injection in
 the automated harness tests the recovery path, rather than a physical GPU
 reset. Hidden-desktop readback proves rendered pixels, and does not prove DWM
 composition, scanout, unoccluded frame latency, monitor hotplug, or RDP behavior.
@@ -155,7 +160,9 @@ compatibility alias.
 
 A Chocolatey package (`noctty`) is built by the release workflow but has not
 been published yet, so `choco install noctty` does not work today. It will
-after the first push clears chocolatey.org moderation.
+after the first push clears chocolatey.org moderation, which can take weeks;
+until a version is approved, later pushes are refused with `403`. See
+[chocolatey-publishing.md](chocolatey-publishing.md).
 
 [getting-started.md](getting-started.md) covers download and install,
 including the SmartScreen warning. [verify-release.md](verify-release.md)
@@ -427,6 +434,26 @@ notification identity may be less stable. If Windows shows a stale icon
 after upgrading or switching between installed and portable builds, restart
 Explorer or clear the icon cache before assuming the build is broken.
 
+A portable copy uses the same AppUserModelID, so its taskbar button groups
+with an installed noctty. From 1.3.133 it leaves the installed copy's
+per-user state alone. It builds no taskbar jump list, so the list Windows
+keeps for the AppUserModelID stays the installed app's (whose entries start
+the installed `noctty.exe`; inferred from the design, not observed). It
+writes the
+`HKCU\Software\Classes\AppUserModelId\io.github.amanthanvi.noctty`
+registration only when that key does not exist, with the same values an
+installed copy writes (its own `noctty.ico` as the icon). Microsoft documents
+that registration as required for toasts from an unpackaged app without a
+Start menu shortcut; whether a portable copy's toasts then show was not
+confirmed, since `ToastNotifier.Setting` and `Show()` report success with no
+registration at all. It changes an existing key in no way, even a broken
+one; an installed copy rewrites it at every start. A portable copy with no
+`noctty.ico` beside it creates nothing. If the folder that registration
+points at is moved or deleted, toasts lose their icon until an installed copy
+runs. Releases up to 1.3.132 behave like an installed copy here: a portable
+copy replaces the installed app's jump list at every start and repairs a
+missing or broken registration.
+
 The icon in a toast's header comes from the `noctty.ico` next to
 `noctty.exe`; the installer, the portable ZIP, and `zig build` all stage it
 there. Windows does not read the icon out of the executable for toasts, and
@@ -576,6 +603,11 @@ become a window.
   empty list.
 - Profiles: the detected shell profiles. Selecting one launches noctty with
   that profile's command.
+
+From 1.3.133 a portable copy builds no jump list and writes no
+`jump-list-recents.json`, so a machine with only a portable copy gets none;
+it also cannot clear one an earlier copy left, which you remove by
+right-clicking its entries. See [App identity](#app-identity).
 
 ### Explorer context menu
 
@@ -856,8 +888,11 @@ Windows 11 the window keeps its frame otherwise: it resizes from its edges
 and rounded corners, maximizes to the work area, and has the Alt+Space window
 menu. Snap should work through the frame but was not measured. Drag the empty
 part of the tab strip to move the window; double-clicking it maximizes and
-restores, and right-clicking it opens the window menu (measured with posted
-messages on a hidden desktop, not with real mouse input). With
+restores, and right-clicking it opens the window menu. The same right-click
+opens the window menu on the empty caption of the integrated title bar. These
+were checked with real mouse input on Windows 11 build 26300; an earlier
+check with posted messages on a hidden desktop had passed while a real
+right-click on an active window opened nothing. With
 `window-show-tab-bar = never` there is no strip to drag, so move the window
 with Alt+Space, then Move, or with Win+arrow keys (Snap, not measured). On
 Windows 10 the window is frameless: no border, shadow, or resize edges, no
@@ -869,7 +904,14 @@ named layouts, and native settings in one fuzzy-ranked, keyboard-driven
 list. Type a prefix to filter one category: `>` actions, `@` tabs, `/`
 panes, `~` profiles, `:` settings, `%` themes, `!` recent commands, `^`
 layouts, or `?` for help. The native Settings window stages edits until Save
-(or Discard changes) and patches your config without rewriting unrelated text. Details for both
+(or Discard changes, which first asks how many fields would be lost) and
+patches your config without rewriting unrelated text. Its "Open in default
+editor" button, and `noctty +edit-config` when neither `VISUAL` nor `EDITOR`
+is set, open the config through the `.txt` association rather than the
+file's own; they refuse a network, mapped or reparse-point path, Settings
+also still refuses an executable-type extension, and a failure shows in
+Settings' status line (a banner from the app, stderr from the CLI).
+Details for both
 are in the [capability matrix notes](windows-capability-matrix.md#notes).
 
 ## Running elevated

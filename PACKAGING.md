@@ -360,9 +360,16 @@ to `bucket/noctty.json` when `SCOOP_BUCKET_MANIFEST_PATH` is unset.
 - Secret: `CHOCO_API_KEY`
 - Package id: `noctty`
 
-The release workflow always generates the Chocolatey package metadata. It
-skips `choco pack` and `choco push` cleanly when `CHOCO_API_KEY` is absent.
-To publish a generated package manually:
+The release workflow always generates the Chocolatey package metadata, and
+its Chocolatey step runs after Scoop and WinGet, so a refusal there cannot hold
+them back. It skips `choco pack` and `choco push` cleanly when
+`CHOCO_API_KEY` is absent. Until a first version is approved, which can take
+weeks, chocolatey.org refuses further pushes with `403`, and that step fails
+after everything else has published.
+[docs/chocolatey-publishing.md](docs/chocolatey-publishing.md) has the
+maintainer's steps for the first submission and for resubmitting a version
+during moderation; do not rerun a published Release for that. To publish a
+generated package manually:
 
 ```powershell
 choco pack .\noctty.nuspec --output-directory .\out
