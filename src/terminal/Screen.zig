@@ -2818,20 +2818,18 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     // carry the state the cursor had, not the program's, so they neither
     // define the state nor end the line; a shell that sends no preexec mark,
     // such as cmd, otherwise ends the line at the first gap. A click on such
-    // a cell takes the state of the nearest text on its row.
+    // a cell takes the state of the nearest text on its row, the left one
+    // when both are as near.
     const semantic_prompt_state: ?Cell.SemanticContent = state: {
         if (!opts.semantic_prompt_boundary) break :state null;
         const rac = opts.pin.rowAndCell();
         if (rac.cell.hasText()) break :state rac.cell.semantic_content;
 
         const cells = opts.pin.node.data.getCells(rac.row);
-        var x: usize = opts.pin.x;
-        while (x > 0) {
-            x -= 1;
-            if (cells[x].hasText()) break :state cells[x].semantic_content;
-        }
-        for (cells[opts.pin.x + 1 ..]) |cell| {
-            if (cell.hasText()) break :state cell.semantic_content;
+        const x: usize = opts.pin.x;
+        for (1..cells.len) |d| {
+            if (d <= x and cells[x - d].hasText()) break :state cells[x - d].semantic_content;
+            if (x + d < cells.len and cells[x + d].hasText()) break :state cells[x + d].semantic_content;
         }
         break :state rac.cell.semantic_content;
     };
@@ -9336,6 +9334,39 @@ test "Screen: selectLine still ends at a real boundary beyond a gap" {
     {
         var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
             .x = 6,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 5,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 6,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+
+    // A click on the gap takes the state of the nearest text: the output
+    // on its left at column 3, the prompt on its right at column 4.
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 3,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 2,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 4,
             .y = 0,
         } }).? }).?;
         defer sel.deinit(&s);
