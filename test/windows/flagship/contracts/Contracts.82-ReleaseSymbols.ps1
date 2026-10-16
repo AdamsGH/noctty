@@ -129,6 +129,13 @@ Invoke-ContractTable -Contracts @(
         Kind = 'Text'
         Description = 'the handoff proxy DLL''s PDB is installed beside it'
     }
+    @{
+        File = $proxyBuild82
+        Content = { $proxyBuildText82 }
+        Pattern = 'module\.addCMacro\("NOCTTY_RELEASE_SYMBOLS", if \(cfg\.release_symbols\) "1" else "0"\);'
+        Kind = 'Text'
+        Description = 'the handoff proxy (C only, blind to build options) hashes release_symbols, so a DLL linked without /OPT:REF is not reused'
+    }
 )
 
 # Scoop, WinGet and Chocolatey name the setup and portable assets and nothing
