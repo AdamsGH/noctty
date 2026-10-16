@@ -3,7 +3,7 @@
 What works in noctty, what is experimental, and what is out of scope. When
 this page disagrees with a commit message, trust this page.
 
-Last updated: 2026-10-15, against fork `main` at `e6dae0919`.
+Last updated: 2026-10-16, against fork `main` at `e3cd417eb`.
 
 For a row-by-row mapping against official Ghostty docs, including the
 implementation detail this page leaves out, see
@@ -81,7 +81,10 @@ Win32-validated VT protocol coverage is tracked in
   IPC and no elevated session restore. See [Running elevated](windows.md#running-elevated).
 - Structural undo/redo for new splits, single-tab close (restoring the
   exact tab, panes, and layout), and drag-to-split subtree transfers. Tab
-  reorder and multi-tab close modes are not undoable.
+  reorder and multi-tab close modes are not undoable. `clear_screen` and
+  `reset` have a terminal-local undo and redo that restores the screen and
+  the cursor position; with the bundled ConPTY it can leave noctty and
+  ConPTY out of step (see [Known caveats](#known-caveats)).
 - Native right-click context menus.
 - In-app profile picker for detected shells: PowerShell 7, Windows
   PowerShell, `cmd`, Git Bash, and WSL distributions when WSL responds.
@@ -97,6 +100,12 @@ Win32-validated VT protocol coverage is tracked in
   an integrated title bar with native caption actions and Snap Layout hover
   on Windows 11 while the tab bar and decorations are visible
   (`window-show-tab-bar = never` and older builds keep the stock caption).
+  On Windows 11, `window-decoration = none` keeps the system frame with no
+  caption (resize edges, shadow, Alt+Space menu) and the window can be dragged
+  by its tab strip; that frame was measured with posted messages on a hidden
+  desktop, not with a real right-click or drag.
+- The tab strip follows the Windows accent colour by default
+  (`accent-follow-system`); the rest of the chrome keeps its fixed palette.
 - High-contrast mode detection and palette switching.
 - IME for CJK and other composed input.
 - A local sensitive-input indicator for no-echo input. `toggle_secure_input`
@@ -114,7 +123,11 @@ Win32-validated VT protocol coverage is tracked in
   payloads, gated by `clipboard-paste-protection`. HTML copy writes both
   CF_HTML and a plain-text fallback. `clipboard-codepoint-map` applies to
   plain, VT, and HTML selection copies; clipboard reads, URL copies, OSC 52
-  writes, and `write_screen_file` exports are not mapped.
+  writes, and `write_screen_file` exports are not mapped. A program's OSC 52
+  read (`clipboard-read = ask` by default) or write (when
+  `clipboard-write = ask`) raises its own prompt that names the tab; Allow
+  only works half a second after the prompt opens and after the last key
+  press.
 - A configurable quick terminal on an edge or the center of the selected
   monitor. It has no default binding; `global:` keybinds use
   `RegisterHotKey`. `exclusive` keyboard interactivity falls back to focused
@@ -128,10 +141,16 @@ Win32-validated VT protocol coverage is tracked in
   not supply.
 - Taskbar progress for the active pane in each host window, driven by
   terminal progress reports when `progress-style` is enabled.
+- Program status ([OSC 7501](windows.md#program-status-osc-7501)): a program
+  reports idle, working, done, blocked or failed, and tabs show a badge, the
+  taskbar shows progress, and `goto_attention` (no default key) jumps to the
+  most urgent other tab.
 - Session restore via `window-save-state`: windows, tabs, splits, profiles,
   working directories, and explicit titles come back; child processes do
   not. The opt-in `window-save-state-scrollback` line count also restores
-  bounded, clearly marked plain-text pane snapshots.
+  bounded, clearly marked plain-text pane snapshots. Only one noctty process
+  owns `session-state.json`; a second instance, a forwarded launch, `-e` and
+  `--working-directory` launches neither restore nor save it.
 - Named layouts (C17): save the focused window's tabs, splits, profiles,
   working directories, and titles, then launch it in a new window from a
   keybind, the universal palette, or `+new-window --launch-layout=<name>`.
@@ -142,7 +161,9 @@ Win32-validated VT protocol coverage is tracked in
   encoding, but not to `global:` hotkeys, which register the literal chord.
 - Native settings window (Appearance, Terminal, Shell, Privacy, Updates,
   Keybindings, Advanced) that stages edits until Save or Discard changes
-  and patches your config without rewriting unrelated text.
+  and patches your config without rewriting unrelated text. A "Config
+  problems" list (palette row, Settings > Advanced) shows what noctty could
+  not use from the config file.
 - Universal palette: actions, tabs, panes, profiles, named layouts, themes,
   native settings, help, and recent commands in one fuzzy-searched,
   keyboard-driven list.
@@ -151,7 +172,10 @@ Win32-validated VT protocol coverage is tracked in
   [automation.md](automation.md).
 - Quick select (`Ctrl+Shift+Space`) labels URL, path, git SHA, IP address,
   and UUID matches in the visible viewport for keyboard copy, allowed-scheme
-  or local-path open, or protected paste.
+  or local-path open, or protected paste. Paths include drive, `.\` and `..\`
+  forms with an optional `:line:col` suffix, which is recognized but does not
+  open the file at that line; UNC shares are recognized, copied and never
+  opened.
 - Copy mode (`Ctrl+Shift+X`): modal vi-style selection and scrollback
   navigation, with keyboard copy/cancel and no PTY input leakage.
 - Opt-in Job Object limits for Windows-local child processes through the
@@ -180,8 +204,10 @@ Win32-validated VT protocol coverage is tracked in
   [D3D11 renderer beta](windows.md#d3d11-renderer-beta).
 - Window chrome is painted with GDI. The D3D11/DirectComposition +
   DirectWrite shell pipeline is not started at launch (its device graph cost
-  about 156 ms to first swap and 79 driver threads for banner text alone); it
-  never touches the terminal renderer.
+  about 156 ms to first swap and 79 driver threads for banner text alone,
+  measured 2026-10-11 on the dev machine, #329 and
+  [ADR 0002](adr/0002-use-directcomposition-shell-with-retained-opengl-terminal.md));
+  it never touches the terminal renderer.
 - Presentation is power- and visibility-aware: focused non-saver cadence is
   unchanged, unfocused and saver pacing is capped, and minimized or
   DWM-cloaked windows stop presenting. Details and measurement fields are in
@@ -199,23 +225,31 @@ Win32-validated VT protocol coverage is tracked in
   stay on the release-page path. Installer-managed installs launch the verified
   installer; portable installs apply a verified ZIP on the next launch and roll
   back an unconfirmed or failed startup. Applying a staged update is always
-  user-initiated. Details in [windows.md](windows.md#updates).
+  user-initiated, and Install asks first when a terminal still has a running
+  program. The relaunch after an installer-managed Install was checked by
+  unit tests and the installer compile, not on a real install. Details in
+  [windows.md](windows.md#updates).
 
 ### Windows package managers
 
 - WinGet package id: `AmanThanvi.noctty` (published; `winget install --id AmanThanvi.noctty -e`).
-- Chocolatey package id: `noctty` (built by the release workflow; not yet
-  published).
+- Chocolatey package id: `noctty` (the release workflow builds it, but its
+  publish step is skipped while no `CHOCO_API_KEY` secret is configured, as
+  in 1.3.132; community.chocolatey.org had no `noctty` package on
+  2026-10-16).
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
 
 ### Crash reports
 
-- Crash dumps stay local under `%LOCALAPPDATA%\noctty\crash`. There is no
-  automatic upload, and no code path to upload exists in this repo.
+- Crash dumps stay local under `%LOCALAPPDATA%\noctty\crash`. noctty never
+  uploads anything from there, and the Sentry initialization path is a no-op
+  on Windows.
 - `noctty +crash-report` reads whatever is there. Details in
   [windows.md](windows.md#crash-reports-and-diagnostics).
 - Unreadable session state is quarantined, never deleted, and repeated
-  startup failures fall back to safe mode. Details in
+  startup failures fall back to safe mode. A saved session that keeps ending
+  the process during restore is renamed to `session-state.json.restore-failed`
+  instead of being restored again. Details in
   [windows.md](windows.md#session-restore-and-recovery).
 - `+diagnostic-bundle` exports are explicit and redact terminal content,
   environment, and config values by default.
@@ -233,7 +267,8 @@ picker without package identity, and it implements no `IConsoleHandoff`, so
 Windows Terminal must stay selected as the console half. A handoff is served
 by a separate `-Embedding` noctty process that opens its own window and has
 no single-instance IPC, jump list or global hotkeys; it never reaches the
-noctty you already have open, and elevated consoles were not verified. Details in
+noctty you already have open, and a console at a different integrity level
+(an elevated one) is refused. Details in
 [windows.md](windows.md#default-terminal).
 
 ### Windows UI Automation (accessibility)
@@ -250,7 +285,10 @@ text is exposed through TextPattern/TextPattern2 with bounded ranges (up to
 visible geometry, an accurate caret while the live screen remains inside
 that bounded snapshot, and real selections. In deeper scrollback the
 viewport remains available, but the off-window live caret is reported at
-the document end.
+the document end. A text range's `ScrollIntoView` scrolls the terminal, and
+each closable tab has a "Close tab" Button child; both are covered by unit
+tests, and neither the interactive UI Automation harness nor the
+screen-reader matrix exercises them yet (#394).
 
 Not yet covered: the profile picker and tab-overview overlay rows, context
 menus, toasts, the tab drag preview, and quick-terminal chrome. `Ctrl+F6` and
@@ -289,10 +327,11 @@ lands incrementally.
 ## Known caveats
 
 - Installers and the Windows binaries inside the portable ZIP are
-  Authenticode-signed; the ZIP container itself is checksummed, not signed.
-  SmartScreen can still warn for a new or low-reputation publisher
-  certificate; see
-  [getting-started.md](getting-started.md#about-the-smartscreen-warning).
+  Authenticode-signed with a self-signed certificate; the ZIP container
+  itself is checksummed, not signed. Windows shows no publisher identity and
+  SmartScreen warns on first run, and that warning does not fade over time;
+  see [getting-started.md](getting-started.md#about-the-smartscreen-warning)
+  and [code-signing-policy.md](code-signing-policy.md).
 - GitHub Issues are for reproducible bugs. For questions, feature
   discussion, and feedback, use
   [Discussions](https://github.com/amanthanvi/noctty/discussions).
@@ -313,6 +352,18 @@ lands incrementally.
   [capability matrix](windows-capability-matrix.md#settings-accepted-without-effect).
 - Crash capture is local-only, and some hard-abort paths may still
   terminate before Windows can produce a dump.
+- With the bundled ConPTY, undo after `clear_screen` or `reset` can leave
+  noctty's cursor row and ConPTY's apart until the shell clears again, and
+  after `clear_screen` ConPTY drops the rows below the cursor (#401). A
+  wrapped command line, a full-screen program started from it, a maximize
+  that unwraps the line and leaving the program can leave noctty and conhost
+  restoring the saved cursor one row apart; one resize scenario in the
+  ConPTY comparison harness stays marked out of sync (#328).
+- Cancel on an OSC 52 prompt does not answer the program, so a program
+  waiting for a read reply waits until its own timeout (#353).
+- Direct3D 11 beta: physical GPU reset, monitor hotplug, real DPI changes and
+  Remote Desktop were not measured, and its visible-desktop check used posted
+  messages, not real input (#303).
 - Power- and visibility-aware render pacing has not been exercised on a
   machine with a battery (forced saver pacing, `power-saver-rendering = on`,
   has been measured, #297), and the DWM cloak/uncloak WinEvent path has not
