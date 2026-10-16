@@ -24954,6 +24954,25 @@ test "win32 terminal undo keeps nonzero live rows, wrap and snapshot margins" {
     }
 }
 
+test "win32 terminal undo keeps alternate screen rows while preserving the live cursor" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049hone\r\ntwo\r\nthree\r\nfour");
+    const snapshot = try captureTerminalUndoStateBytes(alloc, &t);
+    defer alloc.free(snapshot);
+    t.fullReset();
+    _ = restoreTerminalUndoState(&t, snapshot, true);
+    try std.testing.expect(t.screens.active_key == .alternate);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.y);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), t.screens.active.cursor.x);
+    const active = try t.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+    defer alloc.free(active);
+    try std.testing.expect(std.mem.startsWith(u8, active, "one\ntwo\nthree\nfour"));
+}
+
 test "win32 terminal undo aligns content with scrollback and trailing blank rows" {
     const alloc = std.testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 5 });
@@ -25024,7 +25043,10 @@ fn restoreTerminalUndoState(
             .left = 0,
             .right = terminal_state.cols - 1,
         };
-        if (saved_y > live_y) {
+        // Alternate screens have no scrollback to retain shifted-out rows.
+        // Preserve their full-screen picture for the application's redraws.
+        const shift_rows = terminal_state.screens.active_key == .primary;
+        if (shift_rows and saved_y > live_y) {
             // Trailing blanks can put the saved line beyond the replayed
             // active area. SU clamps to one screen, so scroll in chunks.
             var remaining = saved_y - live_y;
@@ -25036,7 +25058,7 @@ fn restoreTerminalUndoState(
                 };
                 remaining -= count;
             }
-        } else if (saved_y < live_y) {
+        } else if (shift_rows and saved_y < live_y) {
             terminal_state.scrollDown(@intCast(live_y - saved_y));
         }
         terminal_state.scrolling_region = region;
