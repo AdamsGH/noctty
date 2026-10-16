@@ -460,6 +460,9 @@ function Send-ModifiedChar {
     # the real keyboard would, then restore the exact old state and detach.
     $targetProcessId = [uint32] 0
     $targetThread = [Win11ShellCommandLiveNative]::GetWindowThreadProcessId($Hwnd, [ref] $targetProcessId)
+    if ($targetThread -eq 0) {
+        throw "GetWindowThreadProcessId found no thread for window $Hwnd while typing '$Character'"
+    }
     $thisThread = [Win11ShellCommandLiveNative]::GetCurrentThreadId()
     if (-not [Win11ShellCommandLiveNative]::AttachThreadInput($thisThread, $targetThread, $true)) {
         throw "AttachThreadInput failed for character '$Character'"

@@ -329,9 +329,10 @@ function Get-InteractiveWin11WindowsPowerShellModulePath {
     # imports PowerShell 7's Microsoft.PowerShell.Utility, which has no
     # Get-FileHash: the harness then fails with CommandNotFoundException.
     $sharedPaths = @(
-        (Join-Path ([System.Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'),
-        (Join-Path $env:ProgramFiles 'PowerShell\Modules')
-    ) | ForEach-Object { $_.TrimEnd('\') }
+        foreach ($base in @([System.Environment]::GetFolderPath('MyDocuments'), $env:ProgramFiles)) {
+            if (-not [string]::IsNullOrWhiteSpace($base)) { (Join-Path $base 'PowerShell\Modules').TrimEnd('\') }
+        }
+    )
 
     $kept = foreach ($entry in @($ModulePath -split ';')) {
         if ([string]::IsNullOrWhiteSpace($entry)) { continue }
@@ -360,10 +361,10 @@ function Invoke-InteractiveWin11Bootstrap {
     $childExitCode = 0
     [System.Environment]::SetEnvironmentVariable($EnvironmentVariable, '1', 'Process')
     $savedModulePath = $env:PSModulePath
-    $env:PSModulePath = Get-InteractiveWin11WindowsPowerShellModulePath -ModulePath $savedModulePath
 
     Push-Location $RepoRoot
     try {
+        $env:PSModulePath = Get-InteractiveWin11WindowsPowerShellModulePath -ModulePath $savedModulePath
         & $bootstrapCmd powershell.exe -ExecutionPolicy Bypass -File $LauncherPath @ArgumentList
         if ($null -ne $LASTEXITCODE) {
             $childExitCode = $LASTEXITCODE
