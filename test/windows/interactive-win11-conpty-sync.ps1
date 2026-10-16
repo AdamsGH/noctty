@@ -1157,11 +1157,20 @@ finally {
     # Closing the job ends anything the inner half left running.
     [void][NocttyConptySyncNative]::CloseHandle($job)
     [void][NocttyConptySyncNative]::CloseDesktop($desktop)
-    $clipboardAfter = [NocttyConptySyncNative]::GetClipboardSequenceNumber()
-    Write-Host "clipboard sequence after: $clipboardAfter"
-    if ($clipboardAfter -ne $clipboardBefore) { $guardFailures.Add('clipboard sequence changed during conpty-sync; stop all launches and report') }
-    if ((Get-ConptySyncRealStartupAttempts) -ne $realStartupBefore) { $guardFailures.Add("the real profile's startup-attempts.json changed during the run") }
-    if ((Get-ConptySyncRealPSReadLineState) -ne $historyBefore) { $guardFailures.Add('the real PSReadLine history metadata changed during the run; stop all launches and report') }
+    try {
+        $clipboardAfter = [NocttyConptySyncNative]::GetClipboardSequenceNumber()
+        Write-Host "clipboard sequence after: $clipboardAfter"
+        if ($clipboardAfter -ne $clipboardBefore) { $guardFailures.Add('clipboard sequence changed during conpty-sync; stop all launches and report') }
+    }
+    catch { $guardFailures.Add('could not verify the clipboard sequence after the run; stop all launches and report') }
+    try {
+        if ((Get-ConptySyncRealStartupAttempts) -ne $realStartupBefore) { $guardFailures.Add("the real profile's startup-attempts.json changed during the run") }
+    }
+    catch { $guardFailures.Add("could not verify the real profile's startup-attempts.json after the run; stop all launches and report") }
+    try {
+        if ((Get-ConptySyncRealPSReadLineState) -ne $historyBefore) { $guardFailures.Add('the real PSReadLine history metadata changed during the run; stop all launches and report') }
+    }
+    catch { $guardFailures.Add('could not verify the real PSReadLine history metadata after the run; stop all launches and report') }
     # Check every guard and preserve any driver exception already in flight.
     if ($guardFailures.Count -gt 0) { Write-Warning ($guardFailures -join '; ') }
 }
