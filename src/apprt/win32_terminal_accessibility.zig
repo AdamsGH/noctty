@@ -52,6 +52,7 @@ pub const Ops = struct {
     focused: *const fn (*anyopaque) bool,
     capture: *const fn (*anyopaque, Allocator) anyerror!Capture,
     defer_provider_release: *const fn (*anyopaque, *win32_uia.TerminalProvider) void,
+    scroll: ?*const fn (*anyopaque, win32_uia.widgets.ScrollRequest) anyerror!void = null,
 };
 
 pub const Change = enum { unchanged, geometry, caret, text, text_and_caret };
@@ -73,6 +74,9 @@ pub const TerminalAccessibilitySession = struct {
     provider: ?*win32_uia.TerminalProvider = null,
     last_query_ms: std.atomic.Value(u64) = .init(0),
     query_refresh_post_pending: std.atomic.Value(bool) = .init(false),
+    pending_scroll: ?win32_uia.widgets.ScrollRequest = null,
+    scroll_retry_pending: bool = false,
+    cached_scroll_token: ?u64 = null,
     last_refresh_ms: u64 = 0,
     refresh_timer_active: bool = false,
     /// Set when a refresh was skipped because the renderer lock was held. The
@@ -184,8 +188,51 @@ pub const TerminalAccessibilitySession = struct {
         self.publish(force, .accumulate);
     }
 
+    /// The window message carries no pointer and the session owns its pending
+    /// value. Surface teardown makes late messages harmless; no caller stack
+    /// or frozen range needs to outlive this asynchronous request.
+    pub fn handleScroll(self: *TerminalAccessibilitySession) void {
+        self.scroll_retry_pending = false;
+        self.mutex.lock();
+        const request = self.pending_scroll;
+        self.pending_scroll = null;
+        const attached = self.attached;
+        self.mutex.unlock();
+        if (!attached) return;
+        if (request) |value| {
+            if (self.ops.scroll) |scroll| scroll(self.ops.ctx, value) catch |err| {
+                if (err == error.WouldBlock) {
+                    self.mutex.lock();
+                    // Keep a newer client request if it arrived meanwhile.
+                    if (self.attached and self.pending_scroll == null) self.pending_scroll = value;
+                    self.mutex.unlock();
+                    self.scroll_retry_pending = true;
+                    self.armContentionRetry();
+                }
+                return;
+            };
+            self.publish(true, .discard);
+        }
+    }
+
+    fn providerScroll(ctx: *anyopaque, request: win32_uia.widgets.ScrollRequest) !void {
+        const self: *TerminalAccessibilitySession = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.attached) return error.ElementNotAvailable;
+        if (self.ops.scroll == null) return error.NotSupported;
+        const hwnd = self.ops.hwnd(self.ops.ctx) orelse return error.ElementNotAvailable;
+        const already_pending = self.pending_scroll != null;
+        self.pending_scroll = request;
+        if (!already_pending and sys.PostMessageW(hwnd, self.query_message, 2, 0) == 0) {
+            self.pending_scroll = null;
+            return error.ElementNotAvailable;
+        }
+    }
+
     pub fn handleTimer(self: *TerminalAccessibilitySession) void {
         self.cancelTimer();
+        self.handleScroll();
         self.publish(false, .emit);
     }
 
@@ -201,6 +248,7 @@ pub const TerminalAccessibilitySession = struct {
             self.clearRecentInput();
             self.announcement_normalizer = .{};
             self.mutex.unlock();
+            if (self.scroll_retry_pending) self.armContentionRetry();
             return;
         }
         if (self.provider == null) return;
@@ -318,6 +366,7 @@ pub const TerminalAccessibilitySession = struct {
         self.cancelTimer();
         self.mutex.lock();
         self.attached = false;
+        self.pending_scroll = null;
         self.query_refresh_post_pending.store(false, .release);
         self.mutex.unlock();
         if (self.provider) |provider| {
@@ -333,6 +382,9 @@ pub const TerminalAccessibilitySession = struct {
         force: bool,
         requested_speech_mode: SpeechMode,
     ) void {
+        // Snapshot publication/focus can cancel the shared refresh timer.
+        // Keep a contended scroll alive until it is validated or detached.
+        defer if (self.scroll_retry_pending) self.armContentionRetry();
         const provider = self.provider orelse return;
         const now_ms = sys.GetTickCount64();
         const policy = publishPolicy(
@@ -435,6 +487,7 @@ pub const TerminalAccessibilitySession = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.cached_scroll_token = snapshot.scroll_token;
         if (!self.attached) {
             self.alloc.free(cells);
             self.alloc.free(text);
@@ -634,6 +687,7 @@ pub const TerminalAccessibilitySession = struct {
             .name = providerName,
             .value = providerValue,
             .snapshot = providerSnapshot,
+            .scroll_range = providerScroll,
             .focused = providerFocused,
         };
     }
@@ -687,6 +741,7 @@ pub const TerminalAccessibilitySession = struct {
             .terminal_selection_range = self.cached_selection_range,
             .terminal_selection_active_offset = self.cached_selection_active_offset,
             .geometry = .{
+                .scroll_token = self.cached_scroll_token,
                 .cell_for_byte = cells,
                 .viewport_rows = self.viewport_rows,
                 .viewport_columns = self.viewport_columns,
@@ -777,6 +832,81 @@ pub fn cellsEqual(
         if (a.row != b.row or a.column != b.column or a.width != b.width) return false;
     }
     return true;
+}
+
+test "PKG71 scroll requests cross threads by value and detach cancels pending work" {
+    const message: u32 = 0x8000 + 6;
+    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = sys.DestroyWindow(hwnd);
+    const Context = struct {
+        hwnd_value: HWND,
+        ui_thread: u32,
+        calls: usize = 0,
+        last_row: i32 = 0,
+        blocked: bool = true,
+        fn window(ctx: *anyopaque) ?HWND {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.hwnd_value;
+        }
+        fn scroll(ctx: *anyopaque, request: win32_uia.widgets.ScrollRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(self.ui_thread, sys.GetCurrentThreadId());
+            if (self.blocked) return error.WouldBlock;
+            self.calls += 1;
+            self.last_row = request.row;
+        }
+        fn worker(session: *TerminalAccessibilitySession) void {
+            TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+                .token = 1,
+                .row = -5,
+                .align_to_top = true,
+            }) catch @panic("failed to post scroll");
+            // Multiple requests coalesce to the newest by-value request.
+            TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+                .token = 1,
+                .row = -7,
+                .align_to_top = false,
+            }) catch @panic("failed to post scroll");
+        }
+    };
+    var ctx = Context{ .hwnd_value = hwnd, .ui_thread = sys.GetCurrentThreadId() };
+    var ops = TestOps.ops(@ptrCast(&ctx));
+    ops.hwnd = Context.window;
+    ops.scroll = Context.scroll;
+    const session = try TerminalAccessibilitySession.create(std.testing.allocator, ops, message, 991);
+    var owned = true;
+    defer if (owned) session.deinit();
+    const thread = try std.Thread.spawn(.{}, Context.worker, .{session});
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+    var queued: sys.MSG = undefined;
+    try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) != 0);
+    try std.testing.expectEqual(@as(usize, 2), queued.wParam);
+    try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) == 0);
+    session.handleScroll(); // Contention retains the request for the timer.
+    try std.testing.expect(session.pending_scroll != null);
+    ctx.blocked = false;
+    session.handleTimer();
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(i32, -7), ctx.last_row);
+    // A provider reference can outlive Surface teardown. Its retained session
+    // refuses callbacks before touching the now-invalid owner context.
+    TerminalAccessibilitySession.retain(@ptrCast(session));
+    defer TerminalAccessibilitySession.release(@ptrCast(session));
+    try TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+        .token = 1,
+        .row = -8,
+        .align_to_top = true,
+    });
+    session.deinit();
+    owned = false;
+    session.handleScroll();
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectError(error.ElementNotAvailable, TerminalAccessibilitySession.providerScroll(@ptrCast(session), .{
+        .token = 1,
+        .row = 0,
+        .align_to_top = true,
+    }));
 }
 
 const TestOps = struct {

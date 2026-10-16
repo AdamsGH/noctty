@@ -28,7 +28,13 @@ pub fn raiseFocusChanged(provider: *com.IRawElementProviderSimple) void {
 /// event raised from inside a provider call rather than from a message
 /// handler; the providers that do so are COM-threaded, which puts the
 /// raise on the window's own thread.
+pub threadlocal var testing_invocations: usize = 0;
+
 pub fn raiseInvoked(provider: *com.IRawElementProviderSimple) void {
+    if (builtin.is_test) {
+        testing_invocations += 1;
+        return;
+    }
     if (!clientsAreListening()) return;
     const hr = com.UiaRaiseAutomationEvent(
         provider,

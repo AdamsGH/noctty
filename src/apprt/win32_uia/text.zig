@@ -28,6 +28,7 @@ pub const AccessibleTextSnapshot = struct {
     cell_for_byte: []TerminalCellPosition,
     viewport_rows: u32,
     viewport_columns: u32,
+    scroll_token: ?u64 = null,
 
     pub fn deinit(self: *AccessibleTextSnapshot) void {
         self.alloc.free(self.cell_for_byte);
@@ -146,6 +147,19 @@ pub fn snapshotTerminalAccessiblePlainText(
     const viewport_screen = pages.pointFromPin(.screen, viewport_top) orelse return error.UnknownPoint;
     const viewport_y: i64 = @intCast(viewport_screen.screen.y);
 
+    // Include page provenance as well as content. Recycling a page, trimming
+    // history, switching screens, resizing, or moving the viewport invalidates
+    // frozen relative rows even when the rendered text happens to be equal.
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(text);
+    const provenance = [_]u64{
+        @intFromEnum(terminal_state.screens.active_key), pages.page_serial,
+        pages.page_serial_min,                           pages.pages.first.?.serial,
+        pages.total_rows,                                @intCast(viewport_y),
+        pages.rows,                                      pages.cols,
+    };
+    hash.update(std.mem.sliceAsBytes(&provenance));
+
     var rows: ScreenRows = .{ .pages = pages };
     var visible_start: ?usize = null;
     var visible_end: usize = 0;
@@ -157,6 +171,11 @@ pub fn snapshotTerminalAccessiblePlainText(
             .column = pin.x,
             .width = if (text[index] == '\n') 0 else @intCast(cell.gridWidth()),
         };
+        // Hash canonical scalar fields together, with no struct padding and
+        // no second per-byte pass while the renderer lock is held.
+        const position = cell_for_byte[index];
+        const canonical = [3]u32{ @bitCast(position.row), position.column, position.width };
+        hash.update(std.mem.sliceAsBytes(&canonical));
         if (pin.isBetween(viewport_top, viewport_bottom)) {
             if (visible_start == null) visible_start = index;
             visible_end = index + 1;
@@ -186,7 +205,25 @@ pub fn snapshotTerminalAccessiblePlainText(
         .cell_for_byte = cell_for_byte,
         .viewport_rows = @intCast(pages.rows),
         .viewport_columns = @intCast(pages.cols),
+        .scroll_token = hash.final(),
     };
+}
+
+/// Called on the UI thread with the renderer lock held, so validation and
+/// mutation see exactly the same live viewport. Refuse a stale frozen range.
+pub fn scrollFrozenRange(
+    alloc: std.mem.Allocator,
+    state: *terminal.Terminal,
+    token: u64,
+    row: i32,
+    align_to_top: bool,
+) !bool {
+    var live = try snapshotTerminalAccessiblePlainText(alloc, state);
+    defer live.deinit();
+    if (token != live.scroll_token.?) return false;
+    const delta: isize = @as(isize, row) - if (align_to_top) @as(isize, 0) else @as(isize, live.viewport_rows -| 1);
+    state.scrollViewport(.{ .delta = delta });
+    return true;
 }
 
 const SelectionOffsets = struct {
@@ -324,6 +361,57 @@ fn caretOffsetForGridPosition(
         index += scalar_len;
     }
     return row_end orelse text.len;
+}
+
+test "PKG71 frozen scroll aligns top and bottom and refuses changed viewports" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 20, .rows = 3, .max_scrollback = 100_000 });
+    defer t.deinit(alloc);
+    try t.printString("zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+    var frozen = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer frozen.deinit();
+    const index = std.mem.indexOf(u8, frozen.text, "two").?;
+    const row = frozen.cell_for_byte[index].row;
+    try std.testing.expect(row < 0);
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, row, true));
+    var top = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer top.deinit();
+    try std.testing.expectEqual(@as(i32, 0), top.cell_for_byte[std.mem.indexOf(u8, top.text, "two").?].row);
+    // The same frozen relative row is no longer safe after a viewport move.
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, frozen.scroll_token.?, row, false));
+    t.scrollViewport(.bottom);
+    var bottom_source = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer bottom_source.deinit();
+    const bottom_row = bottom_source.cell_for_byte[std.mem.indexOf(u8, bottom_source.text, "two").?].row;
+    try std.testing.expect(try scrollFrozenRange(alloc, &t, bottom_source.scroll_token.?, bottom_row, false));
+    var bottom = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer bottom.deinit();
+    try std.testing.expectEqual(@as(i32, 2), bottom.cell_for_byte[std.mem.indexOf(u8, bottom.text, "two").?].row);
+    try std.testing.expect(t.screens.active.selection == null);
+}
+
+test "PKG71 frozen scroll rejects output resize screen switch and history recycling" {
+    const alloc = std.testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 12, .rows = 3, .max_scrollback = 1000 });
+    defer t.deinit(alloc);
+    try t.printString("old\r\nrow\r\ntail\r\n");
+    var original = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer original.deinit();
+    try t.printString("new");
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, original.scroll_token.?, -1, true));
+    var before_resize = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer before_resize.deinit();
+    try t.resize(alloc, 15, 4);
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_resize.scroll_token.?, -1, true));
+    var before_switch = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer before_switch.deinit();
+    _ = try t.switchScreen(.alternate);
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_switch.scroll_token.?, -1, true));
+    _ = try t.switchScreen(.primary);
+    var before_trim = try snapshotTerminalAccessiblePlainText(alloc, &t);
+    defer before_trim.deinit();
+    for (0..1000) |_| try t.printString("repeat\r\n");
+    try std.testing.expect(!try scrollFrozenRange(alloc, &t, before_trim.scroll_token.?, -1, false));
 }
 
 test "snapshotTerminalAccessiblePlainText bounds history and maps viewport" {
