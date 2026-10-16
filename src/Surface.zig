@@ -3922,7 +3922,7 @@ test "Surface: typing redraws only what it changed on screen" {
 
 /// Change the cell size for the terminal grid. This can happen as
 /// a result of changing the font size at runtime.
-fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
+fn setCellSize(self: *Surface, size: rendererpkg.CellSize) void {
     // Update our cell size within our size struct
     self.size.cell = size;
     self.balancePaddingIfNeeded();
@@ -3938,12 +3938,15 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
         log.warn("unable to recompute initial window size: {}", .{err});
     };
 
-    // Notify the window
-    _ = try self.rt_app.performAction(
+    // Notify the window. The grid above has already changed, so a failure
+    // here must not fail the font change halfway through it.
+    _ = self.rt_app.performAction(
         .{ .surface = self },
         .cell_size,
         .{ .width = size.width, .height = size.height },
-    );
+    ) catch |err| {
+        log.warn("unable to notify the window of the new cell size: {}", .{err});
+    };
 }
 
 /// Change the font size.
@@ -3960,7 +3963,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     errdefer self.app.font_grid_set.deref(font_grid_key);
 
     // Set our cell size
-    try self.setCellSize(.{
+    self.setCellSize(.{
         .width = font_grid.metrics.cell_width,
         .height = font_grid.metrics.cell_height,
     });
@@ -5655,13 +5658,21 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
         return;
     }
 
-    try self.setFontSize(size);
-
     // Update our padding which is dependent on DPI. We only do this for
-    // unbalanced padding since balanced padding is not dependent on DPI.
+    // unbalanced padding; setCellSize recalculates balanced padding.
+    // Before the font: its new cell size recomputes the configured window
+    // size from this padding, and the old DPI's padding left a window moved
+    // to another DPI a few pixels off the size it opens at there. A failed
+    // font change keeps the old DPI, so it keeps the old padding too.
+    const previous_padding = self.size.padding;
     if (self.config.window_padding_balance == .false) {
         self.size.padding = self.config.scaledPadding(x_dpi, y_dpi);
     }
+
+    self.setFontSize(size) catch |err| {
+        self.size.padding = previous_padding;
+        return err;
+    };
 
     // Force a resize event because the change in padding will affect
     // pixel-level changes to the renderer and viewport.
@@ -9190,6 +9201,38 @@ test "Surface: font size preserves DPI after failed grid allocation" {
     try std.testing.expectError(error.OutOfMemory, surface.setFontSize(next));
     try std.testing.expectEqual(original, surface.font_size);
     try std.testing.expectEqual(@as(usize, 0), app.font_grid_set.map.count());
+}
+
+test "Surface: a failed DPI change keeps the old DPI's padding" {
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var font_config = try font.SharedGridSet.DerivedConfig.init(alloc, &config);
+    defer font_config.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var app: App = undefined;
+    app.font_grid_set = try font.SharedGridSet.init(alloc);
+    defer app.font_grid_set.deinit();
+    app.font_grid_set.alloc = failing.allocator();
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.config.font = font_config;
+    surface.config.window_padding_top = 2;
+    surface.config.window_padding_bottom = 2;
+    surface.config.window_padding_left = 2;
+    surface.config.window_padding_right = 2;
+    surface.config.window_padding_balance = .false;
+    const original: font.face.DesiredSize = .{ .points = 12, .xdpi = 96, .ydpi = 96 };
+    surface.font_size = original;
+    surface.size.padding = surface.config.scaledPadding(96, 96);
+    const padding = surface.size.padding;
+
+    // The new padding is installed before the font so the window size
+    // recomputed from the new cell size uses it; when the font cannot
+    // change, the DPI did not change either.
+    try std.testing.expectError(error.OutOfMemory, surface.contentScaleCallback(.{ .x = 1.5, .y = 1.5 }));
+    try std.testing.expectEqual(original, surface.font_size);
+    try std.testing.expectEqual(padding, surface.size.padding);
 }
 
 test "Surface: lock keys alone do not count as a mouse mods change" {
