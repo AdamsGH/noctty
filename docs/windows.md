@@ -1491,8 +1491,9 @@ and the
 
 - **Kitty graphics replies reach the child as input.** A command that carries
   an image id or number (`i=` or `I=`) is answered on the child's input with
-  `ESC _ G ... ESC \` unless `q=1` (suppress success replies) or `q=2`
-  (suppress all replies) is set (`graphics_exec.zig`, `StreamHandler.apcEnd`).
+  `ESC _ G ... ESC \`, an `OK` or an error, unless `q=1` (suppress success
+  replies) or `q=2` (suppress all replies) is set. A successful delete never
+  replies (`graphics_exec.zig`, `StreamHandler.apcEnd`).
   noctty has no ConPTY-specific suppression. The 2026-10-10 audit measured the
   bundled ConPTY handing a native console program (`[Console]::ReadKey` in
   pwsh, and `cmd`) a lone `\` for such a reply, while the same reply arrived
