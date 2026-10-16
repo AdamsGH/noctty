@@ -8,6 +8,7 @@ param(
     [int] $TimeoutSeconds = 900,
     # Internal: the half of the harness that runs on the hidden desktop.
     [switch] $Inner,
+    [string] $DesktopName,
     [string] $RunRoot,
     [string] $ResultPath
 )
@@ -114,6 +115,44 @@ public static class NocttyConptySyncNative {
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint type);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint threadId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder value, uint size, out uint needed);
+
+    public static string DesktopOf(IntPtr hwnd) {
+        int pid;
+        uint thread = GetWindowThreadProcessId(hwnd, out pid);
+        var name = new StringBuilder(256);
+        uint needed;
+        if (thread == 0 || !GetUserObjectInformationW(GetThreadDesktop(thread), 2, name, 512, out needed))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return name.ToString();
+    }
+
+    public static System.Diagnostics.Process StartOnDesktop(string exe, string args, string cwd, string desktop) {
+        if (String.IsNullOrEmpty(desktop) || !desktop.StartsWith("noctty-conpty-sync-", StringComparison.Ordinal))
+            throw new ArgumentException("a private conpty-sync desktop is required");
+        var si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        si.lpDesktop = "WinSta0\\" + desktop;
+        PROCESS_INFORMATION pi;
+        // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED.
+        // Open the managed handle before resuming even a short-lived helper.
+        // lpDesktop is explicit: children do not inherit a private desktop.
+        if (!CreateProcessW(exe, new StringBuilder("\"" + exe + "\" " + args), IntPtr.Zero, IntPtr.Zero,
+                            false, 0x08004004, IntPtr.Zero, cwd, ref si, out pi))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            var process = System.Diagnostics.Process.GetProcessById(pi.dwProcessId);
+            var handle = process.Handle;
+            if (ResumeThread(pi.hThread) == UInt32.MaxValue)
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return process;
+        }
+        catch { TerminateProcess(pi.hProcess, 1); throw; }
+        finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    }
 
     public static string ClassOf(IntPtr h) { var sb = new StringBuilder(256); GetClassNameW(h, sb, 256); return sb.ToString(); }
 
@@ -248,14 +287,13 @@ function Get-ConptySyncRealStartupAttempts {
 }
 
 # PSReadLine's history file lives in the real roaming profile whatever APPDATA
-# says. The scenarios redirect it; this looks for the sandbox path, which every
-# PowerShell scenario types, in the real file. A count rather than a hash, so
-# the user's own sessions writing to it at the same time do not trip it.
-function Get-ConptySyncRealPSReadLineLeaks([string] $Token) {
+# says. Check metadata and a hash only; never search the user's history.
+function Get-ConptySyncRealPSReadLineState {
     $real = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
     $path = Join-Path $real 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 0 }
-    return @(Select-String -LiteralPath $path -SimpleMatch -Pattern $Token).Count
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 'absent' }
+    $item = Get-Item -LiteralPath $path
+    return '{0} {1} {2}' -f $item.Length, $item.LastWriteTimeUtc.ToString('o'), (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
 }
 
 # ===========================================================================
@@ -353,12 +391,8 @@ if ($Inner) {
 
     function Read-SyncConpty([int] $ShellPid) {
         $path = Join-Path $script:Work ('dump-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $script:DumpExe
-        $psi.Arguments = '{0} "{1}"' -f $ShellPid, $path
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $proc = [System.Diagnostics.Process]::Start($psi)
+        $arguments = '{0} "{1}"' -f $ShellPid, $path
+        $proc = [NocttyConptySyncNative]::StartOnDesktop($script:DumpExe, $arguments, $script:Work, $DesktopName)
         if (-not $proc.WaitForExit(10000)) { $proc.Kill(); throw 'console dump timed out' }
         $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
         Remove-Item -LiteralPath $path -Force
@@ -505,9 +539,9 @@ if ($Inner) {
         [IO.File]::WriteAllLines($configPath, [string[]]$config, (New-Object System.Text.UTF8Encoding $false))
         # The shared composer adds the Job Object containment, a private
         # single-instance class per scenario, and nothing else.
-        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "conpty-sync-$Name" })) +
+        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" })) +
             @("`"--config-file=$configPath`"")
-        $process = Start-Process -FilePath $script:Exe -ArgumentList $arguments -WorkingDirectory $script:Work -PassThru
+        $process = [NocttyConptySyncNative]::StartOnDesktop($script:Exe, ($arguments -join ' '), $script:Work, $DesktopName)
         $ctx = [pscustomobject]@{
             Name = $Name; Shell = $Shell; ShellExe = $shellExe; Process = $process
             Host = [IntPtr]::Zero; Surface = [IntPtr]::Zero; ShellPid = 0
@@ -518,6 +552,10 @@ if ($Inner) {
                 Where-Object { [NocttyConptySyncNative]::IsWindowVisible($_) })
             if ($hosts.Count -eq 0) { return $false }
             $ctx.Host = $hosts[0]
+            # Sanity assertion for the HWND before driving it. EnumWindows
+            # already scopes discovery to this desktop; lpDesktop above is
+            # what prevents a launch onto the interactive desktop.
+            if ([NocttyConptySyncNative]::DesktopOf($ctx.Host) -cne $DesktopName) { throw 'noctty window is on the wrong desktop' }
             $surfaces = @(Get-SyncSurfaces $ctx)
             if ($surfaces.Count -ne 1) { return $false }
             $ctx.Surface = $surfaces[0]
@@ -873,16 +911,15 @@ if ($Inner) {
             }
         }
         [pscustomobject]@{
-            Name = 'altscreen-wrapped-maximize-powershell'; Shell = 'powershell'; Expect = 'desync'; Finding = 'saved cursor'
+            Name = 'altscreen-wrapped-maximize-powershell'; Shell = 'powershell'; Expect = 'sync'; Finding = 'saved cursor'
             Description = 'the same, started from a command line that wraps'
             Setup = { param($c) Invoke-SyncFill $c }
             Trigger = {
                 param($c)
                 # The maximize unwraps the command line above the cursor that
-                # the full-screen program saved. noctty moves that saved
-                # cursor with its row; conhost restores it at its old
-                # coordinates, one row lower, so the next prompt lands one row
-                # apart (2 rows differ).
+                # the full-screen program saved. Both sides must restore
+                # the saved coordinates, rather than following that row
+                # through reflow (the old behavior differed on 2 rows).
                 Invoke-SyncAltScreenMaximize $c "[Console]::Write([char]27 + '[?1049h' + [char]27 + '[HALT' + ' SCREEN'); [void][Console]::ReadKey(`$true); [Console]::Write([char]27 + '[?1049l')"
             }
         }
@@ -1062,7 +1099,9 @@ Set-Content -LiteralPath $altApp -Encoding ASCII -Value @(
 $env:NOCTTY_SYNC_ALTAPP = $altApp
 Add-Type -TypeDefinition $script:ConptySyncDumpSource -OutputAssembly (Join-Path $runRoot 'tools\conpty-sync-dump.exe') -OutputType ConsoleApplication
 
-$historyLeaksBefore = Get-ConptySyncRealPSReadLineLeaks (Join-Path $runRoot 'work')
+$historyBefore = Get-ConptySyncRealPSReadLineState
+$clipboardBefore = [NocttyConptySyncNative]::GetClipboardSequenceNumber()
+Write-Host "clipboard sequence before: $clipboardBefore"
 
 # A short prompt keeps cmd's line from wrapping; the integration keeps it.
 $env:PROMPT = 'sync$G'
@@ -1075,10 +1114,11 @@ if ($desktop -eq [IntPtr]::Zero) { throw "CreateDesktopW failed: $([Runtime.Inte
 $job = [NocttyConptySyncNative]::NewKillOnCloseJob()
 if ($job -eq [IntPtr]::Zero) { [void][NocttyConptySyncNative]::CloseDesktop($desktop); throw 'could not create the cleanup job object' }
 $innerExit = $null
+$guardFailures = New-Object System.Collections.Generic.List[string]
 try {
     $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $innerArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcherPath`"", '-Inner',
-        '-RunRoot', "`"$runRoot`"", '-ResultPath', "`"$resultPath`"")
+        '-RunRoot', "`"$runRoot`"", '-ResultPath', "`"$resultPath`"", '-DesktopName', $desktopName)
     if ($Scenario.Count -gt 0) { $innerArgs += @('-Scenario', ($Scenario -join ',')) }
     $commandLine = New-Object System.Text.StringBuilder ("`"$powershell`" " + ($innerArgs -join ' '))
     $si = New-Object NocttyConptySyncNative+STARTUPINFO
@@ -1117,19 +1157,28 @@ finally {
     # Closing the job ends anything the inner half left running.
     [void][NocttyConptySyncNative]::CloseHandle($job)
     [void][NocttyConptySyncNative]::CloseDesktop($desktop)
+    try {
+        $clipboardAfter = [NocttyConptySyncNative]::GetClipboardSequenceNumber()
+        Write-Host "clipboard sequence after: $clipboardAfter"
+        if ($clipboardAfter -ne $clipboardBefore) { $guardFailures.Add('clipboard sequence changed during conpty-sync; stop all launches and report') }
+    }
+    catch { $guardFailures.Add('could not verify the clipboard sequence after the run; stop all launches and report') }
+    try {
+        if ((Get-ConptySyncRealStartupAttempts) -ne $realStartupBefore) { $guardFailures.Add("the real profile's startup-attempts.json changed during the run") }
+    }
+    catch { $guardFailures.Add("could not verify the real profile's startup-attempts.json after the run; stop all launches and report") }
+    try {
+        if ((Get-ConptySyncRealPSReadLineState) -ne $historyBefore) { $guardFailures.Add('the real PSReadLine history metadata changed during the run; stop all launches and report') }
+    }
+    catch { $guardFailures.Add('could not verify the real PSReadLine history metadata after the run; stop all launches and report') }
+    # Check every guard and preserve any driver exception already in flight.
+    if ($guardFailures.Count -gt 0) { Write-Warning ($guardFailures -join '; ') }
 }
 
 $innerLog = Join-Path $runRoot 'evidence\inner.log'
 if (Test-Path -LiteralPath $innerLog) { Get-Content -LiteralPath $innerLog | ForEach-Object { Write-Host $_ } }
+if ($guardFailures.Count -gt 0) { throw ($guardFailures -join '; ') }
 
-$realStartupAfter = Get-ConptySyncRealStartupAttempts
-if ($realStartupAfter -ne $realStartupBefore) {
-    throw "the real profile's startup-attempts.json changed during the run: before=$realStartupBefore after=$realStartupAfter"
-}
-$historyToken = Join-Path $runRoot 'work'
-if ((Get-ConptySyncRealPSReadLineLeaks $historyToken) -gt $historyLeaksBefore) {
-    throw "a scenario command reached the real PSReadLine history (lines containing $historyToken)"
-}
 if ($null -eq $innerExit) { throw "the hidden-desktop driver did not finish within $TimeoutSeconds s (evidence: $runRoot\evidence)" }
 if ($innerExit -ne 0) { throw "the hidden-desktop driver exited with $innerExit (evidence: $runRoot\evidence)" }
 if (-not (Test-Path -LiteralPath $resultPath)) { throw "no results at $resultPath" }

@@ -1807,7 +1807,9 @@ pub const Resize = struct {
     prompt_redraw: osc.semantic_prompt.Redraw = .false,
 
     /// Whether the resize may pull rows out of scrollback back into the
-    /// active area. See PageList.Resize for details.
+    /// active area. When false, also retain saved cursor coordinates as
+    /// ConPTY does, rather than moving them with reflowed text. The restore
+    /// operation clamps them to the screen. See PageList.Resize for details.
     pull_scrollback: bool = true,
 };
 
@@ -1879,6 +1881,10 @@ pub inline fn resize(
     // We need to insert a tracked pin for our saved cursor so we can
     // modify its X/Y for reflow.
     const saved_cursor_pin: ?*Pin = saved_cursor: {
+        // Conhost saves viewport-relative coordinates, not a text position.
+        // Moving those coordinates with the text desynchronizes the next
+        // restore (including 1049) after a wrapped command line unwraps.
+        if (!opts.pull_scrollback) break :saved_cursor null;
         const sc = self.saved_cursor orelse break :saved_cursor null;
         const pin = self.pages.pin(.{ .active = .{
             .x = sc.x,
