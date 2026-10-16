@@ -2895,12 +2895,15 @@ test "win32 IPC server thread does not busy-poll while it waits for a client" {
     // Allow a bounded startup/retry budget for that or an incidental wakeup.
     // A 5 ms poll keeps accruing cycles in every 300 ms window and fails.
     var cycles = try testThreadCycles(thread);
-    for (0..10) |_| {
+    var cycle_deltas: [10]u64 = undefined;
+    for (&cycle_deltas) |*delta| {
         std.Thread.sleep(300 * std.time.ns_per_ms);
         const now = try testThreadCycles(thread);
+        delta.* = now - cycles;
         if (now == cycles) return;
         cycles = now;
     }
+    std.debug.print("IPC server thread cycle deltas across 300 ms windows: {any}\n", .{cycle_deltas});
     return error.TestUnexpectedResult;
 }
 
