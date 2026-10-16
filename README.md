@@ -75,8 +75,8 @@ later.
   ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)).
 
 The latest release is
-[noctty 1.3.131](https://github.com/amanthanvi/noctty/releases/tag/v1.3.131),
-published 2026-09-24.
+[noctty 1.3.132](https://github.com/amanthanvi/noctty/releases/tag/v1.3.132),
+published 2026-10-16.
 
 ### With WinGet
 
@@ -99,8 +99,8 @@ any folder without installing.
 
 | Your PC                        | Installer                                                                                                                                          | Portable                                                                                                                                                 |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **x64** (Intel and AMD)        | [`noctty-1.3.131-windows-x64-setup.exe`](https://github.com/amanthanvi/noctty/releases/download/v1.3.131/noctty-1.3.131-windows-x64-setup.exe)     | [`noctty-1.3.131-windows-x64-portable.zip`](https://github.com/amanthanvi/noctty/releases/download/v1.3.131/noctty-1.3.131-windows-x64-portable.zip)     |
-| **ARM64** (Windows on Arm PCs) | [`noctty-1.3.131-windows-arm64-setup.exe`](https://github.com/amanthanvi/noctty/releases/download/v1.3.131/noctty-1.3.131-windows-arm64-setup.exe) | [`noctty-1.3.131-windows-arm64-portable.zip`](https://github.com/amanthanvi/noctty/releases/download/v1.3.131/noctty-1.3.131-windows-arm64-portable.zip) |
+| **x64** (Intel and AMD)        | [`noctty-1.3.132-windows-x64-setup.exe`](https://github.com/amanthanvi/noctty/releases/download/v1.3.132/noctty-1.3.132-windows-x64-setup.exe)     | [`noctty-1.3.132-windows-x64-portable.zip`](https://github.com/amanthanvi/noctty/releases/download/v1.3.132/noctty-1.3.132-windows-x64-portable.zip)     |
+| **ARM64** (Windows on Arm PCs) | [`noctty-1.3.132-windows-arm64-setup.exe`](https://github.com/amanthanvi/noctty/releases/download/v1.3.132/noctty-1.3.132-windows-arm64-setup.exe) | [`noctty-1.3.132-windows-arm64-portable.zip`](https://github.com/amanthanvi/noctty/releases/download/v1.3.132/noctty-1.3.132-windows-arm64-portable.zip) |
 
 > [!NOTE]
 > Releases are signed with a self-signed certificate, so Windows SmartScreen
@@ -110,7 +110,7 @@ any folder without installing.
 > `SHA256SUMS-windows-arm64.txt` from the same release:
 >
 > ```powershell
-> Get-FileHash .\noctty-1.3.131-windows-x64-setup.exe -Algorithm SHA256
+> Get-FileHash .\noctty-1.3.132-windows-x64-setup.exe -Algorithm SHA256
 > ```
 >
 > A matching checksum shows the file arrived intact, not who published it.
@@ -118,8 +118,8 @@ any folder without installing.
 > provenance and signature checks.
 
 Each release also includes signed manifests of the portable ZIP contents
-(`noctty-1.3.131-windows-x64-portable.manifest.ps1` and
-`noctty-1.3.131-windows-arm64-portable.manifest.ps1`) and `SHA256SUMS.txt`, an
+(`noctty-1.3.132-windows-x64-portable.manifest.ps1` and
+`noctty-1.3.132-windows-arm64-portable.manifest.ps1`) and `SHA256SUMS.txt`, an
 alias of the x64 checksum file kept for older auto-update clients.
 
 Scoop puts `noctty` on your `PATH`. WinGet runs the installer, and neither the
