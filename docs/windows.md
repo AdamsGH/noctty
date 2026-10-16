@@ -35,11 +35,10 @@ the staged executable's version string and numeric fields to match `-Version`.
 
 ## D3D11 renderer beta
 
-OpenGL remains the default. A normal Windows build includes both renderers,
-and the x64 and ARM64 release builds are normal builds (the 1.3.132 ARM64
-portable ZIP's `noctty.exe` contains the beta; `+version` prints a
-`D3D11 beta` line that reads `available` or `omitted`). To opt in, add this to
-your config and open a new window, tab, or split:
+OpenGL remains the default. The x64 and ARM64 release builds include both
+renderers; `noctty +version` prints a `D3D11 beta` line that reads `available`
+(or `omitted` in a build made with `-Dd3d11=false`). To opt in, add this to your
+config and open a new window, tab, or split:
 
 ```ini
 renderer = d3d11
@@ -109,6 +108,21 @@ Kitty-triggered OpenGL handoff. Screenshots are optional and capture displayed
 pixels. `-PrepareOnly` validates staging without launching a window. It changes
 only the staged config and never sets the clipboard or takes foreground.
 An automated readback alone is not a passing visible-desktop check.
+
+### Starting without OpenGL
+
+Set `renderer` before launch failures pile up. The config file is
+`%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside
+`noctty.exe` in portable mode. After three launches in a row that end before
+the window is ready, noctty starts in safe mode (see
+[Session restore and recovery](#session-restore-and-recovery)). Safe mode uses
+the built-in defaults and ignores `renderer`, so the failing OpenGL start
+repeats and counts again. If that has happened, move `startup-attempts.json`
+out of the noctty data folder (`%LOCALAPPDATA%\noctty`, or the folder beside
+`noctty.exe` in portable mode; noctty writes a new one) and start noctty
+again. This comes from reading `Policy`, `decide` and
+`beginRecoveryStartupAtPath` in the Win32 runtime; it was not run on a machine
+without OpenGL.
 
 ## Install modes
 
@@ -834,10 +848,10 @@ part of the tab strip to move the window; double-clicking it maximizes and
 restores, and right-clicking it opens the window menu (measured with posted
 messages on a hidden desktop, not with real mouse input). With
 `window-show-tab-bar = never` there is no strip to drag, so move the window
-with Alt+Space, then Move, or with Win+arrow keys. On Windows 10 the window is
-frameless: no border, shadow, or resize edges, no Alt+Space menu, and
-maximizing it covers the taskbar. The quick terminal is frameless on both, so
-it sits flush with its screen edge.
+with Alt+Space, then Move, or with Win+arrow keys (Snap, not measured). On
+Windows 10 the window is frameless: no border, shadow, or resize edges, no
+Alt+Space menu, and no tab-strip drag, and maximizing it covers the taskbar.
+The quick terminal is frameless on both, so it sits flush with its screen edge.
 
 The universal palette puts actions, live tabs, panes, Windows profiles,
 named layouts, and native settings in one fuzzy-ranked, keyboard-driven
@@ -1619,25 +1633,32 @@ With the pack, OpenGL comes from a Microsoft mapping layer rather than a GPU
 vendor's driver, but noctty neither knows nor cares which supplied it.
 
 The alternative, without the pack, is the opt-in D3D11 renderer (beta), which
-the ARM64 release build includes. Add `renderer = d3d11` to
-`%LOCALAPPDATA%\noctty\config.ghostty` (hardware Direct3D 11, then Microsoft's
-WARP software renderer) or `renderer = d3d11-warp` (WARP only), and start
-noctty again. With either setting, and no custom shader or background image
-configured, noctty creates no OpenGL context for a new terminal, so a PC whose
-only OpenGL is the GDI software implementation can start (read from
-`Surface.init` and `renderer/Windows.zig`; the CI smoke on the ARM64 runner
-covers the WARP lifecycle, not a Snapdragon GPU). Custom shaders, background
-images and Kitty images are not drawn by the beta: noctty tries OpenGL for them
-and, if that fails, keeps drawing text with a visible notice. WARP can use a lot
-of CPU under heavy output.
+the ARM64 release build includes. Add `renderer = d3d11` to the config file
+(hardware Direct3D 11, then Microsoft's WARP software renderer) or
+`renderer = d3d11-warp` (WARP only), and start noctty again. The config file is
+`%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside
+`noctty.exe` in portable mode. With either setting, and no custom shader or
+background image configured, noctty creates no OpenGL context for a new
+terminal, so a PC whose only OpenGL is the GDI software implementation can
+start (read from `Surface.init` and `renderer/Windows.zig`; the CI smoke on the
+ARM64 runner covers the WARP lifecycle, not a Snapdragon GPU). Custom shaders,
+background images and Kitty images are not drawn by the beta: noctty tries
+OpenGL for them and, if that fails, keeps drawing text with a visible notice.
+WARP can use a lot of CPU under heavy output.
+
+Make that change before a third failed start; see
+[starting without OpenGL](#starting-without-opengl).
 
 There is no AMD or NVIDIA driver to reinstall on ARM64 and no second GPU to
 select in Windows Graphics settings, so noctty's startup dialog leads with
 the Compatibility Pack when it detects an ARM64 native machine, and keeps the
-Remote Desktop and VM guidance, which applies on any architecture. The dialog
-and `noctty +version` both report the architecture: `ARM64` for a native
-build, or `x64 (running on ARM64)` if you installed the x64 build by mistake.
-Prefer the ARM64 artifacts on a Snapdragon PC.
+Remote Desktop and VM guidance, which applies on any architecture. The
+1.3.132 dialog predates the beta: it says the build has no software, DirectX,
+or ANGLE fallback renderer and does not mention `renderer = d3d11`, which is
+out of date for builds that include the beta. The dialog and `noctty +version`
+both report the architecture: `ARM64` for a native build, or
+`x64 (running on ARM64)` if you installed the x64 build by mistake. Prefer the
+ARM64 artifacts on a Snapdragon PC.
 
 ### Stale installed build
 

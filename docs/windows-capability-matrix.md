@@ -300,7 +300,9 @@ it — see the [screen-reader matrix](accessibility-matrix.md).
 
 ### Renderer
 
-Terminal presentation is owned by WGL `SwapBuffers`. A separate
+With the default OpenGL renderer, terminal presentation is owned by WGL
+`SwapBuffers`; the opt-in D3D11 beta presents through its own flip-model swap
+chain. A separate
 D3D11/DirectComposition shell pipeline (recoverable top-level targets,
 transparent DPI-sized D2D surfaces, DirectWrite host banner text) exists in
 the source but is not started: `App.init` gives its backend no driver, so

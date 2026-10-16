@@ -69,17 +69,19 @@ supports OpenGL 4.3 or later.
 
 - The default renderer has no software fallback, so Noctty won't start where
   OpenGL falls back to software. That is common over Remote Desktop and in VMs
-  without 3D acceleration. The opt-in Direct3D 11 renderer (beta) is the
-  alternative there: set `renderer = d3d11` in your config to try hardware
-  Direct3D 11, then Microsoft's WARP software renderer, or use
-  `renderer = d3d11-warp` for WARP directly. It draws text without OpenGL;
-  custom shaders, background images, and Kitty images need OpenGL. Remote
-  Desktop has not been measured
-  ([details](docs/windows.md#d3d11-renderer-beta)).
-- On Windows on Arm PCs, first install the free **OpenCL, OpenGL, and Vulkan
+  without 3D acceleration.
+- The opt-in Direct3D 11 renderer (beta) is the alternative there. Set
+  `renderer = d3d11` in your config to try hardware Direct3D 11, then
+  Microsoft's WARP software renderer, or `renderer = d3d11-warp` to use WARP
+  directly. It draws text without OpenGL; custom shaders, background images,
+  and Kitty images need OpenGL. Remote Desktop has not been measured. Set it
+  before launch failures pile up: after three failed starts Noctty uses
+  built-in defaults, which ignore `renderer`
+  ([details](docs/windows.md#starting-without-opengl)).
+- On Windows on Arm PCs, install the free **OpenCL, OpenGL, and Vulkan
   Compatibility Pack** from the Microsoft Store
   ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)),
-  or try the Direct3D 11 renderer (beta) above. The ARM64 build includes it.
+  or use the Direct3D 11 renderer (beta). The ARM64 build includes it.
 
 The latest release is
 [noctty 1.3.132](https://github.com/amanthanvi/noctty/releases/tag/v1.3.132),
