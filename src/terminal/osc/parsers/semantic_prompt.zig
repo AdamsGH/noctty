@@ -152,11 +152,13 @@ pub const Option = enum {
             // If we're looking for exit_code we special case it.
             // as the first value.
             if (comptime self == .exit_code) {
-                return std.fmt.parseInt(
-                    i32,
-                    full,
-                    10,
-                ) catch null;
+                return std.fmt.parseInt(i32, full, 10) catch {
+                    // Windows reports an exit code as a DWORD, so a crash
+                    // is often spelled unsigned (`3221225477` for
+                    // 0xC0000005). Keep the 32 bits.
+                    const unsigned = std.fmt.parseInt(u32, full, 10) catch return null;
+                    return @bitCast(unsigned);
+                };
             }
 
             // Parse our key=value and verify our key matches our
@@ -1261,4 +1263,18 @@ test "Option.read exit_code" {
     try testing.expect(Option.exit_code.read("-1").? == -1);
     try testing.expect(Option.exit_code.read("abc") == null);
     try testing.expect(Option.exit_code.read("127;aid=foo").? == 127);
+}
+
+test "Option.read exit_code accepts the unsigned spelling of a 32-bit code" {
+    const testing = std.testing;
+    // 0xC0000005 (access violation) as a DWORD, and the same code signed.
+    try testing.expectEqual(@as(?i32, -1073741819), Option.exit_code.read("3221225477"));
+    try testing.expectEqual(@as(?i32, -1073741819), Option.exit_code.read("-1073741819"));
+    try testing.expectEqual(@as(?i32, -1), Option.exit_code.read("4294967295"));
+    try testing.expectEqual(@as(?i32, std.math.minInt(i32)), Option.exit_code.read("2147483648"));
+    try testing.expectEqual(@as(?i32, 2147483647), Option.exit_code.read("2147483647"));
+    try testing.expectEqual(@as(?i32, -1073741819), Option.exit_code.read("3221225477;aid=foo"));
+    // Past 32 bits either way is still malformed.
+    try testing.expect(Option.exit_code.read("4294967296") == null);
+    try testing.expect(Option.exit_code.read("-2147483649") == null);
 }
