@@ -78,14 +78,18 @@ The latest release is
 [noctty 1.3.131](https://github.com/amanthanvi/noctty/releases/tag/v1.3.131),
 published 2026-09-24.
 
+### With WinGet
+
+```powershell
+winget install --id AmanThanvi.noctty -e
+```
+
 ### With Scoop
 
 ```powershell
 scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty
 scoop install noctty/noctty
 ```
-
-A WinGet package is planned but not published yet.
 
 ### Direct download
 
@@ -118,7 +122,8 @@ Each release also includes signed manifests of the portable ZIP contents
 `noctty-1.3.131-windows-arm64-portable.manifest.ps1`) and `SHA256SUMS.txt`, an
 alias of the x64 checksum file kept for older auto-update clients.
 
-Scoop puts `noctty` on your `PATH`; the installer and the portable ZIP do not.
+Scoop puts `noctty` on your `PATH`; WinGet runs the installer, so it, the
+installer and the portable ZIP do not.
 To run the `noctty` commands in this README, add the install folder to `PATH`
 or run `.\noctty.com` from that folder.
 

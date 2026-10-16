@@ -1,8 +1,8 @@
-// Copies the Scoop install command from the hero.
+// Copies the WinGet install command from the hero.
 
 const COPY_RESET_MS = 1400;
 const INSTALL_COMMAND =
-  'scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty\r\nscoop install noctty/noctty';
+  'winget install --id AmanThanvi.noctty -e';
 
 function writeClipboardTextFallback(text) {
   const textarea = document.createElement('textarea');

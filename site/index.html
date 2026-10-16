@@ -105,8 +105,7 @@
           <div class="nc-install">
             <div class="nc-install__row">
               <span class="nc-install__sigil" aria-hidden="true">$</span>
-              <code class="nc-install__command" id="nc-install-command">scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty
-scoop install noctty/noctty</code>
+              <code class="nc-install__command" id="nc-install-command">winget install --id AmanThanvi.noctty -e</code>
               <button type="button" class="nc-install__copy" id="nc-install-copy" aria-label="Copy install command">
                 <svg class="nc-install__copy-icon nc-install__copy-icon--copy" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <rect x="5.5" y="5.5" width="8" height="9" rx="1.5" stroke="currentColor" stroke-width="1.25" />
@@ -118,7 +117,7 @@ scoop install noctty/noctty</code>
               </button>
               <span class="nc-sr-only" aria-live="polite" id="nc-install-status"></span>
             </div>
-            <p class="nc-install__note">Scoop, or the signed installer below. WinGet: bootstrap pending.</p>
+            <p class="nc-install__note">WinGet, Scoop, or the signed installer below.</p>
           </div>
         </div>
 
@@ -254,12 +253,11 @@ scoop install noctty/noctty</code>
     <section class="nc-shell nc-section nc-close" id="install" aria-labelledby="install-title">
       <h2 class="nc-section__title" id="install-title">Install</h2>
       <div class="nc-close__grid">
-        <pre class="nc-code"><code>scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty
-scoop install noctty/noctty</code></pre>
+        <pre class="nc-code"><code>winget install --id AmanThanvi.noctty -e</code></pre>
         <p class="nc-close__note">
-          Or take the signed installer or portable ZIP from the
+          Or use Scoop (<code>scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty</code>, then
+          <code>scoop install noctty/noctty</code>), or take the signed installer or portable ZIP from the
           <a href="https://github.com/amanthanvi/noctty/releases/latest" target="_blank" rel="noopener noreferrer">latest release</a>.
-          WinGet is pending bootstrap.
           <a href="https://github.com/amanthanvi/noctty/blob/main/docs/getting-started.md" target="_blank" rel="noopener noreferrer">Getting started</a>
           covers first run;
           <a href="https://github.com/amanthanvi/noctty/blob/main/docs/verify-release.md" target="_blank" rel="noopener noreferrer">verifying a release</a>
@@ -302,7 +300,7 @@ scoop install noctty/noctty</code></pre>
 
   <script type="module" src="app.js?v=98916ae44c47820a7a796236e272181592d780769a90b706acea8eeb8eead2d1"></script>
   <script type="module" src="version.js?v=0193c4af60136c3be71d1872ce66e4e95e19846cf55000f71b7b24497c321ec3"></script>
-  <script type="module" src="install.js?v=7d814eb53693cfdd38356f41fca1fbbe1111beccbae7eb87aa2f8c3e82527ca5"></script>
+  <script type="module" src="install.js?v=1005bd5f2e7cf474443409e9871ca91c6c71254d46dce67126352aa1c5779c90"></script>
   <script type="module" src="terminal.js?v=e01f79a4a5b520d66741c4d16f039c2a5fbc154e7415564822367dea8d2acd2d"></script>
 </body>
 </html>
