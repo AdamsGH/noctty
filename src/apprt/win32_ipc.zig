@@ -94,6 +94,18 @@ pub const NewSplitPayload = struct {
     }
 };
 
+/// One end of an IPC pipe. The server's instances are opened with
+/// FILE_FLAG_OVERLAPPED so that waiting for a client, or for a request's
+/// bytes, blocks on an event instead of polling: for those, `event` is the
+/// manual-reset event every read and write completes on, and `stop_event`
+/// abandons a wait once it is set. Client handles (PIPE_NOWAIT) and the
+/// decoders' test files are synchronous and leave both null.
+pub const Pipe = struct {
+    handle: windows.HANDLE,
+    event: ?windows.HANDLE = null,
+    stop_event: ?windows.HANDLE = null,
+};
+
 /// Did the first-instance claim lose to a process that already owns the
 /// name? Both codes mean "someone else has it", not "the call was wrong".
 pub fn isIpcPipeClaimConflict(err: windows.Win32Error) bool {
@@ -155,7 +167,7 @@ fn appendWorkingDirectory(dst: *std.ArrayList(u8), alloc: Allocator, value: ?[]c
     try dst.appendSlice(alloc, cwd);
 }
 
-fn decodeWorkingDirectory(alloc: Allocator, pipe: windows.HANDLE, deadline_ms: u64) !?[]u8 {
+fn decodeWorkingDirectory(alloc: Allocator, pipe: Pipe, deadline_ms: u64) !?[]u8 {
     var len_buf: [4]u8 = undefined;
     try readExactUntil(pipe, &len_buf, deadline_ms);
     const len = readU32(&len_buf);
@@ -364,7 +376,7 @@ pub fn encodeSendTextRequest(
     return try encoded.toOwnedSlice(alloc);
 }
 
-pub fn decodeRequestKind(pipe: windows.HANDLE) !RequestKind {
+pub fn decodeRequestKind(pipe: Pipe) !RequestKind {
     var header: [5]u8 = undefined;
     try readExactUntil(pipe, &header, deadline());
 
@@ -374,7 +386,7 @@ pub fn decodeRequestKind(pipe: windows.HANDLE) !RequestKind {
 
 pub fn decodeNewWindowPayload(
     alloc: Allocator,
-    pipe: windows.HANDLE,
+    pipe: Pipe,
 ) !?[]const [:0]const u8 {
     const deadline_ms = deadline();
     var argc_buf: [4]u8 = undefined;
@@ -413,7 +425,7 @@ pub fn decodeNewWindowPayload(
 }
 
 fn decodeAutomationDeadline(
-    pipe: windows.HANDLE,
+    pipe: Pipe,
     timed: bool,
     io_deadline_ms: u64,
 ) !u64 {
@@ -423,7 +435,7 @@ fn decodeAutomationDeadline(
     return readU64(&encoded);
 }
 
-pub fn decodeListWindowsDeadline(pipe: windows.HANDLE, timed: bool) !u64 {
+pub fn decodeListWindowsDeadline(pipe: Pipe, timed: bool) !u64 {
     const io_deadline_ms = deadline();
     if (timed) return decodeAutomationDeadline(pipe, true, io_deadline_ms);
 
@@ -437,7 +449,7 @@ pub fn decodeListWindowsDeadline(pipe: windows.HANDLE, timed: bool) !u64 {
 
 pub fn decodePerformActionPayload(
     alloc: Allocator,
-    pipe: windows.HANDLE,
+    pipe: Pipe,
     timed: bool,
 ) !PerformActionPayload {
     const io_deadline_ms = deadline();
@@ -467,7 +479,7 @@ pub fn decodePerformActionPayload(
 
 pub fn decodeLaunchLayoutPayload(
     alloc: Allocator,
-    pipe: windows.HANDLE,
+    pipe: Pipe,
     timed: bool,
 ) !struct { deadline_ms: u64, name: []u8 } {
     const io_deadline_ms = deadline();
@@ -496,7 +508,7 @@ fn validateLaunchLayoutName(name: []const u8) !void {
     win32_layouts.validateName(name) catch return error.InvalidAutomationAction;
 }
 
-pub fn decodeNewTabPayload(alloc: Allocator, pipe: windows.HANDLE, timed: bool) !NewTabPayload {
+pub fn decodeNewTabPayload(alloc: Allocator, pipe: Pipe, timed: bool) !NewTabPayload {
     const io_deadline_ms = deadline();
     const request_deadline_ms = try decodeAutomationDeadline(pipe, timed, io_deadline_ms);
     var encoded: [9]u8 = undefined;
@@ -510,7 +522,7 @@ pub fn decodeNewTabPayload(alloc: Allocator, pipe: windows.HANDLE, timed: bool) 
     };
 }
 
-pub fn decodeNewSplitPayload(alloc: Allocator, pipe: windows.HANDLE, timed: bool) !NewSplitPayload {
+pub fn decodeNewSplitPayload(alloc: Allocator, pipe: Pipe, timed: bool) !NewSplitPayload {
     const io_deadline_ms = deadline();
     const request_deadline_ms = try decodeAutomationDeadline(pipe, timed, io_deadline_ms);
     var encoded: [10]u8 = undefined;
@@ -533,7 +545,7 @@ pub fn decodeNewSplitPayload(alloc: Allocator, pipe: windows.HANDLE, timed: bool
     };
 }
 
-pub fn decodeFocusPayload(pipe: windows.HANDLE, timed: bool) !FocusPayload {
+pub fn decodeFocusPayload(pipe: Pipe, timed: bool) !FocusPayload {
     const io_deadline_ms = deadline();
     const request_deadline_ms = try decodeAutomationDeadline(pipe, timed, io_deadline_ms);
     var encoded: [9]u8 = undefined;
@@ -546,7 +558,7 @@ pub fn decodeFocusPayload(pipe: windows.HANDLE, timed: bool) !FocusPayload {
 
 pub fn decodeSendTextPayload(
     alloc: Allocator,
-    pipe: windows.HANDLE,
+    pipe: Pipe,
     timed: bool,
 ) !SendTextPayload {
     const io_deadline_ms = deadline();
@@ -570,11 +582,11 @@ pub fn decodeSendTextPayload(
     };
 }
 
-pub fn writeAck(pipe: windows.HANDLE, success: bool) !void {
+pub fn writeAck(pipe: Pipe, success: bool) !void {
     return writeAckStatus(pipe, if (success) ack_success else ack_failure);
 }
 
-pub fn writeAckStatus(pipe: windows.HANDLE, status: u8) !void {
+pub fn writeAckStatus(pipe: Pipe, status: u8) !void {
     var response: [5]u8 = undefined;
     std.mem.writeInt(u32, response[0..4], wire_version, .little);
     response[4] = status;
@@ -603,7 +615,7 @@ pub fn readAckWithTimeout(pipe: windows.HANDLE, timeout_ms: u64) !bool {
 }
 
 pub fn writeDataResponse(
-    pipe: windows.HANDLE,
+    pipe: Pipe,
     success: bool,
     body: []const u8,
 ) !void {
@@ -629,9 +641,10 @@ pub fn readDataResponseWithTimeout(
     pipe: windows.HANDLE,
     timeout_ms: u64,
 ) ![]u8 {
+    const client: Pipe = .{ .handle = pipe };
     const deadline_ms = sys.GetTickCount64() +| timeout_ms;
     var header: [5]u8 = undefined;
-    try readExactUntil(pipe, &header, deadline_ms);
+    try readExactUntil(client, &header, deadline_ms);
     if (readU32(header[0..4]) != wire_version) return error.InvalidIpcResponse;
 
     const success = switch (header[4]) {
@@ -641,7 +654,7 @@ pub fn readDataResponseWithTimeout(
     };
 
     var len_buf: [4]u8 = undefined;
-    readExactUntil(pipe, &len_buf, deadline_ms) catch |err| switch (err) {
+    readExactUntil(client, &len_buf, deadline_ms) catch |err| switch (err) {
         error.EndOfStream => {
             if (!success) return error.IPCFailed;
             return error.InvalidIpcResponse;
@@ -655,12 +668,12 @@ pub fn readDataResponseWithTimeout(
     if (len > max_data_response_len) return error.InvalidIpcResponse;
     const body = try alloc.alloc(u8, len);
     errdefer alloc.free(body);
-    if (len > 0) try readExactUntil(pipe, body, deadline_ms);
+    if (len > 0) try readExactUntil(client, body, deadline_ms);
     return body;
 }
 
 pub fn readExact(pipe: windows.HANDLE, dst: []u8) !void {
-    return readExactUntil(pipe, dst, deadline());
+    return readExactUntil(.{ .handle = pipe }, dst, deadline());
 }
 
 pub fn readExactWithTimeout(
@@ -668,7 +681,7 @@ pub fn readExactWithTimeout(
     dst: []u8,
     timeout_ms: u64,
 ) !void {
-    return readExactUntil(pipe, dst, sys.GetTickCount64() +| timeout_ms);
+    return readExactUntil(.{ .handle = pipe }, dst, sys.GetTickCount64() +| timeout_ms);
 }
 
 fn deadline() u64 {
@@ -680,7 +693,7 @@ fn pipeIoPending(err: windows.Win32Error) bool {
 }
 
 fn readExactUntil(
-    pipe: windows.HANDLE,
+    pipe: Pipe,
     dst: []u8,
     deadline_ms: u64,
 ) !void {
@@ -694,7 +707,7 @@ fn readExactUntil(
         // continuously dribbling short reads.
         if (expired_buffered_budget == null and sys.GetTickCount64() >= deadline_ms) {
             var available: u32 = 0;
-            if (sys.PeekNamedPipe(pipe, null, 0, null, &available, null) == 0) {
+            if (sys.PeekNamedPipe(pipe.handle, null, 0, null, &available, null) == 0) {
                 const err = windows.kernel32.GetLastError();
                 if (err == .BROKEN_PIPE) return error.EndOfStream;
                 if (pipeIoPending(err)) return error.IpcTimeout;
@@ -708,23 +721,28 @@ fn readExactUntil(
             @min(budget, dst.len - offset)
         else
             dst.len - offset;
-        var read_len: u32 = 0;
-        if (windows.kernel32.ReadFile(
-            pipe,
-            dst[offset..].ptr,
-            @intCast(read_cap),
-            &read_len,
-            null,
-        ) == 0) {
-            const err = windows.kernel32.GetLastError();
-            if (err == .BROKEN_PIPE) return error.EndOfStream;
-            if (pipeIoPending(err)) {
-                if (sys.GetTickCount64() >= deadline_ms) return error.IpcTimeout;
-                std.Thread.sleep(poll_interval_ns);
-                continue;
+        const read_len = if (pipe.event) |event|
+            try readOverlapped(pipe, event, dst[offset..][0..read_cap], deadline_ms)
+        else read: {
+            var read_len: u32 = 0;
+            if (windows.kernel32.ReadFile(
+                pipe.handle,
+                dst[offset..].ptr,
+                @intCast(read_cap),
+                &read_len,
+                null,
+            ) == 0) {
+                const err = windows.kernel32.GetLastError();
+                if (err == .BROKEN_PIPE) return error.EndOfStream;
+                if (pipeIoPending(err)) {
+                    if (sys.GetTickCount64() >= deadline_ms) return error.IpcTimeout;
+                    std.Thread.sleep(poll_interval_ns);
+                    continue;
+                }
+                return windows.unexpectedError(err);
             }
-            return windows.unexpectedError(err);
-        }
+            break :read read_len;
+        };
 
         if (read_len == 0) return error.EndOfStream;
         offset += read_len;
@@ -735,31 +753,103 @@ fn readExactUntil(
     }
 }
 
-pub fn writeAll(pipe: windows.HANDLE, src: []const u8) !void {
+pub fn writeAll(pipe: Pipe, src: []const u8) !void {
     const started_at = sys.GetTickCount64();
     var offset: usize = 0;
     while (offset < src.len) {
-        var write_len: u32 = 0;
-        if (windows.kernel32.WriteFile(
-            pipe,
-            src[offset..].ptr,
-            @intCast(src.len - offset),
-            &write_len,
-            null,
-        ) == 0) {
-            const err = windows.kernel32.GetLastError();
-            if (pipeIoPending(err)) {
-                if (sys.GetTickCount64() -| started_at >= io_timeout_ms) {
-                    return error.IpcTimeout;
+        const write_len = if (pipe.event) |event|
+            try writeOverlapped(pipe, event, src[offset..], started_at +| io_timeout_ms)
+        else write: {
+            var write_len: u32 = 0;
+            if (windows.kernel32.WriteFile(
+                pipe.handle,
+                src[offset..].ptr,
+                @intCast(src.len - offset),
+                &write_len,
+                null,
+            ) == 0) {
+                const err = windows.kernel32.GetLastError();
+                if (pipeIoPending(err)) {
+                    if (sys.GetTickCount64() -| started_at >= io_timeout_ms) {
+                        return error.IpcTimeout;
+                    }
+                    std.Thread.sleep(poll_interval_ns);
+                    continue;
                 }
-                std.Thread.sleep(poll_interval_ns);
-                continue;
+                return windows.unexpectedError(err);
             }
-            return windows.unexpectedError(err);
-        }
+            break :write write_len;
+        };
         if (write_len == 0) return error.WriteFailed;
         offset += write_len;
     }
+}
+
+fn readOverlapped(pipe: Pipe, event: windows.HANDLE, dst: []u8, deadline_ms: u64) !u32 {
+    var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    overlapped.hEvent = event;
+    const started = windows.kernel32.ReadFile(pipe.handle, dst.ptr, @intCast(dst.len), null, &overlapped);
+    return finishOverlapped(pipe, &overlapped, started, deadline_ms);
+}
+
+fn writeOverlapped(pipe: Pipe, event: windows.HANDLE, src: []const u8, deadline_ms: u64) !u32 {
+    var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    overlapped.hEvent = event;
+    const started = windows.kernel32.WriteFile(pipe.handle, src.ptr, @intCast(src.len), null, &overlapped);
+    return finishOverlapped(pipe, &overlapped, started, deadline_ms);
+}
+
+fn finishOverlapped(
+    pipe: Pipe,
+    overlapped: *windows.OVERLAPPED,
+    started: BOOL,
+    deadline_ms: u64,
+) !u32 {
+    if (started == 0) switch (windows.kernel32.GetLastError()) {
+        .IO_PENDING => {},
+        .BROKEN_PIPE, .NO_DATA, .PIPE_NOT_CONNECTED => return error.EndOfStream,
+        else => |err| return windows.unexpectedError(err),
+    };
+    return awaitOverlapped(pipe.handle, overlapped, pipe.stop_event, deadline_ms);
+}
+
+/// Wait for an overlapped operation on `handle` to complete, for
+/// `deadline_ms` to pass (`maxInt(u64)` never passes), or for `stop_event`.
+/// An operation still running then is cancelled and waited for, so the
+/// kernel is done with `overlapped` whenever this returns. Returns the bytes
+/// transferred.
+pub fn awaitOverlapped(
+    handle: windows.HANDLE,
+    overlapped: *windows.OVERLAPPED,
+    stop_event: ?windows.HANDLE,
+    deadline_ms: u64,
+) !u32 {
+    var events: [2]windows.HANDLE = .{ overlapped.hEvent.?, undefined };
+    var count: u32 = 1;
+    if (stop_event) |event| {
+        events[1] = event;
+        count = 2;
+    }
+    const timeout_ms: u32 = if (deadline_ms == std.math.maxInt(u64))
+        windows.INFINITE
+    else
+        @intCast(@min(deadline_ms -| sys.GetTickCount64(), windows.INFINITE - 1));
+    const waited = windows.kernel32.WaitForMultipleObjects(count, &events, windows.FALSE, timeout_ms);
+    if (waited != windows.WAIT_OBJECT_0) _ = windows.kernel32.CancelIoEx(handle, overlapped);
+
+    var transferred: u32 = 0;
+    if (windows.kernel32.GetOverlappedResult(handle, overlapped, &transferred, windows.TRUE) != 0) {
+        return transferred;
+    }
+    return switch (windows.kernel32.GetLastError()) {
+        .OPERATION_ABORTED => switch (waited) {
+            windows.WAIT_OBJECT_0 + 1 => error.IpcStopped,
+            windows.WAIT_TIMEOUT => error.IpcTimeout,
+            else => error.Unexpected,
+        },
+        .BROKEN_PIPE, .NO_DATA, .PIPE_NOT_CONNECTED => error.EndOfStream,
+        else => |err| windows.unexpectedError(err),
+    };
 }
 
 fn automationTargetBytes(tag: u8, value: u64) [9]u8 {
@@ -848,10 +938,10 @@ test "win32 automation keeps legacy v1 kinds decodable" {
     list_request[4] = @intFromEnum(RequestKind.list_windows);
     std.mem.writeInt(u32, list_request[5..9], 0, .little);
     try writeAutomationBytes(&file, &list_request);
-    try std.testing.expectEqual(RequestKind.list_windows, try decodeRequestKind(file.handle));
+    try std.testing.expectEqual(RequestKind.list_windows, try decodeRequestKind(.{ .handle = file.handle }));
     try std.testing.expectEqual(
         std.math.maxInt(u64),
-        try decodeListWindowsDeadline(file.handle, false),
+        try decodeListWindowsDeadline(.{ .handle = file.handle }, false),
     );
 
     const action_text = "new_tab";
@@ -864,8 +954,8 @@ test "win32 automation keeps legacy v1 kinds decodable" {
     try appendU32(&action_request, std.testing.allocator, @intCast(action_text.len));
     try action_request.appendSlice(std.testing.allocator, action_text);
     try writeAutomationBytes(&file, action_request.items);
-    try std.testing.expectEqual(RequestKind.perform_action, try decodeRequestKind(file.handle));
-    const payload = try decodePerformActionPayload(std.testing.allocator, file.handle, false);
+    try std.testing.expectEqual(RequestKind.perform_action, try decodeRequestKind(.{ .handle = file.handle }));
+    const payload = try decodePerformActionPayload(std.testing.allocator, .{ .handle = file.handle }, false);
     defer std.testing.allocator.free(payload.action_text);
     try std.testing.expectEqual(std.math.maxInt(u64), payload.deadline_ms);
     try std.testing.expectEqual(apprt.ipc.AutomationActionTarget.focused, payload.target);
@@ -883,8 +973,8 @@ test "win32 automation request and ack round trips" {
         const request = try encodeFocusRequest(std.testing.allocator, target, test_deadline_ms);
         defer std.testing.allocator.free(request);
         try writeAutomationBytes(&file, request);
-        try std.testing.expectEqual(RequestKind.focus_timed, try decodeRequestKind(file.handle));
-        const payload = try decodeFocusPayload(file.handle, true);
+        try std.testing.expectEqual(RequestKind.focus_timed, try decodeRequestKind(.{ .handle = file.handle }));
+        const payload = try decodeFocusPayload(.{ .handle = file.handle }, true);
         try std.testing.expectEqual(test_deadline_ms, payload.deadline_ms);
         try std.testing.expectEqual(target, payload.target);
     }
@@ -898,8 +988,8 @@ test "win32 automation request and ack round trips" {
     );
     defer std.testing.allocator.free(send);
     try writeAutomationBytes(&file, send);
-    try std.testing.expectEqual(RequestKind.send_text_timed, try decodeRequestKind(file.handle));
-    var sent = try decodeSendTextPayload(std.testing.allocator, file.handle, true);
+    try std.testing.expectEqual(RequestKind.send_text_timed, try decodeRequestKind(.{ .handle = file.handle }));
+    var sent = try decodeSendTextPayload(std.testing.allocator, .{ .handle = file.handle }, true);
     defer sent.deinit(std.testing.allocator);
     try std.testing.expectEqual(test_deadline_ms, sent.deadline_ms);
     try std.testing.expectEqualStrings(text, sent.text);
@@ -915,8 +1005,8 @@ test "win32 automation request and ack round trips" {
     );
     defer std.testing.allocator.free(tab);
     try writeAutomationBytes(&file, tab);
-    try std.testing.expectEqual(RequestKind.new_tab_timed, try decodeRequestKind(file.handle));
-    var tab_payload = try decodeNewTabPayload(std.testing.allocator, file.handle, true);
+    try std.testing.expectEqual(RequestKind.new_tab_timed, try decodeRequestKind(.{ .handle = file.handle }));
+    var tab_payload = try decodeNewTabPayload(std.testing.allocator, .{ .handle = file.handle }, true);
     defer tab_payload.deinit(std.testing.allocator);
     try std.testing.expectEqual(test_deadline_ms, tab_payload.deadline_ms);
     try std.testing.expectEqual(apprt.ipc.AutomationTarget{ .window_id = std.math.maxInt(u32) }, tab_payload.target);
@@ -931,8 +1021,8 @@ test "win32 automation request and ack round trips" {
     );
     defer std.testing.allocator.free(split);
     try writeAutomationBytes(&file, split);
-    try std.testing.expectEqual(RequestKind.new_split_timed, try decodeRequestKind(file.handle));
-    var split_payload = try decodeNewSplitPayload(std.testing.allocator, file.handle, true);
+    try std.testing.expectEqual(RequestKind.new_split_timed, try decodeRequestKind(.{ .handle = file.handle }));
+    var split_payload = try decodeNewSplitPayload(std.testing.allocator, .{ .handle = file.handle }, true);
     defer split_payload.deinit(std.testing.allocator);
     try std.testing.expectEqual(test_deadline_ms, split_payload.deadline_ms);
     try std.testing.expectEqual(apprt.ipc.AutomationTarget{ .surface_id = 42 }, split_payload.target);
@@ -945,7 +1035,7 @@ test "win32 automation request and ack round trips" {
     }) |case| {
         try file.setEndPos(0);
         try file.seekTo(0);
-        try writeAckStatus(file.handle, case.status);
+        try writeAckStatus(.{ .handle = file.handle }, case.status);
         try file.seekTo(0);
         try std.testing.expectError(case.expected, readAck(file.handle));
     }
@@ -981,8 +1071,8 @@ test "win32 automation malformed codecs free allocations" {
     var file = try tmp.dir.createFile("automation-invalid.bin", .{ .read = true });
     defer file.close();
     try writeAutomationBytes(&file, max_send);
-    _ = try decodeRequestKind(file.handle);
-    var max_payload = try decodeSendTextPayload(alloc, file.handle, true);
+    _ = try decodeRequestKind(.{ .handle = file.handle });
+    var max_payload = try decodeSendTextPayload(alloc, .{ .handle = file.handle }, true);
     defer max_payload.deinit(alloc);
     try std.testing.expectEqual(@as(usize, max_action_text_len), max_payload.text.len);
 
@@ -997,12 +1087,12 @@ test "win32 automation malformed codecs free allocations" {
     };
     for (bad_cases) |case| {
         try writeAutomationSizedPayload(&file, surface, "", case.len, case.body);
-        try std.testing.expectError(case.expected, decodeSendTextPayload(alloc, file.handle, true));
+        try std.testing.expectError(case.expected, decodeSendTextPayload(alloc, .{ .handle = file.handle }, true));
     }
     try writeAutomationSizedPayload(&file, surface, "", 0, "");
-    try std.testing.expectError(error.InvalidAutomationTarget, decodeNewTabPayload(alloc, file.handle, true));
+    try std.testing.expectError(error.InvalidAutomationTarget, decodeNewTabPayload(alloc, .{ .handle = file.handle }, true));
     try writeAutomationSizedPayload(&file, surface, &.{0}, 0, "");
-    try std.testing.expectError(error.InvalidAutomationDirection, decodeNewSplitPayload(alloc, file.handle, true));
+    try std.testing.expectError(error.InvalidAutomationDirection, decodeNewSplitPayload(alloc, .{ .handle = file.handle }, true));
     for ([_]struct { len: u32, body: []const u8, expected: anyerror }{
         .{ .len = 1, .body = &.{0xFF}, .expected = error.InvalidAutomationWorkingDirectory },
         .{ .len = 3, .body = "x\x00y", .expected = error.InvalidAutomationWorkingDirectory },
@@ -1010,7 +1100,7 @@ test "win32 automation malformed codecs free allocations" {
         .{ .len = 3, .body = "x", .expected = error.EndOfStream },
     }) |case| {
         try writeAutomationSizedPayload(&file, window, "", case.len, case.body);
-        try std.testing.expectError(case.expected, decodeNewTabPayload(alloc, file.handle, true));
+        try std.testing.expectError(case.expected, decodeNewTabPayload(alloc, .{ .handle = file.handle }, true));
     }
 }
 
@@ -1072,14 +1162,14 @@ test "win32 IPC silent client read is bounded" {
         readExactWithTimeout(server, &byte, 10),
     );
 
-    try writeAll(client, "x");
+    try writeAll(.{ .handle = client }, "x");
     try readExactWithTimeout(server, &byte, 0);
     try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
 
     const DelayedWriter = struct {
         fn run(pipe: windows.HANDLE) void {
             std.Thread.sleep(20 * std.time.ns_per_ms);
-            writeAll(pipe, "y") catch unreachable;
+            writeAll(.{ .handle = pipe }, "y") catch unreachable;
         }
     };
     const writer = try std.Thread.spawn(.{}, DelayedWriter.run, .{server});
@@ -1151,8 +1241,8 @@ test "win32 launch-layout IPC encode decode round trip" {
     try file.writeAll(request);
     try file.seekTo(0);
 
-    try std.testing.expectEqual(RequestKind.launch_layout_timed, try decodeRequestKind(file.handle));
-    const decoded = try decodeLaunchLayoutPayload(std.testing.allocator, file.handle, true);
+    try std.testing.expectEqual(RequestKind.launch_layout_timed, try decodeRequestKind(.{ .handle = file.handle }));
+    const decoded = try decodeLaunchLayoutPayload(std.testing.allocator, .{ .handle = file.handle }, true);
     defer std.testing.allocator.free(decoded.name);
     try std.testing.expectEqual(test_deadline_ms, decoded.deadline_ms);
     try std.testing.expectEqualStrings("Project Alpha", decoded.name);
@@ -1223,7 +1313,7 @@ test "win32 launch-layout IPC decoder rejects invalid names without leaks" {
         try file.seekTo(0);
         try std.testing.expectError(
             error.InvalidAutomationAction,
-            decodeLaunchLayoutPayload(std.testing.allocator, file.handle, true),
+            decodeLaunchLayoutPayload(std.testing.allocator, .{ .handle = file.handle }, true),
         );
     }
 }
@@ -1249,7 +1339,7 @@ test "win32 launch-layout IPC decoder cleans up on partial EOF" {
     try file.seekTo(0);
     try std.testing.expectError(
         error.EndOfStream,
-        decodeLaunchLayoutPayload(std.testing.allocator, file.handle, true),
+        decodeLaunchLayoutPayload(std.testing.allocator, .{ .handle = file.handle }, true),
     );
 }
 
@@ -1285,7 +1375,7 @@ test "win32 decodeNewWindowPayload rejects oversized argument length before allo
 
     try std.testing.expectError(
         error.InvalidIpcRequest,
-        decodeNewWindowPayload(std.testing.allocator, file.handle),
+        decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -1310,7 +1400,7 @@ test "win32 decodeNewWindowPayload rejects aggregate argument bytes before alloc
 
     try std.testing.expectError(
         error.InvalidIpcRequest,
-        decodeNewWindowPayload(std.testing.allocator, file.handle),
+        decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -1336,7 +1426,7 @@ test "win32 decodeNewWindowPayload cleans up initialized args on partial EOF" {
 
     try std.testing.expectError(
         error.EndOfStream,
-        decodeNewWindowPayload(std.testing.allocator, file.handle),
+        decodeNewWindowPayload(std.testing.allocator, .{ .handle = file.handle }),
     );
 }
 
@@ -1406,7 +1496,7 @@ fn fuzzDecodeNewWindowPayload(transport: *FuzzTransport, input: []const u8) !voi
     try transport.load(input);
     const arguments = decodeNewWindowPayload(
         std.testing.allocator,
-        transport.file.handle,
+        .{ .handle = transport.file.handle },
     ) catch |err| switch (err) {
         error.EndOfStream, error.InvalidIpcRequest, error.IpcTimeout => return,
         else => return err,
@@ -1430,7 +1520,7 @@ fn fuzzDecodeNewWindowPayload(transport: *FuzzTransport, input: []const u8) !voi
     try transport.load(encoded_before[5..]);
     const round_trip = try decodeNewWindowPayload(
         std.testing.allocator,
-        transport.file.handle,
+        .{ .handle = transport.file.handle },
     );
     defer freeOwnedArguments(std.testing.allocator, round_trip);
     try expectArgumentsEqual(arguments, round_trip);
@@ -1461,7 +1551,7 @@ test "win32 IPC new-window decoder rejects every truncated payload" {
         try transport.load(payload[0..len]);
         try std.testing.expectError(
             error.EndOfStream,
-            decodeNewWindowPayload(std.testing.allocator, transport.file.handle),
+            decodeNewWindowPayload(std.testing.allocator, .{ .handle = transport.file.handle }),
         );
     }
 }
@@ -1515,7 +1605,7 @@ fn fuzzDecodePerformActionPayload(transport: *FuzzTransport, input: []const u8) 
     try transport.load(input);
     const payload = decodePerformActionPayload(
         std.testing.allocator,
-        transport.file.handle,
+        .{ .handle = transport.file.handle },
         false,
     ) catch |err| switch (err) {
         error.EndOfStream,
@@ -1548,7 +1638,7 @@ fn fuzzDecodePerformActionPayload(transport: *FuzzTransport, input: []const u8) 
     try transport.load(encoded_before[5..]);
     const round_trip = try decodePerformActionPayload(
         std.testing.allocator,
-        transport.file.handle,
+        .{ .handle = transport.file.handle },
         true,
     );
     defer std.testing.allocator.free(round_trip.action_text);
@@ -1582,7 +1672,7 @@ test "win32 IPC perform-action decoder rejects every truncated payload" {
             error.EndOfStream,
             decodePerformActionPayload(
                 std.testing.allocator,
-                transport.file.handle,
+                .{ .handle = transport.file.handle },
                 false,
             ),
         );
