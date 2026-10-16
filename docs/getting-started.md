@@ -1,7 +1,9 @@
 # Getting started
 
 noctty runs on Windows 10 version 1809 (build 17763) or newer and Windows 11,
-x64 and ARM64, and needs a GPU driver with OpenGL 4.3 or newer.
+x64 and ARM64. The default renderer needs a GPU driver with OpenGL 4.3 or
+newer; where there is none, the opt-in Direct3D 11 renderer (beta) can draw
+text instead (see [the Windows guide](windows.md#d3d11-renderer-beta)).
 
 ## Install with WinGet or Scoop
 
@@ -188,8 +190,9 @@ WSL shows up in the picker but is never the default unless you set
 
 ## Updates
 
-noctty checks GitHub Releases on launch, unless a check succeeded in the
-last 24 hours, and never installs anything until you start it. `auto-update = off` disables the
+noctty checks GitHub Releases on launch, and about every six hours while a
+window stays open, unless a check succeeded in the last 24 hours, and never
+installs anything until you start it. `auto-update = off` disables the
 check. `auto-update = download` also downloads and verifies the installer
 ahead of time; you still choose when to install. Details are in
 [windows.md](windows.md#updates).

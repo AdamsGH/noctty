@@ -64,15 +64,22 @@ comparison with upstream Ghostty.
 ## Install
 
 **Requirements:** Windows 10 version 1809 (build 17763) or later, or
-Windows 11, on x64 or ARM64, with a GPU driver that supports OpenGL 4.3 or
-later.
+Windows 11, on x64 or ARM64. The default renderer needs a GPU driver that
+supports OpenGL 4.3 or later.
 
-- There is no software renderer, so Noctty won't start where OpenGL falls
-  back to software. That is common over Remote Desktop and in VMs without 3D
-  acceleration.
+- The default renderer has no software fallback, so Noctty won't start where
+  OpenGL falls back to software. That is common over Remote Desktop and in VMs
+  without 3D acceleration. The opt-in Direct3D 11 renderer (beta) is the
+  alternative there: set `renderer = d3d11` in your config to try hardware
+  Direct3D 11, then Microsoft's WARP software renderer, or use
+  `renderer = d3d11-warp` for WARP directly. It draws text without OpenGL;
+  custom shaders, background images, and Kitty images need OpenGL. Remote
+  Desktop has not been measured
+  ([details](docs/windows.md#d3d11-renderer-beta)).
 - On Windows on Arm PCs, first install the free **OpenCL, OpenGL, and Vulkan
   Compatibility Pack** from the Microsoft Store
-  ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)).
+  ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)),
+  or try the Direct3D 11 renderer (beta) above. The ARM64 build includes it.
 
 The latest release is
 [noctty 1.3.132](https://github.com/amanthanvi/noctty/releases/tag/v1.3.132),
@@ -172,8 +179,9 @@ Noctty from scripts and the command line, see
 
 - **No telemetry.** On its own, Noctty goes online only to check for updates,
   from GitHub Releases unless you set another update feed.
-- **Updates** are checked when Noctty starts, unless a check succeeded in the
-  last 24 hours. Nothing is installed until you start the update yourself. Set
+- **Updates** are checked when Noctty starts and about every six hours while a
+  window stays open, but no request is made if a check succeeded in the last
+  24 hours. Nothing is installed until you start the update yourself. Set
   `auto-update = off` to stop checking, or `auto-update = download` to have
   Noctty download and verify the update ahead of time.
 - **Crash dumps** stay on your PC in `%LOCALAPPDATA%\noctty\crash` and are
