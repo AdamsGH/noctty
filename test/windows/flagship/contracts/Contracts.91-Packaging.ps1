@@ -49,9 +49,15 @@ Invoke-ContractTable -Contracts @(
     }
     @{
         File = (Join-Path $repoRoot 'scripts\release-publish-chocolatey.ps1')
-        Pattern = '(?ms)Test-ChocolateyVersionPublished.*?nothing to push.*?choco push.*?\$pushExitCode -ne 0.*?already exists.*?treating the push as complete.*?throw "choco push failed'
+        Pattern = '(?ms)Test-ChocolateyVersionPublished.*?nothing to push.*?choco push.*?\$pushExitCode -ne 0\) \{\s*(?:#[^\n]*\n\s*)*if \(Test-ChocolateyVersionPublished.*?treating the push as complete.*?\$global:LASTEXITCODE = 0\s*return\s*\}.*?throw "choco push failed'
         Kind = 'Workflow'
-        Description = 'Chocolatey publishing is rerun-safe and tolerates only the duplicate-version response'
+        Description = 'Chocolatey publishing is rerun-safe and tolerates a failed push only when the feed then holds the version (409 also means a failed validation)'
+    }
+    @{
+        File = $releaseWorkflow
+        Pattern = '(?ms)- name: Submit WinGet manifest update\r?\n.*?- name: Publish Chocolatey package\r?\n(?:(?!- name:).)*\z'
+        Kind = 'Workflow'
+        Description = 'Chocolatey publishes last, so a moderation 403 cannot keep WinGet from the release'
     }
     @{
         File = "$releasePreflight :: Assert-WingetArchitectureCoverage"

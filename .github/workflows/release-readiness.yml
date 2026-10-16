@@ -30,6 +30,14 @@ jobs:
       WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
       WINDOWS_CODESIGN_TRUST_SELF_SIGNED: ${{ vars.WINDOWS_CODESIGN_TRUST_SELF_SIGNED }}
       WINDOWS_CODESIGN_MIN_VALIDITY_DAYS: ${{ vars.WINDOWS_CODESIGN_MIN_VALIDITY_DAYS }}
+      # Azure Artifact Signing (ADR 0006) stays dormant until the release
+      # environment defines all five; it signs through this job's GitHub OIDC
+      # identity, so it needs no secret (docs/artifact-signing-runbook.md).
+      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+      ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+      ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      ARTIFACT_SIGNING_TENANT_ID: ${{ vars.ARTIFACT_SIGNING_TENANT_ID }}
+      ARTIFACT_SIGNING_CLIENT_ID: ${{ vars.ARTIFACT_SIGNING_CLIENT_ID }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

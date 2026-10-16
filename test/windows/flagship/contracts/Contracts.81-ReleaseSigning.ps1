@@ -333,7 +333,12 @@ function Invoke-PreflightTimestampProbe {
         'WINDOWS_CODESIGN_PFX_BASE64',
         'WINDOWS_CODESIGN_PFX_PATH',
         'WINDOWS_CODESIGN_PFX_PASSWORD',
-        'WINDOWS_CODESIGN_MIN_VALIDITY_DAYS'
+        'WINDOWS_CODESIGN_MIN_VALIDITY_DAYS',
+        'ARTIFACT_SIGNING_ENDPOINT',
+        'ARTIFACT_SIGNING_ACCOUNT_NAME',
+        'ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME',
+        'ARTIFACT_SIGNING_TENANT_ID',
+        'ARTIFACT_SIGNING_CLIENT_ID'
     )
     $saved = @{}
     foreach ($name in $signingVariables) {
@@ -382,6 +387,59 @@ $preflightTimestampProbes = [ordered] @{
         MustMatch = 'Required code-signing certificate was not configured'
         MustNotMatch = 'WINDOWS_CODESIGN_TIMESTAMP_URL must'
     }
+    # Azure Artifact Signing (ADR 0006) stays dormant: a partial configuration,
+    # one next to the PFX, or a complete one before the updater accepts its
+    # rotating leaf certificates all stop preflight, and none of them falls
+    # back to the PFX checks above.
+    'Artifact Signing partly configured' = [pscustomobject]@{
+        Environment = @{
+            WINDOWS_CODESIGN_TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com'
+            ARTIFACT_SIGNING_ACCOUNT_NAME = 'nocttyprobe'
+        }
+        ExpectedExitCode = 1
+        MustMatch = 'Azure Artifact Signing is partly configured'
+        MustNotMatch = 'Required code-signing certificate was not configured'
+    }
+    'Artifact Signing next to the PFX' = [pscustomobject]@{
+        Environment = @{
+            WINDOWS_CODESIGN_TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com'
+            WINDOWS_CODESIGN_PFX_BASE64 = 'cHJvYmU='
+            ARTIFACT_SIGNING_ENDPOINT = 'https://eus.codesigning.azure.net'
+            ARTIFACT_SIGNING_ACCOUNT_NAME = 'nocttyprobe'
+            ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME = 'nocttyprobeprofile'
+            ARTIFACT_SIGNING_TENANT_ID = '00000000-0000-0000-0000-000000000001'
+            ARTIFACT_SIGNING_CLIENT_ID = '00000000-0000-0000-0000-000000000002'
+        }
+        ExpectedExitCode = 1
+        MustMatch = 'so WINDOWS_CODESIGN_PFX_BASE64 must be removed'
+        MustNotMatch = 'Signer SPKI SHA-256'
+    }
+    'Artifact Signing with a foreign endpoint' = [pscustomobject]@{
+        Environment = @{
+            WINDOWS_CODESIGN_TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com'
+            ARTIFACT_SIGNING_ENDPOINT = 'https://eus.codesigning.azure.net.example'
+            ARTIFACT_SIGNING_ACCOUNT_NAME = 'nocttyprobe'
+            ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME = 'nocttyprobeprofile'
+            ARTIFACT_SIGNING_TENANT_ID = '00000000-0000-0000-0000-000000000001'
+            ARTIFACT_SIGNING_CLIENT_ID = '00000000-0000-0000-0000-000000000002'
+        }
+        ExpectedExitCode = 1
+        MustMatch = 'ARTIFACT_SIGNING_ENDPOINT must be a regional endpoint'
+        MustNotMatch = 'Required code-signing certificate was not configured'
+    }
+    'Artifact Signing before the updater accepts it' = [pscustomobject]@{
+        Environment = @{
+            WINDOWS_CODESIGN_TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com'
+            ARTIFACT_SIGNING_ENDPOINT = 'https://eus.codesigning.azure.net'
+            ARTIFACT_SIGNING_ACCOUNT_NAME = 'nocttyprobe'
+            ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME = 'nocttyprobeprofile'
+            ARTIFACT_SIGNING_TENANT_ID = '00000000-0000-0000-0000-000000000001'
+            ARTIFACT_SIGNING_CLIENT_ID = '00000000-0000-0000-0000-000000000002'
+        }
+        ExpectedExitCode = 1
+        MustMatch = 'The updater does not accept Azure Artifact Signing yet'
+        MustNotMatch = 'Required code-signing certificate was not configured|Release preflight passed'
+    }
 }
 foreach ($probe in $preflightTimestampProbes.GetEnumerator()) {
     $result = Invoke-PreflightTimestampProbe -Environment $probe.Value.Environment
@@ -391,6 +449,86 @@ foreach ($probe in $preflightTimestampProbes.GetEnumerator()) {
         throw "Release preflight timestamp gate misbehaved for $($probe.Key) (exit $($result.ExitCode)): $($result.Text)"
     }
 }
+
+# The Artifact Signing path is configuration only: both workflows that enter
+# the release environment read its five values from environment variables,
+# never from secrets, and it signs through the job's own OIDC identity.
+$artifactSigningWorkflowContracts = foreach ($workflowPath in @(
+        $releaseWorkflow,
+        (Join-Path $repoRoot '.github\workflows\release-readiness.yml')
+    )) {
+    foreach ($name in @(
+            'ARTIFACT_SIGNING_ENDPOINT',
+            'ARTIFACT_SIGNING_ACCOUNT_NAME',
+            'ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME',
+            'ARTIFACT_SIGNING_TENANT_ID',
+            'ARTIFACT_SIGNING_CLIENT_ID'
+        )) {
+        @{
+            File = $workflowPath
+            Pattern = "(?m)^      ${name}: \`$\{\{ vars\.${name} \}\}\s*$"
+            Kind = 'Workflow'
+            Description = "the release job reads $name from the release environment's variables"
+        }
+    }
+}
+Invoke-ContractTable -Contracts @($artifactSigningWorkflowContracts)
+foreach ($workflowPath in @($releaseWorkflow, (Join-Path $repoRoot '.github\workflows\release-readiness.yml'))) {
+    if ((Get-Content -LiteralPath $workflowPath -Raw) -match 'secrets\.(?:ARTIFACT_SIGNING|AZURE)_') {
+        throw "Artifact Signing must not read a secret: $workflowPath"
+    }
+}
+Invoke-ContractTable -Contracts @(
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)function Get-SigningConfig \{\s*\$artifactSigning = Get-ArtifactSigningConfiguration\s*if \(\$artifactSigning\) \{\s*return Get-ArtifactSigningConfig -Configuration \$artifactSigning\s*\}\s*\$hasPath = '
+        Kind = 'Text'
+        Description = 'packaging takes the Artifact Signing path only when it is configured and otherwise reaches the PFX path unchanged'
+    }
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)function Invoke-SignFile.*?if \(\$SigningConfig\.DlibPath\) \{\s*\$signArgs \+= @\("/dlib", \$SigningConfig\.DlibPath, "/dmdf", \$SigningConfig\.MetadataPath\)\s*\} else \{\s*\$signArgs \+= @\("/f", \$SigningConfig\.PfxPath, "/p", \$SigningConfig\.PfxPassword\)\s*\}'
+        Kind = 'Text'
+        Description = 'signtool gets the Artifact Signing dlib or the PFX, never both'
+    }
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)\$artifactSigningClientVersion = "1\.0\.146"\s*\$artifactSigningClientSha512 = "/G0hG/VDIS6psW23b5t1V/ORIgn0PVAOtGj9w\+hkPmAuI4pempfwlW50E2GtHscnz9\+5Qz3hbC4mcb7ej2Yn1A=="'
+        Kind = 'Text'
+        Description = 'the Artifact Signing client is pinned by version and nuget.org SHA-512'
+    }
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)SHA512\]::HashData.*?if \(\$packageSha512 -cne \$artifactSigningClientSha512\) \{\s*throw .*?ExtractToDirectory'
+        Kind = 'Text'
+        Description = 'the Artifact Signing client is hash-checked before it is extracted'
+    }
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)ExcludeCredentials = @\(\s*"EnvironmentCredential",\s*"ManagedIdentityCredential",\s*"SharedTokenCacheCredential",\s*"VisualStudioCredential",\s*"VisualStudioCodeCredential",\s*"AzureCliCredential",\s*"AzurePowerShellCredential",\s*"AzureDeveloperCliCredential",\s*"InteractiveBrowserCredential"\s*\)'
+        Kind = 'Text'
+        Description = 'only the workload-identity credential can sign for the release job'
+    }
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)audience = \[System\.Uri\]::EscapeDataString\("api://AzureADTokenExchange"\).*?try \{\s*\[System\.IO\.File\]::WriteAllText\(\$SigningConfig\.FederatedTokenPath.*?& \$SigningConfig\.SignToolPath @signArgs\s*\}\s*finally \{.*?Remove-Item -LiteralPath \$SigningConfig\.FederatedTokenPath'
+        Kind = 'Text'
+        Description = 'each Artifact Signing call gets a fresh OIDC token that is deleted after signtool returns'
+    }
+    @{
+        File = $windowsPackager
+        Content = { $windowsPackagerText }
+        Pattern = '(?ms)function Assert-ValidSignature.*?SignatureStatus\]::Valid\) \{\s*throw .*?\}\s*if \(\$SigningConfig -and \$SigningConfig\.DlibPath -and \$null -eq \$signature\.TimeStamperCertificate\) \{\s*throw '
+        Kind = 'Text'
+        Description = 'an Artifact Signing signature without an RFC 3161 timestamp fails packaging'
+    }
+)
 
 $portableManifestVerifier = Join-Path $repoRoot 'scripts\portable-manifest-verification.ps1'
 $portableManifestVerifierText = Get-Content -LiteralPath $portableManifestVerifier -Raw

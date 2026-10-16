@@ -121,6 +121,10 @@ jobs:
         shell: pwsh
         run: ./test/windows/package-scoop.ps1
 
+      - name: Chocolatey package contract
+        shell: pwsh
+        run: ./test/windows/package-chocolatey.ps1
+
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:

@@ -212,3 +212,73 @@ allows three document-upload attempts. Nothing in this repository can substitute
 for it, and no code should be written against this decision until it succeeds —
 if eligibility fails, the fallback is a purchased OV certificate, which is the
 one option that leaves the existing pin design intact.
+
+## Re-checked on 2026-10-16
+
+The decision stands. Every fact below was read on 2026-10-16 from the page
+cited next to it.
+
+- Individuals are still eligible, still only in the US and Canada, and still
+  only through a billing account whose Account Type is Individual: "Individual
+  developers must be located in the United States or Canada" and "The billing
+  account must have an Account Type of Individual. The legal name and sold-to
+  address on the billing account must match the information on the
+  government-issued ID"
+  (<https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart>,
+  updated 2026-10-08). Free, trial and sponsored subscriptions are still
+  excluded (<https://learn.microsoft.com/en-us/azure/artifact-signing/faq>).
+  Individual validation is now a Microsoft Entra Verified ID flow through a
+  third-party verifier (the quickstart's example is AU10TIX) that ends in
+  Microsoft Authenticator; the 1 to 20 business days figure is stated for
+  organizations, and no separate figure is given for individuals.
+- Basic is $9.99 a month for 5,000 signatures and Premium $99.99 for 100,000,
+  $0.005 per extra signature (Azure retail prices API,
+  <https://prices.azure.com/api/retail/prices>, where the meters are still named
+  "Trusted Signing"; the product page,
+  <https://azure.microsoft.com/en-us/products/artifact-signing>, gives the
+  same Basic price).
+- Leaf certificates are still "renewed daily and are valid for only 72 hours",
+  and pinning "an individual certificate's public key, thumbprint, or other
+  certificate attributes isn't durable"
+  (<https://learn.microsoft.com/en-us/azure/artifact-signing/concept-certificate-management>).
+  One correction to the decision above: the custom EKU belongs to the
+  certificate profile, not to the identity validation. "The EKU is associated
+  with the certificate profile, not with the subscriber or identity validation
+  resource", it stays the same for the life of the profile, and deleting and
+  recreating the profile assigns a new one (same page, updated 2026-10-01).
+  The same page notes that Artifact Signing's CAs are scheduled for removal
+  from the Common CA Database but stay on the Windows platform trust list, so
+  Windows keeps trusting them; nothing in this project validates them any
+  other way.
+- SignPath Foundation's terms are unchanged on the three points that rule it
+  out (<https://signpath.org/terms.html>).
+- A purchased OV certificate now lasts at most 460 days: CA/Browser Forum
+  ballot CSC-31 set "For Code Signing Certificates issued on or after March
+  1st, 2026, the validity period MUST NOT exceed 460 days"
+  (<https://cabforum.org/working-groups/code-signing/requirements/>, CSBR
+  3.11.0). The fallback therefore rotates its leaf pin at least every 15
+  months.
+- EV still buys nothing for SmartScreen: "EV certificates no longer bypass
+  SmartScreen"
+  (<https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation>,
+  updated 2026-08-17).
+
+One part of the plan above changed while it was implemented. The release job
+does not use `azure/login` or the Azure CLI. `scripts/package-windows.ps1`
+asks GitHub for a fresh OIDC token before every `signtool` call and hands it
+to the dlib's workload-identity credential, with every other credential type
+excluded in `metadata.json`. No third-party action enters the release job, and
+the token cannot expire during a packaging step that runs for half an hour.
+The values the plan put in `AZURE_*` variables are the `ARTIFACT_SIGNING_*`
+variables of the `release` environment instead, and none of them is a secret.
+
+That signing path is now in the repository and dormant: release preflight and
+packaging take it only when all five `ARTIFACT_SIGNING_*` variables are set,
+and preflight still refuses it while `src/update/github_releases.zig` declares
+no `pinned_publisher_artifact_signing_ekus`. Teaching the updater,
+`Assert-ReleaseSignature` and `scripts/verify-published-release.ps1` (which
+also requires one thumbprint across a whole release, and a release can cross a
+daily renewal) the PCA-plus-EKU rule is the remaining repository work, and it cannot be finished before the maintainer's certificate profile
+exists, because the EKU is unique to that profile.
+[The Artifact Signing runbook](../artifact-signing-runbook.md) lists every
+step in order.

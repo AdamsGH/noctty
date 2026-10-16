@@ -38,6 +38,14 @@ jobs:
       WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
       WINDOWS_CODESIGN_TRUST_SELF_SIGNED: ${{ vars.WINDOWS_CODESIGN_TRUST_SELF_SIGNED }}
       WINDOWS_CODESIGN_MIN_VALIDITY_DAYS: ${{ vars.WINDOWS_CODESIGN_MIN_VALIDITY_DAYS }}
+      # Azure Artifact Signing (ADR 0006) stays dormant until the release
+      # environment defines all five; it signs through this job's GitHub OIDC
+      # identity, so it needs no secret (docs/artifact-signing-runbook.md).
+      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+      ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+      ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      ARTIFACT_SIGNING_TENANT_ID: ${{ vars.ARTIFACT_SIGNING_TENANT_ID }}
+      ARTIFACT_SIGNING_CLIENT_ID: ${{ vars.ARTIFACT_SIGNING_CLIENT_ID }}
 
     steps:
       - name: Checkout code
@@ -382,14 +390,6 @@ jobs:
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: ./scripts/release-publish-scoop.ps1 -Version $env:RELEASE_VERSION
 
-      - name: Publish Chocolatey package
-        if: steps.meta.outputs.prerelease != 'true'
-        shell: pwsh
-        env:
-          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
-          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
-        run: ./scripts/release-publish-chocolatey.ps1 -Version $env:RELEASE_VERSION
-
       - name: Submit WinGet manifest update
         if: steps.meta.outputs.prerelease != 'true'
         shell: pwsh
@@ -398,3 +398,14 @@ jobs:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGETCREATE_TOKEN }}
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: ./scripts/release-submit-winget.ps1 -Version $env:RELEASE_VERSION
+
+      # Last on purpose: until chocolatey.org approves a first version, every
+      # later push is refused with 403 for weeks (docs/chocolatey-publishing.md),
+      # and that must not keep WinGet from getting the release.
+      - name: Publish Chocolatey package
+        if: steps.meta.outputs.prerelease != 'true'
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: ./scripts/release-publish-chocolatey.ps1 -Version $env:RELEASE_VERSION
