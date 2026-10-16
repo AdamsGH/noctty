@@ -111,18 +111,26 @@ An automated readback alone is not a passing visible-desktop check.
 
 ### Starting without OpenGL
 
-Set `renderer` before launch failures pile up. The config file is
+When OpenGL cannot start, the startup dialog names `renderer = d3d11` and
+`renderer = d3d11-warp` and the config file to put the line in:
 `%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside
-`noctty.exe` in portable mode. After three launches in a row, within seven
-days, that end before the window is ready, noctty starts in safe mode (see
-[Session restore and recovery](#session-restore-and-recovery)). Safe mode uses
-the built-in defaults and ignores `renderer`, so the failing OpenGL start
-repeats and counts again. If that has happened, move `startup-attempts.json`
+`noctty.exe` in portable mode (the dialog shows that default; a launch with
+`--config-file` reads that file instead). noctty does not switch to Direct3D 11
+on its own; the line is your choice. A build without the beta keeps the old
+wording.
+
+A launch that ends at that dialog is not counted toward safe mode (see
+[Session restore and recovery](#session-restore-and-recovery)), because safe
+mode uses the built-in defaults, ignores `renderer`, and would fail the same
+way. So any number of failed OpenGL starts leaves the next launch normal and
+reading your config.
+
+Releases up to 1.3.132 counted those launches: after three within seven days
+they started in safe mode, which failed the same way and counted again. If
+you are stuck there, set `renderer` as above, then move `startup-attempts.json`
 (and any `startup-attempts.json.pending-*` beside it) out of the noctty data
 folder (`%LOCALAPPDATA%\noctty`, or the folder beside `noctty.exe` in portable
-mode; noctty writes a new one) and start noctty again. This comes from reading `Policy`, `decide` and
-`beginRecoveryStartupAtPath` in the Win32 runtime; it was not run on a machine
-without OpenGL.
+mode; noctty writes a new one) and start noctty again.
 
 ## Install modes
 
@@ -1010,7 +1018,12 @@ deleted either way.
 
 Three consecutive pre-ready startup failures select an ephemeral safe mode:
 built-in config, no session restore. `noctty --safe-mode` picks it for one
-launch. Safe mode never overwrites your config or quarantined state.
+launch. Safe mode never overwrites your config or quarantined state. A launch
+that ends at the OpenGL startup dialog is recorded but not counted, and does
+not end a run of other failures either: safe mode starts the same OpenGL
+renderer, so it could not help (see
+[Starting without OpenGL](#starting-without-opengl)). A crash, in OpenGL,
+Direct3D 11 or anywhere else, still counts.
 
 Each launch records in `startup-attempts.json` the noctty version that started
 it, when it began restoring the saved session and whether that restore
@@ -1580,9 +1593,9 @@ Win32 or Zig error. On x64, try in order:
    GPU in Windows Graphics settings.
 5. If OpenGL 4.3 is not available at all, set `renderer = d3d11` (or
    `renderer = d3d11-warp`) in your config file. The
-   [D3D11 renderer beta](#d3d11-renderer-beta) draws text without OpenGL; see
-   [Starting without OpenGL](#starting-without-opengl) for the config path and
-   what to do after repeated failed starts.
+   [D3D11 renderer beta](#d3d11-renderer-beta) draws text without OpenGL, and
+   the startup dialog names the config file; see
+   [Starting without OpenGL](#starting-without-opengl).
 
 Steps 3 and 4 do not apply on an ARM64 PC whose GPU vendor ships no desktop
 OpenGL driver (any Snapdragon PC), where there is no vendor driver to
@@ -1648,16 +1661,16 @@ background images and Kitty images are not drawn by the beta: noctty tries
 OpenGL for them and, if that fails, keeps drawing text with a visible notice.
 WARP can use a lot of CPU under heavy output.
 
-Make that change before a third failed start; see
-[starting without OpenGL](#starting-without-opengl).
+See [starting without OpenGL](#starting-without-opengl) for how failed
+starts interact with safe mode.
 
 There is no AMD or NVIDIA driver to reinstall on ARM64 and no second GPU to
 select in Windows Graphics settings, so noctty's startup dialog leads with
 the Compatibility Pack when it detects an ARM64 native machine, and keeps the
-Remote Desktop and VM guidance, which applies on any architecture. The
-1.3.132 dialog predates the beta: it says the build has no software, DirectX,
-or ANGLE fallback renderer and does not mention `renderer = d3d11`, which is
-out of date for builds that include the beta. The dialog and `noctty +version`
+Remote Desktop and VM guidance, which applies on any architecture. It also
+names `renderer = d3d11` and the config file; the 1.3.132 dialog predates
+that and says the build has no software, DirectX, or ANGLE fallback renderer,
+which is out of date for builds that include the beta. The dialog and `noctty +version`
 both report the architecture: `ARM64` for a native build, or
 `x64 (running on ARM64)` if you installed the x64 build by mistake. Prefer the
 ARM64 artifacts on a Snapdragon PC.

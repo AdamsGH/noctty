@@ -10,7 +10,9 @@
 //!      `mergeMarkReady` only after normal startup is usable.
 //!
 //! An attempt without `ready_at_unix_ms` is evidence that the process ended
-//! before reaching the ready marker. This module performs no filesystem work.
+//! before reaching the ready marker, unless it records that OpenGL could not
+//! start (`opengl_unavailable_at_unix_ms`). This module performs no filesystem
+//! work.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -48,6 +50,10 @@ pub const StartupAttempt = struct {
     /// When this attempt began restoring the saved session. Written before the
     /// first window is restored, so a launch that ends during restore keeps it.
     session_restore_at_unix_ms: ?u64 = null,
+    /// When this attempt gave up because OpenGL could not start, the failure
+    /// the startup dialog reports. Such an attempt is no evidence for safe
+    /// mode, which starts the same renderer.
+    opengl_unavailable_at_unix_ms: ?u64 = null,
     /// The build that recorded the attempt.
     version: ?BuildVersion = null,
 };
@@ -208,7 +214,7 @@ pub fn appendBounded(
 
 /// Merge two independently observed histories. Duplicate start markers name
 /// the same attempt; retain the furthest lifecycle phase, any ready marker,
-/// the raw persistence diagnosis, the restore flag and the version. The newest bounded history is returned.
+/// the raw persistence diagnosis, the restore and OpenGL flags and the version. The newest bounded history is returned.
 pub fn mergeRecords(
     first: StartupAttemptRecord,
     second: StartupAttemptRecord,
@@ -256,6 +262,9 @@ pub fn mergeRecords(
             if (current.session_restore_at_unix_ms == null) {
                 current.session_restore_at_unix_ms = next.session_restore_at_unix_ms;
             }
+            if (current.opengl_unavailable_at_unix_ms == null) {
+                current.opengl_unavailable_at_unix_ms = next.opengl_unavailable_at_unix_ms;
+            }
             if (current.version == null) current.version = next.version;
             continue;
         }
@@ -300,6 +309,8 @@ pub const AttemptMark = union(enum) {
     session_restore: u64,
     /// Finished restoring it, whether or not any window came back.
     session_restored,
+    /// Gave up at this time because OpenGL could not start.
+    opengl_unavailable: u64,
 };
 
 /// As `mergeMarkReady`, but record `mark` on this process's attempt. A mark
@@ -325,6 +336,9 @@ pub fn applyMark(attempt: *StartupAttempt, mark: AttemptMark) void {
         .session_restored => if (attempt.phase == .init) {
             attempt.phase = .window_created;
         },
+        .opengl_unavailable => |at| if (attempt.opengl_unavailable_at_unix_ms == null) {
+            attempt.opengl_unavailable_at_unix_ms = at;
+        },
     }
 }
 
@@ -335,24 +349,39 @@ fn findAttempt(attempts: []StartupAttempt, started_at_unix_ms: u64) error{Target
     return error.TargetAttemptMissing;
 }
 
-/// Count consecutive unresolved attempts from newest to oldest. Counting stops
-/// at the first ready attempt, future timestamp, or attempt older than the
-/// policy window. This prevents old isolated crashes from accumulating forever.
+/// The unresolved attempts that count toward safe mode, newest first. The walk
+/// stops at the first ready attempt, future timestamp, or attempt older than
+/// the policy window, which keeps old isolated crashes from accumulating
+/// forever. An attempt that gave up because OpenGL could not start is passed
+/// over: it is no evidence for safe mode, and it does not end a streak of
+/// failures that are.
+const RecentFailures = struct {
+    attempts: []const StartupAttempt,
+    now_unix_ms: u64,
+    max_age_ms: u64,
+
+    fn next(self: *RecentFailures) ?StartupAttempt {
+        while (self.attempts.len > 0) {
+            const attempt = self.attempts[self.attempts.len - 1];
+            if (attempt.ready_at_unix_ms != null) break;
+            if (attempt.started_at_unix_ms > self.now_unix_ms) break;
+            if (self.now_unix_ms - attempt.started_at_unix_ms > self.max_age_ms) break;
+            self.attempts.len -= 1;
+            if (attempt.opengl_unavailable_at_unix_ms == null) return attempt;
+        }
+        self.attempts.len = 0;
+        return null;
+    }
+};
+
 pub fn recentFailureCount(
     record: StartupAttemptRecord,
     now_unix_ms: u64,
     max_age_ms: u64,
 ) usize {
+    var failures: RecentFailures = .{ .attempts = record.attempts, .now_unix_ms = now_unix_ms, .max_age_ms = max_age_ms };
     var count: usize = 0;
-    var i = record.attempts.len;
-    while (i > 0) {
-        i -= 1;
-        const attempt = record.attempts[i];
-        if (attempt.ready_at_unix_ms != null) break;
-        if (attempt.started_at_unix_ms > now_unix_ms) break;
-        if (now_unix_ms - attempt.started_at_unix_ms > max_age_ms) break;
-        count += 1;
-    }
+    while (failures.next() != null) count += 1;
     return count;
 }
 
@@ -368,7 +397,9 @@ pub fn decide(
     const threshold = policy.failure_threshold;
     if (threshold == 0) return .normal;
     if (recentFailureCount(record, now_unix_ms, policy.max_failure_age_ms) < threshold) return .normal;
-    for (record.attempts[record.attempts.len - threshold ..]) |attempt| {
+    var failures: RecentFailures = .{ .attempts = record.attempts, .now_unix_ms = now_unix_ms, .max_age_ms = policy.max_failure_age_ms };
+    for (0..threshold) |_| {
+        const attempt = failures.next().?;
         if (attempt.session_restore_at_unix_ms == null or attempt.phase != .init) return .safe_mode;
     }
     return .quarantine_session;
@@ -644,6 +675,88 @@ test "win32 recovery sets the session aside only when the latest failures all re
         Decision.safe_mode,
         decide(.{ .attempts = &safe_mode_died }, 500, .{}),
     );
+}
+
+test "win32 recovery never counts a start that failed for want of OpenGL" {
+    // Three clean OpenGL start failures: safe mode uses the same renderer, so
+    // it could not help, and the next launch stays normal.
+    const no_opengl = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100, .opengl_unavailable_at_unix_ms = 110 },
+        .{ .started_at_unix_ms = 200, .opengl_unavailable_at_unix_ms = 210 },
+        .{ .started_at_unix_ms = 300, .opengl_unavailable_at_unix_ms = 310 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), recentFailureCount(.{ .attempts = &no_opengl }, 400, 1_000));
+    try std.testing.expectEqual(Decision.normal, decide(.{ .attempts = &no_opengl }, 400, .{}));
+
+    // It does not end a streak either: real failures on both sides of it
+    // still add up to safe mode.
+    const crashes_around = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100 },
+        .{ .started_at_unix_ms = 200, .opengl_unavailable_at_unix_ms = 210 },
+        .{ .started_at_unix_ms = 300 },
+        .{ .started_at_unix_ms = 400, .opengl_unavailable_at_unix_ms = 410 },
+        .{ .started_at_unix_ms = 500 },
+    };
+    try std.testing.expectEqual(@as(usize, 3), recentFailureCount(.{ .attempts = &crashes_around }, 600, 1_000));
+    try std.testing.expectEqual(Decision.safe_mode, decide(.{ .attempts = &crashes_around }, 600, .{}));
+
+    // The age window and a ready attempt still end the count behind it.
+    try std.testing.expectEqual(@as(usize, 1), recentFailureCount(.{ .attempts = &crashes_around }, 1_450, 1_000));
+    var ready_behind = crashes_around;
+    ready_behind[1].ready_at_unix_ms = 220;
+    try std.testing.expectEqual(@as(usize, 2), recentFailureCount(.{ .attempts = &ready_behind }, 600, 1_000));
+    // An attempt exactly at the window's edge still counts; one past it, or
+    // one ahead of the clock, ends the walk even behind a skipped attempt.
+    try std.testing.expectEqual(@as(usize, 3), recentFailureCount(.{ .attempts = &crashes_around }, 1_100, 1_000));
+    try std.testing.expectEqual(@as(usize, 2), recentFailureCount(.{ .attempts = &crashes_around }, 1_101, 1_000));
+    try std.testing.expectEqual(@as(usize, 0), recentFailureCount(.{ .attempts = &crashes_around }, 450, 1_000));
+    try std.testing.expectEqual(Decision.normal, decide(.{ .attempts = &crashes_around }, 600, .{ .failure_threshold = 0 }));
+}
+
+test "win32 recovery judges the session by the failures it counted" {
+    // The newest attempt failed for want of OpenGL; the three failures it
+    // skips all ended restoring the session, so the session is set aside.
+    const restoring = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100, .session_restore_at_unix_ms = 110 },
+        .{ .started_at_unix_ms = 200, .session_restore_at_unix_ms = 210 },
+        .{ .started_at_unix_ms = 300, .session_restore_at_unix_ms = 310 },
+        .{ .started_at_unix_ms = 400, .opengl_unavailable_at_unix_ms = 410 },
+    };
+    try std.testing.expectEqual(Decision.quarantine_session, decide(.{ .attempts = &restoring }, 500, .{}));
+
+    // A skipped attempt that also began a restore does not stand in for a
+    // counted one that did not.
+    const mixed = [_]StartupAttempt{
+        .{ .started_at_unix_ms = 100 },
+        .{ .started_at_unix_ms = 200, .session_restore_at_unix_ms = 210 },
+        .{ .started_at_unix_ms = 300, .session_restore_at_unix_ms = 310, .opengl_unavailable_at_unix_ms = 320 },
+        .{ .started_at_unix_ms = 400, .session_restore_at_unix_ms = 410 },
+    };
+    try std.testing.expectEqual(Decision.safe_mode, decide(.{ .attempts = &mixed }, 500, .{}));
+}
+
+test "win32 recovery OpenGL marker round trips, merges and never moves" {
+    const attempts = [_]StartupAttempt{.{ .started_at_unix_ms = 100, .opengl_unavailable_at_unix_ms = 140 }};
+    const encoded = try encodeAlloc(std.testing.allocator, .{ .attempts = &attempts });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"schema_version\":1,\"attempts\":[{\"started_at_unix_ms\":100,\"phase\":\"init\",\"opengl_unavailable_at_unix_ms\":140}]}",
+        encoded,
+    );
+    var parsed = try parseAlloc(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 140), parsed.value.attempts[0].opengl_unavailable_at_unix_ms);
+
+    // Only the disk copy carries it; the ready merge keeps it.
+    const memory = [_]StartupAttempt{.{ .started_at_unix_ms = 100 }};
+    var out: [max_attempts]StartupAttempt = undefined;
+    const merged = try mergeRecords(.{ .attempts = &memory }, .{ .attempts = &attempts }, &out);
+    try std.testing.expectEqual(@as(?u64, 140), merged.attempts[0].opengl_unavailable_at_unix_ms);
+
+    const marked = try mergeMarkAttempt(.{}, .{ .attempts = &memory }, 100, .{ .opengl_unavailable = 150 }, &out);
+    try std.testing.expectEqual(@as(?u64, 150), marked.attempts[0].opengl_unavailable_at_unix_ms);
+    applyMark(&out[0], .{ .opengl_unavailable = 999 });
+    try std.testing.expectEqual(@as(?u64, 150), out[0].opengl_unavailable_at_unix_ms);
 }
 
 test "win32 recovery attempt marks flag this attempt and keep a concurrent one" {

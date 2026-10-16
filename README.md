@@ -74,10 +74,9 @@ supports OpenGL 4.3 or later.
   `renderer = d3d11` in your config to try hardware Direct3D 11, then
   Microsoft's WARP software renderer, or `renderer = d3d11-warp` to use WARP
   directly. It draws text without OpenGL; custom shaders, background images,
-  and Kitty images need OpenGL. Remote Desktop has not been measured. Set it
-  before launch failures pile up: after three failed starts Noctty uses
-  built-in defaults, which ignore `renderer`
-  ([details](docs/windows.md#starting-without-opengl)).
+  and Kitty images need OpenGL. Remote Desktop has not been measured. When
+  OpenGL cannot start, the startup dialog names the setting and the config
+  file ([details](docs/windows.md#starting-without-opengl)).
 - On Windows on Arm PCs, install the free **OpenCL, OpenGL, and Vulkan
   Compatibility Pack** from the Microsoft Store
   ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)),

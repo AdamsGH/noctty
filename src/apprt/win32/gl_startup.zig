@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const build_config = @import("../../build_config.zig");
+const config_file_load = @import("../../config/file_load.zig");
 const os_windows = @import("../../os/windows.zig");
 const win32_types = @import("../win32_types.zig");
 const c = @import("consts.zig");
@@ -168,6 +169,12 @@ fn openGLStartupDiagnosticsActive() bool {
     return opengl_startup_diagnostics_active;
 }
 
+/// Whether this startup recorded an OpenGL failure that no later success
+/// cleared: the failure `reportStartupFailure` explains.
+pub fn openGLStartupFailed() bool {
+    return currentOpenGLStartupFailure() != null;
+}
+
 fn currentOpenGLStartupFailure() ?OpenGLStartupFailure {
     opengl_startup_diagnostics_mutex.lock();
     defer opengl_startup_diagnostics_mutex.unlock();
@@ -243,11 +250,17 @@ pub fn reportStartupFailure(err: anyerror) void {
 
 fn formatStartupFailureMessage(buf: []u8, err: anyerror) []const u8 {
     if (currentOpenGLStartupFailure()) |failure| {
+        const config_path: ?[]const u8 = if (build_config.d3d11)
+            config_file_load.preferredDefaultFilePath(std.heap.page_allocator) catch null
+        else
+            null;
+        defer if (config_path) |path| std.heap.page_allocator.free(path);
         return formatOpenGLStartupFailureMessage(
             buf,
             err,
             failure,
             os_windows.detectProcessArchitecture(),
+            .{ .d3d11 = build_config.d3d11, .config_path = config_path },
         ) catch
             "noctty could not initialize the Windows OpenGL renderer.";
     }
@@ -257,6 +270,38 @@ fn formatStartupFailureMessage(buf: []u8, err: anyerror) []const u8 {
         "noctty {s} failed: {s}\n\nOpen an issue with the full log if this keeps happening.",
         .{ build_config.version_string, @errorName(err) },
     ) catch "noctty failed.";
+}
+
+/// What the dialog can offer a machine where OpenGL does not start. noctty
+/// never switches renderers on its own, so the dialog is where a user without
+/// OpenGL learns that the config can choose one that does not need it.
+const RendererChoice = struct {
+    /// This build includes the beta Direct3D 11 renderer (`build_config.d3d11`).
+    d3d11: bool,
+    /// The default config file, when it could be found. A `--config-file`
+    /// launch reads another one, which the dialog cannot know after teardown,
+    /// so it is named as the default.
+    config_path: ?[]const u8 = null,
+};
+
+/// The paragraph on renderers: the only one there is, or how to choose the
+/// one that does not need OpenGL. `below_floor` is the version-floor dialog.
+fn formatRendererParagraph(buf: []u8, choice: RendererChoice, below_floor: bool) []const u8 {
+    if (!choice.d3d11) return if (below_floor)
+        "This build does not include a software, DirectX, or ANGLE fallback renderer, so noctty cannot start below OpenGL 4.3."
+    else
+        "noctty currently uses OpenGL 4.3 through WGL on Windows. This build does not include a DirectX or ANGLE fallback renderer.";
+
+    const config_file = "config.ghostty in %LOCALAPPDATA%\\noctty, or beside noctty.exe in portable mode";
+    const paragraph =
+        \\noctty starts with OpenGL 4.3 through WGL and does not switch renderers on its own. This build also includes the beta Direct3D 11 renderer, which does not need OpenGL. To use it, add this line to the config file (by default {s}) and start noctty again:
+        \\
+        \\renderer = d3d11
+        \\
+        \\It renders in software (WARP) when the GPU has no usable Direct3D 11 driver, and renderer = d3d11-warp always does. If the config already sets one of them, Direct3D 11 could not start either, unless this was safe mode, which ignores the config.
+    ;
+    return std.fmt.bufPrint(buf, paragraph, .{choice.config_path orelse config_file}) catch
+        std.fmt.comptimePrint(paragraph, .{config_file});
 }
 
 /// Where a working OpenGL 4.3 implementation is supposed to come from on this
@@ -303,7 +348,7 @@ fn detectedRemediationAdvice(remediation: Remediation) []const u8 {
         .arm64 =>
         \\This is a Windows on ARM PC, and Qualcomm Snapdragon systems ship no desktop OpenGL driver at all. A detected renderer of "GDI Generic" at version 1.1 means none is installed: get the free "OpenCL, OpenGL, and Vulkan Compatibility Pack" from the Microsoft Store and restart noctty. It supplies a desktop OpenGL implementation that runs on Direct3D 12.
         \\
-        \\If that pack is already installed and the detected version above is still below 4.3, it is not exposing enough OpenGL on this GPU and noctty cannot start on it. Microsoft's support statement for the pack promises only OpenGL 3.3, so a version between 3.3 and 4.3 is the pack working as documented rather than a broken install.
+        \\If that pack is already installed and the detected version above is still below 4.3, it is not exposing enough OpenGL on this GPU and noctty's OpenGL renderer cannot start on it. Microsoft's support statement for the pack promises only OpenGL 3.3, so a version between 3.3 and 4.3 is the pack working as documented rather than a broken install.
         \\
         \\If you are on Remote Desktop, end the session and launch noctty in a local console session. In a VM, enable 3D acceleration and install the guest graphics driver.
         ,
@@ -359,12 +404,14 @@ fn formatOpenGLStartupFailureMessage(
     err: anyerror,
     failure: OpenGLStartupFailure,
     arch: ?os_windows.ProcessArchitecture,
+    renderer_choice: RendererChoice,
 ) ![]const u8 {
     const zig_error_name = failure.zig_error_name orelse @errorName(err);
     const remediation: Remediation = .forNativeMachine(nativeMachineOrBuild(arch));
 
     var architecture_buf: [96]u8 = undefined;
     const architecture_text = formatArchitectureLine(&architecture_buf, arch);
+    var renderer_buf: [1024]u8 = undefined;
 
     if (failure.detected) |detected| {
         var win32_error_buf: [64]u8 = undefined;
@@ -384,7 +431,7 @@ fn formatOpenGLStartupFailureMessage(
             \\Detected renderer: {s}
             \\Detected vendor: {s}
             \\
-            \\This build does not include a software, DirectX, or ANGLE fallback renderer, so noctty cannot start below OpenGL 4.3.
+            \\{s}
             \\
             \\{s}
             \\
@@ -399,6 +446,7 @@ fn formatOpenGLStartupFailureMessage(
             detected.minor,
             if (detected.renderer.len > 0) detected.renderer.value() else "not reported",
             if (detected.vendor.len > 0) detected.vendor.value() else "not reported",
+            formatRendererParagraph(&renderer_buf, renderer_choice, true),
             detectedRemediationAdvice(remediation),
         });
     }
@@ -411,7 +459,7 @@ fn formatOpenGLStartupFailureMessage(
             \\Win32 error: {d}{s}
             \\Architecture: {s}
             \\
-            \\noctty currently uses OpenGL 4.3 through WGL on Windows. This build does not include a DirectX or ANGLE fallback renderer.
+            \\{s}
             \\
             \\{s}
             \\
@@ -423,6 +471,7 @@ fn formatOpenGLStartupFailureMessage(
             win32_error,
             win32ErrorSuffix(win32_error),
             architecture_text,
+            formatRendererParagraph(&renderer_buf, renderer_choice, false),
             openglStartupFailureHint(failure, remediation),
             stepRemediationAdvice(remediation),
         });
@@ -435,7 +484,7 @@ fn formatOpenGLStartupFailureMessage(
         \\Win32 error: not reported
         \\Architecture: {s}
         \\
-        \\noctty currently uses OpenGL 4.3 through WGL on Windows. This build does not include a DirectX or ANGLE fallback renderer.
+        \\{s}
         \\
         \\{s}
         \\
@@ -445,6 +494,7 @@ fn formatOpenGLStartupFailureMessage(
         failure.step.label(),
         zig_error_name,
         architecture_text,
+        formatRendererParagraph(&renderer_buf, renderer_choice, false),
         openglStartupFailureHint(failure, remediation),
         stepRemediationAdvice(remediation),
     });
@@ -502,6 +552,9 @@ const test_x64_on_arm64: os_windows.ProcessArchitecture = .{
     .native_machine = os_windows.IMAGE_FILE_MACHINE_ARM64,
 };
 
+/// A build without the beta Direct3D 11 renderer.
+const test_no_d3d11: RendererChoice = .{ .d3d11 = false };
+
 /// Every dialog path must be free of advice that names hardware a Snapdragon
 /// PC does not have.
 fn expectNoVendorGpuAdvice(message: []const u8) !void {
@@ -517,7 +570,7 @@ test "win32-opengl-startup-failure-message-explains-error-126" {
         .step = .create_context,
         .win32_error = c.ERROR_MOD_NOT_FOUND,
         .zig_error_name = "Unexpected",
-    }, test_x64);
+    }, test_x64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "Win32 error: 126 (ERROR_MOD_NOT_FOUND)") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "AMD+NVIDIA hybrid GPU") != null);
@@ -530,7 +583,7 @@ test "win32-opengl-startup-failure-message-explains-version-floor" {
     const message = try formatOpenGLStartupFailureMessage(&buf, error.OpenGLOutdated, .{
         .step = .version_check,
         .zig_error_name = "OpenGLOutdated",
-    }, test_x64);
+    }, test_x64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "OpenGL 4.3 through WGL") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "required OpenGL 4.3 feature level") != null);
@@ -548,7 +601,7 @@ test "win32-opengl-startup-failure-message-reports-detected-version" {
             .renderer = .init("GDI Generic"),
             .vendor = .init("Microsoft Corporation"),
         },
-    }, test_x64);
+    }, test_x64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "while checking the OpenGL version") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "Required OpenGL version: 4.3 through WGL") != null);
@@ -569,7 +622,7 @@ test "win32-opengl-startup-detected-version-message-uses-recorded-diagnostics" {
         .win32_error = c.ERROR_MOD_NOT_FOUND,
         .zig_error_name = "OpenGLOutdated",
         .detected = .{ .major = 1, .minor = 1 },
-    }, test_x64);
+    }, test_x64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "while creating the WGL context") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "while checking the OpenGL version") == null);
@@ -667,7 +720,7 @@ test "win32-opengl-startup-arm64-message-names-the-compatibility-pack" {
             .renderer = .init("GDI Generic"),
             .vendor = .init("Microsoft Corporation"),
         },
-    }, test_arm64);
+    }, test_arm64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, detected_message, "Architecture: ARM64 process on ARM64 Windows") != null);
     try std.testing.expect(std.mem.indexOf(u8, detected_message, "OpenCL, OpenGL, and Vulkan Compatibility Pack") != null);
@@ -684,7 +737,7 @@ test "win32-opengl-startup-arm64-message-names-the-compatibility-pack" {
         .step = .create_context,
         .win32_error = c.ERROR_MOD_NOT_FOUND,
         .zig_error_name = "Unexpected",
-    }, test_arm64);
+    }, test_arm64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, win32_message, "Win32 error: 126 (ERROR_MOD_NOT_FOUND)") != null);
     try std.testing.expect(std.mem.indexOf(u8, win32_message, "OpenCL, OpenGL, and Vulkan Compatibility Pack") != null);
@@ -696,7 +749,7 @@ test "win32-opengl-startup-arm64-message-names-the-compatibility-pack" {
     const bare_message = try formatOpenGLStartupFailureMessage(&bare_buf, error.OpenGLOutdated, .{
         .step = .version_check,
         .zig_error_name = "OpenGLOutdated",
-    }, test_arm64);
+    }, test_arm64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, bare_message, "Win32 error: not reported") != null);
     try std.testing.expect(std.mem.indexOf(u8, bare_message, "OpenCL, OpenGL, and Vulkan Compatibility Pack") != null);
@@ -712,7 +765,7 @@ test "win32-opengl-startup-arm64-message-does-not-claim-a-fallback-renderer" {
         .step = .version_check,
         .zig_error_name = "OpenGLOutdated",
         .detected = .{ .major = 1, .minor = 1 },
-    }, test_arm64);
+    }, test_arm64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "does not include a software, DirectX, or ANGLE fallback renderer") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "noctty cannot start below OpenGL 4.3") != null);
@@ -727,7 +780,7 @@ test "win32-opengl-startup-x64-message-keeps-the-gpu-vendor-advice" {
         .step = .version_check,
         .zig_error_name = "OpenGLOutdated",
         .detected = .{ .major = 1, .minor = 1 },
-    }, test_x64);
+    }, test_x64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "Architecture: x64 process on x64 Windows") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "updating or reinstalling your GPU driver") != null);
@@ -739,10 +792,65 @@ test "win32-opengl-startup-x64-message-keeps-the-gpu-vendor-advice" {
         .step = .load_opengl32,
         .win32_error = c.ERROR_MOD_NOT_FOUND,
         .zig_error_name = "Unexpected",
-    }, test_x64);
+    }, test_x64, test_no_d3d11);
 
     try std.testing.expect(std.mem.indexOf(u8, win32_message, "OEM AMD graphics driver, then the NVIDIA driver") != null);
     try std.testing.expect(std.mem.indexOf(u8, win32_message, "Compatibility Pack") == null);
+}
+
+test "win32-opengl-startup-message-names-the-d3d11-renderer-in-builds-that-have-it" {
+    const config_path = "C:\\Users\\someone\\AppData\\Local\\noctty\\config.ghostty";
+    const choice: RendererChoice = .{ .d3d11 = true, .config_path = config_path };
+    const failures = [_]OpenGLStartupFailure{
+        // The longest dialog: both driver strings at their bound.
+        .{ .step = .version_check, .zig_error_name = "OpenGLOutdated", .detected = .{
+            .major = 1,
+            .minor = 1,
+            .renderer = .init("r" ** OpenGLStartupString.capacity),
+            .vendor = .init("v" ** OpenGLStartupString.capacity),
+        } },
+        .{ .step = .load_opengl32, .win32_error = c.ERROR_MOD_NOT_FOUND, .zig_error_name = "Unexpected" },
+        .{ .step = .version_check, .zig_error_name = "OpenGLOutdated" },
+    };
+    for (failures) |failure| for ([_]os_windows.ProcessArchitecture{ test_x64, test_arm64 }) |arch| {
+        var buf: [4096]u8 = undefined;
+        const message = try formatOpenGLStartupFailureMessage(&buf, error.Unexpected, failure, arch, choice);
+
+        try std.testing.expect(std.mem.indexOf(u8, message, "\nrenderer = d3d11\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "renderer = d3d11-warp") != null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "add this line to the config file (by default " ++ config_path ++ ") and start noctty again") != null);
+        // A launch that set it may have been safe mode, which ignored it.
+        try std.testing.expect(std.mem.indexOf(u8, message, "unless this was safe mode") != null);
+        // Choosing it is the user's move: nothing claims a switch happens.
+        try std.testing.expect(std.mem.indexOf(u8, message, "does not switch renderers on its own") != null);
+        // Nor that no other renderer exists.
+        try std.testing.expect(std.mem.indexOf(u8, message, "does not include") == null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "cannot start below OpenGL 4.3") == null);
+        try std.testing.expect(std.mem.endsWith(u8, message, "issues/64."));
+    };
+}
+
+test "win32-opengl-startup-message-describes-the-config-file-it-could-not-find" {
+    var buf: [4096]u8 = undefined;
+    const message = try formatOpenGLStartupFailureMessage(&buf, error.OpenGLOutdated, .{
+        .step = .version_check,
+        .zig_error_name = "OpenGLOutdated",
+        .detected = .{ .major = 1, .minor = 1 },
+    }, test_x64, .{ .d3d11 = true });
+    try std.testing.expect(std.mem.indexOf(u8, message, "config.ghostty in %LOCALAPPDATA%\\noctty, or beside noctty.exe in portable mode") != null);
+
+    // A path too long for the paragraph's buffer gets the description, not a
+    // cut path or no advice at all.
+    const long_path = "C:\\" ++ "d" ** 1024 ++ "\\config.ghostty";
+    var long_buf: [4096]u8 = undefined;
+    const long_message = try formatOpenGLStartupFailureMessage(&long_buf, error.Unexpected, .{
+        .step = .create_context,
+        .win32_error = c.ERROR_MOD_NOT_FOUND,
+        .zig_error_name = "Unexpected",
+    }, test_arm64, .{ .d3d11 = true, .config_path = long_path });
+    try std.testing.expect(std.mem.indexOf(u8, long_message, "dddd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, long_message, "%LOCALAPPDATA%\\noctty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, long_message, "\nrenderer = d3d11\n") != null);
 }
 
 test "win32-opengl-startup-failure-bounds-driver-strings" {
@@ -758,6 +866,7 @@ test "win32-opengl-startup-failure-recording-is-startup-scoped" {
     clearOpenGLStartupFailure();
     recordOpenGLStartupError(.make_current, error.Unexpected);
     try std.testing.expect(currentOpenGLStartupFailure() == null);
+    try std.testing.expect(!openGLStartupFailed());
 
     beginOpenGLStartupDiagnostics();
     try std.testing.expect(openGLStartupDiagnosticsActive());
@@ -783,6 +892,10 @@ test "win32-opengl-startup-failure-preserves-win32-loader-cause" {
     const failure = currentOpenGLStartupFailure().?;
     try std.testing.expectEqual(OpenGLStartupStep.load_opengl32, failure.step);
     try std.testing.expectEqual(@as(?DWORD, c.ERROR_MOD_NOT_FOUND), failure.win32_error);
+    try std.testing.expect(openGLStartupFailed());
 
+    // A later success clears it, and the launch is no longer failing for
+    // want of OpenGL.
     clearOpenGLStartupFailure();
+    try std.testing.expect(!openGLStartupFailed());
 }

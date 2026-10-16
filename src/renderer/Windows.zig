@@ -105,6 +105,9 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
             } else {
                 result.setNotice("D3D11 beta: hardware renderer active.", .{});
             }
+            // An OpenGL failure tried above is handled: neither the startup
+            // dialog nor the recovery ledger may blame a later error on it.
+            apprt.win32.clearOpenGLStartupFailure();
             return result;
         } else |err| {
             alloc.destroy(value);

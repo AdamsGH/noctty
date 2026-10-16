@@ -3231,6 +3231,13 @@ pub const App = struct {
             return;
         }
 
+        // A launch whose first window fails because OpenGL could not start is
+        // not a crash, and safe mode starts the same renderer: three of them
+        // must not strand the user there. Only this stretch: a later error
+        // is no startup failure, and once the ready marker has merged other
+        // instances' attempts, this one is no longer the last in memory.
+        var initial_windows_created = false;
+        errdefer if (!initial_windows_created) self.markRecoveryOpenGLUnavailable();
         if (!self.embedding_mode and self.config.@"launch-layout" != null) {
             const name = self.config.@"launch-layout".?;
             // An explicit CLI layout request is honored even when
@@ -3246,6 +3253,8 @@ pub const App = struct {
             // into a layout launch.
             _ = self.config.dropLaunchLayoutReplaySteps(0);
             if (!launched) {
+                // Handled, as for a skipped restore window.
+                gl_startup.clearOpenGLStartupFailure();
                 try self.createWindow(default_title);
                 if (self.primarySurface()) |surface| if (surface.host) |host| {
                     host.setBanner(.err, "Layout could not be opened.") catch {};
@@ -3269,6 +3278,7 @@ pub const App = struct {
         } else if (!self.embedding_mode) {
             log.info("initial-window is disabled; win32 runtime waiting without a window", .{});
         }
+        initial_windows_created = true;
 
         // Keep the banner text even without an initial window: every later
         // host receives its own copy when it is created.
@@ -4015,6 +4025,9 @@ pub const App = struct {
                 self.activateSurface(surface);
             } else |err| {
                 log.warn("win32 session restore: skipped window err={}", .{err});
+                // Handled: the dialog and the recovery ledger describe only
+                // the failure that ends the launch.
+                gl_startup.clearOpenGLStartupFailure();
             }
         }
 
@@ -4259,6 +4272,17 @@ pub const App = struct {
                 self.showRecoverySafeModeNotice(text);
             }
         }
+    }
+
+    /// Record on this launch's attempt that it is ending because OpenGL could
+    /// not start (the failure the startup dialog then reports), so the next
+    /// launch does not count it toward safe mode. Best effort, like the
+    /// restore markers. A crash, inside any renderer, never gets here.
+    fn markRecoveryOpenGLUnavailable(self: *App) void {
+        if (!gl_startup.openGLStartupFailed()) return;
+        const path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json") orelse return;
+        defer self.core_app.alloc.free(path);
+        markRecoveryAttemptAtPath(self.core_app.alloc, path, &self.recovery_startup, .{ .opengl_unavailable = unixMillis() });
     }
 
     /// Errors are the retryable ones only: everything deterministic (no
@@ -49718,6 +49742,32 @@ test "win32 recovery restore markers reach disk and keep a concurrent attempt" {
     defer finished.deinit();
     try std.testing.expectEqual(win32_recovery.StartupPhase.window_created, finished.value.attempts[0].phase);
     try std.testing.expectEqual(win32_recovery.StartupPhase.init, finished.value.attempts[1].phase);
+}
+
+test "win32 recovery launches that ended without OpenGL leave the next one normal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "startup-attempts.json" });
+    defer std.testing.allocator.free(target);
+
+    // Three launches in a row ended at the OpenGL startup dialog.
+    for ([_]u64{ 100, 200, 300 }) |now| {
+        var startup = beginRecoveryStartupAtPath(std.testing.allocator, target, null, now, recovery_ledger_lock_wait_ms);
+        try std.testing.expectEqual(win32_recovery.Decision.normal, startup.decision);
+        markRecoveryAttemptAtPath(std.testing.allocator, target, &startup, .{ .opengl_unavailable = now + 50 });
+        try std.testing.expectEqual(@as(?u64, now + 50), startup.attempts[startup.count - 1].opengl_unavailable_at_unix_ms);
+    }
+    const after_opengl = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 400, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.normal, after_opengl.decision);
+
+    // The one after it crashed (no marker), and so did two more: a crash
+    // still leads to safe mode with defaults, whatever the renderer.
+    _ = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 500, recovery_ledger_lock_wait_ms);
+    _ = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 600, recovery_ledger_lock_wait_ms);
+    const after_crashes = beginRecoveryStartupAtPath(std.testing.allocator, target, null, 700, recovery_ledger_lock_wait_ms);
+    try std.testing.expectEqual(win32_recovery.Decision.safe_mode, after_crashes.decision);
 }
 
 test "win32 recovery sets a crashed session aside without deleting it" {
