@@ -952,8 +952,9 @@ does not restore the same windows again.
 If the session-state file is unreadable, noctty moves it aside to a sibling
 with a `.corrupt` suffix, logs the failure, and starts with a fresh window.
 When an earlier quarantine file already exists, a numeric suffix is added
-(`.corrupt.1`, `.corrupt.2`, and so on) so nothing is overwritten. If the
-move fails, the original file is left untouched.
+(`.corrupt.1` up to `.corrupt.4`). Once all five exist, the one written
+longest ago is replaced, so a file that keeps failing cannot fill the folder.
+If the move fails, the original file is left untouched.
 
 A field this build does not know is skipped, so a file from a build that added
 one within the same schema version still restores, whether it sits on a window,
@@ -987,6 +988,17 @@ deleted either way.
 Three consecutive pre-ready startup failures select an ephemeral safe mode:
 built-in config, no session restore. `noctty --safe-mode` picks it for one
 launch. Safe mode never overwrites your config or quarantined state.
+
+Each launch records in `startup-attempts.json` the noctty version that started
+it, when it began restoring the saved session and whether that restore
+finished. When all three failures ended during a restore, safe mode alone would
+only postpone the next three, so the safe-mode launch also renames
+`session-state.json` to `session-state.json.restore-failed` (or `.1` up to
+`.4` if earlier ones exist) and its notice says so; the next normal launch
+starts with a fresh window. Nothing is deleted or replaced: rename the file
+back to try that session again. A session another running noctty owns, or one
+with all five `.restore-failed` names already taken, is left where it is, and
+that safe-mode launch says only that the session was not loaded.
 
 ## Named layouts
 
