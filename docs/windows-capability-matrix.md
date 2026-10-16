@@ -5,7 +5,7 @@ Windows. Cells stay short; rows with real nuance point into the
 [Notes](#notes) section below. Update rows when Windows behavior changes or
 when upstream docs add or remove a surface that this fork cares about.
 
-Last reviewed: 2026-10-15 (renderer, handoff, graphics and inert-settings notes; other rows 2026-09-02).
+Last reviewed: 2026-10-16 (jump list, native settings and scrollbar rows; renderer, handoff, graphics and inert-settings notes 2026-10-15; other rows 2026-09-02).
 
 ## Status legend
 
@@ -68,7 +68,7 @@ Last reviewed: 2026-10-15 (renderer, handoff, graphics and inert-settings notes;
 | Power-aware rendering                                                             | `unfocused-render-fps` caps visible background presentation; `power-saver-rendering` controls saver pacing; minimized and DWM-cloaked windows do not present. See [power and battery](windows.md#power-and-battery). |
 | SSH host discovery                                                                | Concrete aliases from `%USERPROFILE%\.ssh\config` appear as system `ssh.exe` launch entries in the picker and palette.                                                                                               |
 | Windows default terminal                                                          | `+register-default-terminal` selects noctty per user through the Windows Terminal 1.24-or-newer OpenConsole handoff; see [windows.md](windows.md#default-terminal).                                                  |
-| Taskbar jump lists                                                                | Recent working directories and detected shell profiles launch from the pinned or running taskbar button. See [taskbar jump list](windows.md#taskbar-jump-list).                                                      |
+| Taskbar jump lists                                                                | Recent working directories and detected shell profiles launch from the pinned or running taskbar button; from 1.3.133 a portable copy builds none. See [taskbar jump list](windows.md#taskbar-jump-list).            |
 | Quick terminal and global hotkeys                                                 | Configurable edge/center terminal toggled by a bindable action; `global:` bindings use `RegisterHotKey`. See [quick terminal](#quick-terminal).                                                                      |
 | Desktop notifications                                                             | WinRT Action Center toasts with a local fallback; command-finish and program status toasts focus their pane when clicked. See [notifications and progress](#notifications-and-progress).                             |
 | Taskbar progress                                                                  | OSC 9;4 reports, or the root OSC 7501 status once a program reports one, drive the active pane's taskbar indicator when `progress-style` is enabled.                                                                 |
@@ -390,8 +390,10 @@ share one typed, fuzzy-ranked list with:
 
 Appearance, Terminal, Shell, Privacy, Updates, Keybindings, and Advanced
 sections ship. Edits are staged until Save and applied through an atomic,
-source-preserving config patch; Advanced shows the pending field diff and
-keeps the plain-text escape hatch. Owned snapshots survive external reloads,
+source-preserving config patch; Discard changes asks how many fields would be
+lost before it throws the draft away. Advanced shows the pending field diff and
+keeps the plain-text escape hatch, which opens the config through the `.txt`
+association rather than the file's own. Owned snapshots survive external reloads,
 and native fields support reversible live preview, revision-aware
 external-edit merging, and explicit Keep mine / Use disk conflict
 resolution. Keybinding editing still uses the text config and CLI discovery
@@ -426,7 +428,7 @@ are display-only. Reliable cold-start
 activation depends on the installed Start menu shortcut.
 `notify-on-command-finish-after` and the focus policy are applied before the
 bell or toast; command marks come from shell integration or OSC 133, which
-`cmd.exe` does not supply.
+plain `cmd.exe` does not supply (Clink with the shipped script does).
 
 With `progress-style = true`, terminal progress reports map to normal, paused,
 error, or indeterminate taskbar states for the active pane in each host. If
@@ -437,7 +439,10 @@ the taskbar COM interface fails, noctty disables the native indicator.
 `Ctrl+Shift+F` opens search for the focused pane. Search state and controls
 are per pane; results can mark the graphical scrollbar. `scrollbar = system`
 respects Windows' dynamic-scrollbar preference and stays visible in High
-Contrast; `never` removes only the visual widget.
+Contrast. With dynamic scrollbars on, the bar starts fading 1.5 s after the
+last activity (hovering or dragging holds it), then its window is hidden, and
+it returns on scrolling, viewport-moving output, or the pointer reaching the
+pane's right edge. `never` removes only the visual widget.
 
 ### Clipboard and drag-drop
 

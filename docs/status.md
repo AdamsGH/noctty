@@ -3,7 +3,7 @@
 What works in noctty, what is experimental, and what is out of scope. When
 this page disagrees with a commit message, trust this page.
 
-Last updated: 2026-10-16, against fork `main` at `e3cd417eb`.
+Last updated: 2026-10-16, against fork `main` at `f41abb9a9`.
 
 For a row-by-row mapping against official Ghostty docs, including the
 implementation detail this page leaves out, see
@@ -82,29 +82,38 @@ Win32-validated VT protocol coverage is tracked in
 - Structural undo/redo for new splits, single-tab close (restoring the
   exact tab, panes, and layout), and drag-to-split subtree transfers. Tab
   reorder and multi-tab close modes are not undoable. `clear_screen` and
-  `reset` have a terminal-local undo and redo that restores the screen and
-  the cursor position; with the bundled ConPTY it can leave noctty and
-  ConPTY out of step (see [Known caveats](#known-caveats)).
+  `reset` have a terminal-local undo and redo that restores the saved
+  screen; with the bundled ConPTY the restored content is shifted to the
+  console's live cursor, and some cases can still leave noctty and ConPTY
+  out of step (see [Known caveats](#known-caveats)).
 - Native right-click context menus.
 - In-app profile picker for detected shells: PowerShell 7, Windows
   PowerShell, `cmd`, Git Bash, and WSL distributions when WSL responds.
 - Concrete aliases from `%USERPROFILE%\.ssh\config` appear in the profile
   picker and universal palette and launch through the system `ssh.exe`.
 - Native taskbar jump list with recent working directories and detected
-  shell profiles.
+  shell profiles. From 1.3.133 a portable copy builds none, so it leaves the
+  installed app's list alone; earlier portable copies replaced it at every
+  start.
 - Classic Explorer `Open noctty here` verbs for folders, folder backgrounds,
   and drives, registered by the installer or explicitly per-user for
   portable builds.
-- Per-monitor DPI scaling.
+- Per-monitor DPI scaling. With `window-width` and `window-height` set, a
+  window moved to a monitor of another DPI takes the size it opens at there,
+  and its frame is laid out at the new DPI (measured with the D3D11 renderer
+  on one two-monitor machine; see [Known caveats](#known-caveats) for the one
+  gap).
 - DWM dark caption that follows the app theme on all supported builds, plus
   an integrated title bar with native caption actions and Snap Layout hover
   on Windows 11 while the tab bar and decorations are visible
   (`window-show-tab-bar = never` and older builds keep the stock caption).
   On Windows 11, `window-decoration = none` keeps the system frame with no
   caption (resize edges, shadow, Alt+Space menu), and while the tab bar is
-  shown the window can be dragged by its tab strip. The drag and the window
-  menu were measured with posted messages on a hidden desktop, not with real
-  mouse input.
+  shown the window can be dragged by its tab strip. Right-clicking that strip
+  or the integrated title bar's empty caption opens the window menu. The
+  drag, the double-click maximize and the right-click menu were checked with
+  real mouse input on Windows 11 build 26300 (a right-click on an active
+  window opened no menu until that check found why); Snap was not measured.
 - The tab strip follows the Windows accent colour by default
   (`accent-follow-system`); the rest of the chrome keeps its fixed palette.
 - High-contrast mode detection and palette switching.
@@ -118,8 +127,12 @@ Win32-validated VT protocol coverage is tracked in
 - Per-pane docked scrollback search (`Ctrl+Shift+F`) with regex, case, and
   whole-word modes, result navigation, and match markers on the scrollbar.
 - Per-pane graphical scrollbars. `scrollbar = system` follows Windows'
-  dynamic-scrollbar preference; `never` hides the widget without disabling
-  scrolling.
+  dynamic-scrollbar preference: with dynamic scrollbars on, the bar starts
+  fading 1.5 s after the last activity (hovering or dragging holds it) and
+  its window is hidden once it has faded; scrolling, output that moves the
+  viewport, or the pointer reaching the pane's right edge bring it back, and
+  UI Automation reports it offscreen while it is hidden. `never` hides the
+  widget without disabling scrolling.
 - Clipboard paste confirmation for risky content, including dropped
   payloads, gated by `clipboard-paste-protection`. HTML copy writes both
   CF_HTML and a plain-text fallback. `clipboard-codepoint-map` applies to
@@ -128,7 +141,8 @@ Win32-validated VT protocol coverage is tracked in
   read (`clipboard-read = ask` by default) or write (when
   `clipboard-write = ask`) raises its own prompt that names the tab; Allow
   only works half a second after the prompt opens and after the last key
-  press.
+  press. Cancel or Escape on a read prompt answers the program with an
+  empty reply at once.
 - A configurable quick terminal on an edge or the center of the selected
   monitor. It has no default binding; `global:` keybinds use
   `RegisterHotKey`. `exclusive` keyboard interactivity falls back to focused
@@ -164,7 +178,11 @@ Win32-validated VT protocol coverage is tracked in
   encoding, but not to `global:` hotkeys, which register the literal chord.
 - Native settings window (Appearance, Terminal, Shell, Privacy, Updates,
   Keybindings, Advanced) that stages edits until Save or Discard changes
-  and patches your config without rewriting unrelated text. A "Config
+  (Discard first asks, naming how many fields would be lost) and patches
+  your config without rewriting unrelated text. Its "Open in default
+  editor" button and `+edit-config` without `VISUAL`/`EDITOR` open the config
+  through the `.txt` association rather than the file's own (Settings still
+  refuses an executable-type extension). A "Config
   problems" list (palette row, Settings > Advanced) shows what noctty could
   not use from the config file.
 - Universal palette: actions, tabs, panes, profiles, named layouts, themes,
@@ -236,10 +254,12 @@ Win32-validated VT protocol coverage is tracked in
 ### Windows package managers
 
 - WinGet package id: `AmanThanvi.noctty` (published; `winget install --id AmanThanvi.noctty -e`).
-- Chocolatey package id: `noctty` (the release workflow builds it, but its
-  publish script skips the push while no `CHOCO_API_KEY` secret is
-  configured, as in 1.3.132; community.chocolatey.org had no `noctty` package
-  on 2026-10-16).
+- Chocolatey package id: `noctty` (the release workflow builds it and its
+  last step runs after WinGet, but the publish script skips the push while no
+  `CHOCO_API_KEY` secret is configured, as in 1.3.132; community.chocolatey.org
+  had no `noctty` package on 2026-10-16). The first submission then waits in
+  moderation for weeks, and later pushes get `403` until a version is
+  approved; see [chocolatey-publishing.md](chocolatey-publishing.md).
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
 
 ### Crash reports
@@ -247,10 +267,13 @@ Win32-validated VT protocol coverage is tracked in
 - Crash dumps stay local under `%LOCALAPPDATA%\noctty\crash`. noctty never
   uploads anything from there, and the Sentry initialization path is a no-op
   on Windows.
-- `noctty +crash-report` reads whatever is there. Details in
+- `noctty +crash-report` reads whatever is there. Releases from 1.3.133 on
+  also publish a zip of debug symbols per architecture for reading a dump
+  with a debugger; it is not in the installer or the portable ZIP. Details in
   [windows.md](windows.md#crash-reports-and-diagnostics).
 - Unreadable session state is quarantined, never deleted, and repeated
-  startup failures fall back to safe mode. A saved session that keeps ending
+  startup failures fall back to safe mode (a launch that ends only because
+  OpenGL cannot start is not counted). A saved session that keeps ending
   the process during restore is renamed to `session-state.json.restore-failed`
   instead of being restored again. Details in
   [windows.md](windows.md#session-restore-and-recovery).
@@ -334,14 +357,22 @@ lands incrementally.
   itself is checksummed, not signed. Windows shows no publisher identity and
   SmartScreen warns on first run, and that warning does not fade over time;
   see [getting-started.md](getting-started.md#about-the-smartscreen-warning)
-  and [code-signing-policy.md](code-signing-policy.md).
+  and [code-signing-policy.md](code-signing-policy.md). A release path for
+  Azure Artifact Signing is in the workflow but switched off: preflight
+  refuses it until the updater learns to trust its daily-rotating
+  certificates, so no release uses it yet.
 - GitHub Issues are for reproducible bugs. For questions, feature
   discussion, and feedback, use
   [Discussions](https://github.com/amanthanvi/noctty/discussions).
 - OpenGL 4.3 through WGL is a hard floor for the default renderer, with no
   automatic software fallback. Below it, noctty shows a startup diagnostic
-  with the detected version and does not start (the opt-in D3D11 beta can use
-  WARP, but needs OpenGL 4.3 for images and shaders); see [windows.md](windows.md#gpu-floor-and-opengl-driver-issues).
+  with the detected version and does not start. The diagnostic names
+  `renderer = d3d11` and `d3d11-warp` (the opt-in D3D11 beta can use WARP, but
+  needs OpenGL 4.3 for images and shaders) and the default config file to
+  put the line in; noctty never switches renderers on its own. Releases up to 1.3.132
+  counted those launches toward safe mode, which ignores `renderer`; see
+  [windows.md](windows.md#starting-without-opengl) and
+  [windows.md](windows.md#gpu-floor-and-opengl-driver-issues).
   On a Snapdragon PC that OpenGL comes from Microsoft's GLon12 mapping layer
   in the Compatibility Pack, not from a GPU vendor driver.
 - No supported Linux application packaging. Upstream's Flatpak and Snap
@@ -355,18 +386,38 @@ lands incrementally.
   [capability matrix](windows-capability-matrix.md#settings-accepted-without-effect).
 - Crash capture is local-only, and some hard-abort paths may still
   terminate before Windows can produce a dump.
-- With the bundled ConPTY, undo after `clear_screen` or `reset` can leave
-  noctty's cursor row and ConPTY's apart until the shell clears again, and
-  after `clear_screen` ConPTY drops the rows below the cursor (#401). A
-  wrapped command line, a full-screen program started from it, a maximize
-  that unwraps the line and leaving the program can leave noctty and conhost
-  restoring the saved cursor one row apart; one resize scenario in the
-  ConPTY comparison harness stays marked out of sync (#328).
-- Cancel on an OSC 52 prompt does not answer the program, so a program
-  waiting for a read reply waits until its own timeout (#353).
-- Direct3D 11 beta: physical GPU reset, monitor hotplug, real DPI changes and
-  Remote Desktop were not measured, and its visible-desktop check used posted
-  messages, not real input (#303).
+- With the bundled ConPTY, undo after `clear_screen` or `reset` restores the
+  saved content shifted to the console's live cursor, and rows shifted above
+  the screen go to scrollback, subject to its limit. ConPTY's own console
+  buffer cannot be restored: an off-prompt `clear_screen` still discards the
+  rows below the cursor (#401), so a console-buffer read or a program's later
+  repaint can differ from the restored content. Shifting down to a later live
+  row inserts blank rows above and can clip saved rows at the bottom. A clear
+  the shell redraws itself (at a prompt) keeps the old undo behavior and can
+  still leave noctty's cursor and ConPTY's apart until the shell clears
+  again; a clear that is still queued when undo runs can erase the restored
+  content. An alternate-screen snapshot keeps its whole picture and the live
+  cursor, since it has no scrollback to take shifted rows. The application's
+  own saved cursor (`ESC 7` / `ESC 8`) was not measured for undo.
+- Cancel or Escape on an OSC 52 read prompt sends an empty reply, which has
+  the same bytes as an allowed empty clipboard: Neovim can report an empty
+  register on the next paste. Denial by `clipboard-read = deny`, and a prompt
+  that another overlay replaced or whose tab was closed, send nothing, so a
+  program waiting there waits for its own timeout (#353).
+- Direct3D 11 beta: physical GPU reset, monitor hotplug and Remote Desktop
+  were not measured. Real input was used on one two-monitor machine for a
+  drag between DPIs, but its visible-desktop check used posted messages (#303).
+  While the beta's notice banner is shown (about 5 s by default, the system's
+  notification time) PresentMon on one machine showed the pane presented as
+  composed flip; afterwards it was independent flip, whether or not the
+  scrollbar was shown.
+- A real drag across monitors of different DPI can push long lines into
+  scrollback: in 1 of 15 measured drags (D3D11 renderer, `cmd.exe`, 72-column
+  lines, from a 144 DPI monitor to a 96 DPI one and back) the first 16 lines
+  went there, and 0 of 10 before the DPI padding fix. The likely cause (inferred, not confirmed) is
+  the transient size Windows gives the window before the new font is in, which
+  wraps long lines; the counts cannot show whether the fixes made it more
+  likely. It is not fixed.
 - Alt+Space still sends ESC SPACE to the program as well as opening the
   window menu (#381). Once conhost has seen a Win32 input record it holds a
   lone ESC back until more input arrives, as under Windows Terminal (#335).
