@@ -162,9 +162,8 @@ with one of those names is not a marker. A freshly extracted ZIP is not
 portable by default, because it ships `config-template.ghostty`, which is not
 a marker. An empty `noctty.portable` is enough.
 
-`config.ghostty` is a marker only for portable extracts: when the setup
-installer's machine-wide uninstall entry records the directory as its
-`InstallLocation`, a lone `config.ghostty` is ignored, so a config file dropped
+A lone `config.ghostty` is ignored when the setup installer's machine-wide
+uninstall entry records the executable's directory as its `InstallLocation`, so a config file dropped
 beside an installed `noctty.exe` does not move its data. `noctty.portable` and
 `portable.txt` still count in an installed directory.
 
