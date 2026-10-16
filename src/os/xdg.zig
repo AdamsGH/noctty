@@ -79,7 +79,8 @@ pub fn portableRoot(alloc: Allocator) !?[]u8 {
     return try alloc.dupe(u8, portable_root_cache.path[0..portable_root_cache.len]);
 }
 
-/// Whether `portableRoot` finds a root, without allocating, so it cannot fail.
+/// The cached answer `portableRoot` gives, without copying the path, so a
+/// caller cannot see a different one when that copy fails.
 pub fn portableModeActive() bool {
     portable_root_once.call();
     return portable_root_cache.present;
