@@ -64,15 +64,24 @@ comparison with upstream Ghostty.
 ## Install
 
 **Requirements:** Windows 10 version 1809 (build 17763) or later, or
-Windows 11, on x64 or ARM64, with a GPU driver that supports OpenGL 4.3 or
-later.
+Windows 11, on x64 or ARM64. The default renderer needs a GPU driver that
+supports OpenGL 4.3 or later.
 
-- There is no software renderer, so Noctty won't start where OpenGL falls
-  back to software. That is common over Remote Desktop and in VMs without 3D
-  acceleration.
-- On Windows on Arm PCs, first install the free **OpenCL, OpenGL, and Vulkan
+- The default renderer has no software fallback, so Noctty won't start where
+  OpenGL falls back to software. That is common over Remote Desktop and in VMs
+  without 3D acceleration.
+- The opt-in Direct3D 11 renderer (beta) is the alternative there. Set
+  `renderer = d3d11` in your config to try hardware Direct3D 11, then
+  Microsoft's WARP software renderer, or `renderer = d3d11-warp` to use WARP
+  directly. It draws text without OpenGL; custom shaders, background images,
+  and Kitty images need OpenGL. Remote Desktop has not been measured. Set it
+  before launch failures pile up: after three failed starts Noctty uses
+  built-in defaults, which ignore `renderer`
+  ([details](docs/windows.md#starting-without-opengl)).
+- On Windows on Arm PCs, install the free **OpenCL, OpenGL, and Vulkan
   Compatibility Pack** from the Microsoft Store
-  ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)).
+  ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)),
+  or use the Direct3D 11 renderer (beta). The ARM64 build includes it.
 
 The latest release is
 [noctty 1.3.132](https://github.com/amanthanvi/noctty/releases/tag/v1.3.132),
@@ -172,8 +181,9 @@ Noctty from scripts and the command line, see
 
 - **No telemetry.** On its own, Noctty goes online only to check for updates,
   from GitHub Releases unless you set another update feed.
-- **Updates** are checked when Noctty starts, unless a check succeeded in the
-  last 24 hours. Nothing is installed until you start the update yourself. Set
+- **Updates** are checked when Noctty starts and about every six hours while a
+  window stays open, but no request is made if a check succeeded in the last
+  24 hours. Nothing is installed until you start the update yourself. Set
   `auto-update = off` to stop checking, or `auto-update = download` to have
   Noctty download and verify the update ahead of time.
 - **Crash dumps** stay on your PC in `%LOCALAPPDATA%\noctty\crash` and are
@@ -187,7 +197,8 @@ in [docs/windows.md](docs/windows.md#updates).
 
 - **Won't start?** If a broken config or saved session blocks launch, run
   `noctty --safe-mode`. It starts once with built-in defaults and no session
-  restore, so you can fix the config.
+  restore, so you can fix the config. It still needs OpenGL 4.3; without it,
+  see [Starting without OpenGL](docs/windows.md#starting-without-opengl).
 - **Crashed?** `noctty +crash-report` lists the local crash dumps. For a bug
   report, `noctty +diagnostic-bundle` writes a support bundle that leaves out
   terminal content, commands, and config values by default. Crash dumps can

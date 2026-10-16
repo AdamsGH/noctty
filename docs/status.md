@@ -21,9 +21,11 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
 
 - Windows 10 version 1809 (build 17763) or newer, and Windows 11, on
   x64 and ARM64. ConPTY is a static import, so earlier builds fail to load
-  rather than degrade. ARM64 additionally needs the Microsoft Store
-  "OpenCL, OpenGL, and Vulkan Compatibility Pack", because Qualcomm ships
-  no desktop OpenGL driver; see
+  rather than degrade. The default OpenGL renderer on a Snapdragon PC
+  additionally needs the Microsoft Store "OpenCL, OpenGL, and Vulkan
+  Compatibility Pack", because Qualcomm ships no desktop OpenGL driver; the
+  opt-in D3D11 renderer (beta, `renderer = d3d11`) is included in the ARM64
+  build and does not need it for text. See
   [windows.md](windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack).
 - Windows 10 is a supported floor, not a tested target. CI runs on Windows
   Server 2025 (`windows-2025`, `windows-latest`) and Windows 11 ARM64
@@ -119,10 +121,11 @@ Win32-validated VT protocol coverage is tracked in
   input, and `quick-terminal-space-behavior` has no Windows effect.
 - WinRT Action Center notifications with an in-app banner/log fallback,
   gated by `desktop-notifications`. Command-finish toasts also need
-  `notify-on-command-finish` and a `notify` action, and are the only toasts
-  that focus the originating pane when clicked; OSC 9 / OSC 777 toasts are
-  display-only. Command-finish toasts depend on OSC 133 command marks, which
-  `cmd.exe` does not supply.
+  `notify-on-command-finish` and a `notify` action. Command-finish and
+  program status ([OSC 7501](windows.md#program-status-osc-7501)) toasts focus
+  the originating pane when clicked; OSC 9 / OSC 777 toasts are display-only.
+  Command-finish toasts depend on OSC 133 command marks, which `cmd.exe` does
+  not supply.
 - Taskbar progress for the active pane in each host window, driven by
   terminal progress reports when `progress-style` is enabled.
 - Session restore via `window-save-state`: windows, tabs, splits, profiles,
@@ -297,8 +300,8 @@ lands incrementally.
   automatic software fallback. Below it, noctty shows a startup diagnostic
   with the detected version and does not start (the opt-in D3D11 beta can use
   WARP, but needs OpenGL 4.3 for images and shaders); see [windows.md](windows.md#gpu-floor-and-opengl-driver-issues).
-  On ARM64 that OpenGL comes from Microsoft's GLon12 mapping layer in the
-  Compatibility Pack, not from a GPU vendor driver.
+  On a Snapdragon PC that OpenGL comes from Microsoft's GLon12 mapping layer
+  in the Compatibility Pack, not from a GPU vendor driver.
 - No supported Linux application packaging. Upstream's Flatpak and Snap
   surfaces are removed; the curated Nix flake supports only `libghostty-vt`.
 - A few generated artifacts still reference upstream: the `libghostty-vt`

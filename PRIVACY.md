@@ -1,6 +1,6 @@
 # Privacy policy
 
-Last updated: 15 October 2026
+Last updated: 16 October 2026
 
 This policy covers Noctty, the Windows terminal published by Aman Thanvi at
 [github.com/amanthanvi/noctty](https://github.com/amanthanvi/noctty): the app
@@ -23,9 +23,11 @@ published release files, such as Scoop or WinGet, install the same app.
 ### Update checks (on by default)
 
 - When Noctty starts, it asks the GitHub API for the latest stable release,
-  unless a check succeeded in the last 24 hours. A failed check is retried at
-  the next start. It does not check again while it keeps running.
-  Pre-release builds do not check on their own.
+  unless a check succeeded in the last 24 hours. While a window stays open it
+  tries again about every six hours, and still sends no request if a check
+  succeeded in the last 24 hours. A failed check is retried at the next of
+  those attempts or at the next start. Pre-release builds do not check on
+  their own.
 - **Check for Updates** in the command palette asks right away, even with
   automatic checks off. In a pre-release build it opens the releases page in
   your browser instead.
