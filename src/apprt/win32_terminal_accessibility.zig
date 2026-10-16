@@ -84,7 +84,6 @@ pub const TerminalAccessibilitySession = struct {
     cached_name: [256]u8 = undefined,
     cached_name_len: usize = 0,
     cached_focused: std.atomic.Value(bool) = .init(false),
-    cached_visible_text: []u8,
     cached_visible_range: win32_uia.OffsetRange = .{ .start = 0, .end = 0 },
     cached_caret_offset: usize = 0,
     cached_selection_range: ?win32_uia.OffsetRange = null,
@@ -119,8 +118,6 @@ pub const TerminalAccessibilitySession = struct {
         errdefer alloc.destroy(self);
         const cached_text = try alloc.dupe(u8, "");
         errdefer alloc.free(cached_text);
-        const cached_visible_text = try alloc.dupe(u8, "");
-        errdefer alloc.free(cached_visible_text);
         const cached_cells = try alloc.alloc(win32_uia.TerminalCellPosition, 0);
         errdefer alloc.free(cached_cells);
         self.* = .{
@@ -129,7 +126,6 @@ pub const TerminalAccessibilitySession = struct {
             .query_message = query_message,
             .timer_id = timer_id,
             .cached_text = cached_text,
-            .cached_visible_text = cached_visible_text,
             .cached_cells = cached_cells,
         };
         self.cacheName();
@@ -436,13 +432,10 @@ pub const TerminalAccessibilitySession = struct {
         const caret_offset = snapshot.caret_offset;
         const selection_range = snapshot.selection_range;
         const selection_active_offset = snapshot.selection_active_offset;
-        const visible_text = try self.alloc.dupe(u8, text[visible_range.start..visible_range.end]);
-        errdefer self.alloc.free(visible_text);
 
         self.mutex.lock();
         defer self.mutex.unlock();
         if (!self.attached) {
-            self.alloc.free(visible_text);
             self.alloc.free(cells);
             self.alloc.free(text);
             return .{ .change = .unchanged };
@@ -470,7 +463,6 @@ pub const TerminalAccessibilitySession = struct {
                 try self.takePendingAnnouncement()
             else
                 null;
-            self.alloc.free(visible_text);
             self.alloc.free(cells);
             self.alloc.free(text);
             if (update_refresh_time) self.last_refresh_ms = sys.GetTickCount64();
@@ -488,10 +480,8 @@ pub const TerminalAccessibilitySession = struct {
         errdefer if (announcement) |value| self.alloc.free(value);
 
         self.alloc.free(self.cached_cells);
-        self.alloc.free(self.cached_visible_text);
         self.alloc.free(self.cached_text);
         self.cached_text = text;
-        self.cached_visible_text = visible_text;
         self.cached_visible_range = visible_range;
         self.cached_caret_offset = caret_offset;
         self.cached_selection_range = selection_range;
@@ -658,7 +648,6 @@ pub const TerminalAccessibilitySession = struct {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous != 1) return;
         self.alloc.free(self.cached_cells);
-        self.alloc.free(self.cached_visible_text);
         self.alloc.free(self.cached_text);
         self.alloc.destroy(self);
     }
@@ -690,12 +679,9 @@ pub const TerminalAccessibilitySession = struct {
         if (!self.attached) return error.ElementNotAvailable;
         const document_text = try alloc.dupe(u8, self.cached_text);
         errdefer alloc.free(document_text);
-        const visible_text = try alloc.dupe(u8, self.cached_visible_text);
-        errdefer alloc.free(visible_text);
         const cells = try alloc.dupe(win32_uia.TerminalCellPosition, self.cached_cells);
         return .{
             .document_text = document_text,
-            .visible_text = visible_text,
             .visible_range = self.cached_visible_range,
             .caret_offset = self.cached_caret_offset,
             .terminal_selection_range = self.cached_selection_range,
@@ -1078,6 +1064,30 @@ test "terminal accessibility refresh and query policies" {
     try std.testing.expect(!semanticOutputInterestPolicy(true, true, false));
     try std.testing.expect(!semanticOutputInterestPolicy(true, false, true));
     try std.testing.expect(!semanticOutputInterestPolicy(false, true, true));
+}
+
+test "terminal snapshot does not allocate a second visible text copy" {
+    var ctx: MutableTestOps.Context = .{
+        .focused = true,
+        .text = "history\nvisible\n",
+        .visible_range = .{ .start = 8, .end = 16 },
+    };
+    const session = try TerminalAccessibilitySession.create(
+        std.testing.allocator,
+        MutableTestOps.ops(&ctx),
+        0,
+        0,
+    );
+    defer session.deinit();
+    _ = try session.refresh(.discard, false);
+
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counted.allocator();
+    const snapshot = try TerminalAccessibilitySession.providerSnapshot(@ptrCast(session), alloc);
+    defer alloc.free(snapshot.document_text);
+    defer if (snapshot.geometry) |geometry| alloc.free(geometry.cell_for_byte);
+    const geometry_bytes = snapshot.geometry.?.cell_for_byte.len * @sizeOf(win32_uia.TerminalCellPosition);
+    try std.testing.expectEqual(snapshot.document_text.len + geometry_bytes, counted.allocated_bytes);
 }
 
 test "terminal output announcements are readable bounded increments" {

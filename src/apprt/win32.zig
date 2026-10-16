@@ -27759,15 +27759,12 @@ fn editSnapshot(
     value: []const u8,
 ) !win32_uia.TerminalSnapshot {
     const document_text = try alloc.dupe(u8, value);
-    errdefer alloc.free(document_text);
-    const visible_text = try alloc.dupe(u8, value);
     const selection = nativeEditSelection(hwnd);
     const start = utf16CodeUnitOffsetToUtf8ByteOffset(value, selection[0]);
     const end = utf16CodeUnitOffsetToUtf8ByteOffset(value, selection[1]);
     const caret = utf16CodeUnitOffsetToUtf8ByteOffset(value, nativeEditCaret(hwnd, selection));
     return .{
         .document_text = document_text,
-        .visible_text = visible_text,
         .visible_range = .{ .start = 0, .end = document_text.len },
         .caret_offset = caret,
         .selection_range = .{ .start = @min(start, end), .end = @max(start, end) },
