@@ -89,23 +89,27 @@ pub fn registerAumidDisplayName(alloc: std.mem.Allocator, portable: bool) void {
     defer alloc.free(exe_path);
     const parent = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Classes\\AppUserModelId");
     const name = std.unicode.utf8ToUtf16LeStringLiteral(aumid_utf8);
-    register(alloc, parent, name, exe_path, portable) catch |err| {
+    _ = register(alloc, parent, name, exe_path, portable) catch |err| {
         std.log.warn("AUMID: registration failed err={}", .{err});
     };
 }
 
+/// Returns whether this call wrote the registration.
 fn register(
     alloc: std.mem.Allocator,
     parent: [:0]const u16,
     name: [:0]const u16,
     exe_path: []const u8,
     portable: bool,
-) !void {
+) !bool {
     var parent_key: HKEY = undefined;
     if (sys.RegCreateKeyExW(HKEY_CURRENT_USER, parent, 0, null, REG_OPTION_NON_VOLATILE, KEY_WRITE, null, &parent_key, null) != ERROR_SUCCESS)
         return error.RegistryOpenFailed;
     defer _ = sys.RegCloseKey(parent_key);
-    if (!portable) return registerForExe(alloc, parent_key, name, exe_path);
+    if (!portable) {
+        try registerForExe(alloc, parent_key, name, exe_path);
+        return true;
+    }
 
     // A portable copy leaves an existing registration alone, whoever wrote
     // it. Where there is none, it fills a complete key under a private name
@@ -115,7 +119,7 @@ fn register(
     var existing: HKEY = undefined;
     if (sys.RegOpenKeyExW(parent_key, name, 0, KEY_QUERY_VALUE, &existing) == ERROR_SUCCESS) {
         _ = sys.RegCloseKey(existing);
-        return;
+        return false;
     }
     var random: [8]u8 = undefined;
     std.crypto.random.bytes(&random);
@@ -125,10 +129,12 @@ fn register(
     defer alloc.free(pending_w);
     @memcpy(pending_w[0..name.len], name);
     for (suffix, pending_w[name.len..]) |c, *w| w.* = c;
-    try registerForExe(alloc, parent_key, pending_w, exe_path);
-    if (RegRenameKey(parent_key, pending_w, name) != ERROR_SUCCESS) {
-        _ = RegDeleteKeyW(parent_key, pending_w);
-    }
+    const published = if (registerForExe(alloc, parent_key, pending_w, exe_path))
+        RegRenameKey(parent_key, pending_w, name) == ERROR_SUCCESS
+    else |_|
+        false;
+    if (!published) _ = RegDeleteKeyW(parent_key, pending_w);
+    return published;
 }
 
 extern "advapi32" fn RegRenameKey(key: HKEY, sub_key: ?LPCWSTR, new_name: LPCWSTR) callconv(.winapi) i32;
@@ -153,15 +159,19 @@ fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_pat
     }
     defer _ = sys.RegCloseKey(hkey);
 
+    // Every write is attempted; a failed one is reported at the end.
+    var complete = true;
     const display_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty");
     const set_rc = writeRegSz(hkey, std.unicode.utf8ToUtf16LeStringLiteral("DisplayName"), display_name);
     if (set_rc != ERROR_SUCCESS) {
         std.log.warn("AUMID: write DisplayName failed rc={d}", .{set_rc});
+        complete = false;
     }
 
     {
         const icon_path = iconUriPath(alloc, exe_path) catch |err| blk: {
             std.log.warn("AUMID: sibling icon path unavailable err={}; leaving IconUri unchanged", .{err});
+            complete = false;
             break :blk null;
         };
         defer if (icon_path) |path| alloc.free(path);
@@ -179,9 +189,11 @@ fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_pat
                 const icon_rc = writeRegSz(hkey, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), icon_uri);
                 if (icon_rc != ERROR_SUCCESS) {
                     std.log.warn("AUMID: write IconUri failed rc={d}", .{icon_rc});
+                    complete = false;
                 }
             } else |err| {
                 std.log.warn("AUMID: IconUri utf16 conversion failed err={}", .{err});
+                complete = false;
             }
         }
     }
@@ -197,7 +209,9 @@ fn registerForExe(alloc: std.mem.Allocator, root: HKEY, subkey: LPCWSTR, exe_pat
     );
     if (show_rc != ERROR_SUCCESS) {
         std.log.warn("AUMID: write ShowInSettings failed rc={d}", .{show_rc});
+        complete = false;
     }
+    if (!complete) return error.RegistryWriteFailed;
 }
 
 fn writeRegSz(hkey: HKEY, value_name: LPCWSTR, value: [:0]const u16) i32 {
@@ -380,7 +394,7 @@ test "aumid registration: installed copies always write, portable copies only cr
     {
         const reg = try TestRegistry.init(alloc);
         defer reg.deinit(alloc);
-        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        try std.testing.expect(try register(alloc, reg.parent, TestRegistry.name, p1, true));
         const key = try reg.open(TestRegistry.name);
         defer _ = sys.RegCloseKey(key);
         try TestRegistry.expectSz(key, "DisplayName", "noctty");
@@ -395,7 +409,7 @@ test "aumid registration: installed copies always write, portable copies only cr
         // Present: another portable copy changes no value and not even the
         // key's last-write time, including values it would not have written.
         std.Thread.sleep(20 * std.time.ns_per_ms);
-        try register(alloc, reg.parent, TestRegistry.name, p2, true);
+        try std.testing.expect(!try register(alloc, reg.parent, TestRegistry.name, p2, true));
         const kept = try reg.snapshot();
         try std.testing.expectEqualSlices(u16, created.icon[0 .. created.icon_bytes / 2], kept.icon[0 .. kept.icon_bytes / 2]);
         try std.testing.expectEqual(created.written, kept.written);
@@ -403,47 +417,99 @@ test "aumid registration: installed copies always write, portable copies only cr
 
         // An installed copy always writes: its own icon replaces the portable
         // one, and an exe with no icon beside it leaves IconUri alone.
-        try register(alloc, reg.parent, TestRegistry.name, installed, false);
+        try std.testing.expect(try register(alloc, reg.parent, TestRegistry.name, installed, false));
         try TestRegistry.expectSz(key, "IconUri", icons[0]);
-        try register(alloc, reg.parent, TestRegistry.name, bare, false);
+        try std.testing.expect(try register(alloc, reg.parent, TestRegistry.name, bare, false));
         try TestRegistry.expectSz(key, "IconUri", icons[0]);
-        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        try std.testing.expect(!try register(alloc, reg.parent, TestRegistry.name, p1, true));
         try TestRegistry.expectSz(key, "IconUri", icons[0]);
 
         // Not even a registration whose icon has gone is repaired.
         try tmp.dir.deleteFile("installed/" ++ icon_file_name);
         const broken = try reg.snapshot();
-        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        try std.testing.expect(!try register(alloc, reg.parent, TestRegistry.name, p1, true));
         try TestRegistry.expectSz(key, "IconUri", icons[0]);
         try std.testing.expectEqual(broken.written, (try reg.snapshot()).written);
         try tmp.dir.writeFile(.{ .sub_path = "installed/" ++ icon_file_name, .data = "installed" });
     }
 
-    // Copies starting together: three portable copies and an installed one.
-    // At most one portable copy publishes, nothing pending is left, and the
-    // installed copy's values win whatever the order.
-    for (0..8) |_| {
+    // Copies starting together, released at once: portable copies alone
+    // publish exactly one registration; with an installed copy among them
+    // at most one portable copy publishes and the installed values win.
+    // Either way nothing pending is left.
+    for ([_]bool{ false, true }) |with_installed| {
+        for (0..8) |_| {
+            const reg = try TestRegistry.init(alloc);
+            defer reg.deinit(alloc);
+            const Run = struct {
+                fn run(gate: *std.Thread.ResetEvent, a: std.mem.Allocator, parent: [:0]const u16, exe: []const u8, portable: bool, out: *?bool) void {
+                    gate.wait();
+                    out.* = register(a, parent, TestRegistry.name, exe, portable) catch null;
+                }
+            };
+            var gate: std.Thread.ResetEvent = .{};
+            var published: [4]?bool = .{ null, null, null, null };
+            var threads: [4]std.Thread = undefined;
+            var spawned: usize = 0;
+            defer {
+                gate.set();
+                for (threads[0..spawned]) |t| t.join();
+            }
+            const first: usize = if (with_installed) 0 else 1;
+            for (first..4) |i| {
+                threads[spawned] = try std.Thread.spawn(.{}, Run.run, .{ &gate, alloc, reg.parent, exes[i], i != 0, &published[i] });
+                spawned += 1;
+            }
+            gate.set();
+            for (threads[0..spawned]) |t| t.join();
+            spawned = 0;
+
+            var portable_published: usize = 0;
+            for (published[1..]) |p| portable_published += @intFromBool((p orelse return error.TestUnexpectedResult));
+            const key = try reg.open(TestRegistry.name);
+            defer _ = sys.RegCloseKey(key);
+            if (with_installed) {
+                try std.testing.expect(published[0].?);
+                try std.testing.expect(portable_published <= 1);
+                try TestRegistry.expectSz(key, "IconUri", icons[0]);
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), portable_published);
+                const winner = for (published[1..], 1..) |p, i| {
+                    if (p.?) break i;
+                } else unreachable;
+                try TestRegistry.expectSz(key, "IconUri", icons[winner]);
+            }
+            try std.testing.expectEqual(@as(DWORD, 1), (try reg.snapshot()).siblings);
+        }
+    }
+
+    // A portable copy that cannot write every value publishes nothing and
+    // leaves no pending key, at every allocation that can fail.
+    for (0..64) |fail_index| {
         const reg = try TestRegistry.init(alloc);
         defer reg.deinit(alloc);
-        const Run = struct {
-            fn run(a: std.mem.Allocator, parent: [:0]const u16, exe: []const u8, portable: bool) void {
-                register(a, parent, TestRegistry.name, exe, portable) catch {};
-            }
-        };
-        var threads: [4]std.Thread = undefined;
-        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Run.run, .{ alloc, reg.parent, exes[i], i != 0 });
-        for (threads) |t| t.join();
-        const key = try reg.open(TestRegistry.name);
-        defer _ = sys.RegCloseKey(key);
-        try TestRegistry.expectSz(key, "IconUri", icons[0]);
-        try std.testing.expectEqual(@as(DWORD, 1), (try reg.snapshot()).siblings);
-    }
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        const published = register(failing.allocator(), reg.parent, TestRegistry.name, p1, true) catch false;
+        if (published) {
+            try std.testing.expect(!failing.has_induced_failure);
+            const key = try reg.open(TestRegistry.name);
+            defer _ = sys.RegCloseKey(key);
+            try TestRegistry.expectSz(key, "IconUri", icons[1]);
+            break;
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        const parent = try reg.open(null);
+        defer _ = sys.RegCloseKey(parent);
+        var subkeys: DWORD = 99;
+        try std.testing.expectEqual(ERROR_SUCCESS, TestRegistry.RegQueryInfoKeyW(parent, null, null, null, &subkeys, null, null, null, null, null, null, null));
+        try std.testing.expectEqual(@as(DWORD, 0), subkeys);
+    } else return error.TestUnexpectedResult;
 
     // The guard itself: renaming onto a name that exists fails.
     {
         const reg = try TestRegistry.init(alloc);
         defer reg.deinit(alloc);
-        try register(alloc, reg.parent, TestRegistry.name, p1, true);
+        try std.testing.expect(try register(alloc, reg.parent, TestRegistry.name, p1, true));
         var parent: HKEY = undefined;
         try std.testing.expectEqual(ERROR_SUCCESS, sys.RegCreateKeyExW(HKEY_CURRENT_USER, reg.parent, 0, null, 0, KEY_WRITE, null, &parent, null));
         defer _ = sys.RegCloseKey(parent);
