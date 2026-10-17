@@ -296,10 +296,25 @@ Recommended order:
    workflow with `run_interactive_win11=true`. The interactive job runs
    only on this opted-in dispatch, and the **Release** workflow refuses
    to publish without its hash-bound evidence at the exact release SHA.
-5. After readiness passes, either:
+5. Run the Windows 10 22H2 checklist,
+   [docs/windows10-release-checklist.md](docs/windows10-release-checklist.md),
+   against a candidate built from the intended source SHA on a Windows 10
+   machine. Use [Local packaging](#local-packaging) with `-RequireConPty` and
+   Inno Setup available for the installed rows. Local builds are unsigned unless
+   signing is configured; record that limit. **Release Readiness** produces no
+   artifacts. Record the source SHA and candidate hashes. Stable publication
+   rebuilds the assets, so this pass binds to the source SHA; record the shipped
+   hashes separately and repeat affected checks if the source changes. No
+   hosted image or interactive job covers Windows 10; the checklist is a manual
+   release step, not a CI gate. Put its results table in the release notes'
+   validation section. The scheduled **Windows 10 branches** workflow is a
+   separate, non-required check that runs the unit suite on Windows Server 2022
+   (build 20348); read its latest run too.
+6. After readiness passes, either:
    - push tag `v<version>`, or
-   - manually dispatch the **Release** workflow with `version=<version>`.
-6. Confirm the workflow published artifacts for both x64 and ARM64:
+   - manually dispatch the **Release** workflow with `version=<version>` and
+     `prerelease=false`.
+7. Confirm the workflow published artifacts for both x64 and ARM64:
    - installer
    - portable ZIP
    - `noctty-<version>-windows-x64-portable.manifest.ps1`
@@ -308,8 +323,8 @@ Recommended order:
    - `SHA256SUMS-windows-<arch>.txt`
    - legacy x64 `SHA256SUMS.txt`
    - GitHub Release notes/assets
-7. Confirm build provenance for the eleven non-icon assets.
-8. Confirm follow-on publishes:
+8. Confirm build provenance for the eleven non-icon assets.
+9. Confirm follow-on publishes:
    - Scoop manifest update
    - WinGet submission
    - Chocolatey package push

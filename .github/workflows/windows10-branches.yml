@@ -1,0 +1,127 @@
+name: Windows 10 branches
+
+# Not a required check and not part of the PR gate. GitHub offers no Windows 10
+# image (windows-2019 was retired on 2025-06-30). windows-2022 is Windows Server
+# 2022, build 20348: below 22000, so every `os_build >= 22000` gate in
+# src/apprt/win32.zig takes its Windows 10 branch. docs/windows10-release-checklist.md
+# lists what this job covers and what only a Windows 10 desktop can.
+#
+# Pull requests run it only when this file changes, to test the file itself.
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/windows10-branches.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-2022:
+    name: Windows Server 2022 (build below 22000)
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Require a Windows build below 22000
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $build = [int]$os.BuildNumber
+          Write-Host "$($os.Caption) version $($os.Version) build $build"
+          "windows_build=$build" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ($build -ge 22000) {
+            throw "windows-2022 is build $build; the Windows 10 gates in src/apprt/win32.zig take their Windows 11 branch at 22000. Pick another image or retire this workflow."
+          }
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig exports its own global cache even with use-cache disabled.
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Zig version
+        run: zig version
+
+      - name: Full Zig test suite
+        shell: pwsh
+        run: |
+          zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all 2>&1 | Tee-Object -FilePath zig-test.log
+          $code = $LASTEXITCODE
+          $summary = Select-String -Path zig-test.log -Pattern 'tests passed' | Select-Object -Last 1
+          "Zig suite on build ${env:windows_build}: $($summary.Line)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          if ($code -ne 0) { exit $code }
+
+      - name: Build executable
+        run: zig build -Demit-exe=true
+
+      - name: noctty +version smoke
+        shell: pwsh
+        run: |
+          $versionText = & .\zig-out\bin\noctty.com +version | Out-String
+          Write-Host $versionText
+          if ($LASTEXITCODE -ne 0) { throw "noctty.com +version failed with exit code $LASTEXITCODE." }
+          if ($versionText -notmatch 'ConPTY') { throw 'noctty.com +version did not report the ConPTY source.' }
+
+      - name: Build D3D11 lifecycle smoke tools
+        shell: pwsh
+        timeout-minutes: 30
+        run: zig build -Doptimize=ReleaseFast -Dcustom-shaders=true -Dd3d11=true -Drenderer-test-tools=true --prefix renderer-smoke --summary all
+
+      # The same harness test.yml runs on windows-2025, here on a kernel below
+      # 22000. It launches a portable copy on a hidden desktop, so this is the
+      # first run of the real binary on a Windows 10 era build.
+      - name: Hidden-desktop WARP lifecycle smoke
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./test/windows/renderer/Invoke-RendererParity.ps1 -Binary ./renderer-smoke/bin/noctty.exe -OutputDirectory ./renderer-smoke/evidence -WarpOnly
+
+      - name: Require the app to take the Windows 10 branch
+        shell: pwsh
+        run: |
+          $logs = @(Get-ChildItem -Path renderer-smoke/evidence -Recurse -Filter stderr.txt)
+          if ($logs.Count -eq 0) { throw 'The smoke left no stderr.txt to read.' }
+          $lines = $logs | Select-String -Pattern 'os_build=(\d+) integrated_titlebar=(true|false)'
+          if (-not $lines) { throw 'No stderr.txt holds the os_build line the app logs at startup.' }
+          foreach ($line in $lines) {
+            $match = [regex]::Match($line.Line, 'os_build=(\d+) integrated_titlebar=(true|false)')
+            $build = [int]$match.Groups[1].Value
+            if ($build -ne [int]$env:windows_build -or $build -ge 22000 -or $match.Groups[2].Value -ne 'false') {
+              throw "The app logged '$($match.Value)' on build $env:windows_build; expected the same build below 22000 with integrated_titlebar=false."
+            }
+          }
+          "App startup log on build ${env:windows_build}: $($lines.Count) launches took the Windows 10 branch." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload Windows 10 branch evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows10-branches-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            zig-test.log
+            renderer-smoke/evidence
