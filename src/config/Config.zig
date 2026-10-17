@@ -1178,6 +1178,13 @@ palette: Palette = .{},
 ///
 ///   * `passwd` entry (user information)
 ///
+/// On Windows the `SHELL` variable and `passwd` do not apply. The default is
+/// PowerShell 7 (`pwsh.exe`) when it is found on `PATH`, else Windows
+/// PowerShell, else Command Prompt (`cmd.exe`). WSL is never the default,
+/// because `wsl.exe --status` can report a healthy installation when starting
+/// a session would still fail; use `command = wsl.exe` to choose it. A launch
+/// with `--safe-mode` always starts `cmd.exe`, which reads no startup files.
+///
 /// This can contain additional arguments to run the command with. If additional
 /// arguments are provided, the command will be executed using `/bin/sh -c`
 /// to offload shell argument expansion.
