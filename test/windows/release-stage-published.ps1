@@ -16,6 +16,7 @@ $root = Join-Path ([System.IO.Path]::GetTempPath()) ('release-stage-published-' 
 $scriptsDirectory = Join-Path $root 'scripts'
 $binDirectory = Join-Path $root 'bin'
 $downloadDirectory = Join-Path $root 'download'
+$scratchTemp = Join-Path $root 'temp'
 $ghLog = Join-Path $root 'gh-calls.txt'
 $packageLog = Join-Path $root 'package-calls.txt'
 $stager = Join-Path $scriptsDirectory 'release-stage-published.ps1'
@@ -34,6 +35,10 @@ try {
 param([string] $Version, [string] $DownloadDirectory)
 if ($env:FAKE_VERIFY -eq 'fail') { throw 'release verification failed' }
 New-Item -ItemType Directory -Path $DownloadDirectory -Force | Out-Null
+if ($env:FAKE_VERIFY -eq 'fail-after-download') {
+    Set-Content -LiteralPath (Join-Path $DownloadDirectory 'partial') -Value 'x'
+    throw 'release verification failed after the download'
+}
 foreach ($arch in 'x64', 'arm64') {
     foreach ($kind in 'setup.exe', 'portable.zip') {
         Set-Content -LiteralPath (Join-Path $DownloadDirectory "noctty-$Version-windows-$arch-$kind") -Value "$arch $kind"
@@ -56,24 +61,31 @@ exit 2
 '@
 
     function Invoke-Stager {
-        param([string] $Verify = 'ok', [string] $Attest = 'ok', [string] $SourceRef = '')
+        param([string] $Verify = 'ok', [string] $Attest = 'ok', [string] $SourceRef = '', [switch] $ChooseDownloadDirectory)
 
-        Remove-Item -LiteralPath $ghLog, $packageLog, $downloadDirectory, (Join-Path $root 'dist') -Recurse -Force -ErrorAction Ignore
-        $savedPath = $env:PATH
+        Remove-Item -LiteralPath $ghLog, $packageLog, $downloadDirectory, $scratchTemp, (Join-Path $root 'dist') -Recurse -Force -ErrorAction Ignore
+        New-Item -ItemType Directory -Path $scratchTemp -Force | Out-Null
+        $savedEnvironment = @{ PATH = $env:PATH; TEMP = $env:TEMP; TMP = $env:TMP }
         try {
             $env:PATH = $binDirectory + [System.IO.Path]::PathSeparator + $env:PATH
+            # Where the stager's own temporary folder, if it picks one, would go.
+            $env:TEMP = $scratchTemp
+            $env:TMP = $scratchTemp
             $env:FAKE_VERIFY = $Verify
             $env:FAKE_ATTEST = $Attest
             $env:FAKE_GH_LOG = $ghLog
             $env:FAKE_PACKAGE_LOG = $packageLog
             $env:FAKE_TAG_COMMIT = $tagCommit
-            $arguments = @('-NoProfile', '-File', $stager, '-Version', $version, '-DownloadDirectory', $downloadDirectory)
+            $arguments = @('-NoProfile', '-File', $stager, '-Version', $version)
+            if (-not $ChooseDownloadDirectory) { $arguments += @('-DownloadDirectory', $downloadDirectory) }
             if ($SourceRef) { $arguments += @('-PackageSourceRef', $SourceRef) }
             $output = (& pwsh @arguments 2>&1 | Out-String)
             $exitCode = $LASTEXITCODE
         }
         finally {
-            $env:PATH = $savedPath
+            $env:PATH = $savedEnvironment.PATH
+            $env:TEMP = $savedEnvironment.TEMP
+            $env:TMP = $savedEnvironment.TMP
             Remove-Item Env:FAKE_VERIFY, Env:FAKE_ATTEST, Env:FAKE_GH_LOG, Env:FAKE_PACKAGE_LOG, Env:FAKE_TAG_COMMIT -ErrorAction Ignore
         }
         return [pscustomobject]@{
@@ -82,6 +94,8 @@ exit 2
             GhCalls    = @(if (Test-Path -LiteralPath $ghLog) { Get-Content -LiteralPath $ghLog })
             Packages   = @(if (Test-Path -LiteralPath $packageLog) { Get-Content -LiteralPath $packageLog })
             Staged     = Test-Path -LiteralPath (Join-Path $root 'dist')
+            Downloaded = Test-Path -LiteralPath $downloadDirectory
+            Leftovers  = @(Get-ChildItem -LiteralPath $scratchTemp -Directory -Filter 'noctty-chocolatey-release-*')
         }
     }
 
@@ -120,7 +134,17 @@ exit 2
     $result = Invoke-Stager
     Assert-Case 'no source ref is passed unless one is given' ($result.ExitCode -eq 0 -and $result.Packages.Count -eq 1 -and $result.Packages[0] -ceq "$version|x64,arm64|") $result
 
-    Write-Host 'release-stage-published.ps1 behaviour: PASS (7 cases)'
+    # A folder the caller supplies is the caller's to clean up.
+    $result = Invoke-Stager
+    Assert-Case 'a download folder supplied by the caller is kept' ($result.ExitCode -eq 0 -and $result.Downloaded -and $result.Leftovers.Count -eq 0) $result
+
+    # A folder the script picked is removed after a success and after a failure.
+    $result = Invoke-Stager -ChooseDownloadDirectory
+    Assert-Case 'a temporary download folder is removed after a success' ($result.ExitCode -eq 0 -and $result.Staged -and $result.Packages.Count -eq 1 -and $result.Leftovers.Count -eq 0) $result
+    $result = Invoke-Stager -ChooseDownloadDirectory -Verify 'fail-after-download'
+    Assert-Case 'a temporary download folder is removed after a failure' ($result.ExitCode -ne 0 -and -not $result.Staged -and $result.Leftovers.Count -eq 0) $result
+
+    Write-Host 'release-stage-published.ps1 behaviour: PASS (10 cases)'
     # GitHub's pwsh wrapper exits with the last native exit code.
     $global:LASTEXITCODE = 0
 }
