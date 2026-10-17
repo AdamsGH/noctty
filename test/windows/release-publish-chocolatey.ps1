@@ -40,7 +40,7 @@ try {
     # The fake choco: `pack` writes a package where --output-directory says,
     # `push` behaves as FAKE_CHOCO_PUSH says.
     Set-Content -LiteralPath (Join-Path $binDirectory 'choco.ps1') -Value @'
-Add-Content -LiteralPath $env:FAKE_CHOCO_LOG -Value ($args -join ' ')
+Add-Content -LiteralPath $env:FAKE_CHOCO_LOG -Value ((@($args) -join ' ') + ' | key-in-env=' + [bool]$env:CHOCO_API_KEY)
 switch ($args[0]) {
     'pack' {
         $output = $args[[array]::IndexOf($args, '--output-directory') + 1]
@@ -143,9 +143,11 @@ exit 2
     $result = Invoke-Publisher
     Assert-Case 'a real run without a key skips' ($result.ExitCode -eq 0 -and $result.Packs.Count -eq 0 -and $result.Output -match 'CHOCO_API_KEY is not configured') $result
 
-    # A real run packs, then pushes with the key, and never prints it.
+    # A real run packs without the key in the packing process's environment,
+    # then pushes with it, and never prints it.
     $result = Invoke-Publisher -WithKey $true
-    Assert-Case 'a real run packs, then pushes with the key' ($result.ExitCode -eq 0 -and $result.Packs.Count -eq 1 -and $result.Pushes.Count -eq 1 -and
+    Assert-Case 'a real run packs without the key, then pushes with it' ($result.ExitCode -eq 0 -and $result.Packs.Count -eq 1 -and $result.Pushes.Count -eq 1 -and
+        $result.Packs[0] -match 'key-in-env=False' -and $result.Pushes[0] -match 'key-in-env=True' -and
         $result.Pushes[0] -match '--source https://push\.invalid/' -and $result.Pushes[0] -match ('--api-key ' + [regex]::Escape($fakeKey)) -and
         $result.Output -notmatch [regex]::Escape($fakeKey)) $result
 

@@ -38,16 +38,43 @@ $DownloadDirectory = [System.IO.Path]::GetFullPath($DownloadDirectory)
 # asset set, a digest, checksum, provenance or Authenticode mismatch.
 & (Join-Path $PSScriptRoot 'verify-published-release.ps1') -Version $Version -DownloadDirectory $DownloadDirectory
 
+$architectures = @(Get-WindowsPackageArchitectures)
+
+# verify-published-release.ps1 ties each attestation to this repository's
+# release workflow, not to a commit. Tie the installers the package will name
+# to the commit the release tag points at as well: a release rebuilt later from
+# another commit and re-uploaded under the same tag passes the checks above and
+# fails this one. (A rebuild of the same commit still passes both; the WinGet
+# manifest's InstallerSha256 values are the independent record to compare.)
+$repository = if ([string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) { 'amanthanvi/noctty' } else { $env:GITHUB_REPOSITORY }
+$tagCommit = ((& gh api "repos/$repository/commits/v$Version" --jq .sha) | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $tagCommit -cnotmatch '\A[0-9a-f]{40}\z') {
+    throw "Could not resolve the commit of tag v$Version in $repository."
+}
+foreach ($architecture in $architectures) {
+    $setupPath = Join-Path $DownloadDirectory (New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind setup)
+    & gh attestation verify $setupPath `
+        --repo $repository `
+        --signer-workflow "$repository/.github/workflows/release.yml" `
+        --source-digest $tagCommit
+    if ($LASTEXITCODE -ne 0) {
+        throw "The $architecture installer was not built from the commit of tag v${Version}: $setupPath"
+    }
+}
+
 # The layout package-package-managers.ps1 and release-publish-chocolatey.ps1
 # read: one directory per architecture, the icon beside the x64 files.
 $artifactRoot = Join-Path $repoRoot 'dist/artifacts'
-$architectures = @(Get-WindowsPackageArchitectures)
 foreach ($architecture in $architectures) {
     $architectureDirectory = Join-Path $artifactRoot "noctty-$Version-windows-$architecture"
     New-Item -ItemType Directory -Path $architectureDirectory -Force | Out-Null
     foreach ($kind in @('setup', 'portable', 'checksums')) {
         $name = New-WindowsPackageArtifactName -Version $Version -Architecture $architecture -Kind $kind
         Copy-Item -LiteralPath (Join-Path $DownloadDirectory $name) -Destination (Join-Path $architectureDirectory $name) -Force
+        if ($kind -eq 'setup') {
+            # Printed so the hashes can be compared with the ones WinGet holds.
+            Write-Host "Installer $architecture SHA-256: $(Get-FileSha256Lower -Path (Join-Path $architectureDirectory $name))"
+        }
     }
 }
 Copy-Item `

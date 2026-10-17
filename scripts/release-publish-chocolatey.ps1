@@ -123,11 +123,21 @@ if (Test-Path -LiteralPath $packageOutputDir) {
 }
 New-Item -ItemType Directory -Path $packageOutputDir -Force | Out-Null
 
-& choco pack $nuspecPath `
-    --output-directory $packageOutputDir `
-    --limit-output
-if ($LASTEXITCODE -ne 0) {
-    throw "choco pack failed with exit code $LASTEXITCODE."
+# The key is for the push alone: take it out of this process's environment
+# while choco pack runs, so the packing process does not inherit it.
+$apiKey = $env:CHOCO_API_KEY
+Remove-Item -LiteralPath Env:CHOCO_API_KEY -ErrorAction Ignore
+try {
+    & choco pack $nuspecPath `
+        --output-directory $packageOutputDir `
+        --limit-output
+    $packExitCode = $LASTEXITCODE
+}
+finally {
+    if ($apiKey) { $env:CHOCO_API_KEY = $apiKey }
+}
+if ($packExitCode -ne 0) {
+    throw "choco pack failed with exit code $packExitCode."
 }
 
 $packages = @(Get-ChildItem -LiteralPath $packageOutputDir -Filter '*.nupkg' -File)

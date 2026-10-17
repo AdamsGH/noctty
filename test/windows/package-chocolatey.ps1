@@ -212,8 +212,9 @@ try {
         throw 'A repacked nuspec must keep pointing at the original release.'
     }
 
-    # The publish script behind the Release step and the manual Chocolatey
-    # Publish workflow, against a fake choco and a loopback feed.
+    # The scripts behind the manual Chocolatey Publish workflow (the publish
+    # script is also the Release step's), against fake tools and a loopback feed.
+    & (Join-Path $PSScriptRoot 'release-stage-published.ps1')
     & (Join-Path $PSScriptRoot 'release-publish-chocolatey.ps1')
 
     Write-Host "Chocolatey package validation: PASS (version=$Version, architecture=$Architecture)"

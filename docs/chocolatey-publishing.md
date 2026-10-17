@@ -67,6 +67,9 @@ Chocolatey 2.7.4 in image 20261013.288.2), and builds nothing:
    `Release` workflow ends with: GitHub's digest for every asset, the
    `SHA256SUMS` files, the build provenance attestation of every asset except
    the icon, and the Authenticode signer. A draft or prerelease fails there.
+   It then requires both installers' attestations to name the commit the
+   release tag points at, so an installer re-uploaded from another commit is
+   refused.
 3. It builds the package from those installers with
    `scripts/package-package-managers.ps1`, whose `packageSourceUrl` names the
    workflow's commit.
@@ -75,8 +78,20 @@ Chocolatey 2.7.4 in image 20261013.288.2), and builds nothing:
    key and never contacts the push source.
 5. With `push`, the same script runs for real. Only this step can read
    `CHOCO_API_KEY`, and it fails with a clear message if the secret is
-   missing. The 403 and 409 handling and the rule below are the `Release`
-   workflow's, because it is the same script.
+   missing. The script takes the key out of its environment while
+   `choco pack` runs, so only `choco push` receives it. The 403 and 409
+   handling and the rule below are the `Release` workflow's, because it is the
+   same script.
+
+What this cannot tell is a rebuild of the same commit re-uploaded under the
+same tag (the thing not to do in step 4 above): its attestations are as good as
+the original's. Before the first push of a version, compare the
+`Installer <arch> SHA-256` lines the build step prints with `InstallerSha256`
+in the WinGet manifest of that version (`microsoft/winget-pkgs`,
+`manifests/a/AmanThanvi/noctty/<version>`), which was published from the
+original build. For 1.3.132 the release's installers and that manifest were
+identical on 2026-10-17 for both x64 (`b59f99a3...`) and arm64
+(`f7c465e1...`).
 
 The script skips a version the feed already lists. The feed's exact-version
 lookup also lists a version that is still in moderation (measured on
@@ -86,11 +101,14 @@ such a version needs `-f resubmit=true` as well. Without it the run reports
 `Chocolatey already has noctty <version>; nothing to push.`
 
 The check that the run starts from `main` guards against a mistake, not
-against a person with write access: on 2026-10-17 the `release` environment
-had no deployment-branch rule and no required reviewers, so a workflow on any
-branch could read its secrets. Restricting the environment to `main` (and to
-the `v*` tags the `Release` workflow runs from) in its settings would close
-that.
+against a person with write access: it is part of the workflow file, and on
+2026-10-17 the `release` environment had no deployment-branch rule and no
+required reviewers, so a copy of the workflow edited on any branch could
+still read the environment's secrets (`CHOCO_API_KEY` and the signing
+certificate alike). The fix is in the environment's settings, which this
+repository's code cannot change: limit deployment branches and tags to `main`
+and the `v*` tags (with a tag ruleset, otherwise a writer can create a
+matching tag on any commit), or require a reviewer for the environment.
 
 ## What happens after the first push
 

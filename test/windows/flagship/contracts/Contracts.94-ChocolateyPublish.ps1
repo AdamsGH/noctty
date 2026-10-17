@@ -1,17 +1,25 @@
 # The manual Chocolatey Publish workflow pushes the one release secret nothing
-# else uses (CHOCO_API_KEY) from a runner, so its shape is pinned the way the
-# release workflow's is: the checks below are a function that must accept the
-# committed workflow and reject each mutant after it.
+# else uses (CHOCO_API_KEY) from a runner, so it is pinned the way the release
+# workflow is. The whole file carries a digest (any edit is a review event, which
+# also catches what a pattern cannot, such as a decoy in a comment), and a
+# function states the properties that matter and must reject each mutant.
+$chocolateyPublishWorkflowSha256 = '8b14690bf70342fcf44596cd09f3b40aec55ecce30587511bcfd46a64cd37784'
 $chocolateyPublishWorkflow = Join-Path $repoRoot '.github\workflows\chocolatey-publish.yml'
 $chocolateyPublisherScript = Join-Path $repoRoot 'scripts\release-publish-chocolatey.ps1'
 $chocolateyStagerScript = Join-Path $repoRoot 'scripts\release-stage-published.ps1'
 $chocolateyPublishingDoc = Join-Path $repoRoot 'docs\chocolatey-publishing.md'
 
 function Test-ChocolateyPublishWorkflow {
-    param([Parameter(Mandatory)] [string] $Text)
+    param(
+        [Parameter(Mandatory)] [string] $Text,
+        [switch] $SkipDigest
+    )
 
     $problems = [System.Collections.Generic.List[string]]::new()
     $canonical = ConvertTo-CanonicalText -Text $Text
+    if (-not $SkipDigest -and (Get-CanonicalTextSha256 -Text $Text) -cne $chocolateyPublishWorkflowSha256) {
+        $problems.Add('the workflow differs from its pinned digest: review the change, then update the digest')
+    }
     $pushStepName = 'Push to Chocolatey'
     $expectedSteps = @(
         'Checkout code',
@@ -100,6 +108,11 @@ function Test-ChocolateyPublishWorkflow {
     if ($steps['Checkout code'] -notmatch '(?m)^          persist-credentials: false\s*$') {
         $problems.Add('checkout must not persist credentials')
     }
+    foreach ($name in $expectedSteps | Where-Object { $_ -cne 'Pack the package (dry run)' -and $_ -cne $pushStepName }) {
+        if ($steps[$name] -match '(?m)^        if:') {
+            $problems.Add("step runs conditionally: $name")
+        }
+    }
     $metaStep = $steps['Check the version and the workflow commit']
     foreach ($required in @(
             "if (`$env:GH_REPOSITORY -cne 'amanthanvi/noctty')",
@@ -126,12 +139,12 @@ function Test-ChocolateyPublishWorkflow {
         }
     }
     $packStep = $steps['Pack the package (dry run)']
-    if (-not $packStep.Contains('if: ${{ !inputs.push }}', [StringComparison]::Ordinal) -or
+    if ($packStep -notmatch '(?m)^        if: \$\{\{ !inputs\.push \}\}\s*$' -or
         -not $packStep.Contains('./scripts/release-publish-chocolatey.ps1 -Version $env:RELEASE_VERSION -PackOnly', [StringComparison]::Ordinal)) {
         $problems.Add('the dry run must run exactly when push is off, and must pass -PackOnly')
     }
     $pushStep = $steps[$pushStepName]
-    if (-not $pushStep.Contains('if: ${{ inputs.push }}', [StringComparison]::Ordinal) -or
+    if ($pushStep -notmatch '(?m)^        if: \$\{\{ inputs\.push \}\}\s*$' -or
         -not $pushStep.Contains('CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}', [StringComparison]::Ordinal) -or
         -not $pushStep.Contains('RESUBMIT: ${{ inputs.resubmit }}', [StringComparison]::Ordinal) -or
         -not $pushStep.Contains('$publishArguments = @{ Version = $env:RELEASE_VERSION; Resubmit = ($env:RESUBMIT -ceq ''true'') }', [StringComparison]::Ordinal) -or
@@ -162,6 +175,8 @@ if ($chocolateyPublishProblems.Count -ne 0) {
     throw "Chocolatey Publish workflow contract failed: $($chocolateyPublishProblems -join '; ')"
 }
 $chocolateyPublishCanonical = ConvertTo-CanonicalText -Text $chocolateyPublishWorkflowText
+# Each mutant must break a stated property, checked without the digest so that
+# the digest cannot be what rejects it.
 $chocolateyPublishMutants = @(
     @{ Label = 'extra push trigger'; Target = "on:`n  workflow_dispatch:"; Replacement = "on:`n  push:`n    branches: [main]`n  workflow_dispatch:" },
     @{ Label = 'unpinned checkout'; Target = 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2'; Replacement = 'actions/checkout@v6' },
@@ -175,14 +190,24 @@ $chocolateyPublishMutants = @(
     @{ Label = 'no default-branch check'; Target = 'if ($env:WORKFLOW_REF -cne "refs/heads/$env:DEFAULT_BRANCH")'; Replacement = 'if ($false)' },
     @{ Label = 'ignored failure'; Target = '        timeout-minutes: 10'; Replacement = "        timeout-minutes: 10`n        continue-on-error: true" },
     @{ Label = 'no token baseline'; Target = 'permissions: {}'; Replacement = 'permissions: write-all' },
-    @{ Label = 'missing key guard'; Target = 'throw ''The release environment has no CHOCO_API_KEY secret.'''; Replacement = 'Write-Host ''no key''' }
+    @{ Label = 'missing key guard'; Target = 'throw ''The release environment has no CHOCO_API_KEY secret.'''; Replacement = 'Write-Host ''no key''' },
+    @{ Label = 'condition with a trailing decoy'; Target = 'if: ${{ inputs.push }}'; Replacement = 'if: ${{ true }} # if: ${{ inputs.push }}' },
+    @{ Label = 'condition added to the build step'; Target = '        timeout-minutes: 15'; Replacement = "        timeout-minutes: 15`n        if: `${{ false }}" }
 )
-foreach ($mutant in $chocolateyPublishMutants) {
+# What only the digest can see: a guard whose throw became a message, the
+# verifier wrapped in a dead branch, a decoy of the old condition in a comment.
+$chocolateyPublishDigestOnlyMutants = @(
+    @{ Label = 'guard that no longer throws'; Target = "throw ""Run this workflow from `$env:DEFAULT_BRANCH, not `$env:WORKFLOW_REF."""; Replacement = 'Write-Host "not main"' },
+    @{ Label = 'verifier in a dead branch'; Target = '          ./scripts/release-stage-published.ps1 `'; Replacement = '          if ($false) { ./scripts/release-stage-published.ps1 `' },
+    @{ Label = 'comment decoy'; Target = '      - name: Show the Chocolatey version'; Replacement = "      # if: `${{ inputs.push }}`n      - name: Show the Chocolatey version" }
+)
+foreach ($mutant in $chocolateyPublishMutants + $chocolateyPublishDigestOnlyMutants) {
     if (@([regex]::Matches($chocolateyPublishCanonical, [regex]::Escape($mutant.Target))).Count -ne 1) {
         throw "Chocolatey Publish mutation target is not unique: $($mutant.Label)"
     }
     $mutantText = $chocolateyPublishCanonical.Replace($mutant.Target, $mutant.Replacement)
-    if (@(Test-ChocolateyPublishWorkflow -Text $mutantText).Count -eq 0) {
+    $skipDigest = $mutant -notin $chocolateyPublishDigestOnlyMutants
+    if (@(Test-ChocolateyPublishWorkflow -Text $mutantText -SkipDigest:$skipDigest).Count -eq 0) {
         throw "Chocolatey Publish workflow contract accepted mutant: $($mutant.Label)"
     }
 }
@@ -197,6 +222,20 @@ Invoke-ContractTable -Contracts @(
         Pattern = '(?ms)\[switch\] \$PackOnly.*?if \(-not \$PackOnly -and -not \$env:CHOCO_API_KEY\) \{.*?& choco pack.*?if \(\$PackOnly\) \{[^}]*return\s*\}.*?& choco push'
         Kind = 'Text'
         Description = '-PackOnly needs no API key, packs, and returns before choco push'
+    }
+    @{
+        File = $chocolateyPublisherScript
+        Content = { $chocolateyPublisherText }
+        Pattern = '(?ms)\$apiKey = \$env:CHOCO_API_KEY\s+Remove-Item -LiteralPath Env:CHOCO_API_KEY.*?& choco pack.*?finally \{\s*if \(\$apiKey\) \{ \$env:CHOCO_API_KEY = \$apiKey \}\s*\}'
+        Kind = 'Text'
+        Description = 'choco pack runs without the API key in its environment'
+    }
+    @{
+        File = $chocolateyStagerScript
+        Content = { $chocolateyStagerText }
+        Pattern = '(?ms)verify-published-release\.ps1.*?gh attestation verify \$setupPath.*?--source-digest \$tagCommit.*?throw "The \$architecture installer was not built from the commit'
+        Kind = 'Text'
+        Description = 'the installers are verified against the release tag''s commit before they are staged'
     }
     @{
         File = $chocolateyStagerScript
