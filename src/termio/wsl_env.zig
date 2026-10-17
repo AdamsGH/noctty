@@ -272,14 +272,10 @@ fn isLocalAbsolute(path: []const u8) bool {
 /// final component with FILE_OPEN_REPARSE_POINT would not protect ancestors.
 const LocalPath = enum { safe, missing, unsafe };
 fn localPathState(path: []const u8) LocalPath {
-    return localPathStateWithMapping(path, os_windows.directVolumePath);
-}
-
-fn localPathStateWithMapping(path: []const u8, comptime map: anytype) LocalPath {
     if (comptime builtin.os.tag != .windows) return .unsafe;
     if (!isLocalAbsolute(path)) return .unsafe;
     var wide = windows.sliceToPrefixedFileW(null, path) catch return .unsafe;
-    if (!map(&wide)) return .unsafe;
+    if (!os_windows.directVolumePath(&wide)) return .unsafe;
     const span = wide.span();
     var name: windows.UNICODE_STRING = .{
         .Length = @intCast(span.len * 2),
@@ -817,8 +813,8 @@ test "probeKey distinguishes forwarded HOME and cwd independent of map order" {
 test "WSL guarded paths map DOS roots without an unchecked fallback" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const Reject = struct {
-        fn map(_: *windows.PathSpace) bool {
-            return false;
+        fn map(_: [*:0]const u16, _: []u16) ?[]const u16 {
+            return null;
         }
     };
     const alloc = std.testing.allocator;
@@ -827,10 +823,41 @@ test "WSL guarded paths map DOS roots without an unchecked fallback" {
     try tmp.dir.writeFile(.{ .sub_path = "safe.txt", .data = "safe" });
     const path = try tmp.dir.realpathAlloc(alloc, "safe.txt");
     defer alloc.free(path);
-    try std.testing.expectEqual(LocalPath.unsafe, localPathStateWithMapping(path, Reject.map));
-    try std.testing.expectEqual(LocalPath.safe, localPathStateWithMapping(path, os_windows.directVolumePath));
+    os_windows.TestHooks.direct_volume_mapping = Reject.map;
+    defer os_windows.TestHooks.direct_volume_mapping = null;
+    try std.testing.expectEqual(LocalPath.unsafe, localPathState(path));
+    os_windows.TestHooks.direct_volume_mapping = null;
+    try std.testing.expectEqual(LocalPath.safe, localPathState(path));
     try tmp.dir.deleteFile("safe.txt");
-    try std.testing.expectEqual(LocalPath.missing, localPathStateWithMapping(path, os_windows.directVolumePath));
+    try std.testing.expectEqual(LocalPath.missing, localPathState(path));
+}
+
+test "WSL executable probe enters production DOS mapping" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const Reject = struct {
+        fn map(_: [*:0]const u16, _: []u16) ?[]const u16 {
+            return null;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "wsl.exe", .data = "not executed" });
+    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(cwd);
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    os_windows.TestHooks.direct_volume_mapping = Reject.map;
+    defer os_windows.TestHooks.direct_volume_mapping = null;
+    const refused = try localExecutable(alloc, &env, "wsl.exe", cwd);
+    defer if (refused) |path| alloc.free(path);
+    try std.testing.expectEqual(null, refused);
+    os_windows.TestHooks.direct_volume_mapping = null;
+    const found = (try localExecutable(alloc, &env, "wsl.exe", cwd)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(found);
+    const expected = try std.fs.path.join(alloc, &.{ cwd, "wsl.exe" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, found);
 }
 
 test "localExecutable refuses remote device and ambiguous search paths" {

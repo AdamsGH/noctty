@@ -121,8 +121,19 @@ fn isDirectVolumeDeviceName(name: []const u16) bool {
 /// Replace the DOS drive alias in a prefixed path before OBJ_DONT_REPARSE.
 /// Callers must screen the drive's media type before resolving this mapping.
 pub fn directVolumePath(path: *windows.PathSpace) bool {
+    if (builtin.is_test) {
+        if (TestHooks.direct_volume_mapping) |mapping|
+            return directVolumePathWithMapping(path, mapping);
+    }
     return directVolumePathWithMapping(path, directVolumeDeviceName);
 }
+
+/// Inject at the OS boundary so tests enter through the real production callers.
+/// The override and its dispatch are absent from non-test builds. Thread-local
+/// state keeps a test's refusal from affecting unrelated worker threads.
+pub const TestHooks = if (builtin.is_test) struct {
+    pub threadlocal var direct_volume_mapping: ?*const fn ([*:0]const u16, []u16) ?[]const u16 = null;
+} else struct {};
 
 fn directVolumePathWithMapping(path: *windows.PathSpace, mapping: anytype) bool {
     const prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\??\\");
