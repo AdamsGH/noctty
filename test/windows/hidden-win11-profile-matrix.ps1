@@ -32,6 +32,8 @@ param(
     [switch] $Driver,
     [switch] $AllowProductAumid,
     [string[]] $Profile = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'git-bash'),
+    # A machine without an OpenGL 4.3 driver (a hosted runner, a VM) needs `d3d11-warp` to open a window.
+    [string] $Renderer = '',
     [ValidateRange(30, 1800)] [int] $DriverTimeoutSeconds = 420
 )
 $ErrorActionPreference = 'Stop'
@@ -40,6 +42,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $Driver) {
     Assert-MeasureAumid (Join-Path (Resolve-Path -LiteralPath $Bin).Path 'noctty.exe') -AllowProductAumid:$AllowProductAumid
     $extra = @('-Profile', ($Profile -join ','))
+    if ($Renderer) { $extra += @('-Renderer', $Renderer) }
     if ($AllowProductAumid) { $extra += '-AllowProductAumid' }
     Invoke-HiddenDriver -Script $PSCommandPath -Bin $Bin -Run $Run -TimeoutSeconds $DriverTimeoutSeconds -ExtraArguments $extra -Label 'Hidden profile matrix'
     exit
@@ -90,7 +93,7 @@ function Start-Case([string] $Key, [string] $Suffix, [string[]] $ExtraConfig) {
     $session = @{ schema_version = 1; windows = @(@{ selected_tab = 0; tabs = @(@{ selected_leaf = 0; layout = @{ root = 0; nodes = @($node) } }) }) }
     Set-Content -LiteralPath (Join-Path $dir 'session-state.json') -Value ($session | ConvertTo-Json -Depth 12 -Compress) -NoNewline -Encoding utf8NoBOM
     $config = Join-Path $dir 'matrix.ghostty'
-    (@('window-save-state = always', 'confirm-close-surface = false', 'single-instance = false', 'auto-update = off', 'window-width = 100', 'window-height = 30') + $ExtraConfig) | Set-Content -LiteralPath $config
+    (@('window-save-state = always', 'confirm-close-surface = false', 'single-instance = false', 'auto-update = off', 'window-width = 100', 'window-height = 30') + $(if ($Renderer) { @("renderer = $Renderer") } else { @() }) + $ExtraConfig) | Set-Content -LiteralPath $config
     return @{ Key = $Key; Name = $name; Dir = $dir; Cwd = @{ A = $cwdA; B = $cwdB; Seed = $seed }; Config = $config; Home = (Join-Path $Run "$name\home") }
 }
 

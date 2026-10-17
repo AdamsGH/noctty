@@ -12,7 +12,8 @@ This reads the per-test output of the test executable (`ghostty-test.exe`, run d
   * a test in the guarded family (names starting with `familyPrefix`) skips and is not on the runner's
     allowlist, or
   * the total number of skipped tests is above the runner's `maxTotalSkipped`, or
-  * the log is incomplete (fewer lines than the `M` it announces), so a crash cannot pass as a budget.
+  * the log is incomplete or inconsistent (no closing `N passed; N skipped; N failed.` line, or counts that
+    disagree with the tests parsed), so a crash cannot pass as a budget.
 An allowlisted test that runs is fine: the list is an upper bound, because a developer's machine has
 more fonts than a runner. Lower the numbers when a skip goes away; raise them only with a reason in
 the commit, since that is the decision this check exists to force.
@@ -38,17 +39,40 @@ if (-not $limits -and -not $Report) {
 }
 
 $announced = 0
+$summary = $null
 $parsed = [Collections.Generic.List[object]]::new()
+$pending = $null
 foreach ($line in Get-Content -LiteralPath $TestLog) {
-    # The runner prints a progress line per test; names contain spaces and may contain dots.
-    $match = [regex]::Match($line, '^(\d+)/(\d+) (.*)\.\.\.(OK|SKIP|FAIL)\s*$')
-    if (-not $match.Success) { continue }
-    $announced = [int]$match.Groups[2].Value
-    $parsed.Add([pscustomobject]@{ Index = [int]$match.Groups[1].Value; Name = $match.Groups[3].Value; Result = $match.Groups[4].Value })
+    # The runner prints `N/M name...` and then OK, SKIP or FAIL, on the same line unless the test logged
+    # in between: the log lines follow the header and the result stands alone on a later line.
+    if ($null -ne $pending) {
+        if ($line -match '^(OK|SKIP|FAIL)\b') {
+            $parsed.Add([pscustomobject]@{ Index = $pending.Index; Name = $pending.Name; Result = $Matches[1] })
+            $pending = $null
+            continue
+        }
+    }
+    $header = [regex]::Match($line, '^(\d+)/(\d+) (.*?)\.\.\.(.*)$')
+    if ($header.Success -and [int]$header.Groups[1].Value -eq $parsed.Count + 1) {
+        $announced = [int]$header.Groups[2].Value
+        $item = [pscustomobject]@{ Index = [int]$header.Groups[1].Value; Name = $header.Groups[3].Value }
+        $rest = $header.Groups[4].Value
+        if ($rest -match '^(OK|SKIP|FAIL)\s*$') { $parsed.Add([pscustomobject]@{ Index = $item.Index; Name = $item.Name; Result = $Matches[1] }); $pending = $null }
+        else { $pending = $item }
+        continue
+    }
+    $total = [regex]::Match($line, '^(\d+) passed; (\d+) skipped; (\d+) failed\.$')
+    if ($total.Success) { $summary = @{ Passed = [int]$total.Groups[1].Value; Skipped = [int]$total.Groups[2].Value; Failed = [int]$total.Groups[3].Value } }
 }
 $problems = [Collections.Generic.List[string]]::new()
 if ($parsed.Count -eq 0) { $problems.Add('The log holds no per-test lines; run ghostty-test.exe directly and pass its output.') }
-elseif ($parsed.Count -ne $announced) { $problems.Add("The log is incomplete: $($parsed.Count) of $announced tests were reported.") }
+elseif ($null -eq $summary) { $problems.Add("The log has no closing 'N passed; N skipped; N failed.' line, so the run did not finish ($($parsed.Count) of $announced tests reported).") }
+elseif ($parsed.Count -ne $announced -or ($summary.Passed + $summary.Skipped + $summary.Failed) -ne $announced) {
+    $problems.Add("The log is inconsistent: $($parsed.Count) tests parsed, $announced announced, the closing line counts $($summary.Passed + $summary.Skipped + $summary.Failed).")
+}
+elseif (@($parsed | Where-Object Result -eq 'SKIP').Count -ne $summary.Skipped) {
+    $problems.Add("Parsed $(@($parsed | Where-Object Result -eq 'SKIP').Count) skipped tests but the closing line says $($summary.Skipped).")
+}
 
 $skipped = @($parsed | Where-Object Result -eq 'SKIP')
 $family = @($skipped | Where-Object { $_.Name.StartsWith($prefix, [StringComparison]::Ordinal) })
