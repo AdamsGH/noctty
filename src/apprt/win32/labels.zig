@@ -2167,33 +2167,6 @@ pub fn overlayPaintCacheDirty(
     );
 }
 
-pub fn buildInspectorBannerText(
-    alloc: Allocator,
-    host: HostTabStatus,
-    pane_count: usize,
-    zoomed: bool,
-) ![]u8 {
-    if (zoomed and pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "Inspector active | tab {d}/{d} | panes {d} | zoomed | toggle Inspect to return",
-            .{ host.index + 1, host.total, pane_count },
-        );
-    }
-    if (pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "Inspector active | tab {d}/{d} | panes {d} | toggle Inspect to return",
-            .{ host.index + 1, host.total, pane_count },
-        );
-    }
-    return try std.fmt.allocPrint(
-        alloc,
-        "Inspector active | tab {d}/{d} | toggle Inspect to return",
-        .{ host.index + 1, host.total },
-    );
-}
-
 pub fn buildInspectorPanelTitleText(
     alloc: Allocator,
     host: HostTabStatus,
@@ -4199,22 +4172,6 @@ test "win32 key-remap applies to command palette toggle lookup" {
     const no_remaps: input.KeyRemapSet = .empty;
     try std.testing.expect(!keyEventTogglesCommandPalette(event, &cfg.keybind.set, &no_remaps));
     try std.testing.expect(keyEventTogglesCommandPalette(event, &cfg.keybind.set, &remaps));
-}
-
-test "win32 buildInspectorBannerText reflects host inspector context" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const multi = try buildInspectorBannerText(std.testing.allocator, .{ .index = 1, .total = 4 }, 3, false);
-    defer std.testing.allocator.free(multi);
-    try std.testing.expectEqualStrings("Inspector active | tab 2/4 | panes 3 | toggle Inspect to return", multi);
-
-    const zoomed = try buildInspectorBannerText(std.testing.allocator, .{ .index = 0, .total = 2 }, 2, true);
-    defer std.testing.allocator.free(zoomed);
-    try std.testing.expectEqualStrings("Inspector active | tab 1/2 | panes 2 | zoomed | toggle Inspect to return", zoomed);
-
-    const single = try buildInspectorBannerText(std.testing.allocator, .{ .index = 0, .total = 1 }, 1, false);
-    defer std.testing.allocator.free(single);
-    try std.testing.expectEqualStrings("Inspector active | tab 1/1 | toggle Inspect to return", single);
 }
 
 test "win32 buildHostBannerText prefixes info and error banners" {

@@ -5410,7 +5410,7 @@ pub const SettingsWindow = struct {
 
         // Nothing in the Win32 runtime can show a backdrop blur (AGENTS.md,
         // 2026-09-14), so the box is shown for what the config file may say and
-        // cannot be changed here. It keeps its place and its accessible name.
+        // cannot be changed here. Its visible and accessible names explain why.
         self.chk_bg_blur = makeCheckbox(
             form,
             self.handle.hinstance,

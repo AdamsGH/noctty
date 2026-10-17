@@ -2674,7 +2674,6 @@ pub const App = struct {
     next_host_id: u32 = 1,
     launcher_profile_key: ?[:0]const u8 = null,
     launcher_profile_hint: ?[:0]const u8 = null,
-    launcher_profile_order_hint: ?[:0]const u8 = null,
     launcher_quick_slot_keys: [3]?[:0]const u8 = .{ null, null, null },
     launcher_profile_target: ProfileOpenTarget = .tab,
     startup_profile_picker: bool = false,
@@ -2979,7 +2978,6 @@ pub const App = struct {
             .recovery_startup = recovery_startup,
             .hinstance = sys.GetModuleHandleW(null),
             .launcher_profile_hint = detectDefaultProfileHint(core_app.alloc),
-            .launcher_profile_order_hint = windows_shell.profileOrderHint(core_app.alloc),
             .launcher_profile_target = detectDefaultProfileTarget(core_app.alloc),
             .startup_profile_picker = detectStartupProfilePicker(core_app.alloc),
             .explicit_startup_working_directory = detectExplicitStartupWorkingDirectory(core_app.alloc),
@@ -3546,7 +3544,6 @@ pub const App = struct {
         self.global_hotkeys.deinit(self.core_app.alloc);
         if (self.launcher_profile_key) |value| self.core_app.alloc.free(value);
         if (self.launcher_profile_hint) |value| self.core_app.alloc.free(value);
-        if (self.launcher_profile_order_hint) |value| self.core_app.alloc.free(value);
         for (self.launcher_quick_slot_keys) |value| {
             if (value) |owned| self.core_app.alloc.free(owned);
         }
@@ -6937,13 +6934,9 @@ pub const App = struct {
                 return false;
             },
 
-            .readonly => {
-                if (self.findSurfaceForTarget(target)) |surface| {
-                    try surface.setReadonly(value == .on);
-                    return true;
-                }
-                return false;
-            },
+            // The core enforces read-only input. There is no separate chrome
+            // indicator now that the dormant status bar has been removed.
+            .readonly => return self.findSurfaceForTarget(target) != null,
 
             .key_sequence => {
                 if (self.findSurfaceForTarget(target)) |surface| {
@@ -33589,7 +33582,6 @@ pub const Surface = struct {
         .max_width = 0,
         .max_height = 0,
     },
-    readonly: bool = false,
     secure_input: bool = false,
     secure_input_ever_engaged: bool = false,
     key_sequence_active: bool = false,
@@ -39147,11 +39139,6 @@ pub const Surface = struct {
         self.core_surface.occlusionCallback(visible) catch |err| {
             log.err("win32 occlusion callback failed err={} visible={}", .{ err, visible });
         };
-    }
-
-    fn setReadonly(self: *Surface, enabled: bool) !void {
-        if (self.readonly == enabled) return;
-        self.readonly = enabled;
     }
 
     fn setPwd(self: *Surface, pwd: []const u8) !void {
