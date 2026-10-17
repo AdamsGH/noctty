@@ -209,3 +209,6 @@ catch {
 Write-Host "Job selection ($reason)"
 $flags = Get-CiJobFlags -Selection $selection
 foreach ($name in $flags.Keys) { Write-CiOutput -Name $name -Value $flags[$name].ToString().ToLowerInvariant() }
+# A failed `git diff` was handled above (everything runs), but Actions ends a pwsh
+# step with `exit $LASTEXITCODE`, which would still fail the step.
+$global:LASTEXITCODE = 0

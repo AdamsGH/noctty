@@ -89,6 +89,12 @@ finally {
     $env:GITHUB_OUTPUT = $null
     if (Test-Path -LiteralPath $outputFile) { Remove-Item -LiteralPath $outputFile }
 }
+# Actions ends a `shell: pwsh` step with `exit $LASTEXITCODE` when that variable
+# exists, so a git failure the script handled (it fails open) must not leave a
+# nonzero code behind. Reproduce the step's tail in a child process.
+$stepTail = "& '$(Join-Path $repoRoot 'scripts\ci-changed-paths.ps1')' -EventName pull_request -BaseSha not-a-sha -HeadSha not-a-sha 3>`$null 6>`$null | Out-Null; if (Test-Path -LiteralPath variable:\LASTEXITCODE) { exit `$LASTEXITCODE }"
+& pwsh -NoProfile -Command $stepTail
+Assert-True ($LASTEXITCODE -eq 0) "A handled git failure must not fail the changes step (exit code $LASTEXITCODE)."
 
 # --- The table itself -------------------------------------------------------
 # A rule that matches no tracked file is clutter that hides a rename: the file
@@ -280,4 +286,7 @@ Assert-True ($null -ne $baseline -and $baseline.RunId -ceq '100' -and $baseline.
 Assert-True ($trendCalls[0] -like '*event=schedule*' -and -not ($trendCalls -like '*/runs/300/*')) 'Only scheduled runs are candidates, and the current run is never queried.'
 Assert-True ($null -eq (Get-PreviousTrendArtifact -Repository 'owner/repo' -CurrentRunId '300' -Api { param($Path) '{"workflow_runs":[],"artifacts":[]}' | ConvertFrom-Json })) 'With no earlier nightly there is no baseline.'
 
+# The CLI cases above run git against a bad revision on purpose. Actions ends a
+# pwsh step with `exit $LASTEXITCODE`, so leave it clean.
+$global:LASTEXITCODE = 0
 Write-Host "CI script tests passed ($script:passed assertions, $zigNamedFiles Zig-named files and $closureFiles script references checked)." -ForegroundColor Green

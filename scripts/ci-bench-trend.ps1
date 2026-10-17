@@ -134,3 +134,6 @@ $summary = @(
 ) + $rows
 $summary | ForEach-Object { Write-Host $_ }
 if ($env:GITHUB_STEP_SUMMARY) { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8 }
+# A baseline lookup that failed was reported in the summary; do not let its exit
+# code fail the step (Actions ends a pwsh step with `exit $LASTEXITCODE`).
+$global:LASTEXITCODE = 0
