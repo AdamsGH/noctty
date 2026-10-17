@@ -4,7 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const build_config = @import("../../build_config.zig");
-const config_file_load = @import("../../config/file_load.zig");
 const os_windows = @import("../../os/windows.zig");
 const win32_types = @import("../win32_types.zig");
 const c = @import("consts.zig");
@@ -97,6 +96,8 @@ const OpenGLStartupFailure = struct {
     win32_error: ?DWORD = null,
     zig_error_name: ?[]const u8 = null,
     detected: ?DetectedOpenGL = null,
+    /// The Direct3D 11 beta was tried after OpenGL and failed too: its error.
+    d3d11_error_name: ?[]const u8 = null,
 };
 
 /// Fixed-capacity copy of a driver-reported string (`GL_RENDERER`,
@@ -128,6 +129,18 @@ const DetectedOpenGL = struct {
     renderer: OpenGLStartupString = .{},
     vendor: OpenGLStartupString = .{},
 };
+
+/// Set once OpenGL could not start for a surface: later surfaces in this
+/// process start on the Direct3D 11 beta without trying OpenGL.
+var opengl_unavailable: std.atomic.Value(bool) = .init(false);
+
+pub fn markOpenGLUnavailable() void {
+    opengl_unavailable.store(true, .release);
+}
+
+pub fn openGLUnavailable() bool {
+    return opengl_unavailable.load(.acquire);
+}
 
 var opengl_startup_diagnostics_mutex: std.Thread.Mutex = .{};
 var opengl_startup_diagnostics_active = false;
@@ -170,9 +183,23 @@ fn openGLStartupDiagnosticsActive() bool {
 }
 
 /// Whether this startup recorded an OpenGL failure that no later success
-/// cleared: the failure `reportStartupFailure` explains.
+/// cleared and that ended the launch: the failure `reportStartupFailure`
+/// explains.
 pub fn openGLStartupFailed() bool {
-    return currentOpenGLStartupFailure() != null;
+    return launchEndingOpenGLFailure() != null;
+}
+
+/// A recorded OpenGL failure ends the launch only once nothing could draw
+/// instead: in a build with the Direct3D 11 beta, only after Direct3D 11 was
+/// tried and failed too. Another error between the two (OutOfMemory before
+/// renderer init) is reported as itself, and counts toward safe mode.
+fn endsLaunch(failure: OpenGLStartupFailure, d3d11_build: bool) bool {
+    return !d3d11_build or failure.d3d11_error_name != null;
+}
+
+fn launchEndingOpenGLFailure() ?OpenGLStartupFailure {
+    const failure = currentOpenGLStartupFailure() orelse return null;
+    return if (endsLaunch(failure, build_config.d3d11)) failure else null;
 }
 
 fn currentOpenGLStartupFailure() ?OpenGLStartupFailure {
@@ -202,6 +229,16 @@ pub fn recordOpenGLStartupError(step: OpenGLStartupStep, err: anyerror) void {
     })) return;
 
     log.err("Win32 OpenGL startup failed step={s} error={s}", .{ step.label(), @errorName(err) });
+}
+
+/// The Direct3D 11 beta, tried because OpenGL could not start, failed too.
+/// Kept on the OpenGL failure so the dialog can say both were tried.
+pub fn recordDirect3D11StartupError(err: anyerror) void {
+    opengl_startup_diagnostics_mutex.lock();
+    defer opengl_startup_diagnostics_mutex.unlock();
+
+    if (!opengl_startup_diagnostics_active) return;
+    if (last_opengl_startup_failure) |*failure| failure.d3d11_error_name = @errorName(err);
 }
 
 /// Record a below-floor version check together with what the machine
@@ -249,18 +286,13 @@ pub fn reportStartupFailure(err: anyerror) void {
 }
 
 fn formatStartupFailureMessage(buf: []u8, err: anyerror) []const u8 {
-    if (currentOpenGLStartupFailure()) |failure| {
-        const config_path: ?[]const u8 = if (build_config.d3d11)
-            config_file_load.preferredDefaultFilePath(std.heap.page_allocator) catch null
-        else
-            null;
-        defer if (config_path) |path| std.heap.page_allocator.free(path);
+    if (launchEndingOpenGLFailure()) |failure| {
         return formatOpenGLStartupFailureMessage(
             buf,
             err,
             failure,
             os_windows.detectProcessArchitecture(),
-            .{ .d3d11 = build_config.d3d11, .config_path = config_path },
+            .{ .d3d11 = build_config.d3d11 },
         ) catch
             "noctty could not initialize the Windows OpenGL renderer.";
     }
@@ -272,36 +304,29 @@ fn formatStartupFailureMessage(buf: []u8, err: anyerror) []const u8 {
     ) catch "noctty failed.";
 }
 
-/// What the dialog can offer a machine where OpenGL does not start. noctty
-/// never switches renderers on its own, so the dialog is where a user without
-/// OpenGL learns that the config can choose one that does not need it.
+/// What the dialog can say about renderers other than OpenGL.
 const RendererChoice = struct {
-    /// This build includes the beta Direct3D 11 renderer (`build_config.d3d11`).
+    /// This build includes the beta Direct3D 11 renderer (`build_config.d3d11`),
+    /// which every surface tries when OpenGL cannot start.
     d3d11: bool,
-    /// The default config file, when it could be found. A `--config-file`
-    /// launch reads another one, which the dialog cannot know after teardown,
-    /// so it is named as the default.
-    config_path: ?[]const u8 = null,
 };
 
-/// The paragraph on renderers: the only one there is, or how to choose the
-/// one that does not need OpenGL. `below_floor` is the version-floor dialog.
-fn formatRendererParagraph(buf: []u8, choice: RendererChoice, below_floor: bool) []const u8 {
+/// The paragraph on renderers: the only one there is, or the Direct3D 11
+/// fallback that failed too. `below_floor` is the version-floor dialog.
+fn formatRendererParagraph(
+    buf: []u8,
+    choice: RendererChoice,
+    below_floor: bool,
+    d3d11_error_name: ?[]const u8,
+) []const u8 {
     if (!choice.d3d11) return if (below_floor)
         "This build does not include a software, DirectX, or ANGLE fallback renderer, so noctty cannot start below OpenGL 4.3."
     else
         "noctty currently uses OpenGL 4.3 through WGL on Windows. This build does not include a DirectX or ANGLE fallback renderer.";
 
-    const config_file = "config.ghostty in %LOCALAPPDATA%\\noctty, or beside noctty.exe in portable mode";
-    const paragraph =
-        \\noctty starts with OpenGL 4.3 through WGL and does not switch renderers on its own. This build also includes the beta Direct3D 11 renderer, which does not need OpenGL. To use it, add this line to the config file (by default {s}) and start noctty again:
-        \\
-        \\renderer = d3d11
-        \\
-        \\It renders in software (WARP) when the GPU has no usable Direct3D 11 driver, and renderer = d3d11-warp always does. If the config already sets one of them, Direct3D 11 could not start either, unless this was safe mode, which ignores the config.
-    ;
-    return std.fmt.bufPrint(buf, paragraph, .{choice.config_path orelse config_file}) catch
-        std.fmt.comptimePrint(paragraph, .{config_file});
+    const paragraph = "noctty starts with OpenGL 4.3 through WGL and switches to its beta Direct3D 11 renderer, which does not need OpenGL, when OpenGL cannot start. Direct3D 11 could not start either, including its software renderer (WARP). Direct3D 11 error: {s}.";
+    return std.fmt.bufPrint(buf, paragraph, .{d3d11_error_name orelse "not reported"}) catch
+        std.fmt.comptimePrint(paragraph, .{"not reported"});
 }
 
 /// Where a working OpenGL 4.3 implementation is supposed to come from on this
@@ -446,7 +471,7 @@ fn formatOpenGLStartupFailureMessage(
             detected.minor,
             if (detected.renderer.len > 0) detected.renderer.value() else "not reported",
             if (detected.vendor.len > 0) detected.vendor.value() else "not reported",
-            formatRendererParagraph(&renderer_buf, renderer_choice, true),
+            formatRendererParagraph(&renderer_buf, renderer_choice, true, failure.d3d11_error_name),
             detectedRemediationAdvice(remediation),
         });
     }
@@ -471,7 +496,7 @@ fn formatOpenGLStartupFailureMessage(
             win32_error,
             win32ErrorSuffix(win32_error),
             architecture_text,
-            formatRendererParagraph(&renderer_buf, renderer_choice, false),
+            formatRendererParagraph(&renderer_buf, renderer_choice, false, failure.d3d11_error_name),
             openglStartupFailureHint(failure, remediation),
             stepRemediationAdvice(remediation),
         });
@@ -494,7 +519,7 @@ fn formatOpenGLStartupFailureMessage(
         failure.step.label(),
         zig_error_name,
         architecture_text,
-        formatRendererParagraph(&renderer_buf, renderer_choice, false),
+        formatRendererParagraph(&renderer_buf, renderer_choice, false, failure.d3d11_error_name),
         openglStartupFailureHint(failure, remediation),
         stepRemediationAdvice(remediation),
     });
@@ -798,59 +823,75 @@ test "win32-opengl-startup-x64-message-keeps-the-gpu-vendor-advice" {
     try std.testing.expect(std.mem.indexOf(u8, win32_message, "Compatibility Pack") == null);
 }
 
-test "win32-opengl-startup-message-names-the-d3d11-renderer-in-builds-that-have-it" {
-    const config_path = "C:\\Users\\someone\\AppData\\Local\\noctty\\config.ghostty";
-    const choice: RendererChoice = .{ .d3d11 = true, .config_path = config_path };
+test "win32-opengl-startup-message-says-direct3d11-failed-too-in-builds-that-have-it" {
+    const choice: RendererChoice = .{ .d3d11 = true };
     const failures = [_]OpenGLStartupFailure{
         // The longest dialog: both driver strings at their bound.
-        .{ .step = .version_check, .zig_error_name = "OpenGLOutdated", .detected = .{
+        .{ .step = .version_check, .zig_error_name = "OpenGLOutdated", .d3d11_error_name = "Direct3D11Unavailable", .detected = .{
             .major = 1,
             .minor = 1,
             .renderer = .init("r" ** OpenGLStartupString.capacity),
             .vendor = .init("v" ** OpenGLStartupString.capacity),
         } },
-        .{ .step = .load_opengl32, .win32_error = c.ERROR_MOD_NOT_FOUND, .zig_error_name = "Unexpected" },
-        .{ .step = .version_check, .zig_error_name = "OpenGLOutdated" },
+        .{ .step = .load_opengl32, .win32_error = c.ERROR_MOD_NOT_FOUND, .zig_error_name = "Unexpected", .d3d11_error_name = "Direct3D11Unavailable" },
+        .{ .step = .version_check, .zig_error_name = "OpenGLOutdated", .d3d11_error_name = "Direct3D11Unavailable" },
     };
     for (failures) |failure| for ([_]os_windows.ProcessArchitecture{ test_x64, test_arm64 }) |arch| {
         var buf: [4096]u8 = undefined;
         const message = try formatOpenGLStartupFailureMessage(&buf, error.Unexpected, failure, arch, choice);
 
-        try std.testing.expect(std.mem.indexOf(u8, message, "\nrenderer = d3d11\n") != null);
-        try std.testing.expect(std.mem.indexOf(u8, message, "renderer = d3d11-warp") != null);
-        try std.testing.expect(std.mem.indexOf(u8, message, "add this line to the config file (by default " ++ config_path ++ ") and start noctty again") != null);
-        // A launch that set it may have been safe mode, which ignored it.
-        try std.testing.expect(std.mem.indexOf(u8, message, "unless this was safe mode") != null);
-        // Choosing it is the user's move: nothing claims a switch happens.
-        try std.testing.expect(std.mem.indexOf(u8, message, "does not switch renderers on its own") != null);
-        // Nor that no other renderer exists.
+        // The dialog appears only once Direct3D 11 was tried and failed too,
+        // so it neither offers it as a fix nor claims it does not exist.
+        try std.testing.expect(std.mem.indexOf(u8, message, "switches to its beta Direct3D 11 renderer, which does not need OpenGL, when OpenGL cannot start") != null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "Direct3D 11 could not start either, including its software renderer (WARP). Direct3D 11 error: Direct3D11Unavailable.") != null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "renderer = d3d11") == null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "does not switch renderers") == null);
         try std.testing.expect(std.mem.indexOf(u8, message, "does not include") == null);
         try std.testing.expect(std.mem.indexOf(u8, message, "cannot start below OpenGL 4.3") == null);
         try std.testing.expect(std.mem.endsWith(u8, message, "issues/64."));
     };
-}
 
-test "win32-opengl-startup-message-describes-the-config-file-it-could-not-find" {
+    // Without a recorded Direct3D 11 error the paragraph still reads.
     var buf: [4096]u8 = undefined;
     const message = try formatOpenGLStartupFailureMessage(&buf, error.OpenGLOutdated, .{
         .step = .version_check,
         .zig_error_name = "OpenGLOutdated",
-        .detected = .{ .major = 1, .minor = 1 },
-    }, test_x64, .{ .d3d11 = true });
-    try std.testing.expect(std.mem.indexOf(u8, message, "config.ghostty in %LOCALAPPDATA%\\noctty, or beside noctty.exe in portable mode") != null);
+    }, test_x64, choice);
+    try std.testing.expect(std.mem.indexOf(u8, message, "Direct3D 11 error: not reported.") != null);
+}
 
-    // A path too long for the paragraph's buffer gets the description, not a
-    // cut path or no advice at all.
-    const long_path = "C:\\" ++ "d" ** 1024 ++ "\\config.ghostty";
-    var long_buf: [4096]u8 = undefined;
-    const long_message = try formatOpenGLStartupFailureMessage(&long_buf, error.Unexpected, .{
-        .step = .create_context,
-        .win32_error = c.ERROR_MOD_NOT_FOUND,
-        .zig_error_name = "Unexpected",
-    }, test_arm64, .{ .d3d11 = true, .config_path = long_path });
-    try std.testing.expect(std.mem.indexOf(u8, long_message, "dddd") == null);
-    try std.testing.expect(std.mem.indexOf(u8, long_message, "%LOCALAPPDATA%\\noctty") != null);
-    try std.testing.expect(std.mem.indexOf(u8, long_message, "\nrenderer = d3d11\n") != null);
+test "win32-opengl-startup-failure-ends-the-launch-only-once-direct3d11-failed-too" {
+    const opengl_only: OpenGLStartupFailure = .{ .step = .version_check, .zig_error_name = "OpenGLOutdated" };
+    var both = opengl_only;
+    both.d3d11_error_name = "Direct3D11Unavailable";
+    // Without the beta there is nothing else to try.
+    try std.testing.expect(endsLaunch(opengl_only, false));
+    try std.testing.expect(endsLaunch(both, false));
+    // With it, an OpenGL failure alone is still pending: renderer init has
+    // not tried Direct3D 11 yet, and another error may end the launch first.
+    try std.testing.expect(!endsLaunch(opengl_only, true));
+    try std.testing.expect(endsLaunch(both, true));
+}
+
+test "win32-opengl-startup-records-the-direct3d11-error-on-the-opengl-failure" {
+    clearOpenGLStartupFailure();
+    // Outside startup diagnostics, nothing is recorded.
+    recordDirect3D11StartupError(error.Direct3D11Unavailable);
+    try std.testing.expect(currentOpenGLStartupFailure() == null);
+
+    beginOpenGLStartupDiagnostics();
+    defer clearOpenGLStartupFailure();
+    // No OpenGL failure yet: nothing to attach it to, and nothing to report.
+    recordDirect3D11StartupError(error.Direct3D11Unavailable);
+    try std.testing.expect(!openGLStartupFailed());
+
+    try std.testing.expect(recordOpenGLStartupFailure(.{ .step = .version_check, .zig_error_name = "OpenGLOutdated" }));
+    recordDirect3D11StartupError(error.Direct3D11Unavailable);
+    // The last candidate tried is the one the dialog names.
+    recordDirect3D11StartupError(error.OutOfMemory);
+    const failure = currentOpenGLStartupFailure().?;
+    try std.testing.expectEqual(OpenGLStartupStep.version_check, failure.step);
+    try std.testing.expectEqualStrings("OutOfMemory", failure.d3d11_error_name.?);
 }
 
 test "win32-opengl-startup-failure-bounds-driver-strings" {
@@ -892,6 +933,10 @@ test "win32-opengl-startup-failure-preserves-win32-loader-cause" {
     const failure = currentOpenGLStartupFailure().?;
     try std.testing.expectEqual(OpenGLStartupStep.load_opengl32, failure.step);
     try std.testing.expectEqual(@as(?DWORD, c.ERROR_MOD_NOT_FOUND), failure.win32_error);
+    // In a build with the Direct3D 11 beta, the launch ends for want of
+    // OpenGL only once Direct3D 11 failed too.
+    try std.testing.expectEqual(!build_config.d3d11, openGLStartupFailed());
+    recordDirect3D11StartupError(error.Direct3D11Unavailable);
     try std.testing.expect(openGLStartupFailed());
 
     // A later success clears it, and the launch is no longer failing for

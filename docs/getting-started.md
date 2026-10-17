@@ -2,8 +2,8 @@
 
 noctty runs on Windows 10 version 1809 (build 17763) or newer and Windows 11,
 x64 and ARM64. The default renderer needs a GPU driver with OpenGL 4.3 or
-newer; where there is none, the opt-in Direct3D 11 renderer (beta) can draw
-text instead (see [the Windows guide](windows.md#starting-without-opengl)).
+newer; where there is none, noctty draws text with its Direct3D 11 renderer
+(beta) instead (see [the Windows guide](windows.md#starting-without-opengl)).
 
 ## Install with WinGet or Scoop
 

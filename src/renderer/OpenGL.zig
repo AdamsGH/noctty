@@ -254,8 +254,16 @@ fn prepareContext(getProcAddress: anytype) !void {
         recordWin32OpenGLStartupError(.load_functions, err);
         return err;
     };
-    const major = gl.glad.versionMajor(@intCast(version));
-    const minor = gl.glad.versionMinor(@intCast(version));
+    var major = gl.glad.versionMajor(@intCast(version));
+    var minor = gl.glad.versionMinor(@intCast(version));
+    if (comptime build_config.renderer_test_tools) {
+        // A real context and pixel format exist by now, as on a machine whose
+        // only OpenGL is GDI Generic 1.1; only the version is made up.
+        if (std.process.hasEnvVarConstant("NOCTTY_RENDERER_FAIL_OPENGL_VERSION")) {
+            major = 1;
+            minor = 1;
+        }
+    }
     log.debug("loaded OpenGL {}.{}", .{ major, minor });
 
     // Need to check version before trying to enable it

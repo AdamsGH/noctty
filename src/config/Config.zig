@@ -187,6 +187,16 @@ language: ?[:0]const u8 = null,
 /// surfaces; unsupported features enabled by reload also trigger fallback.
 /// If OpenGL cannot initialize, a healthy D3D11 pane keeps rendering text and
 /// ignores unsupported images/effects with a visible notice.
+///
+/// When OpenGL cannot start (no driver, a version below 4.3, or a failed WGL
+/// pixel format or context), `opengl`, set or left as the default, falls back
+/// to D3D11 (hardware, then WARP) with a banner, and later surfaces in the
+/// process start on D3D11 without trying OpenGL. noctty shows its startup
+/// error only when D3D11 cannot start either. Set `d3d11` to skip the initial
+/// OpenGL attempt unless custom shaders or a background image are configured.
+/// Kitty images received later can still request OpenGL.
+/// Safe mode uses WARP for the D3D11 fallback and device recovery, avoiding
+/// a hardware driver that may have caused the crash.
 /// Available since 1.3.132.
 renderer: RendererBackend = .opengl,
 

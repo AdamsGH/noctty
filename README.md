@@ -67,16 +67,14 @@ comparison with upstream Ghostty.
 Windows 11, on x64 or ARM64. The default renderer needs a GPU driver that
 supports OpenGL 4.3 or later.
 
-- The default renderer has no software fallback, so Noctty won't start where
-  OpenGL falls back to software. That is common over Remote Desktop and in VMs
-  without 3D acceleration.
-- The opt-in Direct3D 11 renderer (beta) is the alternative there. Set
-  `renderer = d3d11` in your config to try hardware Direct3D 11, then
-  Microsoft's WARP software renderer, or `renderer = d3d11-warp` to use WARP
-  directly. It draws text without OpenGL; custom shaders, background images,
-  and Kitty images need OpenGL. Remote Desktop has not been measured. When
-  OpenGL cannot start, the startup dialog names the setting and the config
-  file ([details](docs/windows.md#starting-without-opengl)).
+- Where OpenGL 4.3 cannot start (common over Remote Desktop and in VMs
+  without 3D acceleration), Noctty switches on its own to its Direct3D 11
+  renderer (beta): hardware Direct3D 11, then Microsoft's WARP software
+  renderer, with a banner saying so. It draws text without OpenGL; custom
+  shaders, background images, and Kitty images need OpenGL. Set
+  `renderer = d3d11` (or `renderer = d3d11-warp` for WARP alone) to start
+  with it. Remote Desktop has not been measured
+  ([details](docs/windows.md#starting-without-opengl)).
 - On Windows on Arm PCs, install the free **OpenCL, OpenGL, and Vulkan
   Compatibility Pack** from the Microsoft Store
   ([why](docs/windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack)),
