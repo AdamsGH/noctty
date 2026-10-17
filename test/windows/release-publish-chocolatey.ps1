@@ -173,6 +173,9 @@ exit 2
     Assert-Case 'a failed resubmission is a failure' ($result.ExitCode -ne 0 -and $result.Output -notmatch 'treating the push as complete') $result
 
     Write-Host 'release-publish-chocolatey.ps1 behaviour: PASS (10 cases)'
+    # The last case ends on a failing child; GitHub's pwsh wrapper exits with
+    # the last native exit code.
+    $global:LASTEXITCODE = 0
 }
 finally {
     if ($null -ne $listener) { $listener.Close() }

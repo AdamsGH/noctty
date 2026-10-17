@@ -121,6 +121,8 @@ exit 2
     Assert-Case 'no source ref is passed unless one is given' ($result.ExitCode -eq 0 -and $result.Packages.Count -eq 1 -and $result.Packages[0] -ceq "$version|x64,arm64|") $result
 
     Write-Host 'release-stage-published.ps1 behaviour: PASS (7 cases)'
+    # GitHub's pwsh wrapper exits with the last native exit code.
+    $global:LASTEXITCODE = 0
 }
 finally {
     if ((Test-Path -LiteralPath $root) -and

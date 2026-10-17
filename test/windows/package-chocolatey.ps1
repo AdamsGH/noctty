@@ -218,6 +218,7 @@ try {
     & (Join-Path $PSScriptRoot 'release-publish-chocolatey.ps1')
 
     Write-Host "Chocolatey package validation: PASS (version=$Version, architecture=$Architecture)"
+    $global:LASTEXITCODE = 0
 }
 finally {
     if (Test-Path -LiteralPath $packRoot) {
