@@ -1183,7 +1183,8 @@ palette: Palette = .{},
 /// PowerShell, else Command Prompt (`cmd.exe`). WSL is never the default,
 /// because `wsl.exe --status` can report a healthy installation when starting
 /// a session would still fail; use `command = wsl.exe` to choose it. A launch
-/// with `--safe-mode` always starts `cmd.exe`, which reads no startup files.
+/// with `--safe-mode` always starts `cmd.exe /D`: no PowerShell profile and no
+/// `AutoRun` command can get in the way of recovery.
 ///
 /// This can contain additional arguments to run the command with. If additional
 /// arguments are provided, the command will be executed using `/bin/sh -c`
@@ -4992,7 +4993,7 @@ pub fn resolveWindowsDefaultCommand(self: *Config) !void {
 }
 
 /// Replace an automatic Windows command with the one safe mode starts, so a
-/// recovery launch does not run the user's PowerShell profile. A command the
+/// recovery launch does not run the user's PowerShell profile or AutoRun. A command the
 /// user set stays; safe mode never reads it, because it uses the built-in
 /// config.
 pub fn useWindowsRecoveryCommand(self: *Config) !void {

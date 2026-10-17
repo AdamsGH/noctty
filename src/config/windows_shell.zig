@@ -97,12 +97,13 @@ pub fn defaultCommand(alloc: Allocator) !Command {
     return try defaultCommandWithHost(alloc, DefaultShellHost);
 }
 
-/// The command safe mode runs: always Command Prompt. Recovery has to work
-/// when the user's own startup files are what broke, and `cmd.exe` is the one
-/// shell that reads none (PowerShell loads `$PROFILE` even with the shell
-/// integration's `-NoExit -Command`).
+/// The command safe mode runs: always Command Prompt, as `cmd.exe /D`. Recovery
+/// has to work when the user's own startup files are what broke. PowerShell
+/// loads `$PROFILE` even under the shell integration's `-NoExit -Command`;
+/// `cmd.exe` reads no profile, and `/D` also skips the `AutoRun` command that
+/// a registry value or Clink can hang there.
 pub fn recoveryCommand(alloc: Allocator) !Command {
-    return try commandPromptWithHost(alloc, DefaultShellHost);
+    return try commandPromptWithHost(alloc, DefaultShellHost, &.{"/D"});
 }
 
 pub fn listProfiles(alloc: Allocator, include_ssh_hosts: bool) ![]Profile {
@@ -448,7 +449,7 @@ fn pathAttributes(path: []const u8) ?windows.DWORD {
 /// package is gone. Following a symlink or junction would open its target,
 /// which can be on a network share, so those are not accepted.
 /// The caller screens network and device paths first.
-fn isLaunchableShell(path: []const u8) bool {
+fn isLaunchableFile(path: []const u8) bool {
     const attributes = pathAttributes(path) orelse return false;
     if (attributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) return false;
     if (attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0) return true;
@@ -473,7 +474,7 @@ fn appExecLinkTargetExists(path: []const u8) bool {
     );
     if (handle == windows.INVALID_HANDLE_VALUE) return false;
     defer windows.CloseHandle(handle);
-    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = undefined;
+    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
     windows.DeviceIoControl(handle, windows.FSCTL_GET_REPARSE_POINT, null, &data) catch return false;
     var target_w: [1024]u16 = undefined;
     const target_len = appExecLinkTarget(&data, &target_w) orelse return false;
@@ -493,7 +494,9 @@ fn appExecLinkTargetExists(path: []const u8) bool {
 /// the package family name, the AppUserModelID, the target path and the
 /// application type. Layout as read from the aliases of installed packages
 /// (the same one libuv reads). Returns the length of the target, or null for
-/// any other tag or a record that is cut short.
+/// any other tag, a version, or a record that is not exactly those four
+/// strings: the buffer is zeroed before the call, so a length header that
+/// claims more than the call returned reads as empty strings and fails here.
 fn appExecLinkTarget(data: []const u8, out: []u16) ?usize {
     if (data.len < 12 or std.mem.readInt(u32, data[0..4], .little) != IO_REPARSE_TAG_APPEXECLINK) return null;
     const end = 8 + @as(usize, std.mem.readInt(u16, data[4..6], .little));
@@ -501,19 +504,17 @@ fn appExecLinkTarget(data: []const u8, out: []u16) ?usize {
     const strings = data[12..end];
     var index: usize = 0;
     var start: usize = 0;
-    var field: usize = 0;
-    while (index + 2 <= strings.len) : (index += 2) {
+    var fields: usize = 0;
+    var target: []const u8 = &.{};
+    while (index + 2 <= strings.len and fields < 4) : (index += 2) {
         if (strings[index] != 0 or strings[index + 1] != 0) continue;
-        if (field == 2) {
-            const len = (index - start) / 2;
-            if (len == 0 or len > out.len) return null;
-            for (0..len) |i| out[i] = std.mem.readInt(u16, strings[start + 2 * i ..][0..2], .little);
-            return len;
-        }
-        field += 1;
+        if (fields == 2) target = strings[start..index];
+        fields += 1;
         start = index + 2;
     }
-    return null;
+    if (fields != 4 or start != strings.len or target.len == 0 or target.len / 2 > out.len) return null;
+    for (0..target.len / 2) |i| out[i] = std.mem.readInt(u16, target[2 * i ..][0..2], .little);
+    return target.len / 2;
 }
 
 test "PKG08 round2 child executable lookup respects PATHEXT and local PATH" {
@@ -956,15 +957,7 @@ pub fn pathToWsl(alloc: Allocator, path: []const u8) !?[]const u8 {
 const DefaultShellHost = struct {
     /// `pwsh.exe` on the process's `PATH`.
     fn findPwsh(alloc: Allocator) !?[]u8 {
-        if (builtin.os.tag != .windows) return null;
-        const path = std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
-        };
-        defer alloc.free(path);
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const found = searchPath(&buf, "pwsh.exe", path, null, isLaunchableShell) orelse return null;
-        return try alloc.dupe(u8, found);
+        return try lookupExecutable(alloc, "pwsh.exe");
     }
 
     /// `relative` below the Windows system directory. The built-in shells are
@@ -981,7 +974,7 @@ const DefaultShellHost = struct {
         };
         defer alloc.free(dir);
         const path = try std.fs.path.join(alloc, &.{ dir, relative });
-        if (isLaunchableShell(path)) return path;
+        if (isLaunchableFile(path)) return path;
         alloc.free(path);
         return null;
     }
@@ -998,17 +991,19 @@ fn defaultCommandWithHost(alloc: Allocator, comptime Host: type) !Command {
         defer alloc.free(path);
         return try directCommand(alloc, &.{path});
     }
-    return try commandPromptWithHost(alloc, Host);
+    return try commandPromptWithHost(alloc, Host, &.{});
 }
 
-fn commandPromptWithHost(alloc: Allocator, comptime Host: type) !Command {
-    if (try Host.systemShell(alloc, "cmd.exe")) |path| {
-        defer alloc.free(path);
-        return try directCommand(alloc, &.{path});
-    }
+fn commandPromptWithHost(alloc: Allocator, comptime Host: type, switches: []const []const u8) !Command {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    const found = try Host.systemShell(alloc, "cmd.exe");
+    defer if (found) |path| alloc.free(path);
     // Windows without its own cmd.exe cannot start anything anyway; the bare
     // name is what the launch path resolves and reports.
-    return try directCommand(alloc, &.{"cmd.exe"});
+    try argv.append(alloc, found orelse "cmd.exe");
+    try argv.appendSlice(alloc, switches);
+    return try directCommand(alloc, argv.items);
 }
 
 fn listProfilesWithLookupAndProbeAndWslList(
@@ -1442,8 +1437,21 @@ fn directCommand(alloc: Allocator, argv: []const []const u8) !Command {
     return .{ .direct = args };
 }
 
+/// A program by bare name, for the profile list and the SSH lookup. The same
+/// search `defaultCommand` uses for pwsh.exe, so the picker and a new tab agree
+/// on what is installed: local absolute `PATH` entries only, quoted entries
+/// understood, and nothing opened (an App Execution Alias cannot be opened).
 fn lookupExecutable(alloc: Allocator, exe: []const u8) !?[]u8 {
-    return try internal_os.path.expand(alloc, exe);
+    if (builtin.os.tag != .windows or std.mem.indexOfAny(u8, exe, "\\/:") != null)
+        return try internal_os.path.expand(alloc, exe);
+    const path = std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer alloc.free(path);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const found = searchPath(&buf, exe, path, null, isLaunchableFile) orelse return null;
+    return try alloc.dupe(u8, found);
 }
 
 /// Git for Windows' `bash.exe`, from the most to the least trustworthy source:
@@ -1995,11 +2003,59 @@ test "the picker starts on the profile the default command runs, not on WSL" {
     try std.testing.expectEqual(@as(?usize, null), profileIndexForDefaultCommand(&profiles, .{ .shell = "pwsh.exe" }));
 }
 
-test "recovery command is cmd even when PowerShell is installed" {
+test "the recovery command keeps /D through launch preparation" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const recovery = try recoveryCommand(alloc);
+    defer recovery.deinit(alloc);
+    for ([_]bool{ false, true }) |utf8_console| {
+        const prepared = try prepareCommand(alloc, recovery, null, false, utf8_console);
+        defer if (prepared.direct.ptr != recovery.direct.ptr) prepared.deinit(alloc);
+        try std.testing.expect(prepared == .direct);
+        try std.testing.expect(std.ascii.eqlIgnoreCase(std.fs.path.basename(prepared.direct[0]), "cmd.exe"));
+        // /D stays the first switch, ahead of anything the UTF-8 preamble adds.
+        try std.testing.expectEqualStrings("/D", prepared.direct[1]);
+    }
+}
+
+test "recovery command is cmd /D even when PowerShell is installed" {
     const alloc = std.testing.allocator;
     const all_system = [_][]const u8{ windows_powershell_relative, "cmd.exe" };
-    try expectDefaultShell(test_cmd, try commandPromptWithHost(alloc, FakeDefaultShellHost(test_pwsh, &all_system)));
-    try expectDefaultShell("cmd.exe", try commandPromptWithHost(alloc, FakeDefaultShellHost(test_pwsh, &.{windows_powershell_relative})));
+    const with_cmd = try commandPromptWithHost(alloc, FakeDefaultShellHost(test_pwsh, &all_system), &.{"/D"});
+    defer with_cmd.deinit(alloc);
+    try std.testing.expect(with_cmd == .direct);
+    try std.testing.expectEqual(@as(usize, 2), with_cmd.direct.len);
+    try std.testing.expectEqualStrings(test_cmd, with_cmd.direct[0]);
+    try std.testing.expectEqualStrings("/D", with_cmd.direct[1]);
+
+    const bare = try commandPromptWithHost(alloc, FakeDefaultShellHost(test_pwsh, &.{windows_powershell_relative}), &.{"/D"});
+    defer bare.deinit(alloc);
+    try std.testing.expectEqualStrings("cmd.exe", bare.direct[0]);
+    try std.testing.expectEqualStrings("/D", bare.direct[1]);
+
+    // The default command itself carries no switch.
+    try expectDefaultShell(test_cmd, try defaultCommandWithHost(alloc, FakeDefaultShellHost(null, &.{"cmd.exe"})));
+}
+
+/// The bytes `FSCTL_GET_REPARSE_POINT` returns for an App Execution Alias made
+/// of `strings`: header, version 3, each string NUL-terminated.
+fn appExecLinkRecord(alloc: Allocator, strings: []const []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, &.{ 3, 0, 0, 0 });
+    for (strings) |text| {
+        const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
+        defer alloc.free(wide);
+        try body.appendSlice(alloc, std.mem.sliceAsBytes(wide));
+        try body.appendSlice(alloc, &.{ 0, 0 });
+    }
+    var record: std.ArrayList(u8) = .empty;
+    errdefer record.deinit(alloc);
+    try record.appendSlice(alloc, &.{ 0x1b, 0x00, 0x00, 0x80 });
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(body.items.len))));
+    try record.appendSlice(alloc, &.{ 0, 0 });
+    try record.appendSlice(alloc, body.items);
+    return try record.toOwnedSlice(alloc);
 }
 
 /// Creates an empty file `name` in `dir` and makes it an App Execution Alias to
@@ -2024,65 +2080,57 @@ fn createTestAppExecLink(dir: std.fs.Dir, name: []const u8, target: []const u8) 
     if (handle == windows.INVALID_HANDLE_VALUE) return error.SkipZigTest;
     defer windows.CloseHandle(handle);
 
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(std.testing.allocator);
     const alloc = std.testing.allocator;
-    try body.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, 3)));
-    for ([_][]const u8{ "Test.Pkg_abc", "Test.Pkg_abc!App", target, "0" }) |text| {
-        const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
-        defer alloc.free(wide);
-        try body.appendSlice(alloc, std.mem.sliceAsBytes(wide));
-        try body.appendSlice(alloc, &.{ 0, 0 });
-    }
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(alloc);
-    try buffer.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, IO_REPARSE_TAG_APPEXECLINK)));
-    try buffer.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(body.items.len))));
-    try buffer.appendSlice(alloc, &.{ 0, 0 });
-    try buffer.appendSlice(alloc, body.items);
+    const record = try appExecLinkRecord(alloc, &.{ "Test.Pkg_abc", "Test.Pkg_abc!App", target, "0" });
+    defer alloc.free(record);
 
     const FSCTL_SET_REPARSE_POINT: windows.DWORD = 0x900a4;
-    windows.DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, buffer.items, null) catch return error.SkipZigTest;
+    windows.DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, record, null) catch return error.SkipZigTest;
 }
 
-test "appExecLinkTarget reads the third string and rejects a cut or foreign record" {
+test "appExecLinkTarget reads the third string and rejects a cut, foreign or odd record" {
     const alloc = std.testing.allocator;
-    var record: std.ArrayList(u8) = .empty;
-    defer record.deinit(alloc);
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(alloc);
-    try body.appendSlice(alloc, &.{ 3, 0, 0, 0 });
-    for ([_][]const u8{ "Microsoft.PowerShell_8wekyb3d8bbwe", "Microsoft.PowerShell_8wekyb3d8bbwe!App", "C:\\Program Files\\WindowsApps\\x\\pwsh.exe", "0" }) |text| {
-        const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
-        defer alloc.free(wide);
-        try body.appendSlice(alloc, std.mem.sliceAsBytes(wide));
-        try body.appendSlice(alloc, &.{ 0, 0 });
-    }
-    try record.appendSlice(alloc, &.{ 0x1b, 0x00, 0x00, 0x80 });
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(body.items.len))));
-    try record.appendSlice(alloc, &.{ 0, 0 });
-    try record.appendSlice(alloc, body.items);
+    const target = "C:\\Program Files\\WindowsApps\\x\\pwsh.exe";
+    const record = try appExecLinkRecord(alloc, &.{ "Microsoft.PowerShell_8wekyb3d8bbwe", "Microsoft.PowerShell_8wekyb3d8bbwe!App", target, "0" });
+    defer alloc.free(record);
 
     var out: [128]u16 = undefined;
-    const len = appExecLinkTarget(record.items, &out).?;
+    const len = appExecLinkTarget(record, &out).?;
     var utf8: [128]u8 = undefined;
     const end = try std.unicode.utf16LeToUtf8(&utf8, out[0..len]);
-    try std.testing.expectEqualStrings("C:\\Program Files\\WindowsApps\\x\\pwsh.exe", utf8[0..end]);
+    try std.testing.expectEqualStrings(target, utf8[0..end]);
 
-    // Another tag, a wrong version, a length past the buffer and a target that
-    // is not terminated before the record ends are all refused.
-    var other = try alloc.dupe(u8, record.items);
+    // Another tag, a wrong version, a length past the buffer and a record cut
+    // short are all refused.
+    var other = try alloc.dupe(u8, record);
     defer alloc.free(other);
     other[3] = 0xa0;
     try std.testing.expect(appExecLinkTarget(other, &out) == null);
-    var version = try alloc.dupe(u8, record.items);
+    var version = try alloc.dupe(u8, record);
     defer alloc.free(version);
     version[8] = 2;
     try std.testing.expect(appExecLinkTarget(version, &out) == null);
-    try std.testing.expect(appExecLinkTarget(record.items[0 .. record.items.len - 40], &out) == null);
-    try std.testing.expect(appExecLinkTarget(record.items[0..8], &out) == null);
+    try std.testing.expect(appExecLinkTarget(record[0 .. record.len - 40], &out) == null);
+    try std.testing.expect(appExecLinkTarget(record[0..8], &out) == null);
     var tiny: [4]u16 = undefined;
-    try std.testing.expect(appExecLinkTarget(record.items, &tiny) == null);
+    try std.testing.expect(appExecLinkTarget(record, &tiny) == null);
+
+    // A record that is not exactly four terminated strings is not one Windows
+    // wrote, even when its length header fits: no application type, bytes after
+    // it, an empty target.
+    const three = try appExecLinkRecord(alloc, &.{ "pkg", "pkg!App", target });
+    defer alloc.free(three);
+    try std.testing.expect(appExecLinkTarget(three, &out) == null);
+    const five = try appExecLinkRecord(alloc, &.{ "pkg", "pkg!App", target, "0", "extra" });
+    defer alloc.free(five);
+    try std.testing.expect(appExecLinkTarget(five, &out) == null);
+    const empty = try appExecLinkRecord(alloc, &.{ "pkg", "pkg!App", "", "0" });
+    defer alloc.free(empty);
+    try std.testing.expect(appExecLinkTarget(empty, &out) == null);
+    // The unfilled tail of the zeroed buffer after a short call reads as empty strings.
+    var zeroed = [_]u8{0} ** 512;
+    @memcpy(zeroed[0..40], record[0..40]);
+    try std.testing.expect(appExecLinkTarget(&zeroed, &out) == null);
 }
 
 test "pwsh search skips what cannot start and keeps going down PATH" {
@@ -2113,13 +2161,13 @@ test "pwsh search skips what cannot start and keeps going down PATH" {
     defer alloc.free(expected);
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings(expected, searchPath(&buf, "pwsh.exe", path, null, isLaunchableShell).?);
+    try std.testing.expectEqualStrings(expected, searchPath(&buf, "pwsh.exe", path, null, isLaunchableFile).?);
 
     // With only the dead alias and the directory on PATH nothing is found, so
     // the default moves on to Windows PowerShell instead of a shell that fails.
     const dead = try std.fmt.allocPrint(alloc, "{s}\\dir;{s}\\gone", .{ root, root });
     defer alloc.free(dead);
-    try std.testing.expect(searchPath(&buf, "pwsh.exe", dead, null, isLaunchableShell) == null);
+    try std.testing.expect(searchPath(&buf, "pwsh.exe", dead, null, isLaunchableFile) == null);
 }
 
 test "an App Execution Alias counts only while its target exists" {
@@ -2150,7 +2198,7 @@ test "an App Execution Alias counts only while its target exists" {
         fn launchable(a: Allocator, dir: []const u8, name: []const u8) !bool {
             const full = try std.fmt.allocPrint(a, "{s}\\{s}", .{ dir, name });
             defer a.free(full);
-            return isLaunchableShell(full);
+            return isLaunchableFile(full);
         }
     }.launchable;
     try std.testing.expect(try check(alloc, root, "to-present.exe"));
@@ -2173,11 +2221,12 @@ test "the real machine yields a default command that exists" {
     const exe = std.fs.path.basename(command.direct[0]);
     try std.testing.expect(std.ascii.eqlIgnoreCase(exe, "pwsh.exe") or
         std.ascii.eqlIgnoreCase(exe, "powershell.exe") or std.ascii.eqlIgnoreCase(exe, "cmd.exe"));
-    try std.testing.expect(isLaunchableShell(command.direct[0]));
+    try std.testing.expect(isLaunchableFile(command.direct[0]));
 
     const recovery = try recoveryCommand(alloc);
     defer recovery.deinit(alloc);
     try std.testing.expect(std.ascii.eqlIgnoreCase(std.fs.path.basename(recovery.direct[0]), "cmd.exe"));
+    try std.testing.expectEqualStrings("/D", recovery.direct[1]);
 }
 
 /// A machine for `lookupGitBashWithHost`: the files that exist and the install

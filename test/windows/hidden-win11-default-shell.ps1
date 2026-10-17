@@ -259,7 +259,8 @@ function Find-Shell([int]$RootPid) {
     foreach ($p in $all) {
         if ($ids.Contains([int]$p.ProcessId) -and $p.ProcessId -ne $RootPid -and $shellNames -contains $p.Name.ToLowerInvariant()) {
             $integration = ($null -ne $p.CommandLine) -and ($p.CommandLine -match 'integration\.ps1|__ghostty')
-            return @{ Pid=[int]$p.ProcessId; Name=$p.Name.ToLowerInvariant(); Integration=$integration }
+            $noAutoRun = ($null -ne $p.CommandLine) -and ($p.CommandLine -match '(?i)\s/d(\s|$)')
+            return @{ Pid=[int]$p.ProcessId; Name=$p.Name.ToLowerInvariant(); Integration=$integration; NoAutoRun=$noAutoRun }
         }
     }
     return $null
@@ -280,7 +281,7 @@ function Launch-Case([string]$Case,[string]$Exe,[string[]]$ExtraArgs,[hashtable]
     foreach ($k in $Env.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k,$Env[$k]) }
     $class = "noctty-test-pkg49-$([guid]::NewGuid().ToString('N').Substring(0,12))"
     $line = '"{0}" --single-instance=false --class={1} {2}' -f $Exe,$class,($ExtraArgs -join ' ')
-    $record = @{ Case=$Case; Shell=$null; Integration=$null; PromptMs=$null; PromptLine=$null; Screen=@(); NocttyWarnings=@(); HostNoise=@() }
+    $record = @{ Case=$Case; Shell=$null; Integration=$null; PromptMs=$null; PromptLine=$null; Screen=@(); NocttyWarnings=@(); HostNoise=@(); Unexplained=@(); NoAutoRun=$null }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     try { $pi = [Ds]::Launch($Exe,$line,$dir,$Desktop,[IntPtr]::Zero,$false) }
     finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k,$saved[$k]) } }
@@ -293,7 +294,7 @@ function Launch-Case([string]$Case,[string]$Exe,[string[]]$ExtraArgs,[hashtable]
             if ($null -eq $shell) { Start-Sleep -Milliseconds 100 }
         }
         if ($shell) {
-            $record.Shell = $shell.Name; $record.Integration = $shell.Integration
+            $record.Shell = $shell.Name; $record.Integration = $shell.Integration; $record.NoAutoRun = $shell.NoAutoRun
             $out = Join-Path $dir "screen-$Case.txt"
             # A prompt is the screen holding the same non-empty rows in two reads 750 ms apart: prompts are
             # themed (a starship prompt is `~ ❯`), so no pattern for them is trusted.
@@ -317,7 +318,9 @@ function Launch-Case([string]$Case,[string]$Exe,[string[]]$ExtraArgs,[hashtable]
             # Lines from the shell host or the user's own profile are not ours: Windows PowerShell under Restricted
             # cannot load PSReadLine or a profile.ps1 in any terminal. A line naming this app is.
             $record.NocttyWarnings = @($record.Screen | Where-Object { $_ -match '(?i)noctty|integration (skipped|could not)|could not load' })
-            $record.HostNoise = @($record.Screen | Where-Object { $_ -match '(?i)PSReadline|profile\.ps1|about_Execution_Policies|SecurityError|UnauthorizedAccess|FullyQualifiedErrorId|^\s*\+ |^At line:' })
+            $record.HostNoise = @($record.Screen | Where-Object { $_ -match '(?i)PSReadline|profile\.ps1|about_Execution_Policies|SecurityError|UnauthorizedAccess|FullyQualifiedErrorId|^\s*\+ |^At line:|^because running scripts|^about_Execution' })
+            # Every row but the last (the prompt) must be a row the host explains; wrapped lines of the profile error count.
+            $record.Unexplained = @($record.Screen | Select-Object -SkipLast 1 | Where-Object { $record.HostNoise -notcontains $_ -and $_ -notmatch '^(because|about_|\. :|File )' })
         }
         if ([Ds]::WaitForSingleObject($pi.process,0) -ne 0) {
             foreach ($h in [Ds]::Windows($pi.pid,'noctty.win32.host')) { [void][Ds]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
@@ -342,22 +345,27 @@ try {
     $r = Launch-Case 'default' $exe @() @{}
     Check 'default' "the first tab runs $(if($pwshOnPath){'pwsh.exe, which is on PATH'}else{'powershell.exe, as pwsh.exe is not on PATH'})" ($r.Shell -eq $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'})) $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'}) $r.Shell
     Check 'default' 'the shell integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
-    Check 'default' 'a prompt appears' ($null -ne $r.PromptMs) 'prompt' $r.PromptLine
+    Check 'default' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
+    Check 'default' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'default' 'no warning from this app on the screen' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
 
     $r = Launch-Case 'no-pwsh' $exe @() @{ PATH = $withoutPwsh }
     Check 'no-pwsh' 'without pwsh.exe on PATH the first tab runs Windows PowerShell' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
-    Check 'no-pwsh' 'a prompt appears' ($null -ne $r.PromptMs) 'prompt' $r.PromptLine
+    Check 'no-pwsh' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
+    Check 'no-pwsh' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
 
     $r = Launch-Case 'restricted-51' $exe @() @{ PATH = $withoutPwsh; PSExecutionPolicyPreference = 'Restricted' }
     Check 'restricted-51' 'Windows PowerShell 5.1 starts under the Restricted policy' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
     Check 'restricted-51' 'the integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
-    Check 'restricted-51' 'a prompt appears' ($null -ne $r.PromptMs) 'prompt' $r.PromptLine
+    Check 'restricted-51' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
+    Check 'restricted-51' 'every row above the prompt is the host or the user profile under Restricted' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'restricted-51' 'no warning from this app on the screen (the host and profile lines below it are Restricted behaviour in any terminal)' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
 
     $r = Launch-Case 'safe-mode' $exe @('--safe-mode') @{}
     Check 'safe-mode' 'safe mode starts cmd.exe although PowerShell is installed' ($r.Shell -eq 'cmd.exe') 'cmd.exe' $r.Shell
-    Check 'safe-mode' 'a prompt appears' ($null -ne $r.PromptMs) 'prompt' $r.PromptLine
+    Check 'safe-mode' 'with /D, which skips the AutoRun command' ($r.NoAutoRun -eq $true) $true $r.NoAutoRun
+    Check 'safe-mode' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
+    Check 'safe-mode' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
 } catch {
     $script:checks.Add(@{Name='Harness execution'; Passed=$false; Error=$_.Exception.Message})
 } finally {
