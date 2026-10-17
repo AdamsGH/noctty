@@ -43,6 +43,28 @@ public static class RendererNative {
  [DllImport("user32")] public static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint f,uint timeout,out IntPtr result);
  public static string ClassOf(IntPtr h) { var b=new StringBuilder(256); GetClassNameW(h,b,256); return b.ToString(); }
  public static string DesktopName() {var b=new StringBuilder(256);uint needed;if(!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),2,b,512,out needed))throw new Exception("Cannot verify thread desktop");return b.ToString();}
+ public static string WindowDesktop(IntPtr h) { int pid;uint tid=GetWindowThreadProcessId(h,out pid);var b=new StringBuilder(256);uint needed;if(tid==0 || !GetUserObjectInformationW(GetThreadDesktop(tid),2,b,512,out needed))throw new Exception("Cannot verify window desktop");return b.ToString(); }
+ public static IntPtr ChildOfId(IntPtr parent,int id) {IntPtr found=IntPtr.Zero;EnumChildWindows(parent,(h,l)=>{if(GetDlgCtrlID(h)==id){found=h;return false;}return true;},IntPtr.Zero);return found;}
+ [DllImport("user32")] static extern int GetDlgCtrlID(IntPtr h);
+ // Explicit lpDesktop is required: a null desktop from a private-desktop
+ // driver can put its child on the interactive desktop.
+ [DllImport("kernel32",SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle,uint mask,uint flags);
+ public static PI Launch(string exe,string cwd,string desktop,System.Collections.IDictionary overrides,string stderrPath) {
+  var values=new System.Collections.Generic.SortedDictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+  foreach(System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables()) values[(string)e.Key]=(string)e.Value;
+  foreach(System.Collections.DictionaryEntry e in overrides) values[e.Key.ToString()]=e.Value.ToString();
+  var block=new StringBuilder();foreach(var pair in values)block.Append(pair.Key).Append('=').Append(pair.Value).Append('\0');block.Append('\0');
+  IntPtr env=Marshal.StringToHGlobalUni(block.ToString());
+  var si=new SI {cb=Marshal.SizeOf<SI>(),desktop="WinSta0\\"+desktop,flags=0x101,show=0};PI pi;
+  try {
+   using(var log=new FileStream(stderrPath,FileMode.Create,FileAccess.Write,FileShare.ReadWrite)) {
+    si.stdout=si.stderr=log.SafeFileHandle.DangerousGetHandle();
+    if(!SetHandleInformation(si.stderr,1,1))throw new Exception("Cannot inherit renderer log handle");
+    if(!CreateProcessW(exe,new StringBuilder("\""+exe+"\" --single-instance=false"),IntPtr.Zero,IntPtr.Zero,true,0x08000400,env,cwd,ref si,out pi))throw new Exception("Renderer CreateProcess failed: "+Marshal.GetLastWin32Error());
+    return pi;
+   }
+  } finally {Marshal.FreeHGlobal(env);}
+ }
  public static IntPtr Host(int pid) { IntPtr found=IntPtr.Zero; EnumWindows((h,l)=>{int p;GetWindowThreadProcessId(h,out p);if(p==pid && ClassOf(h)=="noctty.win32.host") found=h;return true;},IntPtr.Zero);return found; }
  public static IntPtr Surface(IntPtr host) { IntPtr found=IntPtr.Zero; EnumChildWindows(host,(h,l)=>{if(ClassOf(h)=="noctty.win32" && IsWindowVisible(h)) {found=h;return false;}return true;},IntPtr.Zero);return found; }
  public static IntPtr[] Surfaces(IntPtr host,bool visibleOnly) { var found=new List<IntPtr>();EnumChildWindows(host,(h,l)=>{if(ClassOf(h)=="noctty.win32" && (!visibleOnly || IsWindowVisible(h))) found.Add(h);return true;},IntPtr.Zero);return found.ToArray(); }

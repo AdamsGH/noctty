@@ -30,6 +30,18 @@ pub fn startupOrder(
     return if (warp_only) &.{ .@"d3d11-warp", .opengl } else &.{ .d3d11, .@"d3d11-warp", .opengl };
 }
 
+/// Recovery must not re-enter a hardware driver that may have crashed.
+/// OpenGL keeps its normal first attempt; its D3D11 fallback is WARP-only.
+pub fn startupOrderForMode(
+    requested: Config.RendererBackend,
+    feature: ?Unsupported,
+    opengl_unavailable: bool,
+    safe_mode: bool,
+) []const Config.RendererBackend {
+    if (safe_mode) return if (opengl_unavailable) &.{.@"d3d11-warp"} else &.{ .opengl, .@"d3d11-warp" };
+    return startupOrder(requested, feature, opengl_unavailable);
+}
+
 /// The banner a surface shows when OpenGL could not start for it and the
 /// Direct3D 11 beta drew instead.
 pub fn openGLFallbackNotice(warp: bool) []const u8 {
@@ -58,6 +70,15 @@ test "renderer startup skips OpenGL once it could not start in this process" {
         try std.testing.expectEqualSlices(Backend, &.{ .d3d11, .@"d3d11-warp" }, startupOrder(.opengl, feature, true));
         try std.testing.expectEqualSlices(Backend, &.{ .d3d11, .@"d3d11-warp" }, startupOrder(.d3d11, feature, true));
         try std.testing.expectEqualSlices(Backend, &.{.@"d3d11-warp"}, startupOrder(.@"d3d11-warp", feature, true));
+    }
+}
+
+test "renderer safe mode excludes hardware D3D11 at startup and after cached GL failure" {
+    const Backend = Config.RendererBackend;
+    inline for (std.meta.tags(Backend)) |requested| {
+        try std.testing.expectEqualSlices(Backend, &.{ .opengl, .@"d3d11-warp" }, startupOrderForMode(requested, null, false, true));
+        try std.testing.expectEqualSlices(Backend, &.{.@"d3d11-warp"}, startupOrderForMode(requested, .custom_shaders, true, true));
+        try std.testing.expectEqualSlices(Backend, startupOrder(requested, null, false), startupOrderForMode(requested, null, false, false));
     }
 }
 

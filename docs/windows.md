@@ -130,15 +130,19 @@ banner. The cached decision applies to new terminals. A config reload retries
 OpenGL for configured custom shaders, background images or retained Kitty images;
 device-failure recovery also keeps its throttled OpenGL retries. This happens
 whether `renderer` is unset or set to
-`opengl`, and in safe mode, which uses the built-in defaults. WARP can use a
+`opengl`, and in safe mode, which uses the built-in defaults and WARP for the
+Direct3D 11 fallback and its device recovery, avoiding a hardware driver that
+may have caused the crash. WARP can use a
 lot of CPU under heavy output. If OpenGL starts but noctty cannot build its
 renderer on it (for example, a `background-image` that does not decode), that
 terminal is also drawn by Direct3D 11, with a notice naming the error, and the
 next one tries OpenGL again.
 
-To skip the OpenGL attempt on such a machine, set `renderer = d3d11` (or
+To skip the initial OpenGL attempt on such a machine, set `renderer = d3d11` (or
 `renderer = d3d11-warp` for WARP alone) in `%LOCALAPPDATA%\noctty\config.ghostty`,
-or in the `config.ghostty` beside `noctty.exe` in portable mode.
+or in the `config.ghostty` beside `noctty.exe` in portable mode. Custom shaders
+or a background image still request OpenGL first; remove those settings too
+to skip that attempt. Kitty images received later can still request OpenGL.
 
 Only when Direct3D 11 cannot start either does noctty stop at the startup
 dialog, which reports the OpenGL failure and the Direct3D 11 error. A build
@@ -1098,8 +1102,8 @@ Three consecutive pre-ready startup failures select an ephemeral safe mode:
 built-in config, no session restore. `noctty --safe-mode` picks it for one
 launch. Safe mode never overwrites your config or quarantined state. A launch
 that ends at the OpenGL startup dialog is recorded but not counted, and does
-not end a run of other failures either: safe mode tries the same renderers,
-so it could not help (see
+not end a run of other failures either: safe mode still needs working OpenGL
+or WARP, so it cannot help when both failed (see
 [Starting without OpenGL](#starting-without-opengl)). A crash, in OpenGL,
 Direct3D 11 or anywhere else, still counts.
 
@@ -1701,7 +1705,8 @@ custom shaders and images, or after that dialog), on x64 try in order:
    GPU in Windows Graphics settings.
 5. If OpenGL 4.3 is not available at all, noctty already draws text with the
    [D3D11 renderer beta](#d3d11-renderer-beta); set `renderer = d3d11` (or
-   `renderer = d3d11-warp`) to start with it and skip the OpenGL attempt. See
+   `renderer = d3d11-warp`) and remove custom shaders and background images
+   to start with it and skip the OpenGL attempt. See
    [Starting without OpenGL](#starting-without-opengl).
 
 Steps 3 and 4 do not apply on an ARM64 PC whose GPU vendor ships no desktop
@@ -1756,7 +1761,7 @@ vendor's driver, but noctty neither knows nor cares which supplied it.
 
 Without the pack, noctty switches to the D3D11 renderer (beta), which the
 ARM64 release build includes, when OpenGL cannot start, and says so in a
-banner. To start with it and skip the OpenGL attempt, add `renderer = d3d11`
+banner. To start with it, add `renderer = d3d11`
 to the config file (hardware Direct3D 11, then Microsoft's WARP software
 renderer) or `renderer = d3d11-warp` (WARP only). The config file is
 `%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside

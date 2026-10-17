@@ -6,6 +6,7 @@ param(
     [string]$ExpectedProfileMtime = '',
     [switch]$RequireHardware,
     [switch]$WarpOnly,
+    [switch]$OpenGLStartupOnly,
     [switch]$Driver,
     [string]$RealProfile = '',
     [string]$DesktopName = ''
@@ -54,6 +55,7 @@ if (!$Driver) {
         if ($ExpectedProfileMtime) { $command += ' -ExpectedProfileMtime ' + $ExpectedProfileMtime }
         if ($RequireHardware) { $command += ' -RequireHardware' }
         if ($WarpOnly) { $command += ' -WarpOnly' }
+        if ($OpenGLStartupOnly) { $command += ' -OpenGLStartupOnly' }
         if (![RendererNative]::CreateProcessW($exe, [Text.StringBuilder]::new($command), [IntPtr]::Zero, [IntPtr]::Zero, $false, 0x08004000, [IntPtr]::Zero, $PSScriptRoot, [ref]$si, [ref]$pi)) { throw 'Hidden driver CreateProcess failed.' }
         Write-Output "Hidden renderer driver PID=$($pi.pid) desktop=$DesktopName"
         $wait = [Diagnostics.Stopwatch]::StartNew()
@@ -77,7 +79,7 @@ if (!$Driver) {
 if ([RendererNative]::DesktopName() -ne $DesktopName -or !$DesktopName.StartsWith('renderer-test-')) { throw 'Driver is not on its verified hidden desktop.' }
 [void][RendererNative]::SetThreadDpiAwarenessContext([IntPtr]-4)
 $result = [ordered]@{ status = 'error'; hiddenDesktop = $DesktopName; profileBefore = $before; binarySHA256 = (Get-FileHash -LiteralPath $Binary).Hash; runs = @(); comparisons = @() }
-function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironment = @{}, [string[]]$ExtraConfig = @(), [switch]$Lifecycle, [switch]$MultiPane, [switch]$Streaming, [int]$FailureAction = 0, [switch]$ReloadUnsupported, [switch]$ReloadImages, [switch]$RetryHardware) {
+function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironment = @{}, [string[]]$ExtraConfig = @(), [switch]$Lifecycle, [switch]$MultiPane, [switch]$Streaming, [int]$FailureAction = 0, [switch]$ReloadUnsupported, [switch]$ReloadImages, [switch]$RetryHardware, [switch]$OpenGLStartupFallback) {
     [void](Assert-Profile $before)
     $run = Join-Path $OutputDirectory $Label
     $bin = Join-Path $run 'bin'
@@ -94,26 +96,45 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
     $config += 'command=direct:"' + (Get-Command pwsh).Source + '" -NoProfile -File "' + (Join-Path $bin 'Fixture.ps1') + '"'
     if ($Streaming) { $config[-1] += ' -Stream' }
     $config += $ExtraConfig
+    $config += 'class=noctty-test-renderer-' + [guid]::NewGuid().ToString('N')
     Set-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value ($config -join "`n") -Encoding utf8
     $environment = @{ LOCALAPPDATA = (Join-Path $run 'LocalAppData'); APPDATA = (Join-Path $run 'AppData'); NOCTTY_RENDERER_CAPTURE_PATH = (Join-Path $run 'frame.bmp'); NOCTTY_RENDERER_STATUS_PATH = (Join-Path $run 'renderer.json'); NOCTTY_RENDERER_READY_PATH = (Join-Path $run 'ready.txt'); NOCTTY_RENDERER_HIDE_NOTICES = '1' }
     foreach ($key in $ExtraEnvironment.Keys) { $environment[$key] = $ExtraEnvironment[$key] }
+    if ($OpenGLStartupFallback) { [void]$environment.Remove('NOCTTY_RENDERER_HIDE_NOTICES') }
     [void](New-Item -ItemType Directory -Path $environment.LOCALAPPDATA, $environment.APPDATA)
     if (!(Test-Path -LiteralPath (Join-Path $bin 'noctty.portable'))) { throw 'Portable marker missing; app launch blocked.' }
     $proc = $null
+    $nativeProcess = New-Object RendererNative+PI
+    if ($OpenGLStartupFallback) { Add-Type -AssemblyName UIAutomationClient }
     $case = [ordered]@{ label = $Label; requested = $Backend; portable = $true; appDataRedirected = $true }
     try {
-        $proc = Start-Process -FilePath (Join-Path $bin 'noctty.exe') -ArgumentList '--single-instance=false' -WorkingDirectory $bin -WindowStyle Hidden -Environment $environment -PassThru -RedirectStandardError (Join-Path $run 'stderr.txt')
+        $nativeProcess = [RendererNative]::Launch((Join-Path $bin 'noctty.exe'), $bin, $DesktopName, $environment, (Join-Path $run 'stderr.txt'))
+        try { $proc = Get-Process -Id $nativeProcess.pid } catch {
+            $exitCode=0; [void][RendererNative]::GetExitCodeProcess($nativeProcess.process,[ref]$exitCode)
+            throw "App exited before fixture: $exitCode"
+        }
         $identity = $proc.StartTime
         $case.pid = $proc.Id; $case.startTime = $identity
         $clock = [Diagnostics.Stopwatch]::StartNew(); $hostWindow = [IntPtr]::Zero; $surfaceWindow = [IntPtr]::Zero
         while ($clock.Elapsed.TotalSeconds -lt 40) {
-            $proc.Refresh(); if ($proc.HasExited) { throw "App exited before fixture: $($proc.ExitCode)" }
+            if ([RendererNative]::WaitForSingleObject($nativeProcess.process,0) -eq 0) {
+                $exitCode=0; [void][RendererNative]::GetExitCodeProcess($nativeProcess.process,[ref]$exitCode)
+                throw "App exited before fixture: $exitCode"
+            }
             $hostWindow = [RendererNative]::Host($proc.Id)
             if ($hostWindow -ne [IntPtr]::Zero) {
+                if ([RendererNative]::WindowDesktop($hostWindow) -ne $DesktopName) { throw 'App window is not on the private desktop.' }
                 if (![RendererNative]::IsWindowVisible($hostWindow)) { [void][RendererNative]::ShowWindow($hostWindow, 4) }
                 $surfaceWindow = [RendererNative]::Surface($hostWindow)
+                if ($OpenGLStartupFallback -and !$case.fallbackBanner) {
+                    $banner=[RendererNative]::ChildOfId($hostWindow,1913)
+                    if ($banner -ne [IntPtr]::Zero) {
+                        $name=[Windows.Automation.AutomationElement]::FromHandle($banner).Current.Name
+                        if ($name -match 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { $case.fallbackBanner=$name }
+                    }
+                }
             }
-            if ($surfaceWindow -ne [IntPtr]::Zero -and (Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH)) { break }
+            if ($surfaceWindow -ne [IntPtr]::Zero -and (Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH) -and (!$OpenGLStartupFallback -or $case.fallbackBanner)) { break }
             Start-Sleep -Milliseconds 25
         }
         if ($surfaceWindow -eq [IntPtr]::Zero -or !(Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH)) { throw 'Fixture did not become ready.' }
@@ -134,6 +155,22 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             return @{ path = $image; status = $status; pixels = $pixels }
         }
         $case.initial = & $capture 'initial'
+        if ($OpenGLStartupFallback) {
+            if ($case.initial.status.backend -ne 'd3d11' -or !$case.initial.status.opengl_unavailable -or $case.initial.status.opengl_context) { throw 'Unavailable OpenGL did not fall back, cache its failure, and release WGL.' }
+            if ($case.fallbackBanner -notmatch 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { throw 'OpenGL startup fallback banner is incomplete.' }
+            Remove-Item -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH
+            if (![RendererNative]::Action($surfaceWindow,1)) { throw 'New tab action rejected.' }
+            $tabClock=[Diagnostics.Stopwatch]::StartNew()
+            while (!(Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH) -and $tabClock.Elapsed.TotalSeconds -lt 40) { Start-Sleep -Milliseconds 25 }
+            if (!(Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH)) { throw 'Second-tab fixture did not become ready.' }
+            Start-Sleep -Milliseconds 500
+            if ([RendererNative]::Surfaces($hostWindow,$false).Count -ne 2) { throw 'Cached fallback did not open a second surface.' }
+            $surfaceWindow = [RendererNative]::Surface($hostWindow)
+            $case.cachedSurface = & $capture 'cached-surface'
+            if ($case.cachedSurface.status.backend -ne 'd3d11' -or !$case.cachedSurface.status.opengl_unavailable -or $case.cachedSurface.status.opengl_context) { throw 'Cached surface did not start on D3D11 without a WGL context.' }
+            $case.ledger = Get-Content -LiteralPath (Join-Path $bin 'startup-attempts.json') -Raw | ConvertFrom-Json
+            if ($case.ledger.attempts[0].phase -ne 'ready' -or $case.ledger.attempts[0].opengl_unavailable_at_unix_ms) { throw 'Successful fallback was not an ordinary ready launch.' }
+        }
         if ($RetryHardware) {
             if ($case.initial.status.backend -ne 'd3d11' -or !$case.initial.status.warp) { throw 'Hardware startup failure did not select WARP.' }
             if (![RendererNative]::LoseDevice($surfaceWindow)) { throw 'Device loss inside retry window rejected.' }
@@ -332,12 +369,17 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             }
             $proc.Dispose()
         }
+        if ($nativeProcess.thread -ne [IntPtr]::Zero) { [void][RendererNative]::CloseHandle($nativeProcess.thread) }
+        if ($nativeProcess.process -ne [IntPtr]::Zero) { [void][RendererNative]::CloseHandle($nativeProcess.process) }
         [void](Assert-Profile $before)
         if ($caseSuccessful -and $case.teardown -ne 'graceful') { throw 'Successful renderer case did not close gracefully.' }
     }
 }
 try {
     # These cases need no GL driver and run on x64 and native ARM64 CI too.
+    $startupFallback = Invoke-Case 'opengl-startup-fallback' 'opengl' @{NOCTTY_RENDERER_FAIL_OPENGL_VERSION='1'} -OpenGLStartupFallback
+    $result.runs += $startupFallback
+    if ($OpenGLStartupOnly) { $result.status = 'pass'; return }
     $blockedKitty = Invoke-Case 'kitty-without-gl' 'd3d11-warp' @{NOCTTY_RENDERER_FAIL_OPENGL='1';NOCTTY_RENDERER_TEST_KITTY='1';NOCTTY_RENDERER_TEST_IMAGE_CHURN='1'} @('power-saver-rendering=on') -Streaming -ReloadImages
     $result.runs += $blockedKitty
     if ($blockedKitty.initial.status.backend -ne 'd3d11' -or !$blockedKitty.initial.status.fallback_blocked) { throw 'Failed GL image fallback did not retain healthy D3D11.' }

@@ -84,6 +84,8 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
     var config = options.config;
     errdefer config.deinit();
     const requested = config.renderer_backend;
+    const safe_mode = options.rt_surface.app.safe_mode;
+    const recovery_preference = if (safe_mode) .@"d3d11-warp" else requested;
     const feature = selection.unsupported(config.custom_shaders.value.items.len != 0, config.bg_image != null, false);
     const base: Windows = .{ .alloc = alloc, .rt_surface = options.rt_surface, .surface_mailbox = options.surface_mailbox, .active = undefined, .thread = options.thread };
     var result = base;
@@ -94,7 +96,7 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
     // Each candidate covers full generic-renderer initialization. WARP
     // remains a separate candidate for failures after device creation. The
     // candidate that succeeds writes the notice, from what failed before it.
-    for (selection.startupOrder(requested, feature, skip_opengl)) |candidate| {
+    for (selection.startupOrderForMode(requested, feature, skip_opengl, safe_mode)) |candidate| {
         if (candidate == .opengl) {
             if (initGL(alloc, options)) |value| {
                 result.active = .{ .opengl = value };
@@ -128,7 +130,7 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
         if (D3D.init(alloc, candidate_options)) |initialized| {
             value.* = initialized;
             value.config.renderer_backend = requested;
-            value.api.setRecoveryPreference(requested);
+            value.api.setRecoveryPreference(recovery_preference);
             result.active = .{ .d3d11 = value };
             result.last_warp = value.api.stats().warp != 0;
             // OpenGL is not tried again for images or effects it would draw.
@@ -374,6 +376,8 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
                 .removed_reason = receipt.removed_reason,
                 .fallback_blocked = self.fallback_blocked,
                 .fallback_attempts = self.fallback_attempts,
+                .opengl_unavailable = apprt.win32.openGLUnavailable(),
+                .opengl_context = self.rt_surface.hglrc != null,
                 .image_count = v.images.images.count(),
                 .max_image_id = max_image_id,
                 .hardware_attempts = receipt.hardware_attempts,
