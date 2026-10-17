@@ -68,8 +68,8 @@ Chocolatey 2.7.4 in image 20261013.288.2), and builds nothing:
    `SHA256SUMS` files, the build provenance attestation of every asset except
    the icon, and the Authenticode signer. A draft or prerelease fails there.
    It then requires both installers' attestations to name the commit the
-   release tag points at, so an installer re-uploaded from another commit is
-   refused.
+   release tag points at now, so an installer re-uploaded from another commit
+   is refused while the tag still points where it did.
 3. It builds the package from those installers with
    `scripts/package-package-managers.ps1`, whose `packageSourceUrl` names the
    workflow's commit.
@@ -84,8 +84,12 @@ Chocolatey 2.7.4 in image 20261013.288.2), and builds nothing:
    same script.
 
 What this cannot tell is a rebuild of the same commit re-uploaded under the
-same tag (the thing not to do in step 4 above): its attestations are as good as
-the original's. Before the first push of a version, compare the
+same tag (the thing not to do in step 4 above), or a tag moved to another
+commit together with that commit's rebuilt assets (the release page was not
+immutable and no tag ruleset existed on 2026-10-17): their attestations are as
+good as the original's. Nothing in the repository holds the original hashes
+except the Scoop and WinGet manifests, so before the first push of a version,
+compare the
 `Installer <arch> SHA-256` lines the build step prints with `InstallerSha256`
 in the WinGet manifest of that version (`microsoft/winget-pkgs`,
 `manifests/a/AmanThanvi/noctty/<version>`), which was published from the
