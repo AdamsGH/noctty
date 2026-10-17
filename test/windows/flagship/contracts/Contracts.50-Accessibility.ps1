@@ -1743,7 +1743,7 @@ $postWrapperInvocations = 0
 $postLiveFailureMessage = $null
 $postExitedMessage = $null
 $postDeadlineMessage = $null
-$exitedProbeProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-Command', 'exit 19') -PassThru -Wait
+$exitedProbeProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-Command', 'exit 19') -WindowStyle Hidden -PassThru -Wait
 try {
     $liveProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
     $liveDeadline = [DateTime]::UtcNow.AddSeconds(5)
