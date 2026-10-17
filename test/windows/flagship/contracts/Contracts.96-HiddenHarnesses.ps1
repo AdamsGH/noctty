@@ -310,6 +310,7 @@ METHOD
         @{ WrongDesktop = $true; Other = $true }
         @{ QueryFails = $true; Api = 'GetThreadDesktop'; Code = 5 }
         @{ CloseFails = $true; Api = 'Observer CloseDesktop'; Code = 6 }
+        @{ QueryFails = $true; CloseFails = $true; Api = 'GetThreadDesktop'; Code = 5; Cleanup = $true }
     )) {
         foreach ($field in @('OpenFails', 'AttachFails', 'WrongDesktop', 'QueryFails', 'CloseFails')) { $type.GetField($field).SetValue($null, [bool]$fixture[$field]) }
         $type::Opens = $type::Queries = $type::Closes = 0
@@ -318,12 +319,14 @@ METHOD
         if ([bool]$caught -ne [bool]($fixture.Api -or $fixture.Other) -or
             ($fixture.Api -and ($caught -isnot [ComponentModel.Win32Exception] -or $caught.Message -cne $fixture.Api -or $caught.NativeErrorCode -ne $fixture.Code))) { throw 'Attached observer changed failure stage/code or accepted a failed operation.' }
         if ($type::Opens -ne 1 -or $type::Closes -ne $(if ($fixture.OpenFails) { 0 } else { 1 })) { throw 'Attached observer lost owned desktop cleanup.' }
+        if ($fixture.Cleanup -and ($caught.Data['ObserverCleanupApi'] -cne 'Observer CloseDesktop' -or $caught.Data['ObserverCleanupCode'] -ne 6)) { throw 'Attached observer masked primary error or lost secondary cleanup evidence.' }
         if (-not $caught -and ($rows.Count -ne 1 -or $rows[0].Desktop -cne 'actual-target-desktop' -or $type::Queries -ne 1)) { throw 'Attached observer substituted expected desktop for actual target evidence.' }
     }
 }
 Assert-HiddenMutation 'attached observer did not attach' $attachedObserver ($attachedObserver.Replace('if (!SetThreadDesktop(desktop))', 'if (false)')) ${function:Test-AttachedDesktopObserver}
 Assert-HiddenMutation 'attached observer connection not verified' $attachedObserver ($attachedObserver.Replace('if (CurrentDesktopName() != desktopName)', 'if (false)')) ${function:Test-AttachedDesktopObserver}
-Assert-HiddenMutation 'attached observer errors ignored' $attachedObserver ($attachedObserver.Replace('if (failure != null) throw failure;', '')) ${function:Test-AttachedDesktopObserver}
+Assert-HiddenMutation 'attached observer errors ignored' $attachedObserver ($attachedObserver.Replace('throw failure;', '')) ${function:Test-AttachedDesktopObserver}
+Assert-HiddenMutation 'attached observer primary error masked by cleanup' $attachedObserver ($attachedObserver.Replace('throw failure;', 'if (cleanupFailure != null) throw cleanupFailure; throw failure;')) ${function:Test-AttachedDesktopObserver}
 Assert-HiddenMutation 'attached observer handle inheritable' $attachedObserver ($attachedObserver.Replace('OpenDesktopW(desktopName, 0, false, 0x0001)', 'OpenDesktopW(desktopName, 0, true, 0x0001)')) ${function:Test-AttachedDesktopObserver}
 
 if (-not ('HiddenStartContract' -as [type])) {
@@ -578,6 +581,8 @@ Assert-HiddenMutation 'visible default job window accepted' $defaultAssertion ($
 
 # Real native observation only: no process/window is created and no existing job is touched.
 . $hiddenLib
+$closeImport = [HiddenWin].GetMethod('CloseDesktop').GetCustomAttributes([Runtime.InteropServices.DllImportAttribute], $false)
+if ($closeImport.Count -ne 1 -or -not $closeImport[0].SetLastError) { throw 'CloseDesktop must preserve the native error consumed by observer cleanup diagnostics.' }
 $nativeRows = @([HiddenWin]::ObserveDesktopThreads([int[]]@($PID)))
 if (-not $nativeRows.Count -or @($nativeRows | Where-Object { $_.Error -or (-not $_.Desktop -and -not $_.Unconnected -and -not $_.Exited -and -not $_.ThreadExited) }).Count) {
     throw 'Native observation of this PowerShell process produced query error rows.'
@@ -766,7 +771,8 @@ using System;
 public static class PrivateDesktopContract {
     public static string Desktop, Current;
     public static int Gates, Creates, Launches, Stops, Closes, StartupSamples, ReadySamples, DefaultSamples, AttachedSamples;
-    public static bool DriverExited, StopTimeout, ExitFails, CleanupFails, AttachedFails;
+    public static bool DriverExited, StopTimeout, ExitFails, CleanupFails, AttachedFails, AttachedNative, AttachedCleanup;
+    public static string AttachedStage;
     public static DateTime UtcNow;
     public struct ProcessInfo { public int pid, tid; public IntPtr process, thread; }
     public static string CurrentDesktopName() { return Current; }
@@ -774,7 +780,13 @@ public static class PrivateDesktopContract {
     public static int[] JobProcessIds(IntPtr j) { return new[] { 41, 42 }; }
     public static object[] ObserveDesktopThreadsOnDesktop(int[] ids, string name) {
         if (name != Desktop || ids.Length != 2 || ids[0] != 41 || ids[1] != 42) throw new Exception("Wrong attached observer inputs");
-        AttachedSamples++; if (AttachedFails) throw new System.ComponentModel.Win32Exception(5, "Observer OpenDesktopW"); return new object[0];
+        AttachedSamples++;
+        if (AttachedFails) {
+            Exception error = AttachedNative ? new System.ComponentModel.Win32Exception(5, AttachedStage) : new Exception(AttachedStage);
+            if (AttachedCleanup) { error.Data["ObserverCleanupApi"] = "Observer CloseDesktop"; error.Data["ObserverCleanupCode"] = 6; }
+            throw error;
+        }
+        return new object[0];
     }
     public static IntPtr CreateInheritedDesktop(string n) { Desktop = n; Creates++; return new IntPtr(8); }
     public static IntPtr CreateOwnedJob() { return new IntPtr(7); }
@@ -803,7 +815,15 @@ function Test-PrivateDesktopControl([string] $Code) {
     foreach ($fixture in @(
         @{ Mode = 'Parent' }, @{ Mode = 'Driver' }
         @{ Mode = 'Parent'; Relative = $true }
-        @{ Mode = 'Parent'; AttachedFails = $true }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedNative = $true; AttachedStage = 'Observer OpenDesktopW' }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedNative = $true; AttachedStage = 'GetThreadDesktop'; AttachedCleanup = $true }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedStage = 'Observer desktop mismatch' }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedStage = 'Current desktop connection failed' }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedStage = 'Current thread has no connected desktop' }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedStage = 'Job process query failed' }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedStage = 'Job process query incomplete' }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedStage = 'Observer desktop mismatch fixture secret'; Unknown = $true }
+        @{ Mode = 'Parent'; AttachedFails = $true; AttachedNative = $true; AttachedStage = 'Observer OpenDesktopW fixture secret'; Unknown = $true }
         @{ Mode = 'Parent'; StartupFails = $true; Blocked = $true }
         @{ Mode = 'Parent'; ReadyFails = $true; Blocked = $true }
         @{ Mode = 'Parent'; WrongReadyPid = $true; Blocked = $true }
@@ -823,7 +843,8 @@ function Test-PrivateDesktopControl([string] $Code) {
         @{ Mode = 'Driver'; MissingStop = $true; Blocked = $true }
     )) {
         foreach ($field in @('Gates', 'Creates', 'Launches', 'Stops', 'Closes', 'StartupSamples', 'ReadySamples', 'DefaultSamples', 'AttachedSamples')) { [PrivateDesktopContract].GetField($field).SetValue($null, 0) }
-        foreach ($field in @('DriverExited', 'StopTimeout', 'ExitFails', 'CleanupFails', 'AttachedFails')) { [PrivateDesktopContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        foreach ($field in @('DriverExited', 'StopTimeout', 'ExitFails', 'CleanupFails', 'AttachedFails', 'AttachedNative', 'AttachedCleanup')) { [PrivateDesktopContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        [PrivateDesktopContract]::AttachedStage = $fixture.AttachedStage
         [PrivateDesktopContract]::UtcNow = [datetime]'2026-01-01T00:00:00Z'
         $requestedRun = if ($fixture.Relative) { '.\fixture-private' } else { 'C:\fixture\private' }
         $expectedRun = [IO.Path]::GetFullPath($requestedRun)
@@ -879,12 +900,21 @@ function Test-PrivateDesktopControl([string] $Code) {
         if (-not $fixture.Blocked -or $fixture.StartupFails -or $fixture.ReadyFails) {
             $comparison = $writes['private-attached-desktops.json'] | ConvertFrom-Json
             if ([PrivateDesktopContract]::AttachedSamples -ne 1 -or $comparison.ParentWindowStation -cne 'fixture-station' -or $comparison.DriverWindowStation -cne 'fixture-station' -or $comparison.DriverSessionId -ne 42 -or
-                ($fixture.AttachedFails -and ($comparison.ErrorApi -cne 'Observer OpenDesktopW' -or $comparison.ErrorCode -ne 5))) { throw 'Private control lost attached comparison or station/session/error metadata.' }
+                ($fixture.AttachedFails -and -not $comparison.Error)) { throw 'Private control lost attached comparison or station/session/error metadata.' }
+            $expectedStage = if ($fixture.AttachedFails -and -not $fixture.Unknown) { $fixture.AttachedStage } else { $null }
+            $expectedApi = if ($expectedStage -and $fixture.AttachedNative) { $expectedStage } else { $null }
+            $expectedCode = if ($expectedApi) { 5 } else { $null }
+            if ($comparison.ErrorStage -cne $expectedStage -or $comparison.ErrorApi -cne $expectedApi -or $comparison.ErrorCode -ne $expectedCode -or
+                ($fixture.AttachedCleanup -and ($comparison.CleanupErrorApi -cne 'Observer CloseDesktop' -or $comparison.CleanupErrorCode -ne 6))) {
+                throw 'Private control lost allowlisted stages/primary/cleanup codes or emitted arbitrary exception text.'
+            }
         }
         if (-not $fixture.Blocked -and ([PrivateDesktopContract]::StartupSamples -lt 1 -or [PrivateDesktopContract]::ReadySamples -ne 1 -or [PrivateDesktopContract]::DefaultSamples -lt 1)) { throw 'Private control omitted startup, forced ready, or Default observations.' }
     }
 }
 Assert-HiddenMutation 'private control startup failure forgotten' $privateFunctions ($privateFunctions.Replace('if ($null -ne $observationFailure) { throw $observationFailure }', '')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control arbitrary native label disclosed' $privateFunctions ($privateFunctions.Replace('$nativeStages -ccontains $failure.Message', '$true')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control arbitrary fixed label disclosed' $privateFunctions ($privateFunctions.Replace('$fixedStages -ccontains $failure.Message', '$true')) ${function:Test-PrivateDesktopControl}
 Assert-HiddenMutation 'private control relative run not normalized' $privateFunctions ($privateFunctions.Replace('$Run = [IO.Path]::GetFullPath($Run)', '')) ${function:Test-PrivateDesktopControl}
 Assert-HiddenMutation 'private control ready PID ignored' $privateFunctions ($privateFunctions.Replace(' -and $ready.ProcessId -eq $driver.pid', '')) ${function:Test-PrivateDesktopControl}
 Assert-HiddenMutation 'private control ready desktop ignored' $privateFunctions ($privateFunctions.Replace(' -and $ready.Desktop -ceq $desktopName', '')) ${function:Test-PrivateDesktopControl}

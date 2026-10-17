@@ -47,7 +47,7 @@ public static class HiddenWin {
     }
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateDesktopW(string n, IntPtr dev, IntPtr mode, int flags, uint access, ref SecurityAttributes sa);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref Startup si, out ProcessInfo pi);
     [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
@@ -262,6 +262,7 @@ public static class HiddenWin {
     // Diagnostic comparison only. Never move the outer Default oracle's calling thread.
     public static DesktopObservation[] ObserveDesktopThreadsOnDesktop(int[] ids, string desktopName) {
         DesktopObservation[] rows = null; Exception failure = null;
+        System.ComponentModel.Win32Exception cleanupFailure = null;
         IntPtr desktop = IntPtr.Zero;
         var observer = new System.Threading.Thread(() => {
             try {
@@ -274,12 +275,20 @@ public static class HiddenWin {
             } catch (Exception error) { failure = error; }
         });
         try { observer.Start(); observer.Join(); }
+        catch (Exception error) { failure = error; }
         finally {
             // Closing while the worker is attached would fail; join precedes handle cleanup.
             if (desktop != IntPtr.Zero && !CloseDesktop(desktop))
-                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer CloseDesktop");
+                cleanupFailure = new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer CloseDesktop");
         }
-        if (failure != null) throw failure;
+        if (failure != null) {
+            if (cleanupFailure != null) {
+                failure.Data["ObserverCleanupApi"] = cleanupFailure.Message;
+                failure.Data["ObserverCleanupCode"] = cleanupFailure.NativeErrorCode;
+            }
+            throw failure;
+        }
+        if (cleanupFailure != null) throw cleanupFailure;
         return rows;
     }
     public sealed class DesktopWindowObservation {

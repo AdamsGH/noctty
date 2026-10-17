@@ -189,20 +189,31 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
             $readyObserved = $ready -and $ready.Connected -eq $true -and $ready.ProcessId -eq $driver.pid -and $ready.Desktop -ceq $desktopName
             if ([datetime]::UtcNow -ge $deadline) { throw 'Private control driver did not report its desktop within fifteen seconds.' }
         } until ($readyObserved)
-        $attachedRows = @(); $attachedError = $null; $attachedErrorApi = $null; $attachedErrorCode = $null
+        $attachedRows = @(); $attachedError = $null; $attachedErrorApi = $null; $attachedErrorCode = $null; $attachedErrorStage = $null
+        $attachedCleanupApi = $null; $attachedCleanupCode = $null
         try {
             $ids = @(@([HiddenWin]::JobProcessIds($job)) + $driver.pid | Select-Object -Unique)
             $attachedRows = @([HiddenWin]::ObserveDesktopThreadsOnDesktop([int[]]$ids, $desktopName))
         } catch {
             $attachedError = 'Attached desktop observation failed'
-            if ($_.Exception.InnerException -is [ComponentModel.Win32Exception]) {
-                $attachedErrorApi = $_.Exception.InnerException.Message
-                $attachedErrorCode = $_.Exception.InnerException.NativeErrorCode
+            $failure = $_.Exception.InnerException
+            $nativeStages = @('GetThreadDesktop', 'GetUserObjectInformationW', 'Observer OpenDesktopW', 'Observer SetThreadDesktop', 'Observer CloseDesktop')
+            $fixedStages = @('Observer desktop mismatch', 'Current desktop connection failed', 'Current thread has no connected desktop', 'Job process query failed', 'Job process query incomplete')
+            if ($failure -is [ComponentModel.Win32Exception] -and $nativeStages -ccontains $failure.Message) {
+                $attachedErrorStage = $attachedErrorApi = $failure.Message
+                $attachedErrorCode = $failure.NativeErrorCode
+            } elseif ($failure -and $fixedStages -ccontains $failure.Message) {
+                $attachedErrorStage = $failure.Message
+            }
+            if ($failure -and $failure.Data['ObserverCleanupApi'] -ceq 'Observer CloseDesktop' -and $failure.Data['ObserverCleanupCode'] -is [int]) {
+                $attachedCleanupApi = 'Observer CloseDesktop'
+                $attachedCleanupCode = $failure.Data['ObserverCleanupCode']
             }
         }
         @{ ExpectedDesktop = $desktopName; ParentWindowStation = [HiddenWin]::CurrentWindowStationName()
             ParentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId; DriverWindowStation = $ready.WindowStation; DriverSessionId = $ready.SessionId
-            AttachedThreads = $attachedRows; Error = $attachedError; ErrorApi = $attachedErrorApi; ErrorCode = $attachedErrorCode } |
+            AttachedThreads = $attachedRows; Error = $attachedError; ErrorStage = $attachedErrorStage; ErrorApi = $attachedErrorApi; ErrorCode = $attachedErrorCode
+            CleanupErrorApi = $attachedCleanupApi; CleanupErrorCode = $attachedCleanupCode } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'private-attached-desktops.json')
         # A distinct receipt bypasses startup sampling throttling and always observes after connection.
         Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl')
