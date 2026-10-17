@@ -9,15 +9,19 @@ Cases, each one launch of noctty with no `command` in its config:
   default           the machine as it is: expects pwsh.exe when it is on PATH
   no-pwsh           PATH without any pwsh.exe: expects powershell.exe
   restricted-51     the same, with the process execution policy Restricted: the
-                    first prompt must appear with no warning from this app and
+                    screen must settle with no warning from this app and
                     the injected shell integration must be on the command line (the
                     host's own PSReadLine and profile.ps1 errors are expected there)
   safe-mode         --safe-mode: expects cmd.exe whatever else is installed
 Per case the results hold the shell's image name, whether the integration
-payload is on its command line (a boolean; the command line itself is never
-written), the time from launch until its screen stops changing (the first prompt), and the text of
-that shell's own screen, read through its console (the screen of a terminal
-this script started, never a user's).
+payload was supplied on its command line (a boolean; the command line itself is
+never written), the time from launch until its screen stops changing, and the
+text of that shell's own screen, read through its console (the screen of a
+terminal this script started, never a user's). This is a smoke check: a screen
+that settles proves the shell started and went quiet, not that the integration
+hook ran. That the injected payload loads, under Restricted included, is
+test/windows/powershell-shell-integration.ps1's job; no key is typed here, so no
+shell history is written.
 
 Every file the app reads or writes is one this script creates beside a portable
 copy (`noctty.portable`), with LOCALAPPDATA and APPDATA redirected into the run
@@ -345,19 +349,19 @@ try {
     $r = Launch-Case 'default' $exe @() @{}
     Check 'default' "the first tab runs $(if($pwshOnPath){'pwsh.exe, which is on PATH'}else{'powershell.exe, as pwsh.exe is not on PATH'})" ($r.Shell -eq $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'})) $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'}) $r.Shell
     Check 'default' 'the shell integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
-    Check 'default' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
+    Check 'default' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
     Check 'default' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'default' 'no warning from this app on the screen' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
 
     $r = Launch-Case 'no-pwsh' $exe @() @{ PATH = $withoutPwsh }
     Check 'no-pwsh' 'without pwsh.exe on PATH the first tab runs Windows PowerShell' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
     Check 'no-pwsh' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
-    Check 'no-pwsh' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
+    Check 'no-pwsh' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
 
     $r = Launch-Case 'restricted-51' $exe @() @{ PATH = $withoutPwsh; PSExecutionPolicyPreference = 'Restricted' }
     Check 'restricted-51' 'Windows PowerShell 5.1 starts under the Restricted policy' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
     Check 'restricted-51' 'the integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
-    Check 'restricted-51' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
+    Check 'restricted-51' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
     Check 'restricted-51' 'every row above the prompt is the host or the user profile under Restricted' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'restricted-51' 'no warning from this app on the screen (the host and profile lines below it are Restricted behaviour in any terminal)' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
 
@@ -365,11 +369,11 @@ try {
     Check 'safe-mode' 'safe mode starts cmd.exe although PowerShell is installed' ($r.Shell -eq 'cmd.exe') 'cmd.exe' $r.Shell
     Check 'safe-mode' 'with /D, which skips the AutoRun command' ($r.NoAutoRun -eq $true) $true $r.NoAutoRun
     Check 'safe-mode' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
-    Check 'safe-mode' 'the screen settles (its last row is the prompt)' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
+    Check 'safe-mode' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
 } catch {
     $script:checks.Add(@{Name='Harness execution'; Passed=$false; Error=$_.Exception.Message})
 } finally {
-    @{ PwshOnPath=$pwshOnPath; Checks=$script:checks; Launches=$script:launches; Limit='One window, one tab per launch; no input; the prompt time is from launch to the first prompt row on the shell screen, polled every 250 ms, on a debug-free ReleaseFast build.' } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'default-shell-results.json')
+    @{ PwshOnPath=$pwshOnPath; Checks=$script:checks; Launches=$script:launches; Limit='One window, one tab per launch; no input; the settle time is from launch until the shell screen stops changing for 750 ms, polled every 250 ms; a settled screen is not proof that the integration hook ran.' } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'default-shell-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
 if($failed.Count -or $script:checks.Count -eq 0){exit 1}

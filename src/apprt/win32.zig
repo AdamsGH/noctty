@@ -3015,9 +3015,10 @@ pub const App = struct {
             .config = if (safe_mode) config: {
                 var config = try configpkg.Config.default(core_app.alloc);
                 errdefer config.deinit();
-                try config.finalize();
-                // Recovery runs the shell that reads no startup files of its own.
+                // Recovery runs `cmd /D`, which loads no profile and skips AutoRun,
+                // and so needs no PATH search.
                 try config.useWindowsRecoveryCommand();
+                try config.finalize();
                 break :config config;
             } else try configpkg.Config.load(core_app.alloc),
             .is_elevated = is_elevated,

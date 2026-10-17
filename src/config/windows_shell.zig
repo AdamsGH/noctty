@@ -90,9 +90,10 @@ pub const ProfileDiscovery = struct {
 /// when launching a session would still fail; a distribution is picked from
 /// the profile picker or by `command = wsl.exe`.
 ///
-/// Nothing is launched and no network or device path is opened, so this is
-/// safe on the UI thread while the configuration loads. A direct command
-/// skips the `cmd.exe /C` trampoline.
+/// Nothing is launched, and `PATH` entries that are network or device paths,
+/// or folder links to one, are never searched, so this is safe on the UI thread
+/// while the configuration loads. A direct command skips the `cmd.exe /C`
+/// trampoline.
 pub fn defaultCommand(alloc: Allocator) !Command {
     return try defaultCommandWithHost(alloc, DefaultShellHost);
 }
@@ -377,6 +378,7 @@ fn searchPath(
             (dir[2] != '\\' and dir[2] != '/')) continue;
         if (internal_os.windows.driveTypeForLetter(dir[0]) == internal_os.windows.DRIVE_REMOTE)
             continue;
+        if (!isLocalSearchDirectory(dir)) continue;
         var extensions = std.mem.splitScalar(u8, if (extension.len > 0) "" else pathext orelse ".COM;.EXE;.BAT;.CMD", ';');
         while (extensions.next()) |raw_ext| {
             const ext = std.mem.trim(u8, raw_ext, " \t");
@@ -456,6 +458,82 @@ fn isLaunchableFile(path: []const u8) bool {
     return appExecLinkTargetExists(path);
 }
 
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa0000003;
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000000c;
+
+/// The reparse data of the open reparse point `handle`, as the slice of `buf`
+/// the call filled, or null.
+fn readReparseData(handle: windows.HANDLE, buf: []align(4) u8) ?[]const u8 {
+    var returned: windows.DWORD = 0;
+    if (internal_os.windows.DeviceIoControl(
+        handle,
+        windows.FSCTL_GET_REPARSE_POINT,
+        null,
+        0,
+        buf.ptr,
+        @intCast(buf.len),
+        &returned,
+        null,
+    ) == 0) return null;
+    return buf[0..@min(returned, buf.len)];
+}
+
+/// Whether the folder `dir`, an absolute local-drive `PATH` entry, can be
+/// searched without leaving this machine's disks. A plain folder can. A folder
+/// that is itself a link is read, not followed: a junction names a local volume
+/// by construction, a symbolic link must name a local drive path or stay on its
+/// own volume, and every other reparse point (a cloud placeholder, whose files
+/// can be fetched over the network on first touch) is refused. A link higher up
+/// in `dir`'s path is not detected.
+fn isLocalSearchDirectory(dir: []const u8) bool {
+    const attributes = pathAttributes(dir) orelse return false;
+    if (attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0) return true;
+    const dir_w = windows.sliceToPrefixedFileW(null, dir) catch return false;
+    const handle = windows.kernel32.CreateFileW(
+        dir_w.span().ptr,
+        windows.FILE_READ_ATTRIBUTES,
+        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        null,
+        windows.OPEN_EXISTING,
+        windows.FILE_FLAG_OPEN_REPARSE_POINT | windows.FILE_FLAG_BACKUP_SEMANTICS,
+        null,
+    );
+    if (handle == windows.INVALID_HANDLE_VALUE) return false;
+    defer windows.CloseHandle(handle);
+    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
+    const record = readReparseData(handle, &data) orelse return false;
+    return reparseDirectoryIsLocal(record);
+}
+
+/// `isLocalSearchDirectory` for the reparse data `record` of a folder.
+fn reparseDirectoryIsLocal(record: []const u8) bool {
+    if (record.len < 8) return false;
+    const tag = std.mem.readInt(u32, record[0..4], .little);
+    // A junction can only point at a local volume.
+    if (tag == IO_REPARSE_TAG_MOUNT_POINT) return true;
+    if (tag != IO_REPARSE_TAG_SYMLINK or record.len < 20) return false;
+    const offset = 20 + @as(usize, std.mem.readInt(u16, record[8..10], .little));
+    const length = @as(usize, std.mem.readInt(u16, record[10..12], .little));
+    if (length % 2 != 0 or offset + length > record.len) return false;
+    const relative = std.mem.readInt(u32, record[16..20], .little) & 1 != 0; // SYMLINK_FLAG_RELATIVE
+    var name: [260]u8 = undefined;
+    var chars: usize = 0;
+    for (0..length / 2) |i| {
+        const unit = std.mem.readInt(u16, record[offset + 2 * i ..][0..2], .little);
+        // Local-drive syntax is ASCII; a name that is not is not one.
+        if (unit == 0 or unit > 0x7f or chars == name.len) return false;
+        name[chars] = @intCast(unit);
+        chars += 1;
+    }
+    var target: []const u8 = name[0..chars];
+    // A relative link cannot change volume unless it names a drive or a root.
+    if (relative) return target.len > 0 and target[0] != '\\' and target[0] != '/' and
+        std.mem.indexOfScalar(u8, target, ':') == null;
+    if (std.mem.startsWith(u8, target, "\\??\\")) target = target[4..];
+    return isDriveAbsolutePath(target) and !internal_os.path.isNetworkOrDevicePath(target) and
+        internal_os.windows.driveTypeForLetter(target[0]) != internal_os.windows.DRIVE_REMOTE;
+}
+
 const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000001b;
 
 /// Whether the alias at `path` points at a file that exists. Reads the alias's
@@ -475,9 +553,9 @@ fn appExecLinkTargetExists(path: []const u8) bool {
     if (handle == windows.INVALID_HANDLE_VALUE) return false;
     defer windows.CloseHandle(handle);
     var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
-    windows.DeviceIoControl(handle, windows.FSCTL_GET_REPARSE_POINT, null, &data) catch return false;
+    const record = readReparseData(handle, &data) orelse return false;
     var target_w: [1024]u16 = undefined;
-    const target_len = appExecLinkTarget(&data, &target_w) orelse return false;
+    const target_len = appExecLinkTarget(record, &target_w) orelse return false;
     var target_buf: [3 * target_w.len]u8 = undefined;
     const target_end = std.unicode.utf16LeToUtf8(&target_buf, target_w[0..target_len]) catch return false;
     const target = target_buf[0..target_end];
@@ -1444,6 +1522,13 @@ fn directCommand(alloc: Allocator, argv: []const []const u8) !Command {
 fn lookupExecutable(alloc: Allocator, exe: []const u8) !?[]u8 {
     if (builtin.os.tag != .windows or std.mem.indexOfAny(u8, exe, "\\/:") != null)
         return try internal_os.path.expand(alloc, exe);
+    // The built-in shells live in the system directory, where `defaultCommand`
+    // takes them from, so the picker lists exactly the executable a new tab runs.
+    if (std.ascii.eqlIgnoreCase(exe, "cmd.exe")) {
+        if (try DefaultShellHost.systemShell(alloc, "cmd.exe")) |path| return path;
+    } else if (std.ascii.eqlIgnoreCase(exe, "powershell.exe")) {
+        if (try DefaultShellHost.systemShell(alloc, windows_powershell_relative)) |path| return path;
+    }
     const path = std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -2111,6 +2196,8 @@ test "appExecLinkTarget reads the third string and rejects a cut, foreign or odd
     version[8] = 2;
     try std.testing.expect(appExecLinkTarget(version, &out) == null);
     try std.testing.expect(appExecLinkTarget(record[0 .. record.len - 40], &out) == null);
+    // Even the last terminator missing: only what the call returned counts.
+    try std.testing.expect(appExecLinkTarget(record[0 .. record.len - 2], &out) == null);
     try std.testing.expect(appExecLinkTarget(record[0..8], &out) == null);
     var tiny: [4]u16 = undefined;
     try std.testing.expect(appExecLinkTarget(record, &tiny) == null);
@@ -2131,6 +2218,68 @@ test "appExecLinkTarget reads the third string and rejects a cut, foreign or odd
     var zeroed = [_]u8{0} ** 512;
     @memcpy(zeroed[0..40], record[0..40]);
     try std.testing.expect(appExecLinkTarget(&zeroed, &out) == null);
+}
+
+/// Reparse data of a symbolic link whose substitute name is `name`.
+fn symlinkRecord(alloc: Allocator, flags: u32, name: []const u8) ![]u8 {
+    const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, name);
+    defer alloc.free(wide);
+    var record: std.ArrayList(u8) = .empty;
+    errdefer record.deinit(alloc);
+    const bytes: u16 = @intCast(wide.len * 2);
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, IO_REPARSE_TAG_SYMLINK)));
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 12 + bytes)));
+    try record.appendSlice(alloc, &.{ 0, 0 });
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 0))); // substitute offset
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, bytes)));
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 0))); // print offset
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 0)));
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, flags)));
+    try record.appendSlice(alloc, std.mem.sliceAsBytes(wide));
+    return try record.toOwnedSlice(alloc);
+}
+
+test "a PATH folder that is a link counts only when it stays on local disks" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const relative_flag = 1;
+    const cases = [_]struct { flags: u32, name: []const u8, local: bool }{
+        .{ .flags = 0, .name = "\\??\\C:\\Tools\\shells", .local = true },
+        .{ .flags = 0, .name = "\\??\\UNC\\server\\share\\shells", .local = false },
+        .{ .flags = 0, .name = "\\\\server\\share\\shells", .local = false },
+        .{ .flags = 0, .name = "\\??\\Volume{00000000-0000-0000-0000-000000000000}\\", .local = false },
+        .{ .flags = 0, .name = "\\\\?\\pipe\\x", .local = false },
+        .{ .flags = relative_flag, .name = "..\\shells", .local = true },
+        .{ .flags = relative_flag, .name = "shells", .local = true },
+        .{ .flags = relative_flag, .name = "\\shells", .local = false },
+        .{ .flags = relative_flag, .name = "D:shells", .local = false },
+        .{ .flags = relative_flag, .name = "", .local = false },
+    };
+    for (cases) |case| {
+        const record = try symlinkRecord(alloc, case.flags, case.name);
+        defer alloc.free(record);
+        try std.testing.expectEqual(case.local, reparseDirectoryIsLocal(record));
+        // Cut anywhere short of its name, it is refused rather than guessed at.
+        if (case.name.len > 0) try std.testing.expect(!reparseDirectoryIsLocal(record[0 .. record.len - 2]));
+    }
+
+    // A junction can only name a local volume; any other kind of reparse
+    // point (a cloud placeholder here) is refused.
+    var junction = [_]u8{ 0x03, 0x00, 0x00, 0xa0, 8, 0, 0, 0 };
+    try std.testing.expect(reparseDirectoryIsLocal(&junction));
+    var cloud = [_]u8{ 0x1a, 0x00, 0x00, 0x90, 8, 0, 0, 0 };
+    try std.testing.expect(!reparseDirectoryIsLocal(&cloud));
+    try std.testing.expect(!reparseDirectoryIsLocal(junction[0..4]));
+
+    // A real folder passes, a missing one does not (nothing to search).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    try std.testing.expect(isLocalSearchDirectory(root));
+    const missing = try std.fmt.allocPrint(alloc, "{s}\\absent", .{root});
+    defer alloc.free(missing);
+    try std.testing.expect(!isLocalSearchDirectory(missing));
 }
 
 test "pwsh search skips what cannot start and keeps going down PATH" {

@@ -59,6 +59,19 @@ pub const FOLDERID_LocalAppData = windows.FOLDERID_LocalAppData;
 
 pub extern "kernel32" fn GetACP() callconv(.winapi) windows.UINT;
 pub extern "kernel32" fn GetOEMCP() callconv(.winapi) windows.UINT;
+/// std's `DeviceIoControl` wrapper drops the byte count, which a reader of
+/// variable-length output (reparse data) needs.
+pub extern "kernel32" fn DeviceIoControl(
+    hDevice: windows.HANDLE,
+    dwIoControlCode: windows.DWORD,
+    lpInBuffer: ?*const anyopaque,
+    nInBufferSize: windows.DWORD,
+    lpOutBuffer: ?*anyopaque,
+    nOutBufferSize: windows.DWORD,
+    lpBytesReturned: ?*windows.DWORD,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
 pub extern "kernel32" fn GetDriveTypeW(
     lpRootPathName: ?windows.LPCWSTR,
 ) callconv(.winapi) windows.UINT;

@@ -4992,15 +4992,16 @@ pub fn resolveWindowsDefaultCommand(self: *Config) !void {
     self._command_defaulted = true;
 }
 
-/// Replace an automatic Windows command with the one safe mode starts, so a
-/// recovery launch does not run the user's PowerShell profile or AutoRun. A command the
-/// user set stays; safe mode never reads it, because it uses the built-in
-/// config.
+/// Give a config with no `command` the one safe mode starts, so a recovery
+/// launch runs neither the user's PowerShell profile nor AutoRun. Call it before
+/// `finalize`, which then has no default to look for: safe mode searches no
+/// `PATH`. The command stays marked automatic. A command already set stays.
 pub fn useWindowsRecoveryCommand(self: *Config) !void {
-    if (!self._command_defaulted) return;
+    if (self.command != null) return;
     const cmd = try windows_shell.recoveryCommand(self._arena.?.allocator());
     log.info("default shell src=windows-recovery value={}", .{cmd});
     self.command = cmd;
+    self._command_defaulted = true;
 }
 
 /// Callback for src/cli/args.zig to allow us to handle special cases
@@ -12072,12 +12073,10 @@ test "Windows safe mode swaps only the automatic command for cmd.exe" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // The automatic command is PowerShell or cmd; recovery makes it cmd.exe,
-    // which reads no profile, and it stays marked automatic.
+    // With no command, recovery gives `cmd.exe /D` (no profile, no AutoRun),
+    // marked automatic, before `finalize` has anything to look up.
     var automatic = try Config.default(alloc);
     defer automatic.deinit();
-    try automatic.resolveWindowsDefaultCommand();
-    try testing.expect(automatic._command_defaulted);
     try automatic.useWindowsRecoveryCommand();
     try testing.expect(automatic._command_defaulted);
     try testing.expect(automatic.command.? == .direct);
@@ -12085,6 +12084,10 @@ test "Windows safe mode swaps only the automatic command for cmd.exe" {
         std.fs.path.basename(automatic.command.?.direct[0]),
         "cmd.exe",
     ));
+    try testing.expectEqualStrings("/D", automatic.command.?.direct[1]);
+    // The default lookup leaves a command that is already set alone.
+    try automatic.resolveWindowsDefaultCommand();
+    try testing.expectEqualStrings("/D", automatic.command.?.direct[1]);
 
     // A command somebody set is not replaced.
     var explicit = try Config.default(alloc);

@@ -258,15 +258,16 @@ With `command` unset, a new tab runs the first of these that can be started:
 
 WSL is never part of this order. The lookup only reads the filesystem and
 launches nothing. It skips relative `PATH` entries and any `PATH` entry that is
-a network share, a device path or a mapped network drive, so a stale share
-named in `PATH` cannot stall startup or plant a shell (a local folder that is
-itself a link to a share is not detected). The profile picker uses the same
-search, so both agree on what is installed. A `pwsh.exe` that
+a network share, a device path, a mapped network drive or a link to one, so a
+stale share named in `PATH` cannot stall startup or plant a shell (a link
+higher up in a `PATH` folder's own path is not looked at). A `pwsh.exe` that
 is a Microsoft Store App Execution Alias counts only while the file it points
 at exists; an alias left behind by an uninstalled package is passed over, and
 so is a directory or a symlink named `pwsh.exe`. Windows PowerShell and
 `cmd.exe` come from the system directory rather than `PATH`, so an earlier
-`PATH` entry cannot replace them. `noctty --safe-mode` always starts
+`PATH` entry cannot replace them. The profile picker finds `pwsh.exe` with the
+same `PATH` search and takes those two shells from the same directory, so it
+lists the executable a new tab runs. `noctty --safe-mode` always starts
 `cmd.exe /D`: recovery must work when the user's PowerShell profile is what
 broke, and Command Prompt loads no profile (`/D` also skips the `AutoRun`
 command that a registry value or Clink can hang there). The profile
