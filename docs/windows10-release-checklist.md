@@ -153,16 +153,21 @@ out of date; record it.
 
 **W10-08 Decoration toggle round trip.** From a decorated window run the palette
 action `toggle_window_decorations`, then again. Expected: the caption disappears
-and returns; position and client size stay the same within one frame width; a
-maximised window stays maximised through the toggle.
+and returns; position and client size stay the same within one frame width. Do the
+round trip from a normal window. A maximised window is a separate observation:
+the Windows 10 path rewrites the window style without `WS_MAXIMIZE`
+(`AGENTS.md`, 2026-09-24 entry, trap 4), so toggling while maximised is expected
+to leave an un-maximised window inside the maximised rectangle. Record what you
+see; neither outcome is a pass or a fail.
 
 **W10-09 Fullscreen round trip.** Maximise, then `toggle_fullscreen`, leave
 fullscreen, then restore from maximised. Expected: the window returns to its
 normal size and place, not to the maximised rectangle (the 2026-10-06 fullscreen
 entry in `AGENTS.md` describes the Windows 11 failure this guards).
 
-**W10-10 Quick terminal.** Set `quick-terminal-position = top` and invoke the
-quick terminal with its global hotkey. Expected: frameless on both Windows
+**W10-10 Quick terminal.** There is no default key for it. Put `quick-terminal-position
+= top` and `keybind = global:ctrl+alt+q=toggle_quick_terminal` in the config, reload
+with `Ctrl+Shift+,`, and press `Ctrl+Alt+Q`. Expected: frameless on both Windows
 versions, flush with the top edge, full width, no gap and no shadow.
 
 ### Theme and DWM
@@ -227,13 +232,18 @@ script whose box remains and the fonts that Windows 10 lacks.
 
 ### ConPTY and shells
 
-**W10-19 ConPTY source (Core).** Run `noctty +version`. Expected: `ConPTY :
+**W10-19 ConPTY source (Core).** (a) Run `noctty +version`. Expected: `ConPTY :
 bundled (<path>)`. Open `cmd`, run `cls` and `dir`, then start a full-screen
-program (for example `more` on a long file). Close, set `NOCTTY_CONPTY=inbox`
-and start again: expected a banner saying the in-box console host is in use, and a
-working shell. [windows.md](windows.md#keyboard) says the in-box conhost of build
-19045 was not measured for key encoding; record anything that looks wrong in the
-in-box path as such.
+program (for example `more` on a long file). (b) Set `NOCTTY_CONPTY=inbox` in the
+environment and run `noctty +version` and a new instance. Expected: `+version` reads
+`ConPTY : inbox (NOCTTY_CONPTY=inbox is set)`, `err.txt` holds the warning
+`NOCTTY_CONPTY=inbox is set; using the in-box conhost`, there is no banner (a forced
+choice is the user's own, `pty.zig`), and the shell works. (c) Without the variable,
+copy the folder, delete `conpty.dll` from the copy and start it. Expected: a banner
+that begins "Using Windows' in-box console host because conpty.dll is not next to
+noctty.exe", and a working shell. [windows.md](windows.md#keyboard) says the in-box
+conhost of build 19045 was not measured for key encoding; record anything that looks
+wrong in the in-box path as such.
 
 **W10-20 Alt chords do not beep.** In the shell press `Alt+F`, `Alt+B`, `Alt+Left`.
 Expected: the terminal gets the chords and Windows plays no sound (#250, #252,
@@ -257,13 +267,16 @@ and `jump_to_prompt` finds the previous prompt (OSC 133).
 [Default terminal](windows.md#default-terminal): it refuses when `DelegationConsole`
 is missing, empty or the inbox console host, printing "Cannot register noctty as the
 default terminal: HKCU\Console\%%Startup\DelegationConsole is missing or selects
-the inbox console host", and writes nothing. Check that key is unchanged. (b) Install Windows Terminal 1.24 or newer,
-confirm Settings > Startup shows "Default terminal application", run
-`noctty +register-default-terminal`, then start `cmd.exe` from the Run dialog.
-Expected: a visible noctty window adopts the console (a separate `-Embedding`
-process, see [Default terminal](windows.md#default-terminal)). (c) Run
-`noctty +unregister-default-terminal` and start `cmd.exe` again. Expected: the
-previous default is back. Revert to the snapshot afterwards.
+the inbox console host", and writes nothing. Check that key is unchanged. (b) Install Windows Terminal 1.24 or newer, open its
+Settings > Startup and choose "Windows Terminal" as the default terminal application
+(installing it does not select it; registration needs that selection for the console
+half). Note `DelegationConsole` and `DelegationTerminal` under that key. Run
+`noctty +register-default-terminal`. Expected: it succeeds. Start `cmd.exe` from the
+Run dialog. Expected: a visible noctty window adopts the console (a separate
+`-Embedding` process, see [Default terminal](windows.md#default-terminal)). (c) Run
+`noctty +unregister-default-terminal` and start `cmd.exe` again. Expected: the two
+values are back to what (b) recorded, and the console opens in Windows Terminal.
+Revert to the snapshot afterwards.
 
 **W10-23 Toasts (installed).** Install with the installer so the Start Menu shortcut
 carries the AppUserModelID. Set `notify-on-command-finish = always`, run `Start-Sleep
