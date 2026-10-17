@@ -89,6 +89,29 @@ finally {
     $env:GITHUB_OUTPUT = $null
     if (Test-Path -LiteralPath $outputFile) { Remove-Item -LiteralPath $outputFile }
 }
+# The pull-request path with a real revision pair, the job summary on. The first
+# hosted run of this filter failed open here (an empty summary line was rejected
+# by a mandatory parameter) and only a warning in the log said so.
+$revisions = @(& git -C $repoRoot rev-list -n 2 HEAD)
+if ($revisions.Count -eq 2) {
+    $summaryFile = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-ci-summary-$([guid]::NewGuid().ToString('N')).md")
+    $outputFile = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-ci-output-$([guid]::NewGuid().ToString('N')).txt")
+    try {
+        $env:GITHUB_STEP_SUMMARY = $summaryFile
+        $env:GITHUB_OUTPUT = $outputFile
+        $warnings = & (Join-Path $repoRoot 'scripts\ci-changed-paths.ps1') -EventName pull_request -BaseSha $revisions[1] -HeadSha $revisions[0] 3>&1 6>$null | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+        Assert-True (@($warnings).Count -eq 0) "The real diff path must not fail open: $(@($warnings) -join '; ')"
+        $summary = [System.IO.File]::ReadAllText($summaryFile)
+        Assert-True ($summary -match '### Changed paths' -and $summary -match 'Compiled jobs: zig=') 'The job summary must be written.'
+        Assert-True ((@(Get-Content -LiteralPath $outputFile)).Count -eq 10) 'The real diff path must write all ten flags.'
+        Assert-True ([System.IO.File]::ReadAllBytes($outputFile)[0] -ne 0xEF) 'GITHUB_OUTPUT must not start with a byte-order mark.'
+    }
+    finally {
+        $env:GITHUB_STEP_SUMMARY = $null
+        $env:GITHUB_OUTPUT = $null
+        Remove-Item -LiteralPath $summaryFile, $outputFile -ErrorAction Ignore
+    }
+}
 # Actions ends a `shell: pwsh` step with `exit $LASTEXITCODE` when that variable
 # exists, so a git failure the script handled (it fails open) must not leave a
 # nonzero code behind. Reproduce the step's tail in a child process.

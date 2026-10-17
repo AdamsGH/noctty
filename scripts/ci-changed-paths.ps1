@@ -160,7 +160,8 @@ function Get-CiChangedPaths {
 # GITHUB_OUTPUT and GITHUB_STEP_SUMMARY want UTF-8 without a byte-order mark,
 # which Windows PowerShell 5.1's `-Encoding utf8` would write.
 function Add-CiFileLine {
-    param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [string[]] $Line)
+    # AllowEmptyString: a summary has blank lines.
+    param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [AllowEmptyString()] [string[]] $Line)
     [System.IO.File]::AppendAllText($Path, (($Line -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
 }
 
