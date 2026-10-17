@@ -16143,7 +16143,7 @@ const Host = struct {
             tab.cached_button_index,
             tab.cached_button_active,
             tab.cached_button_pane_count,
-            tab.cached_button_label_max_width,
+            win32_bell.tabTextWidth(tab.cached_button_label_max_width, tab.cached_button_bell),
             tab.cached_button_show_pane_count,
         );
         if (!labels.hostLabelIsCompacted(title, budget)) {
@@ -22891,10 +22891,13 @@ const Host = struct {
             bell == self.caption_bell) return false;
         const caption = if (bell) try win32_bell.withTitleGlyph(alloc, host_base_title) else null;
         defer if (caption) |value| alloc.free(value);
-        try appendOwnedString(alloc, &self.cached_window_title, host_base_title);
-        self.caption_bell = bell;
         const title_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, caption orelse host_base_title);
         defer alloc.free(title_w);
+        // Everything that can fail has run: the caches below describe what
+        // the caption shows only once it shows it, so a failure above leaves
+        // the next sync to retry, glyph included.
+        try appendOwnedString(alloc, &self.cached_window_title, host_base_title);
+        self.caption_bell = bell;
         _ = sys.SetWindowTextW(hwnd, title_w.ptr);
         return true;
     }
@@ -22969,17 +22972,13 @@ const Host = struct {
                 // made an animated title flicker the popup: `refreshTabTooltip`.
                 if (shown == tab.id) tooltip_title_changed = !title_unchanged;
             }
-            // The glyph is part of the drawn title, so the label's budget
-            // pays for it; the cached title (tooltip, UIA name, palette) and
-            // the pane's own title stay without it.
-            const bell_title = if (bell)
-                try win32_bell.withTitleGlyph(self.app.core_app.alloc, title orelse "noctty")
-            else
-                null;
-            defer if (bell_title) |value| self.app.core_app.alloc.free(value);
-            const label = try buildTabButtonLabel(
+            // The glyph is in front of the drawn label, and its width comes out
+            // of the label's budget; the cached title (tooltip, UIA name,
+            // palette) and the pane's own title stay without it.
+            const label = try win32_bell.tabLabel(
                 self.app.core_app.alloc,
-                bell_title orelse title,
+                title,
+                bell,
                 i,
                 active,
                 pane_count,

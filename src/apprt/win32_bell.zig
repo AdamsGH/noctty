@@ -23,6 +23,7 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 const configpkg = @import("../config.zig");
 const internal_os = @import("../os/main.zig");
+const labels = @import("win32/labels.zig");
 
 const log = std.log.scoped(.win32_bell);
 
@@ -85,6 +86,44 @@ pub const uia_item_status = "Bell";
 /// `title` with the glyph in front. Caller frees.
 pub fn withTitleGlyph(alloc: Allocator, title: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, title_glyph ++ "{s}", .{title});
+}
+
+/// Display cells `title_glyph` takes in a tab label (the emoji is two wide).
+const title_glyph_cells: usize = 3;
+
+/// The label width the tab's own text (index, marker, title, pane count) may
+/// use: an alerted tab spends `title_glyph_cells` of it on the glyph. One
+/// definition for `tabLabel` and the tooltip gate, which asks whether the
+/// title had to be compacted to this budget.
+pub fn tabTextWidth(max_width: usize, bell: bool) usize {
+    return if (bell) max_width -| title_glyph_cells else max_width;
+}
+
+/// The drawn tab label: `labels.buildTabButtonLabel`'s, with the glyph in
+/// front of it for an alerted tab. The glyph sits outside the text that is
+/// compacted, so a narrow tab shortens its title and never loses the glyph.
+pub fn tabLabel(
+    alloc: Allocator,
+    base_title: ?[]const u8,
+    bell: bool,
+    index: usize,
+    active: bool,
+    pane_count: usize,
+    max_width: usize,
+    show_pane_count: bool,
+) ![]u8 {
+    const text = try labels.buildTabButtonLabel(
+        alloc,
+        base_title,
+        index,
+        active,
+        pane_count,
+        tabTextWidth(max_width, bell),
+        show_pane_count,
+    );
+    if (!bell) return text;
+    defer alloc.free(text);
+    return withTitleGlyph(alloc, text);
 }
 
 /// MCI volume for `bell-audio-volume`: 0 to 1000. A volume the config could
@@ -365,6 +404,28 @@ test "win32 bell title glyph goes in front and leaves the title alone" {
     const empty = try withTitleGlyph(testing.allocator, "");
     defer testing.allocator.free(empty);
     try testing.expectEqualStrings("\u{1F514} ", empty);
+}
+
+test "win32 bell tab label keeps the glyph on a narrow tab" {
+    const glyph = title_glyph;
+    // Plenty of room: the title keeps all but the glyph's three cells.
+    const wide = try tabLabel(testing.allocator, "beta", true, 1, false, 1, 24, false);
+    defer testing.allocator.free(wide);
+    try testing.expectEqualStrings(glyph ++ "2: beta", wide);
+    // The same tab without a bell is the plain label.
+    const plain = try tabLabel(testing.allocator, "beta", false, 1, false, 1, 24, false);
+    defer testing.allocator.free(plain);
+    try testing.expectEqualStrings("2: beta", plain);
+    // Narrow: the active tab 10 leaves four cells for its title. The title is
+    // compacted, the glyph is not.
+    const narrow = try tabLabel(testing.allocator, "beta gamma", true, 9, true, 1, 10, false);
+    defer testing.allocator.free(narrow);
+    try testing.expect(std.mem.startsWith(u8, narrow, glyph));
+    try testing.expect(std.mem.indexOf(u8, narrow, "10: ") != null);
+    // The tooltip gate's budget is the label's.
+    try testing.expectEqual(@as(usize, 7), tabTextWidth(10, true));
+    try testing.expectEqual(@as(usize, 10), tabTextWidth(10, false));
+    try testing.expectEqual(@as(usize, 0), tabTextWidth(2, true));
 }
 
 test "win32 bell volume maps 0.0..1.0 onto MCI's 0..1000" {
