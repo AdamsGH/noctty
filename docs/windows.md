@@ -35,10 +35,12 @@ the staged executable's version string and numeric fields to match `-Version`.
 
 ## D3D11 renderer beta
 
-OpenGL remains the default. The x64 and ARM64 release builds include both
-renderers; `noctty +version` prints a `D3D11 beta` line that reads `available`
-(or `omitted` in a build made with `-Dd3d11=false`). To opt in, add this to your
-config and open a new window, tab, or split:
+OpenGL remains the default, and noctty switches to this renderer on its own
+when OpenGL cannot start or cannot build its renderer (see
+[Starting without OpenGL](#starting-without-opengl)). The x64 and ARM64 release
+builds include both renderers; `noctty +version` prints a `D3D11 beta` line
+that reads `available` (or `omitted` in a build made with `-Dd3d11=false`). To
+opt in, add this to your config and open a new window, tab, or split:
 
 ```ini
 renderer = d3d11
@@ -116,19 +118,38 @@ An automated readback alone is not a passing visible-desktop check.
 
 ### Starting without OpenGL
 
-When OpenGL cannot start, the startup dialog names `renderer = d3d11` and
-`renderer = d3d11-warp` and the config file to put the line in:
-`%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside
-`noctty.exe` in portable mode (the dialog shows that default; a launch with
-`--config-file` reads that file instead). noctty does not switch to Direct3D 11
-on its own; the line is your choice. A build without the beta keeps the old
-wording.
+When OpenGL cannot start for a terminal (no OpenGL driver, only the
+`GDI Generic` OpenGL 1.1 that Windows falls back to, a version below 4.3, or a
+pixel format or context that WGL refuses), noctty draws that terminal with the
+[D3D11 renderer beta](#d3d11-renderer-beta) instead: hardware Direct3D 11
+first, then Microsoft's WARP software renderer. A banner says that OpenGL could
+not start, that custom shaders and images are not available, and that the
+`renderer` setting chooses the renderer. Later windows, tabs and splits in
+that noctty process start on Direct3D 11 without trying OpenGL and without the
+banner. The cached decision applies to new terminals. A config reload retries
+OpenGL for configured custom shaders, background images or retained Kitty images;
+device-failure recovery also keeps its throttled OpenGL retries. This happens
+whether `renderer` is unset or set to
+`opengl`, and in safe mode, which uses the built-in defaults. WARP can use a
+lot of CPU under heavy output. If OpenGL starts but noctty cannot build its
+renderer on it (for example, a `background-image` that does not decode), that
+terminal is also drawn by Direct3D 11, with a notice naming the error, and the
+next one tries OpenGL again.
+
+To skip the OpenGL attempt on such a machine, set `renderer = d3d11` (or
+`renderer = d3d11-warp` for WARP alone) in `%LOCALAPPDATA%\noctty\config.ghostty`,
+or in the `config.ghostty` beside `noctty.exe` in portable mode.
+
+Only when Direct3D 11 cannot start either does noctty stop at the startup
+dialog, which reports the OpenGL failure and the Direct3D 11 error. A build
+made with `-Dd3d11=false` has no fallback; its dialog says so. Earlier
+releases stopped at the dialog without trying Direct3D 11.
 
 A launch that ends at that dialog is not counted toward safe mode (see
 [Session restore and recovery](#session-restore-and-recovery)), because safe
-mode uses the built-in defaults, ignores `renderer`, and would fail the same
-way. So any number of failed OpenGL starts leaves the next launch normal and
-reading your config.
+mode tries the same renderers and would fail the same way. So any number of
+failed starts leaves the next launch normal and reading your config. A launch
+that switched to Direct3D 11 is a normal launch.
 
 Releases up to 1.3.132 counted those launches: after three within seven days
 they started in safe mode, which failed the same way and counted again. If
@@ -1077,8 +1098,8 @@ Three consecutive pre-ready startup failures select an ephemeral safe mode:
 built-in config, no session restore. `noctty --safe-mode` picks it for one
 launch. Safe mode never overwrites your config or quarantined state. A launch
 that ends at the OpenGL startup dialog is recorded but not counted, and does
-not end a run of other failures either: safe mode starts the same OpenGL
-renderer, so it could not help (see
+not end a run of other failures either: safe mode tries the same renderers,
+so it could not help (see
 [Starting without OpenGL](#starting-without-opengl)). A crash, in OpenGL,
 Direct3D 11 or anywhere else, still counts.
 
@@ -1652,24 +1673,25 @@ and the
 
 ### GPU floor and OpenGL driver issues
 
-The default OpenGL backend needs OpenGL 4.3 or newer through WGL and does not
-automatically switch to another renderer when the active implementation is
-below that floor. The opt-in D3D11 beta can draw supported text with feature
-level 11.0 hardware or WARP, without OpenGL. Full rendering of unsupported
-images and effects requires a working OpenGL fallback; otherwise healthy D3D11
-continues drawing text with those features degraded. The OpenGL floor is a
+The default OpenGL backend needs OpenGL 4.3 or newer through WGL. Below that
+floor, or when WGL fails, noctty switches to the D3D11 beta, which draws text
+with feature level 11.0 hardware or WARP, without OpenGL (see
+[Starting without OpenGL](#starting-without-opengl)). Custom shaders,
+background images and Kitty images still need a working OpenGL 4.3 driver;
+without one they are not drawn. The OpenGL floor is a
 common issue in RDP sessions that fall
 back to software GL (often `GDI Generic` at OpenGL 1.1), VMs without 3D
 acceleration or a guest GPU driver, and older integrated GPUs whose driver
 stops before 4.3.
 
-With the OpenGL backend below the floor, noctty stops before showing its window and the startup
+If Direct3D 11 cannot start either, noctty stops before showing its window and the startup
 dialog lists the required and detected OpenGL versions plus the renderer and
 vendor strings the driver reports. The dialog also prints an `Architecture:`
 line naming the process and native machine, so a bug report separates a
 native ARM64 build from an x64 build running under emulation. Failures later
 in OpenGL initialization use the same dialog to name the failed step and any
-Win32 or Zig error. On x64, try in order:
+Win32 or Zig error, and the Direct3D 11 error. To get OpenGL back (for
+custom shaders and images, or after that dialog), on x64 try in order:
 
 1. End the Remote Desktop session and launch noctty locally.
 2. In a VM, enable 3D acceleration and install the guest graphics driver.
@@ -1677,10 +1699,9 @@ Win32 or Zig error. On x64, try in order:
    AMD+NVIDIA hybrid system, the AMD driver first, then NVIDIA.
 4. On a hybrid-GPU system, force `noctty.exe` to the discrete or integrated
    GPU in Windows Graphics settings.
-5. If OpenGL 4.3 is not available at all, set `renderer = d3d11` (or
-   `renderer = d3d11-warp`) in your config file. The
-   [D3D11 renderer beta](#d3d11-renderer-beta) draws text without OpenGL, and
-   the startup dialog names the config file; see
+5. If OpenGL 4.3 is not available at all, noctty already draws text with the
+   [D3D11 renderer beta](#d3d11-renderer-beta); set `renderer = d3d11` (or
+   `renderer = d3d11-warp`) to start with it and skip the OpenGL attempt. See
    [Starting without OpenGL](#starting-without-opengl).
 
 Steps 3 and 4 do not apply on an ARM64 PC whose GPU vendor ships no desktop
@@ -1709,9 +1730,9 @@ software fallback Windows uses when no ICD is present, not a driver that
 stopped short of 4.3.
 
 Install the free **OpenCL, OpenGL, and Vulkan Compatibility Pack** from the
-Microsoft Store, then restart noctty. (The opt-in
-[D3D11 renderer beta](#d3d11-renderer-beta) is an alternative that does not
-need the pack; see the end of this section.) The pack installs Microsoft's
+Microsoft Store, then restart noctty. (Without the pack, noctty draws text
+with the [D3D11 renderer beta](#d3d11-renderer-beta) on its own; see the end
+of this section.) The pack installs Microsoft's
 GLon12 mapping layer, which implements desktop OpenGL on top of Direct3D 12 and
 supplies the ICD that is otherwise missing. Microsoft's own support statement
 for the pack promises OpenGL 3.3, below noctty's floor, but a measured report
@@ -1733,10 +1754,11 @@ OpenGL driver, the Compatibility Pack is required for noctty's default OpenGL
 With the pack, OpenGL comes from a Microsoft mapping layer rather than a GPU
 vendor's driver, but noctty neither knows nor cares which supplied it.
 
-The alternative, without the pack, is the opt-in D3D11 renderer (beta), which
-the ARM64 release build includes. Add `renderer = d3d11` to the config file
-(hardware Direct3D 11, then Microsoft's WARP software renderer) or
-`renderer = d3d11-warp` (WARP only), and start noctty again. The config file is
+Without the pack, noctty switches to the D3D11 renderer (beta), which the
+ARM64 release build includes, when OpenGL cannot start, and says so in a
+banner. To start with it and skip the OpenGL attempt, add `renderer = d3d11`
+to the config file (hardware Direct3D 11, then Microsoft's WARP software
+renderer) or `renderer = d3d11-warp` (WARP only). The config file is
 `%LOCALAPPDATA%\noctty\config.ghostty`, or the `config.ghostty` beside
 `noctty.exe` in portable mode. With either setting, and no custom shader or
 background image configured, noctty creates no OpenGL context for a new
@@ -1753,10 +1775,10 @@ starts interact with safe mode.
 There is no AMD or NVIDIA driver to reinstall on ARM64 and no second GPU to
 select in Windows Graphics settings, so noctty's startup dialog leads with
 the Compatibility Pack when it detects an ARM64 native machine, and keeps the
-Remote Desktop and VM guidance, which applies on any architecture. It also
-names `renderer = d3d11` and the config file; the 1.3.132 dialog predates
-that and says the build has no software, DirectX, or ANGLE fallback renderer,
-which is out of date for builds that include the beta. The dialog and `noctty +version`
+Remote Desktop and VM guidance, which applies on any architecture. That dialog
+now appears only when Direct3D 11 could not start either; the 1.3.132 dialog
+says the build has no software, DirectX, or ANGLE fallback renderer, which is
+out of date for builds that include the beta. The dialog and `noctty +version`
 both report the architecture: `ARM64` for a native build, or
 `x64 (running on ARM64)` if you installed the x64 build by mistake. Prefer the
 ARM64 artifacts on a Snapdragon PC.

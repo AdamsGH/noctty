@@ -23,9 +23,9 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
   x64 and ARM64. ConPTY is a static import, so earlier builds fail to load
   rather than degrade. The default OpenGL renderer on a Snapdragon PC
   additionally needs the Microsoft Store "OpenCL, OpenGL, and Vulkan
-  Compatibility Pack", because Qualcomm ships no desktop OpenGL driver; the
-  opt-in D3D11 renderer (beta, `renderer = d3d11`) is included in the ARM64
-  build and does not need it for text. See
+  Compatibility Pack", because Qualcomm ships no desktop OpenGL driver;
+  without it noctty falls back to the D3D11 renderer (beta), which is included
+  in the ARM64 build and does not need it for text. See
   [windows.md](windows.md#windows-on-arm-without-a-vendor-opengl-driver-needs-the-compatibility-pack).
 - Windows 10 is a supported floor, not a tested target. CI runs on Windows
   Server 2025 (`windows-2025`, `windows-latest`) and Windows 11 ARM64
@@ -219,9 +219,10 @@ Win32-validated VT protocol coverage is tracked in
 
 ### Renderer
 
-- Terminal content renders with OpenGL 4.3+ via WGL by default. An opt-in
-  Direct3D 11 beta (`renderer = d3d11`) adds hardware and WARP text rendering
-  and hands images, custom shaders and background images to OpenGL; see
+- Terminal content renders with OpenGL 4.3+ via WGL by default. A
+  Direct3D 11 beta (`renderer = d3d11`, and the automatic fallback when
+  OpenGL cannot start) adds hardware and WARP text rendering and hands images,
+  custom shaders and background images to OpenGL; see
   [D3D11 renderer beta](windows.md#d3d11-renderer-beta).
 - Window chrome is painted with GDI. The D3D11/DirectComposition +
   DirectWrite shell pipeline is not started at launch (its device graph cost
@@ -367,13 +368,12 @@ lands incrementally.
 - GitHub Issues are for reproducible bugs. For questions, feature
   discussion, and feedback, use
   [Discussions](https://github.com/amanthanvi/noctty/discussions).
-- OpenGL 4.3 through WGL is a hard floor for the default renderer, with no
-  automatic software fallback. Below it, noctty shows a startup diagnostic
-  with the detected version and does not start. The diagnostic names
-  `renderer = d3d11` and `d3d11-warp` (the opt-in D3D11 beta can use WARP, but
-  needs OpenGL 4.3 for images and shaders) and the default config file to
-  put the line in; noctty never switches renderers on its own. Releases up to 1.3.132
-  counted those launches toward safe mode, which ignores `renderer`; see
+- OpenGL 4.3 through WGL is a floor for the default renderer. Below it, or
+  when WGL fails, noctty falls back to the D3D11 beta (hardware, then WARP)
+  with a banner; custom shaders, background images and Kitty images still need
+  OpenGL 4.3. Only when D3D11 cannot start either does noctty show a startup
+  diagnostic with the detected OpenGL version and the D3D11 error, and not
+  start. Releases up to 1.3.132 counted those launches toward safe mode; see
   [windows.md](windows.md#starting-without-opengl) and
   [windows.md](windows.md#gpu-floor-and-opengl-driver-issues).
   On a Snapdragon PC that OpenGL comes from Microsoft's GLon12 mapping layer

@@ -44,10 +44,18 @@ presentation_pending_changed: std.atomic.Value(bool) = .init(false),
 /// renderer init, after the complete per-surface config is available.
 pub fn surfaceInit(surface: *apprt.Surface) !void {
     // Default WGL creation precedes core init, exactly as in GL-only builds.
-    if (surface.hglrc != null) try GL.surfaceInit(surface);
+    // A failure is kept for `init`, which then tries the Direct3D 11 beta.
+    if (surface.hglrc != null) GL.surfaceInit(surface) catch |err| {
+        surface.renderer_gl_error = err;
+    };
 }
 
 fn initGL(alloc: std.mem.Allocator, options: renderer.Options) !*GL {
+    // Reported once: a later, explicit retry (a config reload) tries again.
+    if (options.rt_surface.renderer_gl_error) |err| {
+        options.rt_surface.renderer_gl_error = null;
+        return err;
+    }
     if (comptime build_config.renderer_test_tools) {
         if (std.process.hasEnvVarConstant("NOCTTY_RENDERER_FAIL_OPENGL")) return error.OpenGLTestFailure;
     }
@@ -63,47 +71,82 @@ fn initGL(alloc: std.mem.Allocator, options: renderer.Options) !*GL {
     return value;
 }
 
+/// After a failed `initGL`: whether OpenGL itself could not start (a WGL
+/// pixel format or context, the functions, the 4.3 floor), rather than the
+/// renderer built on it (an image that does not decode, OutOfMemory). Only
+/// the first is a reason to stop trying OpenGL in this process. Read it
+/// before `releaseGL`, which clears the flag.
+fn openGLCouldNotStart(surface: *const apprt.Surface) bool {
+    return !surface.renderer_gl_prepared;
+}
+
 pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
     var config = options.config;
     errdefer config.deinit();
+    const requested = config.renderer_backend;
     const feature = selection.unsupported(config.custom_shaders.value.items.len != 0, config.bg_image != null, false);
     const base: Windows = .{ .alloc = alloc, .rt_surface = options.rt_surface, .surface_mailbox = options.surface_mailbox, .active = undefined, .thread = options.thread };
     var result = base;
-    if (config.renderer_backend == .opengl or feature != null) {
-        if (initGL(alloc, options)) |value| {
-            result.active = .{ .opengl = value };
-            result.opengl.store(value, .release);
-            if (config.renderer_backend != .opengl) if (feature) |reason| result.setNotice("OpenGL: D3D11 beta does not support {s}.", .{@tagName(reason)});
-            return result;
-        } else |err| {
-            if (config.renderer_backend == .opengl) return err;
-            result.setNotice("OpenGL failed ({s}); D3D11 will draw text without unsupported features.", .{@errorName(err)});
+    const skip_opengl = apprt.win32.openGLUnavailable();
+    var opengl_error: ?anyerror = null;
+    var opengl_unavailable = false;
+    var d3d11_error: ?anyerror = null;
+    // Each candidate covers full generic-renderer initialization. WARP
+    // remains a separate candidate for failures after device creation. The
+    // candidate that succeeds writes the notice, from what failed before it.
+    for (selection.startupOrder(requested, feature, skip_opengl)) |candidate| {
+        if (candidate == .opengl) {
+            if (initGL(alloc, options)) |value| {
+                result.active = .{ .opengl = value };
+                result.opengl.store(value, .release);
+                if (requested != .opengl) {
+                    if (feature) |reason| {
+                        result.setNotice("OpenGL: D3D11 beta does not support {s}.", .{@tagName(reason)});
+                    } else if (d3d11_error) |err| {
+                        result.setNotice("OpenGL: D3D11 startup failed ({s}).", .{@errorName(err)});
+                    }
+                }
+                return result;
+            } else |err| {
+                opengl_error = err;
+                opengl_unavailable = openGLCouldNotStart(options.rt_surface);
+                // Nothing of the failed attempt stays bound or is rebound
+                // for each frame (`Surface.redraw`).
+                options.rt_surface.releaseGL();
+                log.warn("OpenGL startup failed err={} could_not_start={}; trying the Direct3D 11 beta", .{ err, opengl_unavailable });
+                continue;
+            }
         }
-    }
-    // Each D3D candidate covers full generic-renderer initialization. WARP
-    // remains a separate candidate for failures after device creation.
-    for (selection.startupOrder(config.renderer_backend, null)) |candidate| {
-        if (candidate == .opengl) break;
         var candidate_options = options;
         candidate_options.config.renderer_backend = candidate;
         // An allocation failure is a candidate failure: OpenGL still gets its turn.
         const value = alloc.create(D3D) catch |err| {
+            d3d11_error = err;
             log.warn("{s} startup failed err={}", .{ @tagName(candidate), err });
-            result.setNotice("OpenGL: D3D11 startup failed ({s}).", .{@errorName(err)});
             continue;
         };
         if (D3D.init(alloc, candidate_options)) |initialized| {
             value.* = initialized;
-            value.config.renderer_backend = config.renderer_backend;
-            value.api.setRecoveryPreference(config.renderer_backend);
+            value.config.renderer_backend = requested;
+            value.api.setRecoveryPreference(requested);
             result.active = .{ .d3d11 = value };
             result.last_warp = value.api.stats().warp != 0;
-            if (feature != null) {
-                result.fallback_blocked = true;
-            } else if (result.last_warp) {
-                result.setNotice("D3D11 WARP (software): hardware unavailable or software requested; HRESULT 0x{x}.", .{@as(u32, @bitCast(value.api.stats().last_error))});
-            } else {
-                result.setNotice("D3D11 beta: hardware renderer active.", .{});
+            // OpenGL is not tried again for images or effects it would draw.
+            result.fallback_blocked = feature != null or opengl_error != null or skip_opengl;
+            if (opengl_unavailable) {
+                apprt.win32.markOpenGLUnavailable();
+                // Later surfaces in this process come straight here
+                // without a banner.
+                result.setNotice("{s}", .{selection.openGLFallbackNotice(result.last_warp)});
+            } else if (opengl_error) |err| {
+                // OpenGL started, but its renderer could not be built.
+                result.setNotice("OpenGL failed ({s}); D3D11 will draw text without unsupported features.", .{@errorName(err)});
+            } else if (requested != .opengl and feature == null) {
+                if (result.last_warp) {
+                    result.setNotice("D3D11 WARP (software): hardware unavailable or software requested; HRESULT 0x{x}.", .{@as(u32, @bitCast(value.api.stats().last_error))});
+                } else {
+                    result.setNotice("D3D11 beta: hardware renderer active.", .{});
+                }
             }
             // An OpenGL failure tried above is handled: neither the startup
             // dialog nor the recovery ledger may blame a later error on it.
@@ -111,14 +154,17 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
             return result;
         } else |err| {
             alloc.destroy(value);
+            d3d11_error = err;
             log.warn("{s} startup failed err={}", .{ @tagName(candidate), err });
-            result.setNotice("OpenGL: D3D11 startup failed ({s}).", .{@errorName(err)});
         }
     }
-    const value = try initGL(alloc, options);
-    result.active = .{ .opengl = value };
-    result.opengl.store(value, .release);
-    return result;
+    // The startup dialog explains an OpenGL failure ahead of any other, and
+    // says Direct3D 11 failed too.
+    if (opengl_error) |err| {
+        if (d3d11_error) |d3d11_err| apprt.win32.recordDirect3D11StartupError(d3d11_err);
+        return err;
+    }
+    return d3d11_error orelse error.OpenGLUnavailable;
 }
 
 fn setNotice(self: *Windows, comptime fmt: []const u8, args: anytype) void {
@@ -148,7 +194,13 @@ fn fallBack(self: *Windows) !void {
         .d3d11 => |v| v,
     };
     try old.api.suspendPresentation();
-    const replacement = try initGL(self.alloc, .{ .config = old.config, .font_grid = old.font_grid, .size = old.size, .surface_mailbox = old.surface_mailbox, .rt_surface = self.rt_surface, .thread = self.thread });
+    const replacement = initGL(self.alloc, .{ .config = old.config, .font_grid = old.font_grid, .size = old.size, .surface_mailbox = old.surface_mailbox, .rt_surface = self.rt_surface, .thread = self.thread }) catch |err| {
+        // Where OpenGL could not start, later surfaces in this process start
+        // without it. Nothing of the attempt is bound for later frames.
+        if (openGLCouldNotStart(self.rt_surface)) apprt.win32.markOpenGLUnavailable();
+        self.rt_surface.releaseGL();
+        return err;
+    };
     old.transferCpuState(replacement);
     old.deinitAfterBackendSwitch();
     self.alloc.destroy(old);

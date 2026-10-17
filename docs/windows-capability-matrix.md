@@ -308,11 +308,12 @@ transparent DPI-sized D2D surfaces, DirectWrite host banner text) exists in
 the source but is not started: `App.init` gives its backend no driver, so
 chrome text is drawn with GDI. That pipeline
 does not replace or call the terminal renderer. The default terminal renderer
-has a hard OpenGL 4.3-via-WGL floor and no software fallback; below it, noctty
-shows a startup diagnostic naming the detected version and does not launch. The
-opt-in `renderer = d3d11` beta (feature level 11.0, with Microsoft's WARP
-software renderer as its own fallback) is a separate terminal path that does
-not lift that floor for images, custom shaders or background images: those
+has an OpenGL 4.3-via-WGL floor; below it, noctty falls back to the
+`renderer = d3d11` beta (feature level 11.0, with Microsoft's WARP software
+renderer as its own fallback) with a banner, and shows a startup diagnostic
+and does not launch only when that fails too. The D3D11 beta is a separate
+terminal path that does not lift the floor for images, custom shaders or
+background images: those
 switch the surface to OpenGL, and without a working OpenGL 4.3 driver a healthy
 D3D11 surface ignores them. See
 [D3D11 renderer beta](windows.md#d3d11-renderer-beta).

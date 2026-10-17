@@ -11,41 +11,72 @@ pub fn unsupported(custom_shaders: bool, background_image: bool, terminal_images
     return null;
 }
 
-pub fn useD3D11(requested: Config.RendererBackend, feature: ?Unsupported) bool {
-    return requested != .opengl and feature == null;
+/// Each surface tries these in order until one initializes completely.
+/// OpenGL goes first when it was asked for or a feature needs it, and last
+/// otherwise. The Direct3D 11 beta fills the rest: hardware, then WARP, or
+/// WARP alone when software was asked for. Once OpenGL could not start in
+/// this process (`opengl_unavailable`), it is left out.
+pub fn startupOrder(
+    requested: Config.RendererBackend,
+    feature: ?Unsupported,
+    opengl_unavailable: bool,
+) []const Config.RendererBackend {
+    const warp_only = requested == .@"d3d11-warp";
+    if (opengl_unavailable) return if (warp_only) &.{.@"d3d11-warp"} else &.{ .d3d11, .@"d3d11-warp" };
+    if (requested == .opengl or feature != null) return if (warp_only)
+        &.{ .opengl, .@"d3d11-warp" }
+    else
+        &.{ .opengl, .d3d11, .@"d3d11-warp" };
+    return if (warp_only) &.{ .@"d3d11-warp", .opengl } else &.{ .d3d11, .@"d3d11-warp", .opengl };
 }
 
-/// Complete initialization failures advance through this bounded order.
-/// The D3D11 API also tries WARP if hardware device creation itself fails.
-pub fn startupOrder(requested: Config.RendererBackend, feature: ?Unsupported) []const Config.RendererBackend {
-    if (!useD3D11(requested, feature)) return &.{.opengl};
-    return switch (requested) {
-        .d3d11 => &.{ .d3d11, .@"d3d11-warp", .opengl },
-        .@"d3d11-warp" => &.{ .@"d3d11-warp", .opengl },
-        .opengl => unreachable,
-    };
+/// The banner a surface shows when OpenGL could not start for it and the
+/// Direct3D 11 beta drew instead.
+pub fn openGLFallbackNotice(warp: bool) []const u8 {
+    const before = "OpenGL could not start, so noctty switched to the Direct3D 11 beta renderer";
+    const after = ". Custom shaders and images are not available. To choose a renderer, set renderer in the config.";
+    return if (warp) before ++ ", in software (WARP)" ++ after else before ++ after;
 }
 
-test "renderer startup fallback is bounded and preserves software preference" {
+test "renderer startup order is bounded and tries every renderer once" {
     const Backend = Config.RendererBackend;
-    try std.testing.expectEqualSlices(Backend, &.{.opengl}, startupOrder(.opengl, null));
-    try std.testing.expectEqualSlices(Backend, &.{ .d3d11, .@"d3d11-warp", .opengl }, startupOrder(.d3d11, null));
-    try std.testing.expectEqualSlices(Backend, &.{ .@"d3d11-warp", .opengl }, startupOrder(.@"d3d11-warp", null));
+    // OpenGL, the default, falls back to the Direct3D 11 beta.
+    try std.testing.expectEqualSlices(Backend, &.{ .opengl, .d3d11, .@"d3d11-warp" }, startupOrder(.opengl, null, false));
+    try std.testing.expectEqualSlices(Backend, &.{ .d3d11, .@"d3d11-warp", .opengl }, startupOrder(.d3d11, null, false));
+    try std.testing.expectEqualSlices(Backend, &.{ .@"d3d11-warp", .opengl }, startupOrder(.@"d3d11-warp", null, false));
     inline for (std.meta.tags(Unsupported)) |feature| {
-        try std.testing.expectEqualSlices(Backend, &.{.opengl}, startupOrder(.d3d11, feature));
+        // A feature only OpenGL draws puts OpenGL first, whatever was asked.
+        try std.testing.expectEqualSlices(Backend, &.{ .opengl, .d3d11, .@"d3d11-warp" }, startupOrder(.opengl, feature, false));
+        try std.testing.expectEqualSlices(Backend, &.{ .opengl, .d3d11, .@"d3d11-warp" }, startupOrder(.d3d11, feature, false));
+        try std.testing.expectEqualSlices(Backend, &.{ .opengl, .@"d3d11-warp" }, startupOrder(.@"d3d11-warp", feature, false));
     }
 }
 
-test "renderer selection keeps OpenGL default and rejects unsupported features" {
-    try std.testing.expect(!useD3D11(.opengl, null));
-    try std.testing.expect(useD3D11(.d3d11, null));
-    try std.testing.expect(useD3D11(.@"d3d11-warp", null));
-    inline for (std.meta.tags(Unsupported)) |reason| {
-        try std.testing.expect(!useD3D11(.d3d11, reason));
-        try std.testing.expect(!useD3D11(.@"d3d11-warp", reason));
+test "renderer startup skips OpenGL once it could not start in this process" {
+    const Backend = Config.RendererBackend;
+    for ([_]?Unsupported{ null, .custom_shaders, .terminal_images }) |feature| {
+        try std.testing.expectEqualSlices(Backend, &.{ .d3d11, .@"d3d11-warp" }, startupOrder(.opengl, feature, true));
+        try std.testing.expectEqualSlices(Backend, &.{ .d3d11, .@"d3d11-warp" }, startupOrder(.d3d11, feature, true));
+        try std.testing.expectEqualSlices(Backend, &.{.@"d3d11-warp"}, startupOrder(.@"d3d11-warp", feature, true));
     }
+}
+
+test "renderer feature selection names the first unsupported feature" {
     try std.testing.expectEqual(Unsupported.custom_shaders, unsupported(true, true, true).?);
     try std.testing.expectEqual(Unsupported.background_image, unsupported(false, true, true).?);
     try std.testing.expectEqual(Unsupported.terminal_images, unsupported(false, false, true).?);
     try std.testing.expectEqual(@as(?Unsupported, null), unsupported(false, false, false));
+}
+
+test "OpenGL fallback notice says what happened, what is missing, and how to choose" {
+    try std.testing.expectEqualStrings(
+        "OpenGL could not start, so noctty switched to the Direct3D 11 beta renderer. Custom shaders and images are not available. To choose a renderer, set renderer in the config.",
+        openGLFallbackNotice(false),
+    );
+    try std.testing.expectEqualStrings(
+        "OpenGL could not start, so noctty switched to the Direct3D 11 beta renderer, in software (WARP). Custom shaders and images are not available. To choose a renderer, set renderer in the config.",
+        openGLFallbackNotice(true),
+    );
+    // The renderer keeps its notice in a fixed 256-byte buffer.
+    try std.testing.expect(openGLFallbackNotice(true).len <= 256);
 }

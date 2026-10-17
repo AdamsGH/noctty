@@ -243,6 +243,9 @@ pub const clearOpenGLStartupFailure = gl_startup.clearOpenGLStartupFailure;
 const recordOpenGLStartupWin32Failure = gl_startup.recordOpenGLStartupWin32Failure;
 pub const recordOpenGLStartupError = gl_startup.recordOpenGLStartupError;
 pub const recordOpenGLStartupVersionError = gl_startup.recordOpenGLStartupVersionError;
+pub const recordDirect3D11StartupError = gl_startup.recordDirect3D11StartupError;
+pub const markOpenGLUnavailable = gl_startup.markOpenGLUnavailable;
+pub const openGLUnavailable = gl_startup.openGLUnavailable;
 pub const OpenGLStartupString = gl_startup.OpenGLStartupString;
 pub const reportStartupFailure = gl_startup.reportStartupFailure;
 
@@ -33621,6 +33624,10 @@ pub const Surface = struct {
     paint_pending: bool = false,
     live_resize_repaint_deferred: bool = false,
     renderer_gl_prepared: bool = false,
+    /// OpenGL failed before core init (the eager WGL context or GL loading);
+    /// renderer init falls back to the Direct3D 11 beta with this error,
+    /// which it consumes.
+    renderer_gl_error: ?anyerror = null,
     renderer_repaint_requested: std.atomic.Value(bool) = .init(false),
     renderer_repaint_retry_pending: std.atomic.Value(bool) = .init(false),
     /// One-shot post-show frame handshake for #224. Only ever touched from
@@ -33978,11 +33985,16 @@ pub const Surface = struct {
         if (app.test_surface_init_stage) |stage| {
             try stage(self, .gl_context);
             self.noteBenchmarkMemoryStage(.gl_context_created, null);
-        } else if (!build_config.d3d11 or config.renderer == .opengl) {
+        } else if (!build_config.d3d11 or (config.renderer == .opengl and !gl_startup.openGLUnavailable())) {
             // `ensureGLContext` publishes the pixel format before its stage
             // note, which only emits the wgl_* provenance fields after that.
-            try self.ensureGLContext();
-            log.debug("surface.init gl context created", .{});
+            if (self.ensureGLContext()) |_| {
+                log.debug("surface.init gl context created", .{});
+            } else |err| {
+                // Renderer init falls back to the Direct3D 11 beta.
+                if (!build_config.d3d11) return err;
+                self.renderer_gl_error = err;
+            }
         }
         errdefer self.destroyGL();
 
@@ -39654,7 +39666,9 @@ pub const Surface = struct {
         }
     }
 
-    /// Release the surface's native GL resources.
+    /// Release the surface's native GL resources. Also called when OpenGL
+    /// failed for a surface that Direct3D 11 draws instead, so the failed
+    /// context is not bound again for each frame (`redraw`).
     ///
     /// Each benchmark teardown stage is emitted only when the boundary it
     /// names actually holds. `Get-BenchMemoryStageSamples` validates stage
@@ -39662,7 +39676,7 @@ pub const Surface = struct {
     /// let a memory run report verified native teardown while the HGLRC or
     /// DC was never released. A missing stage fails the run closed, which is
     /// the intended outcome when cleanup did not happen.
-    fn destroyGL(self: *Surface) void {
+    pub fn releaseGL(self: *Surface) void {
         if (self.hglrc) |hglrc| {
             if (self.clearGLContextCurrentChecked()) {
                 self.noteBenchmarkMemoryStage(.wgl_context_unbound, null);
@@ -39696,7 +39710,11 @@ pub const Surface = struct {
             self.hdc = null;
             if (released) self.noteBenchmarkMemoryStage(.dc_released, null);
         }
+        self.renderer_gl_prepared = false;
+    }
 
+    fn destroyGL(self: *Surface) void {
+        self.releaseGL();
         self.hwnd = null;
     }
 };
