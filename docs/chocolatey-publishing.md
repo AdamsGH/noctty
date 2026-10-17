@@ -33,15 +33,64 @@ rejects an icon served from GitHub.
    gh secret set CHOCO_API_KEY --repo amanthanvi/noctty --env release
    ```
 
-4. Wait for the next stable release; its last step pushes the package. Or, to
-   publish 1.3.132 now, run the manual block under "What happens after the
-   first push" with `$version = "1.3.132"`: it packs the installers already on
-   the release page. Do not rerun the 1.3.132 `Release` run instead. A rerun
-   rebuilds the installers and replaces the assets on the release page with
-   new bytes whose hashes no longer match the Scoop and WinGet manifests
-   already published for 1.3.132. It would also run the workflow and scripts
-   as they were at 1.3.132, which push a package naming a GitHub-hosted icon
-   that the validator rejects.
+4. Wait for the next stable release; its last step pushes the package. Or
+   publish a version that is already released, 1.3.132 for instance, by
+   running the **Chocolatey Publish** workflow
+   ([`chocolatey-publish.yml`](../.github/workflows/chocolatey-publish.yml))
+   from `main`. Run it once without `push` first; that dry run does everything
+   except the push:
+
+   ```powershell
+   gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.132
+   gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.132 -f push=true
+   ```
+
+   Do not rerun the 1.3.132 `Release` run instead. A rerun rebuilds the
+   installers and replaces the assets on the release page with new bytes
+   whose hashes no longer match the Scoop and WinGet manifests already
+   published for 1.3.132. It would also run the workflow and scripts as they
+   were at 1.3.132, which push a package naming a GitHub-hosted icon that the
+   validator rejects.
+
+## What the Chocolatey Publish workflow does
+
+It runs in the `release` environment on a GitHub-hosted `windows-latest`
+runner, where Chocolatey is preinstalled
+([Windows Server 2025 image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md):
+Chocolatey 2.7.4 in image 20261013.288.2), and builds nothing:
+
+1. It refuses to run unless the repository is `amanthanvi/noctty`, the
+   version is plain three-part semver such as `1.3.132`, and the workflow
+   commit is the head of `main`.
+2. `scripts/release-stage-published.ps1` downloads the published release and
+   verifies it with `scripts/verify-published-release.ps1`, the check the
+   `Release` workflow ends with: GitHub's digest for every asset, the
+   `SHA256SUMS` files, the build provenance attestation of every asset except
+   the icon, and the Authenticode signer. A draft or prerelease fails there.
+3. It builds the package from those installers with
+   `scripts/package-package-managers.ps1`, whose `packageSourceUrl` names the
+   workflow's commit.
+4. Without `push`, `scripts/release-publish-chocolatey.ps1 -PackOnly` packs it
+   with `choco pack` and prints the file's size and SHA-256. It reads no API
+   key and never contacts the push source.
+5. With `push`, the same script runs for real. Only this step can read
+   `CHOCO_API_KEY`, and it fails with a clear message if the secret is
+   missing. The 403 and 409 handling and the rule below are the `Release`
+   workflow's, because it is the same script.
+
+The script skips a version the feed already lists. The feed's exact-version
+lookup also lists a version that is still in moderation (measured on
+2026-10-17: versions with the status `Submitted` and `Ready` answer `200`
+there, while `FindPackagesById` leaves them out), so a corrected package for
+such a version needs `-f resubmit=true` as well. Without it the run reports
+`Chocolatey already has noctty <version>; nothing to push.`
+
+The check that the run starts from `main` guards against a mistake, not
+against a person with write access: on 2026-10-17 the `release` environment
+had no deployment-branch rule and no required reviewers, so a workflow on any
+branch could read its secrets. Restricting the environment to `main` (and to
+the `v*` tags the `Release` workflow runs from) in its settings would close
+that.
 
 ## What happens after the first push
 
@@ -55,11 +104,32 @@ under **Package Status**; `Submitted` means it is still queued.
 If a moderator asks for changes, the status turns to **Waiting for
 Maintainer** and the email says what to change. The fix goes into
 `scripts/package-package-managers.ps1` through a pull request, and Chocolatey
-wants the corrected package under the same version. The release workflow
-cannot send it: it skips any version the feed already lists, and rerunning a
-release would rebuild its installers. Rebuild the package by hand instead,
-from the installers already published, with `gh` and `choco` installed and the
-fix merged:
+wants the corrected package under the same version. Once the fix is on `main`,
+run the **Chocolatey Publish** workflow again for that version, with
+`resubmit` so that the listed version is not skipped:
+
+```powershell
+gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.133 -f push=true -f resubmit=true
+```
+
+Do not rerun the release instead: it would rebuild its installers.
+Chocolatey's [moderation page](https://docs.chocolatey.org/en-us/community-repository/moderation/)
+says to "resubmit the exact same version" with the required changes; this
+repository has not done that yet, because no package has ever been pushed, so
+the `resubmit` path is untested against the live feed.
+
+The package script checks every downloaded installer against the release's
+`SHA256SUMS` before it writes the checksums into the package, so the
+resubmitted package installs exactly the bytes on the release page. Its
+`packageSourceUrl` names the commit of the generator that built it, so a
+moderator can reproduce the corrected package; every other link still points
+at the original release.
+
+### Without the workflow
+
+The workflow is these two scripts, so the same steps run from a checkout of
+`main` with `gh` and `choco` installed and the fix merged; use this when
+Actions is unavailable:
 
 ```powershell
 $version = "1.3.133"   # the version the moderator asked about
@@ -68,30 +138,14 @@ function Assert-Exit([string] $What) { if ($LASTEXITCODE -ne 0) { throw "$What f
 git switch main; Assert-Exit "git switch"
 git pull --ff-only; Assert-Exit "git pull"
 $generator = (git rev-parse HEAD).Trim(); Assert-Exit "git rev-parse"
-foreach ($arch in "x64", "arm64") {
-    gh release download "v$version" --repo amanthanvi/noctty --dir "dist/artifacts/noctty-$version-windows-$arch" --clobber `
-        --pattern "noctty-$version-windows-$arch-setup.exe" `
-        --pattern "noctty-$version-windows-$arch-portable.zip" `
-        --pattern "SHA256SUMS-windows-$arch.txt"
-    Assert-Exit "gh release download ($arch)"
-}
-gh release download "v$version" --repo amanthanvi/noctty --dir "dist/artifacts/noctty-$version-windows-x64" --clobber --pattern "noctty-icon.svg"
-Assert-Exit "gh release download (icon)"
-./scripts/package-package-managers.ps1 -Version $version -Architectures x64, arm64 -PackageSourceRef $generator
-$out = "dist/artifacts/chocolatey-$(Get-Date -Format yyyyMMddHHmmss)"
-choco pack "dist/artifacts/noctty-$version-windows-x64/package-managers/chocolatey/noctty.nuspec" --output-directory $out
-Assert-Exit "choco pack"
+$env:WINDOWS_CODESIGN_TRUST_SELF_SIGNED = "true"   # the release is signed with a self-signed certificate
+./scripts/release-stage-published.ps1 -Version $version -PackageSourceRef $generator
+./scripts/release-publish-chocolatey.ps1 -Version $version -PackOnly   # dry run: packs, pushes nothing
 $key = Read-Host -Prompt "Chocolatey API key" -AsSecureString
-choco push "$out/noctty.$version.nupkg" --source https://push.chocolatey.org/ --api-key ([Net.NetworkCredential]::new("", $key).Password)
-Assert-Exit "choco push"
+$env:CHOCO_API_KEY = [Net.NetworkCredential]::new("", $key).Password
+try { ./scripts/release-publish-chocolatey.ps1 -Version $version -Resubmit }   # drop -Resubmit for a version the feed does not list yet
+finally { Remove-Item Env:CHOCO_API_KEY }
 ```
-
-The package script checks every downloaded installer against the release's
-`SHA256SUMS` before it writes the checksums into the package, so the
-resubmitted package installs exactly the bytes on the release page. Its
-`packageSourceUrl` names the commit of the generator that built it, so a
-moderator can reproduce the corrected package; every other link still points
-at the original release.
 
 Until a first version is approved, Chocolatey refuses every further push with
 `403`: one of the causes it documents is "Package has a version in moderation
