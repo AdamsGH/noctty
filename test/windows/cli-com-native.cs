@@ -75,6 +75,7 @@ public static class ComCliNative {
     [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr h);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes,IntPtr name);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job,int kind,ref JobLimits limits,int size);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job,int kind,ref uint limits,int size);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job,int kind,out JobAccounting info,int size,IntPtr returned);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool IsProcessInJob(IntPtr process,IntPtr job,out int result);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
@@ -187,7 +188,7 @@ public static class ComCliNative {
             if(mode=="none") { si.flags|=0x100; si.input=new IntPtr(-1); si.output=new IntPtr(-1); si.error=new IntPtr(-1); }
             if(mode!="none") {
                 stdin=FileHandle(String.IsNullOrEmpty(input)?"NUL":input,true);
-                if(mode=="pipes" || mode=="blocked") {
+                if(mode=="pipes" || mode=="blocked" || mode=="restricted") {
                     var sa=Inheritable(); Check(CreatePipe(out outRead,out stdout,ref sa,4096)); Check(SetHandleInformation(outRead,1,0));
                     Check(CreatePipe(out errRead,out stderr,ref sa,4096)); Check(SetHandleInformation(errRead,1,0));
                 } else if(mode=="console") {
@@ -201,11 +202,16 @@ public static class ComCliNative {
             job=CreateJobObjectW(IntPtr.Zero,IntPtr.Zero); Check(job!=IntPtr.Zero);
             var limits=new JobLimits { flags=0x2000 }; // KILL_ON_JOB_CLOSE, owned descendants only
             Check(SetInformationJobObject(job,9,ref limits,Marshal.SizeOf(typeof(JobLimits))));
+            if(mode=="restricted") {
+                // READCLIPBOARD exercises documented job-nesting restrictions;
+                // the probe never reads or writes any clipboard.
+                uint uiLimits=2; Check(SetInformationJobObject(job,4,ref uiLimits,sizeof(uint)));
+            }
             Check(AssignProcessToJobObject(job,pi.process));
             long born,exited,kernel,user; Check(GetProcessTimes(pi.process,out born,out exited,out kernel,out user));
             var child=new Child { Handle=pi.process,Job=job,Pid=pi.pid,Created=born,Image=Path.GetFullPath(image) };
             Verify(child);
-            if(mode=="pipes") { child.Output=Drain(outRead); outRead=IntPtr.Zero; }
+            if(mode=="pipes" || mode=="restricted") { child.Output=Drain(outRead); outRead=IntPtr.Zero; }
             if(mode=="blocked") { child.OutputRead=outRead; outRead=IntPtr.Zero; }
             if(errRead!=IntPtr.Zero) { child.Error=Drain(errRead); errRead=IntPtr.Zero; }
             if(ResumeThread(pi.thread)==0xFFFFFFFF) throw new Win32Exception();

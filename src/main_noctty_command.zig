@@ -69,7 +69,7 @@ fn forward() !u32 {
     }
     // Keep an action's lifetime tied to the wrapper, as with the old in-process
     // dispatch. Editors or GUI processes the action launches may outlive it.
-    const job = if (wait) try actionJob() else null;
+    const job = if (wait) actionJob() catch null else null;
     defer if (job) |handle| w.CloseHandle(handle);
     var process: w.PROCESS_INFORMATION = undefined;
     if (k.CreateProcessW(image_z, raw, null, null, @intFromBool(wait), .{ .detached_process = !wait, .create_suspended = wait }, null, null, &startup, &process) == 0)
@@ -86,7 +86,9 @@ fn forward() !u32 {
         _ = k.WaitForSingleObject(process.hProcess, w.INFINITE);
     }
     if (!wait) return 0;
-    if (jobs.AssignProcessToJobObject(job.?, process.hProcess) == 0) return error.ActionJobFailed;
+    // Some caller-owned jobs cannot nest (notably with UI restrictions).
+    // Preserve CLI availability there; lifetime cleanup is best effort.
+    if (job) |handle| _ = jobs.AssignProcessToJobObject(handle, process.hProcess);
     if (ResumeThread(process.hThread) == 0xFFFFFFFF) return error.ResumeFailed;
     if (k.WaitForSingleObject(process.hProcess, w.INFINITE) != w.WAIT_OBJECT_0) return error.WaitFailed;
     var code: u32 = undefined;

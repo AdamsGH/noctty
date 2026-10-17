@@ -206,7 +206,8 @@ pub const std_options: std.Options = .{
     .logFn = logFn,
 };
 
-/// The `panic` of noctty.exe and noctty.com. Debug and ReleaseSafe keep Zig's
+/// The application's panic handler (the thin console launcher uses no_panic).
+/// Debug and ReleaseSafe keep Zig's
 /// default: the message and a symbolized stack trace. ReleaseFast and
 /// ReleaseSmall print the message and trap, because the default handler pulls
 /// std.debug's whole PDB/DWARF symbolizer into any image that keeps debug

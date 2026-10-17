@@ -388,6 +388,9 @@ try {
         } finally { $child.Dispose() }
     }
     if ($ThinForwarder) {
+        Test-Case 'thin: actions work inside an outer job with UI restrictions' {
+            Assert-Version (Invoke-Cli '+version' 'restricted')
+        }
         Test-Case 'thin: terminating the wrapper ends its blocked action child' {
             $child = [ComCliNative]::Launch($com, '+show-config --default --docs --no-pager', $BinDir, $desktopPath, 'blocked', $null, $null, $null, 0)
             try {
