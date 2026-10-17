@@ -15,11 +15,13 @@ desktop.
 - Before every release, with the release candidate's artifacts (see the
   [release runbook](../PACKAGING.md#release-runbook)).
 - Produce the candidate from the exact intended source SHA with the
-  [local packaging procedure](../PACKAGING.md#local-packaging), or use the
-  **Release** workflow's manual `prerelease = true` output. **Release Readiness**
-  only checks configuration; it produces no candidate artifacts. Record the
-  candidate's source SHA and artifact hashes. A later source change needs a new
-  candidate and the affected rows repeated before stable publication.
+  [local packaging procedure](../PACKAGING.md#local-packaging), passing
+  `-RequireConPty` and with Inno Setup available for the installed rows. Local
+  builds are unsigned unless signing is configured; record that limit.
+  **Release Readiness** produces no candidate artifacts. Record the candidate's
+  source SHA and hashes. Stable publication rebuilds assets, so the pass binds
+  to the source SHA; record shipped hashes separately. A later source change
+  needs a new candidate and the affected rows repeated before publication.
 - A release whose diff since the last Windows 10 pass touches none of the files in
   the [gate inventory](#gate-inventory) and no chrome, input or startup code may
   run only the rows marked **Core**. Say in the release notes which pass was run.
@@ -243,10 +245,10 @@ script whose box remains and the fonts that Windows 10 lacks.
 **W10-19 ConPTY source (Core).** Close all noctty windows before each case and
 start each test instance with `--single-instance=false` so an existing instance
 cannot consume the launch with a different environment or ConPTY source.
-(a) Run `noctty +version`. Expected: `ConPTY :
+(a) Run `.\noctty.com +version`. Expected: `ConPTY :
 bundled (<path>)`. Open `cmd`, run `cls` and `dir`, then start a full-screen
 program (for example `more` on a long file). (b) Set `NOCTTY_CONPTY=inbox` in the
-environment and run `noctty +version` and a new instance. Expected: `+version` reads
+environment and run `.\noctty.com +version` and a new instance. Expected: `+version` reads
 `ConPTY : inbox (NOCTTY_CONPTY=inbox is set)`, `err.txt` holds the warning
 `NOCTTY_CONPTY=inbox is set; using the in-box conhost`, there is no banner (a forced
 choice is the user's own, `pty.zig`), and the shell works. (c) Without the variable,
@@ -274,7 +276,7 @@ and `jump_to_prompt` finds the previous prompt (OSC 133).
 
 **W10-22 Default terminal (installed, throwaway snapshot only).** Gate:
 `win32_terminal_handoff.zig`. (a) With Windows Terminal not installed, run
-`noctty +register-default-terminal`. Expected, per
+`.\noctty.com +register-default-terminal`. Expected, per
 [Default terminal](windows.md#default-terminal): it refuses when `DelegationConsole`
 is missing, empty or the inbox console host, printing "Cannot register noctty as the
 default terminal: HKCU\Console\%%Startup\DelegationConsole is missing or selects
@@ -282,10 +284,10 @@ the inbox console host", and writes nothing. Check that key is unchanged. (b) In
 Settings > Startup and choose "Windows Terminal" as the default terminal application
 (installing it does not select it; registration needs that selection for the console
 half). Note `DelegationConsole` and `DelegationTerminal` under that key. Run
-`noctty +register-default-terminal`. Expected: it succeeds. Start `cmd.exe` from the
+`.\noctty.com +register-default-terminal`. Expected: it succeeds. Start `cmd.exe` from the
 Run dialog. Expected: a visible noctty window adopts the console (a separate
 `-Embedding` process, see [Default terminal](windows.md#default-terminal)). (c) Run
-`noctty +unregister-default-terminal` and start `cmd.exe` again. Expected: the two
+`.\noctty.com +unregister-default-terminal` and start `cmd.exe` again. Expected: the two
 values are back to what (b) recorded, and the console opens in Windows Terminal.
 Revert to the snapshot afterwards.
 
@@ -306,10 +308,10 @@ button. Expected: "Recent" lists the folders, "Profiles" lists the detected shel
 choosing an entry opens noctty in that folder or profile. A portable copy builds no
 jump list ([Taskbar jump list](windows.md#taskbar-jump-list)).
 
-**W10-25 Explorer verb and taskbar progress.** Run `noctty +register-shell-menu`, then
+**W10-25 Explorer verb and taskbar progress.** Run `.\noctty.com +register-shell-menu`, then
 right-click a folder in Explorer. Expected: "Open noctty here" is in the main context
 menu (Windows 11 puts it under "Show more options"); it opens a new instance in that
-folder. Run `noctty +unregister-shell-menu` afterwards. Then, in a tab, print
+folder. Run `.\noctty.com +unregister-shell-menu` afterwards. Then, in a tab, print
 `printf '\e]9;4;1;50\a'` from Git Bash or `[Console]::Write("$([char]27)]9;4;1;50$([char]7)")`
 from PowerShell. Expected: a progress bar on the taskbar button; `OSC 9;4;0` clears
 it.
@@ -327,7 +329,32 @@ Copy this table into the release notes' validation section or the release PR.
 
 | Row               | Result (pass, fail, n/a) | Build | Evidence (screenshot, log line, note)        |
 | ----------------- | ------------------------ | ----- | -------------------------------------------- |
-| W10-01 to W10-26  |                          |       |                                              |
+| W10-01            |                          |       |                                              |
+| W10-02            |                          |       |                                              |
+| W10-03            |                          |       |                                              |
+| W10-04            |                          |       |                                              |
+| W10-05            |                          |       |                                              |
+| W10-06            |                          |       |                                              |
+| W10-07            |                          |       |                                              |
+| W10-08            |                          |       |                                              |
+| W10-09            |                          |       |                                              |
+| W10-10            |                          |       |                                              |
+| W10-11            |                          |       |                                              |
+| W10-12            |                          |       |                                              |
+| W10-13            |                          |       |                                              |
+| W10-14            |                          |       |                                              |
+| W10-15            |                          |       |                                              |
+| W10-16            |                          |       |                                              |
+| W10-17            |                          |       |                                              |
+| W10-18            |                          |       |                                              |
+| W10-19            |                          |       |                                              |
+| W10-20            |                          |       |                                              |
+| W10-21            |                          |       |                                              |
+| W10-22            |                          |       |                                              |
+| W10-23            |                          |       |                                              |
+| W10-24            |                          |       |                                              |
+| W10-25            |                          |       |                                              |
+| W10-26            |                          |       |                                              |
 | Machine and image |                          |       | `winver`, VM type, display scaling           |
 | Artifact          |                          |       | source SHA, version, SHA-256 of ZIP or setup |
 | Date and tester   |                          |       |                                              |

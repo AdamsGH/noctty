@@ -154,8 +154,8 @@ $win10Contracts = @(
     }
     @{
         File = $win10ChecklistPath
-        Content = { $win10Checklist }
-        Pattern = ('(?m)^\| W10-01 to ' + [regex]::Escape($win10ExpectedIds[-1]) + ' ')
+        Content = { ([regex]::Matches($win10Checklist, '(?m)^\| (W10-\d{2}) +\|') | ForEach-Object { $_.Groups[1].Value }) -join ',' }
+        Pattern = ('\A' + [regex]::Escape(($win10ExpectedIds -join ',')) + '\z')
         Kind = 'Text'
         Description = 'the results table covers every checklist row'
     }
@@ -179,6 +179,13 @@ $win10Contracts = @(
         Pattern = '(?m)^    runs-on: windows-2022\s*$'
         Kind = 'Text'
         Description = 'the Windows 10 workflow runs on the Server 2022 image, the only hosted one below build 22000'
+    }
+    @{
+        File = (Join-Path $repoRoot 'src/apprt/win32.zig')
+        Content = { Get-Content -LiteralPath (Join-Path $repoRoot 'src/apprt/win32.zig') -Raw }
+        Pattern = 'log\.info\("win32 os_build=\{d\} integrated_titlebar=\{\}"'
+        Kind = 'Text'
+        Description = 'the startup log format still matches the workflow and checklist evidence reader'
     }
     @{
         File = $win10WorkflowPath

@@ -299,10 +299,12 @@ Recommended order:
 5. Run the Windows 10 22H2 checklist,
    [docs/windows10-release-checklist.md](docs/windows10-release-checklist.md),
    against a candidate built from the intended source SHA on a Windows 10
-   machine. Obtain it through [Local packaging](#local-packaging), or a manual
-   **Release** dispatch with `prerelease = true`; **Release Readiness** produces
-   no artifacts. Record the source SHA and candidate hashes, and repeat affected
-   checks if the source changes before stable publication. No
+   machine. Use [Local packaging](#local-packaging) with `-RequireConPty` and
+   Inno Setup available for the installed rows. Local builds are unsigned unless
+   signing is configured; record that limit. **Release Readiness** produces no
+   artifacts. Record the source SHA and candidate hashes. Stable publication
+   rebuilds the assets, so this pass binds to the source SHA; record the shipped
+   hashes separately and repeat affected checks if the source changes. No
    hosted image or interactive job covers Windows 10; the checklist is a manual
    release step, not a CI gate. Put its results table in the release notes'
    validation section. The scheduled **Windows 10 branches** workflow is a
@@ -310,7 +312,8 @@ Recommended order:
    (build 20348); read its latest run too.
 6. After readiness passes, either:
    - push tag `v<version>`, or
-   - manually dispatch the **Release** workflow with `version=<version>`.
+   - manually dispatch the **Release** workflow with `version=<version>` and
+     `prerelease=false`.
 7. Confirm the workflow published artifacts for both x64 and ARM64:
    - installer
    - portable ZIP
