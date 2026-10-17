@@ -440,7 +440,8 @@ follows `bell-features`, which defaults to `attention,title`:
   caption, until the terminal is focused or typed into. It is not shown for the
   terminal you are typing into. A screen reader gets the tab's UI Automation
   `ItemStatus` "Bell". The title the program set is not changed, so
-  `title-report`, saved sessions and automation still see it.
+  `title-report`, saved sessions and IPC automation still see it. The window's
+  own UIA `Name` follows its visible caption and includes the bell glyph.
 - `audio`: plays `bell-audio-path` through MCI, at `bell-audio-volume` (0.0 to
   1.0 of the system volume), on a short-lived thread. One sound plays at a
   time; a bell that rings meanwhile is dropped. Playback runs to the end of
