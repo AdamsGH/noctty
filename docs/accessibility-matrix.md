@@ -179,7 +179,7 @@ tests, and Tab traversal and the key-release swallow run natively on a
 hidden desktop; opening the real context menu from a key press, the tooltip
 popup under a real cursor and any screen-reader output are not measured.
 What the cycle itself still does not reach: the caption buttons, the
-profile picker and tab-overview rows, and context menus. The caption buttons are deliberately outside the
+profile picker and tab-overview rows, and menus other than the tab context menu. The caption buttons are deliberately outside the
 cycle: they are exposed and invokable through UIA, and they report
 `IsKeyboardFocusable = false` so no reader is told otherwise. Overlays such as the command
 palette keep their own focus handling and are outside the cycle. None of

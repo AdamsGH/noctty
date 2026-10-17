@@ -237,8 +237,8 @@ pub fn chromeButtonKeyAction(vk: WPARAM, mods: KeyMods) ?ChromeButtonKeyAction {
 /// The key-ups that must not reach `DefWindowProc` on a tab button: it turns
 /// the menu key's release (and Shift+F10's) into a second WM_CONTEXTMENU after
 /// the key-down already opened the menu.
-pub fn tabButtonSwallowsKeyUp(vk: WPARAM) bool {
-    return vk == c.VK_APPS or vk == c.VK_F10;
+pub fn tabButtonSwallowsKeyUp(vk: WPARAM, mods: KeyMods) bool {
+    return vk == c.VK_APPS or (vk == c.VK_F10 and mods.shift and !mods.ctrl and !mods.alt);
 }
 
 /// The first stop after `current` that `available` accepts, in the direction
@@ -4173,9 +4173,11 @@ test "win32 tab button keys: the menu key and Shift+F10 open the context menu, T
 
     // DefWindowProc turns the release of the menu key and of F10 into a
     // second WM_CONTEXTMENU once the key-down already opened the menu.
-    try std.testing.expect(tabButtonSwallowsKeyUp(c.VK_APPS));
-    try std.testing.expect(tabButtonSwallowsKeyUp(c.VK_F10));
-    try std.testing.expect(!tabButtonSwallowsKeyUp(c.VK_RETURN));
+    try std.testing.expect(tabButtonSwallowsKeyUp(c.VK_APPS, none));
+    try std.testing.expect(!tabButtonSwallowsKeyUp(c.VK_F10, none));
+    try std.testing.expect(tabButtonSwallowsKeyUp(c.VK_F10, shift));
+    try std.testing.expect(!tabButtonSwallowsKeyUp(c.VK_F10, .{ .shift = true, .ctrl = true }));
+    try std.testing.expect(!tabButtonSwallowsKeyUp(c.VK_RETURN, none));
 }
 
 test "win32 chrome button keys: Enter clicks and Tab moves, Ctrl and Alt do neither" {

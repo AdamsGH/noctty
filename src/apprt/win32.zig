@@ -17182,6 +17182,14 @@ const Host = struct {
         }
         keyboard.set(&([_]u8{0} ** 256));
 
+        // Enter is a keyboard activation, not a synthetic mouse press.
+        const new_tab = host.new_tab_hwnd.?;
+        _ = sys.SetFocus(new_tab);
+        host.focus_input_mode = .keyboard;
+        try std.testing.expectEqual(@as(LRESULT, 0), sys.SendMessageW(new_tab, c.WM_KEYDOWN, c.VK_RETURN, 0));
+        try std.testing.expectEqual(focus_cue.InputMode.keyboard, host.focus_input_mode);
+        try std.testing.expect(host.button_tooltip.dismissed == null);
+
         // [+] and [v] name themselves for the tooltip as UIA does; a tab does not.
         try std.testing.expectEqualStrings("New tab", host.chromeButtonTooltipName(host.new_tab_hwnd.?).?);
         try std.testing.expectEqualStrings("More tabs", host.chromeButtonTooltipName(host.overflow_hwnd.?).?);
@@ -18439,9 +18447,6 @@ const Host = struct {
         self.placeBanner(true);
     }
 
-    /// Whether the banner child belongs on screen: there is a message or an
-    /// update notice to show, and no overlay is open (an overlay shows banner
-    /// text in its own feedback lane).
     fn refreshModeIndicator(self: *Host) !void {
         try self.refreshModeIndicatorAt(sys.GetTickCount64());
     }
@@ -18598,6 +18603,8 @@ const Host = struct {
         try std.testing.expect(bannerTestVisible(banner));
     }
 
+    /// Whether the banner child belongs on screen: message, mode or update
+    /// text exists and no overlay owns the feedback lane.
     fn bannerShown(self: *const Host) bool {
         if (self.overlay_mode != .none) return false;
         return self.banner_text != null or self.mode_indicator_text != null or self.app.update_notice != null;
@@ -21496,7 +21503,9 @@ const Host = struct {
         const hwnd = self.hwnd orelse return false;
         if (tab_index >= self.tabs.items.len) return false;
         const tab_id = self.tabs.items[tab_index].id;
-        if (!self.activateTabIndex(tab_index)) return false;
+        if (origin != .keyboard or tab_index != self.active_tab) {
+            if (!self.activateTabIndex(tab_index)) return false;
+        }
         // The menu answers the question a title tooltip was there for.
         self.hideTabTooltip();
         const menu = sys.CreatePopupMenu() orelse return true;
@@ -21646,7 +21655,15 @@ const Host = struct {
         if (!in_strip and search_surface == null) return false;
         const action = labels.chromeButtonKeyAction(vk, mods) orelse return false;
         switch (action) {
-            .click => _ = sys.SendMessageW(button, c.BM_CLICK, 0, 0),
+            .click => {
+                const parent = sys.GetParent(button) orelse return false;
+                const id = sys.GetDlgCtrlID(button);
+                if (id <= 0) return false;
+                // BM_CLICK simulates mouse messages, which hide keyboard
+                // focus cues and dismiss tooltips. Send its notification
+                // directly, and touch nothing after the action runs.
+                _ = sys.SendMessageW(parent, c.WM_COMMAND, @as(WPARAM, @intCast(id)) | (@as(WPARAM, c.BN_CLICKED) << 16), @intCast(@intFromPtr(button)));
+            },
             .focus_next, .focus_previous => {
                 const reverse = action == .focus_previous;
                 if (search_surface) |surface| {
@@ -32666,7 +32683,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                 // Without these, `DefWindowProc` posts a second
                 // WM_CONTEXTMENU when the key comes back up.
                 c.WM_KEYUP, c.WM_SYSKEYUP => {
-                    if (labels.tabButtonSwallowsKeyUp(wParam)) return 0;
+                    if (labels.tabButtonSwallowsKeyUp(wParam, chromeKeyMods())) return 0;
                 },
                 // The keyboard form (-1, -1) was served on the key-down. A
                 // right click opens the menu from WM_RBUTTONUP and never
