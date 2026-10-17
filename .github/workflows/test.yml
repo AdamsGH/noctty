@@ -21,13 +21,54 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
   cancel-in-progress: true
 
+# Job layout. `checks` (contracts, shell integration, site and release copy)
+# runs on every change and needs no Zig. The compiled jobs are independent of
+# each other, so they run side by side and a run takes as long as the slowest,
+# the Zig test suite. On a pull request, `changes` decides from the changed
+# files which compiled jobs are needed (scripts/ci-changed-paths.ps1: a table of
+# files they never read, everything else runs everything); a docs-only or
+# script-only change then runs `checks` alone. A job skipped by an `if:` reports
+# success, so no required check can be left pending by the filter. The gate job
+# `windows` keeps the check name the single serial job had, fails when a needed
+# job did not succeed, and fails when a job ran or was skipped against its flag.
+# Push, schedule and manual runs run everything.
 jobs:
-  windows:
-    name: Windows Build And Tests
-    # Pin the runner image for the headless performance regression floor. The
-    # documented baseline remains machine-specific; this is not a cross-host
-    # absolute comparison.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tests: ${{ steps.filter.outputs.tests }}
+      bench: ${{ steps.filter.outputs.bench }}
+      build: ${{ steps.filter.outputs.build }}
+      cross_arm64: ${{ steps.filter.outputs.cross_arm64 }}
+      lib_vt: ${{ steps.filter.outputs.lib_vt }}
+      conpty_probes: ${{ steps.filter.outputs.conpty_probes }}
+      renderer_smoke: ${{ steps.filter.outputs.renderer_smoke }}
+      portable_smoke: ${{ steps.filter.outputs.portable_smoke }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The diff needs the merge base.
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Decide which jobs the change needs
+        id: filter
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/ci-changed-paths.ps1 -EventName $env:EVENT_NAME -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+
+  checks:
+    name: Windows Checks
+    # Pinned with the compiled jobs: the PowerShell 5.1, Git Bash and Clink
+    # steps need a Windows image, and one image keeps their results comparable.
     runs-on: windows-2025
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
@@ -43,6 +84,10 @@ jobs:
       - name: Interactive hints contract checks
         shell: pwsh
         run: ./test/windows/Test-InteractiveWin11HintsContracts.ps1
+
+      - name: CI script tests (path filter, gate, reports)
+        shell: pwsh
+        run: ./test/windows/ci-scripts.ps1
 
       - name: PowerShell shell integration tests (PowerShell 7)
         shell: pwsh
@@ -125,6 +170,24 @@ jobs:
         shell: pwsh
         run: ./test/windows/package-chocolatey.ps1
 
+      - name: PowerShell syntax and JSON validity
+        shell: pwsh
+        run: ./scripts/check-source-format.ps1
+
+  tests:
+    name: Windows Zig Tests
+    needs: changes
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
@@ -146,6 +209,81 @@ jobs:
       - name: Zig version
         run: zig version
 
+      - name: Zig formatting
+        shell: pwsh
+        run: ./scripts/check-zig-format.ps1
+
+      - name: Full Zig test suite
+        # -Dcustom-shaders=true because that is what ships: every release
+        # binary is built with it (scripts/build-package-windows.ps1), so the
+        # default-off config is one no user runs. It is also a superset,
+        # 4495 tests against 4491, the difference being the shadertoy tests
+        # that used to have a step of their own. That step ran
+        # -Dtest-filter=shadertoy, which executed 0 of them (measured, before
+        # the src/main.zig filter fix); replacing it with a second full-suite
+        # run would have doubled this job's time to collect 4 tests.
+        # Compiling the default-off config is still covered by the "Build
+        # executable" and "Verify default source-build shader mode" steps of
+        # the build job.
+        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all
+
+      - name: Native Win32 compositor tests
+        run: zig test src/apprt/win32_compositor_native.zig -lc -luser32 -lkernel32
+
+      # Report only: the stock test runner prints no durations, so the suite's
+      # executable runs once more under a timestamper. `zig build test` does not
+      # install it; the install step does, from the compile the suite just
+      # cached. It costs a few minutes, so it runs on the nightly and on demand,
+      # not on pull requests.
+      - name: Per-test timing (report only)
+        if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          zig build -Demit-test-exe=true -Demit-exe=false -Dcustom-shaders=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/ci-test-timing.ps1 -TestExe ./zig-out/bin/ghostty-test.exe
+
+  bench:
+    name: Windows Headless Benchmarks
+    needs: changes
+    if: needs.changes.outputs.bench == 'true'
+    # Pin the runner image for the headless performance regression floor. The
+    # documented baseline remains machine-specific; this is not a cross-host
+    # absolute comparison.
+    runs-on: windows-2025
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig exports its own global cache even with use-cache disabled.
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Zig version
+        run: zig version
+
+      # These floors are catastrophic-regression guards (docs/windows-benchmark-
+      # methodology.md); the nightly bench-trend job reports the actual numbers.
       - name: Headless benchmark regression gates
         shell: pwsh
         run: |
@@ -162,29 +300,39 @@ jobs:
           zig build bench:palette-match -- --entries=5000 --keystrokes=5000 --budget-us=2500
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Zig formatting
+  build:
+    name: Windows Executable Build
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig exports its own global cache even with use-cache disabled.
+      - name: Configure Zig package cache
         shell: pwsh
-        run: ./scripts/check-zig-format.ps1
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
 
-      - name: PowerShell syntax and JSON validity
-        shell: pwsh
-        run: ./scripts/check-source-format.ps1
-
-      - name: Full Zig test suite
-        # -Dcustom-shaders=true because that is what ships: every release
-        # binary is built with it (scripts/build-package-windows.ps1), so the
-        # default-off config is one no user runs. It is also a superset,
-        # 4495 tests against 4491, the difference being the shadertoy tests
-        # that used to have a step of their own. That step ran
-        # -Dtest-filter=shadertoy, which executed 0 of them (measured, before
-        # the src/main.zig filter fix); replacing it with a second full-suite
-        # run would have doubled this job's time to collect 4 tests.
-        # Compiling the default-off config is still covered by "Build
-        # executable" and "Verify default source-build shader mode" below.
-        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all
-
-      - name: Native Win32 compositor tests
-        run: zig test src/apprt/win32_compositor_native.zig -lc -luser32 -lkernel32
+      - name: Zig version
+        run: zig version
 
       - name: Build executable
         # This traverses the default build graph too; a preceding plain
@@ -204,8 +352,46 @@ jobs:
             throw "Default source build did not report disabled custom shaders."
           }
 
+      - name: Verify source build stages the pinned ConPTY
+        shell: pwsh
+        run: ./test/windows/source-build-conpty.ps1 -Architecture x64
+
       - name: Build without D3D11 beta
         run: zig build -Demit-exe=true -Dd3d11=false --prefix opengl-only --summary all
+
+  renderer-smoke:
+    name: Windows D3D11 Renderer Smoke
+    needs: changes
+    if: needs.changes.outputs.renderer_smoke == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig exports its own global cache even with use-cache disabled.
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Zig version
+        run: zig version
 
       - name: Build D3D11 lifecycle smoke tools
         shell: pwsh
@@ -226,13 +412,46 @@ jobs:
           name: renderer-x64-${{ github.run_id }}
           path: renderer-smoke/evidence
           if-no-files-found: ignore
-      - name: Verify source build stages the pinned ConPTY
-        shell: pwsh
-        run: ./test/windows/source-build-conpty.ps1 -Architecture x64
 
+  cross-arm64:
+    name: Windows ARM64 Cross Build
+    needs: changes
+    if: needs.changes.outputs.cross_arm64 == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig exports its own global cache even with use-cache disabled.
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Zig version
+        run: zig version
+
+      # Kept although windows-arm64.yml builds ARM64 natively: this is a Debug
+      # build with the source-build ConPTY staging check below, which the native
+      # job's ReleaseFast package build does not run. It runs beside the other
+      # jobs, so it costs no wall time.
       - name: Build ARM64 executable
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
         # Cross-compilation coverage only; native execution runs in windows-arm64.yml.
         run: zig build -Demit-exe=true -Dtarget=aarch64-windows-msvc -Dcpu=baseline
 
@@ -242,6 +461,8 @@ jobs:
 
   windows-lib-vt:
     name: Windows libghostty-vt Tests
+    needs: changes
+    if: needs.changes.outputs.lib_vt == 'true'
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
@@ -270,6 +491,8 @@ jobs:
 
   windows-conpty-probes:
     name: Windows ConPTY Probes (experimental)
+    needs: changes
+    if: needs.changes.outputs.conpty_probes == 'true'
     runs-on: windows-2025
     timeout-minutes: 20
     continue-on-error: true
@@ -304,6 +527,8 @@ jobs:
 
   windows-portable-smoke:
     name: Windows x64 Portable Package Smoke
+    needs: changes
+    if: needs.changes.outputs.portable_smoke == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -344,6 +569,82 @@ jobs:
           path: |
             test/windows/flagship/artifacts/portable-x64
             dist/artifacts/noctty-0.0.1-windows-x64
+
+  # Report only, nightly and on demand: the same four workloads and the palette
+  # benchmark as the `bench` gate, without floors, with the medians written to
+  # the job summary and kept as an artifact, and the change since the previous
+  # nightly. The gate stays a catastrophic-regression guard; this is where a slow
+  # drift shows up.
+  bench-trend:
+    name: Windows Benchmark Trend (report only)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig exports its own global cache even with use-cache disabled.
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      # Reuse only verified dependency packages, never compiler/build outputs.
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Measure and compare with the previous nightly
+        shell: pwsh
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci-bench-trend.ps1 -OutputDirectory bench-trend -Repository ${{ github.repository }}
+
+      - name: Upload benchmark trend
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bench-trend-${{ github.run_id }}
+          path: bench-trend
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # The check a branch rule would require. It keeps the name of the single
+  # serial job this workflow used to have.
+  windows:
+    name: Windows Build And Tests
+    needs: [changes, checks, tests, bench, build, renderer-smoke, cross-arm64]
+    # Not always(): a cancelled run (a newer push) must stay cancelled.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout the gate script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          sparse-checkout: scripts/ci-gate.ps1
+          sparse-checkout-cone-mode: false
+
+      - name: Every needed job succeeded and every skipped job was not needed
+        shell: pwsh
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: ./scripts/ci-gate.ps1 -NeedsJson $env:NEEDS_JSON -Expect checks:always,tests:tests,bench:bench,build:build,renderer-smoke:renderer_smoke,cross-arm64:cross_arm64
 
   windows-interactive:
     name: Windows 11 Interactive Composite

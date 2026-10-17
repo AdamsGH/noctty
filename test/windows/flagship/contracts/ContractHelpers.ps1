@@ -132,39 +132,56 @@ function Assert-DeferredZigFixtureExecution {
         [Parameter(Mandatory)] [string] $Source
     )
 
-    $windowsJob = Get-YamlJobText `
+    # The flagship contracts run in the always-on checks job, where no Zig
+    # exists, and leave the registered Zig fixtures to the full suite in the
+    # tests job, which the gate requires whenever Zig sources can have changed.
+    $checksJob = Get-YamlJobText `
         -Content $WorkflowText `
-        -Name 'windows' `
+        -Name 'checks' `
+        -Source $Source
+    $testsJob = Get-YamlJobText `
+        -Content $WorkflowText `
+        -Name 'tests' `
         -Source $Source
     $flagshipStep = Get-YamlStepBlock `
-        -Content $windowsJob `
+        -Content $checksJob `
         -Name 'Flagship verification contract checks' `
-        -Source "$Source :: windows"
+        -Source "$Source :: checks"
     $setupStep = Get-YamlStepBlock `
-        -Content $windowsJob `
+        -Content $testsJob `
         -Name 'Setup Zig' `
-        -Source "$Source :: windows"
+        -Source "$Source :: tests"
     $fullSuiteStep = Get-YamlStepBlock `
-        -Content $windowsJob `
+        -Content $testsJob `
         -Name 'Full Zig test suite' `
-        -Source "$Source :: windows"
+        -Source "$Source :: tests"
     $conditionalStepPattern = '(?m)^        (?:if|continue-on-error):'
-    $flagshipIndex = $windowsJob.IndexOf($flagshipStep, [StringComparison]::Ordinal)
-    $setupIndex = $windowsJob.IndexOf($setupStep, [StringComparison]::Ordinal)
-    $fullSuiteIndex = $windowsJob.IndexOf($fullSuiteStep, [StringComparison]::Ordinal)
+    $setupIndex = $testsJob.IndexOf($setupStep, [StringComparison]::Ordinal)
+    $fullSuiteIndex = $testsJob.IndexOf($fullSuiteStep, [StringComparison]::Ordinal)
 
     if ($flagshipStep -notmatch
             '(?m)^        run: \./test/windows/flagship/Test-VerificationContracts\.ps1\s*$' -or
+        $flagshipStep -match $conditionalStepPattern -or
+        $checksJob -match '(?m)^    (?:if|needs|continue-on-error):' -or
+        $testsJob -notmatch "(?m)^    if: needs\.changes\.outputs\.tests == 'true'\s*$" -or
+        $testsJob -match '(?m)^    continue-on-error:' -or
         $setupStep -notmatch
             '(?m)^        uses: mlugg/setup-zig@[^\s]+(?:\s+#.*)?\s*$' -or
         $setupStep -match $conditionalStepPattern -or
         $fullSuiteStep -notmatch
             '(?m)^        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all\s*$' -or
         $fullSuiteStep -match $conditionalStepPattern -or
-        $flagshipIndex -lt 0 -or
-        $setupIndex -le $flagshipIndex -or
+        $setupIndex -lt 0 -or
         $fullSuiteIndex -le $setupIndex) {
-        throw 'The early flagship contract must defer unavailable fixture execution to the same Windows job''s mandatory Setup Zig and full Zig test suite.'
+        throw 'The early flagship contract must run unconditionally in the checks job and defer unavailable fixture execution to the tests job''s mandatory Setup Zig and full Zig test suite.'
+    }
+    $gateJob = Get-YamlJobText `
+        -Content $WorkflowText `
+        -Name 'windows' `
+        -Source $Source
+    if ($gateJob -notmatch '(?m)^    needs: \[[^\]]*\bchecks\b[^\]]*\btests\b[^\]]*\]\s*$' -or
+        $gateJob -notmatch '-Expect [^\r\n]*\bchecks:always\b[^\r\n]*\btests:tests\b') {
+        throw 'The gate job must require both the checks job and the tests job.'
     }
 }
 
@@ -321,7 +338,7 @@ function Invoke-ZigFixtureBatch {
     if ($fixtures.Count -eq 0) { return }
     if (-not (Test-FlagshipZigFixtureExecutionEnabled)) {
         foreach ($fixture in $fixtures) {
-            Write-Host "ZIG-FIXTURE-EXECUTION-SKIPPED [$($fixture.Filter)]: deferred to mandatory full Zig suite in the same Windows job."
+            Write-Host "ZIG-FIXTURE-EXECUTION-SKIPPED [$($fixture.Filter)]: deferred to the mandatory full Zig suite in the tests job."
         }
         return
     }

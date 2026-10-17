@@ -7,6 +7,38 @@ Each interactive Win11 harness uses its own repo-local sandbox under
 only that harness's logs/temp state instead of tearing down sibling
 validators.
 
+## ci-scripts.ps1
+
+Tests for the CI helper scripts: the pull-request path filter
+(`scripts/ci-changed-paths.ps1`), the gate job's logic (`scripts/ci-gate.ps1`)
+and the parsers of the report-only nightly jobs (`scripts/ci-test-timing.ps1`,
+`scripts/ci-bench-trend.ps1`). `.github/workflows/test.yml` runs one
+always-on `checks` job (contracts, shell integration, site and release copy)
+and independent compiled jobs (`tests`, `bench`, `build`, `renderer-smoke`,
+`cross-arm64`, libghostty-vt, ConPTY probes, portable smoke), and
+`windows-arm64.yml` splits its tests from its package build. On a pull request
+a `changes` job lists the changed files, and a change that touches only files
+no compiled job reads (docs, the site, release and check scripts, harnesses
+the `checks` job runs) skips the compiled jobs with a job-level `if:`. A skipped
+job reports success, so no required check is left pending, and the gate jobs
+(`Windows Build And Tests`, `Native Windows ARM64 Tests`) fail when a needed job
+did not succeed or a job ran against its flag. The table of skippable files is
+an allowlist: a file it does not name runs everything. Push, schedule and manual
+runs always run everything.
+
+The test checks fixed cases and the table against the repository: every rule
+must match a tracked file; every repository path a Zig source names in a string
+literal must run all compiled jobs (a Zig unit test reads
+`scripts/package-windows.ps1`, so that script is not "script-only"); and every
+file reachable from the scripts a compiled job runs, through dot-sourcing and
+`Join-Path`, must keep that job. The reachability scan reads quoted file names
+and repo paths, so a script that builds a path at run time is not followed; add
+such a file to the table by hand.
+
+```powershell
+pwsh -NoProfile -File .\ci-scripts.ps1
+```
+
 ## interactive-win11-accessibility.ps1
 
 Full interactive UI Automation story for terminal text, focus, notifications,
