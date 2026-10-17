@@ -37,6 +37,75 @@ pub const NormalizedWheelScroll = struct {
     mods: input.ScrollMods = .{},
 };
 
+/// Whole chrome rows/tabs, retaining precision-wheel fractions between events.
+pub const WheelSteps = struct {
+    remainder: f64 = 0,
+    last_ms: ?u64 = null,
+
+    pub fn add(self: *WheelSteps, delta: f64, now_ms: u64) i32 {
+        if (delta == 0) return 0;
+        if (self.last_ms) |last| {
+            if (now_ms -| last >= 500 or
+                (self.remainder < 0 and delta > 0) or
+                (self.remainder > 0 and delta < 0)) self.remainder = 0;
+        }
+        self.last_ms = now_ms;
+        self.remainder += delta;
+        const steps: i32 = @intFromFloat(self.remainder);
+        self.remainder -= @floatFromInt(steps);
+        return steps;
+    }
+};
+
+/// Chrome uses fixed logical units rather than terminal cells. Positive
+/// horizontal messages mean right/next, the opposite of vertical up/previous.
+pub fn chromeWheelDelta(horizontal: bool, delta: i16, units_per_notch: u32) f64 {
+    const normalized = normalizeWheelDelta(.{
+        .settings = .{ .lines = 1, .chars = 1 },
+        .cell_size = .{ .width = units_per_notch, .height = units_per_notch },
+    }, if (horizontal) .horizontal else .vertical, delta);
+    return if (horizontal) -normalized.xoff else normalized.yoff;
+}
+
+pub fn tabDragThresholdExceeded(dx: i32, dy: i32, width: i32, height: i32) bool {
+    // SM_CXDRAG / SM_CYDRAG describe a rectangle centered on the press.
+    return dx > @divTrunc(@max(2, width), 2) or
+        dy > @divTrunc(@max(2, height), 2);
+}
+
+test "win32 chrome pointer wheel retains fractions and resets a gesture" {
+    var steps: WheelSteps = .{};
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 0));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 10));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 20));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(0.25, 30));
+    try std.testing.expectEqual(@as(i32, -2), steps.add(-2.5, 40));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.75, 50));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(0.25, 60));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.75, 70));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 600));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0, 610));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(0.75, 620));
+}
+
+test "win32 chrome pointer drag uses each DPI metric axis" {
+    try std.testing.expect(!tabDragThresholdExceeded(3, 3, 12, 16));
+    try std.testing.expect(!tabDragThresholdExceeded(6, 8, 12, 16));
+    try std.testing.expect(tabDragThresholdExceeded(7, 0, 12, 16));
+    try std.testing.expect(tabDragThresholdExceeded(0, 9, 12, 16));
+    try std.testing.expect(!tabDragThresholdExceeded(0, 0, 0, 0));
+}
+
+test "win32 chrome pointer wheel normalizes horizontal direction and palette rows" {
+    try std.testing.expectEqual(@as(f64, 1), chromeWheelDelta(false, 120, 1));
+    try std.testing.expectEqual(@as(f64, -1), chromeWheelDelta(true, 120, 1));
+    try std.testing.expectEqual(@as(f64, 1), chromeWheelDelta(true, -120, 1));
+    try std.testing.expectEqual(@as(f64, 3), chromeWheelDelta(false, 120, 3));
+    var steps: WheelSteps = .{};
+    for (0..3) |i| try std.testing.expectEqual(@as(i32, 0), steps.add(chromeWheelDelta(false, 10, 3), i));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(chromeWheelDelta(false, 10, 3), 3));
+}
+
 pub const GlobalHotkeySpec = struct {
     modifiers: UINT,
     vk: UINT,

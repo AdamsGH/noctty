@@ -330,6 +330,7 @@ pub extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: INTRESOU
 pub extern "user32" fn LoadImageW(hInst: HINSTANCE, name: INTRESOURCE, @"type": UINT, cx: i32, cy: i32, fuLoad: UINT) callconv(.winapi) ?*anyopaque;
 
 pub extern "user32" fn GetSystemMetrics(nIndex: i32) callconv(.winapi) i32;
+pub extern "user32" fn GetSystemMetricsForDpi(nIndex: i32, dpi: UINT) callconv(.winapi) i32;
 
 pub extern "user32" fn SetThreadDpiAwarenessContext(dpiContext: isize) callconv(.winapi) isize;
 
