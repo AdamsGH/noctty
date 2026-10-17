@@ -91,12 +91,17 @@ jobs:
       - name: Profile matrix on a hidden desktop
         shell: pwsh
         timeout-minutes: 10
-        run: ./test/windows/hidden-win11-profile-matrix.ps1 -Bin ./zig-out/bin -Run ./hidden-evidence/profile-matrix -AllowProductAumid -Renderer d3d11-warp
+        run: ./test/windows/hidden-win11-profile-matrix.ps1 -Bin ./zig-out/bin -Run ./hidden-evidence/profile-matrix -AllowProductAumid -RequireAll -Renderer d3d11-warp
 
       - name: Embedding idle exit leaves state alone
         shell: pwsh
         timeout-minutes: 5
         run: ./test/windows/hidden-win11-embedding-idle.ps1 -Bin ./zig-out/bin -Run ./hidden-evidence/embedding -AllowProductAumid
+
+      - name: Embedding window oracle negative control
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./test/windows/hidden-win11-embedding-idle.ps1 -Bin ./zig-out/bin -Run ./hidden-evidence/embedding-control -AllowProductAumid -NegativeControl -Renderer d3d11-warp
 
       # The build runner reports only a total of skipped tests; the executable run directly names them.
       - name: Per-test results from the test executable
@@ -151,4 +156,8 @@ jobs:
             zig-test.log
             ghostty-test.log
             hidden-evidence
+            !hidden-evidence/**/*.exe
+            !hidden-evidence/**/*.dll
+            !hidden-evidence/**/*.pdb
+            !hidden-evidence/**/share/**
             renderer-smoke/evidence

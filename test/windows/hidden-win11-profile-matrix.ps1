@@ -34,6 +34,8 @@ param(
     [Parameter(Mandatory)] [string] $Run,
     [switch] $Driver,
     [switch] $AllowProductAumid,
+    # CI knows all four profiles are installed; missing detection must fail rather than skip.
+    [switch] $RequireAll,
     [string[]] $Profile = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'git-bash'),
     # A machine without an OpenGL 4.3 driver (a hosted runner, a VM) needs `d3d11-warp` to open a window.
     [string] $Renderer = '',
@@ -48,6 +50,7 @@ if (-not $Driver) {
     $extra = @('-Profile', ($Profile -join ','))
     if ($Renderer) { $extra += @('-Renderer', $Renderer) }
     if ($AllowProductAumid) { $extra += '-AllowProductAumid' }
+    if ($RequireAll) { $extra += '-RequireAll' }
     Invoke-HiddenDriver -Script $PSCommandPath -Bin $Bin -Run $Run -TimeoutSeconds $DriverTimeoutSeconds -ExtraArguments $extra -Label 'Hidden profile matrix'
     exit
 }
@@ -265,7 +268,11 @@ function Invoke-Case([string] $Key, [switch] $Control) {
 
 foreach ($key in $Profile) {
     if (-not $expectations.ContainsKey($key)) { throw "Unknown profile '$key'." }
-    if (-not (Test-Available $key)) { $cases.Add(@{ Profile = $key; Result = 'skipped'; Reason = 'not installed on this machine' }); continue }
+    if (-not (Test-Available $key)) {
+        $cases.Add(@{ Profile = $key; Result = 'skipped'; Reason = 'not installed on this machine' })
+        if ($RequireAll) { Check $key 'required profile is installed and detected' $false 'available' 'not detected' }
+        continue
+    }
     Invoke-Case $key
 }
 if ($Profile -contains 'cmd.exe') { Invoke-Case 'cmd.exe' -Control }

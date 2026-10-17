@@ -455,7 +455,8 @@ and its history file is the real user's (the harness proves that file, the real
 `startup-attempts.json` and the clipboard sequence number did not change). A
 control case runs cmd with `shell-integration = none` and expects the seed to
 survive. No interactive WSL or SSH profile is started; startup discovery may
-probe WSL. A profile that is not installed is skipped and reported.
+probe WSL. A profile that is not installed is skipped and reported; `-RequireAll`
+turns any such skip into a failure. The hosted workflow requires all four.
 
 ```powershell
 pwsh -NoProfile -File .\hidden-win11-profile-matrix.ps1 -Bin <dir with noctty.exe> -Run <new dir>
@@ -468,7 +469,7 @@ AUMID in the real `%APPDATA%`, which redirection does not move) unless
 
 ## hidden-win11-embedding-idle.ps1
 
-Host-safe lifecycle of `noctty.exe -Embedding`, the process Windows starts to hand
+Ephemeral-runner lifecycle of `noctty.exe -Embedding`, the process Windows starts to hand
 over a delegated console. It starts one with nothing to hand over, with
 `LOCALAPPDATA` and the portable folder holding seeded `session-state.json`,
 `palette-mru.txt`, `update-state.json`, `jump-list-recents.json`,
@@ -478,6 +479,8 @@ file byte-identical, quarantines nothing and does not touch the console
 delegation values. `-NegativeControl` starts an ordinary instance instead and
 expects the window oracle to fire. It writes no delegation registry value and
 delivers no handoff; journeys that need one need a machine that can be restored.
+The workflow also runs that negative control with `-Renderer d3d11-warp` so
+an ordinary instance can open a window on the GPU-less runner.
 The harness refuses to start when the user's `DelegationTerminal` selects noctty:
 the measurement AUMID does not isolate the session's live COM handoff class.
 
@@ -493,9 +496,11 @@ desktop metadata receipts and binary fingerprints with its artifacts.
 Both scripts share `hidden-win11-lib.ps1` (private desktop, owned job, explicit
 desktop selection for harness launches, inherited desktop handles for direct
 children, observed descendant-thread desktop checks, and real-state receipts).
-The window oracle samples every 100 ms, so it does not prove the absence of a
-window whose whole lifetime falls between samples. No external broker journey
-is exercised. Keep the exact bundled and in-box ConPTY desktop evidence separate.
+The outer window oracle polls at nominal 100 ms intervals and thread metadata
+is sampled at most once per second; native calls and scheduling can delay either.
+Neither proves the absence of a window whose whole lifetime falls between samples.
+Unconnected threads are recorded separately from query errors. No external broker
+journey is exercised. Keep bundled and in-box ConPTY desktop evidence separate.
 
 ## ..\..\scripts\check-test-skips.ps1
 

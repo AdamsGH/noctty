@@ -4,7 +4,9 @@
 # Safety rules these harnesses keep (AGENTS.md, test/windows/README.md):
 #   * The driver and noctty use explicit desktop names and inherit ONE desktop
 #     handle, which their ordinary shell/discovery launches can propagate.
-#     Every observed job process/thread is checked; this is not broker isolation.
+#     Connected observed job threads are checked; unconnected threads are recorded.
+#     The outer process also checks its Default desktop for visible job windows.
+#     Sampling does not isolate short-lived processes or external brokers.
 #   * Launches are restricted to ephemeral GitHub-hosted runners until the exact
 #     bundled and in-box ConPTY host placement has been observed there.
 #   * Every noctty is a copy with a `noctty.portable` marker, with LOCALAPPDATA
@@ -32,7 +34,7 @@ public static class HiddenWin {
     }
     [StructLayout(LayoutKind.Sequential)] public struct ProcessInfo { public IntPtr process,thread; public int pid,tid; }
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow cb, IntPtr p);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool EnumWindows(EnumWindow cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumWindow cb, IntPtr p);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
@@ -145,14 +147,26 @@ public static class HiddenWin {
         return list.ToArray();
     }
     [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetThreadDesktop(uint threadId);
+    // SetLastError=true also refreshes .NET's cached last error after this call.
+    [DllImport("kernel32.dll", SetLastError=true)] static extern void SetLastError(uint error);
+    [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder name, int length, out int needed);
     public static string CurrentDesktopName() {
-        return ThreadDesktopName(GetCurrentThreadId());
+        // Connect this calling thread to its assigned desktop without creating a window.
+        if (GetDesktopWindow() == IntPtr.Zero) throw new Exception("Current desktop connection failed");
+        var name = ThreadDesktopName(GetCurrentThreadId());
+        if (string.IsNullOrEmpty(name)) throw new Exception("Current thread has no connected desktop");
+        return name;
     }
     public static string ThreadDesktopName(uint threadId) {
+        SetLastError(0);
         var desktop = GetThreadDesktop(threadId);
-        if (desktop == IntPtr.Zero) throw new Exception("GetThreadDesktop failed: " + Marshal.GetLastWin32Error());
+        if (desktop == IntPtr.Zero) {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 0) return null; // Non-GUI thread with no desktop connection.
+            throw new Exception("GetThreadDesktop failed: " + error);
+        }
         var name = new StringBuilder(256); int needed;
         if (!GetUserObjectInformationW(desktop, 2, name, 512, out needed))
             throw new Exception("Desktop name query failed: " + Marshal.GetLastWin32Error());
@@ -174,7 +188,7 @@ public static class HiddenWin {
     public sealed class DesktopObservation {
         public int ProcessId, ThreadId;
         public string Name, Desktop, Error;
-        public bool Exited;
+        public bool Exited, Unconnected;
     }
     static bool ConclusivelyExited(Process process) {
         try { return process.HasExited; } catch { return false; }
@@ -197,7 +211,10 @@ public static class HiddenWin {
                     foreach (ProcessThread thread in threads) {
                         row = new DesktopObservation { ProcessId = id, ThreadId = thread.Id, Name = process.ProcessName };
                         rows.Add(row);
-                        try { row.Desktop = ThreadDesktopName((uint)thread.Id); }
+                        try {
+                            row.Desktop = ThreadDesktopName((uint)thread.Id);
+                            row.Unconnected = row.Desktop == null;
+                        }
                         catch { row.Exited = ConclusivelyExited(process); if (!row.Exited) row.Error = "Thread desktop query failed"; }
                     }
                 } catch {
@@ -207,6 +224,23 @@ public static class HiddenWin {
                 }
             }
         }
+        return rows.ToArray();
+    }
+    public sealed class DesktopWindowObservation {
+        public int ProcessId, ThreadId;
+    }
+    // EnumWindows sees the calling thread's desktop. Call only from the outer Default driver.
+    // No window titles or unrelated window metadata are retained.
+    public static DesktopWindowObservation[] VisibleJobWindows(IntPtr job) {
+        var ids = new HashSet<int>(JobProcessIds(job));
+        var rows = new List<DesktopWindowObservation>();
+        SetLastError(0);
+        if (!EnumWindows((h, p) => {
+            int id; int tid = GetWindowThreadProcessId(h, out id);
+            if (ids.Contains(id) && IsWindowVisible(h))
+                rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid });
+            return true;
+        }, IntPtr.Zero)) throw new Exception("Default desktop window enumeration failed: " + Marshal.GetLastWin32Error());
         return rows.ToArray();
     }
     public static bool ContainsBytes(byte[] hay, byte[] needle) {
@@ -231,6 +265,10 @@ function Assert-HiddenRunner {
 # Metadata only, including the driver and every currently observed member of its job.
 # Short-lived processes between samples and external brokers are outside this receipt.
 function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $ReceiptPath, [int] $DriverPid = $PID) {
+    if (-not (Get-Variable -Name hiddenDesktopSamples -Scope Script -ErrorAction Ignore)) { $script:hiddenDesktopSamples = @{} }
+    $sampleKey = "$Job/$DesktopName/$ReceiptPath/$DriverPid"
+    $lastSample = $script:hiddenDesktopSamples[$sampleKey]
+    if ($null -ne $lastSample -and ([datetime]::UtcNow - $lastSample).TotalSeconds -lt 1) { return }
     try {
         $ids = @(@([HiddenWin]::JobProcessIds($Job)) + $DriverPid | Select-Object -Unique)
         $rows = @([HiddenWin]::ObserveDesktopThreads([int[]]$ids))
@@ -244,9 +282,26 @@ function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $Re
         ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath $ReceiptPath
     foreach ($row in $rows) {
         if (($row.Desktop -and $row.Desktop -cne $DesktopName) -or
-            (-not $row.Exited -and ($row.Error -or -not $row.Desktop))) {
+            (-not $row.Exited -and ($row.Error -or (-not $row.Desktop -and -not $row.Unconnected)))) {
             throw "Hidden desktop confinement failed for PID=$($row.ProcessId) TID=$($row.ThreadId); inspect metadata receipt."
         }
+    }
+    $script:hiddenDesktopSamples[$sampleKey] = [datetime]::UtcNow
+}
+
+# Called every outer wait tick, independently of the slower thread metadata receipt.
+# A failure escapes the wait loop and immediately closes the entire owned driver job.
+function Assert-HiddenDefaultDesktop([IntPtr] $Job, [string] $ReceiptPath) {
+    try { $windows = @([HiddenWin]::VisibleJobWindows($Job)) }
+    catch {
+        @{ At = [datetime]::UtcNow.ToString('o'); Error = 'Default desktop window query failed' } |
+            ConvertTo-Json -Compress | Add-Content -LiteralPath $ReceiptPath
+        throw 'Hidden desktop default-window query failed; further launches are blocked.'
+    }
+    if ($windows.Count) {
+        @{ At = [datetime]::UtcNow.ToString('o'); Desktop = 'Default'; Windows = $windows } |
+            ConvertTo-Json -Depth 4 -Compress | Add-Content -LiteralPath $ReceiptPath
+        throw 'Hidden desktop visible job window found on Default; further launches are blocked.'
     }
 }
 
@@ -310,6 +365,7 @@ function Invoke-HiddenDriver {
         [Parameter(Mandatory)] [int] $TimeoutSeconds, [string[]] $ExtraArguments = @(), [Parameter(Mandatory)] [string] $Label
     )
     Assert-HiddenRunner
+    if ([HiddenWin]::CurrentDesktopName() -cne 'Default') { throw 'Outer hidden harness must observe the Default desktop.' }
     $Bin = (Resolve-Path -LiteralPath $Bin).Path
     $Run = [IO.Path]::GetFullPath($Run)
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
@@ -339,9 +395,11 @@ function Invoke-HiddenDriver {
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
         while ([HiddenWin]::WaitForSingleObject($pi.process, 100) -eq 258) {
+            Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')
             Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $pi.pid -ReceiptPath (Join-Path $Run 'driver-desktops.jsonl')
             if ([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $TimeoutSeconds seconds; the owned process job will be closed." }
         }
+        Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')
         [uint32]$exit = 0; [void][HiddenWin]::GetExitCodeProcess($pi.process, [ref]$exit); $code = [int]$exit
     } finally {
         $env:LOCALAPPDATA = $oldLocal; $env:APPDATA = $oldRoaming
@@ -378,6 +436,7 @@ function Invoke-HiddenDriver {
 function Start-HiddenNoctty {
     param([Parameter(Mandatory)] [string] $Dir, [Parameter(Mandatory)] [string[]] $Arguments, [Parameter(Mandatory)] [string] $DesktopName, [Parameter(Mandatory)] [IntPtr] $Job, [string] $StderrPath)
     Assert-HiddenRunner
+    Assert-HiddenDesktop -Job $Job -DesktopName $DesktopName -ReceiptPath (Join-Path $Dir 'launch-desktops.jsonl')
     $exe = Join-Path $Dir 'noctty.exe'
     if (-not (Test-Path -LiteralPath (Join-Path $Dir 'noctty.portable'))) { throw 'Portable marker missing; launch blocked.' }
     $line = '"{0}" {1}' -f $exe, ($Arguments -join ' ')

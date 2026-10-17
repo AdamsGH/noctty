@@ -21,7 +21,7 @@ binary must carry the measurement AUMID unless -AllowProductAumid is given (an e
 Before any launch, the delegation guard must pass: this refuses to run while HKCU Console\%%Startup
 selects noctty as DelegationTerminal, because the real COM handoff CLSID is shared even by a
 measurement build. Run only in a sandbox with independent delegation in that case; no bypass exists.
-Exit 1 when a check fails. Opt in: nothing runs it automatically.
+Exit 1 when a check fails. The optional Windows 10 branches workflow runs both modes.
 Launches currently require an ephemeral GitHub-hosted runner. Job/thread desktop metadata is
 recorded while the process runs; sampling does not establish isolation of arbitrary external brokers.
 #>
@@ -33,6 +33,8 @@ param(
     [switch] $AllowProductAumid,
     # Starts an ordinary instance instead, to show the oracle is not vacuous: it must open a host window.
     [switch] $NegativeControl,
+    # The ordinary-instance negative control needs WARP on a GPU-less hosted runner.
+    [string] $Renderer = '',
     [ValidateRange(30, 600)] [int] $DriverTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
@@ -43,6 +45,7 @@ Assert-EmbeddingDelegationSafe
 if (-not $Driver) {
     Assert-MeasureAumid (Join-Path (Resolve-Path -LiteralPath $Bin).Path 'noctty.exe') -AllowProductAumid:$AllowProductAumid
     $extra = @(); if ($AllowProductAumid) { $extra += '-AllowProductAumid' }; if ($NegativeControl) { $extra += '-NegativeControl' }
+    if ($Renderer) { $extra += @('-Renderer', $Renderer) }
     Invoke-HiddenDriver -Script $PSCommandPath -Bin $Bin -Run $Run -TimeoutSeconds $DriverTimeoutSeconds -ExtraArguments $extra -Label 'Hidden embedding idle'
     exit
 }
@@ -67,7 +70,7 @@ $seeds = [ordered]@{
     'update-state.json'     = '{"schema_version":1}'
     'jump-list-recents.json' = '{"schema_version":1,"recents":[]}'
     'startup-attempts.json' = '{"schema_version":1,"attempts":[]}'
-    'config.ghostty'        = "font-size = 13`n"
+    'config.ghostty'        = "font-size = 13`n" + $(if ($Renderer) { "renderer = $Renderer`n" } else { '' })
 }
 foreach ($stateDir in $stateDirs) {
     foreach ($name in $seeds.Keys) { Set-Content -LiteralPath (Join-Path $stateDir $name) -Value $seeds[$name] -NoNewline -Encoding utf8NoBOM }
