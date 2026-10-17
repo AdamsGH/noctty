@@ -368,8 +368,12 @@ weeks, chocolatey.org refuses further pushes with `403`, and that step fails
 after everything else has published.
 [docs/chocolatey-publishing.md](docs/chocolatey-publishing.md) has the
 maintainer's steps for the first submission and for resubmitting a version
-during moderation; do not rerun a published Release for that. To publish a
-generated package manually:
+during moderation; do not rerun a published Release for that. To push a
+version that is already released, dispatch the **Chocolatey Publish**
+workflow (`.github/workflows/chocolatey-publish.yml`, `version` input; `push`
+off is a dry run that verifies the release and packs); it verifies the
+published assets and then runs `scripts/release-publish-chocolatey.ps1`, the
+script the Release step uses. To publish a generated package by hand:
 
 ```powershell
 choco pack .\noctty.nuspec --output-directory .\out

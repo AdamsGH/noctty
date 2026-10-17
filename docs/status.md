@@ -259,7 +259,8 @@ Win32-validated VT protocol coverage is tracked in
   `CHOCO_API_KEY` secret is configured, as in 1.3.132; community.chocolatey.org
   had no `noctty` package on 2026-10-16). The first submission then waits in
   moderation for weeks, and later pushes get `403` until a version is
-  approved; see [chocolatey-publishing.md](chocolatey-publishing.md).
+  approved; see [chocolatey-publishing.md](chocolatey-publishing.md). A
+  released version is pushed with the manual Chocolatey Publish workflow.
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
 
 ### Crash reports

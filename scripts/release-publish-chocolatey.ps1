@@ -15,13 +15,27 @@ param(
 
     [string] $PushSource = 'https://push.chocolatey.org/',
 
-    [string] $QuerySource = 'https://community.chocolatey.org/api/v2/'
+    [string] $QuerySource = 'https://community.chocolatey.org/api/v2/',
+
+    # Do everything up to `choco push`: ask the feed, pack, and check that one
+    # package came out. It needs no API key and never contacts the push source,
+    # which is what the manual Chocolatey Publish workflow's dry run relies on.
+    [switch] $PackOnly,
+
+    # Push even though the feed lists this version. The exact-version lookup
+    # below also answers 200 for a version still in moderation (measured on
+    # 2026-10-17 for Submitted and Ready ones, which FindPackagesById omits), so
+    # without this a corrected package for a version in moderation, which
+    # Chocolatey wants under the same version, would always be skipped. A failed
+    # push is then never counted as complete: the version being listed proves
+    # nothing about the bytes the feed holds.
+    [switch] $Resubmit
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 
-if (-not $env:CHOCO_API_KEY) {
+if (-not $PackOnly -and -not $env:CHOCO_API_KEY) {
     Write-Host 'Skipping Chocolatey publish: CHOCO_API_KEY is not configured.'
     return
 }
@@ -89,8 +103,14 @@ if (Test-ChocolateyVersionPublished `
         -Name $packageName `
         -PackageVersion $Version `
         -Source $QuerySource) {
-    Write-Host "Chocolatey already has $packageName $Version; nothing to push."
-    return
+    if (-not $Resubmit) {
+        Write-Host "Chocolatey already has $packageName $Version; nothing to push."
+        # A dry run still packs, so it shows what a -Resubmit run would push.
+        if (-not $PackOnly) { return }
+    }
+    else {
+        Write-Host "Chocolatey lists $packageName $Version; -Resubmit pushes it again."
+    }
 }
 
 if (-not $PSCmdlet.ShouldProcess($PushSource, "publish $packageName $Version to Chocolatey")) {
@@ -103,16 +123,31 @@ if (Test-Path -LiteralPath $packageOutputDir) {
 }
 New-Item -ItemType Directory -Path $packageOutputDir -Force | Out-Null
 
-& choco pack $nuspecPath `
-    --output-directory $packageOutputDir `
-    --limit-output
-if ($LASTEXITCODE -ne 0) {
-    throw "choco pack failed with exit code $LASTEXITCODE."
+# The key is for the push alone: take it out of this process's environment
+# while choco pack runs, so the packing process does not inherit it.
+$apiKey = $env:CHOCO_API_KEY
+Remove-Item -LiteralPath Env:CHOCO_API_KEY -ErrorAction Ignore
+try {
+    & choco pack $nuspecPath `
+        --output-directory $packageOutputDir `
+        --limit-output
+    $packExitCode = $LASTEXITCODE
+}
+finally {
+    if ($apiKey) { $env:CHOCO_API_KEY = $apiKey }
+}
+if ($packExitCode -ne 0) {
+    throw "choco pack failed with exit code $packExitCode."
 }
 
 $packages = @(Get-ChildItem -LiteralPath $packageOutputDir -Filter '*.nupkg' -File)
 if ($packages.Count -ne 1) {
     throw "Expected one Chocolatey package; found $($packages.Count)."
+}
+
+if ($PackOnly) {
+    Write-Host "Packed $($packages[0].Name) ($($packages[0].Length) bytes, SHA-256 $(Get-FileSha256Lower -Path $packages[0].FullName)); -PackOnly stops here, nothing was pushed."
+    return
 }
 
 $pushOutput = & choco push $packages[0].FullName `
@@ -127,10 +162,10 @@ if ($pushExitCode -ne 0) {
     # end state then holds. The status code cannot say that on its own: the
     # feed also answers 409 Conflict for a package that fails its basic
     # validation, so ask the feed again instead of reading the response.
-    if (Test-ChocolateyVersionPublished `
+    if (-not $Resubmit -and (Test-ChocolateyVersionPublished `
             -Name $packageName `
             -PackageVersion $Version `
-            -Source $QuerySource) {
+            -Source $QuerySource)) {
         Write-Host "Chocolatey already has $packageName $Version; treating the push as complete."
         # GitHub's pwsh wrapper exits with the last native exit code, which is
         # still the failed push's.

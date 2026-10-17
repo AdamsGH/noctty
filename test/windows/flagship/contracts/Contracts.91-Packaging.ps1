@@ -49,9 +49,9 @@ Invoke-ContractTable -Contracts @(
     }
     @{
         File = (Join-Path $repoRoot 'scripts\release-publish-chocolatey.ps1')
-        Pattern = '(?ms)Test-ChocolateyVersionPublished.*?nothing to push.*?choco push.*?\$pushExitCode -ne 0\) \{\s*(?:#[^\n]*\n\s*)*if \(Test-ChocolateyVersionPublished.*?treating the push as complete.*?\$global:LASTEXITCODE = 0\s*return\s*\}.*?throw "choco push failed'
+        Pattern = '(?ms)Test-ChocolateyVersionPublished.*?nothing to push.*?choco push.*?\$pushExitCode -ne 0\) \{\s*(?:#[^\n]*\n\s*)*if \(-not \$Resubmit -and \(Test-ChocolateyVersionPublished.*?treating the push as complete.*?\$global:LASTEXITCODE = 0\s*return\s*\}.*?throw "choco push failed'
         Kind = 'Workflow'
-        Description = 'Chocolatey publishing is rerun-safe and tolerates a failed push only when the feed then holds the version (409 also means a failed validation)'
+        Description = 'Chocolatey publishing is rerun-safe and tolerates a failed push only when the feed then holds the version and the run is not a deliberate resubmission (409 also means a failed validation)'
     }
     @{
         File = $releaseWorkflow
