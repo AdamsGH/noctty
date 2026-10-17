@@ -436,15 +436,33 @@ pub const Face = struct {
         try self.face.loadGlyph(glyph_index, self.glyphLoadFlags(opts.constraint.doesAnything()));
         const glyph = self.face.handle.*.glyph;
 
-        // For synthetic bold, we embolden the glyph.
-        if (self.synthetic.bold) {
-            // We need to scale the embolden amount based on the font size.
-            // This is a heuristic I found worked well across a variety of
-            // founts: 1 pixel per 64 units of height.
-            const font_height: f64 = @floatFromInt(self.face.handle.*.size.*.metrics.height);
-            const ratio: f64 = 64.0 / 2048.0;
-            const amount = @ceil(font_height * ratio);
-            _ = freetype.c.FT_Outline_Embolden(&glyph.*.outline, @intFromFloat(amount));
+        // Embolden outlines before measuring them, so constraints, bearings and
+        // atlas allocation all include the extra stroke. Bitmap/color glyphs
+        // retain their existing raster data. Use the stronger request instead
+        // of applying synthetic bold and aesthetic thickening twice.
+        if (glyph.*.format == freetype.c.FT_GLYPH_FORMAT_OUTLINE) {
+            const size_metrics = self.face.handle.*.size.*.metrics;
+            var amount: f64 = 0;
+            if (self.synthetic.bold) {
+                // Preserve the existing synthetic-bold amount (26.6 units).
+                const font_height: f64 = @floatFromInt(size_metrics.height);
+                amount = @ceil(font_height * (64.0 / 2048.0));
+            }
+            if (opts.thicken and atlas.format == .grayscale) {
+                // The maximum is 1/32 em, scaled by the current size/DPI.
+                // Strength 0 is the lightest positive stroke, not disabled.
+                const pixels_per_em: f64 = @floatFromInt(size_metrics.y_ppem);
+                const fraction = (@as(f64, @floatFromInt(opts.thicken_strength)) + 1) / 256;
+                // FreeType halves the strength internally; one 26.6 unit
+                // rounds to zero. Two units are its smallest useful stroke.
+                amount = @max(amount, @max(2, @ceil(pixels_per_em * 2 * fraction)));
+            }
+            if (amount > 0) {
+                // Preserve synthetic bold's fallback for outlines FreeType
+                // cannot orient (for example, zero-area contours): render
+                // the original glyph rather than failing its cache entry.
+                _ = freetype.c.FT_Outline_Embolden(&glyph.*.outline, @intFromFloat(amount));
+            }
         }
 
         // We get a rect that represents the position
@@ -1155,6 +1173,120 @@ test {
         );
         try testing.expectEqual(@as(u32, 21), g2.height);
     }
+}
+
+test "font-thicken grows the outline and raster coverage with strength" {
+    const alloc = testing.allocator;
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var face = try Face.init(lib, font.embedded.regular, .{ .size = .{ .points = 12 } });
+    defer face.deinit();
+
+    const normal = try fontThickenSample(&face, 'H', false, 255, .grayscale);
+    const light = try fontThickenSample(&face, 'H', true, 0, .grayscale);
+    const medium = try fontThickenSample(&face, 'H', true, 127, .grayscale);
+    const strong = try fontThickenSample(&face, 'H', true, 255, .grayscale);
+    try testing.expect(light.outline_width > normal.outline_width);
+    try testing.expect(light.outline_height > normal.outline_height);
+    try testing.expect(medium.outline_width > light.outline_width);
+    try testing.expect(strong.outline_width > medium.outline_width);
+    try testing.expect(light.coverage > normal.coverage);
+    try testing.expect(medium.coverage > light.coverage);
+    try testing.expect(strong.coverage > medium.coverage);
+    try testing.expectEqual(normal.cell_width, strong.cell_width);
+    try testing.expectEqual(normal.cell_height, strong.cell_height);
+    try testing.expectEqualDeep(normal, try fontThickenSample(&face, 'H', false, 0, .grayscale));
+    // Loading the slot anew must prevent thickening from accumulating.
+    try testing.expectEqualDeep(strong, try fontThickenSample(&face, 'H', true, 255, .grayscale));
+}
+
+test "font-thicken scales with DPI and does not double synthetic bold" {
+    const alloc = testing.allocator;
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var face = try Face.init(lib, font.embedded.regular, .{ .size = .{ .points = 12 } });
+    defer face.deinit();
+    var large = try Face.init(lib, font.embedded.regular, .{ .size = .{ .points = 12, .xdpi = 192, .ydpi = 192 } });
+    defer large.deinit();
+    const normal = try fontThickenSample(&face, 'H', false, 255, .grayscale);
+    const thick = try fontThickenSample(&face, 'H', true, 255, .grayscale);
+    const large_normal = try fontThickenSample(&large, 'H', false, 255, .grayscale);
+    const large_thick = try fontThickenSample(&large, 'H', true, 255, .grayscale);
+    try testing.expectEqual(2 * (thick.outline_width - normal.outline_width), large_thick.outline_width - large_normal.outline_width);
+    face.synthetic.bold = true;
+    const bold = try fontThickenSample(&face, 'H', false, 255, .grayscale);
+    try testing.expectEqualDeep(bold, try fontThickenSample(&face, 'H', true, 255, .grayscale));
+}
+
+test "font-thicken preserves bitmap and color glyphs" {
+    const alloc = testing.allocator;
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var bitmap = try Face.init(lib, font.embedded.terminus_ttf, .{ .size = .{ .points = 12 } });
+    defer bitmap.deinit();
+    try testing.expectEqualDeep(
+        try fontThickenSample(&bitmap, 'i', false, 255, .grayscale),
+        try fontThickenSample(&bitmap, 'i', true, 255, .grayscale),
+    );
+    var emoji = try Face.init(lib, font.embedded.emoji, .{ .size = .{ .points = 12 } });
+    defer emoji.deinit();
+    try testing.expectEqualDeep(
+        try fontThickenSample(&emoji, '🥸', false, 255, .bgra),
+        try fontThickenSample(&emoji, '🥸', true, 255, .bgra),
+    );
+}
+
+const FontThickenSample = struct {
+    outline_width: freetype.c.FT_Pos = 0,
+    outline_height: freetype.c.FT_Pos = 0,
+    cell_width: u32,
+    cell_height: u32,
+    width: u32,
+    height: u32,
+    offset_x: i32,
+    offset_y: i32,
+    coverage: u64 = 0,
+    pixels_sha256: [32]u8 = undefined,
+};
+
+fn fontThickenSample(face: *Face, cp: u21, thicken: bool, strength: u8, format: font.Atlas.Format) !FontThickenSample {
+    const alloc = testing.allocator;
+    var atlas = try font.Atlas.init(alloc, 512, format);
+    defer atlas.deinit(alloc);
+    const metrics = font.Metrics.calc(face.getMetrics());
+    const glyph = try face.renderGlyph(alloc, &atlas, face.glyphIndex(cp).?, .{
+        .grid_metrics = metrics,
+        .thicken = thicken,
+        .thicken_strength = strength,
+    });
+    var result: FontThickenSample = .{
+        .cell_width = metrics.cell_width,
+        .cell_height = metrics.cell_height,
+        .width = glyph.width,
+        .height = glyph.height,
+        .offset_x = glyph.offset_x,
+        .offset_y = glyph.offset_y,
+    };
+    // FT_Render_Glyph preserves the loaded outline while adding its bitmap.
+    // Measure the actual production outline, not a separate embolden call.
+    face.ft_mutex.lock();
+    defer face.ft_mutex.unlock();
+    const outline = &face.face.handle.*.glyph.*.outline;
+    if (outline.n_points > 0) {
+        var box: freetype.c.FT_BBox = undefined;
+        try testing.expectEqual(0, freetype.c.FT_Outline_Get_BBox(outline, &box));
+        result.outline_width = box.xMax - box.xMin;
+        result.outline_height = box.yMax - box.yMin;
+    }
+    const row_bytes = glyph.width * format.depth();
+    var pixels_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (0..glyph.height) |y| {
+        const row = atlas.data[(glyph.atlas_y + y) * atlas.size * format.depth() + glyph.atlas_x * format.depth() ..][0..row_bytes];
+        pixels_hash.update(row);
+        for (row) |pixel| result.coverage += pixel;
+    }
+    pixels_hash.final(&result.pixels_sha256);
+    return result;
 }
 
 test "color emoji" {

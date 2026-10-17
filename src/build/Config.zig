@@ -24,7 +24,7 @@ renderer_test_tools: bool = false,
 font_backend: FontBackend = .freetype,
 
 /// Feature flags
-sentry: bool = true,
+sentry: bool = false,
 simd: bool = true,
 i18n: bool = true,
 custom_shaders: bool = false,
@@ -150,13 +150,8 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
     config.sentry = b.option(
         bool,
         "sentry",
-        "Build with Sentry crash reporting. Enabled by default for Windows in this fork.",
-    ) orelse sentry: {
-        switch (target.result.os.tag) {
-            .windows => break :sentry true,
-            else => break :sentry false,
-        }
-    };
+        "Build with the Sentry SDK (disabled by default; Windows uses local minidumps independently).",
+    ) orelse false;
 
     config.simd = b.option(
         bool,

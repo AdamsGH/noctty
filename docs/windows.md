@@ -795,6 +795,16 @@ render trace when the first traced surface is destroyed. Presented fps is
 `(swap_buffers_count - 1) * 1000 / (last_swap_at_ms - first_swap_at_ms)`
 when at least two swaps are present and the time difference is positive.
 
+## Font stroke weight
+
+`font-thicken = true` thickens FreeType grayscale outline glyphs before
+cell fitting. `font-thicken-strength` ranges from `0` (the lightest positive
+stroke) to `255` (the default strength, approximately 1/32 em). The stroke
+scales with font size and DPI; the terminal's cell grid stays the same.
+Bitmap fonts and color emoji keep their original pixels. When a font needs
+synthetic bold, noctty uses the stronger stroke instead of stacking both.
+Thickening is off by default.
+
 ## Keyboard
 
 Key events are translated with the active Windows keyboard layout, so the

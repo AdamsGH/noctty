@@ -151,7 +151,7 @@ pub const GlobalState = struct {
         // Initialize our crash reporting.
         crash.init(self.alloc) catch |err| {
             std.log.warn(
-                "sentry init failed, no crash capture available err={}",
+                "crash capture init failed, no crash capture available err={}",
                 .{err},
             );
         };

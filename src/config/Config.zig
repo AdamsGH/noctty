@@ -395,8 +395,9 @@ renderer: RendererBackend = .opengl,
 /// Note: This only applies to text copying operations, not URL copying.
 @"clipboard-codepoint-map": RepeatableClipboardCodepointMap = .{},
 
-/// Draw fonts with a thicker stroke, if supported by the active renderer and
-/// font pipeline.
+/// Draw fonts with a thicker stroke. On Windows this thickens FreeType
+/// grayscale outlines before cell fitting, without changing the cell grid.
+/// Bitmap fonts and color emoji are unchanged.
 @"font-thicken": bool = false,
 
 /// Strength of thickening when `font-thicken` is enabled.
@@ -405,6 +406,8 @@ renderer: RendererBackend = .opengl,
 /// *no* thickening, rather it corresponds to the lightest available thickening.
 ///
 /// Has no effect when `font-thicken` is set to `false`.
+/// Scales with font size and DPI, up to 1/32 em. When synthetic bold is
+/// needed, the stronger stroke is used instead of adding both amounts.
 @"font-thicken-strength": u8 = 255,
 
 /// Locations to break font shaping into multiple runs.

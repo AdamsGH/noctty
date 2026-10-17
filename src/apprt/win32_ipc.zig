@@ -12,6 +12,9 @@ const PIPE_READMODE_BYTE = 0x00000000;
 const security_sqos_present: windows.DWORD = 0x00100000;
 const security_identification: windows.DWORD = 0x00010000;
 pub const pipe_nowait = 0x00000001;
+/// A named-pipe server impersonates at SecurityImpersonation by default.
+/// Identification-level SQOS lets it query the client's identity, but not
+/// open objects on the client's behalf. Keep both flags on every client open.
 pub const client_pipe_open_flags: windows.DWORD = windows.FILE_ATTRIBUTE_NORMAL |
     security_sqos_present |
     security_identification;
