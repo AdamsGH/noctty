@@ -10,7 +10,6 @@ const builtin = @import("builtin");
 const windows = std.os.windows;
 const Allocator = std.mem.Allocator;
 
-const internal_os = @import("../../os/main.zig");
 const win32_types = @import("../win32_types.zig");
 const sys = @import("sys.zig");
 const pixel_format = @import("pixel_format.zig");

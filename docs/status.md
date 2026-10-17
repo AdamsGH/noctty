@@ -336,13 +336,15 @@ proves, and per-reader results are in
 ### Link previews
 
 `link-previews` is parsed and the shared core emits link-hover preview
-actions, but the Win32 runtime does not render the preview tooltip. Link
-matching, hover highlighting, and opening work.
+actions, but the Win32 runtime does not render the preview tooltip. The
+Settings control is disabled and says "not supported on Windows"; the config
+key and tested hover tracker remain for compatibility and future wiring.
+Link matching, hover highlighting, and opening work.
 
 ### Status bar
 
-Not shipping. `Host.statusBarHeight()` returns 0, so no terminal rows are
-reserved; host banners and overlays carry transient status instead.
+Removed. No terminal rows are reserved; host banners and overlays carry
+transient status instead.
 
 ### Win32 runtime extraction
 

@@ -5,7 +5,6 @@ const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const windows_shell = @import("../../config/windows_shell.zig");
 const input = @import("../../input.zig");
-const terminal = @import("../../terminal/main.zig");
 const unicode = @import("../../unicode/main.zig");
 
 const win32_elevation = @import("../win32_elevation.zig");
@@ -67,24 +66,6 @@ const search_results_pending = "Searching";
 const search_results_none = "No matches";
 const search_results_invalid = "Invalid pattern";
 
-pub const SearchStatus = struct {
-    active: bool = false,
-    needle: ?[]const u8 = null,
-    total: ?usize = null,
-    selected: ?usize = null,
-};
-
-pub const SurfaceStatus = struct {
-    pwd: ?[]const u8 = null,
-    scrollbar: terminal.Scrollbar = .zero,
-    readonly: bool = false,
-    secure_input: bool = false,
-    key_sequence_active: bool = false,
-    key_table_name: ?[]const u8 = null,
-    search: SearchStatus = .{},
-    progress: ?[]const u8 = null,
-};
-
 pub const HostTabStatus = struct {
     index: usize = 0,
     total: usize = 1,
@@ -93,12 +74,6 @@ pub const HostTabStatus = struct {
 const VisibleTabRange = struct {
     start: usize,
     count: usize,
-};
-
-const TabOverviewEntry = struct {
-    title: ?[]const u8 = null,
-    pane_count: usize = 1,
-    active: bool = false,
 };
 
 pub const HostBannerKind = enum {
@@ -134,37 +109,6 @@ const SearchButtonKeyAction = enum {
     dismiss,
 };
 
-const TabsButtonKeyAction = enum {
-    previous,
-    next,
-    rename,
-    overview,
-};
-
-const CommandButtonKeyAction = enum {
-    toggle,
-    previous,
-    next,
-    dismiss,
-};
-
-const ProfilesButtonKeyAction = enum {
-    open,
-    toggle,
-    previous,
-    next,
-    first,
-    last,
-};
-
-const QuickSlotFocusKeyAction = enum {
-    previous,
-    next,
-    first,
-    last,
-    open,
-};
-
 pub const LaunchTargetButtonKeyAction = enum {
     previous,
     next,
@@ -197,19 +141,9 @@ pub fn ownedStringEquals(current: ?[:0]const u8, value: []const u8) bool {
 /// to scroll does not strand focus outside the cycle.
 pub const OverlayFocusSlot = enum { edit, preview, accept, cancel };
 
-const ScrollStatusKey = struct {
-    visible: bool,
-    percent: usize,
-};
-
 const ResizeSplitFallbackDelta = struct {
     width: i32 = 0,
     height: i32 = 0,
-};
-
-const SurfaceOrderEntry = struct {
-    host_id: u32,
-    host_active: bool,
 };
 
 pub const SearchBarResultsVisual = struct {
@@ -347,13 +281,6 @@ pub fn tabClosedMessage(set: *const input.Binding.Set, options: struct { has_mod
     return writer.buffered();
 }
 
-fn searchDirectionFromWheelDelta(delta: i16) input.Binding.Action.NavigateSearch {
-    return if (delta > 0)
-        .next
-    else
-        .previous;
-}
-
 pub fn searchSelectedRawFromCoreDisplay(selected: ?usize) ?usize {
     const value = selected orelse return null;
     if (value == 0) return null;
@@ -402,16 +329,8 @@ pub fn searchBarDisplayStateChanged(
         search_bar.selected != selected;
 }
 
-pub fn profileChromeVisible(overlay_mode: HostOverlayMode, status_bar_height: i32) bool {
-    return win32_chrome_state.profileVisible(overlay_mode, status_bar_height);
-}
-
-pub fn profileChromeNeedsFullTextInvalidation(overlay_mode: HostOverlayMode, status_bar_height: i32) bool {
-    return win32_chrome_state.profileNeedsFullTextInvalidation(overlay_mode, status_bar_height);
-}
-
-pub fn chromeTextNeedsFullInvalidation(status_bar_height: i32) bool {
-    return win32_chrome_state.textNeedsFullInvalidation(status_bar_height);
+pub fn profileChromeVisible(overlay_mode: HostOverlayMode) bool {
+    return win32_chrome_state.profileVisible(overlay_mode);
 }
 
 pub fn inspectorVisibilityChangeNeedsHostRelayout(changed: bool) bool {
@@ -551,8 +470,8 @@ pub fn nextVisibleOverlayFocusSlot(
     return null;
 }
 
-pub fn inspectorChromeVisible(overlay_mode: HostOverlayMode, status_bar_height: i32) bool {
-    return win32_chrome_state.inspectorVisible(overlay_mode, status_bar_height);
+pub fn inspectorChromeVisible(overlay_mode: HostOverlayMode) bool {
+    return win32_chrome_state.inspectorVisible(overlay_mode);
 }
 
 pub fn inspectorBannerStateChanged(
@@ -568,43 +487,6 @@ pub fn inspectorBannerStateChanged(
 
 pub fn windowTitleSyncChanged(current: ?[:0]const u8, next: []const u8) bool {
     return !ownedStringEquals(current, next);
-}
-
-fn scrollStatusKey(scrollbar: terminal.Scrollbar) ScrollStatusKey {
-    const visible = scrollbar.total > scrollbar.len and
-        scrollbar.offset + scrollbar.len < scrollbar.total;
-    const percent = if (visible and scrollbar.total > 0)
-        (scrollbar.offset * 100) / scrollbar.total
-    else
-        0;
-    return .{
-        .visible = visible,
-        .percent = percent,
-    };
-}
-
-pub fn scrollStatusTextChanged(previous: terminal.Scrollbar, next: terminal.Scrollbar) bool {
-    return !std.meta.eql(scrollStatusKey(previous), scrollStatusKey(next));
-}
-
-fn tabsButtonKeyAction(vk: WPARAM) ?TabsButtonKeyAction {
-    return switch (vk) {
-        c.VK_LEFT, c.VK_UP => .previous,
-        c.VK_RIGHT, c.VK_DOWN => .next,
-        c.VK_F2 => .rename,
-        c.VK_APPS => .overview,
-        else => null,
-    };
-}
-
-fn commandButtonKeyAction(vk: WPARAM) ?CommandButtonKeyAction {
-    return switch (vk) {
-        c.VK_RETURN, c.VK_SPACE => .toggle,
-        c.VK_UP => .previous,
-        c.VK_DOWN => .next,
-        c.VK_ESCAPE => .dismiss,
-        else => null,
-    };
 }
 
 pub fn bindingActionsToggleCommandPalette(actions: []const input.Binding.Action) bool {
@@ -645,14 +527,6 @@ pub fn keyEventTogglesCommandPalette(
     return bindingActionsToggleCommandPalette(actions);
 }
 
-fn commandPaletteDirectionFromWheelDelta(delta: i16) bool {
-    return delta > 0;
-}
-
-fn profileDirectionFromWheelDelta(delta: i16) bool {
-    return delta > 0;
-}
-
 pub fn profileShortcutIndexFromKey(vk: WPARAM) ?usize {
     if (vk >= @as(WPARAM, '1') and vk <= @as(WPARAM, '9')) {
         return @as(usize, @intCast(vk - @as(WPARAM, '1')));
@@ -685,29 +559,6 @@ pub fn quickSlotPinOrdinalFromKey(vk: WPARAM, alt_pressed: bool, shift_pressed: 
 pub fn clearQuickSlotPinsRequested(vk: WPARAM, alt_pressed: bool, shift_pressed: bool) bool {
     if (!alt_pressed or !shift_pressed) return false;
     return vk == c.VK_0 or vk == c.VK_NUMPAD0;
-}
-
-fn quickSlotFocusKeyAction(vk: WPARAM) ?QuickSlotFocusKeyAction {
-    return switch (vk) {
-        c.VK_LEFT, c.VK_UP => .previous,
-        c.VK_RIGHT, c.VK_DOWN => .next,
-        c.VK_HOME => .first,
-        c.VK_END => .last,
-        c.VK_RETURN => .open,
-        else => null,
-    };
-}
-
-fn profilesButtonKeyAction(vk: WPARAM) ?ProfilesButtonKeyAction {
-    return switch (vk) {
-        c.VK_RETURN => .open,
-        c.VK_SPACE, c.VK_APPS => .toggle,
-        c.VK_LEFT, c.VK_UP => .previous,
-        c.VK_RIGHT, c.VK_DOWN => .next,
-        c.VK_HOME => .first,
-        c.VK_END => .last,
-        else => null,
-    };
 }
 
 pub fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
@@ -826,78 +677,6 @@ pub fn quickSlotProfileIndex(
     return null;
 }
 
-pub fn formatProgressStatus(
-    alloc: Allocator,
-    value: win32_taskbar_progress.ProgressReport,
-) !?[]u8 {
-    const progress = win32_taskbar_progress.clampPercent(value.progress);
-    return switch (value.state) {
-        .remove => null,
-        .set => if (progress) |value_|
-            try std.fmt.allocPrint(alloc, "progress:{d}%", .{value_})
-        else
-            try alloc.dupe(u8, "progress"),
-        .@"error" => if (progress) |value_|
-            try std.fmt.allocPrint(alloc, "progress error:{d}%", .{value_})
-        else
-            try alloc.dupe(u8, "progress error"),
-        .indeterminate => try alloc.dupe(u8, "progress:busy"),
-        .pause => if (progress) |value_|
-            try std.fmt.allocPrint(alloc, "progress paused:{d}%", .{value_})
-        else
-            try alloc.dupe(u8, "progress paused"),
-    };
-}
-
-fn buildWindowTitle(
-    alloc: Allocator,
-    base_title: ?[]const u8,
-    status: SurfaceStatus,
-) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(alloc);
-
-    try buf.appendSlice(alloc, base_title orelse "noctty");
-
-    const appendStatus = struct {
-        fn call(
-            list: *std.ArrayListUnmanaged(u8),
-            alloc_: Allocator,
-            comptime fmt: []const u8,
-            args: anytype,
-        ) !void {
-            try list.appendSlice(alloc_, " | ");
-            try list.writer(alloc_).print(fmt, args);
-        }
-    }.call;
-
-    if (status.readonly) try appendStatus(&buf, alloc, "readonly", .{});
-    if (status.secure_input) try appendStatus(&buf, alloc, "sensitive", .{});
-    if (status.key_sequence_active) try appendStatus(&buf, alloc, "keys", .{});
-    if (status.key_table_name) |name| try appendStatus(&buf, alloc, "table:{s}", .{name});
-    if (status.pwd) |pwd| try appendStatus(&buf, alloc, "cwd:{s}", .{pwd});
-    if (status.search.active) {
-        if (status.search.needle) |needle| {
-            if (status.search.selected) |selected| {
-                if (status.search.total) |total| {
-                    try appendStatus(&buf, alloc, "find:{s} ({d}/{d})", .{ needle, selected, total });
-                } else {
-                    try appendStatus(&buf, alloc, "find:{s} ({d})", .{ needle, selected });
-                }
-            } else if (status.search.total) |total| {
-                try appendStatus(&buf, alloc, "find:{s} ({d})", .{ needle, total });
-            } else {
-                try appendStatus(&buf, alloc, "find:{s}", .{needle});
-            }
-        } else {
-            try appendStatus(&buf, alloc, "find", .{});
-        }
-    }
-    if (status.progress) |progress| try appendStatus(&buf, alloc, "{s}", .{progress});
-
-    return buf.toOwnedSlice(alloc);
-}
-
 pub fn resolveWindowBaseTitle(
     terminal_title: ?[:0]const u8,
     surface_override: ?[:0]const u8,
@@ -940,15 +719,6 @@ pub fn nextTabInspectorVisible(active_tab_has_inspector: bool, mode: apprt.actio
     return nextInspectorVisible(active_tab_has_inspector, mode);
 }
 
-fn primarySurfaceIndex(entries: []const SurfaceOrderEntry) ?usize {
-    if (entries.len == 0) return null;
-    const first_host_id = entries[0].host_id;
-    for (entries, 0..) |entry, i| {
-        if (entry.host_id == first_host_id and entry.host_active) return i;
-    }
-    return 0;
-}
-
 pub fn buildHostAwareBaseTitle(
     alloc: Allocator,
     base_title: ?[]const u8,
@@ -980,7 +750,6 @@ pub fn buildHostAwareBaseTitle(
 /// budget actually buys. Counting bytes would hand a CJK title a third of the
 /// room it can use -- 24 bytes is 8 kana -- while counting codepoints would let
 /// the same title overrun the space reserved for it.
-/// `compactHostLabelWidth` reports the same width without allocating.
 fn compactHostLabel(
     alloc: Allocator,
     value: []const u8,
@@ -1056,16 +825,6 @@ fn decodeCodepoint(value: []const u8, index: usize) ?DecodedCodepoint {
 fn codepointWidth(cp: u21) usize {
     if (cp <= 0xFF) return 1;
     return @intCast(unicode.table.get(cp).width);
-}
-
-fn compactHostLabelWidth(value: []const u8, max_width: usize) usize {
-    const width = displayWidth(value);
-    if (width <= max_width) return width;
-    if (max_width <= 3) return 3;
-    // Must track `compactHostLabel` exactly: `profileStatusBadgeTextWidth`
-    // reserves chip width from this, and a double-width codepoint dropped at
-    // the cut makes the real label narrower than the budget.
-    return displayWidth(value[0..displayWidthFloor(value, max_width - 3)]) + 3;
 }
 
 /// Cell budget for a tab label drawn into a `button_width` pixel button.
@@ -1257,31 +1016,6 @@ pub fn buildTabButtonLabel(
             compact,
         },
     );
-}
-
-fn buildTabOverviewBannerText(
-    alloc: Allocator,
-    entries: []const TabOverviewEntry,
-) ![]u8 {
-    if (entries.len == 0) return try alloc.dupe(u8, "Tabs: none");
-
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try buf.appendSlice(alloc, "Tabs: ");
-    for (entries, 0..) |entry, i| {
-        if (i > 0) try buf.appendSlice(alloc, " | ");
-        const compact = try compactHostLabel(alloc, entry.title orelse "noctty", 18);
-        defer alloc.free(compact);
-        try buf.writer(alloc).print("{s}{d}:{s}", .{
-            if (entry.active) "*" else "",
-            i + 1,
-            compact,
-        });
-        if (entry.pane_count > 1) {
-            try buf.writer(alloc).print(" ({d})", .{entry.pane_count});
-        }
-    }
-    return try buf.toOwnedSlice(alloc);
 }
 
 pub fn buildSearchOverlayLabel(
@@ -2212,38 +1946,6 @@ pub fn buildHostBannerText(
     };
 }
 
-fn commandPaletteCompletionCandidate(
-    snap: PaletteSnapshot,
-    seed: []const u8,
-    current_text: []const u8,
-    reverse: bool,
-) ?[]const u8 {
-    var ranked_buf: [palette_max_ranked]RankedIndex = undefined;
-    const ranked = rankedIndicesForQuery(snap, seed, &ranked_buf);
-    if (ranked.len == 0) return null;
-    if (ranked.len == 1) return std.mem.span(snap.cvals[ranked[0].index].action);
-
-    var current_rank_index: ?usize = null;
-    for (ranked, 0..) |r, i| {
-        const action = std.mem.span(snap.cvals[r.index].action);
-        if (std.mem.eql(u8, action, current_text)) {
-            current_rank_index = i;
-            break;
-        }
-    }
-
-    const target = if (current_rank_index) |value|
-        if (reverse)
-            (value + ranked.len - 1) % ranked.len
-        else
-            (value + 1) % ranked.len
-    else if (reverse)
-        ranked.len - 1
-    else
-        0;
-    return std.mem.span(snap.cvals[ranked[target].index].action);
-}
-
 /// Look up the Command.description for a given formatted action string.
 /// Returns null if no entry matches or the description is empty.
 fn commandPaletteDescriptionFor(snap: PaletteSnapshot, action_text: []const u8) ?[]const u8 {
@@ -2465,33 +2167,6 @@ pub fn overlayPaintCacheDirty(
     );
 }
 
-pub fn buildInspectorBannerText(
-    alloc: Allocator,
-    host: HostTabStatus,
-    pane_count: usize,
-    zoomed: bool,
-) ![]u8 {
-    if (zoomed and pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "Inspector active | tab {d}/{d} | panes {d} | zoomed | toggle Inspect to return",
-            .{ host.index + 1, host.total, pane_count },
-        );
-    }
-    if (pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "Inspector active | tab {d}/{d} | panes {d} | toggle Inspect to return",
-            .{ host.index + 1, host.total, pane_count },
-        );
-    }
-    return try std.fmt.allocPrint(
-        alloc,
-        "Inspector active | tab {d}/{d} | toggle Inspect to return",
-        .{ host.index + 1, host.total },
-    );
-}
-
 pub fn buildInspectorPanelTitleText(
     alloc: Allocator,
     host: HostTabStatus,
@@ -2547,123 +2222,6 @@ pub fn buildInspectorPanelHintText(
     return try alloc.dupe(u8, "Core inspector is live for this tab. Toggle Inspect to return to terminal-only view.");
 }
 
-pub fn buildInspectorDetailText(
-    alloc: Allocator,
-    host: HostTabStatus,
-    pane_count: usize,
-    zoomed: bool,
-) ![]u8 {
-    if (zoomed and pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "Inspector is attached to tab {d}/{d}. This tab has {d} panes and split zoom is active.",
-            .{ host.index + 1, host.total, pane_count },
-        );
-    }
-    if (pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "Inspector is attached to tab {d}/{d}. This tab currently has {d} panes.",
-            .{ host.index + 1, host.total, pane_count },
-        );
-    }
-    return try std.fmt.allocPrint(
-        alloc,
-        "Inspector is attached to tab {d}/{d}. Toggle Inspect to return to the normal terminal view.",
-        .{ host.index + 1, host.total },
-    );
-}
-
-pub fn buildSearchDetailText(
-    alloc: Allocator,
-    needle: ?[]const u8,
-    total: ?usize,
-    selected: ?usize,
-) ![]u8 {
-    if (needle) |value| {
-        if (selected) |current| {
-            if (total) |count| {
-                return try std.fmt.allocPrint(
-                    alloc,
-                    "Live search for \"{s}\" is active. Match {d} of {d}. Enter moves to the next match.",
-                    .{ value, current, count },
-                );
-            }
-        }
-        if (total) |count| {
-            return try std.fmt.allocPrint(
-                alloc,
-                "Live search for \"{s}\" is active. {d} matches currently visible.",
-                .{ value, count },
-            );
-        }
-        return try std.fmt.allocPrint(
-            alloc,
-            "Live search for \"{s}\" is active. Keep typing to refine the current needle.",
-            .{value},
-        );
-    }
-    return try alloc.dupe(u8, "Live search is active. Keep typing to refine the current needle.");
-}
-
-fn buildCommandButtonLabel(
-    alloc: Allocator,
-    active: bool,
-    input_text: ?[]const u8,
-) ![]u8 {
-    if (active) {
-        if (input_text) |value| {
-            if (value.len > 0) {
-                const compact = try compactHostLabel(alloc, value, 9);
-                defer alloc.free(compact);
-                return try std.fmt.allocPrint(alloc, "Cmd {s}", .{compact});
-            }
-        }
-        return try alloc.dupe(u8, "[Cmd]");
-    }
-    return try alloc.dupe(u8, "Cmd");
-}
-
-fn buildProfilesButtonLabel(
-    alloc: Allocator,
-    active: bool,
-    profiles_opt: ?[]const windows_shell.Profile,
-    selected_index: ?usize,
-    pinned_slot_ordinal: ?usize,
-) ![]u8 {
-    _ = pinned_slot_ordinal;
-    const profiles = profiles_opt orelse return try alloc.dupe(u8, if (active) "Pick shell" else "Launch");
-    if (profiles.len == 0) return try alloc.dupe(u8, if (active) "Pick shell" else "Launch");
-    const index = selected_index orelse 0;
-    const profile = profiles[@min(index, profiles.len - 1)];
-    const compact = try compactHostLabel(alloc, profile.label, 8);
-    defer alloc.free(compact);
-    if (active) return try std.fmt.allocPrint(alloc, "Pick {s}", .{compact});
-    return try std.fmt.allocPrint(alloc, "Launch {s}", .{compact});
-}
-
-fn launchTargetButtonLabel(
-    alloc: Allocator,
-    target: ProfileOpenTarget,
-    selected_index: ?usize,
-    pinned_slot_ordinal: ?usize,
-) ![]u8 {
-    const base = switch (target) {
-        .tab => "Tab",
-        .window => "Win",
-        .split => "Pane",
-    };
-    if (selected_index) |index| {
-        if (index < 9) {
-            if (pinned_slot_ordinal != null and pinned_slot_ordinal.? == index) {
-                return try std.fmt.allocPrint(alloc, "*{d} {s}", .{ index + 1, base });
-            }
-            return try std.fmt.allocPrint(alloc, "{d} {s}", .{ index + 1, base });
-        }
-    }
-    return try alloc.dupe(u8, base);
-}
-
 fn profileKindBadge(kind: windows_shell.ProfileKind) []const u8 {
     return switch (kind) {
         .wsl_default, .wsl_distro => "WSL",
@@ -2695,39 +2253,12 @@ pub fn buildProfileChromeBadgeText(alloc: Allocator, kind: windows_shell.Profile
     });
 }
 
-fn profileKindDetail(kind: windows_shell.ProfileKind) windows_shell.ShellIntegrationDiagnostic {
-    return windows_shell.shellIntegrationDiagnostic(kind);
-}
-
 fn profileOpenTargetActionText(target: ProfileOpenTarget) []const u8 {
     return switch (target) {
         .tab => "new tab",
         .window => "new window",
         .split => "split",
     };
-}
-
-pub fn buildProfileStatusBadgeText(
-    alloc: Allocator,
-    profile: *const windows_shell.Profile,
-    selected_index: ?usize,
-    pinned_slot_ordinal: ?usize,
-) ![]u8 {
-    _ = selected_index;
-    _ = pinned_slot_ordinal;
-    const compact = try compactHostLabel(alloc, profile.label, 12);
-    defer alloc.free(compact);
-    return try alloc.dupe(u8, compact);
-}
-
-pub fn profileStatusBadgeTextWidth(
-    profile: *const windows_shell.Profile,
-    selected_index: ?usize,
-    pinned_slot_ordinal: ?usize,
-) usize {
-    _ = selected_index;
-    _ = pinned_slot_ordinal;
-    return compactHostLabelWidth(profile.label, 12);
 }
 
 pub fn buildDropdownProfileLabel(
@@ -2741,45 +2272,6 @@ pub fn buildDropdownProfileLabel(
     return try alloc.dupe(u8, profile.label);
 }
 
-pub fn buildProfileQuickSlotChipText(
-    alloc: Allocator,
-    profile: *const windows_shell.Profile,
-    slot_index: usize,
-    pinned_slot_ordinal: ?usize,
-) ![]u8 {
-    if (slot_index < 9) {
-        if (pinned_slot_ordinal != null and pinned_slot_ordinal.? == slot_index) {
-            return try std.fmt.allocPrint(alloc, "*{d} {s}", .{
-                slot_index + 1,
-                profileKindBadge(profile.kind),
-            });
-        }
-        return try std.fmt.allocPrint(alloc, "{d} {s}", .{
-            slot_index + 1,
-            profileKindBadge(profile.kind),
-        });
-    }
-    return try alloc.dupe(u8, profileKindBadge(profile.kind));
-}
-
-pub fn profileQuickSlotChipTextLen(
-    profile: *const windows_shell.Profile,
-    slot_index: usize,
-    pinned_slot_ordinal: ?usize,
-) usize {
-    const badge_len = profileKindBadge(profile.kind).len;
-    if (slot_index < 9) {
-        return badge_len + 2 + if (pinned_slot_ordinal != null and pinned_slot_ordinal.? == slot_index) @as(usize, 1) else 0;
-    }
-    return badge_len;
-}
-
-pub fn launcherChipRightInset(has_slot_badge: bool, has_target_marker: bool) i32 {
-    if (has_slot_badge) return 16;
-    if (has_target_marker) return 12;
-    return 5;
-}
-
 fn targetButtonLabelRightInset(target: ?ProfileOpenTarget) i32 {
     return if (target != null) 12 else 0;
 }
@@ -2787,10 +2279,6 @@ fn targetButtonLabelRightInset(target: ?ProfileOpenTarget) i32 {
 pub fn buttonLabelRightInset(pinned_slot_ordinal: ?usize, target: ?ProfileOpenTarget) i32 {
     const slot_inset: i32 = if (pinnedSlotBadgeDigit(pinned_slot_ordinal) != null) 16 else 0;
     return @max(targetButtonLabelRightInset(target), slot_inset);
-}
-
-pub fn shouldPaintQuickSlotTargetMarker(hovered: bool, focused: bool) bool {
-    return hovered or focused;
 }
 
 pub fn pinnedSlotBadgeDigit(pinned_slot_ordinal: ?usize) ?u8 {
@@ -2825,37 +2313,6 @@ fn buildProfileCommandPreviewText(
     return try compactHostLabel(alloc, command, max_width);
 }
 
-fn buildProfileOrderSummaryText(
-    alloc: Allocator,
-    order_hint_opt: ?[]const u8,
-    max_items: usize,
-) !?[]u8 {
-    const order_hint = order_hint_opt orelse return null;
-    var parts: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer parts.deinit(alloc);
-
-    var count: usize = 0;
-    var more = false;
-    var it = std.mem.splitAny(u8, order_hint, ",;");
-    while (it.next()) |raw_token| {
-        const token = std.mem.trim(u8, raw_token, " \t\r\n");
-        if (token.len == 0) continue;
-        if (count >= max_items) {
-            more = true;
-            break;
-        }
-        const compact = try compactHostLabel(alloc, token, 12);
-        defer alloc.free(compact);
-        if (parts.items.len > 0) try parts.appendSlice(alloc, " > ");
-        try parts.appendSlice(alloc, compact);
-        count += 1;
-    }
-
-    if (count == 0) return null;
-    if (more) try parts.appendSlice(alloc, " > ...");
-    return try parts.toOwnedSlice(alloc);
-}
-
 fn buildProfileQuickPickText(
     alloc: Allocator,
     profiles: []const windows_shell.Profile,
@@ -2887,30 +2344,6 @@ fn buildProfileQuickPickText(
 
     if (limit < profiles.len) try parts.appendSlice(alloc, " | ...");
     return try parts.toOwnedSlice(alloc);
-}
-
-fn buildSearchButtonLabel(
-    alloc: Allocator,
-    active: bool,
-    total: ?usize,
-    selected: ?usize,
-) ![]u8 {
-    if (selected) |current| {
-        if (total) |count| {
-            return try std.fmt.allocPrint(alloc, "{s}{d}/{d}", .{
-                if (active) "[F] " else "Find ",
-                current,
-                count,
-            });
-        }
-    }
-    if (total) |count| {
-        return try std.fmt.allocPrint(alloc, "{s}{d}", .{
-            if (active) "[F] " else "Find ",
-            count,
-        });
-    }
-    return try alloc.dupe(u8, if (active) "[Find]" else "Find");
 }
 
 pub fn buildProfileOverlayLabel(
@@ -3010,100 +2443,11 @@ pub fn buildProfileHintText(
     };
 }
 
-pub fn buildProfileDetailText(
-    alloc: Allocator,
-    profile: *const windows_shell.Profile,
-    profiles_opt: ?[]const windows_shell.Profile,
-    overlay_open: bool,
-    default_target: ProfileOpenTarget,
-    order_hint: ?[]const u8,
-    pinned_slot_keys: [3]?[:0]const u8,
-) ![]u8 {
-    const preview = try buildProfileCommandPreviewText(alloc, profile, 32);
-    defer alloc.free(preview);
-    const badge = try buildProfileChromeBadgeText(alloc, profile.kind);
-    defer alloc.free(badge);
-    const pinned_slot = try buildPinnedProfileSlotText(
-        alloc,
-        findLauncherQuickSlotOrdinal(pinned_slot_keys, profile.key),
-    );
-    defer alloc.free(pinned_slot);
-    const quick_picks = if (overlay_open)
-        try buildProfileQuickPickText(alloc, profiles_opt orelse &.{}, 4, 10)
-    else
-        try buildProfileQuickPickText(alloc, profiles_opt orelse &.{}, 3, 9);
-    defer if (quick_picks) |value| alloc.free(value);
-    const quick_suffix = if (overlay_open)
-        if (quick_picks) |value|
-            try std.fmt.allocPrint(alloc, " Quick picks: {s}.", .{value})
-        else
-            try alloc.dupe(u8, "")
-    else if (quick_picks) |value|
-        try std.fmt.allocPrint(alloc, " Top slots: {s}.", .{value})
-    else
-        try alloc.dupe(u8, "");
-    defer alloc.free(quick_suffix);
-    const order_summary = try buildProfileOrderSummaryText(alloc, order_hint, 4);
-    defer if (order_summary) |value| alloc.free(value);
-    const order_suffix = if (order_summary) |value|
-        try std.fmt.allocPrint(alloc, " Order: {s}.", .{value})
-    else
-        try alloc.dupe(u8, "");
-    defer alloc.free(order_suffix);
-    const overlay_suffix = try std.fmt.allocPrint(alloc, "{s}{s}", .{ quick_suffix, order_suffix });
-    defer alloc.free(overlay_suffix);
-    const idle_suffix = try std.fmt.allocPrint(alloc, "{s}{s}", .{ quick_suffix, order_suffix });
-    defer alloc.free(idle_suffix);
-    const detail = profileKindDetail(profile.kind);
-    return if (overlay_open)
-        std.fmt.allocPrint(
-            alloc,
-            "Selected profile: {s} {s}. Run {s}.{s} Enter opens a {s}, Ctrl+Enter splits here, and Shift+Enter opens a new window. Alt+1-3 launches visible slots. Alt+Shift+1-3 pins the current profile. Alt+Shift+0 clears pinning.{s}",
-            .{
-                badge,
-                profile.label,
-                preview,
-                pinned_slot,
-                profileOpenTargetActionText(default_target),
-                overlay_suffix,
-            },
-        )
-    else
-        std.fmt.allocPrint(
-            alloc,
-            "Default profile: {s} {s}. Run {s}.{s} New hosts inherit this {s}.{s}{s} + opens a {s}, middle-click + splits here, and right-click + opens a new window. Alt+1-3 launches visible slots. Alt+Shift+1-3 pins the current profile. Alt+Shift+0 clears pinning.{s}",
-            .{
-                badge,
-                profile.label,
-                preview,
-                pinned_slot,
-                detail.summary,
-                if (detail.next_step != null) " " else "",
-                detail.next_step orelse "",
-                profileOpenTargetActionText(default_target),
-                idle_suffix,
-            },
-        );
-}
-
 fn buildPinnedProfileSlotText(alloc: Allocator, pinned_slot_ordinal: ?usize) ![]u8 {
     if (pinned_slot_ordinal) |ordinal| {
         return try std.fmt.allocPrint(alloc, " Pinned slot {d}.", .{ordinal + 1});
     }
     return try alloc.dupe(u8, "");
-}
-
-fn buildInspectorButtonLabel(
-    alloc: Allocator,
-    visible: bool,
-    pane_count: usize,
-) ![]u8 {
-    if (visible and pane_count > 1) {
-        return try std.fmt.allocPrint(alloc, "[Inspect {d}]", .{pane_count});
-    }
-    if (visible) return try alloc.dupe(u8, "[Inspect]");
-    if (pane_count > 1) return try std.fmt.allocPrint(alloc, "Inspect {d}", .{pane_count});
-    return try alloc.dupe(u8, "Inspect");
 }
 
 pub fn findLauncherQuickSlotOrdinal(slot_keys: [3]?[:0]const u8, key: []const u8) ?usize {
@@ -3166,45 +2510,6 @@ test "win32 profileIndexByKey finds launch profile key" {
     try std.testing.expectEqual(@as(?usize, null), profileIndexByKey(&profiles, "missing"));
 }
 
-test "win32 buildWindowTitle appends active status segments" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const title = try buildWindowTitle(std.testing.allocator, "pwsh", .{
-        .pwd = "/Users/amant",
-        .scrollbar = .{
-            .total = 200,
-            .offset = 50,
-            .len = 40,
-        },
-        .readonly = true,
-        .secure_input = true,
-        .key_sequence_active = true,
-        .key_table_name = "resize",
-        .search = .{
-            .active = true,
-            .needle = "foo",
-            .total = 4,
-            .selected = 2,
-        },
-        .progress = "progress:35%",
-    });
-    defer std.testing.allocator.free(title);
-
-    try std.testing.expectEqualStrings(
-        "pwsh | readonly | sensitive | keys | table:resize | cwd:/Users/amant | find:foo (2/4) | progress:35%",
-        title,
-    );
-}
-
-test "win32 buildWindowTitle uses default title when base is null" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const title = try buildWindowTitle(std.testing.allocator, null, .{});
-    defer std.testing.allocator.free(title);
-
-    try std.testing.expectEqualStrings("noctty", title);
-}
-
 test "win32 resolveWindowBaseTitle prefers tab then surface override" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -3259,23 +2564,6 @@ test "win32 tab inspector toggle hides any active pane inspector" {
     try std.testing.expect(!nextTabInspectorVisible(true, .toggle));
     try std.testing.expect(nextTabInspectorVisible(true, .show));
     try std.testing.expect(!nextTabInspectorVisible(false, .hide));
-}
-
-test "win32 primarySurfaceIndex prefers active tab of first host" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const entries = [_]SurfaceOrderEntry{
-        .{ .host_id = 11, .host_active = false },
-        .{ .host_id = 22, .host_active = true },
-        .{ .host_id = 11, .host_active = true },
-    };
-    try std.testing.expectEqual(@as(?usize, 2), primarySurfaceIndex(&entries));
-
-    const fallback = [_]SurfaceOrderEntry{
-        .{ .host_id = 11, .host_active = false },
-        .{ .host_id = 22, .host_active = true },
-    };
-    try std.testing.expectEqual(@as(?usize, 0), primarySurfaceIndex(&fallback));
 }
 
 test "win32 buildHostAwareBaseTitle prefixes host tab position" {
@@ -3354,15 +2642,6 @@ test "win32 compactHostLabel keeps the cut on a codepoint boundary" {
     defer std.testing.allocator.free(label);
     try std.testing.expect(std.unicode.utf8ValidateSlice(label));
     try std.testing.expectEqualStrings("\u{3042}...", label);
-}
-
-test "win32 compactHostLabelWidth matches the compacted label on a multi-byte cut" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const value = "\u{3042}\u{3044}\u{3046}\u{3048}\u{304a}";
-    const label = try compactHostLabel(std.testing.allocator, value, 6);
-    defer std.testing.allocator.free(label);
-    try std.testing.expectEqual(displayWidth(label), compactHostLabelWidth(value, 6));
 }
 
 test "win32 compactHostLabel spends the budget in cells, not bytes" {
@@ -3569,71 +2848,6 @@ test "win32 visibleTabRange windows tabs around the active tab" {
     try std.testing.expectEqualDeep(VisibleTabRange{ .start = 0, .count = 2 }, visibleTabRange(2, 1, 500));
 }
 
-test "win32 buildTabOverviewBannerText lists active tabs and pane counts" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const banner = try buildTabOverviewBannerText(std.testing.allocator, &.{
-        .{ .title = "pwsh", .pane_count = 1, .active = true },
-        .{ .title = "logs-and-output-pane", .pane_count = 3, .active = false },
-    });
-    defer std.testing.allocator.free(banner);
-    try std.testing.expectEqualStrings("Tabs: *1:pwsh | 2:logs-and-output... (3)", banner);
-}
-
-test "win32 buildSearchButtonLabel reflects active search state" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const active = try buildSearchButtonLabel(std.testing.allocator, true, 8, 2);
-    defer std.testing.allocator.free(active);
-    try std.testing.expectEqualStrings("[F] 2/8", active);
-
-    const passive = try buildSearchButtonLabel(std.testing.allocator, false, 5, null);
-    defer std.testing.allocator.free(passive);
-    try std.testing.expectEqualStrings("Find 5", passive);
-
-    const idle = try buildSearchButtonLabel(std.testing.allocator, false, null, null);
-    defer std.testing.allocator.free(idle);
-    try std.testing.expectEqualStrings("Find", idle);
-}
-
-test "win32 buildProfilesButtonLabel reflects selected cached profile" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profiles = [_]windows_shell.Profile{
-        .{
-            .kind = .pwsh,
-            .key = "pwsh.exe",
-            .label = "PowerShell",
-            .command = .{ .direct = &.{"pwsh.exe"} },
-        },
-        .{
-            .kind = .git_bash,
-            .key = "git-bash",
-            .label = "Git Bash",
-            .command = .{ .direct = &.{"bash.exe"} },
-        },
-    };
-
-    const active = try buildProfilesButtonLabel(std.testing.allocator, true, &profiles, 1, 1);
-    defer std.testing.allocator.free(active);
-    try std.testing.expectEqualStrings("Pick Git Bash", active);
-
-    const idle = try buildProfilesButtonLabel(std.testing.allocator, false, &profiles, 0, null);
-    defer std.testing.allocator.free(idle);
-    try std.testing.expectEqualStrings("Launch Power...", idle);
-}
-
-test "win32 profilesButtonKeyAction maps focused launcher keys" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(ProfilesButtonKeyAction.open, profilesButtonKeyAction(c.VK_RETURN).?);
-    try std.testing.expectEqual(ProfilesButtonKeyAction.toggle, profilesButtonKeyAction(c.VK_SPACE).?);
-    try std.testing.expectEqual(ProfilesButtonKeyAction.previous, profilesButtonKeyAction(c.VK_LEFT).?);
-    try std.testing.expectEqual(ProfilesButtonKeyAction.next, profilesButtonKeyAction(c.VK_DOWN).?);
-    try std.testing.expectEqual(ProfilesButtonKeyAction.first, profilesButtonKeyAction(c.VK_HOME).?);
-    try std.testing.expectEqual(ProfilesButtonKeyAction.last, profilesButtonKeyAction(c.VK_END).?);
-}
-
 test "win32 profileShortcutIndexFromKey supports top row and numpad digits" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -3678,23 +2892,10 @@ test "win32 clearQuickSlotPinsRequested detects clear shortcut" {
     try std.testing.expect(!clearQuickSlotPinsRequested(c.VK_0, false, true));
 }
 
-test "win32 quickSlotFocusKeyAction maps painted quick slot focus keys" {
+test "win32 taskbar mapping clamps percent to shell range" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.previous, quickSlotFocusKeyAction(c.VK_LEFT).?);
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.previous, quickSlotFocusKeyAction(c.VK_UP).?);
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.next, quickSlotFocusKeyAction(c.VK_RIGHT).?);
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.next, quickSlotFocusKeyAction(c.VK_DOWN).?);
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.first, quickSlotFocusKeyAction(c.VK_HOME).?);
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.last, quickSlotFocusKeyAction(c.VK_END).?);
-    try std.testing.expectEqual(QuickSlotFocusKeyAction.open, quickSlotFocusKeyAction(c.VK_RETURN).?);
-    try std.testing.expect(quickSlotFocusKeyAction(c.VK_SPACE) == null);
-}
-
-test "win32 progress status and taskbar mapping clamp percent to shell range" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const report: terminal.osc.Command.ProgressReport = .{
+    const report: win32_taskbar_progress.ProgressReport = .{
         .state = .set,
         .progress = 255,
     };
@@ -3702,38 +2903,6 @@ test "win32 progress status and taskbar mapping clamp percent to shell range" {
     const mapped = win32_taskbar_progress.mapProgressReport(report);
     try std.testing.expectEqual(@as(u64, 100), mapped.value.?.completed);
     try std.testing.expectEqual(@as(u64, 100), mapped.value.?.total);
-
-    const status = try formatProgressStatus(std.testing.allocator, report);
-    defer if (status) |owned| std.testing.allocator.free(owned);
-    try std.testing.expectEqualStrings("progress:100%", status.?);
-}
-
-test "win32 launchTargetButtonLabel reflects selected launcher slot" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const pane = try launchTargetButtonLabel(std.testing.allocator, .split, 2, 2);
-    defer std.testing.allocator.free(pane);
-    try std.testing.expectEqualStrings("*3 Pane", pane);
-
-    const tab = try launchTargetButtonLabel(std.testing.allocator, .tab, null, null);
-    defer std.testing.allocator.free(tab);
-    try std.testing.expectEqualStrings("Tab", tab);
-}
-
-test "win32 launchTargetButtonLabel reflects Windows-style target wording" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const tab = try launchTargetButtonLabel(std.testing.allocator, .tab, null, null);
-    defer std.testing.allocator.free(tab);
-    try std.testing.expectEqualStrings("Tab", tab);
-
-    const win = try launchTargetButtonLabel(std.testing.allocator, .window, null, null);
-    defer std.testing.allocator.free(win);
-    try std.testing.expectEqualStrings("Win", win);
-
-    const pane = try launchTargetButtonLabel(std.testing.allocator, .split, null, null);
-    defer std.testing.allocator.free(pane);
-    try std.testing.expectEqualStrings("Pane", pane);
 }
 
 test "win32 preferredProfileIndex respects host key then app key then hint" {
@@ -3833,92 +3002,6 @@ test "win32 buildProfileOverlayLabel and hint reflect selected profile" {
     try std.testing.expect(std.mem.indexOf(u8, hint, "2 CMD C>") != null);
 }
 
-test "win32 buildProfileDetailText reflects selected launcher state" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profile: windows_shell.Profile = .{
-        .kind = .pwsh,
-        .key = "pwsh.exe",
-        .label = "PowerShell",
-        .command = .{ .direct = &.{"pwsh.exe"} },
-    };
-    const profiles = [_]windows_shell.Profile{
-        profile,
-        .{
-            .kind = .git_bash,
-            .key = "git-bash",
-            .label = "Git Bash",
-            .command = .{ .direct = &.{"bash.exe"} },
-        },
-        .{
-            .kind = .wsl_distro,
-            .key = "wsl:Ubuntu",
-            .label = "WSL: Ubuntu",
-            .command = .{ .direct = &.{ "wsl.exe", "-d", "Ubuntu" } },
-        },
-    };
-
-    const overlay = try buildProfileDetailText(std.testing.allocator, &profile, &profiles, true, .split, "git,pwsh,Ubuntu,cmd", .{ "pwsh.exe", "git-bash", null });
-    defer std.testing.allocator.free(overlay);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Selected profile: PWSH >> PowerShell") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Run pwsh.exe") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Pinned slot 1.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "opens a split") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Alt+1-3 launches visible slots") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Alt+Shift+1-3 pins the current profile") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Alt+Shift+0 clears pinning") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Quick picks: 1 PWSH >> PowerShell") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overlay, "Order: git > pwsh > Ubuntu > cmd.") != null);
-
-    const idle = try buildProfileDetailText(std.testing.allocator, &profile, &profiles, false, .window, "git,pwsh,Ubuntu,cmd", .{ "pwsh.exe", "git-bash", null });
-    defer std.testing.allocator.free(idle);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Default profile: PWSH >> PowerShell") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Run pwsh.exe") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Pinned slot 1.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "New hosts inherit this PowerShell profile with automatic shell integration.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "opens a new window") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Alt+1-3 launches visible slots") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Alt+Shift+1-3 pins the current profile") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Alt+Shift+0 clears pinning") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Top slots: 1 PWSH >>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "2 GIT $> Git Bash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "Order: git > pwsh > Ubuntu > cmd.") != null);
-}
-
-test "win32 buildProfileDetailText appends shell integration guidance when present" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profile: windows_shell.Profile = .{
-        .kind = .wsl_default,
-        .key = "wsl.exe",
-        .label = "WSL",
-        .command = .{ .direct = &.{"wsl.exe"} },
-    };
-
-    const detail = try buildProfileDetailText(
-        std.testing.allocator,
-        &profile,
-        &.{profile},
-        false,
-        .tab,
-        null,
-        .{ null, null, null },
-    );
-    defer std.testing.allocator.free(detail);
-
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        detail,
-        "New hosts inherit this WSL default profile; shell integration depends on the Linux shell.",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        detail,
-        "Enable shell integration inside the selected WSL shell startup.",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "+ opens a new tab") != null);
-}
-
 test "win32 buildProfileCommandPreviewText compacts shell command preview" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -3932,18 +3015,6 @@ test "win32 buildProfileCommandPreviewText compacts shell command preview" {
     const preview = try buildProfileCommandPreviewText(std.testing.allocator, &profile, 14);
     defer std.testing.allocator.free(preview);
     try std.testing.expectEqualStrings("wsl.exe -d ...", preview);
-}
-
-test "win32 buildProfileOrderSummaryText compacts launcher order" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const summary = (try buildProfileOrderSummaryText(
-        std.testing.allocator,
-        "git,pwsh,Ubuntu,cmd,powershell",
-        4,
-    )).?;
-    defer std.testing.allocator.free(summary);
-    try std.testing.expectEqualStrings("git > pwsh > Ubuntu > cmd > ...", summary);
 }
 
 test "win32 buildProfileQuickPickText reflects ordered launcher profiles" {
@@ -3990,79 +3061,6 @@ test "win32 buildProfileQuickPickText reflects ordered launcher profiles" {
     );
 }
 
-test "win32 buildProfileStatusBadgeText reflects selected profile kind" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profile: windows_shell.Profile = .{
-        .kind = .git_bash,
-        .key = "git-bash",
-        .label = "Git Bash",
-        .command = .{ .direct = &.{"bash.exe"} },
-    };
-
-    const badge = try buildProfileStatusBadgeText(std.testing.allocator, &profile, 0, 0);
-    defer std.testing.allocator.free(badge);
-    try std.testing.expectEqualStrings("Git Bash", badge);
-}
-
-test "win32 profileStatusBadgeTextWidth matches built text" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profile: windows_shell.Profile = .{
-        .kind = .git_bash,
-        .key = "git-bash",
-        .label = "Git Bash",
-        .command = .{ .direct = &.{"bash.exe"} },
-    };
-
-    const badge = try buildProfileStatusBadgeText(std.testing.allocator, &profile, 0, 0);
-    defer std.testing.allocator.free(badge);
-    try std.testing.expectEqual(displayWidth(badge), profileStatusBadgeTextWidth(&profile, 0, 0));
-}
-
-test "win32 buildProfileQuickSlotChipText reflects ordered quick slot badge" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profile: windows_shell.Profile = .{
-        .kind = .wsl_distro,
-        .key = "wsl:Ubuntu",
-        .label = "WSL: Ubuntu",
-        .command = .{ .direct = &.{ "wsl.exe", "-d", "Ubuntu" } },
-    };
-
-    const chip = try buildProfileQuickSlotChipText(std.testing.allocator, &profile, 2, 2);
-    defer std.testing.allocator.free(chip);
-    try std.testing.expectEqualStrings("*3 WSL", chip);
-}
-
-test "win32 profileQuickSlotChipTextLen matches built text" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const profile: windows_shell.Profile = .{
-        .kind = .wsl_distro,
-        .key = "wsl:Ubuntu",
-        .label = "WSL: Ubuntu",
-        .command = .{ .direct = &.{ "wsl.exe", "-d", "Ubuntu" } },
-    };
-
-    const pinned = try buildProfileQuickSlotChipText(std.testing.allocator, &profile, 2, 2);
-    defer std.testing.allocator.free(pinned);
-    try std.testing.expectEqual(pinned.len, profileQuickSlotChipTextLen(&profile, 2, 2));
-
-    const unpinned = try buildProfileQuickSlotChipText(std.testing.allocator, &profile, 1, null);
-    defer std.testing.allocator.free(unpinned);
-    try std.testing.expectEqual(unpinned.len, profileQuickSlotChipTextLen(&profile, 1, null));
-}
-
-test "win32 launcherChipRightInset reserves badge and target space" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(@as(i32, 5), launcherChipRightInset(false, false));
-    try std.testing.expectEqual(@as(i32, 12), launcherChipRightInset(false, true));
-    try std.testing.expectEqual(@as(i32, 16), launcherChipRightInset(true, false));
-    try std.testing.expectEqual(@as(i32, 16), launcherChipRightInset(true, true));
-}
-
 test "win32 targetButtonLabelRightInset reserves target badge space" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -4080,14 +3078,6 @@ test "win32 buttonLabelRightInset reserves slot and target badge space" {
     try std.testing.expectEqual(@as(i32, 16), buttonLabelRightInset(0, null));
     try std.testing.expectEqual(@as(i32, 16), buttonLabelRightInset(0, .split));
     try std.testing.expectEqual(@as(i32, 12), buttonLabelRightInset(9, .window));
-}
-
-test "win32 shouldPaintQuickSlotTargetMarker follows active chip state" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expect(!shouldPaintQuickSlotTargetMarker(false, false));
-    try std.testing.expect(shouldPaintQuickSlotTargetMarker(true, false));
-    try std.testing.expect(shouldPaintQuickSlotTargetMarker(false, true));
 }
 
 test "win32 profileOpenTargetMarkerColor reflects launcher target" {
@@ -4145,41 +3135,6 @@ test "win32 buildProfileChromeBadgeText adds profile glyph treatment" {
     const wsl = try buildProfileChromeBadgeText(std.testing.allocator, .wsl_distro);
     defer std.testing.allocator.free(wsl);
     try std.testing.expectEqualStrings("WSL <>", wsl);
-}
-
-test "win32 profileKindDetail exposes shell integration posture" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const pwsh = profileKindDetail(.pwsh);
-    try std.testing.expectEqualStrings(
-        "PowerShell profile with automatic shell integration",
-        pwsh.summary,
-    );
-    try std.testing.expectEqual(@as(?[]const u8, null), pwsh.next_step);
-
-    const wsl = profileKindDetail(.wsl_distro);
-    try std.testing.expectEqualStrings(
-        "WSL distro profile; shell integration depends on the Linux shell",
-        wsl.summary,
-    );
-    try std.testing.expectEqualStrings(
-        "Enable shell integration inside the selected WSL shell startup.",
-        wsl.next_step.?,
-    );
-
-    const git_bash = profileKindDetail(.git_bash);
-    try std.testing.expectEqualStrings(
-        "Git Bash profile with automatic shell integration",
-        git_bash.summary,
-    );
-    try std.testing.expectEqual(@as(?[]const u8, null), git_bash.next_step);
-
-    const cmd = profileKindDetail(.cmd);
-    try std.testing.expectEqualStrings(
-        "Command Prompt profile with PROMPT-based shell integration; Clink adds command-start/finish and exit-code marks",
-        cmd.summary,
-    );
-    try std.testing.expectEqual(@as(?[]const u8, null), cmd.next_step);
 }
 
 test "win32 buildSearchOverlayLabel reflects match counts" {
@@ -4280,22 +3235,6 @@ test "win32 shouldAcceptCoreSearchUpdates rejects pending docked search state" {
 
     bar.searched = true;
     try std.testing.expect(shouldAcceptCoreSearchUpdates(&bar));
-}
-
-test "win32 profileChromeNeedsFullTextInvalidation only trips for status-only profile chrome" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expect(!profileChromeNeedsFullTextInvalidation(.profile, 0));
-    try std.testing.expect(!profileChromeNeedsFullTextInvalidation(.profile, 24));
-    try std.testing.expect(!profileChromeNeedsFullTextInvalidation(.none, 0));
-    try std.testing.expect(profileChromeNeedsFullTextInvalidation(.none, 24));
-}
-
-test "win32 chromeTextNeedsFullInvalidation only trips when status bar is visible" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expect(!chromeTextNeedsFullInvalidation(0));
-    try std.testing.expect(chromeTextNeedsFullInvalidation(24));
 }
 
 test "win32 searchBarResultsVisual marks no-match state with error colors" {
@@ -5032,13 +3971,6 @@ test "win32 tabDirectionFromWheelDelta maps wheel direction to tab navigation" {
     try std.testing.expectEqual(apprt.action.GotoTab.next, tabDirectionFromWheelDelta(-120));
 }
 
-test "win32 searchDirectionFromWheelDelta maps wheel direction to search navigation" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(input.Binding.Action.NavigateSearch.next, searchDirectionFromWheelDelta(120));
-    try std.testing.expectEqual(input.Binding.Action.NavigateSearch.previous, searchDirectionFromWheelDelta(-120));
-}
-
 test "win32 searchBarSearchedState helpers preserve pending searches on null callbacks" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -5063,35 +3995,6 @@ test "win32 searchBarDisplayStateChanged only trips on visible results changes" 
     try std.testing.expect(searchBarDisplayStateChanged(&same, false, 12, 3));
     try std.testing.expect(searchBarDisplayStateChanged(&same, true, 11, 3));
     try std.testing.expect(searchBarDisplayStateChanged(&same, true, 12, 4));
-}
-
-test "win32 scrollStatusTextChanged only trips on indicator visibility or percent deltas" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const hidden_bottom: terminal.Scrollbar = .{ .total = 2000, .len = 21, .offset = 1979 };
-    const hidden_short: terminal.Scrollbar = .{ .total = 21, .len = 21, .offset = 0 };
-    const visible_50: terminal.Scrollbar = .{ .total = 2000, .len = 21, .offset = 1000 };
-    const visible_50_neighbor: terminal.Scrollbar = .{ .total = 2000, .len = 21, .offset = 1001 };
-    const visible_51: terminal.Scrollbar = .{ .total = 2000, .len = 21, .offset = 1020 };
-
-    try std.testing.expect(!scrollStatusTextChanged(hidden_short, hidden_bottom));
-    try std.testing.expect(scrollStatusTextChanged(hidden_bottom, visible_50));
-    try std.testing.expect(!scrollStatusTextChanged(visible_50, visible_50_neighbor));
-    try std.testing.expect(scrollStatusTextChanged(visible_50, visible_51));
-}
-
-test "win32 commandPaletteDirectionFromWheelDelta maps wheel direction to completion direction" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expect(commandPaletteDirectionFromWheelDelta(120));
-    try std.testing.expect(!commandPaletteDirectionFromWheelDelta(-120));
-}
-
-test "win32 profileDirectionFromWheelDelta maps wheel direction to profile navigation" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expect(profileDirectionFromWheelDelta(120));
-    try std.testing.expect(!profileDirectionFromWheelDelta(-120));
 }
 
 test "win32 tabButtonKeyAction maps focused-tab keys" {
@@ -5237,29 +4140,6 @@ test "win32 docked search sequential visible order increments while moving older
     try std.testing.expectEqual(@as(?usize, 1), searchSelectedDisplayFromRaw(raw, total));
 }
 
-test "win32 tabsButtonKeyAction maps focused tabs button keys" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(TabsButtonKeyAction.previous, tabsButtonKeyAction(c.VK_LEFT).?);
-    try std.testing.expectEqual(TabsButtonKeyAction.previous, tabsButtonKeyAction(c.VK_UP).?);
-    try std.testing.expectEqual(TabsButtonKeyAction.next, tabsButtonKeyAction(c.VK_RIGHT).?);
-    try std.testing.expectEqual(TabsButtonKeyAction.next, tabsButtonKeyAction(c.VK_DOWN).?);
-    try std.testing.expectEqual(TabsButtonKeyAction.rename, tabsButtonKeyAction(c.VK_F2).?);
-    try std.testing.expectEqual(TabsButtonKeyAction.overview, tabsButtonKeyAction(c.VK_APPS).?);
-    try std.testing.expect(tabsButtonKeyAction(c.VK_RETURN) == null);
-}
-
-test "win32 commandButtonKeyAction maps focused command button keys" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(CommandButtonKeyAction.toggle, commandButtonKeyAction(c.VK_RETURN).?);
-    try std.testing.expectEqual(CommandButtonKeyAction.toggle, commandButtonKeyAction(c.VK_SPACE).?);
-    try std.testing.expectEqual(CommandButtonKeyAction.previous, commandButtonKeyAction(c.VK_UP).?);
-    try std.testing.expectEqual(CommandButtonKeyAction.next, commandButtonKeyAction(c.VK_DOWN).?);
-    try std.testing.expectEqual(CommandButtonKeyAction.dismiss, commandButtonKeyAction(c.VK_ESCAPE).?);
-    try std.testing.expect(commandButtonKeyAction(c.VK_F2) == null);
-}
-
 test "win32 command palette toggle binding is recognized inside action chains" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -5294,22 +4174,6 @@ test "win32 key-remap applies to command palette toggle lookup" {
     try std.testing.expect(keyEventTogglesCommandPalette(event, &cfg.keybind.set, &remaps));
 }
 
-test "win32 buildInspectorBannerText reflects host inspector context" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const multi = try buildInspectorBannerText(std.testing.allocator, .{ .index = 1, .total = 4 }, 3, false);
-    defer std.testing.allocator.free(multi);
-    try std.testing.expectEqualStrings("Inspector active | tab 2/4 | panes 3 | toggle Inspect to return", multi);
-
-    const zoomed = try buildInspectorBannerText(std.testing.allocator, .{ .index = 0, .total = 2 }, 2, true);
-    defer std.testing.allocator.free(zoomed);
-    try std.testing.expectEqualStrings("Inspector active | tab 1/2 | panes 2 | zoomed | toggle Inspect to return", zoomed);
-
-    const single = try buildInspectorBannerText(std.testing.allocator, .{ .index = 0, .total = 1 }, 1, false);
-    defer std.testing.allocator.free(single);
-    try std.testing.expectEqualStrings("Inspector active | tab 1/1 | toggle Inspect to return", single);
-}
-
 test "win32 buildHostBannerText prefixes info and error banners" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -5339,21 +4203,20 @@ test "win32 overlayPaintCacheDirty ignores repaint-only dirtiness" {
     try std.testing.expect(overlayPaintCacheDirty(false, .profile, cached, cached, null));
 }
 
-test "win32 profileChromeVisible only trips for profile overlay or visible status bar" {
+test "win32 profile chrome visibility requires the profile overlay" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    try std.testing.expect(profileChromeVisible(.profile, 0));
-    try std.testing.expect(profileChromeVisible(.none, 24));
-    try std.testing.expect(!profileChromeVisible(.none, 0));
-    try std.testing.expect(!profileChromeVisible(.search, 0));
+    inline for (std.meta.tags(HostOverlayMode)) |mode| {
+        try std.testing.expectEqual(mode == .profile, profileChromeVisible(mode));
+    }
 }
 
-test "win32 inspector chrome visibility only trips for banner or visible status bar" {
+test "win32 inspector chrome visibility requires no overlay" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    try std.testing.expect(inspectorChromeVisible(.none, 0));
-    try std.testing.expect(inspectorChromeVisible(.search, 24));
-    try std.testing.expect(!inspectorChromeVisible(.search, 0));
+    inline for (std.meta.tags(HostOverlayMode)) |mode| {
+        try std.testing.expectEqual(mode == .none, inspectorChromeVisible(mode));
+    }
 }
 
 test "win32 inspector visibility changes require host relayout" {
@@ -5466,32 +4329,6 @@ test "win32 buildInspectorPanelHintText reflects live inspector scope" {
     const zoomed = try buildInspectorPanelHintText(std.testing.allocator, 2, true);
     defer std.testing.allocator.free(zoomed);
     try std.testing.expect(std.mem.indexOf(u8, zoomed, "zoomed pane") != null);
-}
-
-test "win32 buildInspectorDetailText reflects pane and zoom context" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const multi = try buildInspectorDetailText(std.testing.allocator, .{ .index = 1, .total = 4 }, 3, false);
-    defer std.testing.allocator.free(multi);
-    try std.testing.expect(std.mem.indexOf(u8, multi, "tab 2/4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, multi, "3 panes") != null);
-
-    const zoomed = try buildInspectorDetailText(std.testing.allocator, .{ .index = 0, .total = 2 }, 2, true);
-    defer std.testing.allocator.free(zoomed);
-    try std.testing.expect(std.mem.indexOf(u8, zoomed, "zoom") != null);
-}
-
-test "win32 buildSearchDetailText reflects live search context" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const active = try buildSearchDetailText(std.testing.allocator, "needle", 8, 2);
-    defer std.testing.allocator.free(active);
-    try std.testing.expect(std.mem.indexOf(u8, active, "needle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, active, "2 of 8") != null);
-
-    const pending = try buildSearchDetailText(std.testing.allocator, "logs", null, null);
-    defer std.testing.allocator.free(pending);
-    try std.testing.expect(std.mem.indexOf(u8, pending, "refine") != null);
 }
 
 test "win32 buildOverlayAcceptLabel reflects overlay action state" {
@@ -5634,38 +4471,6 @@ test "win32 overlayCancelLabel reflects overlay mode" {
     try std.testing.expectEqualStrings("Cancel", overlayCancelLabel(.surface_title));
 }
 
-test "win32 buildCommandButtonLabel reflects live palette state" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const active = try buildCommandButtonLabel(std.testing.allocator, true, "toggle_fullscreen");
-    defer std.testing.allocator.free(active);
-    try std.testing.expectEqualStrings("Cmd toggle...", active);
-
-    const armed = try buildCommandButtonLabel(std.testing.allocator, true, "");
-    defer std.testing.allocator.free(armed);
-    try std.testing.expectEqualStrings("[Cmd]", armed);
-
-    const idle = try buildCommandButtonLabel(std.testing.allocator, false, null);
-    defer std.testing.allocator.free(idle);
-    try std.testing.expectEqualStrings("Cmd", idle);
-}
-
-test "win32 buildInspectorButtonLabel reflects inspector and pane state" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const visible = try buildInspectorButtonLabel(std.testing.allocator, true, 3);
-    defer std.testing.allocator.free(visible);
-    try std.testing.expectEqualStrings("[Inspect 3]", visible);
-
-    const multi = try buildInspectorButtonLabel(std.testing.allocator, false, 2);
-    defer std.testing.allocator.free(multi);
-    try std.testing.expectEqualStrings("Inspect 2", multi);
-
-    const idle = try buildInspectorButtonLabel(std.testing.allocator, false, 1);
-    defer std.testing.allocator.free(idle);
-    try std.testing.expectEqualStrings("Inspect", idle);
-}
-
 test "win32 buildCommandPaletteOverlayLabel reflects palette state" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -5712,30 +4517,6 @@ test "win32 command palette rich feedback never calls a theme an action miss" {
     );
     defer std.testing.allocator.free(hidden_feedback);
     try std.testing.expect(std.mem.indexOf(u8, hidden_feedback, "window larger") != null);
-}
-
-test "win32 commandPaletteCompletionCandidate resolves and cycles defaults" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const snap = PaletteSnapshot.fromDefaults();
-
-    try std.testing.expectEqualStrings(
-        "reload_config",
-        commandPaletteCompletionCandidate(snap, "reload_", "reload_", false).?,
-    );
-
-    // toggle_* has multiple matches in defaults; first-next/reverse should
-    // land on entries that all begin with "toggle_".
-    const first = commandPaletteCompletionCandidate(snap, "toggle_", "toggle_", false).?;
-    try std.testing.expect(std.mem.startsWith(u8, first, "toggle_"));
-
-    const second = commandPaletteCompletionCandidate(snap, "toggle_", first, false).?;
-    try std.testing.expect(std.mem.startsWith(u8, second, "toggle_"));
-    try std.testing.expect(!std.mem.eql(u8, first, second));
-
-    const reverse = commandPaletteCompletionCandidate(snap, "toggle_", first, true).?;
-    try std.testing.expect(std.mem.startsWith(u8, reverse, "toggle_"));
-    try std.testing.expect(!std.mem.eql(u8, reverse, first));
 }
 
 test "win32 commandPaletteBannerText shows ready banner for valid action" {

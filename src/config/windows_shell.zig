@@ -185,12 +185,6 @@ fn appendConfiguredSshProfiles(
     return try appendSshProfiles(alloc, shell_profiles, hosts, ssh_path.?);
 }
 
-pub fn profileOrderHint(alloc: Allocator) ?[:0]const u8 {
-    const raw = detectProfileOrderHint(alloc) orelse return null;
-    defer alloc.free(raw);
-    return alloc.dupeZ(u8, raw) catch null;
-}
-
 pub fn deinitProfiles(alloc: Allocator, profiles: []Profile) void {
     for (profiles) |*profile| profile.deinit(alloc);
     alloc.free(profiles);
