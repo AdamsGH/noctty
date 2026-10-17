@@ -105,6 +105,7 @@ const WM_MOUSEWHEEL: UINT = 0x020A;
 const WM_MOUSEMOVE: UINT = 0x0200;
 const WM_MOUSELEAVE: UINT = 0x02A3;
 const WM_KEYDOWN: UINT = 0x0100;
+const WM_KEYUP: UINT = 0x0101;
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_ACTIVATE: UINT = 0x0006;
 const WM_TIMER: UINT = 0x0113;
@@ -2823,6 +2824,7 @@ pub const SettingsWindow = struct {
             }
             self.control_uia_prev_procs[index] = @ptrFromInt(@as(usize, @intCast(previous)));
             self.control_uia_providers[index] = provider;
+            if (spec.role == .combo_box) SettingsComboPopup.attach(control);
         }
     }
 
@@ -5128,9 +5130,9 @@ pub const SettingsWindow = struct {
         for (self.comboControls()) |combo| if (combo) |control| subclassCombo(control);
         for (self.editControls()) |edit| if (edit) |control| subclassEdit(control);
         self.applyTabOrder();
-        self.initializeControlUiaProviders();
-
+        // Establish native values before providers cache their initial state.
         self.refreshAllControls();
+        self.initializeControlUiaProviders();
         self.refreshNativeSectionText();
         self.theme_adapter.apply(hwnd, self.resolveThemeColors());
         self.recreateUiFont();
@@ -9623,6 +9625,95 @@ test "settings descriptor support matches every native editor enabled state" {
     }.body);
 }
 
+test "settings UIA checkbox and combo actions update the draft and discard restores it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const com = @import("win32_uia/com.zig");
+            const constants = @import("win32_uia/constants.zig");
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            var checks: usize = 0;
+            var combos: usize = 0;
+            for (settings_control_specs, 0..) |spec, index| {
+                if (spec.role != .check_box and spec.role != .combo_box) continue;
+                const provider = settings.control_uia_providers[index].?;
+                const control = settings.controlHwnd(index).?;
+                settings.setActiveSection(settings.controlSection(index).?);
+                settings.ensureControlVisible(control);
+                const events = @import("win32_uia/events.zig");
+                const changes_before = events.testing_property_changes;
+                const pattern_id = if (spec.role == .check_box) constants.UIA_TogglePatternId else constants.UIA_ExpandCollapsePatternId;
+                var pattern: ?*com.IUnknown = null;
+                try std.testing.expectEqual(com.S_OK, provider.base.vtbl.GetPatternProvider(&provider.base, pattern_id, &pattern));
+                try std.testing.expect(pattern != null);
+                _ = pattern.?.vtbl.Release(pattern.?);
+                if (spec.role == .check_box) {
+                    checks += 1;
+                    const toggle = &provider.toggle_iface;
+                    const before = settings.pending.?.@"clipboard-trim-trailing-spaces";
+                    if (sys.IsWindowEnabled(control) == 0) {
+                        try std.testing.expectEqual(com.UIA_E_ELEMENTNOTENABLED, toggle.vtbl.Toggle(toggle));
+                        continue;
+                    }
+                    try std.testing.expectEqual(com.S_OK, toggle.vtbl.Toggle(toggle));
+                    if (control == settings.chk_trim_trail.?) try std.testing.expectEqual(!before, settings.pending.?.@"clipboard-trim-trailing-spaces");
+                } else {
+                    combos += 1;
+                    const expand = &provider.expand_iface;
+                    const value = &provider.value_iface;
+                    if (sys.IsWindowEnabled(control) == 0) {
+                        try std.testing.expectEqual(com.UIA_E_ELEMENTNOTENABLED, expand.vtbl.Expand(expand));
+                        try std.testing.expectEqual(com.UIA_E_ELEMENTNOTENABLED, value.vtbl.SetValue(value, std.unicode.utf8ToUtf16LeStringLiteral("Off")));
+                        continue;
+                    }
+                    try std.testing.expectEqual(com.S_OK, expand.vtbl.Expand(expand));
+                    var expanded: i32 = 0;
+                    try std.testing.expectEqual(com.S_OK, expand.vtbl.get_ExpandCollapseState(expand, &expanded));
+                    try std.testing.expectEqual(@as(i32, 1), expanded);
+                    try std.testing.expectEqual(com.S_OK, expand.vtbl.Collapse(expand));
+                    const old_index = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
+                    var label: [128:0]u16 = @splat(0);
+                    const next_index: usize = if (old_index == 0) 1 else 0;
+                    _ = sys.SendMessageW(control, 0x0148, next_index, @bitCast(@intFromPtr(&label))); // CB_GETLBTEXT
+                    try std.testing.expectEqual(com.S_OK, value.vtbl.SetValue(value, &label));
+                    try std.testing.expectEqual(@as(isize, @intCast(next_index)), sys.SendMessageW(control, CB_GETCURSEL, 0, 0));
+                    try std.testing.expectEqual(com.E_INVALIDARG, value.vtbl.SetValue(value, std.unicode.utf8ToUtf16LeStringLiteral("not a Settings option")));
+                }
+                try std.testing.expect(settings.hasPendingChanges());
+                try std.testing.expect(events.testing_property_changes > changes_before);
+                const changes_after_action = events.testing_property_changes;
+                settings.discardChangesNow();
+                try std.testing.expect(!settings.hasPendingChanges());
+                try std.testing.expect(events.testing_property_changes > changes_after_action);
+                if (spec.role == .combo_box) {
+                    // Stock popup SelectionItem uses native selection rather
+                    // than our Value.SetValue, without a CBN_SELCHANGE.
+                    const old_index = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
+                    _ = sys.SendMessageW(control, CB_SETCURSEL, if (old_index == 0) 1 else 0, 0);
+                    try std.testing.expect(settings.hasPendingChanges());
+                    settings.discardChangesNow();
+                    try std.testing.expect(!settings.hasPendingChanges());
+                    var popup: SettingsComboPopup.Info = .{};
+                    try std.testing.expect(SettingsComboPopup.GetComboBoxInfo(control, &popup) != 0);
+                    const popup_changes_before = events.testing_property_changes;
+                    _ = sys.SendMessageW(popup.list.?, 0x0186, if (old_index == 0) 1 else 0, 0); // LB_SETCURSEL
+                    try std.testing.expect(settings.hasPendingChanges());
+                    try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
+                    try std.testing.expect(events.testing_property_changes > popup_changes_before);
+                    settings.discardChangesNow();
+                    try std.testing.expect(!settings.hasPendingChanges());
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 6), checks);
+            try std.testing.expectEqual(@as(usize, 12), combos);
+            const retired = settings.control_uia_providers[3].?;
+            retired.detach();
+            try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, retired.toggle_iface.vtbl.Toggle(&retired.toggle_iface));
+        }
+    }.body);
+}
+
 test "CHROME unsupported settings are disabled and UIA names explain why" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
@@ -9981,6 +10072,13 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
     if (owner) |settings| {
         if (settings.controlIndex(hwnd)) |index| {
             const previous = settings.control_uia_prev_procs[index];
+            if (msg == win32_uia.SettingsControlProvider.action_message) {
+                if (settings.control_uia_providers[index]) |provider| {
+                    const hr = provider.handleAction(wParam, lParam);
+                    return if (hr == @import("win32_uia/com.zig").S_OK) win32_uia.SettingsControlProvider.action_success else hr;
+                }
+                return @import("win32_uia/com.zig").UIA_E_ELEMENTNOTAVAILABLE;
+            }
             if (msg == WM_GETOBJECT) {
                 if (settings.control_uia_providers[index]) |provider| {
                     if (win32_uia.returnSettingsControlProvider(hwnd, wParam, lParam, provider)) |result| return result;
@@ -9998,6 +10096,24 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
                 if (msg == WM_SETFOCUS) {
                     if (settings.control_uia_providers[index]) |provider| provider.raiseFocusChanged();
                 }
+                // Native control messages also cover programmatic refresh /
+                // Discard. Reads performed by syncNativeState do not reenter
+                // this mutation-only gate.
+                switch (msg) {
+                    0x00F1, // BM_SETCHECK
+                    CB_SETCURSEL,
+                    0x014F, // CB_SHOWDROPDOWN
+                    SettingsComboPopup.sync_message,
+                    WM_KEYDOWN,
+                    WM_KEYUP,
+                    WM_SYSKEYDOWN,
+                    0x0105, // WM_SYSKEYUP
+                    WM_LBUTTONDOWN,
+                    0x0202,
+                    WM_KILLFOCUS,
+                    => if (settings.control_uia_providers[index]) |provider| provider.syncNativeState(true),
+                    else => {},
+                }
                 return result;
             }
         }
@@ -10005,12 +10121,44 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
     return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-/// Subclass for the dropdowns. A closed COMBOBOX changes its selection on the
-/// wheel, so scrolling the page past one silently edits it; the wheel goes to
-/// the window instead, and stays with the combo only while its list is open.
-/// The previous procedure lives in the combo's own `GWLP_USERDATA` (a stock
-/// control leaves it unused) so the subclass reads no `SettingsWindow` state
-/// and cannot outlive it: it detaches itself in `WM_NCDESTROY`.
+/// Observe direct stock-popup selection without replacing its UIA provider.
+const SettingsComboPopup = struct {
+    const sync_message: UINT = 0x8000 + 0x10D;
+    const subclass_id: usize = 0x53455491;
+    const Info = extern struct {
+        size: u32 = @sizeOf(Info),
+        item: sys.RECT = std.mem.zeroes(sys.RECT),
+        button: sys.RECT = std.mem.zeroes(sys.RECT),
+        state: u32 = 0,
+        combo: ?HWND = null,
+        edit: ?HWND = null,
+        list: ?HWND = null,
+    };
+    extern "user32" fn GetComboBoxInfo(HWND, *Info) callconv(.winapi) BOOL;
+    extern "comctl32" fn SetWindowSubclass(HWND, *const @TypeOf(proc), usize, usize) callconv(.winapi) BOOL;
+    extern "comctl32" fn RemoveWindowSubclass(HWND, *const @TypeOf(proc), usize) callconv(.winapi) BOOL;
+    extern "comctl32" fn DefSubclassProc(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+
+    fn attach(combo: HWND) void {
+        var info: Info = .{};
+        if (GetComboBoxInfo(combo, &info) == 0) return;
+        if (info.list) |list| _ = SetWindowSubclass(list, &proc, subclass_id, @intFromPtr(combo));
+    }
+
+    fn proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM, id: usize, data: usize) callconv(.winapi) LRESULT {
+        if (msg == WM_NCDESTROY) _ = RemoveWindowSubclass(hwnd, &proc, id);
+        const result = DefSubclassProc(hwnd, msg, w, l);
+        // The stock SelectionItem proxy changes the list directly, bypassing
+        // the combo's CB_SETCURSEL and its usual CBN_SELCHANGE notification.
+        // Carry only the owning HWND, never a SettingsWindow/provider pointer.
+        if (msg == 0x0186) _ = sys.SendMessageW(@ptrFromInt(data), sync_message, 0, 0); // LB_SETCURSEL
+        return result;
+    }
+};
+
+/// A closed COMBOBOX changes its selection on the wheel, so scrolling the
+/// page past one goes to the form instead. Its previous procedure lives in
+/// GWLP_USERDATA and is restored in WM_NCDESTROY.
 fn settingsComboProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     const previous = sys.GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (previous == 0) return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -10660,6 +10808,16 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_COMMAND => {
             const id: usize = wParam & 0xFFFF;
             const notify: u16 = @intCast((wParam >> 16) & 0xFFFF);
+            // Popup mouse input is delivered to its list HWND. Native combo
+            // notifications are the reliable point to announce the resulting
+            // expansion / selection state, after draft handlers have run.
+            defer if (lParam != 0) {
+                if (owner) |o| {
+                    if (o.controlIndex(@ptrFromInt(@as(usize, @bitCast(lParam))))) |index| {
+                        if (o.control_uia_providers[index]) |provider| provider.syncNativeState(notify != CBN_SELCHANGE);
+                    }
+                }
+            };
             // IsDialogMessageW maps Escape to IDCANCEL as a synthetic
             // command with no originating control HWND. Only a click counts:
             // the button's BN_SETFOCUS notification must not cancel, or the

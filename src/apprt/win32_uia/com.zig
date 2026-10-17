@@ -36,6 +36,7 @@ pub const IID_ISelectionProvider = GUID.parse("{FB8B03AF-3BDF-48D4-BD36-1A65793B
 pub const IID_ISelectionItemProvider = GUID.parse("{2ACAD808-B2D4-452D-A407-91FF1AD167B2}");
 pub const IID_IInvokeProvider = GUID.parse("{54FCB24B-E18E-47A2-B4D3-ECCBE77599A2}");
 pub const IID_IToggleProvider = GUID.parse("{56D00BD0-C4F4-433C-A836-1A52A57E0892}");
+pub const IID_IExpandCollapseProvider = GUID.parse("{D847D3A5-CAB0-4A98-8C32-ECB45C59AD24}");
 pub const IID_IRangeValueProvider = GUID.parse("{36DC7AEF-33E6-4691-AFE1-2BE7274B3D33}");
 pub const IID_IValueProvider = GUID.parse("{C7935180-6FB3-4201-B174-7DF73ADBF64A}");
 pub const IID_ITextProvider = GUID.parse("{3589C92C-63F3-4367-99BB-ADA653B77CF2}");
@@ -255,6 +256,19 @@ pub const IToggleProviderVtbl = extern struct {
 
 pub const IToggleProvider = extern struct {
     vtbl: *const IToggleProviderVtbl,
+};
+
+pub const IExpandCollapseProviderVtbl = extern struct {
+    QueryInterface: *const fn (*IExpandCollapseProvider, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IExpandCollapseProvider) callconv(.winapi) u32,
+    Release: *const fn (*IExpandCollapseProvider) callconv(.winapi) u32,
+    Expand: *const fn (*IExpandCollapseProvider) callconv(.winapi) HRESULT,
+    Collapse: *const fn (*IExpandCollapseProvider) callconv(.winapi) HRESULT,
+    get_ExpandCollapseState: *const fn (*IExpandCollapseProvider, *i32) callconv(.winapi) HRESULT,
+};
+
+pub const IExpandCollapseProvider = extern struct {
+    vtbl: *const IExpandCollapseProviderVtbl,
 };
 
 pub const IRangeValueProviderVtbl = extern struct {

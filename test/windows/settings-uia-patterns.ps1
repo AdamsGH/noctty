@@ -1,0 +1,473 @@
+<#
+.SYNOPSIS
+    Native CUIAutomation probe for one private-desktop Settings control.
+.DESCRIPTION
+    The caller owns the fixture and checks pending/save behavior. No input,
+    clipboard access or process launching occurs here. Exercise is opt-in.
+    CompileOnly compiles the interop without contacting UIA or any window.
+#>
+[CmdletBinding()]
+param(
+    [long] $Hwnd,
+    [string] $Desktop,
+    [string] $OutputPath,
+    [ValidateSet('CheckBox', 'ComboBox')][string] $Kind,
+    [string] $ExpectedName,
+    [switch] $Exercise,
+    [switch] $UseSelectionItem,
+    [switch] $CompileOnly
+)
+$ErrorActionPreference = 'Stop'
+if (-not ('SettingsPatterns.Probe' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace SettingsPatterns
+{
+    // Partial interfaces: placeholders MUST NOT be called. Verified against
+    // Windows SDK 10.0.26100.0/um/UIAutomationClient.h; slots include IUnknown.
+    [ComImport, Guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAutomation
+    {
+        void CompareElements();                  // 3
+        void CompareRuntimeIds();                // 4
+        void GetRootElement();                   // 5
+        void ElementFromHandle(IntPtr hwnd, out IElement element); // 6
+        void ElementFromPoint();                 // 7
+        void GetFocusedElement();                // 8
+        void GetRootElementBuildCache();          // 9
+        void ElementFromHandleBuildCache();       // 10
+        void ElementFromPointBuildCache();        // 11
+        void GetFocusedElementBuildCache();       // 12
+        void CreateTreeWalker();                 // 13
+        void GetControlViewWalker();             // 14
+        void GetContentViewWalker();             // 15
+        void GetRawViewWalker(out IWalker walker); // 16
+    }
+
+    [ComImport, Guid("d22108aa-8ac5-49a5-837b-37bbb3d7591e")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IElement
+    {
+        void SetFocus();                         // 3 (unused)
+        void GetRuntimeId();                     // 4
+        void FindFirst();                        // 5
+        void FindAll();                          // 6
+        void FindFirstBuildCache();              // 7
+        void FindAllBuildCache();                // 8
+        void BuildUpdatedCache();                // 9
+        void GetCurrentPropertyValue(int id, [MarshalAs(UnmanagedType.Struct)] out object value); // 10
+        void GetCurrentPropertyValueEx();        // 11
+        void GetCachedPropertyValue();           // 12
+        void GetCachedPropertyValueEx();         // 13
+        void GetCurrentPatternAs();              // 14
+        void GetCachedPatternAs();               // 15
+        [PreserveSig]
+        int GetCurrentPattern(int id, [MarshalAs(UnmanagedType.IUnknown)] out object pattern); // 16
+    }
+
+    [ComImport, Guid("4042c624-389c-4afc-a630-9df854a541fc")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IWalker
+    {
+        void GetParentElement(IElement element, out IElement parent); // 3
+        void GetFirstChildElement(IElement element, out IElement child); // 4
+        void GetLastChildElement(IElement element, out IElement child); // 5
+        void GetNextSiblingElement(IElement element, out IElement sibling); // 6
+    }
+
+    [ComImport, Guid("94cf8058-9b8d-4ab9-8bfd-4cd0a33c8c70")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IToggle
+    {
+        void Toggle();                           // 3
+        void GetCurrentToggleState(out int state); // 4
+    }
+
+    [ComImport, Guid("619be086-1f4e-4ee4-bafa-210128738730")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IExpandCollapse
+    {
+        void Expand();                           // 3
+        void Collapse();                         // 4
+        void GetCurrentExpandCollapseState(out int state); // 5
+    }
+
+    [ComImport, Guid("a94cd8b1-0844-4cd6-9d2d-640537ab39e9")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IValue
+    {
+        void SetValue([MarshalAs(UnmanagedType.BStr)] string value); // 3
+        void GetCurrentValue([MarshalAs(UnmanagedType.BStr)] out string value); // 4
+        void GetCurrentIsReadOnly(out int readOnly); // 5
+    }
+
+    [ComImport, Guid("a8efa66a-0fda-421a-9194-38021f3578ea")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISelectionItem
+    {
+        void Select();                           // 3
+        void AddToSelection();                   // 4 (unused)
+        void RemoveFromSelection();              // 5 (unused)
+        void GetCurrentIsSelected(out int selected); // 6
+    }
+
+    [ComImport, Guid("5ed5202e-b2ac-47a6-b638-4b0bf140d78e")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISelection
+    {
+        void GetCurrentSelection(out IElementArray selection); // 3
+    }
+
+    [ComImport, Guid("14314595-b4bc-4055-95f2-58f2e42c9855")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IElementArray
+    {
+        void GetLength(out int length);           // 3
+        void GetElement(int index, out IElement element); // 4
+    }
+
+    public static class Probe
+    {
+        const int ElementNotEnabled = unchecked((int)0x80040200);
+        [StructLayout(LayoutKind.Sequential)]
+        struct Rect { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ComboInfo
+        {
+            public uint Size;
+            public Rect Item, Button;
+            public uint State;
+            public IntPtr Combo, Edit, List;
+        }
+        [DllImport("user32.dll")]
+        static extern bool GetComboBoxInfo(IntPtr hwnd, ref ComboInfo info);
+        [DllImport("user32.dll")]
+        static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll")]
+        static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+        [DllImport("user32.dll")]
+        static extern bool IsWindowEnabled(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")]
+        static extern IntPtr GetThreadDesktop(uint thread);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern bool GetUserObjectInformationW(IntPtr handle, int index,
+            StringBuilder name, uint bytes, out uint needed);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")]
+        static extern IntPtr ReadComboMessage(IntPtr hwnd, uint message, IntPtr w, IntPtr l,
+            uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")]
+        static extern IntPtr ReadComboText(IntPtr hwnd, uint message, IntPtr w, StringBuilder text,
+            uint flags, uint timeout, out IntPtr result);
+
+        static void Release(object value)
+        {
+            if (value != null && Marshal.IsComObject(value)) Marshal.ReleaseComObject(value);
+        }
+        static object Property(IElement element, int id)
+        {
+            object value;
+            element.GetCurrentPropertyValue(id, out value);
+            return value;
+        }
+        static object Pattern(IElement element, int id, string name, Dictionary<string, object> result)
+        {
+            object value;
+            int hr = element.GetCurrentPattern(id, out value);
+            result[name] = hr >= 0 && value != null;
+            result[name + "Hresult"] = String.Format("0x{0:X8}", hr);
+            if (hr < 0) { Release(value); return null; }
+            return value;
+        }
+        static void Require(bool condition, string message)
+        {
+            if (!condition) throw new InvalidOperationException(message);
+        }
+        static string ReadCombo(object value, object selection)
+        {
+            if (value != null)
+            {
+                string text;
+                ((IValue)value).GetCurrentValue(out text);
+                return text;
+            }
+            IElementArray items = null;
+            IElement item = null;
+            try
+            {
+                ((ISelection)selection).GetCurrentSelection(out items);
+                int count;
+                items.GetLength(out count);
+                Require(count == 1, "Expected one selected combo item");
+                items.GetElement(0, out item);
+                return Convert.ToString(Property(item, 30005));
+            }
+            finally { Release(item); Release(items); }
+        }
+        static string OtherNativeLabel(IntPtr hwnd, string current)
+        {
+            IntPtr count;
+            Require(ReadComboMessage(hwnd, 0x146, IntPtr.Zero, IntPtr.Zero, 2, 2000, out count) != IntPtr.Zero,
+                "Combo item count unavailable"); // CB_GETCOUNT
+            Require(count.ToInt64() > 0 && count.ToInt64() <= 256, "Invalid combo item count");
+            for (int index = 0; index < count.ToInt32(); index++)
+            {
+                IntPtr length, copied;
+                Require(ReadComboMessage(hwnd, 0x149, (IntPtr)index, IntPtr.Zero, 2, 2000, out length) != IntPtr.Zero,
+                    "Combo item length unavailable"); // CB_GETLBTEXTLEN
+                Require(length.ToInt64() >= 0 && length.ToInt64() <= 4096, "Invalid combo label length");
+                var text = new StringBuilder(length.ToInt32() + 1);
+                Require(ReadComboText(hwnd, 0x148, (IntPtr)index, text, 2, 2000, out copied) != IntPtr.Zero &&
+                    copied.ToInt64() >= 0, "Combo item label unavailable"); // CB_GETLBTEXT
+                if (text.ToString() != current) return text.ToString();
+            }
+            throw new InvalidOperationException("No different native combo label");
+        }
+        static bool SelectOther(IElement element, IWalker walker, int depth, ref int budget,
+            IValue writableValue, Dictionary<string, object> result)
+        {
+            Require(depth <= 8 && --budget >= 0, "Popup traversal bound exceeded");
+            object pattern = null;
+            int hr = element.GetCurrentPattern(10010, out pattern);
+            try
+            {
+                if (hr >= 0 && pattern != null)
+                {
+                    int selected;
+                    ((ISelectionItem)pattern).GetCurrentIsSelected(out selected);
+                    // Default auto-update-channel is normalized to this
+                    // build's channel on reload. Exercise an explicit choice.
+                    bool defaultChannel = Object.Equals(result["name"], "Auto-update channel") &&
+                        Convert.ToString(Property(element, 30005)).StartsWith("Default (");
+                    if (selected == 0 && !defaultChannel && Convert.ToBoolean(Property(element, 30010)))
+                    {
+                        result["selectionItemName"] = Property(element, 30005);
+                        result["SelectionItem"] = true;
+                        if (writableValue != null)
+                        {
+                            writableValue.SetValue(Convert.ToString(result["selectionItemName"]));
+                            result["operation"] = "Value.SetValue";
+                        }
+                        else
+                        {
+                            ((ISelectionItem)pattern).Select();
+                            result["operation"] = "SelectionItem.Select";
+                        }
+                        return true;
+                    }
+                }
+            }
+            finally { Release(pattern); }
+            IElement child;
+            walker.GetFirstChildElement(element, out child);
+            while (child != null)
+            {
+                IElement next = null;
+                try
+                {
+                    if (SelectOther(child, walker, depth + 1, ref budget, writableValue, result)) return true;
+                    walker.GetNextSiblingElement(child, out next);
+                }
+                finally { Release(child); }
+                child = next;
+            }
+            return false;
+        }
+        static void RunCore(long hwnd, string desktop, string kind, string expected, bool exercise, bool useSelectionItem,
+            Dictionary<string, object> result)
+        {
+            uint pid, needed;
+            uint thread = GetWindowThreadProcessId((IntPtr)hwnd, out pid);
+            var actual = new StringBuilder(256);
+            Require(thread != 0 && !String.IsNullOrEmpty(desktop) &&
+                !desktop.Equals("Default", StringComparison.OrdinalIgnoreCase) &&
+                GetUserObjectInformationW(GetThreadDesktop(thread), 2, actual, 512, out needed) &&
+                actual.ToString().Equals(desktop, StringComparison.Ordinal),
+                "Target is not on the specified private desktop");
+            result["privateDesktopVerified"] = true;
+            result["processId"] = pid;
+            IAutomation automation = null;
+            IElement element = null;
+            IWalker walker = null;
+            object toggle = null, expand = null, value = null, selection = null;
+            try
+            {
+                automation = (IAutomation)Activator.CreateInstance(Type.GetTypeFromCLSID(
+                    new Guid("ff48dba4-60ef-4201-aa87-54103eef594e")));
+                automation.ElementFromHandle((IntPtr)hwnd, out element);
+                // Collect observations before contract assertions, including on red baselines.
+                result["name"] = Property(element, 30005);
+                result["helpText"] = Property(element, 30013);
+                result["enabled"] = Property(element, 30010);
+                result["offscreen"] = Property(element, 30022);
+                result["dataValid"] = Property(element, 30103);
+                toggle = Pattern(element, 10015, "Toggle", result);
+                expand = Pattern(element, 10005, "ExpandCollapse", result);
+                value = Pattern(element, 10002, "Value", result);
+                selection = Pattern(element, 10001, "Selection", result);
+                Require(String.IsNullOrEmpty(expected) || Object.Equals(result["name"], expected),
+                    "Accessible name changed");
+                Require(Object.Equals(result["dataValid"], true), "Valid fixture reports invalid data");
+                bool enabled = Convert.ToBoolean(result["enabled"]);
+                if (kind == "CheckBox")
+                {
+                    Require(toggle != null, "Missing Toggle pattern");
+                    int before;
+                    ((IToggle)toggle).GetCurrentToggleState(out before);
+                    result["before"] = before;
+                    if (exercise)
+                    {
+                        try
+                        {
+                            ((IToggle)toggle).Toggle();
+                            Require(enabled, "Disabled Toggle unexpectedly succeeded");
+                        }
+                        catch (COMException error)
+                        {
+                            result["operationHresult"] = String.Format("0x{0:X8}", error.HResult);
+                            if (enabled || error.HResult != ElementNotEnabled) throw;
+                            result["disabledRejected"] = true;
+                        }
+                        Thread.Sleep(100);
+                        int after;
+                        ((IToggle)toggle).GetCurrentToggleState(out after);
+                        result["after"] = after;
+                        Require(enabled ? before != after : before == after, "Unexpected Toggle state after operation");
+                    }
+                }
+                else
+                {
+                    Require(expand != null, "Missing ExpandCollapse pattern");
+                    Require(value != null || selection != null, "Missing Value and Selection patterns");
+                    IValue writableValue = null;
+                    if (value != null)
+                    {
+                        int readOnly;
+                        ((IValue)value).GetCurrentIsReadOnly(out readOnly);
+                        result["valueReadOnly"] = readOnly != 0;
+                        if (readOnly == 0) writableValue = (IValue)value;
+                    }
+                    string before = ReadCombo(value, selection);
+                    result["before"] = before;
+                    if (exercise)
+                    {
+                        bool expanded = false;
+                        try
+                        {
+                            try
+                            {
+                                ((IExpandCollapse)expand).Expand();
+                                expanded = true;
+                                Require(enabled, "Disabled Expand unexpectedly succeeded");
+                            }
+                            catch (COMException error)
+                            {
+                                result["operationHresult"] = String.Format("0x{0:X8}", error.HResult);
+                                if (enabled || error.HResult != ElementNotEnabled) throw;
+                                result["disabledRejected"] = true;
+                            }
+                            if (!enabled && writableValue != null)
+                            {
+                                try
+                                {
+                                    writableValue.SetValue(OtherNativeLabel((IntPtr)hwnd, before));
+                                    throw new InvalidOperationException("Disabled Value.SetValue unexpectedly succeeded");
+                                }
+                                catch (COMException error)
+                                {
+                                    result["disabledValueHresult"] = String.Format("0x{0:X8}", error.HResult);
+                                    if (error.HResult != ElementNotEnabled) throw;
+                                    result["disabledValueRejected"] = true;
+                                }
+                            }
+                            if (enabled)
+                            {
+                                Thread.Sleep(100);
+                                int state;
+                                ((IExpandCollapse)expand).GetCurrentExpandCollapseState(out state);
+                                result["expandedState"] = state;
+                                Require(state == 1, "Combo did not expand");
+                                var info = new ComboInfo();
+                                info.Size = (uint)Marshal.SizeOf(typeof(ComboInfo));
+                                Require(GetComboBoxInfo((IntPtr)hwnd, ref info) && info.List != IntPtr.Zero,
+                                    "Combo popup unavailable");
+                                IElement list = null;
+                                try
+                                {
+                                    automation.ElementFromHandle(info.List, out list);
+                                    automation.GetRawViewWalker(out walker);
+                                    int budget = 256;
+                                    Require(SelectOther(list, walker, 0, ref budget, useSelectionItem ? null : writableValue, result),
+                                        "No enabled unselected popup SelectionItem");
+                                    IntPtr save = GetDlgItem(GetAncestor((IntPtr)hwnd, 2), 301);
+                                    result["saveEnabledBeforeCollapse"] = save != IntPtr.Zero && IsWindowEnabled(save);
+                                    Require(Convert.ToBoolean(result["saveEnabledBeforeCollapse"]),
+                                        "Popup operation did not update pending config before Collapse");
+                                }
+                                finally { Release(list); }
+                            }
+                        }
+                        finally
+                        {
+                            if (expanded) ((IExpandCollapse)expand).Collapse();
+                        }
+                        Thread.Sleep(100);
+                        string after = ReadCombo(value, selection);
+                        result["after"] = after;
+                        Require(enabled ? before != after : before == after, "Unexpected combo value after operation");
+                    }
+                }
+                result["nameAfter"] = Property(element, 30005);
+                Require(Object.Equals(result["name"], result["nameAfter"]), "Operation changed accessible name");
+                Require(Object.Equals(result["helpText"], Property(element, 30013)), "Operation changed help text");
+                result["pass"] = true;
+            }
+            finally
+            {
+                Release(walker); Release(selection); Release(value); Release(expand);
+                Release(toggle); Release(element); Release(automation);
+            }
+        }
+        public static Dictionary<string, object> Run(long hwnd, string desktop, string kind,
+            string expected, bool exercise, bool useSelectionItem)
+        {
+            var result = new Dictionary<string, object>();
+            result["pass"] = false;
+            result["kind"] = kind;
+            result["exercise"] = exercise;
+            var thread = new Thread(() =>
+            {
+                try { RunCore(hwnd, desktop, kind, expected, exercise, useSelectionItem, result); }
+                catch (Exception error)
+                {
+                    // Retain observations; do not serialize arbitrary exception data or stacks.
+                    result["error"] = error.Message;
+                    result["errorType"] = error.GetType().Name;
+                    result["hresult"] = String.Format("0x{0:X8}", error.HResult);
+                }
+            });
+            thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.MTA);
+            thread.Start();
+            // The launcher bounds and terminates this dedicated process if COM hangs.
+            thread.Join();
+            return result;
+        }
+    }
+}
+"@
+}
+if ($CompileOnly) { return }
+if (-not $Hwnd -or -not $Desktop -or -not $OutputPath -or -not $Kind) {
+    throw 'Hwnd, Desktop, OutputPath and Kind are required unless CompileOnly is set.'
+}
+$result = [SettingsPatterns.Probe]::Run($Hwnd, $Desktop, $Kind, $ExpectedName, $Exercise.IsPresent, $UseSelectionItem.IsPresent)
+$result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding utf8
+if (-not $result['pass']) { exit 1 }
