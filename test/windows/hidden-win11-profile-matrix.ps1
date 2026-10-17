@@ -17,13 +17,16 @@ Their directory is checked from the first prompt alone, by seeding the session w
 a trailing separator, which a shell reporting its own directory does not.
 
 A control case runs cmd.exe with `shell-integration = none` and expects the seed to survive, so the
-directory checks above cannot pass by accident. WSL, SSH and any distribution are never started. A
-profile that is not installed is reported as skipped, never as a pass.
+directory checks above cannot pass by accident. No interactive WSL/SSH profile is launched;
+startup discovery may probe WSL. A profile that is not installed is reported as skipped, never as a pass.
 
 Run with -Bin <directory holding noctty.exe, conpty.dll, OpenConsole.exe> -Run <new evidence
 directory>. The binary must carry the measurement AUMID unless -AllowProductAumid is given (an
 ephemeral CI runner). Exit 1 when a check fails. It never uses SendInput, takes the foreground or
 copies anything; the clipboard sequence number is logged before and after.
+Launches currently require an ephemeral GitHub-hosted runner. Metadata receipts check every
+observed job thread's desktop, including shell/discovery and ConPTY host processes; they do not
+prove placement of short-lived processes between samples or arbitrary external brokers.
 #>
 [CmdletBinding()]
 param(
@@ -38,6 +41,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'hidden-win11-lib.ps1')
+Assert-HiddenRunner
 
 if (-not $Driver) {
     Assert-MeasureAumid (Join-Path (Resolve-Path -LiteralPath $Bin).Path 'noctty.exe') -AllowProductAumid:$AllowProductAumid
@@ -48,11 +52,13 @@ if (-not $Driver) {
     exit
 }
 
-# The driver: runs on the new desktop. Children get that desktop explicitly.
+# The driver and noctty share the inherited desktop handle. Observe their job
+# threads as well: ConPTY's explicit handle list does not propagate that handle.
 $Profile = @($Profile | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $desktopName = [HiddenWin]::CurrentDesktopName()
 if (-not $desktopName.StartsWith('noctty-hw-')) { throw "Driver is not on its own desktop (found '$desktopName')." }
 $job = [HiddenWin]::CreateOwnedJob()
+$desktopReceipt = Join-Path $Run 'profile-desktops.jsonl'
 $checks = [Collections.Generic.List[object]]::new()
 $cases = [Collections.Generic.List[object]]::new()
 function Check([string] $Case, [string] $Name, [bool] $Passed, $Expected, $Actual) {
@@ -60,12 +66,76 @@ function Check([string] $Case, [string] $Name, [bool] $Passed, $Expected, $Actua
 }
 $runId = [guid]::NewGuid().ToString('N').Substring(0, 8)
 
+# Mirror windows_shell.lookupGitBash: PATH git's install, HKCU/HKLM install roots, then a
+# non-WSL PATH bash. Never execute a candidate or probe a network/device PATH component.
+function Test-LocalShellFile([string] $Path) {
+    if ($Path -notmatch '^[A-Za-z]:[\\/]') { return $false }
+    try {
+        if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($Path)).DriveType -eq [IO.DriveType]::Network) { return $false }
+        return Test-Path -LiteralPath $Path -PathType Leaf
+    } catch { return $false }
+}
+
+function Find-LocalShellOnPath([string] $Name) {
+    foreach ($entry in ($env:PATH -split ';')) {
+        $dir = $entry.Trim().Trim('"')
+        if ($dir -notmatch '^[A-Za-z]:[\\/]') { continue }
+        try { $candidate = Join-Path $dir $Name } catch { continue }
+        if (Test-LocalShellFile $candidate) { return $candidate }
+    }
+    return $null
+}
+
+function Get-GitInstallRoot([Microsoft.Win32.RegistryHive] $Hive) {
+    $base = $null; $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, [Microsoft.Win32.RegistryView]::Default)
+        $key = $base.OpenSubKey('SOFTWARE\GitForWindows', $false)
+        if ($key -and $key.GetValueKind('InstallPath') -eq [Microsoft.Win32.RegistryValueKind]::String) {
+            return [string]$key.GetValue('InstallPath')
+        }
+    } catch { return $null }
+    finally { if ($key) { $key.Dispose() }; if ($base) { $base.Dispose() } }
+    return $null
+}
+
+function Get-AvailableGitBash {
+    $git = Find-LocalShellOnPath 'git.exe'
+    if ($git) {
+        $dir = Split-Path -Parent $git
+        $leaf = Split-Path -Leaf $dir
+        $root = Split-Path -Parent $dir
+        if ($leaf -ieq 'bin') {
+            $environment = Split-Path -Leaf $root
+            if ($environment -match '^(?i:mingw.*|ucrt64|clang64|clangarm64)$') { $root = Split-Path -Parent $root }
+        }
+        if ($leaf -iin @('cmd', 'bin')) {
+            $candidate = Join-Path $root 'bin\bash.exe'
+            if (Test-LocalShellFile $candidate) { return $candidate }
+        }
+    }
+    foreach ($hive in @([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryHive]::LocalMachine)) {
+        $root = Get-GitInstallRoot $hive
+        if ($root -match '^[A-Za-z]:[\\/]') {
+            try { $candidate = Join-Path $root 'bin\bash.exe' } catch { continue }
+            if (Test-LocalShellFile $candidate) { return $candidate }
+        }
+    }
+    $bash = Find-LocalShellOnPath 'bash.exe'
+    if (-not $bash) { return $null }
+    $normalized = $bash.Replace('/', '\')
+    $systemRoot = if ($env:SystemRoot) { $env:SystemRoot.Replace('/', '\').TrimEnd('\') } else { 'C:\Windows' }
+    if ($normalized.StartsWith($systemRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        ($normalized -split '\\') -icontains 'WindowsApps') { return $null }
+    return $bash
+}
+
 function Test-Available([string] $Key) {
     switch ($Key) {
         'cmd.exe' { return [bool]$env:ComSpec -and (Test-Path -LiteralPath $env:ComSpec) }
         'powershell.exe' { return Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') }
         'pwsh.exe' { return [bool](Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue) }
-        'git-bash' { return Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Git\bin\bash.exe') }
+        'git-bash' { return [bool](Get-AvailableGitBash) }
         default { return $false }
     }
 }
@@ -101,6 +171,7 @@ function Wait-Ready($Case, $Process) {
     $ledger = Join-Path $Case.Dir 'startup-attempts.json'
     $deadline = [datetime]::UtcNow.AddSeconds(30)
     while ([datetime]::UtcNow -lt $deadline -and -not $Process.HasExited) {
+        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath $desktopReceipt
         $hosts = @([HiddenWin]::Hosts($Process.Id))
         $ready = $false
         if (Test-Path -LiteralPath $ledger) {
@@ -135,6 +206,7 @@ function Invoke-Case([string] $Key, [switch] $Control) {
         # The profile's own process appears under noctty (through ConPTY's host).
         $shell = $null; $deadline = [datetime]::UtcNow.AddSeconds(20)
         while ([datetime]::UtcNow -lt $deadline -and -not $shell) {
+            Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath $desktopReceipt
             $shell = Get-Descendants $started.Pid | Where-Object { $_.Name -ieq $expected.Name } | Select-Object -First 1
             if (-not $shell) { Start-Sleep -Milliseconds 200 }
         }
@@ -147,6 +219,7 @@ function Invoke-Case([string] $Key, [switch] $Control) {
         Check $label 'command line has no -File or /c payload' (($full -notmatch '(^|\s)-File(\s|$)') -and ($full -notmatch '(^|\s)/c(\s|$)')) 'neither' $shape
         # Give the first prompt time to draw and send its OSC 7.
         Start-Sleep -Milliseconds 2500
+        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath $desktopReceipt
         if ($expected.Cd -and -not $Control) {
             # A command typed before the shell reads input can be lost, so prove the shell is reading
             # first: it must create a marker before the real commands go in.
@@ -180,6 +253,7 @@ function Invoke-Case([string] $Key, [switch] $Control) {
         $cases.Add(@{ Profile = $label; Result = 'ran'; Shape = $shape })
     } catch {
         Check $label 'harness execution' $false 'no error' $_.Exception.Message
+        if ($_.Exception.Message -like 'Hidden desktop*') { throw }
     } finally {
         $env:HOME = $savedHome; $env:HISTFILE = $savedHistfile
         if ($started -and -not $started.Process.HasExited) {

@@ -25,7 +25,7 @@ param(
     [Parameter(Mandatory)] [string] $TestLog,
     [Parameter(Mandatory)] [string] $Runner,
     [string] $BudgetFile = (Join-Path $PSScriptRoot '..\test\windows\test-skip-budget.json'),
-    # Print the skipped tests of the guarded family and exit 0, to draft an allowlist for a new runner.
+    # Validate the run, then print guarded skips without enforcing a runner budget, to draft an allowlist.
     [switch] $Report
 )
 $ErrorActionPreference = 'Stop'
@@ -42,36 +42,57 @@ $announced = 0
 $summary = $null
 $parsed = [Collections.Generic.List[object]]::new()
 $pending = $null
+$problems = [Collections.Generic.List[string]]::new()
 foreach ($line in Get-Content -LiteralPath $TestLog) {
     # The runner prints `N/M name...` and then OK, SKIP or FAIL, on the same line unless the test logged
     # in between: the log lines follow the header and the result stands alone on a later line.
     if ($null -ne $pending) {
-        if ($line -match '^(OK|SKIP|FAIL)\b') {
+        if ($line -match '^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$') {
             $parsed.Add([pscustomobject]@{ Index = $pending.Index; Name = $pending.Name; Result = $Matches[1] })
             $pending = $null
             continue
         }
     }
     $header = [regex]::Match($line, '^(\d+)/(\d+) (.*?)\.\.\.(.*)$')
-    if ($header.Success -and [int]$header.Groups[1].Value -eq $parsed.Count + 1) {
-        $announced = [int]$header.Groups[2].Value
+    if ($header.Success) {
+        if ($null -ne $summary) { $problems.Add('A per-test header follows the closing line.') }
+        if ($null -ne $pending) { $problems.Add("Test $($pending.Index) has no result before the next header.") }
+        if ([int]$header.Groups[1].Value -ne $parsed.Count + 1) { $problems.Add('Per-test indexes are not sequential.') }
+        $count = [int]$header.Groups[2].Value
+        if ($announced -ne 0 -and $count -ne $announced) { $problems.Add('Per-test announced totals changed within the run.') }
+        if ($announced -eq 0) { $announced = $count }
         $item = [pscustomobject]@{ Index = [int]$header.Groups[1].Value; Name = $header.Groups[3].Value }
         $rest = $header.Groups[4].Value
-        if ($rest -match '^(OK|SKIP|FAIL)\s*$') { $parsed.Add([pscustomobject]@{ Index = $item.Index; Name = $item.Name; Result = $Matches[1] }); $pending = $null }
+        if ($rest -match '^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$') { $parsed.Add([pscustomobject]@{ Index = $item.Index; Name = $item.Name; Result = $Matches[1] }); $pending = $null }
         else { $pending = $item }
         continue
     }
     $total = [regex]::Match($line, '^(\d+) passed; (\d+) skipped; (\d+) failed\.$')
-    if ($total.Success) { $summary = @{ Passed = [int]$total.Groups[1].Value; Skipped = [int]$total.Groups[2].Value; Failed = [int]$total.Groups[3].Value } }
+    $allPassed = [regex]::Match($line, '^All (\d+) tests passed\.$')
+    if ($total.Success -or $allPassed.Success) {
+        if ($null -ne $summary) { $problems.Add('The log contains more than one closing line.') }
+        if ($null -ne $pending) { $problems.Add("Test $($pending.Index) has no result before the closing line.") }
+        $summary = if ($total.Success) { @{ Passed = [int]$total.Groups[1].Value; Skipped = [int]$total.Groups[2].Value; Failed = [int]$total.Groups[3].Value } }
+            else { @{ Passed = [int]$allPassed.Groups[1].Value; Skipped = 0; Failed = 0 } }
+    }
+    elseif ($line -match '^\d+/\d+\b|^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$') { $problems.Add('Malformed per-test header or result without a pending test.') }
 }
-$problems = [Collections.Generic.List[string]]::new()
 if ($parsed.Count -eq 0) { $problems.Add('The log holds no per-test lines; run ghostty-test.exe directly and pass its output.') }
 elseif ($null -eq $summary) { $problems.Add("The log has no closing 'N passed; N skipped; N failed.' line, so the run did not finish ($($parsed.Count) of $announced tests reported).") }
 elseif ($parsed.Count -ne $announced -or ($summary.Passed + $summary.Skipped + $summary.Failed) -ne $announced) {
     $problems.Add("The log is inconsistent: $($parsed.Count) tests parsed, $announced announced, the closing line counts $($summary.Passed + $summary.Skipped + $summary.Failed).")
 }
-elseif (@($parsed | Where-Object Result -eq 'SKIP').Count -ne $summary.Skipped) {
-    $problems.Add("Parsed $(@($parsed | Where-Object Result -eq 'SKIP').Count) skipped tests but the closing line says $($summary.Skipped).")
+if ($null -ne $summary) {
+    foreach ($status in @{ OK = 'Passed'; SKIP = 'Skipped'; FAIL = 'Failed' }.GetEnumerator()) {
+        $actual = @($parsed | Where-Object Result -eq $status.Key).Count
+        if ($actual -ne $summary[$status.Value]) { $problems.Add("Parsed $actual $($status.Value) tests but the closing line says $($summary[$status.Value]).") }
+    }
+}
+if (@($parsed | Where-Object Result -eq 'FAIL').Count -gt 0) { $problems.Add('The test run contains failed tests.') }
+# Reporting may relax the allowlist, never the requirement for a complete, successful test run.
+if ($problems.Count -gt 0) {
+    foreach ($problem in $problems) { [Console]::Error.WriteLine("SKIP BUDGET: $problem") }
+    exit 1
 }
 
 $skipped = @($parsed | Where-Object Result -eq 'SKIP')

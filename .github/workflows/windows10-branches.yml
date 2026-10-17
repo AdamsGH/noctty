@@ -109,7 +109,7 @@ jobs:
 
       - name: Skip budget
         shell: pwsh
-        run: ./scripts/check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022 -Report
+        run: ./scripts/check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022
 
       - name: Build D3D11 lifecycle smoke tools
         shell: pwsh

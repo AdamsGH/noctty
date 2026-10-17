@@ -454,8 +454,8 @@ PowerShell panes are never typed into, because a pwsh in a test pane loads PSRea
 and its history file is the real user's (the harness proves that file, the real
 `startup-attempts.json` and the clipboard sequence number did not change). A
 control case runs cmd with `shell-integration = none` and expects the seed to
-survive. WSL and SSH are never started; a profile that is not installed is
-skipped and reported.
+survive. No interactive WSL or SSH profile is started; startup discovery may
+probe WSL. A profile that is not installed is skipped and reported.
 
 ```powershell
 pwsh -NoProfile -File .\hidden-win11-profile-matrix.ps1 -Bin <dir with noctty.exe> -Run <new dir>
@@ -478,22 +478,37 @@ file byte-identical, quarantines nothing and does not touch the console
 delegation values. `-NegativeControl` starts an ordinary instance instead and
 expects the window oracle to fire. It writes no delegation registry value and
 delivers no handoff; journeys that need one need a machine that can be restored.
+The harness refuses to start when the user's `DelegationTerminal` selects noctty:
+the measurement AUMID does not isolate the session's live COM handoff class.
 
 ```powershell
 pwsh -NoProfile -File .\hidden-win11-embedding-idle.ps1 -Bin <dir with noctty.exe> -Run <new dir>
 ```
 
+Both scripts currently require an ephemeral GitHub-hosted runner; local launches
+are blocked until the exact bundled and in-box ConPTY desktop placement has
+hosted evidence. The workflow supplies the runner environment and collects the
+desktop metadata receipts and binary fingerprints with its artifacts.
+
 Both scripts share `hidden-win11-lib.ps1` (private desktop, owned job, explicit
-`lpDesktop` for every child, real-state receipts).
+desktop selection for harness launches, inherited desktop handles for direct
+children, observed descendant-thread desktop checks, and real-state receipts).
+The window oracle samples every 100 ms, so it does not prove the absence of a
+window whose whole lifetime falls between samples. No external broker journey
+is exercised. Keep the exact bundled and in-box ConPTY desktop evidence separate.
 
 ## ..\..\scripts\check-test-skips.ps1
 
 Budget for the Zig tests that skip themselves. `zig build test` reports only a
 total, so a font-shaping test that starts skipping on a runner looks like one that
 always did. The script reads the per-test output of `ghostty-test.exe` run
-directly and fails when a test in the guarded family (`font.shaper.`) skips and is
+directly and fails when a test in the guarded family (`font.`) skips and is
 not on the runner's allowlist in `test-skip-budget.json`, when the total is above
 the runner's budget, or when the log is incomplete.
+The `windows-2022` ceiling of 76 and its nine font skip names were measured from
+run [39027272717](https://github.com/amanthanvi/noctty/actions/runs/39027272717).
+`-Report` drafts an allowlist for a new runner, but still rejects incomplete,
+inconsistent or failed output. CI runs without `-Report` to enforce the budget.
 
 ```powershell
 zig build -Demit-test-exe=true -Dcustom-shaders=true

@@ -1,5 +1,5 @@
 # The hidden-desktop harnesses added for PKG-76 (profile matrix, -Embedding idle) start real
-# copies of noctty on a machine somebody uses, and the skip budget decides what CI may skip
+# copies of noctty on ephemeral hosted runners, and the skip budget decides what CI may skip
 # silently. Both are pinned here: the safety rules by what the files may contain, the budget script
 # by running it on synthetic logs.
 $hiddenLib = Join-Path $repoRoot 'test\windows\hidden-win11-lib.ps1'
@@ -75,21 +75,352 @@ foreach ($script in $hiddenScripts) {
         Kind = 'Text'
         Description = "$name uses no real input, foreground, clipboard, Start-Process or recursive delete"
     }
-    $hiddenContracts += @{
+    if ($name -eq 'hidden-win11-profile-matrix.ps1') { $hiddenContracts += @{
         File = $script
         Content = $text
         Pattern = "(?s)'--single-instance=false'.*?--class=noctty-test-pkg76"
         Kind = 'Text'
         Description = "$name starts every noctty with single-instance off and a unique class"
-    }
+    } }
 }
 Invoke-ContractTable -Contracts $hiddenContracts
+
+# Exercise only extracted functions/expressions with managed native-call stand-ins. No harness
+# top-level code, P/Invoke, process launch, window, registry write or real state read runs here.
+function Get-HiddenFunction([string] $Text, [string] $Name) {
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+    $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name }, $true)
+    if (-not $function) { throw "Missing hidden harness function $Name." }
+    return $function.Extent.Text
+}
+$mutationControls = 0
+function Assert-HiddenMutation([string] $Name, [string] $Original, [string] $Mutated, [scriptblock] $Validate) {
+    if ($Original -ceq $Mutated) { throw "Mutation '$Name' changed no code." }
+    & $Validate $Original
+    $rejected = $false
+    try { & $Validate $Mutated } catch { $rejected = $true }
+    if (-not $rejected) { throw "Hidden harness contract accepted mutation '$Name'." }
+    $script:mutationControls++
+}
+
+$launch = [regex]::Match($hiddenLibText, '(?ms)^    public static ProcessInfo Launch\(.*?^    }').Value
+$createDesktop = [regex]::Match($hiddenLibText, '(?ms)^    public static IntPtr CreateInheritedDesktop\(.*?^    }').Value
+$threadDesktop = [regex]::Match($hiddenLibText, '(?ms)^    public static string ThreadDesktopName\(.*?^    }').Value
+$visibleWindows = [regex]::Match($hiddenLibText, '(?ms)^    public static string\[\] VisibleTopLevelClasses\(.*?^    }').Value
+if (-not $launch -or -not $createDesktop -or -not $threadDesktop -or -not $visibleWindows) { throw 'The hidden native launch/desktop/window methods were not found.' }
+function Test-HiddenNativeCode([string] $Methods) {
+    $typeName = 'HiddenNativeContract' + [guid]::NewGuid().ToString('N')
+    $support = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class TYPE_NAME {
+    [StructLayout(LayoutKind.Sequential)] public struct Startup { public int cb, flags; public string desktop; public IntPtr error; }
+    public struct ProcessInfo { public IntPtr process, thread; }
+    public struct SecurityAttributes { public int length; public bool inherit; }
+    public delegate bool EnumWindow(IntPtr h, IntPtr p);
+    public static string Desktop; public static uint Flags; public static bool Inherit, DesktopInherit, Assigned, Resumed, AssignedBeforeResume, ThreadQueryFails, NameQueryFails;
+    public static int CreatedDesktops;
+    static IntPtr CreateDesktopW(string n, IntPtr d, IntPtr m, int f, uint a, ref SecurityAttributes sa) { CreatedDesktops++; DesktopInherit = sa.inherit; return new IntPtr(9); }
+    static IntPtr GetThreadDesktop(uint threadId) { return ThreadQueryFails ? IntPtr.Zero : new IntPtr(9); }
+    static bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder name, int length, out int needed) { needed = 20; name.Append("contract-private"); return !NameQueryFails; }
+    static IntPtr CreateFileW(string p, uint a, uint s, ref SecurityAttributes sa, uint d, uint f, IntPtr t) { return new IntPtr(3); }
+    static bool CloseHandle(IntPtr h) { return true; }
+    static bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref Startup si, out ProcessInfo pi) {
+        Desktop = si.desktop; Flags = flags; Inherit = inherit; pi = new ProcessInfo { process = new IntPtr(1), thread = new IntPtr(2) }; return true;
+    }
+    static bool AssignProcessToJobObject(IntPtr job, IntPtr process) { Assigned = job == new IntPtr(7) && process == new IntPtr(1); return Assigned; }
+    static uint ResumeThread(IntPtr thread) { AssignedBeforeResume = Assigned; Resumed = true; return 1; }
+    static bool TerminateProcess(IntPtr process, uint code) { return true; }
+    static bool EnumWindows(EnumWindow cb, IntPtr p) { for (int i = 1; i <= 4; i++) cb(new IntPtr(i), p); return true; }
+    static int GetWindowThreadProcessId(IntPtr h, out int pid) { pid = h.ToInt32() == 4 ? 99 : 42; return 1; }
+    static string Class(IntPtr h) { return h.ToInt32() == 1 ? "noctty.win32.host" : "#32770"; }
+    static bool IsWindowVisible(IntPtr h) { return h.ToInt32() == 2 || h.ToInt32() == 4; }
+METHODS
+}
+'@
+    $type = Add-Type -TypeDefinition ($support.Replace('TYPE_NAME', $typeName).Replace('METHODS', $Methods)) -PassThru | Where-Object Name -eq $typeName
+    $null = $type::CreateInheritedDesktop('contract-private')
+    if ($type::CreatedDesktops -ne 1 -or -not $type::DesktopInherit) { throw 'Harness must create exactly one inheritable desktop handle.' }
+    foreach ($stderr in @('', 'unused-stderr')) {
+        $type::Assigned = $type::Resumed = $type::AssignedBeforeResume = $false
+        $null = $type::Launch('unused.exe', 'unused', 'unused', 'WinSta0\contract-private', [IntPtr]7, $stderr)
+        if ($type::Desktop -cne 'WinSta0\contract-private' -or -not $type::Inherit -or ($type::Flags -band 0x08000004) -ne 0x08000004 -or
+            -not $type::Assigned -or -not $type::Resumed -or -not $type::AssignedBeforeResume) { throw 'Native launch lost desktop inheritance, explicit desktop, no-window/suspended flags or assign-before-resume.' }
+    }
+    if ($type::ThreadDesktopName(42) -cne 'contract-private') { throw 'Thread desktop name query failed.' }
+    foreach ($failure in @('ThreadQueryFails', 'NameQueryFails')) {
+        $type.GetField($failure).SetValue($null, $true)
+        $rejected = $false
+        try { $null = $type::ThreadDesktopName(42) } catch { $rejected = $true }
+        $type.GetField($failure).SetValue($null, $false)
+        if (-not $rejected) { throw 'Desktop query error was silently accepted.' }
+    }
+    $classes = @($type::VisibleTopLevelClasses(42))
+    if ($classes.Count -ne 1 -or $classes[0] -cne '#32770') { throw 'Visible-window enumeration lost the process/visibility filter or omitted a dialog.' }
+}
+$nativeCode = $launch + "`n" + $createDesktop + "`n" + $threadDesktop + "`n" + $visibleWindows
+Assert-HiddenMutation 'null native desktop' $nativeCode ($nativeCode.Replace('desktop = desktop', 'desktop = null')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'wrong native desktop' $nativeCode ($nativeCode.Replace('desktop = desktop', 'desktop = "Default"')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'child handle inheritance disabled' $nativeCode ($nativeCode.Replace('IntPtr.Zero, IntPtr.Zero, true, 0x08004004', 'IntPtr.Zero, IntPtr.Zero, false, 0x08004004')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'desktop handle not inheritable' $nativeCode ($nativeCode.Replace('inherit = true', 'inherit = false')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'desktop name query errors ignored' $nativeCode ($nativeCode.Replace('throw new Exception("Desktop name query failed: " + Marshal.GetLastWin32Error())', 'return "contract-private"')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'missing job assignment' $nativeCode ($nativeCode.Replace('!AssignProcessToJobObject(job, pi.process) || ', '')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'missing no-window flag' $nativeCode ($nativeCode.Replace('0x08004004', '0x00004004')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'hidden windows counted as UI' $nativeCode ($nativeCode.Replace(' && IsWindowVisible(h)', '')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'visible dialogs omitted' $nativeCode ($nativeCode.Replace('id == pid && IsWindowVisible(h)', 'id == pid && IsWindowVisible(h) && Class(h) == "noctty.win32.host"')) ${function:Test-HiddenNativeCode}
+
+if (-not ('HiddenDriverContract' -as [type])) {
+    Add-Type @'
+using System;
+public static class HiddenDriverContract {
+    public static string Local, Roaming, Desktop;
+    public struct ProcessInfo { public int pid; public IntPtr thread, process; }
+    public static uint GetClipboardSequenceNumber() { return 0; }
+    public static IntPtr CreateInheritedDesktop(string n) { return new IntPtr(1); }
+    public static IntPtr CreateOwnedJob() { return new IntPtr(2); }
+    public static ProcessInfo Launch(string a, string c, string w, string desktop, IntPtr j, string e) {
+        Local = Environment.GetEnvironmentVariable("LOCALAPPDATA"); Roaming = Environment.GetEnvironmentVariable("APPDATA"); Desktop = desktop;
+        return new ProcessInfo { pid = 1 };
+    }
+    public static uint WaitForSingleObject(IntPtr p, uint ms) { return 0; }
+    public static bool GetExitCodeProcess(IntPtr p, out uint code) { code = 0; return true; }
+    public static uint StopOwnedJob(IntPtr j) { return 0; }
+    public static bool CloseHandle(IntPtr p) { return true; }
+    public static bool CloseDesktop(IntPtr d) { return true; }
+}
+'@
+}
+$driverFunction = (Get-HiddenFunction $hiddenLibText 'Invoke-HiddenDriver').Replace('[HiddenWin]', '[HiddenDriverContract]')
+function Test-HiddenDriverCode([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    $script:driverRunnerGuardCalled = $false
+    function Assert-HiddenRunner { $script:driverRunnerGuardCalled = $true }
+    function Get-RealStateFingerprints { return @{ Startup = @{}; History = @{} } }
+    function Get-FileFingerprint { return @{ Exists = $true; Hash = 'managed fixture' } }
+    function Test-SameFingerprint { return $true }
+    function Copy-PortableBin { }
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ('noctty-hidden-contract-' + [guid]::NewGuid().ToString('N'))
+    $savedLocal = $env:LOCALAPPDATA; $savedRoaming = $env:APPDATA
+    try {
+        $null = New-Item -ItemType Directory -Path (Join-Path $fixture 'bin')
+        Set-Content -LiteralPath (Join-Path $fixture 'bin\noctty.exe') -Value ''
+        $runPath = Join-Path $fixture 'run'
+        Invoke-HiddenDriver -Script 'unused.ps1' -Bin (Join-Path $fixture 'bin') -Run $runPath -TimeoutSeconds 1 -Label 'managed isolation fixture' 6>$null
+        if (-not $script:driverRunnerGuardCalled) { throw 'Driver lost the hosted-runner gate.' }
+        if ([HiddenDriverContract]::Local -cne (Join-Path $runPath 'localappdata') -or
+            [HiddenDriverContract]::Roaming -cne (Join-Path $runPath 'appdata') -or
+            [HiddenDriverContract]::Desktop -notmatch '^WinSta0\\noctty-hw-[0-9a-f]{32}$') { throw 'Driver launch lost run-scoped app data or explicit desktop.' }
+        if ($env:LOCALAPPDATA -cne $savedLocal -or $env:APPDATA -cne $savedRoaming) { throw 'Driver did not restore its environment.' }
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal; $env:APPDATA = $savedRoaming
+        if ([IO.Path]::GetDirectoryName($fixture) -eq [IO.Path]::GetTempPath().TrimEnd('\', '/') -and
+            (Split-Path -Leaf $fixture) -match '^noctty-hidden-contract-[0-9a-f]{32}$') { Remove-Item -LiteralPath $fixture -Recurse -Force }
+    }
+}
+Assert-HiddenMutation 'driver desktop null' $driverFunction ($driverFunction.Replace('"WinSta0\$desktopName"', '$null')) ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'driver runner gate removed' $driverFunction ($driverFunction.Replace('    Assert-HiddenRunner', '')) ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'original LOCALAPPDATA inherited' $driverFunction ($driverFunction.Replace("Join-Path `$Run 'localappdata';", '$oldLocal;')) ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'original APPDATA inherited' $driverFunction ($driverFunction.Replace("Join-Path `$Run 'appdata'", '$oldRoaming')) ${function:Test-HiddenDriverCode}
+
+$runnerGuard = Get-HiddenFunction $hiddenLibText 'Assert-HiddenRunner'
+function Test-HiddenRunnerGuard([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    $savedActions = $env:GITHUB_ACTIONS; $savedRunner = $env:RUNNER_ENVIRONMENT
+    try {
+        foreach ($fixture in @(@('true', 'github-hosted', $false), @('true', 'self-hosted', $true), @('', '', $true), @('', 'github-hosted', $true))) {
+            $env:GITHUB_ACTIONS = $fixture[0]; $env:RUNNER_ENVIRONMENT = $fixture[1]
+            $blocked = $false
+            try { Assert-HiddenRunner } catch { $blocked = $true }
+            if ($blocked -ne $fixture[2]) { throw 'Runner gate accepted a local/self-hosted launch or refused the hosted fixture.' }
+        }
+    } finally { $env:GITHUB_ACTIONS = $savedActions; $env:RUNNER_ENVIRONMENT = $savedRunner }
+}
+Assert-HiddenMutation 'self-hosted runner allowed' $runnerGuard ($runnerGuard.Replace("'github-hosted'", "'self-hosted'")) ${function:Test-HiddenRunnerGuard}
+foreach ($script in $hiddenScripts) {
+    $text = Remove-PowerShellComments (Get-Content -LiteralPath $script -Raw)
+    if ($text -notmatch "(?m)^\. \(Join-Path .+ 'hidden-win11-lib.ps1'\)\r?\nAssert-HiddenRunner\r?\n" -or
+        $text -notmatch '(?m)^\s+Assert-HiddenDesktop -Job \$job -DesktopName \$desktopName -ReceiptPath') {
+        throw 'Hidden harness lost its entry runner gate or observed-thread desktop checks.'
+    }
+}
+
+if (-not ('HiddenDesktopContract' -as [type])) {
+    Add-Type @'
+using System;
+public static class HiddenDesktopContract {
+    public static object[] Rows;
+    public static bool QueryFails;
+    public static int[] Seen;
+    public static int[] JobProcessIds(IntPtr job) { if (QueryFails) throw new Exception("fixture query failure"); return new int[] { 41, 42 }; }
+    public static object[] ObserveDesktopThreads(int[] ids) { Seen = ids; return Rows; }
+}
+'@
+}
+$desktopAssertion = (Get-HiddenFunction $hiddenLibText 'Assert-HiddenDesktop').Replace('[HiddenWin]', '[HiddenDesktopContract]')
+function Test-HiddenDesktopAssertion([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    foreach ($fixture in @(
+        @{ Desktop = 'noctty-hw-fixture'; Blocked = $false }
+        @{ Desktop = 'Default'; Blocked = $true }
+        @{ Desktop = $null; Blocked = $true }
+        @{ Desktop = 'noctty-hw-fixture'; Error = 'query failed'; Blocked = $true }
+        @{ Exited = $true; Error = 'query failed'; Blocked = $false }
+        @{ Exited = $true; Desktop = 'Default'; Blocked = $true }
+        @{ Empty = $true; Blocked = $true }
+        @{ QueryFails = $true; Blocked = $true }
+    )) {
+        $receipts = [Collections.Generic.List[string]]::new()
+        function Add-Content {
+            param([Parameter(ValueFromPipeline)] [string] $Value, [string] $LiteralPath)
+            process { $receipts.Add($Value) }
+        }
+        [HiddenDesktopContract]::QueryFails = [bool]$fixture.QueryFails
+        [HiddenDesktopContract]::Rows = if ($fixture.Empty) { @() } else { @(@{
+            ProcessId = 41; ThreadId = 123; Desktop = $fixture.Desktop; Error = $fixture.Error; Exited = [bool]$fixture.Exited
+        }) }
+        $blocked = $false
+        try { Assert-HiddenDesktop -Job ([IntPtr]7) -DesktopName 'noctty-hw-fixture' -ReceiptPath 'unused.jsonl' -DriverPid 40 } catch { $blocked = $true }
+        if ($blocked -ne $fixture.Blocked -or $receipts.Count -ne 1) { throw 'Desktop observation did not fail closed or preserve its metadata receipt.' }
+        if (-not $fixture.QueryFails -and -not $fixture.Empty -and ([HiddenDesktopContract]::Seen -join ',') -ne '41,42,40') {
+            throw 'Desktop observation omitted the driver or a job process.'
+        }
+        $receipt = $receipts[0] | ConvertFrom-Json
+        if ($receipt.ExpectedDesktop -cne 'noctty-hw-fixture' -or (-not $fixture.QueryFails -and -not $fixture.Empty -and $receipt.Threads.Count -ne 1)) {
+            throw 'Desktop receipt lost expected desktop or thread metadata.'
+        }
+    }
+}
+Assert-HiddenMutation 'wrong observed desktop accepted' $desktopAssertion ($desktopAssertion.Replace('($row.Desktop -and $row.Desktop -cne $DesktopName)', '$false')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'live desktop query error ignored' $desktopAssertion ($desktopAssertion.Replace('$row.Error -or ', '')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'desktop receipt removed' $desktopAssertion ($desktopAssertion.Replace('Add-Content -LiteralPath $ReceiptPath', 'Out-Null')) ${function:Test-HiddenDesktopAssertion}
+
+$embeddingText = Remove-PowerShellComments (Get-Content -LiteralPath $hiddenScripts[1] -Raw)
+$embeddingArguments = [regex]::Match($embeddingText, '(?ms)^\$uniqueClass =.*?(?=^Assert-EmbeddingDelegationSafe|^\$started =)').Value
+function Test-EmbeddingArguments([string] $Code) {
+    if (-not $Code) { throw 'Embedding argument construction missing.' }
+    foreach ($control in @($false, $true)) {
+        & {
+            $NegativeControl = $control
+            . ([scriptblock]::Create($Code))
+            $marker = [array]::IndexOf($launchArguments, '-Embedding')
+            if ($launchArguments[0] -cne '--single-instance=false' -or $launchArguments[1] -notmatch '^--class=noctty-test-pkg76-embedding-[0-9a-f]{8}$' -or
+                ($control -and $marker -ne -1) -or (-not $control -and ($marker -ne 2 -or $launchArguments.Count -ne 3))) { throw 'Embedding isolation must precede the stop marker.' }
+        }
+    }
+}
+Assert-HiddenMutation 'embedding stop marker before isolation' $embeddingArguments ($embeddingArguments.Replace("`$launchArguments += '-Embedding'", "`$launchArguments = @('-Embedding') + `$launchArguments")) ${function:Test-EmbeddingArguments}
+$embeddingAst = [Management.Automation.Language.Parser]::ParseInput($embeddingText, [ref]$null, [ref]$null)
+$oracle = $embeddingAst.Find({ param($node) $node -is [Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -eq 'Check' -and $node.CommandElements[1].Extent.Text -eq "'it opens no visible top-level window'" }, $true).Extent.Text
+function Test-EmbeddingOracle([string] $Code) {
+    if (-not $Code) { throw 'Embedding visible UI oracle missing.' }
+    foreach ($class in @('', 'noctty.win32.host', '#32770')) {
+        & {
+            $classes = [Collections.Generic.HashSet[string]]::new()
+            if ($class) { [void]$classes.Add($class) }
+            function Check([string] $Name, [bool] $Passed, $Expected, $Actual) {
+                if ($Passed -ne (-not [bool]$class)) { throw 'Embedding oracle accepted unexpected process UI.' }
+            }
+            . ([scriptblock]::Create($Code))
+        }
+    }
+}
+Assert-HiddenMutation 'host-only embedding oracle misses dialog' $oracle ($oracle.Replace('$classes.Count -eq 0', "-not `$classes.Contains('noctty.win32.host')")) ${function:Test-EmbeddingOracle}
+
+$delegationGuard = Get-HiddenFunction $hiddenLibText 'Assert-EmbeddingDelegationSafe'
+function Test-EmbeddingDelegationGuard([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    foreach ($value in @($null, '', '{11111111-1111-1111-1111-111111111111}', '{33368c6f-d328-410c-b225-26dc9f12c728}', '33368C6F-D328-410C-B225-26DC9F12C728', 'missing-key', 'unreadable')) {
+        function Get-ItemProperty {
+            param($LiteralPath, $ErrorAction)
+            if ($LiteralPath -cne 'HKCU:\Console\%%Startup' -or $ErrorAction -cne 'Stop') { throw 'Wrong delegation registry read.' }
+            if ($value -eq 'missing-key') { throw [Management.Automation.ItemNotFoundException]::new('Fixture missing key') }
+            if ($value -eq 'unreadable') { throw [UnauthorizedAccessException]::new('Fixture unreadable key') }
+            return @{ DelegationTerminal = $value }
+        }
+        $blocked = $false
+        try { Assert-EmbeddingDelegationSafe } catch { $blocked = $true }
+        $expected = $value -like '*33368*-d328-410c-b225-26dc9f12c728*' -or $value -eq 'unreadable'
+        if ($blocked -ne $expected) { throw 'Delegation guard failed to distinguish absent/unrelated selection from noctty or unreadable state.' }
+    }
+}
+Assert-HiddenMutation 'real COM handoff CLSID unguarded' $delegationGuard ($delegationGuard.Replace('33368C6F-D328-410C-B225-26DC9F12C728', '11111111-1111-1111-1111-111111111111')) ${function:Test-EmbeddingDelegationGuard}
+# Check the actual call sites as well as the callable guard; comments are already removed.
+function Test-EmbeddingGuardCalls([string] $Code) {
+    if ($Code -notmatch '(?m)^Assert-EmbeddingDelegationSafe\r?\n\s*if \(-not \$Driver\)' -or
+        $Code -notmatch '(?m)^Assert-EmbeddingDelegationSafe\r?\n\$started = Start-HiddenNoctty') { throw 'Embedding launch lost the entry/prelaunch delegation guard.' }
+}
+Assert-HiddenMutation 'delegation guard call removed' $embeddingText ($embeddingText -replace '(?m)^Assert-EmbeddingDelegationSafe\r?\n', '') ${function:Test-EmbeddingGuardCalls}
+
+$profileText = Remove-PowerShellComments (Get-Content -LiteralPath $hiddenScripts[0] -Raw)
+$gitFunctions = (Get-HiddenFunction $profileText 'Get-AvailableGitBash') + "`n" + (Get-HiddenFunction $profileText 'Test-Available')
+function Test-GitBashDiscovery([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    $savedRoot = $env:SystemRoot
+    try {
+        $env:SystemRoot = 'C:\Windows'
+        $fixtures = @(
+            @{ Git = 'C:\Custom\cmd\git.exe'; Files = @('C:\Custom\bin\bash.exe'); Expected = 'C:\Custom\bin\bash.exe' }
+            @{ Git = 'C:\Custom\bin\git.exe'; Files = @('C:\Custom\bin\bash.exe'); Expected = 'C:\Custom\bin\bash.exe' }
+            @{ Git = 'C:\Custom\mingw64\bin\git.exe'; Files = @('C:\Custom\bin\bash.exe'); Expected = 'C:\Custom\bin\bash.exe' }
+            @{ Git = 'C:\Custom\ucrt64\bin\git.exe'; Files = @('C:\Custom\bin\bash.exe'); Expected = 'C:\Custom\bin\bash.exe' }
+            @{ User = 'C:\PerUser'; Machine = 'C:\Machine'; Files = @('C:\PerUser\bin\bash.exe', 'C:\Machine\bin\bash.exe'); Expected = 'C:\PerUser\bin\bash.exe' }
+            @{ User = 'C:\Removed'; Machine = 'C:\Machine'; Files = @('C:\Machine\bin\bash.exe'); Expected = 'C:\Machine\bin\bash.exe' }
+            @{ Bash = 'C:\Cygwin\bin\bash.exe'; Expected = 'C:\Cygwin\bin\bash.exe' }
+            @{ Bash = 'c:/WINDOWS/Sysnative/bash.exe'; Expected = $null }
+            @{ Bash = 'C:\Users\fixture\WindowsApps\bash.exe'; Expected = $null }
+            @{ Git = 'C:\Shim\git.exe'; Bash = 'C:\Windows\System32\bash.exe'; Expected = $null }
+            @{ Expected = $null }
+        )
+        foreach ($fixture in $fixtures) {
+            function Find-LocalShellOnPath([string] $Name) { if ($Name -eq 'git.exe') { return $fixture.Git }; return $fixture.Bash }
+            function Get-GitInstallRoot($Hive) { if ($Hive -eq [Microsoft.Win32.RegistryHive]::CurrentUser) { return $fixture.User }; return $fixture.Machine }
+            function Test-LocalShellFile([string] $Path) { return $fixture.Files -icontains $Path }
+            if ((Get-AvailableGitBash) -ine $fixture.Expected -or (Test-Available 'git-bash') -ne [bool]$fixture.Expected) { throw 'Git Bash availability disagrees with supported app discovery.' }
+        }
+    } finally { $env:SystemRoot = $savedRoot }
+}
+Assert-HiddenMutation 'PATH git install ignored' $gitFunctions ($gitFunctions.Replace("Find-LocalShellOnPath 'git.exe'", '$null')) ${function:Test-GitBashDiscovery}
+Assert-HiddenMutation 'per-user Git install ignored' $gitFunctions ($gitFunctions.Replace('[Microsoft.Win32.RegistryHive]::CurrentUser, ', '')) ${function:Test-GitBashDiscovery}
+Assert-HiddenMutation 'WSL bash accepted' $gitFunctions ($gitFunctions.Replace('return $null }', 'return $bash }')) ${function:Test-GitBashDiscovery}
+# The filesystem probe must reject unsafe shapes before it can query a path.
+& {
+    . ([scriptblock]::Create((Get-HiddenFunction $profileText 'Test-LocalShellFile')))
+    $probes = [Collections.Generic.List[string]]::new()
+    function Test-Path { $probes.Add('queried'); return $false }
+    foreach ($path in @('\\server\share\bash.exe', '\??\UNC\server\bash.exe', '//server/share/bash.exe', 'relative\bash.exe', 'C:bash.exe')) {
+        if (Test-LocalShellFile $path) { throw 'Unsafe Git Bash path was accepted.' }
+    }
+    if ($probes.Count -ne 0) { throw 'Unsafe Git Bash path reached the filesystem probe.' }
+}
+& {
+    . ([scriptblock]::Create((Get-HiddenFunction $profileText 'Find-LocalShellOnPath')))
+    $probes = [Collections.Generic.List[string]]::new()
+    function Test-LocalShellFile([string] $Path) { $probes.Add($Path); return $Path -ieq 'C:\PKG76\last\git.exe' }
+    $savedPath = $env:PATH
+    try {
+        $env:PATH = 'relative;\\server\share;"C:\PKG76\bin";C:\PKG76\last'
+        if ((Find-LocalShellOnPath 'git.exe') -ine 'C:\PKG76\last\git.exe' -or $probes.Count -ne 2 -or
+            $probes[0] -ine 'C:\PKG76\bin\git.exe') { throw 'Local PATH lookup lost quoting/order or queried an unsafe component.' }
+    } finally { $env:PATH = $savedPath }
+}
+
+# Pin the actual executable workflow line, so a comment or reporting-only invocation cannot pass.
+$skipWorkflow = Get-Content -LiteralPath (Join-Path $repoRoot '.github\workflows\windows10-branches.yml') -Raw
+function Test-SkipWorkflow([string] $Code) {
+    $command = [regex]::Match($Code, '(?m)^        run: (\./scripts/check-test-skips\.ps1[^\r\n]*)$').Groups[1].Value
+    if ($command -cne './scripts/check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022') { throw 'Windows 2022 workflow must enforce its skip budget.' }
+}
+Assert-HiddenMutation 'workflow reporting only' $skipWorkflow ($skipWorkflow.Replace('-Runner windows-2022', '-Runner windows-2022 -Report')) ${function:Test-SkipWorkflow}
 
 # The skip budget, run on synthetic output of the test executable.
 $skipScript = Join-Path $repoRoot 'scripts\check-test-skips.ps1'
 $skipBudget = Join-Path $repoRoot 'test\windows\test-skip-budget.json'
 $budget = Get-Content -LiteralPath $skipBudget -Raw | ConvertFrom-Json
 if ($budget.schema_version -ne 1 -or -not $budget.familyPrefix) { throw 'test-skip-budget.json lost its schema version or family prefix.' }
+if (-not $budget.runners.'windows-2022') { throw 'The enforcing Windows 2022 workflow needs a measured runner budget.' }
 foreach ($runner in $budget.runners.PSObject.Properties) {
     $limits = $runner.Value
     if ([int]$limits.maxTotalSkipped -lt @($limits.allowedSkips).Count) {
@@ -109,10 +440,11 @@ try {
         schema_version = 1; familyPrefix = 'font.'
         runners = @{ r = @{ maxTotalSkipped = 3; allowedSkips = @('font.a.test.allowed skip') } }
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $fixtureBudget
-    function Invoke-SkipFixture([string] $Name, [string[]] $Lines, [string] $Runner = 'r') {
+    function Invoke-SkipFixture([string] $Name, [string[]] $Lines, [string] $Runner = 'r', [switch] $Report) {
         $log = Join-Path $skipTemp "$Name.log"
         Set-Content -LiteralPath $log -Value $Lines
-        $output = & pwsh -NoProfile -File $skipScript -TestLog $log -Runner $Runner -BudgetFile $fixtureBudget 2>&1 | Out-String
+        $reportArguments = @(); if ($Report) { $reportArguments += '-Report' }
+        $output = & pwsh -NoProfile -File $skipScript -TestLog $log -Runner $Runner -BudgetFile $fixtureBudget @reportArguments 2>&1 | Out-String
         return @{ Exit = $LASTEXITCODE; Output = $output }
     }
     $okRun = @('1/4 font.a.test.allowed skip...SKIP', '2/4 font.b.test.runs...OK', '3/4 other.test.skips...SKIP', '4/4 font.c.test.runs...OK', '2 passed; 2 skipped; 0 failed.')
@@ -130,9 +462,25 @@ try {
            Lines = @('1/2 font.b.test.runs...OK', '2/2 font.c.test.runs...OK', '5 passed; 0 skipped; 0 failed.') }
         @{ Name = 'no per-test lines at all'; Exit = 1; Match = 'no per-test lines'
            Lines = @('some other output') }
+        @{ Name = 'all tests passed summary'; Exit = 0; Match = 'PASS'; Lines = @('1/1 font.b.test.runs...OK', 'All 1 tests passed.') }
+        @{ Name = 'reporting an unknown runner'; Exit = 0; Match = 'font.a.test.allowed skip'; Runner = 'nowhere'; Report = $true; Lines = $okRun }
+        @{ Name = 'reporting an incomplete log'; Exit = 1; Match = 'did not finish'; Report = $true; Lines = @('1/2 x...OK') }
+        @{ Name = 'reporting malformed counts'; Exit = 1; Match = 'inconsistent'; Report = $true; Lines = @('1/1 x...OK', '2 passed; 0 skipped; 0 failed.') }
+        @{ Name = 'reporting without tests'; Exit = 1; Match = 'no per-test lines'; Report = $true; Lines = @('some other output') }
+        @{ Name = 'changing announced totals'; Exit = 1; Match = 'announced totals changed'; Lines = @('1/3 x...OK', '2/2 y...OK', 'All 2 tests passed.') }
+        @{ Name = 'duplicate test index'; Exit = 1; Match = 'not sequential'; Lines = @('1/2 x...OK', '1/2 y...OK', 'All 2 tests passed.') }
+        @{ Name = 'missing test result before header'; Exit = 1; Match = 'no result before'; Lines = @('1/2 x...some log', '2/2 y...OK', 'All 2 tests passed.') }
+        @{ Name = 'missing result before summary'; Exit = 1; Match = 'no result before'; Lines = @('1/1 x...some log', 'All 1 tests passed.', 'OK') }
+        @{ Name = 'test after summary'; Exit = 1; Match = 'follows the closing'; Lines = @('1/2 x...OK', 'All 2 tests passed.', '2/2 y...OK') }
+        @{ Name = 'duplicate summary'; Exit = 1; Match = 'more than one closing'; Lines = @('1/1 x...OK', 'All 1 tests passed.', 'All 1 tests passed.') }
+        @{ Name = 'failed test disguised by summary'; Exit = 1; Match = 'Parsed 0 Passed|Parsed 1 Failed'; Lines = @('1/1 x...FAIL (TestUnexpectedResult)', 'All 1 tests passed.') }
+        @{ Name = 'complete failed run in report mode'; Exit = 1; Match = 'contains failed tests'; Report = $true; Lines = @('1/1 x...FAIL (TestUnexpectedResult)', '0 passed; 0 skipped; 1 failed.') }
+        @{ Name = 'result without pending test'; Exit = 1; Match = 'result without a pending'; Lines = @('1/1 x...OK', 'SKIP', 'All 1 tests passed.') }
+        @{ Name = 'malformed extra header'; Exit = 1; Match = 'Malformed per-test header'; Lines = @('1/1 x...OK', '2/1 missing result marker', 'All 1 tests passed.') }
     )
     foreach ($case in $skipCases) {
-        $result = Invoke-SkipFixture ($case.Name -replace '\W', '-') $case.Lines
+        $runner = if ($case.Runner) { $case.Runner } else { 'r' }
+        $result = Invoke-SkipFixture ($case.Name -replace '\W', '-') $case.Lines -Runner $runner -Report:([bool]$case.Report)
         if ($result.Exit -ne $case.Exit -or $result.Output -notmatch $case.Match) {
             throw "Skip budget fixture '$($case.Name)': expected exit $($case.Exit) matching /$($case.Match)/, got exit $($result.Exit): $($result.Output)"
         }
@@ -147,4 +495,4 @@ finally {
         Remove-Item -LiteralPath $skipTemp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-Write-Host "Hidden harness and skip budget contracts: $($hiddenContracts.Count) static checks, $($skipCases.Count + 1) skip budget fixtures"
+Write-Host "Hidden harness and skip budget contracts: $($hiddenContracts.Count) static checks, $mutationControls mutation controls, $($skipCases.Count + 1) skip budget fixtures"

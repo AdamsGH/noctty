@@ -2,9 +2,11 @@
 # (hidden-win11-profile-matrix.ps1, hidden-win11-embedding-idle.ps1). Dot-source it.
 #
 # Safety rules these harnesses keep (AGENTS.md, test/windows/README.md):
-#   * Every process runs on a desktop this run creates; lpDesktop is explicit
-#     for every CreateProcess, because a child of a driver on a private desktop
-#     does not inherit it.
+#   * The driver and noctty use explicit desktop names and inherit ONE desktop
+#     handle, which their ordinary shell/discovery launches can propagate.
+#     Every observed job process/thread is checked; this is not broker isolation.
+#   * Launches are restricted to ephemeral GitHub-hosted runners until the exact
+#     bundled and in-box ConPTY host placement has been observed there.
 #   * Every noctty is a copy with a `noctty.portable` marker, with LOCALAPPDATA
 #     and APPDATA redirected into the run directory.
 #   * The real startup-attempts.json and the real PSReadLine history file are
@@ -19,6 +21,7 @@ if (-not ('HiddenWin' -as [type])) {
 Add-Type @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class HiddenWin {
@@ -41,7 +44,7 @@ public static class HiddenWin {
         return SendMessageTimeoutW(h, m, new IntPtr(w), new IntPtr(l), 2, 5000, out result) != IntPtr.Zero;
     }
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string n, IntPtr dev, IntPtr mode, int flags, uint access, IntPtr sa);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateDesktopW(string n, IntPtr dev, IntPtr mode, int flags, uint access, ref SecurityAttributes sa);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref Startup si, out ProcessInfo pi);
@@ -93,6 +96,12 @@ public static class HiddenWin {
         } finally { CloseHandle(job); }
     }
     [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes { public int length; public IntPtr descriptor; public bool inherit; }
+    public static IntPtr CreateInheritedDesktop(string name) {
+        var sa = new SecurityAttributes { length = Marshal.SizeOf<SecurityAttributes>(), inherit = true };
+        var desktop = CreateDesktopW(name, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000, ref sa);
+        if (desktop == IntPtr.Zero) throw new Exception("Create inheritable desktop failed: " + Marshal.GetLastWin32Error());
+        return desktop;
+    }
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateFileW(string name, uint access, uint share, ref SecurityAttributes sa, uint disposition, uint flags, IntPtr template);
     // Starts a process suspended on an explicit desktop, assigns it to the owned job and resumes it.
     // stderrPath, when not empty, is created and becomes the child's standard error (its other
@@ -101,15 +110,15 @@ public static class HiddenWin {
         // No STARTF_USESHOWWINDOW: a window hidden by the launcher takes no posted input, and this
         // desktop is never displayed anyway.
         var si = new Startup { cb = Marshal.SizeOf<Startup>(), desktop = desktop }; ProcessInfo pi;
-        IntPtr err = IntPtr.Zero; bool inherit = false;
+        IntPtr err = IntPtr.Zero;
         if (!string.IsNullOrEmpty(stderrPath)) {
             var sa = new SecurityAttributes { length = Marshal.SizeOf<SecurityAttributes>(), inherit = true };
             err = CreateFileW(stderrPath, 0x40000000, 3, ref sa, 2, 0x80, IntPtr.Zero);
             if (err == new IntPtr(-1)) throw new Exception("Creating the stderr file failed: " + Marshal.GetLastWin32Error());
-            si.flags |= 0x100; si.error = err; inherit = true;
+            si.flags |= 0x100; si.error = err;
         }
         bool created;
-        try { created = CreateProcessW(app, new StringBuilder(command), IntPtr.Zero, IntPtr.Zero, inherit, 0x08004004, IntPtr.Zero, cwd, ref si, out pi); }
+        try { created = CreateProcessW(app, new StringBuilder(command), IntPtr.Zero, IntPtr.Zero, true, 0x08004004, IntPtr.Zero, cwd, ref si, out pi); }
         finally { if (err != IntPtr.Zero) CloseHandle(err); }
         if (!created) throw new Exception("CreateProcess failed: " + Marshal.GetLastWin32Error());
         if (!AssignProcessToJobObject(job, pi.process) || ResumeThread(pi.thread) == 0xFFFFFFFF) {
@@ -124,10 +133,10 @@ public static class HiddenWin {
             if (id == pid && Class(h) == "noctty.win32.host") list.Add(h); return true;
         }, IntPtr.Zero); return list.ToArray();
     }
-    // Every top-level window the process owns, whatever its class.
-    public static string[] TopLevelClasses(int pid) {
+    // Every visible top-level window the process owns, dialogs included, whatever its class.
+    public static string[] VisibleTopLevelClasses(int pid) {
         var list = new List<string>(); EnumWindows((h, p) => { int id; GetWindowThreadProcessId(h, out id);
-            if (id == pid) list.Add(Class(h)); return true;
+            if (id == pid && IsWindowVisible(h)) list.Add(Class(h)); return true;
         }, IntPtr.Zero); return list.ToArray();
     }
     public static IntPtr[] Surfaces(IntPtr host) {
@@ -135,13 +144,70 @@ public static class HiddenWin {
         EnumChildWindows(host, (c, p) => { if (Class(c) == "noctty.win32" && IsWindowVisible(c)) list.Add(c); return true; }, IntPtr.Zero);
         return list.ToArray();
     }
-    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint threadId);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetThreadDesktop(uint threadId);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder name, int length, out int needed);
     public static string CurrentDesktopName() {
+        return ThreadDesktopName(GetCurrentThreadId());
+    }
+    public static string ThreadDesktopName(uint threadId) {
+        var desktop = GetThreadDesktop(threadId);
+        if (desktop == IntPtr.Zero) throw new Exception("GetThreadDesktop failed: " + Marshal.GetLastWin32Error());
         var name = new StringBuilder(256); int needed;
-        if (!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), 2, name, 512, out needed)) return "";
+        if (!GetUserObjectInformationW(desktop, 2, name, 512, out needed))
+            throw new Exception("Desktop name query failed: " + Marshal.GetLastWin32Error());
         return name.ToString();
+    }
+    [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job, int type, IntPtr info, uint size, IntPtr returned);
+    public static int[] JobProcessIds(IntPtr job) {
+        const int bytes = 65536;
+        var buffer = Marshal.AllocHGlobal(bytes);
+        try {
+            if (!QueryInformationJobObject(job, 3, buffer, bytes, IntPtr.Zero)) throw new Exception("Job process query failed");
+            int assigned = Marshal.ReadInt32(buffer), count = Marshal.ReadInt32(buffer, 4);
+            if (count < 0 || count != assigned || count > (bytes - 8) / IntPtr.Size) throw new Exception("Job process query incomplete");
+            var ids = new int[count];
+            for (int i = 0; i < count; i++) ids[i] = checked((int)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64());
+            return ids;
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    public sealed class DesktopObservation {
+        public int ProcessId, ThreadId;
+        public string Name, Desktop, Error;
+        public bool Exited;
+    }
+    static bool ConclusivelyExited(Process process) {
+        try { return process.HasExited; } catch { return false; }
+    }
+    public static DesktopObservation[] ObserveDesktopThreads(int[] ids) {
+        var rows = new List<DesktopObservation>();
+        foreach (int id in ids) {
+            Process process;
+            try { process = Process.GetProcessById(id); }
+            catch (ArgumentException) { rows.Add(new DesktopObservation { ProcessId = id, Exited = true }); continue; }
+            using (process) {
+                var row = new DesktopObservation { ProcessId = id };
+                try {
+                    // Retain the process handle before enumerating its threads, so an exit
+                    // check concerns this process instance rather than a subsequently reused PID.
+                    var handle = process.Handle;
+                    row.Name = process.ProcessName;
+                    var threads = process.Threads;
+                    if (threads.Count == 0) throw new Exception("No observed threads");
+                    foreach (ProcessThread thread in threads) {
+                        row = new DesktopObservation { ProcessId = id, ThreadId = thread.Id, Name = process.ProcessName };
+                        rows.Add(row);
+                        try { row.Desktop = ThreadDesktopName((uint)thread.Id); }
+                        catch { row.Exited = ConclusivelyExited(process); if (!row.Exited) row.Error = "Thread desktop query failed"; }
+                    }
+                } catch {
+                    row.Exited = ConclusivelyExited(process);
+                    if (!row.Exited) row.Error = "Process thread enumeration failed";
+                    if (!rows.Contains(row)) rows.Add(row);
+                }
+            }
+        }
+        return rows.ToArray();
     }
     public static bool ContainsBytes(byte[] hay, byte[] needle) {
         int last = hay.Length - needle.Length;
@@ -154,6 +220,34 @@ public static class HiddenWin {
     }
 }
 '@
+}
+
+function Assert-HiddenRunner {
+    if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted') {
+        throw 'Hidden desktop launches require an ephemeral GitHub-hosted runner. Exact ConPTY host desktop placement must be observed there before permitting local launches.'
+    }
+}
+
+# Metadata only, including the driver and every currently observed member of its job.
+# Short-lived processes between samples and external brokers are outside this receipt.
+function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $ReceiptPath, [int] $DriverPid = $PID) {
+    try {
+        $ids = @(@([HiddenWin]::JobProcessIds($Job)) + $DriverPid | Select-Object -Unique)
+        $rows = @([HiddenWin]::ObserveDesktopThreads([int[]]$ids))
+        if ($rows.Count -eq 0) { throw 'No desktop metadata.' }
+    } catch {
+        @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Error = 'Process metadata query failed' } |
+            ConvertTo-Json -Compress | Add-Content -LiteralPath $ReceiptPath
+        throw 'Hidden desktop process metadata query failed; further launches are blocked.'
+    }
+    @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Threads = $rows } |
+        ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath $ReceiptPath
+    foreach ($row in $rows) {
+        if (($row.Desktop -and $row.Desktop -cne $DesktopName) -or
+            (-not $row.Exited -and ($row.Error -or -not $row.Desktop))) {
+            throw "Hidden desktop confinement failed for PID=$($row.ProcessId) TID=$($row.ThreadId); inspect metadata receipt."
+        }
+    }
 }
 
 function Get-FileFingerprint([string] $Path) {
@@ -187,6 +281,19 @@ function Assert-MeasureAumid([string] $Exe, [switch] $AllowProductAumid) {
     }
 }
 
+# The measurement AUMID does not isolate Server.register's real COM CLSID. An idle server
+# could receive the user's live console handoff while noctty is their delegated terminal.
+# Read only that one selection and fail closed on an unreadable key; there is no bypass.
+function Assert-EmbeddingDelegationSafe {
+    try { $selection = Get-ItemProperty -LiteralPath 'HKCU:\Console\%%Startup' -ErrorAction Stop }
+    catch [Management.Automation.ItemNotFoundException] { return }
+    $terminal = [guid]::Empty
+    if ([guid]::TryParse([string]$selection.DelegationTerminal, [ref]$terminal) -and
+        $terminal -eq [guid]'33368C6F-D328-410C-B225-26DC9F12C728') {
+        throw 'Embedding launch blocked: noctty is the selected delegated terminal. The measurement AUMID does not isolate the real COM handoff CLSID; use a sandbox with independent console delegation.'
+    }
+}
+
 function Copy-PortableBin([string] $Source, [string] $Destination) {
     [void](New-Item -ItemType Directory -Path $Destination)
     Get-ChildItem -LiteralPath $Source -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $Destination }
@@ -202,6 +309,7 @@ function Invoke-HiddenDriver {
         [Parameter(Mandatory)] [string] $Script, [Parameter(Mandatory)] [string] $Bin, [Parameter(Mandatory)] [string] $Run,
         [Parameter(Mandatory)] [int] $TimeoutSeconds, [string[]] $ExtraArguments = @(), [Parameter(Mandatory)] [string] $Label
     )
+    Assert-HiddenRunner
     $Bin = (Resolve-Path -LiteralPath $Bin).Path
     $Run = [IO.Path]::GetFullPath($Run)
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
@@ -210,10 +318,14 @@ function Invoke-HiddenDriver {
     $clipboardBefore = [HiddenWin]::GetClipboardSequenceNumber()
     [void](New-Item -ItemType Directory -Path $Run)
     Copy-PortableBin $Bin (Join-Path $Run 'source\bin')
+    $artifacts = foreach ($name in @('noctty.exe', 'conpty.dll', 'OpenConsole.exe')) {
+        @{ Name = $name; Fingerprint = Get-FileFingerprint (Join-Path $Run "source\bin\$name") }
+    }
+    @{ OSVersion = [Environment]::OSVersion.Version.ToString(); Artifacts = @($artifacts) } |
+        ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'runtime-artifacts.json')
     foreach ($name in @('localappdata', 'appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
     $desktopName = 'noctty-hw-' + [guid]::NewGuid().ToString('N')
-    $desktop = [HiddenWin]::CreateDesktopW($desktopName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
-    if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktop failed.' }
+    $desktop = [HiddenWin]::CreateInheritedDesktop($desktopName)
     $oldLocal = $env:LOCALAPPDATA; $oldRoaming = $env:APPDATA
     $pi = $null; $job = [IntPtr]::Zero; $code = 1
     try {
@@ -226,7 +338,8 @@ function Invoke-HiddenDriver {
         $pi = [HiddenWin]::Launch($pwsh, $line, $Run, "WinSta0\$desktopName", $job, '')
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
-        while ([HiddenWin]::WaitForSingleObject($pi.process, 1000) -eq 258) {
+        while ([HiddenWin]::WaitForSingleObject($pi.process, 100) -eq 258) {
+            Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $pi.pid -ReceiptPath (Join-Path $Run 'driver-desktops.jsonl')
             if ([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $TimeoutSeconds seconds; the owned process job will be closed." }
         }
         [uint32]$exit = 0; [void][HiddenWin]::GetExitCodeProcess($pi.process, [ref]$exit); $code = [int]$exit
@@ -264,6 +377,7 @@ function Invoke-HiddenDriver {
 # Starts a portable noctty on the driver's desktop. The returned object owns the process.
 function Start-HiddenNoctty {
     param([Parameter(Mandatory)] [string] $Dir, [Parameter(Mandatory)] [string[]] $Arguments, [Parameter(Mandatory)] [string] $DesktopName, [Parameter(Mandatory)] [IntPtr] $Job, [string] $StderrPath)
+    Assert-HiddenRunner
     $exe = Join-Path $Dir 'noctty.exe'
     if (-not (Test-Path -LiteralPath (Join-Path $Dir 'noctty.portable'))) { throw 'Portable marker missing; launch blocked.' }
     $line = '"{0}" {1}' -f $exe, ($Arguments -join ' ')

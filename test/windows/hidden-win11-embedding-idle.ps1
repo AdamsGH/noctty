@@ -1,6 +1,6 @@
 #requires -Version 7.0
 <#
-Host-safe `-Embedding` lifecycle (PKG-76, G050). Windows starts `noctty.exe -Embedding` to hand it a
+Ephemeral-runner `-Embedding` lifecycle (PKG-76, G050). Windows starts `noctty.exe -Embedding` to hand it a
 delegated console (windows.md, "Default terminal"). This starts the same process with nothing to
 hand it and checks what an idle handoff server does to a user's data:
 
@@ -18,7 +18,12 @@ residue) are not covered here; they need a machine that can be restored.
 
 Run with -Bin <directory holding noctty.exe and its sibling files> -Run <new evidence directory>. The
 binary must carry the measurement AUMID unless -AllowProductAumid is given (an ephemeral CI runner).
+Before any launch, the delegation guard must pass: this refuses to run while HKCU Console\%%Startup
+selects noctty as DelegationTerminal, because the real COM handoff CLSID is shared even by a
+measurement build. Run only in a sandbox with independent delegation in that case; no bypass exists.
 Exit 1 when a check fails. Opt in: nothing runs it automatically.
+Launches currently require an ephemeral GitHub-hosted runner. Job/thread desktop metadata is
+recorded while the process runs; sampling does not establish isolation of arbitrary external brokers.
 #>
 [CmdletBinding()]
 param(
@@ -32,6 +37,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'hidden-win11-lib.ps1')
+Assert-HiddenRunner
+Assert-EmbeddingDelegationSafe
 
 if (-not $Driver) {
     Assert-MeasureAumid (Join-Path (Resolve-Path -LiteralPath $Bin).Path 'noctty.exe') -AllowProductAumid:$AllowProductAumid
@@ -77,13 +84,17 @@ $delegationBefore = Get-Delegation
 
 $stderr = Join-Path $Run 'embedding\stderr.txt'
 $classes = [Collections.Generic.HashSet[string]]::new()
-$launchArguments = if ($NegativeControl) { @('--single-instance=false') } else { @('-Embedding', '--single-instance=false') }
 $uniqueClass = "--class=noctty-test-pkg76-embedding-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-$started = Start-HiddenNoctty -Dir $dir -DesktopName $desktopName -Job $job -StderrPath $stderr -Arguments ($launchArguments + $uniqueClass)
+# -Embedding stops option parsing: isolation must precede that marker.
+$launchArguments = @('--single-instance=false', $uniqueClass)
+if (-not $NegativeControl) { $launchArguments += '-Embedding' }
+Assert-EmbeddingDelegationSafe
+$started = Start-HiddenNoctty -Dir $dir -DesktopName $desktopName -Job $job -StderrPath $stderr -Arguments $launchArguments
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $closed = $false
 while (-not $started.Process.HasExited -and $sw.Elapsed.TotalSeconds -lt 40) {
-    foreach ($class in [HiddenWin]::TopLevelClasses($started.Pid)) { [void]$classes.Add($class) }
+    Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath (Join-Path $Run 'embedding-desktops.jsonl')
+    foreach ($class in [HiddenWin]::VisibleTopLevelClasses($started.Pid)) { [void]$classes.Add($class) }
     # An ordinary instance has no idle timer: close it once the oracle has had time to see its window.
     if ($NegativeControl -and -not $closed -and $sw.Elapsed.TotalSeconds -gt 8) {
         $closed = $true
@@ -104,7 +115,7 @@ $exitCode = if ($exited) { Get-HiddenExitCode $started } else { $null }
 Check 'exit code is 0' ($exitCode -eq 0) 0 $exitCode
 Check 'it waited out the five-second idle timer' ($elapsed -ge 4.0) '>= 4 s' ([math]::Round($elapsed, 1))
 Check 'it reports the idle timeout path' ($log -like '*terminal handoff server idle timeout*') 'terminal handoff server idle timeout' ($log.Length)
-Check 'it opens no host window' (-not $classes.Contains('noctty.win32.host')) 'no noctty.win32.host' ($classes -join ',')
+Check 'it opens no visible top-level window' ($classes.Count -eq 0) 'no visible process UI' ($classes -join ',')
 foreach ($path in $before.Keys) {
     Check ("unchanged: " + $path.Replace($Run, '<run>')) ((Hash-Of $path) -eq $before[$path]) $before[$path] (Hash-Of $path)
 }
@@ -120,7 +131,7 @@ foreach ($f in $failed) { Write-Host ("FAIL {0}: expected {1}, got {2}" -f $f.Na
 Write-Host ("{0} checks, {1} failed; ran {2:N1} s, added: {3}" -f $checks.Count, $failed.Count, $elapsed, (@($added | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
 if ($NegativeControl) {
     # The control passes only when the window oracle saw the ordinary instance's host window.
-    $fired = @($failed | Where-Object { $_.Name -eq 'it opens no host window' }).Count -eq 1
+    $fired = @($failed | Where-Object { $_.Name -eq 'it opens no visible top-level window' }).Count -eq 1
     Write-Host ("negative control: the window oracle {0}" -f $(if ($fired) { 'fired' } else { 'did NOT fire' }))
     if ($fired) { exit 0 } else { exit 1 }
 }
