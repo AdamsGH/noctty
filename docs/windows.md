@@ -275,10 +275,18 @@ picker, its dropdown check mark and a right or middle click on the new-tab
 button start on the profile this default runs; a `command` you set does not
 move that choice.
 
+Discovery also skips drive aliases that map to a folder, such as `subst` drives.
+In safe mode, right or middle click deliberately opens the plain Command Prompt
+profile, whose arguments do not include `/D`; the first tab and plain new-tab
+button retain the recovery command.
+
 These discovery restrictions do not change explicit commands: paths through
 local junctions (such as Scoop's `current` directory) still work when configured.
 In safe mode, reloading or saving Settings keeps recovery active until restart;
 a saved config repair takes effect at that restart.
+Settings still displays the recovery defaults after saving; restart to see the
+repaired file's values. Recovery saves patch the edited keys without loading
+the file for conflict reconciliation.
 
 The profile picker detects:
 

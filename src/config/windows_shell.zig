@@ -2352,6 +2352,28 @@ test "shell discovery accepts a real installed Store execution alias" {
         if (!windowsNonDirectoryPathExists(path)) continue;
         const info = pathInfo(path) orelse return error.TestUnexpectedResult;
         if (info.ReparseTag != IO_REPARSE_TAG_APPEXECLINK) continue;
+        const handle = openPathNoRedirect(path) orelse return error.TestUnexpectedResult;
+        defer windows.CloseHandle(handle);
+        var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
+        const record = readReparseData(handle, &data) orelse return error.TestUnexpectedResult;
+        var target_w: [1024]u16 = undefined;
+        const len = appExecLinkTarget(record, &target_w) orelse return error.TestUnexpectedResult;
+        var target_buf: [3 * target_w.len]u8 = undefined;
+        const target_len = try std.unicode.utf16LeToUtf8(&target_buf, target_w[0..len]);
+        const target = target_buf[0..target_len];
+        // Even a real alias's record is untrusted: screen its target before
+        // the independent existence check can touch it.
+        const checked = openPathNoRedirect(target) orelse {
+            try std.testing.expect(!isLaunchableFile(path));
+            continue;
+        };
+        defer windows.CloseHandle(checked);
+        // A stale alias is valid evidence of layout, but not an installed
+        // target. Its rejection is intentional; try another installed alias.
+        if (!windowsNonDirectoryPathExists(target)) {
+            try std.testing.expect(!isLaunchableFile(path));
+            continue;
+        }
         try std.testing.expect(isLaunchableFile(path));
         return;
     }
