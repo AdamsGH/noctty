@@ -168,6 +168,10 @@ jobs:
           -Optimize ReleaseFast
           -RequireSymbols
 
+      - name: Verify lazy OpenGL import contract
+        shell: pwsh
+        run: ./test/windows/cli-import-contract.ps1 -BinDirectory ./zig-out/bin
+
       - name: Run ARM64 CLI smoke
         shell: pwsh
         run: |

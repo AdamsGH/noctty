@@ -14,8 +14,30 @@ const Api = struct {
 };
 
 const NativeBackend = struct {
+    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: [*]u16, size: u32) callconv(.winapi) u32;
+
     fn loadLibraryExW(_: *@This(), name: [*:0]const u16, reserved: ?windows.HANDLE, flags: u32) types.HMODULE {
+        const build_config = @import("../../build_config.zig");
+        if (build_config.renderer_test_tools) {
+            var value: [2]u16 = undefined;
+            if (GetEnvironmentVariableW(
+                std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_TEST_OPENGL32_MISSING"),
+                &value,
+                value.len,
+            ) == 1 and value[0] == '1') {
+                // Exercise the real Windows loader's missing-module path.
+                return windows.kernel32.LoadLibraryExW(
+                    std.unicode.utf8ToUtf16LeStringLiteral("noctty-opengl32-missing-test.dll"),
+                    reserved,
+                    flags,
+                );
+            }
+        }
         return windows.kernel32.LoadLibraryExW(name, reserved, flags);
+    }
+
+    fn freeLibrary(_: *@This(), module: types.HMODULE) void {
+        _ = windows.kernel32.FreeLibrary(@ptrCast(module.?));
     }
 
     fn getProcAddress(_: *@This(), module: types.HMODULE, name: [*:0]const u8) ?*const anyopaque {
@@ -42,49 +64,47 @@ fn Loader(comptime Backend: type) type {
         mutex: std.Thread.Mutex = .{},
         module: types.HMODULE = null,
         api: ?Api = null,
-        load_error: u32 = 0,
+        load_error: std.atomic.Value(u32) = .init(0),
 
-        fn initialize(self: *Self) void {
-            if (self.initialized.load(.acquire)) return;
+        fn getApi(self: *Self) ?*const Api {
+            if (self.initialized.load(.acquire)) return &self.api.?;
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.initialized.load(.monotonic)) return;
-            defer self.initialized.store(true, .release);
+            if (self.initialized.load(.monotonic)) return &self.api.?;
 
             // Keep this reference for the process lifetime, as the original
             // static import did. Never search the application directory/CWD.
-            self.module = self.backend.loadLibraryExW(
+            const module = self.backend.loadLibraryExW(
                 std.unicode.utf8ToUtf16LeStringLiteral("opengl32.dll"),
                 null,
                 0x00000800, // LOAD_LIBRARY_SEARCH_SYSTEM32
             ) orelse {
-                self.load_error = self.backend.getLastError();
-                return;
+                const err = self.backend.getLastError();
+                self.load_error.store(err, .monotonic);
+                self.backend.setLastError(err);
+                return null;
             };
             var api: Api = undefined;
             inline for (@typeInfo(Api).@"struct".fields) |field| {
-                const ptr = self.backend.getProcAddress(self.module, field.name) orelse {
-                    self.load_error = self.backend.getLastError();
-                    return;
+                const ptr = self.backend.getProcAddress(module, field.name) orelse {
+                    const err = self.backend.getLastError();
+                    self.backend.freeLibrary(module);
+                    self.load_error.store(err, .monotonic);
+                    self.backend.setLastError(err);
+                    return null;
                 };
-                @field(api, field.name) = @ptrCast(ptr);
+                @field(api, field.name) = @ptrCast(@alignCast(ptr));
             }
+            self.module = module;
             self.api = api;
-        }
-
-        fn getApi(self: *Self) ?*const Api {
-            self.initialize();
-            if (self.api) |*api| return api;
-            // Set the calling thread's error after the initialization lock
-            // is released, including on every cached failure.
-            self.backend.setLastError(self.load_error);
-            return null;
+            self.load_error.store(0, .monotonic);
+            self.initialized.store(true, .release);
+            return &self.api.?;
         }
 
         fn lastLoadError(self: *Self) u32 {
             // An error inspection alone must not cause a DLL load.
-            if (!self.initialized.load(.acquire)) return 0;
-            return self.load_error;
+            return self.load_error.load(.monotonic);
         }
 
         fn createContext(self: *Self, hdc: types.HDC) types.HGLRC {
@@ -125,6 +145,11 @@ fn Loader(comptime Backend: type) type {
 }
 
 var loader: Loader(NativeBackend) = .{};
+
+/// Pin System32 OpenGL before GDI's pixel-format APIs can load it by name.
+pub fn ensureLoaded() bool {
+    return loader.getApi() != null;
+}
 
 pub fn wglCreateContext(hdc: types.HDC) callconv(.winapi) types.HGLRC {
     return loader.createContext(hdc);
@@ -171,6 +196,8 @@ const FakeBackend = struct {
     missing_dll: bool = false,
     missing_export: ?[]const u8 = null,
     last_error: u32 = 0,
+    slow_load: bool = false,
+    frees: usize = 0,
 
     const module: *anyopaque = @ptrFromInt(0x1000);
     const context: *anyopaque = @ptrFromInt(0x2000);
@@ -178,6 +205,7 @@ const FakeBackend = struct {
 
     fn loadLibraryExW(self: *@This(), name: [*:0]const u16, reserved: ?windows.HANDLE, flags: u32) types.HMODULE {
         self.loads += 1;
+        if (self.slow_load) std.Thread.sleep(20 * std.time.ns_per_ms);
         self.flags = flags;
         self.filename_ok = std.mem.eql(u16, std.mem.span(name), std.unicode.utf8ToUtf16LeStringLiteral("opengl32.dll"));
         self.reserved_ok = reserved == null;
@@ -208,6 +236,12 @@ const FakeBackend = struct {
 
     fn getLastError(self: *@This()) u32 {
         return self.last_error;
+    }
+
+    fn freeLibrary(self: *@This(), handle: types.HMODULE) void {
+        self.module_ok = self.module_ok and handle == module;
+        self.frees += 1;
+        self.last_error = 0; // prove the resolver error survives cleanup
     }
 
     fn setLastError(self: *@This(), err: u32) void {
@@ -304,48 +338,58 @@ fn expectUnavailable(fixture: *Loader(FakeBackend), expected_error: u32) !void {
     try std.testing.expectEqual(expected_error, fixture.lastLoadError());
 }
 
-test "WGL missing DLL failure is cached and every wrapper restores the load error" {
+test "WGL missing DLL retries and every wrapper restores the load error" {
     var fixture: Loader(FakeBackend) = .{ .backend = .{ .missing_dll = true } };
     try expectUnavailable(&fixture, 126);
-    try std.testing.expectEqual(@as(usize, 1), fixture.backend.loads);
+    try std.testing.expectEqual(@as(usize, 7), fixture.backend.loads);
     try std.testing.expectEqual(@as(usize, 0), fixture.backend.resolutions);
-    // A later apparent recovery does not reinitialize the process cache.
     fixture.backend.missing_dll = false;
-    try expectUnavailable(&fixture, 126);
-    try std.testing.expectEqual(@as(usize, 1), fixture.backend.loads);
+    try std.testing.expectEqual(FakeBackend.context, fixture.getCurrentContext().?);
+    try std.testing.expectEqual(@as(usize, 8), fixture.backend.loads);
+    try std.testing.expectEqual(@as(u32, 0), fixture.lastLoadError());
 }
 
-test "WGL missing export never publishes a partial API and caches the resolver error" {
+test "WGL missing export never publishes a partial API and retries after recovery" {
     inline for (@typeInfo(Api).@"struct".fields, 0..) |field, index| {
         var fixture: Loader(FakeBackend) = .{ .backend = .{ .missing_export = field.name } };
         try expectUnavailable(&fixture, 127);
-        try std.testing.expectEqual(@as(usize, 1), fixture.backend.loads);
-        try std.testing.expectEqual(index + 1, fixture.backend.resolutions);
+        try std.testing.expectEqual(@as(usize, 7), fixture.backend.loads);
+        try std.testing.expectEqual(7 * (index + 1), fixture.backend.resolutions);
+        try std.testing.expectEqual(@as(usize, 7), fixture.backend.frees);
         fixture.backend.missing_export = null;
-        try expectUnavailable(&fixture, 127);
-        try std.testing.expectEqual(@as(usize, 1), fixture.backend.loads);
-        try std.testing.expectEqual(index + 1, fixture.backend.resolutions);
+        try std.testing.expectEqual(FakeBackend.context, fixture.getCurrentContext().?);
+        try std.testing.expectEqual(@as(usize, 8), fixture.backend.loads);
+        try std.testing.expectEqual(7 * (index + 1) + 6, fixture.backend.resolutions);
+        try std.testing.expectEqual(@as(u32, 0), fixture.lastLoadError());
     }
 }
 
 test "WGL concurrent first use initializes and publishes exactly once" {
-    var fixture: Loader(FakeBackend) = .{};
+    var fixture: Loader(FakeBackend) = .{ .backend = .{ .slow_load = true } };
     const Worker = struct {
-        fn run(state: *Loader(FakeBackend)) void {
-            std.debug.assert(state.getCurrentContext() == FakeBackend.context);
+        fn run(state: *Loader(FakeBackend), start: *std.atomic.Value(bool), result: *bool) void {
+            while (!start.load(.acquire)) std.Thread.yield() catch {};
+            result.* = state.getCurrentContext() == FakeBackend.context;
         }
     };
+    var start: std.atomic.Value(bool) = .init(false);
+    var results: [8]bool = @splat(false);
     var threads: [8]std.Thread = undefined;
     var spawned: usize = 0;
-    defer for (threads[0..spawned]) |thread| thread.join();
-    for (&threads) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{&fixture});
+    defer {
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&threads, &results) |*thread, *result| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &fixture, &start, result });
         spawned += 1;
     }
+    start.store(true, .release);
     // Join before inspecting the fake backend, which is only written while
     // the loader initialization mutex is held.
     for (threads[0..spawned]) |thread| thread.join();
     spawned = 0;
+    for (results) |result| try std.testing.expect(result);
     try std.testing.expectEqual(@as(usize, 1), fixture.backend.loads);
     try std.testing.expectEqual(@as(usize, 6), fixture.backend.resolutions);
 }

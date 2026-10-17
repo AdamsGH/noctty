@@ -10293,6 +10293,18 @@ pub const App = struct {
     } {
         if (self.core_app.first) beginOpenGLStartupDiagnostics();
 
+        // GDI can load OPENGL32 by basename during pixel-format selection.
+        // Pin our System32 module first, under the startup dialog suppression.
+        {
+            var suppression = suppressStartupLoaderErrorDialogs();
+            defer suppression.restore();
+            if (!@import("win32/wgl.zig").ensureLoaded()) {
+                const err = windows.kernel32.GetLastError();
+                recordOpenGLStartupWin32Failure(.load_opengl32, err);
+                return windows.unexpectedError(err);
+            }
+        }
+
         const hdc = sys.GetDC(hwnd) orelse {
             recordOpenGLStartupWin32Failure(.get_dc, windows.kernel32.GetLastError());
             return error.GetDCFailed;
