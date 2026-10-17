@@ -364,6 +364,8 @@ try {
         (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
     ) -join ';'
     $windowsPowerShellModules = Get-InteractiveWin11WindowsPowerShellModulePath $env:PSModulePath
+    $expectedWindowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $expectedCmd = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
 
     $r = Launch-Case 'default' $exe @() @{ PATH = $withPwsh }
     $expectedPwsh = Join-Path $PowerShell7Directory 'pwsh.exe'
@@ -374,19 +376,19 @@ try {
     Check 'default' 'no warning from this app on the screen' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
 
     $r = Launch-Case 'no-pwsh' $exe @() @{ PATH = $withoutPwsh; PSModulePath = $windowsPowerShellModules }
-    Check 'no-pwsh' 'without pwsh.exe on PATH the first tab runs Windows PowerShell' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
+    Check 'no-pwsh' 'without pwsh.exe on PATH the first tab runs system Windows PowerShell' ($r.Shell -eq 'powershell.exe' -and $r.ShellPath -eq $expectedWindowsPowerShell) $expectedWindowsPowerShell $r.ShellPath
     Check 'no-pwsh' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'no-pwsh' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
 
     $r = Launch-Case 'restricted-51' $exe @() @{ PATH = $withoutPwsh; PSExecutionPolicyPreference = 'Restricted'; PSModulePath = $windowsPowerShellModules }
-    Check 'restricted-51' 'Windows PowerShell 5.1 starts under the Restricted policy' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
+    Check 'restricted-51' 'system Windows PowerShell 5.1 starts under the Restricted policy' ($r.Shell -eq 'powershell.exe' -and $r.ShellPath -eq $expectedWindowsPowerShell) $expectedWindowsPowerShell $r.ShellPath
     Check 'restricted-51' 'the integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
     Check 'restricted-51' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
     Check 'restricted-51' 'every row above the prompt is the host or the user profile under Restricted' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'restricted-51' 'no integration warning or PSReadLine load error on the screen' ($r.NocttyWarnings.Count -eq 0 -and -not ($r.Screen -match 'Cannot load PSReadline')) 0 $r.NocttyWarnings
 
     $r = Launch-Case 'safe-mode' $exe @('--safe-mode') @{ PATH = $withPwsh }
-    Check 'safe-mode' 'safe mode starts cmd.exe although PowerShell is installed' ($r.Shell -eq 'cmd.exe') 'cmd.exe' $r.Shell
+    Check 'safe-mode' 'safe mode starts system cmd.exe although PowerShell is installed' ($r.Shell -eq 'cmd.exe' -and $r.ShellPath -eq $expectedCmd) $expectedCmd $r.ShellPath
     Check 'safe-mode' 'with /D, which skips the AutoRun command' ($r.NoAutoRun -eq $true) $true $r.NoAutoRun
     Check 'safe-mode' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'safe-mode' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine

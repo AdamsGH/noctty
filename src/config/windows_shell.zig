@@ -1554,9 +1554,9 @@ fn lookupExecutable(alloc: Allocator, exe: []const u8) !?[]u8 {
     // The built-in shells live in the system directory, where `defaultCommand`
     // takes them from, so the picker lists exactly the executable a new tab runs.
     if (std.ascii.eqlIgnoreCase(exe, "cmd.exe")) {
-        if (try DefaultShellHost.systemShell(alloc, "cmd.exe")) |path| return path;
+        return try DefaultShellHost.systemShell(alloc, "cmd.exe");
     } else if (std.ascii.eqlIgnoreCase(exe, "powershell.exe")) {
-        if (try DefaultShellHost.systemShell(alloc, windows_powershell_relative)) |path| return path;
+        return try DefaultShellHost.systemShell(alloc, windows_powershell_relative);
     }
     const path = std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2091,7 +2091,7 @@ test "default command prefers pwsh, then Windows PowerShell, then cmd" {
     try expectDefaultShell(test_pwsh, try defaultCommandWithHost(alloc, FakeDefaultShellHost(test_pwsh, &.{"cmd.exe"})));
 }
 
-test "default command falls back to the bare cmd.exe when the system directory has no shell" {
+test "default command falls back to bare cmd.exe when the system directory is unavailable" {
     try expectDefaultShell("cmd.exe", try defaultCommandWithHost(std.testing.allocator, FakeDefaultShellHost(null, &.{})));
 }
 
@@ -2404,6 +2404,9 @@ test "shell discovery accepts a real installed Store execution alias" {
             continue;
         }
         try std.testing.expect(isLaunchableFile(path));
+        var search_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const found = searchPath(&search_buf, name, std.fs.path.dirname(path).?, null, true, isLaunchableFile) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(path, found);
         return;
     }
     return error.SkipZigTest;

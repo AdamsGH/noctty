@@ -15474,7 +15474,8 @@ const Host = struct {
         // The Settings window offers Keep mine / Use disk when the file now
         // says something else for a setting being edited; a palette pick has no
         // such prompt, so a theme that changed on disk is refused instead of
-        // overwritten, and the running config is left as it is.
+        // overwritten, and the running config is left as it is. Recovery skips
+        // reconciliation because its defaults are not a snapshot of that file.
         const save_outcome = win32_settings.saveReloadOutcome(blk: {
             self.app.settingsReconcileDisk(&pending, &original, false) catch |err| break :blk err;
             break :blk self.app.settingsSaveAndReload(&pending, &original);
@@ -15509,6 +15510,12 @@ const Host = struct {
             );
         }
         self.hideOverlay();
+        if (self.app.safe_mode) {
+            runUiActionOrLog(
+                "palette recovery theme banner failed",
+                self.setBanner(.info, "Theme saved; restart noctty to apply it."),
+            );
+        }
         if (saved_but_masked) {
             log.warn("palette theme saved but masked by a later config layer theme={s}", .{theme_name});
             runUiActionOrLog(
@@ -26767,6 +26774,7 @@ fn settingsDeferUiaDisconnectThunk(
 }
 fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const u8) void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    const saved_title = if (app.safe_mode) "Settings saved; restart noctty to apply them" else title;
     // Always show local chrome feedback for the Save button, even
     // when system/reload notifications are disabled.
     const alloc = app.core_app.alloc;
@@ -26776,7 +26784,7 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
     // raised: the Settings status line already says the save went through.
     if (app.config_problems.count() > 0 and app.showConfigProblemsBanner()) return;
     const banner_text = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
-        title,
+        saved_title,
         if (body.len > 0) ": " else "",
         body,
     }) catch null;
@@ -26801,7 +26809,7 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
     // WinRT notification strings must be sentinel-terminated. On
     // allocation failure, keep any banner already shown and skip the
     // system path.
-    const title_z = alloc.dupeZ(u8, title) catch return;
+    const title_z = alloc.dupeZ(u8, saved_title) catch return;
     defer alloc.free(title_z);
     const body_z = alloc.dupeZ(u8, body) catch return;
     defer alloc.free(body_z);
@@ -53251,6 +53259,7 @@ test "win32 safe mode theme selection and acceptance preserve recovery" {
     try std.testing.expect(command.ptr == app.config.command.?.direct.ptr);
     try std.testing.expectEqualStrings("/D", app.config.command.?.direct[1]);
     try std.testing.expect(app.config.theme == null);
+    try std.testing.expectEqualStrings("Theme saved; restart noctty to apply it.", host.banner_text.?);
     const saved = try tmp.dir.readFileAlloc(alloc, "config", 4096);
     defer alloc.free(saved);
     try std.testing.expect(std.mem.indexOf(u8, saved, "theme = 0x96f") != null);
