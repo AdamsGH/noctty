@@ -408,10 +408,14 @@ namespace SettingsPatterns
                                     "Cannot read popup top index");
                                 int hoverY = (hoverIndex - topIndex.ToInt32()) * itemHeight.ToInt32() + itemHeight.ToInt32() / 2;
                                 Require(itemHeight.ToInt32() > 0 && hoverY >= 0, "Hover row is not visible");
+                                int initialY = (currentIndex.ToInt32() - topIndex.ToInt32()) * itemHeight.ToInt32() + itemHeight.ToInt32() / 2;
+                                ReadComboMessage(info.List, 0x0200, IntPtr.Zero, (IntPtr)((initialY << 16) | 11), 3, 2000, out ignored);
                                 ReadComboMessage(info.List, 0x0200, IntPtr.Zero, (IntPtr)((hoverY << 16) | 10), 3, 2000, out ignored);
                                 result["hoverValue"] = ReadCombo(value, selection);
+                                Require(!Object.Equals(before, result["hoverValue"]), "Hover did not change the native provisional selection");
                                 IntPtr hoverSave = GetDlgItem(GetAncestor((IntPtr)hwnd, 2), 301);
                                 result["hoverSaveBeforeModifier"] = IsWindowEnabled(hoverSave);
+                                Require(!Convert.ToBoolean(result["hoverSaveBeforeModifier"]), "Hover dirtied pending config");
                                 ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x11, (IntPtr)1, 3, 2000, out ignored);
                                 result["hoverSaveEnabled"] = IsWindowEnabled(hoverSave);
                                 Require(!Convert.ToBoolean(result["hoverSaveEnabled"]), "Hover plus modifier dirtied pending config");

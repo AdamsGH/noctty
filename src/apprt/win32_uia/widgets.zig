@@ -1486,13 +1486,13 @@ pub const SettingsControlProvider = struct {
         if (precondition != com.S_OK) return precondition;
         if (self.readOnly()) return com.UIA_E_INVALIDOPERATION;
         if (self.role == .combo_box) {
-            // CB_FINDSTRINGEXACT is a system message: Windows marshals the
-            // string. The private action carries only the resulting index.
-            var index: usize = 0;
-            if (SendMessageTimeoutW(self.hwnd, CB_FINDSTRINGEXACT, std.math.maxInt(usize), @bitCast(@intFromPtr(value)), SMTO_BLOCK | SMTO_ABORTIFHUNG, settings_selection_timeout_ms, &index) == 0)
-                return com.UIA_E_ELEMENTNOTAVAILABLE;
-            if (@as(isize, @bitCast(index)) < 0) return com.E_INVALIDARG;
-            return self.requestAction(.select, @bitCast(index));
+            // Keep the borrowed string alive until the native lookup returns,
+            // including same-process cross-thread calls. A timed-out send could
+            // return while the control still reads it. The bounded private
+            // mutation request carries only the resulting index.
+            const index = SendMessageW(self.hwnd, CB_FINDSTRINGEXACT, std.math.maxInt(usize), @bitCast(@intFromPtr(value)));
+            if (index < 0) return com.E_INVALIDARG;
+            return self.requestAction(.select, index);
         }
         return if (com.SetWindowTextW(self.hwnd, value) != 0) com.S_OK else com.E_INVALIDARG;
     }
@@ -1605,10 +1605,10 @@ pub const SettingsControlProvider = struct {
             const old_expanded = self.last_expanded;
             self.last_expanded = expanded;
             if (expanded != old_expanded) events.raisePropertyChanged(&self.base, constants.UIA_ExpandCollapseExpandCollapseStatePropertyId, com.VARIANT.fromI4(old_expanded), com.VARIANT.fromI4(expanded));
-            // A dropped list tracks its hovered row before the user chooses
-            // it. Observation must neither commit nor cache that provisional
-            // selection: a later explicit SelectionItem.Select may choose it.
-            if (expanded != 0 and selection_sync == .observe) return;
+            // A list tracks its hovered row before the user chooses it, even
+            // during close notifications. Only a committed native notification
+            // or explicit selection may consume the selection-cache change.
+            if (selection_sync == .observe) return;
             const selected = SendMessageW(self.hwnd, CB_GETCURSEL, 0, 0);
             if (self.last_selection != selected) {
                 self.last_selection = selected;

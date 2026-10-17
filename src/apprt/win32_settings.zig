@@ -9683,6 +9683,9 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                         _ = sys.SendMessageW(control, WM_KEYDOWN, 0x11, 1); // Control, without accepting the row
                         try std.testing.expect(!settings.hasPendingChanges());
                         try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+                        try std.testing.expectEqual(com.S_OK, expand.vtbl.Collapse(expand));
+                        try std.testing.expectEqual(before_hover, provider.last_selection);
+                        try std.testing.expect(!settings.hasPendingChanges());
                         // Choosing the already-hovered row explicitly still
                         // commits: observation must not consume its cache change.
                         var hovered_label: [128:0]u16 = @splat(0);
