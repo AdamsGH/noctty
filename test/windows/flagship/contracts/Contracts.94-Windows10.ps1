@@ -156,16 +156,18 @@ $win10Contracts = @(
     }
 )
 foreach ($step in $win10WorkflowSteps.Keys) {
+    # The text is read here, not in a script block: a block run later cannot see this file's functions.
+    $stepText = Get-Win10WorkflowStep $step
     $win10Contracts += @{
         File = "$win10WorkflowPath :: $step"
-        Content = { Get-Win10WorkflowStep $step }.GetNewClosure()
+        Content = $stepText
         Pattern = $win10WorkflowSteps[$step]
         Kind = 'Text'
         Description = "the Windows 10 workflow's '$step' step runs its check"
     }
     $win10Contracts += @{
         File = "$win10WorkflowPath :: $step"
-        Content = { Get-Win10WorkflowStep $step }.GetNewClosure()
+        Content = $stepText
         Pattern = '(?s)^(?!.*(?:continue-on-error|\n {8}if:))'
         Kind = 'Text'
         Description = "the Windows 10 workflow's '$step' step is unconditional and fails the job"
