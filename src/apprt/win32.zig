@@ -10298,7 +10298,30 @@ pub const App = struct {
         {
             var suppression = suppressStartupLoaderErrorDialogs();
             defer suppression.restore();
-            if (!@import("win32/wgl.zig").ensureLoaded()) {
+            const loaded = loaded: {
+                // Keep application build options out of the standalone WGL
+                // module (also imported by native compositor tests).
+                if (build_config.renderer_test_tools) {
+                    const test_tools = struct {
+                        extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: [*]u16, size: u32) callconv(.winapi) u32;
+                    };
+                    var value: [2]u16 = undefined;
+                    if (test_tools.GetEnvironmentVariableW(
+                        std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_TEST_OPENGL32_MISSING"),
+                        &value,
+                        value.len,
+                    ) == 1 and value[0] == '1') {
+                        // Exercise the real Windows loader's missing-module path.
+                        break :loaded windows.kernel32.LoadLibraryExW(
+                            std.unicode.utf8ToUtf16LeStringLiteral("noctty-opengl32-missing-test.dll"),
+                            null,
+                            0x00000800, // LOAD_LIBRARY_SEARCH_SYSTEM32
+                        ) != null;
+                    }
+                }
+                break :loaded @import("win32/wgl.zig").ensureLoaded();
+            };
+            if (!loaded) {
                 const err = windows.kernel32.GetLastError();
                 recordOpenGLStartupWin32Failure(.load_opengl32, err);
                 return windows.unexpectedError(err);

@@ -14,25 +14,7 @@ const Api = struct {
 };
 
 const NativeBackend = struct {
-    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: [*]u16, size: u32) callconv(.winapi) u32;
-
     fn loadLibraryExW(_: *@This(), name: [*:0]const u16, reserved: ?windows.HANDLE, flags: u32) types.HMODULE {
-        const build_config = @import("../../build_config.zig");
-        if (build_config.renderer_test_tools) {
-            var value: [2]u16 = undefined;
-            if (GetEnvironmentVariableW(
-                std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_TEST_OPENGL32_MISSING"),
-                &value,
-                value.len,
-            ) == 1 and value[0] == '1') {
-                // Exercise the real Windows loader's missing-module path.
-                return windows.kernel32.LoadLibraryExW(
-                    std.unicode.utf8ToUtf16LeStringLiteral("noctty-opengl32-missing-test.dll"),
-                    reserved,
-                    flags,
-                );
-            }
-        }
         return windows.kernel32.LoadLibraryExW(name, reserved, flags);
     }
 
