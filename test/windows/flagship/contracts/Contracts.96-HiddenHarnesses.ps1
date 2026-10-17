@@ -93,7 +93,7 @@ function Get-HiddenFunction([string] $Text, [string] $Name) {
     if (-not $function) { throw "Missing hidden harness function $Name." }
     return $function.Extent.Text
 }
-$mutationControls = 0
+$script:mutationControls = 0
 function Assert-HiddenMutation([string] $Name, [string] $Original, [string] $Mutated, [scriptblock] $Validate) {
     if ($Original -ceq $Mutated) { throw "Mutation '$Name' changed no code." }
     & $Validate $Original
@@ -195,12 +195,104 @@ Assert-HiddenMutation 'unconnected native thread rejected' $nativeCode ($nativeC
 Assert-HiddenMutation 'current desktop never connected' $nativeCode ($nativeCode.Replace('if (GetDesktopWindow() == IntPtr.Zero)', 'if (false)')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'unrelated default window counted' $nativeCode ($nativeCode.Replace('ids.Contains(id) && ', '')) ${function:Test-HiddenNativeCode}
 
+# Compile the real observer against a managed process/thread snapshot seam. Query
+# failures only excuse a TID conclusively absent after refreshing the retained process.
+$observerCode = ([regex]::Matches($hiddenLibText, '(?ms)^    (?:public sealed class DesktopObservation\b|static bool Conclusively(?:Thread)?Exited\(|public static DesktopObservation\[\] ObserveDesktopThreads\()[^\r\n]*\r?\n.*?^    }') |
+    ForEach-Object Value) -join "`n"
+function Test-HiddenThreadRace([string] $Methods) {
+    $typeName = 'HiddenThreadRace' + [guid]::NewGuid().ToString('N')
+    $support = @'
+using System;
+using System.Collections.Generic;
+public static class TYPE_NAME {
+    public static bool QueryFails, Vanished, RefreshFails, ProcessExited;
+    public static int Lookups, Refreshes;
+    public sealed class ProcessThread { public int Id; }
+    public sealed class Process : IDisposable {
+        bool retained, refreshed;
+        public static Process GetProcessById(int id) { Lookups++; return new Process(); }
+        public IntPtr Handle { get { retained = true; return new IntPtr(7); } }
+        public string ProcessName { get { return "fixture"; } }
+        public bool HasExited { get { return ProcessExited; } }
+        public List<ProcessThread> Threads { get {
+            if (!retained) throw new Exception("Process handle not retained");
+            var threads = new List<ProcessThread>();
+            if (!refreshed || !Vanished) threads.Add(new ProcessThread { Id = 11 });
+            threads.Add(new ProcessThread { Id = 12 }); return threads;
+        } }
+        public void Refresh() { Refreshes++; if (RefreshFails) throw new Exception("Refresh failed"); refreshed = true; }
+        public void Dispose() { }
+    }
+    static string ThreadDesktopName(uint tid) { if (tid == 11 && QueryFails) throw new Exception("Query failed"); return "private"; }
+METHODS
+}
+'@
+    $type = Add-Type -TypeDefinition ($support.Replace('TYPE_NAME', $typeName).Replace('METHODS', $Methods)) -PassThru | Where-Object Name -eq $typeName
+    foreach ($fixture in @(
+        @{ QueryFails = $false; Vanished = $false; Error = $false; ThreadExited = $false }
+        @{ QueryFails = $true; Vanished = $true; Error = $false; ThreadExited = $true }
+        @{ QueryFails = $true; Vanished = $false; Error = $true; ThreadExited = $false }
+        @{ QueryFails = $true; Vanished = $true; RefreshFails = $true; Error = $true; ThreadExited = $false }
+        @{ QueryFails = $true; ProcessExited = $true; Error = $false; ThreadExited = $false }
+    )) {
+        foreach ($field in @('QueryFails', 'Vanished', 'RefreshFails', 'ProcessExited')) { $type.GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        $type::Lookups = $type::Refreshes = 0
+        $rows = @($type::ObserveDesktopThreads([int[]]@(41)))
+        if ($rows.Count -ne 2 -or $type::Lookups -ne 1 -or [bool]$rows[0].Error -ne $fixture.Error -or
+            $rows[0].ThreadExited -ne $fixture.ThreadExited -or $rows[0].Exited -ne [bool]$fixture.ProcessExited -or $rows[1].Desktop -cne 'private') {
+            throw 'Observer lost the vanished/live/unexplained thread-query distinction.'
+        }
+        if ($fixture.QueryFails -and -not $fixture.ProcessExited -and $type::Refreshes -ne 1) { throw 'Thread disappearance requires a fresh retained-process enumeration.' }
+    }
+}
+Assert-HiddenMutation 'thread snapshot not refreshed' $observerCode ($observerCode.Replace('process.Refresh();', '')) ${function:Test-HiddenThreadRace}
+Assert-HiddenMutation 'live failed thread accepted as exited' $observerCode ($observerCode.Replace('if (thread.Id == threadId) return false;', 'if (thread.Id == threadId) return true;')) ${function:Test-HiddenThreadRace}
+
+if (-not ('HiddenStartContract' -as [type])) {
+    Add-Type @'
+using System;
+public class HiddenStartContract {
+    public static int Launches;
+    public DateTime StartTime = DateTime.UtcNow;
+    public struct ProcessInfo { public int pid; public IntPtr thread, process; }
+    public static ProcessInfo Launch(string a, string c, string w, string d, IntPtr j, string e) { Launches++; return new ProcessInfo { pid = 42 }; }
+    public static HiddenStartContract GetProcessById(int pid) { return new HiddenStartContract(); }
+    public static bool CloseHandle(IntPtr p) { return true; }
+}
+'@
+}
+$startFunction = (Get-HiddenFunction $hiddenLibText 'Start-HiddenNoctty').Replace('[HiddenWin]', '[HiddenStartContract]').Replace('[Diagnostics.Process]', '[HiddenStartContract]')
+function Test-HiddenPrelaunchMetadata([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    foreach ($fail in @($false, $true)) {
+        $script:prelaunchMetadataCalls = 0; $script:prelaunchRunnerCalls = 0; [HiddenStartContract]::Launches = 0
+        function Assert-HiddenRunner { $script:prelaunchRunnerCalls++ }
+        function Assert-HiddenDesktop {
+            $script:prelaunchMetadataCalls++
+            if ([HiddenStartContract]::Launches -ne 0) { throw 'Metadata ran after launch.' }
+            if ($fail) { throw 'fixture prelaunch metadata failure' }
+        }
+        function Test-Path { return $true }
+        $blocked = $false
+        try { $null = Start-HiddenNoctty -Dir 'C:\fixture' -Arguments @('unused') -DesktopName 'private' -Job ([IntPtr]7) }
+        catch { $blocked = $_.Exception.Message -ceq 'fixture prelaunch metadata failure' }
+        if ($blocked -ne $fail -or $script:prelaunchMetadataCalls -ne 1 -or $script:prelaunchRunnerCalls -ne 1 -or
+            [HiddenStartContract]::Launches -ne [int](-not $fail)) { throw 'Prelaunch metadata must execute before and block a failed launch.' }
+    }
+}
+Assert-HiddenMutation 'prelaunch metadata removed' $startFunction ($startFunction -replace '(?m)^\s+Assert-HiddenDesktop[^\r\n]*', '') ${function:Test-HiddenPrelaunchMetadata}
+$prelaunchCall = [regex]::Match($startFunction, '(?m)^    Assert-HiddenDesktop[^\r\n]*').Value
+$lateMetadata = ($startFunction.Replace($prelaunchCall, '')).Replace('    $process =', "$prelaunchCall`n    `$process =")
+Assert-HiddenMutation 'prelaunch metadata moved after launch' $startFunction $lateMetadata ${function:Test-HiddenPrelaunchMetadata}
+
 if (-not ('HiddenDriverContract' -as [type])) {
     Add-Type @'
 using System;
 public static class HiddenDriverContract {
     public static string Local, Roaming, Desktop;
     public static int Waits, Stops, ExitReads;
+    public static uint ExitCode;
+    public static bool ExitQueryFails;
     public struct ProcessInfo { public int pid; public IntPtr thread, process; }
     public static uint GetClipboardSequenceNumber() { return 0; }
     public static IntPtr CreateInheritedDesktop(string n) { return new IntPtr(1); }
@@ -211,7 +303,7 @@ public static class HiddenDriverContract {
         return new ProcessInfo { pid = 1 };
     }
     public static uint WaitForSingleObject(IntPtr p, uint ms) { return Waits++ == 0 ? 258u : 0u; }
-    public static bool GetExitCodeProcess(IntPtr p, out uint code) { ExitReads++; code = 0; return true; }
+    public static bool GetExitCodeProcess(IntPtr p, out uint code) { ExitReads++; code = ExitCode; return !ExitQueryFails; }
     public static uint StopOwnedJob(IntPtr j) { Stops++; return 0; }
     public static bool CloseHandle(IntPtr p) { return true; }
     public static bool CloseDesktop(IntPtr d) { return true; }
@@ -231,6 +323,7 @@ function Test-HiddenDriverCode([string] $Code) {
     function Assert-HiddenDefaultDesktop { $script:defaultOracleCalls++; if ($script:oracleThrows) { throw 'Hidden desktop fixture visible default window' } }
     function Assert-HiddenDesktop { $script:metadataCalls++ }
     [HiddenDriverContract]::Waits = [HiddenDriverContract]::Stops = [HiddenDriverContract]::ExitReads = 0
+    [HiddenDriverContract]::ExitCode = 0; [HiddenDriverContract]::ExitQueryFails = $false
     $fixture = Join-Path ([IO.Path]::GetTempPath()) ('noctty-hidden-contract-' + [guid]::NewGuid().ToString('N'))
     $savedLocal = $env:LOCALAPPDATA; $savedRoaming = $env:APPDATA
     try {
@@ -240,6 +333,7 @@ function Test-HiddenDriverCode([string] $Code) {
         Invoke-HiddenDriver -Script 'unused.ps1' -Bin (Join-Path $fixture 'bin') -Run $runPath -TimeoutSeconds 1 -Label 'managed isolation fixture' 6>$null
         if (-not $script:driverRunnerGuardCalled) { throw 'Driver lost the hosted-runner gate.' }
         if ($script:defaultOracleCalls -ne 2) { throw 'Outer default-desktop oracle must run during polling and after driver exit.' }
+        if ($script:metadataCalls -lt 1) { throw 'Outer polling must collect thread desktop metadata.' }
         if ([HiddenDriverContract]::Local -cne (Join-Path $runPath 'localappdata') -or
             [HiddenDriverContract]::Roaming -cne (Join-Path $runPath 'appdata') -or
             [HiddenDriverContract]::Desktop -notmatch '^WinSta0\\noctty-hw-[0-9a-f]{32}$') { throw 'Driver launch lost run-scoped app data or explicit desktop.' }
@@ -256,6 +350,21 @@ function Test-HiddenDriverCode([string] $Code) {
             throw 'Default-desktop failure must immediately clean up the owned job without continuing driver polling/metadata/exit checks.'
         }
         if ($env:LOCALAPPDATA -cne $savedLocal -or $env:APPDATA -cne $savedRoaming) { throw 'Oracle failure did not restore the driver environment.' }
+        $script:oracleThrows = $false
+        foreach ($failure in @('nonzero', 'query-failure')) {
+            [HiddenDriverContract]::ExitCode = $(if ($failure -eq 'nonzero') { 7 } else { 0 })
+            [HiddenDriverContract]::ExitQueryFails = $failure -eq 'query-failure'
+            [HiddenDriverContract]::Waits = [HiddenDriverContract]::Stops = [HiddenDriverContract]::ExitReads = 0
+            $blocked = $false
+            try {
+                Invoke-HiddenDriver -Script 'unused.ps1' -Bin (Join-Path $fixture 'bin') -Run (Join-Path $fixture $failure) -TimeoutSeconds 1 -Label 'managed exit failure fixture' 6>$null
+            } catch {
+                $expected = if ($failure -eq 'nonzero') { 'Hidden driver failed with exit 7;' } else { 'Hidden driver exit code query failed.' }
+                $blocked = $_.Exception.Message.StartsWith($expected, [StringComparison]::Ordinal)
+            }
+            if (-not $blocked -or [HiddenDriverContract]::Stops -ne 1 -or [HiddenDriverContract]::ExitReads -ne 1) { throw 'Driver exit failures must reject success and clean the owned job.' }
+            if ($env:LOCALAPPDATA -cne $savedLocal -or $env:APPDATA -cne $savedRoaming) { throw 'Exit failure did not restore the driver environment.' }
+        }
     } finally {
         $env:LOCALAPPDATA = $savedLocal; $env:APPDATA = $savedRoaming
         if ([IO.Path]::GetDirectoryName($fixture) -eq [IO.Path]::GetTempPath().TrimEnd('\', '/') -and
@@ -265,6 +374,9 @@ function Test-HiddenDriverCode([string] $Code) {
 Assert-HiddenMutation 'driver desktop null' $driverFunction ($driverFunction.Replace('"WinSta0\$desktopName"', '$null')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'driver runner gate removed' $driverFunction ($driverFunction.Replace('    Assert-HiddenRunner', '')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'outer window oracle removed' $driverFunction ($driverFunction -replace '(?m)^\s+Assert-HiddenDefaultDesktop[^\r\n]*', '') ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'outer thread metadata removed' $driverFunction ($driverFunction -replace '(?m)^\s+Assert-HiddenDesktop[^\r\n]*', '') ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'nonzero driver exit accepted' $driverFunction ($driverFunction.Replace('if ($code -ne 0)', 'if ($false)')) ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'driver exit API failure accepted' $driverFunction ($driverFunction.Replace("throw 'Hidden driver exit code query failed.'", '$null = 0')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'owned driver job cleanup removed' $driverFunction ($driverFunction.Replace('$ownedProcessCount = [HiddenDriverContract]::StopOwnedJob($job)', '$ownedProcessCount = 0')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'original LOCALAPPDATA inherited' $driverFunction ($driverFunction.Replace("Join-Path `$Run 'localappdata';", '$oldLocal;')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'original APPDATA inherited' $driverFunction ($driverFunction.Replace("Join-Path `$Run 'appdata'", '$oldRoaming')) ${function:Test-HiddenDriverCode}
@@ -316,6 +428,8 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         @{ Desktop = 'noctty-hw-fixture'; Error = 'query failed'; Blocked = $true }
         @{ Exited = $true; Error = 'query failed'; Blocked = $false }
         @{ Exited = $true; Desktop = 'Default'; Blocked = $true }
+        @{ ThreadExited = $true; Blocked = $false }
+        @{ ThreadExited = $true; Desktop = 'Default'; Blocked = $true }
         @{ Empty = $true; Blocked = $true }
         @{ QueryFails = $true; Blocked = $true }
     )) {
@@ -328,7 +442,7 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         }
         [HiddenDesktopContract]::QueryFails = [bool]$fixture.QueryFails
         [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{
-            ProcessId = 41; ThreadId = 123; Desktop = $fixture.Desktop; Error = $fixture.Error; Exited = [bool]$fixture.Exited; Unconnected = [bool]$fixture.Unconnected
+            ProcessId = 41; ThreadId = 123; Desktop = $fixture.Desktop; Error = $fixture.Error; Exited = [bool]$fixture.Exited; ThreadExited = [bool]$fixture.ThreadExited; Unconnected = [bool]$fixture.Unconnected
         } })
         $blocked = $false
         try { Assert-HiddenDesktop -Job ([IntPtr]7) -DesktopName 'noctty-hw-fixture' -ReceiptPath 'unused.jsonl' -DriverPid 40 } catch { $blocked = $true }
@@ -353,6 +467,7 @@ Assert-HiddenMutation 'wrong observed desktop accepted' $desktopAssertion ($desk
 Assert-HiddenMutation 'live desktop query error ignored' $desktopAssertion ($desktopAssertion.Replace('$row.Error -or ', '')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'desktop receipt removed' $desktopAssertion ($desktopAssertion.Replace('Add-Content -LiteralPath $ReceiptPath', 'Out-Null')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'unconnected observation rejected' $desktopAssertion ($desktopAssertion.Replace(' -and -not $row.Unconnected', '')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'vanished thread observation rejected' $desktopAssertion ($desktopAssertion.Replace(' -and -not $row.ThreadExited', '')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'metadata sampling unthrottled' $desktopAssertion ($desktopAssertion.Replace('.TotalSeconds -lt 1', '.TotalSeconds -lt 0')) ${function:Test-HiddenDesktopAssertion}
 
 if (-not ('HiddenDefaultDesktopContract' -as [type])) {
@@ -386,7 +501,7 @@ Assert-HiddenMutation 'visible default job window accepted' $defaultAssertion ($
 # Real native observation only: no process/window is created and no existing job is touched.
 . $hiddenLib
 $nativeRows = @([HiddenWin]::ObserveDesktopThreads([int[]]@($PID)))
-if (-not $nativeRows.Count -or @($nativeRows | Where-Object { $_.Error -or (-not $_.Desktop -and -not $_.Unconnected -and -not $_.Exited) }).Count) {
+if (-not $nativeRows.Count -or @($nativeRows | Where-Object { $_.Error -or (-not $_.Desktop -and -not $_.Unconnected -and -not $_.Exited -and -not $_.ThreadExited) }).Count) {
     throw 'Native observation of this PowerShell process produced query error rows.'
 }
 if (-not [HiddenWin]::CurrentDesktopName()) { throw 'Native current-desktop connection did not resolve.' }
@@ -395,6 +510,131 @@ try {
     if (@([HiddenWin]::JobProcessIds($emptyJob)).Count -or @([HiddenWin]::VisibleJobWindows($emptyJob)).Count) { throw 'A new owned job must have no process or visible job window.' }
 } finally { $null = [HiddenWin]::StopOwnedJob($emptyJob) }
 Write-Host "Native no-launch desktop checks: $($nativeRows.Count) own-process threads ($(@($nativeRows | Where-Object Desktop).Count) connected, $(@($nativeRows | Where-Object Unconnected).Count) unconnected) without errors; empty job/process/window queries passed"
+
+# The live Default-window control is hosted-only. Here its real functions run with
+# managed Win32 and filesystem seams; the window C# is compiled, never invoked.
+$controlPath = Join-Path $repoRoot 'test\windows\hidden-win11-desktop-control.ps1'
+$controlText = Remove-PowerShellComments (Get-Content -LiteralPath $controlPath -Raw)
+function Test-DesktopControlStructure([string] $Code) {
+    if ($Code -notmatch "(?m)^\. \(Join-Path .+ 'hidden-win11-lib.ps1'\)\r?\nAssert-HiddenRunner\r?\n" -or
+        $Code -notmatch "(?s)switch \(\`$Mode\).*?'Parent' \{ Invoke-DesktopControlParent -Run \`$Run \}.*?'Nested' \{ Invoke-DesktopControlNested -Run \`$Run \}.*?'Window' \{ Invoke-DesktopControlWindow \}" -or
+        $Code -notmatch $hiddenForbidden) { throw 'Desktop control lost its entry gate, mode dispatch or prohibited-operation boundary.' }
+}
+Assert-HiddenMutation 'desktop control entry gate removed' $controlText ($controlText.Replace("Assert-HiddenRunner`n`$controlScript", "`$controlScript")) ${function:Test-DesktopControlStructure}
+$controlFunctions = (@('Start-DesktopControlHelper', 'Invoke-DesktopControlNested', 'Invoke-DesktopControlParent', 'Invoke-DesktopControlWindow') |
+    ForEach-Object { Get-HiddenFunction $controlText $_ }) -join "`n"
+$controlAst = [Management.Automation.Language.Parser]::ParseInput($controlText, [ref]$null, [ref]$null)
+$windowCode = $controlAst.Find({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and
+    $n.Value.StartsWith("using System;`n") -and $n.Value.Contains('class HiddenDesktopControlWindow') }, $true).Value
+if (-not $windowCode) { throw 'Desktop control window C# was not found.' }
+if (-not ('HiddenDesktopControlWindow' -as [type])) { Add-Type -TypeDefinition $windowCode }
+if (-not ('HiddenControlContract' -as [type])) {
+    Add-Type @'
+using System;
+using System.Collections.Generic;
+public static class HiddenControlContract {
+    public static int Gates, Creates, Launches, Waits, Runs;
+    public static bool WrongWindow, MissingMember, OracleFails, StopFails;
+    public static List<long> Stopped = new List<long>();
+    public struct ProcessInfo { public int pid; public IntPtr process, thread; }
+    public static string CurrentDesktopName() { return "Default"; }
+    public static IntPtr CreateOwnedJob() { Creates++; return new IntPtr(7); }
+    public static ProcessInfo Launch(string a, string c, string w, string d, IntPtr j, string e) {
+        if (Gates == 0 || d != "WinSta0\\Default" || j != new IntPtr(7)) throw new Exception("Invalid control launch");
+        Launches++; return new ProcessInfo { pid = c.EndsWith("Window") ? 42 : 41, process = new IntPtr(9) };
+    }
+    public static int[] JobProcessIds(IntPtr j) { return MissingMember ? new int[] { 41 } : new int[] { 41, 42 }; }
+    public class Window { public int ProcessId; }
+    public static Window[] VisibleJobWindows(IntPtr j) {
+        if (OracleFails) throw new Exception("fixture oracle failure");
+        return new Window[] { new Window { ProcessId = WrongWindow ? 99 : 42 } };
+    }
+    public static uint WaitForSingleObject(IntPtr p, uint ms) { return ms == 10000 || Waits++ > 0 ? 0u : 258u; }
+    public static bool GetExitCodeProcess(IntPtr p, out uint code) { code = 0; return true; }
+    public static uint StopOwnedJob(IntPtr j) { Stopped.Add(j.ToInt64()); if (StopFails) throw new Exception("fixture stop failure"); return 1; }
+    public static bool CloseHandle(IntPtr p) { return true; }
+    public static void Run() { Runs++; }
+}
+'@
+}
+$controlFunctions = $controlFunctions.Replace('[HiddenWin]', '[HiddenControlContract]').Replace('[HiddenDesktopControlWindow]::Run()', '[HiddenControlContract]::Run()')
+function Test-DesktopControlFunctions([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    $controlScript = 'C:\fixture\control.ps1'
+    # Replace Add-Type only for the extracted window function. Its C# compiled above.
+    function Add-Type { }
+    foreach ($fixture in @(
+        @{ Mode = 'Parent' }, @{ Mode = 'Nested' }, @{ Mode = 'Window' }
+        @{ Mode = 'Parent'; WrongWindow = $true; Blocked = $true }
+        @{ Mode = 'Parent'; MissingMember = $true; Blocked = $true }
+        @{ Mode = 'Nested'; MissingMember = $true; Blocked = $true }
+        @{ Mode = 'Parent'; OracleFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; StopFails = $true; Blocked = $true }
+        @{ Mode = 'Nested'; StopFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; Existing = $true; Blocked = $true }
+        @{ Mode = 'Parent'; GateFails = $true; Blocked = $true }
+        @{ Mode = 'Nested'; GateFails = $true; Blocked = $true }
+        @{ Mode = 'Window'; GateFails = $true; Blocked = $true }
+        @{ Mode = 'Helper'; GateFails = $true; Blocked = $true }
+    )) {
+        [HiddenControlContract]::Gates = [HiddenControlContract]::Creates = [HiddenControlContract]::Launches = [HiddenControlContract]::Waits = [HiddenControlContract]::Runs = 0
+        [HiddenControlContract]::Stopped.Clear()
+        foreach ($field in @('WrongWindow', 'MissingMember', 'OracleFails', 'StopFails')) { [HiddenControlContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        $writes = @{}
+        function Assert-HiddenRunner { [HiddenControlContract]::Gates++; if ($fixture.GateFails) { throw 'fixture runner gate' } }
+        function Test-Path {
+            param([string]$LiteralPath)
+            if ($LiteralPath -eq 'C:\fixture\run') { return [bool]$fixture.Existing }
+            return $true
+        }
+        function New-Item { }
+        function Set-Content {
+            param([Parameter(ValueFromPipeline)]$Value, [string]$LiteralPath)
+            process { $writes[(Split-Path -Leaf $LiteralPath)] = $Value }
+        }
+        function Get-Content {
+            param([string]$LiteralPath, [switch]$Raw)
+            if ($LiteralPath.EndsWith('window-helper.json')) { return '{"WindowPid":42,"InnerMember":true}' }
+            return '{"InnerJobCleanedUp":true,"OwnedProcessCount":1}'
+        }
+        $blocked = $false
+        try {
+            switch ($fixture.Mode) {
+                'Parent' { Invoke-DesktopControlParent -Run 'C:\fixture\run' 6>$null }
+                'Nested' { Invoke-DesktopControlNested -Run 'C:\fixture\run' }
+                'Window' { Invoke-DesktopControlWindow }
+                'Helper' { $null = Start-DesktopControlHelper -Job ([IntPtr]7) -Run 'C:\fixture\run' -HelperMode 'Nested' }
+            }
+        } catch { $blocked = $true }
+        if ($blocked -ne [bool]$fixture.Blocked) { throw "Desktop control fixture $($fixture | ConvertTo-Json -Compress) lost its expected result." }
+        if ($fixture.GateFails -or $fixture.Existing) {
+            if ([HiddenControlContract]::Launches -or [HiddenControlContract]::Creates -or [HiddenControlContract]::Runs -or $writes.Count) { throw 'Blocked control must not launch, create jobs/windows or write receipts.' }
+            continue
+        }
+        if ($fixture.Mode -eq 'Window') {
+            if ([HiddenControlContract]::Gates -ne 2 -or [HiddenControlContract]::Runs -ne 1) { throw 'Window mode lost its entry/pre-window runner gate.' }
+            continue
+        }
+        if ([HiddenControlContract]::Gates -ne 2 -or [HiddenControlContract]::Creates -ne 1 -or [HiddenControlContract]::Launches -ne 1 -or
+            [HiddenControlContract]::Stopped.Count -ne 1 -or [HiddenControlContract]::Stopped[0] -ne 7) { throw 'Parent/nested control lost gate, owned job, helper launch or exact-job cleanup.' }
+        if ($fixture.Mode -eq 'Parent') {
+            $receipt = $writes['desktop-control-results.json'] | ConvertFrom-Json
+            if (-not $receipt -or $receipt.Passed -ne (-not [bool]$fixture.Blocked) -or
+                ($receipt.Passed -and ($receipt.WindowPid -ne 42 -or -not $receipt.DefaultOracleDetectedWindow -or -not $receipt.OuterJobContainsNestedWindow -or
+                    -not $receipt.InnerJobCleanedUp -or -not $receipt.OuterJobCleanedUp))) { throw 'Parent control lost its sanitized result/cleanup receipt.' }
+        } else {
+            $receipt = $writes['nested-cleanup.json'] | ConvertFrom-Json
+            if (-not $receipt -or $receipt.InnerJobCleanedUp -eq [bool]$fixture.StopFails) { throw 'Nested cleanup receipt lost success/failure evidence.' }
+        }
+    }
+}
+Assert-HiddenMutation 'desktop control mode gates removed' $controlFunctions ($controlFunctions -replace '(?m)^\s+Assert-HiddenRunner[^\r\n]*', '') ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control inner job removed' $controlFunctions ($controlFunctions.Replace('$inner = [HiddenControlContract]::CreateOwnedJob()', '$inner = [IntPtr]::Zero')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control outer membership ignored' $controlFunctions ($controlFunctions.Replace('$outerIds -contains $windowPid', '$true')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control default oracle removed' $controlFunctions ($controlFunctions.Replace('@([HiddenControlContract]::VisibleJobWindows($outer))', '@()')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control known window PID ignored' $controlFunctions ($controlFunctions.Replace('Where-Object ProcessId -eq $windowPid', 'Where-Object ProcessId -ne $windowPid')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control owned cleanup removed' $controlFunctions ($controlFunctions.Replace('[HiddenControlContract]::StopOwnedJob($inner)', '0').Replace('[HiddenControlContract]::StopOwnedJob($outer)', '0')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control existing directory allowed' $controlFunctions ($controlFunctions.Replace("if (Test-Path -LiteralPath `$Run) { throw 'Run directory must be new.' }", '')) ${function:Test-DesktopControlFunctions}
 
 $embeddingText = Remove-PowerShellComments (Get-Content -LiteralPath $hiddenScripts[1] -Raw)
 $embeddingArguments = [regex]::Match($embeddingText, '(?ms)^\$uniqueClass =.*?(?=^Assert-EmbeddingDelegationSafe|^\$started =)').Value
@@ -645,4 +885,4 @@ finally {
         Remove-Item -LiteralPath $skipTemp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-Write-Host "Hidden harness and skip budget contracts: $($hiddenContracts.Count) static checks, $mutationControls mutation controls, $($skipCases.Count + 1) skip budget fixtures"
+Write-Host "Hidden harness and skip budget contracts: $($hiddenContracts.Count) static checks, $script:mutationControls mutation controls, $($skipCases.Count + 1) skip budget fixtures"

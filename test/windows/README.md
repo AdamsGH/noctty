@@ -492,6 +492,9 @@ Both scripts currently require an ephemeral GitHub-hosted runner; local launches
 are blocked until the exact bundled and in-box ConPTY desktop placement has
 hosted evidence. The workflow supplies the runner environment and collects the
 desktop metadata receipts and binary fingerprints with its artifacts.
+`hidden-win11-desktop-control.ps1` is a hosted-only positive control: a harmless
+window in a nested owned job must be detected from the outer job on Default.
+It launches no noctty and stops its owned helpers after the check.
 
 Both scripts share `hidden-win11-lib.ps1` (private desktop, owned job, explicit
 desktop selection for harness launches, inherited desktop handles for direct
@@ -518,7 +521,7 @@ inconsistent or failed output. CI runs without `-Report` to enforce the budget.
 ```powershell
 zig build -Demit-test-exe=true -Dcustom-shaders=true
 .\zig-out\bin\ghostty-test.exe *> ghostty-test.log
-pwsh -NoProfile -File ..\..\scripts\check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2025
+pwsh -NoProfile -File ..\..\scripts\check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022
 ```
 
 ## ..\..\scripts\interactive-win11.ps1

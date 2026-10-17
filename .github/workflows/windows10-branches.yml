@@ -86,6 +86,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "noctty.com +version failed with exit code $LASTEXITCODE." }
           if ($versionText -notmatch 'ConPTY') { throw 'noctty.com +version did not report the ConPTY source.' }
 
+      # Check the deterministic budget before any harness can stop further launches.
+      - name: Per-test results from the test executable
+        shell: pwsh
+        run: |
+          zig build -Demit-test-exe=true -Dcustom-shaders=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./zig-out/bin/ghostty-test.exe *> ghostty-test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Skip budget
+        shell: pwsh
+        run: ./scripts/check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022
+
+      - name: Default-desktop nested-job oracle positive control
+        shell: pwsh
+        timeout-minutes: 3
+        run: ./test/windows/hidden-win11-desktop-control.ps1 -Run ./hidden-evidence/desktop-control
+
       # Real launches of the portable build on a hidden desktop, below build 22000. A runner has no
       # OpenGL 4.3 driver, so the profile matrix asks for WARP.
       - name: Profile matrix on a hidden desktop
@@ -102,19 +120,6 @@ jobs:
         shell: pwsh
         timeout-minutes: 5
         run: ./test/windows/hidden-win11-embedding-idle.ps1 -Bin ./zig-out/bin -Run ./hidden-evidence/embedding-control -AllowProductAumid -NegativeControl -Renderer d3d11-warp
-
-      # The build runner reports only a total of skipped tests; the executable run directly names them.
-      - name: Per-test results from the test executable
-        shell: pwsh
-        run: |
-          zig build -Demit-test-exe=true -Dcustom-shaders=true
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./zig-out/bin/ghostty-test.exe *> ghostty-test.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Skip budget
-        shell: pwsh
-        run: ./scripts/check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022
 
       - name: Build D3D11 lifecycle smoke tools
         shell: pwsh
@@ -157,6 +162,7 @@ jobs:
             ghostty-test.log
             hidden-evidence
             !hidden-evidence/**/*.exe
+            !hidden-evidence/**/*.com
             !hidden-evidence/**/*.dll
             !hidden-evidence/**/*.pdb
             !hidden-evidence/**/share/**

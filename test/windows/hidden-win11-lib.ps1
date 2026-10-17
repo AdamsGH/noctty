@@ -4,7 +4,7 @@
 # Safety rules these harnesses keep (AGENTS.md, test/windows/README.md):
 #   * The driver and noctty use explicit desktop names and inherit ONE desktop
 #     handle, which their ordinary shell/discovery launches can propagate.
-#     Connected observed job threads are checked; unconnected threads are recorded.
+#     Connected observed job threads are checked; unconnected/vanished threads are recorded.
 #     The outer process also checks its Default desktop for visible job windows.
 #     Sampling does not isolate short-lived processes or external brokers.
 #   * Launches are restricted to ephemeral GitHub-hosted runners until the exact
@@ -188,10 +188,19 @@ public static class HiddenWin {
     public sealed class DesktopObservation {
         public int ProcessId, ThreadId;
         public string Name, Desktop, Error;
-        public bool Exited, Unconnected;
+        public bool Exited, ThreadExited, Unconnected;
     }
     static bool ConclusivelyExited(Process process) {
         try { return process.HasExited; } catch { return false; }
+    }
+    static bool ConclusivelyThreadExited(Process process, int threadId) {
+        try {
+            // Refresh the retained process instance, not a new lookup by a reusable PID.
+            process.Refresh();
+            foreach (ProcessThread thread in process.Threads)
+                if (thread.Id == threadId) return false;
+            return true;
+        } catch { return false; }
     }
     public static DesktopObservation[] ObserveDesktopThreads(int[] ids) {
         var rows = new List<DesktopObservation>();
@@ -215,7 +224,11 @@ public static class HiddenWin {
                             row.Desktop = ThreadDesktopName((uint)thread.Id);
                             row.Unconnected = row.Desktop == null;
                         }
-                        catch { row.Exited = ConclusivelyExited(process); if (!row.Exited) row.Error = "Thread desktop query failed"; }
+                        catch {
+                            row.Exited = ConclusivelyExited(process);
+                            row.ThreadExited = !row.Exited && ConclusivelyThreadExited(process, row.ThreadId);
+                            if (!row.Exited && !row.ThreadExited) row.Error = "Thread desktop query failed";
+                        }
                     }
                 } catch {
                     row.Exited = ConclusivelyExited(process);
@@ -282,7 +295,7 @@ function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $Re
         ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath $ReceiptPath
     foreach ($row in $rows) {
         if (($row.Desktop -and $row.Desktop -cne $DesktopName) -or
-            (-not $row.Exited -and ($row.Error -or (-not $row.Desktop -and -not $row.Unconnected)))) {
+            (-not $row.Exited -and -not $row.ThreadExited -and ($row.Error -or (-not $row.Desktop -and -not $row.Unconnected)))) {
             throw "Hidden desktop confinement failed for PID=$($row.ProcessId) TID=$($row.ThreadId); inspect metadata receipt."
         }
     }
@@ -400,7 +413,9 @@ function Invoke-HiddenDriver {
             if ([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $TimeoutSeconds seconds; the owned process job will be closed." }
         }
         Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')
-        [uint32]$exit = 0; [void][HiddenWin]::GetExitCodeProcess($pi.process, [ref]$exit); $code = [int]$exit
+        [uint32]$exit = 0
+        if (-not [HiddenWin]::GetExitCodeProcess($pi.process, [ref]$exit)) { throw 'Hidden driver exit code query failed.' }
+        $code = [int]$exit
     } finally {
         $env:LOCALAPPDATA = $oldLocal; $env:APPDATA = $oldRoaming
         $cleanupError = $null; $ownedProcessCount = 0
