@@ -45,6 +45,12 @@ jobs:
             throw "windows-2022 is build $build; the Windows 10 gates in src/apprt/win32.zig take their Windows 11 branch at 22000. Pick another image or retire this workflow."
           }
 
+      # Exercise native cross-process desktop queries before long Zig builds.
+      - name: Default-desktop nested-job oracle positive control
+        shell: pwsh
+        timeout-minutes: 3
+        run: ./test/windows/hidden-win11-desktop-control.ps1 -Run ./hidden-evidence/desktop-control
+
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
@@ -86,7 +92,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "noctty.com +version failed with exit code $LASTEXITCODE." }
           if ($versionText -notmatch 'ConPTY') { throw 'noctty.com +version did not report the ConPTY source.' }
 
-      # Check the deterministic budget before any harness can stop further launches.
+      # Check the deterministic budget before any noctty/profile launch.
       - name: Per-test results from the test executable
         shell: pwsh
         run: |
@@ -98,11 +104,6 @@ jobs:
       - name: Skip budget
         shell: pwsh
         run: ./scripts/check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2022
-
-      - name: Default-desktop nested-job oracle positive control
-        shell: pwsh
-        timeout-minutes: 3
-        run: ./test/windows/hidden-win11-desktop-control.ps1 -Run ./hidden-evidence/desktop-control
 
       # Real launches of the portable build on a hidden desktop, below build 22000. A runner has no
       # OpenGL 4.3 driver, so the profile matrix asks for WARP.

@@ -165,11 +165,11 @@ public static class HiddenWin {
         if (desktop == IntPtr.Zero) {
             int error = Marshal.GetLastWin32Error();
             if (error == 0) return null; // Non-GUI thread with no desktop connection.
-            throw new Exception("GetThreadDesktop failed: " + error);
+            throw new System.ComponentModel.Win32Exception(error, "GetThreadDesktop");
         }
         var name = new StringBuilder(256); int needed;
         if (!GetUserObjectInformationW(desktop, 2, name, 512, out needed))
-            throw new Exception("Desktop name query failed: " + Marshal.GetLastWin32Error());
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetUserObjectInformationW");
         return name.ToString();
     }
     [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job, int type, IntPtr info, uint size, IntPtr returned);
@@ -187,7 +187,8 @@ public static class HiddenWin {
     }
     public sealed class DesktopObservation {
         public int ProcessId, ThreadId;
-        public string Name, Desktop, Error;
+        public string Name, Desktop, Error, ErrorApi;
+        public int? ErrorCode;
         public bool Exited, ThreadExited, Unconnected;
     }
     static bool ConclusivelyExited(Process process) {
@@ -224,10 +225,18 @@ public static class HiddenWin {
                             row.Desktop = ThreadDesktopName((uint)thread.Id);
                             row.Unconnected = row.Desktop == null;
                         }
-                        catch {
+                        catch (Exception error) {
+                            // Only our fixed API labels and numeric codes leave this native seam.
+                            // Keep them even when a fresh exit check explains the query race.
+                            var nativeError = error as System.ComponentModel.Win32Exception;
+                            if (nativeError != null) {
+                                row.ErrorApi = nativeError.Message;
+                                row.ErrorCode = nativeError.NativeErrorCode;
+                            }
                             row.Exited = ConclusivelyExited(process);
                             row.ThreadExited = !row.Exited && ConclusivelyThreadExited(process, row.ThreadId);
-                            if (!row.Exited && !row.ThreadExited) row.Error = "Thread desktop query failed";
+                            if (!row.Exited && !row.ThreadExited)
+                                row.Error = nativeError == null ? "Thread desktop query failed" : row.ErrorApi + " failed";
                         }
                     }
                 } catch {

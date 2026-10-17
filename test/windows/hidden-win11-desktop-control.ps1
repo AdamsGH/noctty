@@ -8,7 +8,8 @@ No noctty, foreground, input or clipboard operations. Never run this live locall
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $Run,
-    [ValidateSet('Parent', 'Nested', 'Window')] [string] $Mode = 'Parent'
+    [ValidateSet('Parent', 'Nested', 'Window', 'PrivateDriver')] [string] $Mode = 'Parent',
+    [string] $DesktopName
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'hidden-win11-lib.ps1')
@@ -138,8 +139,83 @@ public static class HiddenDesktopControlWindow {
     [HiddenDesktopControlWindow]::Run()
 }
 
+function Invoke-PrivateDesktopControlDriver([string] $Run, [string] $DesktopName) {
+    Assert-HiddenRunner
+    if ($DesktopName -cnotmatch '^noctty-hw-[0-9a-f]{32}$') { throw 'Invalid private control desktop.' }
+    # Connect only this thread; no child, window, foreground or input operation.
+    $actual = [HiddenWin]::CurrentDesktopName()
+    if ($actual -cne $DesktopName) { throw 'Private control driver is on the wrong desktop.' }
+    @{ ProcessId = $PID; Desktop = $actual; Connected = $true } | ConvertTo-Json |
+        Set-Content -LiteralPath (Join-Path $Run 'private-driver-ready.json')
+    $deadline = [datetime]::UtcNow.AddSeconds(20)
+    while (-not (Test-Path -LiteralPath (Join-Path $Run 'stop-private-control'))) {
+        if ([datetime]::UtcNow -ge $deadline) { throw 'Private control driver exceeded twenty seconds.' }
+        Start-Sleep -Milliseconds 50
+    }
+}
+
+function Invoke-PrivateDesktopControlParent([string] $Run) {
+    Assert-HiddenRunner
+    if ([HiddenWin]::CurrentDesktopName() -cne 'Default') { throw 'Private control parent must observe Default.' }
+    $Run = [IO.Path]::GetFullPath($Run)
+    if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
+    [void](New-Item -ItemType Directory -Path $Run)
+    $desktopName = 'noctty-hw-' + [guid]::NewGuid().ToString('N')
+    $desktop = [IntPtr]::Zero; $job = [IntPtr]::Zero; $driver = $null
+    $readyObserved = $false; $observed = $false; $passed = $false; $cleaned = $false; $count = 0; $observationFailure = $null
+    try {
+        $desktop = [HiddenWin]::CreateInheritedDesktop($desktopName)
+        $job = [HiddenWin]::CreateOwnedJob()
+        $pwsh = (Get-Command pwsh.exe).Source
+        $line = '"{0}" -NoProfile -NonInteractive -File "{1}" -Run "{2}" -Mode PrivateDriver -DesktopName {3}' -f $pwsh, $controlScript, $Run, $desktopName
+        $driver = [HiddenWin]::Launch($pwsh, $line, $Run, "WinSta0\$desktopName", $job, (Join-Path $Run 'private-driver-stderr.log'))
+        $deadline = [datetime]::UtcNow.AddSeconds(15)
+        do {
+            if ([HiddenWin]::WaitForSingleObject($driver.process, 100) -ne 258) { throw 'Private control driver exited before observation.' }
+            Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'private-default-windows.jsonl')
+            try {
+                Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-startup-desktops.jsonl')
+            } catch {
+                # Retain the first failure and fail the control after collecting readiness evidence.
+                # This helper can only connect/query its own desktop; no further launch is allowed.
+                if ($null -eq $observationFailure) { $observationFailure = $_ }
+            }
+            $ready = $null
+            $readyPath = Join-Path $Run 'private-driver-ready.json'
+            if (Test-Path -LiteralPath $readyPath) {
+                try { $ready = Get-Content -LiteralPath $readyPath -Raw | ConvertFrom-Json -ErrorAction Stop } catch { }
+            }
+            $readyObserved = $ready -and $ready.Connected -eq $true -and $ready.ProcessId -eq $driver.pid -and $ready.Desktop -ceq $desktopName
+            if ([datetime]::UtcNow -ge $deadline) { throw 'Private control driver did not report its desktop within fifteen seconds.' }
+        } until ($readyObserved)
+        # A distinct receipt bypasses startup sampling throttling and always observes after connection.
+        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl')
+        $observed = $true
+        if ($null -ne $observationFailure) { throw $observationFailure }
+        Set-Content -LiteralPath (Join-Path $Run 'stop-private-control') -Value ''
+        if ([HiddenWin]::WaitForSingleObject($driver.process, 5000) -ne 0) { throw 'Private control driver stop exceeded five seconds.' }
+        [uint32]$exitCode = 0
+        if (-not [HiddenWin]::GetExitCodeProcess($driver.process, [ref]$exitCode) -or $exitCode -ne 0) { throw 'Private control driver failed.' }
+        $passed = $true
+    } finally {
+        try {
+            if ($job -ne [IntPtr]::Zero) { $count = [HiddenWin]::StopOwnedJob($job); $cleaned = $true }
+        } finally {
+            if ($driver) { [void][HiddenWin]::CloseHandle($driver.thread); [void][HiddenWin]::CloseHandle($driver.process) }
+            if ($desktop -ne [IntPtr]::Zero) { [void][HiddenWin]::CloseDesktop($desktop) }
+            @{ Passed = ($passed -and $cleaned)
+                ExpectedDesktop = $desktopName; DriverPid = $(if ($driver) { $driver.pid } else { 0 }); MainThreadId = $(if ($driver) { $driver.tid } else { 0 })
+                DriverConnected = $readyObserved; ReadyObservationPassed = $observed; StartupObservationFailed = ($null -ne $observationFailure)
+                OwnedJobCleanedUp = $cleaned; OwnedProcessCount = $count } | ConvertTo-Json |
+                Set-Content -LiteralPath (Join-Path $Run 'private-desktop-control-results.json')
+        }
+    }
+    Write-Host 'Private desktop cross-process metadata control: PASS'
+}
+
 switch ($Mode) {
-    'Parent' { Invoke-DesktopControlParent -Run $Run }
+    'Parent' { Invoke-DesktopControlParent -Run $Run; Invoke-PrivateDesktopControlParent -Run (Join-Path $Run 'private-desktop') }
     'Nested' { Invoke-DesktopControlNested -Run $Run }
     'Window' { Invoke-DesktopControlWindow }
+    'PrivateDriver' { Invoke-PrivateDesktopControlDriver -Run $Run -DesktopName $DesktopName }
 }

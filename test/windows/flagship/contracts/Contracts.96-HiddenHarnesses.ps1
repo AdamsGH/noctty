@@ -133,7 +133,7 @@ public static class TYPE_NAME {
     static uint GetCurrentThreadId() { return 42; }
     static IntPtr GetDesktopWindow() { ThreadQueryFails = false; return new IntPtr(9); }
     static int[] JobProcessIds(IntPtr job) { return new int[] { 41, 42 }; }
-    static bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder name, int length, out int needed) { needed = 20; name.Append("contract-private"); return !NameQueryFails; }
+    static bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder name, int length, out int needed) { needed = 20; name.Append("contract-private"); if (NameQueryFails) SetLastError(122); return !NameQueryFails; }
     static IntPtr CreateFileW(string p, uint a, uint s, ref SecurityAttributes sa, uint d, uint f, IntPtr t) { return new IntPtr(3); }
     static bool CloseHandle(IntPtr h) { return true; }
     static bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref Startup si, out ProcessInfo pi) {
@@ -167,7 +167,15 @@ METHODS
     foreach ($failure in @('ThreadQueryFails', 'NameQueryFails')) {
         $type.GetField($failure).SetValue($null, $true)
         $rejected = $false
-        try { $null = $type::ThreadDesktopName(42) } catch { $rejected = $true }
+        try { $null = $type::ThreadDesktopName(42) } catch {
+            $rejected = $true
+            $nativeError = $_.Exception.InnerException
+            $api = if ($failure -eq 'ThreadQueryFails') { 'GetThreadDesktop' } else { 'GetUserObjectInformationW' }
+            $code = if ($failure -eq 'ThreadQueryFails') { 5 } else { 122 }
+            if ($nativeError -isnot [ComponentModel.Win32Exception] -or $nativeError.Message -cne $api -or $nativeError.NativeErrorCode -ne $code) {
+                throw 'Desktop query failure lost its sanitized API stage or numeric error.'
+            }
+        }
         $type.GetField($failure).SetValue($null, $false)
         if (-not $rejected) { throw 'Desktop query error was silently accepted.' }
     }
@@ -185,7 +193,9 @@ Assert-HiddenMutation 'null native desktop' $nativeCode ($nativeCode.Replace('de
 Assert-HiddenMutation 'wrong native desktop' $nativeCode ($nativeCode.Replace('desktop = desktop', 'desktop = "Default"')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'child handle inheritance disabled' $nativeCode ($nativeCode.Replace('IntPtr.Zero, IntPtr.Zero, true, 0x08004004', 'IntPtr.Zero, IntPtr.Zero, false, 0x08004004')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'desktop handle not inheritable' $nativeCode ($nativeCode.Replace('inherit = true', 'inherit = false')) ${function:Test-HiddenNativeCode}
-Assert-HiddenMutation 'desktop name query errors ignored' $nativeCode ($nativeCode.Replace('throw new Exception("Desktop name query failed: " + Marshal.GetLastWin32Error())', 'return "contract-private"')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'desktop name query errors ignored' $nativeCode ($nativeCode.Replace('throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetUserObjectInformationW")', 'return "contract-private"')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'thread desktop error code lost' $nativeCode ($nativeCode.Replace('Win32Exception(error, "GetThreadDesktop")', 'Win32Exception(0, "GetThreadDesktop")')) ${function:Test-HiddenNativeCode}
+Assert-HiddenMutation 'desktop name error stage lost' $nativeCode ($nativeCode.Replace('Win32Exception(Marshal.GetLastWin32Error(), "GetUserObjectInformationW")', 'Win32Exception(Marshal.GetLastWin32Error(), "GetThreadDesktop")')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'missing job assignment' $nativeCode ($nativeCode.Replace('!AssignProcessToJobObject(job, pi.process) || ', '')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'missing no-window flag' $nativeCode ($nativeCode.Replace('0x08004004', '0x00004004')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'hidden windows counted as UI' $nativeCode ($nativeCode.Replace(' && IsWindowVisible(h)', '')) ${function:Test-HiddenNativeCode}
@@ -205,7 +215,7 @@ function Test-HiddenThreadRace([string] $Methods) {
 using System;
 using System.Collections.Generic;
 public static class TYPE_NAME {
-    public static bool QueryFails, Vanished, RefreshFails, ProcessExited;
+    public static bool QueryFails, Vanished, RefreshFails, ProcessExited, NameQueryFails, UnknownFailure;
     public static int Lookups, Refreshes;
     public sealed class ProcessThread { public int Id; }
     public sealed class Process : IDisposable {
@@ -223,7 +233,13 @@ public static class TYPE_NAME {
         public void Refresh() { Refreshes++; if (RefreshFails) throw new Exception("Refresh failed"); refreshed = true; }
         public void Dispose() { }
     }
-    static string ThreadDesktopName(uint tid) { if (tid == 11 && QueryFails) throw new Exception("Query failed"); return "private"; }
+    static string ThreadDesktopName(uint tid) {
+        if (tid == 11 && QueryFails) {
+            if (UnknownFailure) throw new Exception("fixture secret must never reach receipt");
+            throw new System.ComponentModel.Win32Exception(NameQueryFails ? 122 : 5, NameQueryFails ? "GetUserObjectInformationW" : "GetThreadDesktop");
+        }
+        return "private";
+    }
 METHODS
 }
 '@
@@ -234,8 +250,10 @@ METHODS
         @{ QueryFails = $true; Vanished = $false; Error = $true; ThreadExited = $false }
         @{ QueryFails = $true; Vanished = $true; RefreshFails = $true; Error = $true; ThreadExited = $false }
         @{ QueryFails = $true; ProcessExited = $true; Error = $false; ThreadExited = $false }
+        @{ QueryFails = $true; NameQueryFails = $true; Error = $true; ThreadExited = $false }
+        @{ QueryFails = $true; UnknownFailure = $true; Error = $true; ThreadExited = $false }
     )) {
-        foreach ($field in @('QueryFails', 'Vanished', 'RefreshFails', 'ProcessExited')) { $type.GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        foreach ($field in @('QueryFails', 'Vanished', 'RefreshFails', 'ProcessExited', 'NameQueryFails', 'UnknownFailure')) { $type.GetField($field).SetValue($null, [bool]$fixture[$field]) }
         $type::Lookups = $type::Refreshes = 0
         $rows = @($type::ObserveDesktopThreads([int[]]@(41)))
         if ($rows.Count -ne 2 -or $type::Lookups -ne 1 -or [bool]$rows[0].Error -ne $fixture.Error -or
@@ -243,10 +261,18 @@ METHODS
             throw 'Observer lost the vanished/live/unexplained thread-query distinction.'
         }
         if ($fixture.QueryFails -and -not $fixture.ProcessExited -and $type::Refreshes -ne 1) { throw 'Thread disappearance requires a fresh retained-process enumeration.' }
+        $api = if ($fixture.QueryFails -and -not $fixture.UnknownFailure) { if ($fixture.NameQueryFails) { 'GetUserObjectInformationW' } else { 'GetThreadDesktop' } } else { $null }
+        $code = if ($api) { if ($fixture.NameQueryFails) { 122 } else { 5 } } else { $null }
+        if ($rows[0].ErrorApi -cne $api -or $rows[0].ErrorCode -ne $code -or
+            ($fixture.Error -and $rows[0].Error -cne $(if ($api) { "$api failed" } else { 'Thread desktop query failed' }))) {
+            throw 'Observer lost sanitized API/error evidence or leaked an arbitrary exception message.'
+        }
     }
 }
 Assert-HiddenMutation 'thread snapshot not refreshed' $observerCode ($observerCode.Replace('process.Refresh();', '')) ${function:Test-HiddenThreadRace}
 Assert-HiddenMutation 'live failed thread accepted as exited' $observerCode ($observerCode.Replace('if (thread.Id == threadId) return false;', 'if (thread.Id == threadId) return true;')) ${function:Test-HiddenThreadRace}
+Assert-HiddenMutation 'native error receipt code omitted' $observerCode ($observerCode.Replace('row.ErrorCode = nativeError.NativeErrorCode;', '')) ${function:Test-HiddenThreadRace}
+Assert-HiddenMutation 'native error receipt stage omitted' $observerCode ($observerCode.Replace('row.ErrorApi = nativeError.Message;', '')) ${function:Test-HiddenThreadRace}
 
 if (-not ('HiddenStartContract' -as [type])) {
     Add-Type @'
@@ -517,7 +543,7 @@ $controlPath = Join-Path $repoRoot 'test\windows\hidden-win11-desktop-control.ps
 $controlText = Remove-PowerShellComments (Get-Content -LiteralPath $controlPath -Raw)
 function Test-DesktopControlStructure([string] $Code) {
     if ($Code -notmatch "(?m)^\. \(Join-Path .+ 'hidden-win11-lib.ps1'\)\r?\nAssert-HiddenRunner\r?\n" -or
-        $Code -notmatch "(?s)switch \(\`$Mode\).*?'Parent' \{ Invoke-DesktopControlParent -Run \`$Run \}.*?'Nested' \{ Invoke-DesktopControlNested -Run \`$Run \}.*?'Window' \{ Invoke-DesktopControlWindow \}" -or
+        $Code -notmatch "(?s)switch \(\`$Mode\).*?'Parent' \{ Invoke-DesktopControlParent -Run \`$Run; Invoke-PrivateDesktopControlParent -Run \(Join-Path \`$Run 'private-desktop'\) \}.*?'Nested' \{ Invoke-DesktopControlNested -Run \`$Run \}.*?'Window' \{ Invoke-DesktopControlWindow \}.*?'PrivateDriver' \{ Invoke-PrivateDesktopControlDriver -Run \`$Run -DesktopName \`$DesktopName \}" -or
         $Code -notmatch $hiddenForbidden) { throw 'Desktop control lost its entry gate, mode dispatch or prohibited-operation boundary.' }
 }
 Assert-HiddenMutation 'desktop control entry gate removed' $controlText ($controlText.Replace("Assert-HiddenRunner`n`$controlScript", "`$controlScript")) ${function:Test-DesktopControlStructure}
@@ -673,6 +699,129 @@ if (-not $cleanupPoll) { throw 'Desktop control cleanup membership poll was not 
 Assert-HiddenMutation 'desktop control cleanup leak accepted' $controlFunctions ($controlFunctions.Replace($cleanupPoll, '')) ${function:Test-DesktopControlFunctions}
 Assert-HiddenMutation 'desktop control cleanup poll exceeds two seconds' $controlFunctions ($controlFunctions.Replace('::UtcNow.AddSeconds(2)', '::UtcNow.AddSeconds(3)')) ${function:Test-DesktopControlFunctions}
 Assert-HiddenMutation 'desktop control helper stderr omitted' $controlFunctions ($controlFunctions.Replace('(Join-Path $Run "$HelperMode-stderr.log")', "''")) ${function:Test-DesktopControlFunctions}
+
+# Execute the private cross-process probe with managed launch, observer, clock and
+# filesystem seams. The real hosted control alone starts its private helper.
+if (-not ('PrivateDesktopContract' -as [type])) {
+    Add-Type @'
+using System;
+public static class PrivateDesktopContract {
+    public static string Desktop, Current;
+    public static int Gates, Creates, Launches, Stops, Closes, StartupSamples, ReadySamples, DefaultSamples;
+    public static bool DriverExited, StopTimeout, ExitFails, CleanupFails;
+    public static DateTime UtcNow;
+    public struct ProcessInfo { public int pid, tid; public IntPtr process, thread; }
+    public static string CurrentDesktopName() { return Current; }
+    public static IntPtr CreateInheritedDesktop(string n) { Desktop = n; Creates++; return new IntPtr(8); }
+    public static IntPtr CreateOwnedJob() { return new IntPtr(7); }
+    public static ProcessInfo Launch(string a, string c, string w, string d, IntPtr j, string e) {
+        if (Gates == 0 || j != new IntPtr(7) || d != "WinSta0\\" + Desktop ||
+            !System.IO.Path.IsPathFullyQualified(w) || !c.Contains("-Run \"" + w + "\"") ||
+            !c.EndsWith("-Mode PrivateDriver -DesktopName " + Desktop) || e != System.IO.Path.Combine(w, "private-driver-stderr.log")) throw new Exception("Invalid private launch");
+        Launches++; return new ProcessInfo { pid = 41, tid = 11, process = new IntPtr(9), thread = new IntPtr(10) };
+    }
+    public static uint WaitForSingleObject(IntPtr p, uint ms) {
+        UtcNow = UtcNow.AddMilliseconds(ms);
+        return ms == 5000 ? (StopTimeout ? 258u : 0u) : (DriverExited ? 0u : 258u);
+    }
+    public static bool GetExitCodeProcess(IntPtr p, out uint code) { code = ExitFails ? 1u : 0u; return true; }
+    public static uint StopOwnedJob(IntPtr j) { if (j != new IntPtr(7)) throw new Exception("Wrong job"); Stops++; if (CleanupFails) throw new Exception("Fixture cleanup"); return 2; }
+    public static bool CloseHandle(IntPtr h) { if (h != new IntPtr(9) && h != new IntPtr(10)) throw new Exception("Wrong handle"); Closes++; return true; }
+    public static bool CloseDesktop(IntPtr d) { if (d != new IntPtr(8)) throw new Exception("Wrong desktop"); Closes++; return true; }
+}
+'@
+}
+$privateFunctions = ((@('Invoke-PrivateDesktopControlParent', 'Invoke-PrivateDesktopControlDriver') |
+    ForEach-Object { Get-HiddenFunction $controlText $_ }) -join "`n").Replace('[HiddenWin]', '[PrivateDesktopContract]').Replace('[datetime]::UtcNow', '[PrivateDesktopContract]::UtcNow')
+function Test-PrivateDesktopControl([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    $controlScript = 'C:\fixture\control.ps1'
+    foreach ($fixture in @(
+        @{ Mode = 'Parent' }, @{ Mode = 'Driver' }
+        @{ Mode = 'Parent'; Relative = $true }
+        @{ Mode = 'Parent'; StartupFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; ReadyFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; WrongReadyPid = $true; Blocked = $true }
+        @{ Mode = 'Parent'; WrongReadyDesktop = $true; Blocked = $true }
+        @{ Mode = 'Parent'; MissingReady = $true; Blocked = $true }
+        @{ Mode = 'Parent'; DriverExited = $true; Blocked = $true }
+        @{ Mode = 'Parent'; OracleFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; StopTimeout = $true; Blocked = $true }
+        @{ Mode = 'Parent'; ExitFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; CleanupFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; Existing = $true; Blocked = $true }
+        @{ Mode = 'Parent'; GateFails = $true; Blocked = $true }
+        @{ Mode = 'Parent'; WrongCurrent = $true; Blocked = $true }
+        @{ Mode = 'Driver'; GateFails = $true; Blocked = $true }
+        @{ Mode = 'Driver'; WrongCurrent = $true; Blocked = $true }
+        @{ Mode = 'Driver'; InvalidDesktop = $true; Blocked = $true }
+        @{ Mode = 'Driver'; MissingStop = $true; Blocked = $true }
+    )) {
+        foreach ($field in @('Gates', 'Creates', 'Launches', 'Stops', 'Closes', 'StartupSamples', 'ReadySamples', 'DefaultSamples')) { [PrivateDesktopContract].GetField($field).SetValue($null, 0) }
+        foreach ($field in @('DriverExited', 'StopTimeout', 'ExitFails', 'CleanupFails')) { [PrivateDesktopContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        [PrivateDesktopContract]::UtcNow = [datetime]'2026-01-01T00:00:00Z'
+        $requestedRun = if ($fixture.Relative) { '.\fixture-private' } else { 'C:\fixture\private' }
+        $expectedRun = [IO.Path]::GetFullPath($requestedRun)
+        $expectedDesktop = 'noctty-hw-' + ('a' * 32)
+        [PrivateDesktopContract]::Current = if ($fixture.WrongCurrent) { 'wrong' } elseif ($fixture.Mode -eq 'Driver') { $expectedDesktop } else { 'Default' }
+        $writes = @{}
+        function Assert-HiddenRunner { [PrivateDesktopContract]::Gates++; if ($fixture.GateFails) { throw 'Fixture gate' } }
+        function New-Item { }
+        function Test-Path {
+            param([string]$LiteralPath)
+            if ($LiteralPath -eq $expectedRun) { return [bool]$fixture.Existing }
+            if ($LiteralPath.EndsWith('stop-private-control')) { return -not $fixture.MissingStop }
+            return -not $fixture.MissingReady
+        }
+        function Set-Content {
+            param([Parameter(ValueFromPipeline)]$Value, [string]$LiteralPath)
+            process { $writes[(Split-Path -Leaf $LiteralPath)] = $Value }
+        }
+        function Get-Content {
+            param([string]$LiteralPath, [switch]$Raw)
+            @{ ProcessId = $(if ($fixture.WrongReadyPid) { 99 } else { 41 }); Connected = $true
+                Desktop = $(if ($fixture.WrongReadyDesktop) { 'Default' } else { [PrivateDesktopContract]::Desktop }) } | ConvertTo-Json
+        }
+        function Assert-HiddenDefaultDesktop { param($Job, $ReceiptPath); [PrivateDesktopContract]::DefaultSamples++; if ($fixture.OracleFails) { throw 'Fixture default oracle' } }
+        function Assert-HiddenDesktop {
+            param($Job, $DesktopName, $DriverPid, $ReceiptPath)
+            if ($Job -ne [IntPtr]7 -or $DesktopName -cne [PrivateDesktopContract]::Desktop -or $DriverPid -ne 41) { throw 'Wrong private observer arguments' }
+            if ($ReceiptPath.EndsWith('private-ready-desktops.jsonl')) {
+                [PrivateDesktopContract]::ReadySamples++; if ($fixture.ReadyFails) { throw 'Fixture ready metadata failure' }
+            } else { [PrivateDesktopContract]::StartupSamples++; if ($fixture.StartupFails) { throw 'Fixture startup metadata failure' } }
+        }
+        function Start-Sleep { param([int]$Milliseconds); [PrivateDesktopContract]::UtcNow = [PrivateDesktopContract]::UtcNow.AddMilliseconds($Milliseconds) }
+        $blocked = $false
+        try {
+            if ($fixture.Mode -eq 'Parent') { Invoke-PrivateDesktopControlParent -Run $requestedRun 6>$null }
+            else { Invoke-PrivateDesktopControlDriver -Run 'C:\fixture\private' -DesktopName $(if ($fixture.InvalidDesktop) { 'Default' } else { $expectedDesktop }) }
+        } catch { $blocked = $true }
+        if ($blocked -ne [bool]$fixture.Blocked) { throw "Private control fixture $($fixture | ConvertTo-Json -Compress) lost its expected result." }
+        if ($fixture.GateFails -or $fixture.Existing -or $fixture.WrongCurrent -or $fixture.InvalidDesktop) {
+            if ([PrivateDesktopContract]::Creates -or [PrivateDesktopContract]::Launches -or $writes.Count) { throw 'Rejected private control had side effects.' }
+            continue
+        }
+        if ($fixture.Mode -eq 'Driver') {
+            $ready = $writes['private-driver-ready.json'] | ConvertFrom-Json
+            if (-not $ready.Connected -or $ready.Desktop -cne $expectedDesktop -or $ready.ProcessId -ne $PID) { throw 'Private driver lost its self-connection receipt.' }
+            continue
+        }
+        if ([PrivateDesktopContract]::Launches -ne 1 -or [PrivateDesktopContract]::Creates -ne 1 -or [PrivateDesktopContract]::Stops -ne 1 -or [PrivateDesktopContract]::Closes -ne 3) { throw 'Private control lost bounded owned cleanup.' }
+        $receipt = $writes['private-desktop-control-results.json'] | ConvertFrom-Json
+        if (-not $receipt -or $receipt.Passed -ne (-not [bool]$fixture.Blocked) -or $receipt.DriverPid -ne 41 -or $receipt.MainThreadId -ne 11 -or
+            $receipt.OwnedJobCleanedUp -eq [bool]$fixture.CleanupFails) { throw 'Private control lost its success/failure/cleanup evidence.' }
+        if ($fixture.StartupFails -and (-not $receipt.StartupObservationFailed -or -not $receipt.DriverConnected -or -not $receipt.ReadyObservationPassed)) { throw 'Startup failure was lost or prevented collection of ready-state evidence.' }
+        if (-not $fixture.Blocked -and ([PrivateDesktopContract]::StartupSamples -lt 1 -or [PrivateDesktopContract]::ReadySamples -ne 1 -or [PrivateDesktopContract]::DefaultSamples -lt 1)) { throw 'Private control omitted startup, forced ready, or Default observations.' }
+    }
+}
+Assert-HiddenMutation 'private control startup failure forgotten' $privateFunctions ($privateFunctions.Replace('if ($null -ne $observationFailure) { throw $observationFailure }', '')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control relative run not normalized' $privateFunctions ($privateFunctions.Replace('$Run = [IO.Path]::GetFullPath($Run)', '')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control ready PID ignored' $privateFunctions ($privateFunctions.Replace(' -and $ready.ProcessId -eq $driver.pid', '')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control ready desktop ignored' $privateFunctions ($privateFunctions.Replace(' -and $ready.Desktop -ceq $desktopName', '')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control ready observer omitted' $privateFunctions ($privateFunctions -replace '(?m)^\s+Assert-HiddenDesktop[^\r\n]+private-ready-desktops.jsonl[^\r\n]*', '') ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control default oracle omitted' $privateFunctions ($privateFunctions -replace '(?m)^\s+Assert-HiddenDefaultDesktop[^\r\n]*', '') ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private control owned cleanup omitted' $privateFunctions ($privateFunctions.Replace('$count = [PrivateDesktopContract]::StopOwnedJob($job)', '$count = 0')) ${function:Test-PrivateDesktopControl}
+Assert-HiddenMutation 'private driver self-connection unchecked' $privateFunctions ($privateFunctions.Replace("if (`$actual -cne `$DesktopName) { throw 'Private control driver is on the wrong desktop.' }", '')) ${function:Test-PrivateDesktopControl}
 
 $embeddingText = Remove-PowerShellComments (Get-Content -LiteralPath $hiddenScripts[1] -Raw)
 $embeddingArguments = [regex]::Match($embeddingText, '(?ms)^\$uniqueClass =.*?(?=^Assert-EmbeddingDelegationSafe|^\$started =)').Value
