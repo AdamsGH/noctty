@@ -221,7 +221,15 @@ fn hasLocalFinalPath(handle: windows.HANDLE) bool {
     return localRoot(path) != null;
 }
 
-test "link opener maps DOS roots on fast and walked opens without fallback" {
+test "link opener maps DOS roots on production fast opens without fallback" {
+    try testProductionDosMapping(false);
+}
+
+test "link opener maps DOS roots on production walked opens without fallback" {
+    try testProductionDosMapping(true);
+}
+
+fn testProductionDosMapping(comptime walked: bool) !void {
     const Reject = struct {
         fn map(_: [*:0]const u16, _: []u16) ?[]const u16 {
             return null;
@@ -233,28 +241,26 @@ test "link opener maps DOS roots on fast and walked opens without fallback" {
     try tmp.dir.writeFile(.{ .sub_path = "safe.txt", .data = "safe" });
     const path = try tmp.dir.realpathAlloc(alloc, "safe.txt");
     defer alloc.free(path);
-    // On Windows 11 the unconverted DOS path would succeed. Refusing its
-    // mapping must stop both entry points before they can open that path.
+    var remaining: usize = 256;
+    // Enter the actual production path, injecting only the OS device query.
     os_windows.TestHooks.direct_volume_mapping = Reject.map;
     defer os_windows.TestHooks.direct_volume_mapping = null;
-    const refused = open(alloc, path, true);
+    const refused = if (walked) walk(alloc, path, true, 0, &remaining) else open(alloc, path, true);
     defer if (refused) |file| file.close();
     try std.testing.expectEqual(null, refused);
-    var remaining: usize = 256;
-    const refused_walk = walk(alloc, path, true, 0, &remaining);
-    defer if (refused_walk) |file| file.close();
-    try std.testing.expectEqual(null, refused_walk);
+    // Consulting a mapped copy but opening the original DOS path must fail
+    // too, even on Windows 11 where that original path would open normally.
+    os_windows.TestHooks.direct_volume_mapping = os_windows.TestHooks.unavailableVolume;
+    const redirected = if (walked) walk(alloc, path, true, 0, &remaining) else open(alloc, path, true);
+    defer if (redirected) |file| file.close();
+    try std.testing.expectEqual(null, redirected);
     os_windows.TestHooks.direct_volume_mapping = null;
-    const fast = open(alloc, path, true) orelse return error.TestUnexpectedResult;
-    defer fast.close();
-    const walked = walk(alloc, path, true, 0, &remaining) orelse return error.TestUnexpectedResult;
-    defer walked.close();
-    for ([_]std.fs.File{ fast, walked }) |file| {
-        var data: [4]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, 4), try file.read(&data));
-        try std.testing.expectEqualStrings("safe", &data);
-        try std.testing.expect(hasLocalFinalPath(file.handle));
-    }
+    const opened = (if (walked) walk(alloc, path, true, 0, &remaining) else open(alloc, path, true)) orelse return error.TestUnexpectedResult;
+    defer opened.close();
+    var data: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try opened.read(&data));
+    try std.testing.expectEqualStrings("safe", &data);
+    try std.testing.expect(hasLocalFinalPath(opened.handle));
 }
 
 test "link opener allows only the cloud reparse tag family" {

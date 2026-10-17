@@ -826,6 +826,8 @@ test "WSL guarded paths map DOS roots without an unchecked fallback" {
     os_windows.TestHooks.direct_volume_mapping = Reject.map;
     defer os_windows.TestHooks.direct_volume_mapping = null;
     try std.testing.expectEqual(LocalPath.unsafe, localPathState(path));
+    os_windows.TestHooks.direct_volume_mapping = os_windows.TestHooks.unavailableVolume;
+    try std.testing.expect(localPathState(path) != .safe);
     os_windows.TestHooks.direct_volume_mapping = null;
     try std.testing.expectEqual(LocalPath.safe, localPathState(path));
     try tmp.dir.deleteFile("safe.txt");
@@ -852,6 +854,10 @@ test "WSL executable probe enters production DOS mapping" {
     const refused = try localExecutable(alloc, &env, "wsl.exe", cwd);
     defer if (refused) |path| alloc.free(path);
     try std.testing.expectEqual(null, refused);
+    os_windows.TestHooks.direct_volume_mapping = os_windows.TestHooks.unavailableVolume;
+    const redirected = try localExecutable(alloc, &env, "wsl.exe", cwd);
+    defer if (redirected) |path| alloc.free(path);
+    try std.testing.expectEqual(null, redirected);
     os_windows.TestHooks.direct_volume_mapping = null;
     const found = (try localExecutable(alloc, &env, "wsl.exe", cwd)) orelse return error.TestUnexpectedResult;
     defer alloc.free(found);

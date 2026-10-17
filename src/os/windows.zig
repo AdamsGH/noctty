@@ -133,6 +133,12 @@ pub fn directVolumePath(path: *windows.PathSpace) bool {
 /// state keeps a test's refusal from affecting unrelated worker threads.
 pub const TestHooks = if (builtin.is_test) struct {
     pub threadlocal var direct_volume_mapping: ?*const fn ([*:0]const u16, []u16) ?[]const u16 = null;
+
+    pub fn unavailableVolume(_: [*:0]const u16, buf: []u16) ?[]const u16 {
+        const device = std.unicode.utf8ToUtf16LeStringLiteral("\\Device\\NocttyNoSuchVolume");
+        @memcpy(buf[0..device.len], device);
+        return buf[0..device.len];
+    }
 } else struct {};
 
 fn directVolumePathWithMapping(path: *windows.PathSpace, mapping: anytype) bool {

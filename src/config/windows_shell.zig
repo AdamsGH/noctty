@@ -2361,6 +2361,28 @@ test "local executable data reparse tags exclude redirects and cloud files" {
         try std.testing.expect(!isLocalExecutableInfo(.{ .FileAttributes = windows.FILE_ATTRIBUTE_REPARSE_POINT, .ReparseTag = tag }));
 }
 
+test "shell discovery uses the production DOS mapping before metadata opens" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const Reject = struct {
+        fn map(_: [*:0]const u16, _: []u16) ?[]const u16 {
+            return null;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "pwsh.exe", .data = "not executed" });
+    const path = try tmp.dir.realpathAlloc(alloc, "pwsh.exe");
+    defer alloc.free(path);
+    win32.TestHooks.direct_volume_mapping = Reject.map;
+    defer win32.TestHooks.direct_volume_mapping = null;
+    try std.testing.expectEqual(null, pathInfo(path));
+    win32.TestHooks.direct_volume_mapping = win32.TestHooks.unavailableVolume;
+    try std.testing.expectEqual(null, pathInfo(path));
+    win32.TestHooks.direct_volume_mapping = null;
+    try std.testing.expect(pathInfo(path) != null);
+}
+
 test "shell discovery accepts a real installed Store execution alias" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
