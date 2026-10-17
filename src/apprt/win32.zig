@@ -17183,12 +17183,29 @@ const Host = struct {
         keyboard.set(&([_]u8{0} ** 256));
 
         // Enter is a keyboard activation, not a synthetic mouse press.
+        const Clicks = struct {
+            threadlocal var click_count: usize = 0;
+            threadlocal var previous: WNDPROC = undefined;
+            fn proc(h: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+                if (msg == c.WM_COMMAND) {
+                    click_count += 1;
+                    return 0;
+                }
+                return sys.CallWindowProcW(previous, h, msg, wp, lp);
+            }
+        };
+        Clicks.click_count = 0;
+        Clicks.previous = @ptrFromInt(@as(usize, @intCast(sys.SetWindowLongPtrW(window.parent, c.GWLP_WNDPROC, @intCast(@intFromPtr(&Clicks.proc))))));
+        defer _ = sys.SetWindowLongPtrW(window.parent, c.GWLP_WNDPROC, @intCast(@intFromPtr(Clicks.previous)));
         const new_tab = host.new_tab_hwnd.?;
         _ = sys.SetFocus(new_tab);
         host.focus_input_mode = .keyboard;
         try std.testing.expectEqual(@as(LRESULT, 0), sys.SendMessageW(new_tab, c.WM_KEYDOWN, c.VK_RETURN, 0));
         try std.testing.expectEqual(focus_cue.InputMode.keyboard, host.focus_input_mode);
         try std.testing.expect(host.button_tooltip.dismissed == null);
+        try std.testing.expectEqual(@as(usize, 1), Clicks.click_count);
+        _ = sys.SendMessageW(new_tab, c.WM_KEYDOWN, c.VK_RETURN, c.KF_REPEAT);
+        try std.testing.expectEqual(@as(usize, 1), Clicks.click_count);
 
         // [+] and [v] name themselves for the tooltip as UIA does; a tab does not.
         try std.testing.expectEqualStrings("New tab", host.chromeButtonTooltipName(host.new_tab_hwnd.?).?);
@@ -21646,7 +21663,7 @@ const Host = struct {
     /// made a click here: it reaches a button only through a dialog manager,
     /// and the host has none. Touch nothing after a click: it can open a
     /// menu, or close the search bar.
-    fn handleChromeButtonKey(self: *Host, button: HWND, vk: WPARAM, mods: labels.KeyMods) bool {
+    fn handleChromeButtonKey(self: *Host, button: HWND, vk: WPARAM, mods: labels.KeyMods, lParam: LPARAM) bool {
         const search_surface = if (self.searchControlSurface(button)) |surface|
             if (surface.searchBarButtonRole(button) != null) surface else null
         else
@@ -21656,6 +21673,7 @@ const Host = struct {
         const action = labels.chromeButtonKeyAction(vk, mods) orelse return false;
         switch (action) {
             .click => {
+                if ((lParamBits(lParam) & c.KF_REPEAT) != 0) return true;
                 const parent = sys.GetParent(button) orelse return false;
                 const id = sys.GetDlgCtrlID(button);
                 if (id <= 0) return false;
@@ -31151,7 +31169,7 @@ fn searchFocusStopAvailable(surface: *const Surface, stop: usize) bool {
 /// True when the key is one of those chords, so the caller swallows it; a
 /// held key does not toggle again.
 fn searchToggleKey(surface: *Surface, vk: WPARAM, lParam: LPARAM) bool {
-    const role = labels.searchToggleAccelerator(vk, chromeKeyMods()) orelse return false;
+    const role = surface.search_toggle_keys.keyDown(vk, chromeKeyMods(), lParamBits(lParam)) orelse return false;
     if ((lParamBits(lParam) & c.KF_REPEAT) == 0) {
         _ = surface.handleSearchToggleClick(labels.searchBarButtonCommandId(role)) catch |err| {
             logUiActionError("docked search accelerator toggle failed", err);
@@ -32321,7 +32339,7 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // Enter and Tab on [+], [v] and the docked search buttons. May
         // click, so touch nothing after it.
         if (msg == c.WM_KEYDOWN and !v.isOverlayButton(hwnd) and v.bannerButtonOf(hwnd) == null) {
-            if (v.handleChromeButtonKey(hwnd, wParam, chromeKeyMods())) return 0;
+            if (v.handleChromeButtonKey(hwnd, wParam, chromeKeyMods(), lParam)) return 0;
         }
         // Alt+R / Alt+C / Alt+W flip the search flags from a focused search
         // button too. Alt is a system key, so the press is a WM_SYSKEYDOWN,
@@ -32332,7 +32350,7 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 if (msg == c.WM_SYSKEYDOWN) {
                     v.noteChromeKeyInput(c.VK_TAB);
                     if (searchToggleKey(surface, wParam, lParam)) return 0;
-                } else if (labels.searchToggleAcceleratorChar(wParam, chromeKeyMods()) != null) {
+                } else if (surface.search_toggle_keys.consumeChar(wParam, lParamBits(lParam))) {
                     return 0;
                 }
             }
@@ -32374,6 +32392,7 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     v.banner_focused = false;
                     v.syncBannerExpiry();
                 }
+                if (v.searchControlSurface(hwnd)) |surface| surface.search_toggle_keys = .{};
             },
             c.WM_MOUSEMOVE => {
                 // The search bar's icon buttons and the tab strip's [+] and
@@ -32746,6 +32765,7 @@ fn searchEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 surface.invalidateSearchBarChildPaint();
             },
             c.WM_KILLFOCUS => {
+                surface.search_toggle_keys = .{};
                 surface.invalidateSearchBarChildPaint();
             },
             c.WM_LBUTTONDOWN => v.noteChromePointerInput(),
@@ -32756,7 +32776,7 @@ fn searchEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             },
             // The WM_SYSCHAR of Alt+R / Alt+C / Alt+W; see below.
             c.WM_SYSCHAR => {
-                if (labels.searchToggleAcceleratorChar(wParam, chromeKeyMods()) != null) return 0;
+                if (surface.search_toggle_keys.consumeChar(wParam, lParamBits(lParam))) return 0;
             },
             c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
                 v.noteChromeKeyInput(wParam);
@@ -35039,6 +35059,7 @@ pub const Surface = struct {
     search_bar_bg_uia_provider: ?*win32_uia.ChromeControlProvider = null,
     search_bar_bg_placement: ChildPlacement = .{},
     search_bar_edit_hwnd: ?HWND = null,
+    search_toggle_keys: labels.SearchToggleKeys = .{},
     search_bar_edit_prev_proc: ?*const anyopaque = null,
     search_bar_edit_uia_provider: ?*win32_uia.TerminalProvider = null,
     search_bar_edit_uia_selection: ?[2]u32 = null,

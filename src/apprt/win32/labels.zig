@@ -287,12 +287,25 @@ pub fn searchToggleAccelerator(vk: WPARAM, mods: KeyMods) ?SearchBarButtonRole {
     };
 }
 
-/// The WM_SYSCHAR `TranslateMessage` derives from the same press. It has to
-/// be swallowed too, or `DefWindowProc` turns it into a menu request.
-pub fn searchToggleAcceleratorChar(ch: WPARAM, mods: KeyMods) ?SearchBarButtonRole {
-    if (ch > 0x7F) return null;
-    return searchToggleAccelerator(std.ascii.toUpper(@as(u8, @intCast(ch))), mods);
-}
+/// Pair a handled virtual-key shortcut with TranslateMessage's WM_SYSCHAR
+/// by scan code, not character: the character can be non-Latin on another
+/// layout. Only a handled press can consume a character; AltGr stays out.
+pub const SearchToggleKeys = struct {
+    pending_scan: ?u16 = null,
+
+    pub fn keyDown(self: *SearchToggleKeys, vk: WPARAM, mods: KeyMods, bits: usize) ?SearchBarButtonRole {
+        const role = searchToggleAccelerator(vk, mods);
+        self.pending_scan = if (role != null) @intCast((bits >> 16) & 0x1FF) else null;
+        return role;
+    }
+
+    pub fn consumeChar(self: *SearchToggleKeys, ch: WPARAM, bits: usize) bool {
+        _ = ch;
+        const pending = self.pending_scan;
+        self.pending_scan = null;
+        return if (pending) |scan| scan == ((bits >> 16) & 0x1FF) else false;
+    }
+};
 
 /// After a tab's context menu closes, keyboard focus goes back to the strip
 /// when the menu came from the keyboard, unless a command opened an overlay
@@ -4247,11 +4260,22 @@ test "win32 search toggle accelerators need Alt without Ctrl, Shift or AltGr" {
     try std.testing.expectEqual(@as(?SearchBarButtonRole, null), searchToggleAccelerator('R', .{ .ctrl = true }));
     try std.testing.expectEqual(@as(?SearchBarButtonRole, null), searchToggleAccelerator('R', .{ .alt = true, .ctrl = true }));
     try std.testing.expectEqual(@as(?SearchBarButtonRole, null), searchToggleAccelerator('R', .{ .alt = true, .shift = true }));
-    // The paired WM_SYSCHAR carries the character, either case.
-    try std.testing.expectEqual(@as(?SearchBarButtonRole, .regex), searchToggleAcceleratorChar('r', alt));
-    try std.testing.expectEqual(@as(?SearchBarButtonRole, .case_sensitive), searchToggleAcceleratorChar('C', alt));
-    try std.testing.expectEqual(@as(?SearchBarButtonRole, null), searchToggleAcceleratorChar('w', .{ .alt = true, .ctrl = true }));
-    try std.testing.expectEqual(@as(?SearchBarButtonRole, null), searchToggleAcceleratorChar(0x20AC, alt));
+    var keys: SearchToggleKeys = .{};
+    const r_scan = 0x13 << 16;
+    const c_scan = 0x2E << 16;
+    try std.testing.expectEqual(@as(?SearchBarButtonRole, .regex), keys.keyDown('R', alt, r_scan));
+    // Cyrillic K on the R key is consumed just like Latin r.
+    try std.testing.expect(keys.consumeChar(0x041A, r_scan));
+    try std.testing.expect(!keys.consumeChar('r', r_scan));
+    _ = keys.keyDown('C', alt, c_scan);
+    try std.testing.expect(keys.consumeChar('C', c_scan));
+    _ = keys.keyDown('R', alt, r_scan);
+    try std.testing.expect(!keys.consumeChar('c', c_scan));
+    _ = keys.keyDown('R', .{ .alt = true, .ctrl = true }, r_scan);
+    try std.testing.expect(!keys.consumeChar(0x20AC, r_scan));
+    _ = keys.keyDown('R', alt, r_scan);
+    _ = keys.keyDown('X', alt, r_scan);
+    try std.testing.expect(!keys.consumeChar('x', r_scan));
 }
 
 test "win32 a tab context menu hands focus back to the strip only from the keyboard and without an overlay" {
