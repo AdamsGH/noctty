@@ -450,10 +450,14 @@ what the profile really started: the process under noctty and a redacted shape o
 its command line (the PowerShell injection, Git Bash's `--login -i`), and the
 working directory the shell reports with OSC 7, read from the `session-state.json`
 noctty saves at close. cmd and Git Bash are sent a directory change as posted keys;
-PowerShell panes are never typed into, because a pwsh in a test pane loads PSReadLine
-and its history file is the real user's (the harness proves that file, the real
-`startup-attempts.json` and the clipboard sequence number did not change). A
-control case runs cmd with `shell-integration = none` and expects the seed to
+PowerShell panes are never typed into. Their run-owned integration copy sets a
+new run-local PSReadLine history path and `SaveNothing` before the first read;
+a marker written after the actual integration prompt replaces a fixed delay.
+Original and instrumented script hashes are retained. This instruments the test
+copy for isolation/readiness and does not generate OSC 7 or alter cwd. Redirecting
+`APPDATA` alone is not sufficient history isolation. The harness proves the real
+history file, `startup-attempts.json` and the clipboard sequence number did not
+change. A control case runs cmd with `shell-integration = none` and expects the seed to
 survive. No interactive WSL or SSH profile is started; startup discovery may
 probe WSL. A profile that is not installed is skipped and reported; `-RequireAll`
 turns any such skip into a failure. The hosted workflow requires all four.
@@ -498,12 +502,22 @@ It launches no noctty and stops its owned helpers after the check.
 
 Both scripts share `hidden-win11-lib.ps1` (private desktop, owned job, explicit
 desktop selection for harness launches, inherited desktop handles for direct
-children, observed descendant-thread desktop checks, and real-state receipts).
-The outer window oracle polls at nominal 100 ms intervals and thread metadata
-is sampled at most once per second; native calls and scheduling can delay either.
-Neither proves the absence of a window whose whole lifetime falls between samples.
-Unconnected threads are recorded separately from query errors. No external broker
-journey is exercised. Keep bundled and in-box ConPTY desktop evidence separate.
+children, and real-state receipts). The parent validates the driver's desktop
+self-report against its PID, job membership, window station and session before
+approving app launch. The outer process independently enumerates the named private
+desktop and rejects job-owned top-level windows on Default, including hidden
+windows. Profile readiness requires the known noctty PID's window on the private
+desktop before posted input.
+
+Server 2022 returned `GetThreadDesktop` error 5 (access denied) for live foreign
+pwsh/conhost threads, even with matching WinSta0/session IDs and a fresh observer
+thread attached to the private desktop. That is a hosted API observation, not
+proof of a desktop escape. The window oracle uses documented `OpenDesktopW` and
+`EnumDesktopWindows` instead of interpreting a denied query as safe.
+Sampling does not establish desktop membership of windowless foreign threads or
+prove the absence of a window whose whole lifetime falls between samples.
+No external broker journey is exercised; keep bundled and in-box ConPTY
+desktop evidence separate. The Server 2022 run is not a Windows 10 desktop pass.
 
 ## ..\..\scripts\check-test-skips.ps1
 

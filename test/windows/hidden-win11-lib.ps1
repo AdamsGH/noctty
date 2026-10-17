@@ -4,8 +4,8 @@
 # Safety rules these harnesses keep (AGENTS.md, test/windows/README.md):
 #   * The driver and noctty use explicit desktop names and inherit ONE desktop
 #     handle, which their ordinary shell/discovery launches can propagate.
-#     Connected observed job threads are checked; unconnected/vanished threads are recorded.
-#     The outer process also checks its Default desktop for visible job windows.
+#     The driver self-reports its connected desktop before parent approval.
+#     Named-desktop enumeration checks actual job window PIDs; Default rejects all job windows.
 #     Sampling does not isolate short-lived processes or external brokers.
 #   * Launches are restricted to ephemeral GitHub-hosted runners until the exact
 #     bundled and in-box ConPTY host placement has been observed there.
@@ -35,9 +35,10 @@ public static class HiddenWin {
     [StructLayout(LayoutKind.Sequential)] public struct ProcessInfo { public IntPtr process,thread; public int pid,tid; }
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
     [DllImport("user32.dll", SetLastError=true)] static extern bool EnumWindows(EnumWindow cb, IntPtr p);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool EnumDesktopWindows(IntPtr desktop, EnumWindow cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumWindow cb, IntPtr p);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
+    [DllImport("user32.dll", SetLastError=true)] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint type);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeoutMs, out IntPtr result);
@@ -259,53 +260,66 @@ public static class HiddenWin {
         }
         return rows.ToArray();
     }
-    // Diagnostic comparison only. Never move the outer Default oracle's calling thread.
-    public static DesktopObservation[] ObserveDesktopThreadsOnDesktop(int[] ids, string desktopName) {
-        DesktopObservation[] rows = null; Exception failure = null;
-        System.ComponentModel.Win32Exception cleanupFailure = null;
-        IntPtr desktop = IntPtr.Zero;
-        var observer = new System.Threading.Thread(() => {
-            try {
-                // Read-only, noninheritable handle, used only on this fresh no-window thread.
-                desktop = OpenDesktopW(desktopName, 0, false, 0x0001);
-                if (desktop == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer OpenDesktopW");
-                if (!SetThreadDesktop(desktop)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer SetThreadDesktop");
-                if (CurrentDesktopName() != desktopName) throw new Exception("Observer desktop mismatch");
-                rows = ObserveDesktopThreads(ids);
-            } catch (Exception error) { failure = error; }
-        });
-        try { observer.Start(); observer.Join(); }
-        catch (Exception error) { failure = error; }
-        finally {
-            // Closing while the worker is attached would fail; join precedes handle cleanup.
-            if (desktop != IntPtr.Zero && !CloseDesktop(desktop))
-                cleanupFailure = new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer CloseDesktop");
-        }
-        if (failure != null) {
-            if (cleanupFailure != null) {
-                failure.Data["ObserverCleanupApi"] = cleanupFailure.Message;
-                failure.Data["ObserverCleanupCode"] = cleanupFailure.NativeErrorCode;
-            }
-            throw failure;
-        }
-        if (cleanupFailure != null) throw cleanupFailure;
-        return rows;
-    }
     public sealed class DesktopWindowObservation {
         public int ProcessId, ThreadId;
     }
     // EnumWindows sees the calling thread's desktop. Call only from the outer Default driver.
     // No window titles or unrelated window metadata are retained.
-    public static DesktopWindowObservation[] VisibleJobWindows(IntPtr job) {
+    public static DesktopWindowObservation[] DefaultJobWindows(IntPtr job) {
         var ids = new HashSet<int>(JobProcessIds(job));
         var rows = new List<DesktopWindowObservation>();
-        SetLastError(0);
-        if (!EnumWindows((h, p) => {
-            int id; int tid = GetWindowThreadProcessId(h, out id);
-            if (ids.Contains(id) && IsWindowVisible(h))
-                rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid });
-            return true;
-        }, IntPtr.Zero)) throw new Exception("Default desktop window enumeration failed: " + Marshal.GetLastWin32Error());
+        for (int attempt = 0; attempt < 3; attempt++) {
+            bool ownerFailed = false; int ownerError = 0;
+            SetLastError(0);
+            bool complete = EnumWindows((h, p) => {
+                int id; int tid = GetWindowThreadProcessId(h, out id);
+                if (tid == 0) { ownerFailed = true; ownerError = Marshal.GetLastWin32Error(); return false; }
+                if (ids.Contains(id)) rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid });
+                return true;
+            }, IntPtr.Zero);
+            int error = ownerFailed ? ownerError : Marshal.GetLastWin32Error();
+            if (complete && !ownerFailed) return rows.ToArray();
+            if (error == 1400 && attempt < 2) continue; // A window disappeared during this enumeration.
+            var failure = new System.ComponentModel.Win32Exception(error, ownerFailed ? "GetWindowThreadProcessId" : "EnumWindows");
+            failure.Data["ObservedWindows"] = rows.ToArray();
+            throw failure;
+        }
+        throw new Exception("Window enumeration attempts exhausted");
+    }
+    // Enumerate the named desktop directly; do not attach or infer membership from a launch string.
+    public static DesktopWindowObservation[] PrivateJobWindows(IntPtr job, string desktopName) {
+        var ids = new HashSet<int>(JobProcessIds(job));
+        var rows = new List<DesktopWindowObservation>();
+        var desktop = OpenDesktopW(desktopName, 0, false, 0x0001); // DESKTOP_READOBJECTS
+        if (desktop == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "OpenDesktopW");
+        Exception failure = null;
+        System.ComponentModel.Win32Exception cleanupFailure = null;
+        try {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                bool ownerFailed = false; int ownerError = 0;
+                SetLastError(0);
+                bool complete = EnumDesktopWindows(desktop, (h, p) => {
+                    int id; int tid = GetWindowThreadProcessId(h, out id);
+                    if (tid == 0) { ownerFailed = true; ownerError = Marshal.GetLastWin32Error(); return false; }
+                    if (ids.Contains(id)) rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid });
+                    return true;
+                }, IntPtr.Zero);
+                int error = ownerFailed ? ownerError : Marshal.GetLastWin32Error();
+                if (complete && !ownerFailed) break;
+                if (error == 1400 && attempt < 2) continue;
+                var queryFailure = new System.ComponentModel.Win32Exception(error, ownerFailed ? "GetWindowThreadProcessId" : "EnumDesktopWindows");
+                queryFailure.Data["ObservedWindows"] = rows.ToArray();
+                throw queryFailure;
+            }
+        } catch (Exception error) { failure = error; }
+        finally {
+            if (!CloseDesktop(desktop)) cleanupFailure = new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "CloseDesktop");
+        }
+        if (failure != null) {
+            if (cleanupFailure != null) { failure.Data["CleanupApi"] = "CloseDesktop"; failure.Data["CleanupCode"] = cleanupFailure.NativeErrorCode; }
+            throw failure;
+        }
+        if (cleanupFailure != null) throw cleanupFailure;
         return rows.ToArray();
     }
     public static bool ContainsBytes(byte[] hay, byte[] needle) {
@@ -327,46 +341,99 @@ function Assert-HiddenRunner {
     }
 }
 
-# Metadata only, including the driver and every currently observed member of its job.
-# Short-lived processes between samples and external brokers are outside this receipt.
-function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $ReceiptPath, [int] $DriverPid = $PID) {
-    if (-not (Get-Variable -Name hiddenDesktopSamples -Scope Script -ErrorAction Ignore)) { $script:hiddenDesktopSamples = @{} }
-    $sampleKey = "$Job/$DesktopName/$ReceiptPath/$DriverPid"
-    $lastSample = $script:hiddenDesktopSamples[$sampleKey]
-    if ($null -ne $lastSample -and ([datetime]::UtcNow - $lastSample).TotalSeconds -lt 1) { return }
+# Window membership is observed with documented desktop enumeration APIs. This
+# proves sampled UI placement, not desktop membership of windowless threads.
+function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $ReceiptPath, [int] $DriverPid = $PID, [int] $RequiredWindowPid = 0, [switch] $NoWindows) {
     try {
-        $ids = @(@([HiddenWin]::JobProcessIds($Job)) + $DriverPid | Select-Object -Unique)
-        $rows = @([HiddenWin]::ObserveDesktopThreads([int[]]$ids))
-        if ($rows.Count -eq 0) { throw 'No desktop metadata.' }
-    } catch {
-        @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Error = 'Process metadata query failed' } |
-            ConvertTo-Json -Compress | Add-Content -LiteralPath $ReceiptPath
-        throw 'Hidden desktop process metadata query failed; further launches are blocked.'
-    }
-    @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Threads = $rows } |
-        ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath $ReceiptPath
-    foreach ($row in $rows) {
-        if (($row.Desktop -and $row.Desktop -cne $DesktopName) -or
-            (-not $row.Exited -and -not $row.ThreadExited -and ($row.Error -or (-not $row.Desktop -and -not $row.Unconnected)))) {
-            throw "Hidden desktop confinement failed for PID=$($row.ProcessId) TID=$($row.ThreadId); inspect metadata receipt."
+        if ($DesktopName -cnotmatch '^noctty-hw-[0-9a-f]{32}$') { throw 'Invalid desktop name' }
+        $ids = @([HiddenWin]::JobProcessIds($Job))
+        $rows = @([HiddenWin]::PrivateJobWindows($Job, $DesktopName))
+        foreach ($row in $rows) {
+            if ($row.ProcessId -le 0 -or $row.ThreadId -le 0 -or $ids -notcontains $row.ProcessId) { throw 'Invalid window owner' }
         }
+        if ($DriverPid -eq $PID -and [HiddenWin]::CurrentDesktopName() -cne $DesktopName) { throw 'Wrong driver desktop' }
+    } catch {
+        $failure = $_.Exception
+        while ($failure.InnerException) { $failure = $failure.InnerException }
+        $nativeStages = @('OpenDesktopW', 'EnumDesktopWindows', 'GetWindowThreadProcessId', 'CloseDesktop', 'GetThreadDesktop', 'GetUserObjectInformationW')
+        $fixedStages = @('Invalid desktop name', 'Invalid window owner', 'Wrong driver desktop', 'Job process query failed', 'Job process query incomplete', 'Current desktop connection failed', 'Current thread has no connected desktop')
+        $errorStage = $null; $errorApi = $null; $errorCode = $null; $cleanupApi = $null; $cleanupCode = $null
+        if ($failure -is [ComponentModel.Win32Exception] -and $nativeStages -ccontains $failure.Message) {
+            $errorStage = $errorApi = $failure.Message
+            $errorCode = $failure.NativeErrorCode
+        } elseif ($fixedStages -ccontains $failure.Message) { $errorStage = $failure.Message }
+        if ($failure.Data['CleanupApi'] -ceq 'CloseDesktop' -and $failure.Data['CleanupCode'] -is [int]) {
+            $cleanupApi = 'CloseDesktop'; $cleanupCode = $failure.Data['CleanupCode']
+        }
+        $observedWindows = @()
+        if ($errorApi) {
+            foreach ($window in @($failure.Data['ObservedWindows'])) {
+                if ($null -ne $window -and $window.ProcessId -is [int] -and $window.ThreadId -is [int] -and $window.ProcessId -gt 0 -and $window.ThreadId -gt 0) {
+                    $observedWindows += @{ ProcessId = $window.ProcessId; ThreadId = $window.ThreadId }
+                }
+            }
+        }
+        @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Error = 'Private desktop window query failed'
+            ErrorStage = $errorStage; ErrorApi = $errorApi; ErrorCode = $errorCode; CleanupErrorApi = $cleanupApi; CleanupErrorCode = $cleanupCode; Windows = $observedWindows } |
+            ConvertTo-Json -Depth 4 -Compress | Add-Content -LiteralPath $ReceiptPath
+        throw 'Hidden desktop private-window query failed; further launches are blocked.'
     }
-    $script:hiddenDesktopSamples[$sampleKey] = [datetime]::UtcNow
+    @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Oracle = 'EnumDesktopWindows'; Windows = $rows; RequiredWindowPid = $RequiredWindowPid } |
+        ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath $ReceiptPath
+    if ($RequiredWindowPid -gt 0 -and ($ids -notcontains $RequiredWindowPid -or @($rows | Where-Object ProcessId -eq $RequiredWindowPid).Count -eq 0)) {
+        throw 'Window startup required process window is absent; further input is blocked.'
+    }
+    if ($NoWindows -and $rows.Count) { throw 'Hidden desktop unexpected private job window; further launches are blocked.' }
+}
+
+# The child cannot launch noctty until the Default observer validates this receipt.
+function Wait-HiddenDriverApproval([string] $Run, [string] $DesktopName) {
+    if ($DesktopName -cnotmatch '^noctty-hw-[0-9a-f]{32}$' -or [HiddenWin]::CurrentDesktopName() -cne $DesktopName) { throw 'Hidden desktop driver self-check failed.' }
+    @{ ProcessId = $PID; Desktop = $DesktopName; WindowStation = [HiddenWin]::CurrentWindowStationName(); SessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Run 'driver-desktop.json')
+    $deadline = [datetime]::UtcNow.AddSeconds(15)
+    while (-not (Test-Path -LiteralPath (Join-Path $Run 'driver-desktop-approved'))) {
+        if ([datetime]::UtcNow -ge $deadline) { throw 'Hidden desktop driver approval timed out.' }
+        Start-Sleep -Milliseconds 50
+    }
+}
+
+function Approve-HiddenDriver([IntPtr] $Job, [string] $Run, [string] $DesktopName, [int] $DriverPid) {
+    $path = Join-Path $Run 'driver-desktop.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    try { $receipt = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop } catch { return $false }
+    if ($receipt.ProcessId -ne $DriverPid -or @([HiddenWin]::JobProcessIds($Job)) -notcontains $DriverPid -or
+        $receipt.Desktop -cne $DesktopName -or $receipt.WindowStation -cne [HiddenWin]::CurrentWindowStationName() -or
+        $receipt.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId) { throw 'Hidden desktop driver receipt mismatch; further launches are blocked.' }
+    Set-Content -LiteralPath (Join-Path $Run 'driver-desktop-approved') -Value ''
+    return $true
 }
 
 # Called every outer wait tick, independently of the slower thread metadata receipt.
 # A failure escapes the wait loop and immediately closes the entire owned driver job.
 function Assert-HiddenDefaultDesktop([IntPtr] $Job, [string] $ReceiptPath) {
-    try { $windows = @([HiddenWin]::VisibleJobWindows($Job)) }
+    try { $windows = @([HiddenWin]::DefaultJobWindows($Job)) }
     catch {
-        @{ At = [datetime]::UtcNow.ToString('o'); Error = 'Default desktop window query failed' } |
-            ConvertTo-Json -Compress | Add-Content -LiteralPath $ReceiptPath
+        $failure = $_.Exception
+        while ($failure.InnerException) { $failure = $failure.InnerException }
+        $errorApi = $null; $errorCode = $null; $observedWindows = @()
+        if ($failure -is [ComponentModel.Win32Exception] -and @('EnumWindows', 'GetWindowThreadProcessId') -ccontains $failure.Message) {
+            $errorApi = $failure.Message; $errorCode = $failure.NativeErrorCode
+            foreach ($window in @($failure.Data['ObservedWindows'])) {
+                if ($null -ne $window -and $window.ProcessId -is [int] -and $window.ThreadId -is [int] -and $window.ProcessId -gt 0 -and $window.ThreadId -gt 0) {
+                    $observedWindows += @{ ProcessId = $window.ProcessId; ThreadId = $window.ThreadId }
+                }
+            }
+        }
+        @{ At = [datetime]::UtcNow.ToString('o'); Desktop = 'Default'; Error = 'Default desktop window query failed'
+            ErrorApi = $errorApi; ErrorCode = $errorCode; Windows = $observedWindows } |
+            ConvertTo-Json -Depth 4 -Compress | Add-Content -LiteralPath $ReceiptPath
         throw 'Hidden desktop default-window query failed; further launches are blocked.'
     }
     if ($windows.Count) {
         @{ At = [datetime]::UtcNow.ToString('o'); Desktop = 'Default'; Windows = $windows } |
             ConvertTo-Json -Depth 4 -Compress | Add-Content -LiteralPath $ReceiptPath
-        throw 'Hidden desktop visible job window found on Default; further launches are blocked.'
+        throw 'Hidden desktop job window found on Default; further launches are blocked.'
     }
 }
 
@@ -458,15 +525,18 @@ function Invoke-HiddenDriver {
         # CREATE_NO_WINDOW (0x08000000) is part of Launch's flags.
         $pi = [HiddenWin]::Launch($pwsh, $line, $Run, "WinSta0\$desktopName", $job, '')
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
+        $approved = $false
         $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
         while ([HiddenWin]::WaitForSingleObject($pi.process, 100) -eq 258) {
             Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')
             Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $pi.pid -ReceiptPath (Join-Path $Run 'driver-desktops.jsonl')
+            if (-not $approved) { $approved = Approve-HiddenDriver -Job $job -Run $Run -DesktopName $desktopName -DriverPid $pi.pid }
             if ([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $TimeoutSeconds seconds; the owned process job will be closed." }
         }
         Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')
         [uint32]$exit = 0
         if (-not [HiddenWin]::GetExitCodeProcess($pi.process, [ref]$exit)) { throw 'Hidden driver exit code query failed.' }
+        if ($exit -eq 0 -and -not $approved) { throw 'Hidden desktop driver exited without verified self-receipt.' }
         $code = [int]$exit
     } finally {
         $env:LOCALAPPDATA = $oldLocal; $env:APPDATA = $oldRoaming

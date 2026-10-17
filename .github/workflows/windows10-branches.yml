@@ -45,7 +45,7 @@ jobs:
             throw "windows-2022 is build $build; the Windows 10 gates in src/apprt/win32.zig take their Windows 11 branch at 22000. Pick another image or retire this workflow."
           }
 
-      # Exercise native cross-process desktop queries before long Zig builds.
+      # Exercise desktop window enumeration and driver self-receipts before long Zig builds.
       - name: Default-desktop nested-job oracle positive control
         shell: pwsh
         timeout-minutes: 3

@@ -12,7 +12,8 @@ on a hidden desktop and checks what the profile really started, with no hook int
 
 cmd and Git Bash are also sent `pushd` / `cd` as posted keys, so the directory the file ends up with
 can only have come from the shell. PowerShell panes are never typed into: a pwsh in a test pane
-loads PSReadLine, whose history file is the real user's, and the harness proves it did not change.
+loads PSReadLine. The run-owned integration copy sets a run-local history path and SaveNothing
+before the first read, and the harness checks the real history's fingerprint without reading it.
 Their directory is checked from the first prompt alone, by seeding the session with a path that has
 a trailing separator, which a shell reporting its own directory does not.
 
@@ -60,6 +61,7 @@ if (-not $Driver) {
 $Profile = @($Profile | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $desktopName = [HiddenWin]::CurrentDesktopName()
 if (-not $desktopName.StartsWith('noctty-hw-')) { throw "Driver is not on its own desktop (found '$desktopName')." }
+Wait-HiddenDriverApproval -Run $Run -DesktopName $desktopName
 $job = [HiddenWin]::CreateOwnedJob()
 $desktopReceipt = Join-Path $Run 'profile-desktops.jsonl'
 $checks = [Collections.Generic.List[object]]::new()
@@ -153,9 +155,65 @@ $expectations = @{
     'git-bash'       = @{ Name = 'bash.exe'; Probe = 'echo ready> ready.txt'; Cd = "cd '{0}'"; Tokens = @('--login', '-i') }
 }
 
+# Instrument only the run-owned copy. Automatic injection and its argv stay intact.
+function Install-HiddenPowerShellProbe([string] $CaseRoot) {
+    $path = Join-Path $CaseRoot 'share\ghostty\shell-integration\powershell\integration.ps1'
+    if (-not (Test-Path -LiteralPath $path)) { throw 'Run-owned PowerShell integration script is missing.' }
+    $original = [IO.File]::ReadAllBytes($path)
+    $originalHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    $history = (Join-Path $CaseRoot 'history.txt').Replace("'", "''")
+    $ready = (Join-Path $CaseRoot 'powershell-prompt-ready.json').Replace("'", "''")
+    $prelude = @'
+Import-Module PSReadLine -ErrorAction Stop
+Set-PSReadLineOption -HistorySavePath '__HISTORY__' -HistorySaveStyle SaveNothing -ErrorAction Stop
+if ((Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing' -or (Get-PSReadLineOption).HistorySavePath -cne '__HISTORY__') { throw 'Test history isolation failed.' }
+'@
+    $epilogue = @'
+$Global:__noctty_test_cwd_written = $false
+$Global:__noctty_test_original_write_osc = $function:global:__ghostty_write_osc
+function global:__ghostty_write_osc {
+    param([string]$Sequence)
+    & $Global:__noctty_test_original_write_osc $Sequence
+    if ($Sequence.StartsWith(([string][char]27) + ']7;')) { $Global:__noctty_test_cwd_written = $true }
+}
+$Global:__noctty_test_original_prompt = $function:global:prompt
+function global:prompt {
+    $result = & $Global:__noctty_test_original_prompt
+    $option = Get-PSReadLineOption
+    if ($option.HistorySaveStyle -ne 'SaveNothing' -or $option.HistorySavePath -cne '__HISTORY__') { throw 'Test history isolation changed.' }
+    if ($Global:__noctty_test_cwd_written) {
+        @{ ProcessId = $PID; PromptReturned = $true; CwdOscForwarded = $true; HistorySaveStyle = [string]$option.HistorySaveStyle } | ConvertTo-Json | Set-Content -LiteralPath '__READY__'
+    }
+    return $result
+}
+'@
+    [IO.File]::WriteAllBytes((Join-Path $CaseRoot 'integration.original.ps1'), $original)
+    $body = [IO.File]::ReadAllText($path)
+    $instrumented = $prelude.Replace('__HISTORY__', $history) + "`n" + $body + "`n" + $epilogue.Replace('__HISTORY__', $history).Replace('__READY__', $ready)
+    [IO.File]::WriteAllText($path, $instrumented, [Text.UTF8Encoding]::new($true))
+    @{ OriginalSha256 = $originalHash; InstrumentedSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        Limit = 'Run-owned integration instrumented before first read for history isolation and after the real prompt for readiness. No OSC or cwd is synthesized.' } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $CaseRoot 'integration-instrumentation.json')
+}
+
+function Wait-HiddenPowerShellPrompt($Case, [int] $ProcessId, [int] $ShellPid) {
+    $path = Join-Path (Split-Path -Parent $Case.Dir) 'powershell-prompt-ready.json'
+    $deadline = [datetime]::UtcNow.AddSeconds(30)
+    while ([datetime]::UtcNow -lt $deadline) {
+        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath $desktopReceipt -RequiredWindowPid $ProcessId
+        if (Test-Path -LiteralPath $path) {
+            try { $ready = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $ready = $null }
+            if ($ready -and $ready.ProcessId -eq $ShellPid -and $ShellPid -gt 0 -and $ready.PromptReturned -eq $true -and $ready.CwdOscForwarded -eq $true -and $ready.HistorySaveStyle -ceq 'SaveNothing') { return }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw 'PowerShell integrated prompt readiness exceeded thirty seconds.'
+}
+
 function Start-Case([string] $Key, [string] $Suffix, [string[]] $ExtraConfig) {
     $name = ($Key -replace '[^A-Za-z0-9]', '_') + $Suffix
     $dir = Join-Path $Run "$name\bin"; Copy-PortableBin $Bin $dir
+    if ($Key -cin @('powershell.exe', 'pwsh.exe')) { Install-HiddenPowerShellProbe -CaseRoot (Split-Path -Parent $dir) }
     $work = Join-Path $Run "$name\work"
     # The seed spells the directory with a trailing separator. A shell that reports its own directory
     # drops it, so the saved path differs from the seed only if OSC 7 reached noctty.
@@ -185,7 +243,7 @@ function Wait-Ready($Case, $Process) {
         }
         if ($ready -and $hosts.Count) {
             $surfaces = @([HiddenWin]::Surfaces($hosts[0]))
-            if ($surfaces.Count -gt 0) { return @{ Host = $hosts[0]; Surface = $surfaces[0] } }
+            if ($surfaces.Count -gt 0) { Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath $desktopReceipt -RequiredWindowPid $Process.Id; return @{ Host = $hosts[0]; Surface = $surfaces[0] } }
         }
         Start-Sleep -Milliseconds 100
     }
@@ -220,8 +278,8 @@ function Invoke-Case([string] $Key, [switch] $Control) {
             foreach ($token in $expected.Tokens) { Check $label "command line carries $token" ($full -like "*$token*") $token $shape }
         }
         Check $label 'command line has no -File or /c payload' (($full -notmatch '(^|\s)-File(\s|$)') -and ($full -notmatch '(^|\s)/c(\s|$)')) 'neither' $shape
-        # Give the first prompt time to draw and send its OSC 7.
-        Start-Sleep -Milliseconds 2500
+        if ($Key -cin @('powershell.exe', 'pwsh.exe')) { Wait-HiddenPowerShellPrompt -Case $case -ProcessId $started.Pid -ShellPid ([int]$shell.ProcessId) }
+        else { Start-Sleep -Milliseconds 2500 }
         Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath $desktopReceipt
         if ($expected.Cd -and -not $Control) {
             # A command typed before the shell reads input can be lost, so prove the shell is reading

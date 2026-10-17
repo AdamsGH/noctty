@@ -72,7 +72,7 @@ function Invoke-DesktopControlParent([string] $Run) {
                 if ($helper -and $helper.InnerMember -and [int]$helper.WindowPid -gt 0) {
                     $windowPid = [int]$helper.WindowPid
                     $outerIds = @([HiddenWin]::JobProcessIds($outer))
-                    $windows = @([HiddenWin]::VisibleJobWindows($outer))
+                    $windows = @([HiddenWin]::DefaultJobWindows($outer))
                     $seen = $outerIds -contains $windowPid -and @($windows | Where-Object ProcessId -eq $windowPid).Count -gt 0
                 }
             }
@@ -121,8 +121,8 @@ public static class HiddenDesktopControlWindow {
     [DllImport("user32.dll")] static extern bool PeekMessageW(out Message m, IntPtr hwnd, uint min, uint max, uint remove);
     [DllImport("user32.dll")] static extern IntPtr DispatchMessageW(ref Message m);
     public static void Run() {
-        // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, WS_POPUP | WS_VISIBLE; built-in class.
-        var hwnd = CreateWindowExW(0x08000080, "STATIC", "", 0x90000000, 0, 0, 16, 16, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, hidden WS_POPUP; built-in class.
+        var hwnd = CreateWindowExW(0x08000080, "STATIC", "", 0x80000000, 0, 0, 16, 16, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
         if (hwnd == IntPtr.Zero) throw new Exception("Control window creation failed");
         try {
             var deadline = DateTime.UtcNow.AddSeconds(20);
@@ -189,34 +189,10 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
             $readyObserved = $ready -and $ready.Connected -eq $true -and $ready.ProcessId -eq $driver.pid -and $ready.Desktop -ceq $desktopName
             if ([datetime]::UtcNow -ge $deadline) { throw 'Private control driver did not report its desktop within fifteen seconds.' }
         } until ($readyObserved)
-        $attachedRows = @(); $attachedError = $null; $attachedErrorApi = $null; $attachedErrorCode = $null; $attachedErrorStage = $null
-        $attachedCleanupApi = $null; $attachedCleanupCode = $null
-        try {
-            $ids = @(@([HiddenWin]::JobProcessIds($job)) + $driver.pid | Select-Object -Unique)
-            $attachedRows = @([HiddenWin]::ObserveDesktopThreadsOnDesktop([int[]]$ids, $desktopName))
-        } catch {
-            $attachedError = 'Attached desktop observation failed'
-            $failure = $_.Exception.InnerException
-            $nativeStages = @('GetThreadDesktop', 'GetUserObjectInformationW', 'Observer OpenDesktopW', 'Observer SetThreadDesktop', 'Observer CloseDesktop')
-            $fixedStages = @('Observer desktop mismatch', 'Current desktop connection failed', 'Current thread has no connected desktop', 'Job process query failed', 'Job process query incomplete')
-            if ($failure -is [ComponentModel.Win32Exception] -and $nativeStages -ccontains $failure.Message) {
-                $attachedErrorStage = $attachedErrorApi = $failure.Message
-                $attachedErrorCode = $failure.NativeErrorCode
-            } elseif ($failure -and $fixedStages -ccontains $failure.Message) {
-                $attachedErrorStage = $failure.Message
-            }
-            if ($failure -and $failure.Data['ObserverCleanupApi'] -ceq 'Observer CloseDesktop' -and $failure.Data['ObserverCleanupCode'] -is [int]) {
-                $attachedCleanupApi = 'Observer CloseDesktop'
-                $attachedCleanupCode = $failure.Data['ObserverCleanupCode']
-            }
-        }
-        @{ ExpectedDesktop = $desktopName; ParentWindowStation = [HiddenWin]::CurrentWindowStationName()
-            ParentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId; DriverWindowStation = $ready.WindowStation; DriverSessionId = $ready.SessionId
-            AttachedThreads = $attachedRows; Error = $attachedError; ErrorStage = $attachedErrorStage; ErrorApi = $attachedErrorApi; ErrorCode = $attachedErrorCode
-            CleanupErrorApi = $attachedCleanupApi; CleanupErrorCode = $attachedCleanupCode } |
-            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'private-attached-desktops.json')
-        # A distinct receipt bypasses startup sampling throttling and always observes after connection.
-        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl')
+        if ($ready.WindowStation -cne [HiddenWin]::CurrentWindowStationName() -or
+            $ready.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId -or
+            @([HiddenWin]::JobProcessIds($job)) -notcontains $driver.pid) { throw 'Private control driver identity mismatch.' }
+        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl') -NoWindows
         $observed = $true
         if ($null -ne $observationFailure) { throw $observationFailure }
         Set-Content -LiteralPath (Join-Path $Run 'stop-private-control') -Value ''
@@ -237,7 +213,7 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
                 Set-Content -LiteralPath (Join-Path $Run 'private-desktop-control-results.json')
         }
     }
-    Write-Host 'Private desktop cross-process metadata control: PASS'
+    Write-Host 'Private desktop self-receipt and window-enumeration control: PASS'
 }
 
 switch ($Mode) {

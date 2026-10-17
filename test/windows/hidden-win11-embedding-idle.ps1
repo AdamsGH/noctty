@@ -52,6 +52,7 @@ if (-not $Driver) {
 
 $desktopName = [HiddenWin]::CurrentDesktopName()
 if (-not $desktopName.StartsWith('noctty-hw-')) { throw "Driver is not on its own desktop (found '$desktopName')." }
+Wait-HiddenDriverApproval -Run $Run -DesktopName $desktopName
 $job = [HiddenWin]::CreateOwnedJob()
 $checks = [Collections.Generic.List[object]]::new()
 function Check([string] $Name, [bool] $Passed, $Expected, $Actual) {
@@ -95,8 +96,10 @@ Assert-EmbeddingDelegationSafe
 $started = Start-HiddenNoctty -Dir $dir -DesktopName $desktopName -Job $job -StderrPath $stderr -Arguments $launchArguments
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $closed = $false
+try {
 while (-not $started.Process.HasExited -and $sw.Elapsed.TotalSeconds -lt 40) {
     Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath (Join-Path $Run 'embedding-desktops.jsonl')
+    if (-not $NegativeControl) { Assert-HiddenDesktop -Job $job -DesktopName $desktopName -ReceiptPath (Join-Path $Run 'embedding-no-windows.jsonl') -NoWindows }
     foreach ($class in [HiddenWin]::VisibleTopLevelClasses($started.Pid)) { [void]$classes.Add($class) }
     # An ordinary instance has no idle timer: close it once the oracle has had time to see its window.
     if ($NegativeControl -and -not $closed -and $sw.Elapsed.TotalSeconds -gt 8) {
@@ -104,6 +107,13 @@ while (-not $started.Process.HasExited -and $sw.Elapsed.TotalSeconds -lt 40) {
         foreach ($h in [HiddenWin]::Hosts($started.Pid)) { [void][HiddenWin]::PostMessageW($h, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }
     }
     Start-Sleep -Milliseconds 100
+}
+} catch {
+    Check 'desktop observation completed without a confinement violation' $false 'no desktop observation error' 'observation failed; owned job cleanup required'
+    @{ Checks = $checks; ElapsedSeconds = $sw.Elapsed.TotalSeconds; WindowClasses = @($classes); FilesAdded = @(); FatalDesktopObservation = $true
+        Limit = 'Aborted at a failed desktop/window observation. Lifecycle and remaining state checks did not complete.' } |
+        ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Run 'embedding-results.json')
+    throw
 }
 $exited = $started.Process.HasExited
 if (-not $exited) {
