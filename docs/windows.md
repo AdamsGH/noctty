@@ -1022,7 +1022,10 @@ the indicator is later turned off.
 One noctty process owns the saved session: the first one started normally,
 which restores it (or opens its first window when there is nothing to
 restore). Only that process saves it, on exit, at sign-out, shutdown or
-reboot, and when the display configuration changes. The save at sign-out,
+reboot, when the display configuration changes, and one second after a burst
+of window, tab or pane structural changes settles. These checkpoints use the
+same ownership, scrollback opt-in and sensitive-input exclusions as the exit
+save; startup restoration completes before checkpointing is enabled. The save at sign-out,
 shutdown or reboot is the last one and never deletes the file, even with no
 windows left: the sign-out also ends the shells, so an empty window list
 then says nothing about what was closed on purpose. A launch that forwards
