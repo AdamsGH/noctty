@@ -1346,6 +1346,9 @@ test "win32 safe mode reload keeps recovery without loading config" {
     app.safe_mode = true;
     try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = false }));
     try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = true }));
+    var config: configpkg.Config = undefined;
+    try app.settingsReconcileDisk(&config, &config, false);
+    try app.settingsReconcileDisk(&config, &config, true);
 }
 
 /// Filename infix for a startup-ledger record whose write already failed and
@@ -11071,6 +11074,9 @@ pub const App = struct {
         original: *const configpkg.Config,
         apply: bool,
     ) win32_settings.SaveError!void {
+        // Recovery may repair the file, but must never apply its settings live,
+        // including through conflict reconciliation before the save.
+        if (self.safe_mode) return;
         const alloc = self.core_app.alloc;
         self.settings_failure_detail.clear(alloc);
         const user_edited = settingsUserEditedKeys(original, pending);

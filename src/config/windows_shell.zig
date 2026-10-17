@@ -462,9 +462,23 @@ fn windowsNonDirectoryPathExists(path: []const u8) bool {
 /// it. OBJ_DONT_REPARSE prevents even a metadata query from traversing an
 /// ancestor link into a share or an unchecked redirect chain.
 fn openPathNoRedirect(path: []const u8) ?windows.HANDLE {
-    if (!isDriveAbsolutePath(path) or internal_os.path.isNetworkOrDevicePath(path) or
-        internal_os.windows.driveTypeForLetter(path[0]) == internal_os.windows.DRIVE_REMOTE) return null;
-    const wide = windows.sliceToPrefixedFileW(null, path) catch return null;
+    if (!isDriveAbsolutePath(path) or internal_os.path.isNetworkOrDevicePath(path)) return null;
+    const drive_type = internal_os.windows.driveTypeForLetter(path[0]);
+    if (drive_type != internal_os.windows.DRIVE_FIXED and drive_type != internal_os.windows.DRIVE_RAMDISK) return null;
+    var wide = windows.sliceToPrefixedFileW(null, path) catch return null;
+    // Older Windows also treats the DOS drive-letter mapping as a reparse.
+    // Resolve just that mapping without opening a filesystem target, and accept
+    // only a direct local volume device. The rest keeps the kernel guard.
+    const drive_w: [2:0]u16 = .{ path[0], ':' };
+    var device_buf: [512]u16 = undefined;
+    const device = internal_os.windows.directVolumeDeviceName(&drive_w, &device_buf) orelse return null;
+    if (wide.len < 7 or wide.data[5] != ':' or wide.data[6] != '\\') return null;
+    const final_len = device.len + wide.len - 6;
+    if (final_len >= wide.data.len) return null;
+    std.mem.copyBackwards(u16, wide.data[device.len..final_len], wide.data[6..wide.len]);
+    @memcpy(wide.data[0..device.len], device);
+    wide.len = final_len;
+    wide.data[final_len] = 0;
     var name: windows.UNICODE_STRING = .{
         .Length = @intCast(wide.span().len * 2),
         .MaximumLength = @intCast(wide.span().len * 2),
@@ -2325,6 +2339,23 @@ test "local executable data reparse tags exclude redirects and cloud files" {
     }
     for ([_]u32{ 0xa000000c, 0xa0000003, 0x9000001a, 0x8000001b }) |tag|
         try std.testing.expect(!isLocalExecutableInfo(.{ .FileAttributes = windows.FILE_ATTRIBUTE_REPARSE_POINT, .ReparseTag = tag }));
+}
+
+test "shell discovery accepts a real installed Store execution alias" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const local = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return error.SkipZigTest;
+    defer alloc.free(local);
+    for ([_][]const u8{ "wt.exe", "winget.exe" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ local, "Microsoft", "WindowsApps", name });
+        defer alloc.free(path);
+        if (!windowsNonDirectoryPathExists(path)) continue;
+        const info = pathInfo(path) orelse return error.TestUnexpectedResult;
+        if (info.ReparseTag != IO_REPARSE_TAG_APPEXECLINK) continue;
+        try std.testing.expect(isLaunchableFile(path));
+        return;
+    }
+    return error.SkipZigTest;
 }
 
 test "pwsh search skips what cannot start and keeps going down PATH" {

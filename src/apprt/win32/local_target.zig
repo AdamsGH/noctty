@@ -10,7 +10,6 @@ const STATUS_REPARSE_POINT_ENCOUNTERED = 0xc000050b;
 const IO_REPARSE_TAG_CLOUD = 0x9000001a;
 
 extern "kernel32" fn GetFinalPathNameByHandleW(handle: windows.HANDLE, path: [*]u16, size: u32, flags: u32) callconv(.winapi) u32;
-extern "kernel32" fn QueryDosDeviceW(name: [*:0]const u16, target: [*]u16, size: u32) callconv(.winapi) u32;
 
 pub fn open(alloc: std.mem.Allocator, path: []const u8, read_data: bool) ?std.fs.File {
     if (localRoot(path) == null) return null;
@@ -76,15 +75,10 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
         for (path[4..48], 0..) |ch, i| alias_w[i] = ch;
         alias_w[44] = 0;
         var device: [512]u16 = undefined;
-        const count = QueryDosDeviceW(&alias_w, &device, device.len);
-        if (count == 0 or count > device.len) return null;
-        const end = std.mem.indexOfScalar(u16, device[0..count], 0) orelse return null;
-        const prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\Device\\");
-        if (end <= prefix.len or !std.mem.startsWith(u16, device[0..end], prefix) or
-            std.mem.indexOfAny(u16, device[prefix.len..end], &.{ '\\', '/', ':', '?' }) != null) return null;
-        @memcpy(root_w.data[0..end], device[0..end]);
-        root_w.data[end] = '\\';
-        root_w.len = end + 1;
+        const volume = os_windows.directVolumeDeviceName(&alias_w, &device) orelse return null;
+        @memcpy(root_w.data[0..volume.len], volume);
+        root_w.data[volume.len] = '\\';
+        root_w.len = volume.len + 1;
         root_w.data[root_w.len] = 0;
     }
     var parent: windows.HANDLE = undefined;

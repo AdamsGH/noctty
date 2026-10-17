@@ -99,6 +99,32 @@ pub fn driveTypeForLetter(letter: u8) windows.UINT {
     return GetDriveTypeW(&root);
 }
 
+extern "kernel32" fn QueryDosDeviceW(name: [*:0]const u16, target: [*]u16, size: u32) callconv(.winapi) u32;
+
+/// Resolve only a DOS alias (drive letter or Volume{GUID}) in the local device
+/// map. Refuse filesystem paths, redirectors and intermediate aliases before
+/// any open. The caller must separately screen the drive's media type.
+pub fn directVolumeDeviceName(alias: [*:0]const u16, buf: []u16) ?[]const u16 {
+    if (builtin.os.tag != .windows or buf.len > std.math.maxInt(u32)) return null;
+    const count = QueryDosDeviceW(alias, buf.ptr, @intCast(buf.len));
+    if (count == 0 or count > buf.len) return null;
+    const end = std.mem.indexOfScalar(u16, buf[0..count], 0) orelse return null;
+    return if (isDirectVolumeDeviceName(buf[0..end])) buf[0..end] else null;
+}
+
+fn isDirectVolumeDeviceName(name: []const u16) bool {
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\Device\\");
+    return name.len > prefix.len and std.mem.startsWith(u16, name, prefix) and
+        std.mem.indexOfAny(u16, name[prefix.len..], &.{ '\\', '/', ':', '?' }) == null;
+}
+
+test "direct volume device mappings exclude redirects and filesystem paths" {
+    const w = std.unicode.utf8ToUtf16LeStringLiteral;
+    try std.testing.expect(isDirectVolumeDeviceName(w("\\Device\\HarddiskVolume3")));
+    inline for (.{ "\\Device\\", "\\Device\\Mup\\server\\share", "\\??\\C:\\tools", "\\Device\\HarddiskVolume3\\tools", "C:\\tools" }) |path|
+        try std.testing.expect(!isDirectVolumeDeviceName(w(path)));
+}
+
 /// `IMAGE_FILE_MACHINE_*` codes from `winnt.h`. `IsWow64Process2` reports the
 /// process and native architecture using these values.
 pub const IMAGE_FILE_MACHINE_UNKNOWN: u16 = 0x0000;
