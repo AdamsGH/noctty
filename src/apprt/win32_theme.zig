@@ -40,7 +40,6 @@ pub const ThemeColors = struct {
     overlay_border: u32,
     edit_bg: u32,
     edit_frame_bg: u32,
-    status_bg: u32,
     inspector_bg: u32,
 
     // Text
@@ -406,14 +405,13 @@ pub const ThemeMetrics = struct {
     stroke_emphasis: u16 = 3, // HC mode only
 
     // Chrome heights (px). These replace the file-scope constants at the
-    // top of src/apprt/win32.zig (host_tab_height, host_overlay_height,
-    // host_status_height). Keep those aliases until the consumers migrate.
+    // top of src/apprt/win32.zig (host_tab_height, host_overlay_height).
+    // Keep those aliases until the consumers migrate.
     height_tab: u16 = 32, // separate tab bar (Win10 / native mode)
     height_tab_integrated: u16 = 40, // tabs-in-caption (Win11 default)
     height_titlebar: u16 = 40, // integrated titlebar total
     height_overlay: u16 = 58, // command palette / search
     height_inspector: u16 = 42,
-    height_status: u16 = 42, // status row
     height_search_bar: u16 = 40, // docked search row
 
     // Overlay geometry (px).
@@ -537,7 +535,6 @@ pub fn darkTheme() ThemeColors {
         .overlay_border = rgb(48, 48, 48),
         .edit_bg = rgb(20, 20, 22),
         .edit_frame_bg = rgb(18, 18, 20),
-        .status_bg = rgb(26, 26, 28),
         .inspector_bg = rgb(22, 22, 24),
 
         .text_primary = rgb(220, 220, 224),
@@ -597,7 +594,6 @@ pub fn lightTheme() ThemeColors {
         .overlay_border = rgb(220, 220, 220),
         .edit_bg = rgb(255, 255, 255),
         .edit_frame_bg = rgb(245, 245, 245),
-        .status_bg = rgb(238, 238, 238),
         .inspector_bg = rgb(235, 235, 235),
 
         .text_primary = rgb(27, 27, 27),

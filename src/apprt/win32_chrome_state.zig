@@ -13,8 +13,7 @@ pub const HostOverlayMode = win32_theme.HostOverlayMode;
 pub const TextDirty = packed struct(u8) {
     overlay: bool = true,
     inspector: bool = true,
-    status: bool = true,
-    _padding: u5 = 0,
+    _padding: u6 = 0,
 
     pub fn markTop(self: *TextDirty) void {
         self.overlay = true;
@@ -23,25 +22,22 @@ pub const TextDirty = packed struct(u8) {
 
     pub fn markAll(self: *TextDirty) void {
         self.markTop();
-        self.status = true;
     }
 };
 
 pub const RepaintMask = packed struct(u8) {
     top: bool = false,
     content: bool = false,
-    status: bool = false,
     search_frames: bool = false,
-    _padding: u4 = 0,
+    _padding: u5 = 0,
 
     pub fn markChrome(self: *RepaintMask) void {
         self.top = true;
-        self.status = true;
         self.search_frames = true;
     }
 
     pub fn isEmpty(self: RepaintMask) bool {
-        return !self.top and !self.content and !self.status and !self.search_frames;
+        return !self.top and !self.content and !self.search_frames;
     }
 };
 
@@ -49,13 +45,11 @@ pub fn mergeRepaintMask(current: *RepaintMask, next: RepaintMask) RepaintMask {
     const added: RepaintMask = .{
         .top = next.top and !current.top,
         .content = next.content and !current.content,
-        .status = next.status and !current.status,
         .search_frames = next.search_frames and !current.search_frames,
     };
     current.* = .{
         .top = current.top or next.top,
         .content = current.content or next.content,
-        .status = current.status or next.status,
         .search_frames = current.search_frames or next.search_frames,
     };
     return added;
@@ -79,20 +73,12 @@ pub fn focusRepaintNeeded(pane_count: usize) bool {
     return pane_count > 1;
 }
 
-pub fn profileVisible(overlay_mode: HostOverlayMode, status_bar_height: i32) bool {
-    return overlay_mode == .profile or status_bar_height > 0;
+pub fn profileVisible(overlay_mode: HostOverlayMode) bool {
+    return overlay_mode == .profile;
 }
 
-pub fn profileNeedsFullTextInvalidation(overlay_mode: HostOverlayMode, status_bar_height: i32) bool {
-    return overlay_mode != .profile and status_bar_height > 0;
-}
-
-pub fn textNeedsFullInvalidation(status_bar_height: i32) bool {
-    return status_bar_height > 0;
-}
-
-pub fn inspectorVisible(overlay_mode: HostOverlayMode, status_bar_height: i32) bool {
-    return overlay_mode == .none or status_bar_height > 0;
+pub fn inspectorVisible(overlay_mode: HostOverlayMode) bool {
+    return overlay_mode == .none;
 }
 
 pub fn overlayPaintCacheDirty(
@@ -145,38 +131,24 @@ pub fn shellChromeFallbackAction(err: anyerror) ShellChromeFallbackAction {
     };
 }
 
-test "chrome text dirty splits top and status cache invalidation" {
+test "chrome text dirty invalidates overlay and inspector caches" {
     const testing = std.testing;
 
     var dirty: TextDirty = .{
         .overlay = false,
         .inspector = false,
-        .status = false,
     };
     dirty.markTop();
     try testing.expect(dirty.overlay);
     try testing.expect(dirty.inspector);
-    try testing.expect(!dirty.status);
 
     dirty = .{
         .overlay = false,
         .inspector = false,
-        .status = false,
-    };
-    dirty.status = true;
-    try testing.expect(!dirty.overlay);
-    try testing.expect(!dirty.inspector);
-    try testing.expect(dirty.status);
-
-    dirty = .{
-        .overlay = false,
-        .inspector = false,
-        .status = false,
     };
     dirty.markAll();
     try testing.expect(dirty.overlay);
     try testing.expect(dirty.inspector);
-    try testing.expect(dirty.status);
 }
 
 test "chrome repaint mask merge returns only newly requested regions" {
@@ -191,14 +163,12 @@ test "chrome repaint mask merge returns only newly requested regions" {
     try testing.expect(added.isEmpty());
     try testing.expect(std.meta.eql(current, RepaintMask{ .top = true }));
 
-    added = mergeRepaintMask(&current, .{ .status = true, .search_frames = true });
+    added = mergeRepaintMask(&current, .{ .search_frames = true });
     try testing.expect(std.meta.eql(current, RepaintMask{
         .top = true,
-        .status = true,
         .search_frames = true,
     }));
     try testing.expect(std.meta.eql(added, RepaintMask{
-        .status = true,
         .search_frames = true,
     }));
 
@@ -206,7 +176,6 @@ test "chrome repaint mask merge returns only newly requested regions" {
     try testing.expect(std.meta.eql(current, RepaintMask{
         .top = true,
         .content = true,
-        .status = true,
         .search_frames = true,
     }));
     try testing.expect(std.meta.eql(added, RepaintMask{ .content = true }));
@@ -229,20 +198,11 @@ test "chrome layout child paint plan keeps chrome and content separate" {
     );
 }
 
-test "chrome profile and inspector visibility policies are status aware" {
-    try std.testing.expect(profileVisible(.profile, 0));
-    try std.testing.expect(profileVisible(.none, 24));
-    try std.testing.expect(!profileVisible(.none, 0));
-    try std.testing.expect(!profileVisible(.search, 0));
-
-    try std.testing.expect(!profileNeedsFullTextInvalidation(.profile, 0));
-    try std.testing.expect(!profileNeedsFullTextInvalidation(.profile, 24));
-    try std.testing.expect(!profileNeedsFullTextInvalidation(.none, 0));
-    try std.testing.expect(profileNeedsFullTextInvalidation(.none, 24));
-
-    try std.testing.expect(inspectorVisible(.none, 0));
-    try std.testing.expect(inspectorVisible(.search, 24));
-    try std.testing.expect(!inspectorVisible(.search, 0));
+test "chrome profile and inspector visibility follow overlay mode" {
+    inline for (std.meta.tags(HostOverlayMode)) |mode| {
+        try std.testing.expectEqual(mode == .profile, profileVisible(mode));
+        try std.testing.expectEqual(mode == .none, inspectorVisible(mode));
+    }
 }
 
 test "chrome overlay cache dirtiness ignores repaint-only work" {

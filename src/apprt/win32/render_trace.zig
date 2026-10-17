@@ -3,7 +3,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const internal_os = @import("../../os/main.zig");
 const renderer_state = @import("../../renderer/State.zig");
 const sys = @import("sys.zig");
 const bench_trace = @import("bench_trace.zig");

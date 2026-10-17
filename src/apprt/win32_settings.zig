@@ -719,7 +719,7 @@ pub fn paletteDescriptor(field: SettingField) palette_catalog.Descriptor {
         .item = .{
             .id = palette_catalog.stableStringId(.setting, key),
             .title = field.label(),
-            .subtitle = if (field == .background_blur) "Setting (not supported on Windows)" else "Setting",
+            .subtitle = if (field == .background_blur or field == .link_previews) "Setting (not supported on Windows)" else "Setting",
             .keywords = field.paletteKeywords(),
         },
         .payload = .{ .setting = key },
@@ -1250,7 +1250,7 @@ const settings_label_specs = [_][]const u8{
     "OSC 52 clipboard read requests",
     "OSC 52 clipboard write requests",
     "Clickable URL opening",
-    "Link preview popups",
+    link_previews_label,
     "Notifications",
     "Auto-update mode",
     "Auto-update channel",
@@ -1263,6 +1263,7 @@ const settings_text_count = 5 + settings_label_specs.len;
 const text_status_index = 2;
 const text_close_prompt_index = 3;
 const background_blur_label = "Background blur (not supported on Windows)";
+const link_previews_label = "Link preview popups (not supported on Windows)";
 /// A file-level constant: `open` already spends its comptime branch quota on
 /// the other labels, and one more literal there fails the build.
 const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow Windows accent color");
@@ -1281,13 +1282,13 @@ const settings_control_specs = [_]struct { role: SettingsControlRole, name: []co
     .{ .role = .edit, .name = "Window padding X" },
     .{ .role = .edit, .name = "Window padding Y" },
     .{ .role = .combo_box, .name = "Window padding balance" },
-    .{ .role = .check_box, .name = "Background blur" },
+    .{ .role = .check_box, .name = background_blur_label },
     .{ .role = .edit, .name = "Default command" },
     .{ .role = .combo_box, .name = "Shell integration" },
     .{ .role = .combo_box, .name = "OSC 52 clipboard read requests" },
     .{ .role = .combo_box, .name = "OSC 52 clipboard write requests" },
     .{ .role = .combo_box, .name = "Clickable URL opening" },
-    .{ .role = .combo_box, .name = "Link preview popups" },
+    .{ .role = .combo_box, .name = link_previews_label },
     .{ .role = .check_box, .name = "Terminal notifications" },
     .{ .role = .check_box, .name = "Clipboard-copy notification" },
     .{ .role = .check_box, .name = "Config-reload notification" },
@@ -4916,7 +4917,7 @@ pub const SettingsWindow = struct {
         self.setActiveSection(destination.section);
         if (destination.hwnd) |control| {
             self.ensureControlVisible(control);
-            // The blur checkbox is disabled: focus stays on the section instead.
+            // Unsupported controls are disabled: focus stays on the section.
             if (sys.IsWindowEnabled(control) != 0) {
                 _ = SetFocus(control);
             } else if (self.sectionButton(destination.section)) |button| {
@@ -5373,6 +5374,8 @@ pub const SettingsWindow = struct {
             settings_combo_popup_height,
             &link_previews_labels,
         );
+        // The core emits hover actions, but Windows has no preview tooltip.
+        if (self.combo_link_previews) |combo| _ = EnableWindow(combo, 0);
 
         self.combo_window_theme = makeCombo(
             form,
@@ -8923,7 +8926,7 @@ test "settings Tab visits the fields in form order and Save last" {
 
             for (std.enums.values(Section)) |section| {
                 settings.setActiveSection(section);
-                // A disabled control (the background blur box) is not a tab stop.
+                // Unsupported controls are disabled and are not tab stops.
                 var fields: [settings_max_form_items]HWND = undefined;
                 var field_count: usize = 0;
                 for (settings.formItems()) |item| {
@@ -9919,6 +9922,49 @@ test "settings background blur is shown but cannot be changed" {
             try std.testing.expect(std.mem.indexOf(u8, background_blur_label, "not supported on Windows") != null);
             // The section blurb no longer promises it.
             try std.testing.expect(std.mem.indexOf(u8, Section.appearance.placeholderText(), "blur") == null);
+        }
+    }.body);
+}
+
+test "CHROME unsupported settings are disabled and UIA names explain why" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const com = @import("win32_uia/com.zig");
+            const constants = @import("win32_uia/constants.zig");
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            for ([_]HWND{ settings.chk_bg_blur.?, settings.combo_link_previews.? }) |control| {
+                try std.testing.expect(sys.IsWindowEnabled(control) == 0);
+                const provider = settings.control_uia_providers[settings.controlIndex(control).?].?;
+                var name = com.VARIANT.empty();
+                try std.testing.expectEqual(com.S_OK, provider.base.vtbl.GetPropertyValue(&provider.base, constants.UIA_NamePropertyId, &name));
+                defer _ = com.VariantClear(&name);
+                try std.testing.expectEqual(@as(u16, com.VT_BSTR), name.vt);
+                const bstr = name.value.bstr.?;
+                var utf8: [256]u8 = undefined;
+                const len = try std.unicode.utf16LeToUtf8(&utf8, bstr[0..com.SysStringLen(bstr)]);
+                try std.testing.expect(std.mem.indexOf(u8, utf8[0..len], "not supported on Windows") != null);
+            }
+        }
+    }.body);
+}
+
+test "CHROME unsupported link previews retain their config value and palette focus stays on the section" {
+    try std.testing.expect(std.mem.indexOf(u8, paletteDescriptor(.link_previews).item.subtitle, "not supported on Windows") != null);
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            settings.pending.?.@"link-previews" = .osc8;
+            settings.displayLinkPreviewsInCombo();
+            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(settings.combo_link_previews.?, CB_GETCURSEL, 0, 0));
+            try settings.openField(.link_previews);
+            try std.testing.expectEqual(Section.privacy, settings.active_section);
+            try std.testing.expectEqual(settings.sectionButton(.privacy).?, sys.GetFocus().?);
+            try std.testing.expectEqual(@as(@FieldType(Config, "link-previews"), .osc8), settings.pending.?.@"link-previews");
         }
     }.body);
 }
