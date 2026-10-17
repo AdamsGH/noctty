@@ -30,6 +30,7 @@ const win32_input = @import("win32/input.zig");
 const settings_transaction = @import("win32_settings_transaction.zig");
 const sys = @import("win32/sys.zig");
 const config_problems = @import("win32/config_problems.zig");
+const field_model = @import("win32_settings_fields.zig");
 const SetFocus = sys.SetFocus;
 
 /// Minimal set of Win32 aliases + externs we need here. Shared ABI structs
@@ -387,128 +388,7 @@ const AppNotificationField = enum { clipboard, config };
 /// Ownership-safe native settings tracked by the transaction model. The three
 /// arena-backed edit fields use a parallel tracker below because transaction
 /// values must not borrow slices from replaceable Config snapshots.
-pub const SettingField = enum {
-    scrollback_limit,
-    font_size,
-    background_opacity,
-    window_padding_x,
-    window_padding_y,
-    trim_trailing_spaces,
-    desktop_notifications,
-    app_notify_clipboard,
-    app_notify_config,
-    confirm_close,
-    copy_on_select,
-    clipboard_read,
-    clipboard_write,
-    link_url,
-    link_previews,
-    window_theme,
-    shell_integration,
-    cursor_style,
-    background_blur,
-    padding_balance,
-    auto_update,
-    auto_update_channel,
-    accent_follow_system,
-
-    /// The name a person sees for this setting in the conflict message, the
-    /// Advanced page and the command palette. The enum tag is an internal
-    /// identifier (the palette's stable id and payload still use it) and must
-    /// not reach the screen.
-    pub fn label(self: SettingField) []const u8 {
-        return switch (self) {
-            .scrollback_limit => "Scrollback limit",
-            .font_size => "Font size",
-            .background_opacity => "Background opacity",
-            .window_padding_x => "Window padding X",
-            .window_padding_y => "Window padding Y",
-            .trim_trailing_spaces => "Trim trailing spaces on copy",
-            .desktop_notifications => "Terminal desktop notifications",
-            .app_notify_clipboard => "Clipboard copy notification",
-            .app_notify_config => "Config reload notification",
-            .confirm_close => "Close confirmation",
-            .copy_on_select => "Copy on select",
-            .clipboard_read => "Clipboard read requests (OSC 52)",
-            .clipboard_write => "Clipboard write requests (OSC 52)",
-            .link_url => "Clickable URL opening",
-            .link_previews => "Link preview popups",
-            .window_theme => "Window theme",
-            .shell_integration => "Shell integration",
-            .cursor_style => "Cursor style",
-            .background_blur => "Background blur",
-            .padding_balance => "Window padding balance",
-            .auto_update => "Auto-update mode",
-            .auto_update_channel => "Auto-update channel",
-            .accent_follow_system => "Follow Windows accent color",
-        };
-    }
-
-    /// The config-file key behind this setting (`app-notifications` for the two
-    /// notification toggles, which are sub-fields of it).
-    pub fn configKey(self: SettingField) []const u8 {
-        return switch (self) {
-            .scrollback_limit => "scrollback-limit",
-            .font_size => "font-size",
-            .background_opacity => "background-opacity",
-            .window_padding_x => "window-padding-x",
-            .window_padding_y => "window-padding-y",
-            .trim_trailing_spaces => "clipboard-trim-trailing-spaces",
-            .desktop_notifications => "desktop-notifications",
-            .app_notify_clipboard, .app_notify_config => "app-notifications",
-            .confirm_close => "confirm-close-surface",
-            .copy_on_select => "copy-on-select",
-            .clipboard_read => "clipboard-read",
-            .clipboard_write => "clipboard-write",
-            .link_url => "link-url",
-            .link_previews => "link-previews",
-            .window_theme => "window-theme",
-            .shell_integration => "shell-integration",
-            .cursor_style => "cursor-style",
-            .background_blur => "background-blur",
-            .padding_balance => "window-padding-balance",
-            .auto_update => "auto-update",
-            .auto_update_channel => "auto-update-channel",
-            .accent_follow_system => "accent-follow-system",
-        };
-    }
-
-    /// Words that find this setting in the command palette besides its label:
-    /// the config key people copy from the docs, and the plain words for it.
-    /// The key has to be here, because the palette matches on keywords.
-    pub fn paletteKeywords(self: SettingField) []const u8 {
-        const kw = struct {
-            fn with(comptime words: []const u8) []const u8 {
-                return "settings preferences configuration " ++ words;
-            }
-        }.with;
-        return switch (self) {
-            .scrollback_limit => kw("scrollback-limit history lines buffer"),
-            .font_size => kw("font-size text zoom"),
-            .background_opacity => kw("background-opacity transparency transparent"),
-            .window_padding_x => kw("window-padding-x margin"),
-            .window_padding_y => kw("window-padding-y margin"),
-            .trim_trailing_spaces => kw("clipboard-trim-trailing-spaces whitespace copy"),
-            .desktop_notifications => kw("desktop-notifications alerts"),
-            .app_notify_clipboard => kw("app-notifications clipboard-copy toast"),
-            .app_notify_config => kw("app-notifications config-reload toast"),
-            .confirm_close => kw("confirm-close-surface quit exit running"),
-            .copy_on_select => kw("copy-on-select selection clipboard"),
-            .clipboard_read => kw("clipboard-read osc 52 paste"),
-            .clipboard_write => kw("clipboard-write osc 52 copy"),
-            .link_url => kw("link-url url hyperlink"),
-            .link_previews => kw("link-previews url hyperlink tooltip"),
-            .window_theme => kw("window-theme dark light mode"),
-            .shell_integration => kw("shell-integration powershell bash prompt"),
-            .cursor_style => kw("cursor-style caret block bar underline"),
-            .background_blur => kw("background-blur"),
-            .padding_balance => kw("window-padding-balance margin"),
-            .auto_update => kw("auto-update upgrade"),
-            .auto_update_channel => kw("auto-update-channel stable tip release"),
-            .accent_follow_system => kw("accent-follow-system accent color highlight tab windows personalization"),
-        };
-    }
-};
+pub const SettingField = field_model.SettingField;
 
 const OwnedSettingField = enum {
     font_family,
@@ -516,22 +396,80 @@ const OwnedSettingField = enum {
     command,
 
     fn section(self: OwnedSettingField) Section {
-        return switch (self) {
-            .font_family, .theme => .appearance,
-            .command => .shell,
-        };
+        return nativeSection(self.descriptor().section);
     }
 
     fn label(self: OwnedSettingField) []const u8 {
-        return switch (self) {
-            .font_family => "Font family",
-            .theme => "Terminal theme",
-            .command => "Default command",
-        };
+        return self.descriptor().label;
+    }
+    fn descriptor(self: OwnedSettingField) field_model.Descriptor {
+        return field_model.forKey(switch (self) {
+            .font_family => .@"font-family",
+            .theme => .theme,
+            .command => .command,
+        }).?;
     }
 };
 
 const owned_setting_field_count = std.enums.values(OwnedSettingField).len;
+
+test "settings field model covers each Settings-owned Config key exactly once" {
+    inline for (field_model.descriptors) |spec| {
+        if (spec.nativeNames()) |names| {
+            try expectNativeFieldNames(names, spec.kind, spec.section);
+            if (names.form_label) |label| {
+                if (std.mem.indexOf(u8, label, "new terminals") != null) {
+                    try std.testing.expectEqual(field_model.ApplyPolicy.new_terminals, spec.apply);
+                }
+            }
+        }
+        inline for (spec.projections) |part| try expectNativeFieldNames(part.native, .boolean, spec.section);
+    }
+    comptime field_model.assertCoverage(editable_keys);
+}
+
+test "settings field model round trips every descriptor" {
+    try field_model.testRoundTrips(std.testing.allocator);
+}
+
+// Name contracts protect a future generated form from silently using palette
+// wording for UIA or the longer visible field captions. Providers stay intact.
+fn expectNativeFieldNames(names: field_model.NativeNames, kind: field_model.Kind, section: field_model.Section) !void {
+    var control_index: ?usize = null;
+    for (settings_control_specs, 0..) |spec, index| {
+        if (!std.mem.eql(u8, spec.name, names.accessible_name)) continue;
+        try std.testing.expect(control_index == null);
+        control_index = index;
+        const role: SettingsControlRole = switch (kind) {
+            .boolean, .blur => .check_box,
+            .choice => .combo_box,
+            else => .edit,
+        };
+        try std.testing.expectEqual(role, spec.role);
+    }
+    const index = control_index orelse return error.TestExpectedEqual;
+    var model_uses: usize = 0;
+    inline for (field_model.descriptors) |spec| {
+        if (spec.nativeNames()) |other| {
+            if (std.mem.eql(u8, other.accessible_name, names.accessible_name)) model_uses += 1;
+        }
+        for (spec.projections) |part| {
+            if (std.mem.eql(u8, part.native.accessible_name, names.accessible_name)) model_uses += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), model_uses);
+    var form_uses: usize = 0;
+    for (formItemsForSection(nativeSection(section))) |item| {
+        if (item.control_index != index) continue;
+        form_uses += 1;
+        if (names.form_label) |label| {
+            try std.testing.expectEqualStrings(label, settings_label_specs[item.label_index orelse return error.TestExpectedEqual]);
+        } else try std.testing.expect(item.label_index == null);
+        try std.testing.expectEqual(names.caption != null, item.checkbox);
+        if (names.caption) |caption| try std.testing.expectEqualStrings(caption, checkbox_captions[index].?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), form_uses);
+}
 
 /// The complete persistence allowlist. Effective config contains derived fields
 /// and expanded include/shader paths which the native form does not edit.
@@ -547,6 +485,10 @@ pub const editable_keys = .{
     Config.Key.@"accent-follow-system",
 };
 
+comptime {
+    field_model.assertCoverage(editable_keys);
+}
+
 /// Scalar EDIT controls whose raw text can temporarily be invalid and
 /// therefore cannot yet be represented by the typed settings transaction.
 const RawScalarField = enum {
@@ -558,11 +500,16 @@ const RawScalarField = enum {
 
     fn section(self: RawScalarField) Section {
         return switch (self) {
-            .scrollback_limit => .terminal,
-            .font_size, .background_opacity, .window_padding_x, .window_padding_y => .appearance,
+            inline else => |field| nativeSection(field_model.descriptor(@field(SettingField, @tagName(field))).section),
         };
     }
 };
+
+fn nativeSection(section: field_model.Section) Section {
+    return switch (section) {
+        inline else => |value| @field(Section, @tagName(value)),
+    };
+}
 
 const raw_scalar_field_count = std.enums.values(RawScalarField).len;
 
@@ -656,31 +603,7 @@ const StatusNote = enum {
 const nothing_to_save_text = "No changes to save.";
 const unsaved_changes_text = "You have unsaved changes.";
 
-pub const SettingValue = union(SettingField) {
-    scrollback_limit: @FieldType(Config, "scrollback-limit"),
-    font_size: @FieldType(Config, "font-size"),
-    background_opacity: @FieldType(Config, "background-opacity"),
-    window_padding_x: @FieldType(Config, "window-padding-x"),
-    window_padding_y: @FieldType(Config, "window-padding-y"),
-    trim_trailing_spaces: @FieldType(Config, "clipboard-trim-trailing-spaces"),
-    desktop_notifications: @FieldType(Config, "desktop-notifications"),
-    app_notify_clipboard: bool,
-    app_notify_config: bool,
-    confirm_close: @FieldType(Config, "confirm-close-surface"),
-    copy_on_select: @FieldType(Config, "copy-on-select"),
-    clipboard_read: @FieldType(Config, "clipboard-read"),
-    clipboard_write: @FieldType(Config, "clipboard-write"),
-    link_url: @FieldType(Config, "link-url"),
-    link_previews: @FieldType(Config, "link-previews"),
-    window_theme: @FieldType(Config, "window-theme"),
-    shell_integration: @FieldType(Config, "shell-integration"),
-    cursor_style: @FieldType(Config, "cursor-style"),
-    background_blur: @FieldType(Config, "background-blur"),
-    padding_balance: @FieldType(Config, "window-padding-balance"),
-    auto_update: @FieldType(Config, "auto-update"),
-    auto_update_channel: @FieldType(Config, "auto-update-channel"),
-    accent_follow_system: @FieldType(Config, "accent-follow-system"),
-};
+pub const SettingValue = field_model.SettingValue;
 
 fn settingValueEql(a: SettingValue, b: SettingValue) bool {
     return std.meta.eql(a, b);
@@ -719,7 +642,7 @@ pub fn paletteDescriptor(field: SettingField) palette_catalog.Descriptor {
         .item = .{
             .id = palette_catalog.stableStringId(.setting, key),
             .title = field.label(),
-            .subtitle = if (field == .background_blur or field == .link_previews) "Setting (not supported on Windows)" else "Setting",
+            .subtitle = field_model.descriptor(field).support.paletteSubtitle(),
             .keywords = field.paletteKeywords(),
         },
         .payload = .{ .setting = key },
@@ -739,78 +662,16 @@ pub fn paletteDescriptor(field: SettingField) palette_catalog.Descriptor {
 /// The status line reads this too: only a field with an effect other than
 /// `.none` can say "Previewing now", because the other previewed fields show
 /// nothing in the open terminals until they are saved.
-pub const PreviewEffect = enum { none, theme, opacity };
-
+pub const PreviewEffect = field_model.PreviewEffect;
 pub fn previewEffect(field: SettingField) PreviewEffect {
-    return switch (field) {
-        // `resolveTheme` reads `window-theme` and `accent-follow-system`,
-        // nothing else a preview edits.
-        .window_theme, .accent_follow_system => .theme,
-        // The layered alpha of the host window is the only thing that makes
-        // `background-opacity` visible on Win32.
-        .background_opacity => .opacity,
-        else => .none,
-    };
+    return field_model.descriptor(field).preview;
 }
 
 pub const ConflictResolution = SettingsTransaction.Resolution;
 pub const ApplyId = SettingsTransaction.ApplyId;
 
-fn settingValue(config: *const Config, field: SettingField) SettingValue {
-    return switch (field) {
-        .scrollback_limit => .{ .scrollback_limit = config.@"scrollback-limit" },
-        .font_size => .{ .font_size = config.@"font-size" },
-        .background_opacity => .{ .background_opacity = config.@"background-opacity" },
-        .window_padding_x => .{ .window_padding_x = config.@"window-padding-x" },
-        .window_padding_y => .{ .window_padding_y = config.@"window-padding-y" },
-        .trim_trailing_spaces => .{ .trim_trailing_spaces = config.@"clipboard-trim-trailing-spaces" },
-        .desktop_notifications => .{ .desktop_notifications = config.@"desktop-notifications" },
-        .app_notify_clipboard => .{ .app_notify_clipboard = config.@"app-notifications".@"clipboard-copy" },
-        .app_notify_config => .{ .app_notify_config = config.@"app-notifications".@"config-reload" },
-        .confirm_close => .{ .confirm_close = config.@"confirm-close-surface" },
-        .copy_on_select => .{ .copy_on_select = config.@"copy-on-select" },
-        .clipboard_read => .{ .clipboard_read = config.@"clipboard-read" },
-        .clipboard_write => .{ .clipboard_write = config.@"clipboard-write" },
-        .link_url => .{ .link_url = config.@"link-url" },
-        .link_previews => .{ .link_previews = config.@"link-previews" },
-        .window_theme => .{ .window_theme = config.@"window-theme" },
-        .shell_integration => .{ .shell_integration = config.@"shell-integration" },
-        .cursor_style => .{ .cursor_style = config.@"cursor-style" },
-        .background_blur => .{ .background_blur = config.@"background-blur" },
-        .padding_balance => .{ .padding_balance = config.@"window-padding-balance" },
-        .auto_update => .{ .auto_update = config.@"auto-update" },
-        .auto_update_channel => .{ .auto_update_channel = config.@"auto-update-channel" },
-        .accent_follow_system => .{ .accent_follow_system = config.@"accent-follow-system" },
-    };
-}
-
-fn setSettingValue(config: *Config, value: SettingValue) void {
-    switch (value) {
-        .scrollback_limit => |v| config.@"scrollback-limit" = v,
-        .font_size => |v| config.@"font-size" = v,
-        .background_opacity => |v| config.@"background-opacity" = v,
-        .window_padding_x => |v| config.@"window-padding-x" = v,
-        .window_padding_y => |v| config.@"window-padding-y" = v,
-        .trim_trailing_spaces => |v| config.@"clipboard-trim-trailing-spaces" = v,
-        .desktop_notifications => |v| config.@"desktop-notifications" = v,
-        .app_notify_clipboard => |v| config.@"app-notifications".@"clipboard-copy" = v,
-        .app_notify_config => |v| config.@"app-notifications".@"config-reload" = v,
-        .confirm_close => |v| config.@"confirm-close-surface" = v,
-        .copy_on_select => |v| config.@"copy-on-select" = v,
-        .clipboard_read => |v| config.@"clipboard-read" = v,
-        .clipboard_write => |v| config.@"clipboard-write" = v,
-        .link_url => |v| config.@"link-url" = v,
-        .link_previews => |v| config.@"link-previews" = v,
-        .window_theme => |v| config.@"window-theme" = v,
-        .shell_integration => |v| config.@"shell-integration" = v,
-        .cursor_style => |v| config.@"cursor-style" = v,
-        .background_blur => |v| config.@"background-blur" = v,
-        .padding_balance => |v| config.@"window-padding-balance" = v,
-        .auto_update => |v| config.@"auto-update" = v,
-        .auto_update_channel => |v| config.@"auto-update-channel" = v,
-        .accent_follow_system => |v| config.@"accent-follow-system" = v,
-    }
-}
+const settingValue = field_model.settingValue;
+pub const setSettingValue = field_model.setSettingValue;
 
 /// `text` without its backticks. The CLI help is written for Markdown; the
 /// Settings window shows plain text, where a backtick is just noise.
@@ -838,255 +699,45 @@ fn keybindingsHelpText() []const u8 {
             "  keybind = chain=goto_split:left";
 }
 
-// Dropdown items. The position of an item IS the contract with the matching
-// `...FromComboIndex` / `comboIndexFrom...` pair below, and with the order of
-// the config enum's values as the form has always stored them: the text only
-// ever changes how an option reads. What is written to the config file is
-// still the raw token (`false`, `block_hollow`, ...), never this text.
-
-const CursorStyle = @FieldType(Config, "cursor-style");
+// Dropdown items retain the native form's curated order and display wording;
+// typed mappings live in the field model. Config still stores raw tokens.
 const AutoUpdate = @typeInfo(@FieldType(Config, "auto-update")).optional.child;
 const ReleaseChannel = @typeInfo(@FieldType(Config, "auto-update-channel")).optional.child;
 
-/// `true` asks unless the cursor is at a shell prompt, which needs the shell
-/// integration to know; without it a terminal is never "at a prompt", so it asks.
-const confirm_close_labels = [_][]const u8{ "Never", "Unless at a shell prompt", "Always" };
-/// `true` and `clipboard` differ only in the selection clipboard, which Windows
-/// does not have: both copy to the one clipboard.
-const copy_on_select_labels = [_][]const u8{ "Off", "On", "On (same as On on Windows)" };
-const clipboard_access_labels = [_][]const u8{ "Ask each time", "Always allow", "Never allow" };
-const link_url_labels = [_][]const u8{ "On", "Off" };
-const link_previews_labels = [_][]const u8{ "All links", "Only links the program sets", "Off" };
-/// `auto` and `system` resolve to the same thing in the Win32 runtime (follow
-/// the Windows light/dark setting); the config keeps both values, so both stay
-/// in the list and say so. `ghostty` is the dark palette plus the config's
-/// title bar colors.
-const window_theme_labels = [_][]const u8{
-    "Match Windows (auto, default)",
-    "Match Windows (system)",
-    "Light",
-    "Dark",
-    "Dark, custom title bar colors",
-};
-/// `detect` is what starts the integration for PowerShell and cmd on Windows.
-const shell_integration_labels = [_][]const u8{
-    "Off",
-    "Automatic (includes PowerShell and cmd)",
-    "Bash",
-    "Elvish",
-    "Fish",
-    "Nushell",
-    "Zsh",
-};
-const cursor_style_labels = [_][]const u8{ "Bar", "Block", "Underline", "Hollow block" };
-const padding_balance_labels = [_][]const u8{ "Off", "On (top padding capped)", "On (equal on all sides)" };
-/// A missing `auto-update` behaves as `check`.
-const auto_update_labels = [_][]const u8{
-    "Default (check for updates)",
-    "Off",
-    "Check for updates",
-    "Check and download updates",
-};
-/// The Windows updater only checks `stable` by itself; `tip` is a manual channel.
-const auto_update_channel_labels = [_][]const u8{ "Default (matches this build)", "Stable", "Tip (no automatic checks)" };
-
-fn confirmCloseFromComboIndex(idx: LRESULT) ?Config.ConfirmCloseSurface {
-    return switch (idx) {
-        0 => .false,
-        1 => .true,
-        2 => .always,
-        else => null,
-    };
-}
-
-fn comboIndexFromConfirmClose(value: Config.ConfirmCloseSurface) usize {
-    return switch (value) {
-        .false => 0,
-        .true => 1,
-        .always => 2,
-    };
-}
-
-fn copyOnSelectFromComboIndex(idx: LRESULT) ?Config.CopyOnSelect {
-    return switch (idx) {
-        0 => .false,
-        1 => .true,
-        2 => .clipboard,
-        else => null,
-    };
-}
-
-fn comboIndexFromCopyOnSelect(value: Config.CopyOnSelect) usize {
-    return switch (value) {
-        .false => 0,
-        .true => 1,
-        .clipboard => 2,
-    };
-}
-
-fn clipboardAccessFromComboIndex(idx: LRESULT) ?Config.ClipboardAccess {
-    return switch (idx) {
-        0 => .ask,
-        1 => .allow,
-        2 => .deny,
-        else => null,
-    };
-}
-
-fn comboIndexFromClipboardAccess(value: Config.ClipboardAccess) usize {
-    return switch (value) {
-        .ask => 0,
-        .allow => 1,
-        .deny => 2,
-    };
-}
-
-fn linkUrlFromComboIndex(idx: LRESULT) ?bool {
-    return switch (idx) {
-        0 => true,
-        1 => false,
-        else => null,
-    };
-}
-
-fn comboIndexFromLinkUrl(value: bool) usize {
-    return if (value) 0 else 1;
-}
-
-fn linkPreviewsFromComboIndex(idx: LRESULT) ?Config.LinkPreviews {
-    return switch (idx) {
-        0 => .true,
-        1 => .osc8,
-        2 => .false,
-        else => null,
-    };
-}
-
-fn comboIndexFromLinkPreviews(value: Config.LinkPreviews) usize {
-    return switch (value) {
-        .true => 0,
-        .osc8 => 1,
-        .false => 2,
-    };
-}
-
-fn windowThemeFromComboIndex(idx: LRESULT) ?Config.WindowTheme {
-    return switch (idx) {
-        0 => .auto,
-        1 => .system,
-        2 => .light,
-        3 => .dark,
-        4 => .ghostty,
-        else => null,
-    };
-}
-
-fn comboIndexFromWindowTheme(value: Config.WindowTheme) usize {
-    return switch (value) {
-        .auto => 0,
-        .system => 1,
-        .light => 2,
-        .dark => 3,
-        .ghostty => 4,
-    };
-}
-
-fn shellIntegrationFromComboIndex(idx: LRESULT) ?Config.ShellIntegration {
-    return switch (idx) {
-        0 => .none,
-        1 => .detect,
-        2 => .bash,
-        3 => .elvish,
-        4 => .fish,
-        5 => .nushell,
-        6 => .zsh,
-        else => null,
-    };
-}
-
-fn comboIndexFromShellIntegration(value: Config.ShellIntegration) usize {
-    return switch (value) {
-        .none => 0,
-        .detect => 1,
-        .bash => 2,
-        .elvish => 3,
-        .fish => 4,
-        .nushell => 5,
-        .zsh => 6,
-    };
-}
-
-fn cursorStyleFromComboIndex(idx: LRESULT) ?CursorStyle {
-    return switch (idx) {
-        0 => .bar,
-        1 => .block,
-        2 => .underline,
-        3 => .block_hollow,
-        else => null,
-    };
-}
-
-fn comboIndexFromCursorStyle(value: CursorStyle) usize {
-    return switch (value) {
-        .bar => 0,
-        .block => 1,
-        .underline => 2,
-        .block_hollow => 3,
-    };
-}
-
-fn paddingBalanceFromComboIndex(idx: LRESULT) ?Config.WindowPaddingBalance {
-    return switch (idx) {
-        0 => .false,
-        1 => .true,
-        2 => .equal,
-        else => null,
-    };
-}
-
-fn comboIndexFromPaddingBalance(value: Config.WindowPaddingBalance) usize {
-    return switch (value) {
-        .false => 0,
-        .true => 1,
-        .equal => 2,
-    };
-}
-
-/// The inner optional is the setting (null is "default"); the outer one says
-/// the index is not an item at all.
-fn autoUpdateFromComboIndex(idx: LRESULT) ??AutoUpdate {
-    return switch (idx) {
-        0 => @as(?AutoUpdate, null),
-        1 => @as(?AutoUpdate, .off),
-        2 => @as(?AutoUpdate, .check),
-        3 => @as(?AutoUpdate, .download),
-        else => null,
-    };
-}
-
-fn comboIndexFromAutoUpdate(value: ?AutoUpdate) usize {
-    return if (value) |mode| switch (mode) {
-        .off => 1,
-        .check => 2,
-        .download => 3,
-    } else 0;
-}
-
-fn autoUpdateChannelFromComboIndex(idx: LRESULT) ??ReleaseChannel {
-    return switch (idx) {
-        0 => @as(?ReleaseChannel, null),
-        1 => @as(?ReleaseChannel, .stable),
-        2 => @as(?ReleaseChannel, .tip),
-        else => null,
-    };
-}
-
-fn comboIndexFromAutoUpdateChannel(value: ?ReleaseChannel) usize {
-    return if (value) |channel| switch (channel) {
-        .stable => 1,
-        .tip => 2,
-    } else 0;
-}
+// Typed option pairs keep the existing native combo order and wording.
+const confirm_close_labels = field_model.Combo(.confirm_close).labels;
+const confirmCloseFromComboIndex = field_model.Combo(.confirm_close).fromIndex;
+const comboIndexFromConfirmClose = field_model.Combo(.confirm_close).toIndex;
+const copy_on_select_labels = field_model.Combo(.copy_on_select).labels;
+const copyOnSelectFromComboIndex = field_model.Combo(.copy_on_select).fromIndex;
+const comboIndexFromCopyOnSelect = field_model.Combo(.copy_on_select).toIndex;
+const clipboard_access_labels = field_model.Combo(.clipboard_read).labels;
+const clipboardAccessFromComboIndex = field_model.Combo(.clipboard_read).fromIndex;
+const comboIndexFromClipboardAccess = field_model.Combo(.clipboard_read).toIndex;
+const link_url_labels = field_model.Combo(.link_url).labels;
+const linkUrlFromComboIndex = field_model.Combo(.link_url).fromIndex;
+const comboIndexFromLinkUrl = field_model.Combo(.link_url).toIndex;
+const link_previews_labels = field_model.Combo(.link_previews).labels;
+const linkPreviewsFromComboIndex = field_model.Combo(.link_previews).fromIndex;
+const comboIndexFromLinkPreviews = field_model.Combo(.link_previews).toIndex;
+const window_theme_labels = field_model.Combo(.window_theme).labels;
+const windowThemeFromComboIndex = field_model.Combo(.window_theme).fromIndex;
+const comboIndexFromWindowTheme = field_model.Combo(.window_theme).toIndex;
+const shell_integration_labels = field_model.Combo(.shell_integration).labels;
+const shellIntegrationFromComboIndex = field_model.Combo(.shell_integration).fromIndex;
+const comboIndexFromShellIntegration = field_model.Combo(.shell_integration).toIndex;
+const cursor_style_labels = field_model.Combo(.cursor_style).labels;
+const cursorStyleFromComboIndex = field_model.Combo(.cursor_style).fromIndex;
+const comboIndexFromCursorStyle = field_model.Combo(.cursor_style).toIndex;
+const padding_balance_labels = field_model.Combo(.padding_balance).labels;
+const paddingBalanceFromComboIndex = field_model.Combo(.padding_balance).fromIndex;
+const comboIndexFromPaddingBalance = field_model.Combo(.padding_balance).toIndex;
+const auto_update_labels = field_model.Combo(.auto_update).labels;
+const autoUpdateFromComboIndex = field_model.Combo(.auto_update).fromIndex;
+const comboIndexFromAutoUpdate = field_model.Combo(.auto_update).toIndex;
+const auto_update_channel_labels = field_model.Combo(.auto_update_channel).labels;
+const autoUpdateChannelFromComboIndex = field_model.Combo(.auto_update_channel).fromIndex;
+const comboIndexFromAutoUpdateChannel = field_model.Combo(.auto_update_channel).toIndex;
 
 // Win32 entry points used by this module. `win32/sys.zig` owns the shared
 // declarations; the few below it does not export stay local.
@@ -1230,7 +881,7 @@ const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 /// `scrollback-limit` is a byte budget per terminal, and 0 turns scrollback off
 /// (Config.zig, Screen.zig); there is no "unlimited". Only new terminals read it.
 /// The accessible name stays the prefix, "Scrollback limit".
-const scrollback_label = "Scrollback limit (bytes; 0 = off; new terminals only)";
+const scrollback_label = field_model.forKey(.@"scrollback-limit").?.native.?.form_label.?;
 
 const settings_label_specs = [_][]const u8{
     scrollback_label,
@@ -1262,11 +913,27 @@ const settings_text_count = 5 + settings_label_specs.len;
 /// Positions in `SettingsWindow.textHwnd`.
 const text_status_index = 2;
 const text_close_prompt_index = 3;
-const background_blur_label = "Background blur (not supported on Windows)";
-const link_previews_label = "Link preview popups (not supported on Windows)";
+const background_blur_label = field_model.descriptor(.background_blur).nativeNames().?.caption.?;
+const link_previews_label = field_model.descriptor(.link_previews).nativeNames().?.form_label.?;
 /// A file-level constant: `open` already spends its comptime branch quota on
 /// the other labels, and one more literal there fails the build.
-const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow Windows accent color");
+const accent_follow_caption = "Follow Windows accent color";
+const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral(accent_follow_caption);
+const trim_trailing_label = "Trim trailing spaces on copy";
+const desktop_notifications_label = "Allow terminal desktop notifications";
+const notify_clipboard_label = "Notify when clipboard copy completes";
+const notify_config_label = "Notify after config reload";
+// Indexed like settings_control_specs; only native checkbox controls have captions.
+const checkbox_captions = captions: {
+    var result: [settings_control_count]?[]const u8 = @splat(null);
+    result[3] = trim_trailing_label;
+    result[13] = background_blur_label;
+    result[20] = desktop_notifications_label;
+    result[21] = notify_clipboard_label;
+    result[22] = notify_config_label;
+    result[27] = accent_follow_caption;
+    break :captions result;
+};
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
 const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
     .{ .role = .edit, .name = "Scrollback limit" },
@@ -2098,6 +1765,10 @@ pub const SettingsWindow = struct {
             },
             .apply_requested, .persist_field => {},
         };
+    }
+
+    fn trackFieldEdit(self: *SettingsWindow, field: SettingField) void {
+        self.trackEdit(field, field_model.descriptor(field).preview_draft);
     }
 
     fn trackEdit(self: *SettingsWindow, field: SettingField, live_preview: bool) void {
@@ -3866,11 +3537,11 @@ pub const SettingsWindow = struct {
             return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit contains invalid text.");
         const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
         if (trimmed.len == 0) return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit is required.");
-        const parsed = std.fmt.parseInt(usize, trimmed, 10) catch
+        const parsed = field_model.parseScalar(.scrollback_limit, trimmed) catch
             return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit must be a non-negative whole number.");
         self.finishRawScalarEdit(.scrollback_limit);
         p.*.@"scrollback-limit" = parsed;
-        self.trackEdit(.scrollback_limit, false);
+        self.trackFieldEdit(.scrollback_limit);
     }
 
     fn displayScrollbackInEdit(self: *SettingsWindow) void {
@@ -3925,14 +3596,11 @@ pub const SettingsWindow = struct {
             return self.setRawScalarValidationError(.font_size, edit, "Font size contains invalid text.");
         const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
         if (trimmed.len == 0) return self.setRawScalarValidationError(.font_size, edit, "Font size is required.");
-        const parsed = std.fmt.parseFloat(f32, trimmed) catch
-            return self.setRawScalarValidationError(.font_size, edit, "Font size must be a number from 6 through 72.");
-        // Range-clamp: Ghostty Config default is 12 pt; our range is
-        // the same the GUI spinner catalogue will offer (6..72).
-        if (!std.math.isFinite(parsed) or parsed < 6.0 or parsed > 72.0) return self.setRawScalarValidationError(.font_size, edit, "Font size must be from 6 through 72 points.");
+        const parsed = field_model.parseScalar(.font_size, trimmed) catch |err|
+            return self.setRawScalarValidationError(.font_size, edit, field_model.scalarValidationMessage(.font_size, err == error.OutOfRange));
         self.finishRawScalarEdit(.font_size);
         p.*.@"font-size" = parsed;
-        self.trackEdit(.font_size, true);
+        self.trackFieldEdit(.font_size);
     }
 
     fn displayFontSizeInEdit(self: *SettingsWindow) void {
@@ -3994,12 +3662,11 @@ pub const SettingsWindow = struct {
             return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity contains invalid text.");
         const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
         if (trimmed.len == 0) return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity is required.");
-        const parsed = std.fmt.parseFloat(f64, trimmed) catch
-            return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity must be a number from 0 through 1.");
-        if (!std.math.isFinite(parsed) or parsed < 0.0 or parsed > 1.0) return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity must be from 0 through 1.");
+        const parsed = field_model.parseScalar(.background_opacity, trimmed) catch |err|
+            return self.setRawScalarValidationError(.background_opacity, edit, field_model.scalarValidationMessage(.background_opacity, err == error.OutOfRange));
         self.finishRawScalarEdit(.background_opacity);
         p.*.@"background-opacity" = parsed;
-        self.trackEdit(.background_opacity, true);
+        self.trackFieldEdit(.background_opacity);
     }
 
     fn displayBgOpacityInEdit(self: *SettingsWindow) void {
@@ -4065,22 +3732,22 @@ pub const SettingsWindow = struct {
                 .x => "Window padding X could not be read.",
                 .y => "Window padding Y could not be read.",
             });
-        const parsed = Config.WindowPadding.parseCLI(std.mem.trim(u8, text, " \t")) catch
-            return self.setRawScalarValidationError(raw_field, edit, switch (axis) {
-                .x => "Window padding X must be one number or a comma-separated pair.",
-                .y => "Window padding Y must be one number or a comma-separated pair.",
-            });
-        if (parsed.top_left > 200 or parsed.bottom_right > 200)
-            return self.setRawScalarValidationError(raw_field, edit, "Window padding must be from 0 through 200 logical pixels.");
+        const parsed = (switch (axis) {
+            .x => field_model.parseScalar(.window_padding_x, text),
+            .y => field_model.parseScalar(.window_padding_y, text),
+        }) catch |err| return self.setRawScalarValidationError(raw_field, edit, switch (axis) {
+            .x => field_model.scalarValidationMessage(.window_padding_x, err == error.OutOfRange),
+            .y => field_model.scalarValidationMessage(.window_padding_y, err == error.OutOfRange),
+        });
         self.finishRawScalarEdit(raw_field);
         switch (axis) {
             .x => {
                 p.*.@"window-padding-x" = parsed;
-                self.trackEdit(.window_padding_x, true);
+                self.trackFieldEdit(.window_padding_x);
             },
             .y => {
                 p.*.@"window-padding-y" = parsed;
-                self.trackEdit(.window_padding_y, true);
+                self.trackFieldEdit(.window_padding_y);
             },
         }
     }
@@ -4114,7 +3781,7 @@ pub const SettingsWindow = struct {
         const chk = self.chk_trim_trail orelse return;
         const state = sys.SendMessageW(chk, BM_GETCHECK, 0, 0);
         p.*.@"clipboard-trim-trailing-spaces" = (state == BST_CHECKED);
-        self.trackEdit(.trim_trailing_spaces, false);
+        self.trackFieldEdit(.trim_trailing_spaces);
     }
 
     fn displayTrimTrailInCheckbox(self: *SettingsWindow) void {
@@ -4135,7 +3802,7 @@ pub const SettingsWindow = struct {
         const p = &(self.pending orelse return);
         const chk = self.chk_desktop_notifications orelse return;
         p.*.@"desktop-notifications" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        self.trackEdit(.desktop_notifications, false);
+        self.trackFieldEdit(.desktop_notifications);
     }
 
     fn displayDesktopNotificationsInCheckbox(self: *SettingsWindow) void {
@@ -4162,11 +3829,11 @@ pub const SettingsWindow = struct {
         switch (field) {
             .clipboard => {
                 p.*.@"app-notifications".@"clipboard-copy" = enabled;
-                self.trackEdit(.app_notify_clipboard, false);
+                self.trackFieldEdit(.app_notify_clipboard);
             },
             .config => {
                 p.*.@"app-notifications".@"config-reload" = enabled;
-                self.trackEdit(.app_notify_config, false);
+                self.trackFieldEdit(.app_notify_config);
             },
         }
     }
@@ -4196,7 +3863,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"confirm-close-surface" = confirmCloseFromComboIndex(idx) orelse return;
-        self.trackEdit(.confirm_close, false);
+        self.trackFieldEdit(.confirm_close);
     }
 
     fn displayConfirmCloseInCombo(self: *SettingsWindow) void {
@@ -4214,7 +3881,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"copy-on-select" = copyOnSelectFromComboIndex(idx) orelse return;
-        self.trackEdit(.copy_on_select, false);
+        self.trackFieldEdit(.copy_on_select);
     }
 
     fn displayCopyOnSelectInCombo(self: *SettingsWindow) void {
@@ -4233,9 +3900,9 @@ pub const SettingsWindow = struct {
         if (idx < 0) return;
         @field(p.*, field_name) = clipboardAccessFromComboIndex(idx) orelse return;
         if (comptime std.mem.eql(u8, field_name, "clipboard-read")) {
-            self.trackEdit(.clipboard_read, false);
+            self.trackFieldEdit(.clipboard_read);
         } else if (comptime std.mem.eql(u8, field_name, "clipboard-write")) {
-            self.trackEdit(.clipboard_write, false);
+            self.trackFieldEdit(.clipboard_write);
         }
     }
 
@@ -4255,7 +3922,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"link-url" = linkUrlFromComboIndex(idx) orelse return;
-        self.trackEdit(.link_url, false);
+        self.trackFieldEdit(.link_url);
     }
 
     fn displayLinkUrlInCombo(self: *SettingsWindow) void {
@@ -4274,7 +3941,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"link-previews" = linkPreviewsFromComboIndex(idx) orelse return;
-        self.trackEdit(.link_previews, false);
+        self.trackFieldEdit(.link_previews);
     }
 
     fn displayLinkPreviewsInCombo(self: *SettingsWindow) void {
@@ -4293,7 +3960,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"window-theme" = windowThemeFromComboIndex(idx) orelse return;
-        self.trackEdit(.window_theme, true);
+        self.trackFieldEdit(.window_theme);
     }
 
     fn displayWindowThemeInCombo(self: *SettingsWindow) void {
@@ -4311,7 +3978,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"shell-integration" = shellIntegrationFromComboIndex(idx) orelse return;
-        self.trackEdit(.shell_integration, false);
+        self.trackFieldEdit(.shell_integration);
     }
 
     fn displayShellIntegInCombo(self: *SettingsWindow) void {
@@ -4329,7 +3996,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"cursor-style" = cursorStyleFromComboIndex(idx) orelse return;
-        self.trackEdit(.cursor_style, true);
+        self.trackFieldEdit(.cursor_style);
     }
 
     fn displayCursorStyleInCombo(self: *SettingsWindow) void {
@@ -4352,7 +4019,7 @@ pub const SettingsWindow = struct {
             p.*.@"background-blur",
             state == BST_CHECKED,
         );
-        self.trackEdit(.background_blur, true);
+        self.trackFieldEdit(.background_blur);
     }
 
     fn displayBgBlurInCheckbox(self: *SettingsWindow) void {
@@ -4374,7 +4041,7 @@ pub const SettingsWindow = struct {
         const p = &(self.pending orelse return);
         const chk = self.chk_accent_follow orelse return;
         p.*.@"accent-follow-system" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        self.trackEdit(.accent_follow_system, true);
+        self.trackFieldEdit(.accent_follow_system);
     }
 
     fn displayAccentFollowInCheckbox(self: *SettingsWindow) void {
@@ -4392,7 +4059,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"window-padding-balance" = paddingBalanceFromComboIndex(idx) orelse return;
-        self.trackEdit(.padding_balance, true);
+        self.trackFieldEdit(.padding_balance);
     }
 
     fn displayPadBalanceInCombo(self: *SettingsWindow) void {
@@ -4410,7 +4077,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"auto-update" = autoUpdateFromComboIndex(idx) orelse return;
-        self.trackEdit(.auto_update, false);
+        self.trackFieldEdit(.auto_update);
     }
 
     fn displayAutoUpdateInCombo(self: *SettingsWindow) void {
@@ -4428,7 +4095,7 @@ pub const SettingsWindow = struct {
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
         p.*.@"auto-update-channel" = autoUpdateChannelFromComboIndex(idx) orelse return;
-        self.trackEdit(.auto_update_channel, false);
+        self.trackFieldEdit(.auto_update_channel);
     }
 
     fn displayAutoUpdateChannelInCombo(self: *SettingsWindow) void {
@@ -4883,31 +4550,32 @@ pub const SettingsWindow = struct {
 
     /// The section and the native control that own `field`.
     fn settingDestination(self: *const SettingsWindow, field: SettingField) struct { section: Section, hwnd: ?HWND } {
-        return switch (field) {
-            .font_size => .{ .section = .appearance, .hwnd = self.edit_font_size },
-            .background_opacity => .{ .section = .appearance, .hwnd = self.edit_bg_opacity },
-            .window_padding_x => .{ .section = .appearance, .hwnd = self.edit_pad_x },
-            .window_padding_y => .{ .section = .appearance, .hwnd = self.edit_pad_y },
-            .window_theme => .{ .section = .appearance, .hwnd = self.combo_window_theme },
-            .cursor_style => .{ .section = .appearance, .hwnd = self.combo_cursor_style },
-            .background_blur => .{ .section = .appearance, .hwnd = self.chk_bg_blur },
-            .accent_follow_system => .{ .section = .appearance, .hwnd = self.chk_accent_follow },
-            .padding_balance => .{ .section = .appearance, .hwnd = self.combo_pad_balance },
-            .scrollback_limit => .{ .section = .terminal, .hwnd = self.edit_scrollback },
-            .trim_trailing_spaces => .{ .section = .terminal, .hwnd = self.chk_trim_trail },
-            .desktop_notifications => .{ .section = .privacy, .hwnd = self.chk_desktop_notifications },
-            .app_notify_clipboard => .{ .section = .privacy, .hwnd = self.chk_app_notify_clipboard },
-            .app_notify_config => .{ .section = .privacy, .hwnd = self.chk_app_notify_config },
-            .confirm_close => .{ .section = .terminal, .hwnd = self.combo_confirm_close },
-            .copy_on_select => .{ .section = .terminal, .hwnd = self.combo_copy_on_select },
-            .clipboard_read => .{ .section = .privacy, .hwnd = self.combo_clipboard_read },
-            .clipboard_write => .{ .section = .privacy, .hwnd = self.combo_clipboard_write },
-            .link_url => .{ .section = .privacy, .hwnd = self.combo_link_url },
-            .link_previews => .{ .section = .privacy, .hwnd = self.combo_link_previews },
-            .shell_integration => .{ .section = .shell, .hwnd = self.combo_shell_integ },
-            .auto_update => .{ .section = .updates, .hwnd = self.combo_auto_update },
-            .auto_update_channel => .{ .section = .updates, .hwnd = self.combo_auto_update_channel },
+        const hwnd = switch (field) {
+            .font_size => self.edit_font_size,
+            .background_opacity => self.edit_bg_opacity,
+            .window_padding_x => self.edit_pad_x,
+            .window_padding_y => self.edit_pad_y,
+            .window_theme => self.combo_window_theme,
+            .cursor_style => self.combo_cursor_style,
+            .background_blur => self.chk_bg_blur,
+            .accent_follow_system => self.chk_accent_follow,
+            .padding_balance => self.combo_pad_balance,
+            .scrollback_limit => self.edit_scrollback,
+            .trim_trailing_spaces => self.chk_trim_trail,
+            .desktop_notifications => self.chk_desktop_notifications,
+            .app_notify_clipboard => self.chk_app_notify_clipboard,
+            .app_notify_config => self.chk_app_notify_config,
+            .confirm_close => self.combo_confirm_close,
+            .copy_on_select => self.combo_copy_on_select,
+            .clipboard_read => self.combo_clipboard_read,
+            .clipboard_write => self.combo_clipboard_write,
+            .link_url => self.combo_link_url,
+            .link_previews => self.combo_link_previews,
+            .shell_integration => self.combo_shell_integ,
+            .auto_update => self.combo_auto_update,
+            .auto_update_channel => self.combo_auto_update_channel,
         };
+        return .{ .section = nativeSection(field_model.descriptor(field).section), .hwnd = hwnd };
     }
 
     /// Open settings at the exact native control that owns `field`.
@@ -5302,28 +4970,28 @@ pub const SettingsWindow = struct {
             form,
             self.handle.hinstance,
             CHK_TRIM_TRAIL,
-            std.unicode.utf8ToUtf16LeStringLiteral("Trim trailing spaces on copy"),
+            std.unicode.utf8ToUtf16LeStringLiteral(trim_trailing_label),
         );
 
         self.chk_desktop_notifications = makeCheckbox(
             form,
             self.handle.hinstance,
             CHK_DESKTOP_NOTIFICATIONS,
-            std.unicode.utf8ToUtf16LeStringLiteral("Allow terminal desktop notifications"),
+            std.unicode.utf8ToUtf16LeStringLiteral(desktop_notifications_label),
         );
 
         self.chk_app_notify_clipboard = makeCheckbox(
             form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CLIPBOARD,
-            std.unicode.utf8ToUtf16LeStringLiteral("Notify when clipboard copy completes"),
+            std.unicode.utf8ToUtf16LeStringLiteral(notify_clipboard_label),
         );
 
         self.chk_app_notify_config = makeCheckbox(
             form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CONFIG,
-            std.unicode.utf8ToUtf16LeStringLiteral("Notify after config reload"),
+            std.unicode.utf8ToUtf16LeStringLiteral(notify_config_label),
         );
 
         // Comboboxes for enum fields.
@@ -5374,8 +5042,6 @@ pub const SettingsWindow = struct {
             settings_combo_popup_height,
             &link_previews_labels,
         );
-        // The core emits hover actions, but Windows has no preview tooltip.
-        if (self.combo_link_previews) |combo| _ = EnableWindow(combo, 0);
 
         self.combo_window_theme = makeCombo(
             form,
@@ -5417,7 +5083,6 @@ pub const SettingsWindow = struct {
             CHK_BG_BLUR,
             std.unicode.utf8ToUtf16LeStringLiteral(background_blur_label),
         );
-        if (self.chk_bg_blur) |chk| _ = sys.EnableWindow(chk, 0);
 
         self.combo_pad_balance = makeCombo(
             form,
@@ -5442,6 +5107,16 @@ pub const SettingsWindow = struct {
             settings_combo_popup_height,
             &auto_update_channel_labels,
         );
+
+        // Support is descriptor data; retain values while disabling unsupported
+        // editors before tab order and accessibility providers are initialized.
+        inline for (field_model.descriptors) |spec| {
+            if (spec.support != .available) {
+                if (spec.field) |field| {
+                    if (self.settingDestination(field).hwnd) |control| _ = sys.EnableWindow(control, 0);
+                }
+            }
+        }
 
         // Painted field labels keep the native dark visual treatment, while
         // MSAA annotations give the existing EDIT/COMBO HWNDs stable names
@@ -9926,6 +9601,28 @@ test "settings background blur is shown but cannot be changed" {
     }.body);
 }
 
+test "settings descriptor support matches every native editor enabled state" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            inline for (field_model.descriptors) |spec| {
+                const expected_enabled = spec.support == .available;
+                if (spec.field) |field| {
+                    try std.testing.expectEqual(expected_enabled, sys.IsWindowEnabled(settings.settingDestination(field).hwnd.?) != 0);
+                }
+                inline for (spec.projections) |part| {
+                    try std.testing.expectEqual(expected_enabled, sys.IsWindowEnabled(settings.settingDestination(part.field).hwnd.?) != 0);
+                }
+            }
+            for ([_]?HWND{ settings.edit_font_family, settings.edit_theme, settings.edit_command }) |control| {
+                try std.testing.expect(sys.IsWindowEnabled(control.?) != 0);
+            }
+        }
+    }.body);
+}
+
 test "CHROME unsupported settings are disabled and UIA names explain why" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
@@ -11371,32 +11068,8 @@ fn setEditText(edit: HWND, text: []const u8, suppress: *bool) void {
     suppress.* = false;
 }
 
-fn parseFontFamilyEditText(alloc: std.mem.Allocator, text: []const u8) !Config.RepeatableString {
-    const trimmed = std.mem.trim(u8, text, " \t");
-    if (trimmed.len == 0) return .{};
-
-    var next: Config.RepeatableString = .{};
-    var parts = std.mem.splitScalar(u8, trimmed, ',');
-    while (parts.next()) |part| {
-        const family = std.mem.trim(u8, part, " \t");
-        if (family.len == 0) continue;
-        try next.parseCLI(alloc, family);
-    }
-    return next;
-}
-
-fn writeCommandForEdit(writer: *std.Io.Writer, value: Config.Command) !void {
-    switch (value) {
-        .shell => |v| try writer.writeAll(v),
-        .direct => |v| {
-            try writer.writeAll("direct:");
-            for (v, 0..) |arg, i| {
-                if (i != 0) try writer.writeByte(' ');
-                try Config.Command.writeDirectArg(writer, arg);
-            }
-        },
-    }
-}
+const parseFontFamilyEditText = field_model.parseFontFamilyEditText;
+const writeCommandForEdit = field_model.writeCommandForEdit;
 
 fn commandEql(a: Config.Command, b: Config.Command) bool {
     return switch (a) {
@@ -11447,19 +11120,9 @@ fn copyOwnedSetting(target: *Config, source: *const Config, field: OwnedSettingF
 
 fn writeOwnedSettingValue(writer: *std.Io.Writer, config: *const Config, field: OwnedSettingField) !void {
     switch (field) {
-        .font_family => {
-            if (config.@"font-family".list.items.len == 0) return writer.writeAll("(default)");
-            for (config.@"font-family".list.items, 0..) |family, i| {
-                if (i != 0) try writer.writeAll(", ");
-                try writer.writeAll(family);
-            }
-        },
-        .theme => if (config.theme) |theme| {
-            try theme.formatValue(writer);
-        } else try writer.writeAll("(default)"),
-        .command => if (config.command) |command| {
-            try writeCommandForEdit(writer, command);
-        } else try writer.writeAll("(automatic)"),
+        .font_family => try field_model.writeOwnedSettingValue(.@"font-family", writer, config),
+        .theme => try field_model.writeOwnedSettingValue(.theme, writer, config),
+        .command => try field_model.writeOwnedSettingValue(.command, writer, config),
     }
 }
 
@@ -11471,47 +11134,7 @@ const advanced_problems_bytes = 1000;
 const advanced_target_bytes = 243;
 const no_pending_changes_text = "No changes waiting to be saved.";
 
-fn writePaddingValue(writer: *std.Io.Writer, padding: @FieldType(Config, "window-padding-x")) !void {
-    if (padding.top_left == padding.bottom_right) {
-        try writer.print("{d}", .{padding.top_left});
-    } else {
-        try writer.print("{d},{d}", .{ padding.top_left, padding.bottom_right });
-    }
-}
-
-fn writeOnOff(writer: *std.Io.Writer, on: bool) !void {
-    try writer.writeAll(if (on) "On" else "Off");
-}
-
-/// A setting's value the way the form shows it: the dropdown's text for a
-/// dropdown, "on" and "off" for a checkbox, the number for a number. Never the
-/// Zig debug rendering of the transaction's union.
-fn writeSettingValue(writer: *std.Io.Writer, value: SettingValue) !void {
-    switch (value) {
-        .scrollback_limit => |v| try writer.print("{d}", .{v}),
-        .font_size => |v| try writer.print("{d} pt", .{v}),
-        .background_opacity => |v| try writer.print("{d}", .{v}),
-        .window_padding_x, .window_padding_y => |v| try writePaddingValue(writer, v),
-        .trim_trailing_spaces,
-        .desktop_notifications,
-        .app_notify_clipboard,
-        .app_notify_config,
-        .accent_follow_system,
-        => |v| try writeOnOff(writer, v),
-        .confirm_close => |v| try writer.writeAll(confirm_close_labels[comboIndexFromConfirmClose(v)]),
-        .copy_on_select => |v| try writer.writeAll(copy_on_select_labels[comboIndexFromCopyOnSelect(v)]),
-        .clipboard_read, .clipboard_write => |v| try writer.writeAll(clipboard_access_labels[comboIndexFromClipboardAccess(v)]),
-        .link_url => |v| try writer.writeAll(link_url_labels[comboIndexFromLinkUrl(v)]),
-        .link_previews => |v| try writer.writeAll(link_previews_labels[comboIndexFromLinkPreviews(v)]),
-        .window_theme => |v| try writer.writeAll(window_theme_labels[comboIndexFromWindowTheme(v)]),
-        .shell_integration => |v| try writer.writeAll(shell_integration_labels[comboIndexFromShellIntegration(v)]),
-        .cursor_style => |v| try writer.writeAll(cursor_style_labels[comboIndexFromCursorStyle(v)]),
-        .background_blur => |v| try writeOnOff(writer, v.win32BlurRequested()),
-        .padding_balance => |v| try writer.writeAll(padding_balance_labels[comboIndexFromPaddingBalance(v)]),
-        .auto_update => |v| try writer.writeAll(auto_update_labels[comboIndexFromAutoUpdate(v)]),
-        .auto_update_channel => |v| try writer.writeAll(auto_update_channel_labels[comboIndexFromAutoUpdateChannel(v)]),
-    }
-}
+const writeSettingValue = field_model.writeSettingValue;
 
 /// One line of the "waiting to be saved" list: `Cursor style: Block -> Bar`.
 fn writeSettingDiffLine(writer: *std.Io.Writer, field: SettingField, baseline: SettingValue, draft: SettingValue) !void {
