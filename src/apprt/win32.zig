@@ -11253,8 +11253,71 @@ pub const App = struct {
             inline else => |value| value,
         }, volume);
         if (bell.flash) if (hwnd) |h| win32_bell.flashTaskbar(h);
-        if (bell.announce) if (alerted) |s| s.announceBell();
+        if (bell.announce) if (surface) |s| s.announceBell();
         if (bell.glyph) if (alerted) |s| s.setBellRinging(true);
+    }
+
+    test "app bell announces through its primary terminal without marking it" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+
+        const accessibility = try win32_terminal_accessibility.TerminalAccessibilitySession.create(
+            std.testing.allocator,
+            .{
+                .ctx = &surface,
+                .hwnd = terminalAccessibilityHwnd,
+                .name = terminalAccessibilityName,
+                .focused = terminalAccessibilityFocused,
+                .capture = terminalAccessibilityCapture,
+                .defer_provider_release = terminalAccessibilityDeferProviderRelease,
+            },
+            0,
+            0,
+        );
+        defer accessibility.deinit();
+        surface.terminal_accessibility = accessibility;
+        defer surface.terminal_accessibility = null;
+
+        // No HWND or CoreSurface is needed: app bells use app configuration,
+        // and the test event sink counts notifications without invoking UIA.
+        app.config.@"bell-features" = .{ .attention = false, .title = true };
+        win32_uia.events.testing_bells = 0;
+        app.ringBell(.app);
+        try std.testing.expectEqual(@as(usize, 0), win32_uia.events.testing_bells);
+
+        const provider = try win32_uia.TerminalProvider.create(std.testing.allocator, @ptrFromInt(0x1), .{
+            .ctx = &surface,
+            .name = terminalAccessibilityName,
+            .focused = terminalAccessibilityFocused,
+            .value = struct {
+                fn value(_: *anyopaque, _: Allocator) ![]u8 {
+                    unreachable; // Bell dispatch must not query terminal text.
+                }
+            }.value,
+        });
+        defer _ = win32_uia.TerminalProvider.Release(&provider.base);
+        accessibility.provider = provider;
+        defer accessibility.provider = null;
+        app.ringBell(.app);
+        try std.testing.expectEqual(@as(usize, 1), win32_uia.events.testing_bells);
+        try std.testing.expect(!surface.bell_ringing);
+
+        app.config.@"bell-features" = .{ .attention = false, .title = false };
+        app.ringBell(.app);
+        try std.testing.expectEqual(@as(usize, 1), win32_uia.events.testing_bells);
+        try std.testing.expect(!surface.bell_ringing);
     }
 
     fn showDesktopNotificationWithLaunch(
