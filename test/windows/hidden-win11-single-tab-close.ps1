@@ -237,6 +237,8 @@ if (-not $Driver) {
     $clipBefore = [Ds]::GetClipboardSequenceNumber()
     if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
     [void](New-Item -ItemType Directory -Path $Run)
+    # Keep arbitrary quotes and backslashes out of the driver's command line.
+    [IO.File]::WriteAllText((Join-Path $Run 'extra-config.txt'), $ExtraConfig)
     Copy-Portable $Bin (Join-Path $Run 'source\bin')
     foreach ($name in @('localappdata','appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
     $desktopName = 'noctty-tabx-' + [guid]::NewGuid().ToString('N')
@@ -248,7 +250,7 @@ if (-not $Driver) {
         $job=[Ds]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Scenario {5} -ExtraConfig "{6}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName,$Scenario,$ExtraConfig
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Scenario {5} -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName,$Scenario
         $pi=[Ds]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -276,6 +278,7 @@ if (-not $Driver) {
 }
 
 # This branch executes only on the newly created desktop; children inherit it.
+$ExtraConfig = [IO.File]::ReadAllText((Join-Path $Run 'extra-config.txt'))
 [void][Ds]::SetThreadDpiAwarenessContext([IntPtr](-4))
 $script:checks=[Collections.Generic.List[object]]::new()
 $script:samples=[Collections.Generic.List[object]]::new()
