@@ -35,9 +35,11 @@ function ConvertFrom-ZigTestLines {
     $tests = [System.Collections.Generic.List[object]]::new()
     $open = $null
     $lastEnd = 0.0
+    $lastSeen = 0.0
     foreach ($line in $Lines) {
         $text = [string] $line.Text
         $seconds = [double] $line.Seconds
+        $lastSeen = $seconds
         $result = $null
         if ($text -match '^(\d+)/(\d+) (.+?)\.\.\.(.*)$') {
             if ($null -ne $open) {
@@ -60,7 +62,8 @@ function ConvertFrom-ZigTestLines {
         }
     }
     if ($null -ne $open) {
-        $tests.Add([pscustomobject]@{ Name = $open; Seconds = 0.0; Result = 'incomplete' })
+        # The log ended inside a test: charge it the time up to the last line.
+        $tests.Add([pscustomobject]@{ Name = $open; Seconds = [math]::Round($lastSeen - $lastEnd, 3); Result = 'incomplete' })
     }
     return $tests.ToArray()
 }

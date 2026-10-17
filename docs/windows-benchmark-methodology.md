@@ -82,7 +82,8 @@ other jobs, so its two minutes of ReleaseFast compile no longer queue behind
 the contract checks. Because the floors only catch a catastrophe, the nightly
 `Test` run also starts a report-only `bench-trend` job
 (`scripts/ci-bench-trend.ps1`): the same four workloads and the palette
-benchmark with nine runs each and no floors, the medians in the job summary and
+benchmark (nine runs per VT workload, and the palette benchmark's 5,000
+keystrokes in one invocation) with no floors, the medians in the job summary and
 in a `bench-trend-<run id>` artifact kept 90 days, and the change since the
 previous night's artifact. The runner pool is bimodal (about 2x between fast
 and slow machines), so one night's change means little; read it over weeks.

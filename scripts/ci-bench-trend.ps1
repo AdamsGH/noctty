@@ -25,9 +25,10 @@ param(
 
 # The artifact of the newest earlier nightly. Only scheduled runs of test.yml
 # count (they run on the default branch), so a manual run on a work branch never
-# becomes the baseline, and the lookup goes through runs rather than the
-# repository's artifact list, which pages at 100 and would lose the baseline
-# once enough other artifacts exist. $Api takes an API path and returns the
+# becomes the baseline. The lookup goes through runs rather than the repository's
+# artifact list, which pages at 100 and would lose the baseline once enough other
+# artifacts exist, and asks for 100 runs, more than the 90 days an artifact
+# lives, so a run of nights without a trend artifact does not hide an older one. $Api takes an API path and returns the
 # parsed JSON.
 function Get-PreviousTrendArtifact {
     param(
@@ -36,7 +37,7 @@ function Get-PreviousTrendArtifact {
         [scriptblock] $Api = { param($Path) gh api $Path | ConvertFrom-Json }
     )
 
-    $listing = & $Api "repos/$Repository/actions/workflows/test.yml/runs?event=schedule&status=completed&per_page=10"
+    $listing = & $Api "repos/$Repository/actions/workflows/test.yml/runs?event=schedule&status=completed&per_page=100"
     foreach ($run in @($listing.workflow_runs)) {
         if ([string] $run.id -eq $CurrentRunId) { continue }
         $artifacts = & $Api "repos/$Repository/actions/runs/$($run.id)/artifacts?per_page=100"
@@ -82,7 +83,8 @@ $report = [ordered]@{
     commit = $env:GITHUB_SHA
     run_id = $env:GITHUB_RUN_ID
     runner_image = $env:ImageVersion
-    runs_per_workload = $Runs
+    vt_runs_per_workload = $Runs
+    palette_keystrokes = 5000
     metrics = $metrics
 }
 $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'bench-trend.json') -Encoding utf8

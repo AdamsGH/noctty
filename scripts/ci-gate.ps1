@@ -17,7 +17,7 @@ job's name, so a rule written against that name keeps its meaning.
 #>
 [CmdletBinding()]
 param(
-    [string] $NeedsJson,
+    [string] $NeedsJson = $env:NEEDS_JSON,
     [string[]] $Expect,
     [switch] $LibraryOnly
 )
@@ -66,12 +66,16 @@ if ($LibraryOnly) { return }
 
 $ErrorActionPreference = 'Stop'
 $needs = $NeedsJson | ConvertFrom-Json
+# `pwsh -File x.ps1 -Expect a,b` hands a string[] parameter the one string 'a,b'.
+$Expect = @($Expect | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $problems = Get-CiGateProblems -Needs $needs -Expect $Expect
 foreach ($job in $needs.PSObject.Properties) {
     Write-Host ('{0,-24} {1}' -f $job.Name, $job.Value.result)
 }
 if ($problems.Count -gt 0) {
-    $problems | ForEach-Object { Write-Error $_ }
+    # Not Write-Error: under $ErrorActionPreference = 'Stop' the first one would
+    # end the script and hide the rest. ::error:: is a workflow annotation.
+    $problems | ForEach-Object { Write-Host "::error title=CI gate::$_" }
     exit 1
 }
 Write-Host 'Every needed job succeeded and every skipped job was not needed.' -ForegroundColor Green
