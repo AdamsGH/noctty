@@ -102,6 +102,23 @@ namespace Set91
         public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y,
             int width, int height, uint flags);
         [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+        [StructLayout(LayoutKind.Sequential)]
+        struct LastInput { public uint Size, Tick; }
+        [DllImport("user32.dll", SetLastError = true)] static extern bool GetLastInputInfo(ref LastInput input);
+        [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
+        public sealed class InputState
+        {
+            public ulong TickCount;
+            public uint LastInputTick, IdleMilliseconds;
+        }
+        public static InputState ReadInput()
+        {
+            var input = new LastInput { Size = (uint)Marshal.SizeOf(typeof(LastInput)) };
+            if (!GetLastInputInfo(ref input)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            ulong now = GetTickCount64();
+            return new InputState { TickCount = now, LastInputTick = input.Tick,
+                IdleMilliseconds = unchecked((uint)now - input.Tick) };
+        }
         [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
         [DllImport("user32.dll", SetLastError = true)]
         static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, IntPtr w, IntPtr l,
@@ -331,7 +348,7 @@ function Get-GuardSnapshot {
             [ordered]@{ name = $_.Name; bytes = $_.Length; mtime = $_.LastWriteTimeUtc.Ticks
                 sha256 = (Get-FileHash -LiteralPath $_.FullName).Hash }
         })
-    return [ordered]@{ clipboard = [Set91.Native]::GetClipboardSequenceNumber(); files = @($files)
+    return [ordered]@{ clipboard = [Set91.Native]::GetClipboardSequenceNumber(); input = [Set91.Native]::ReadInput(); files = @($files)
         destinations = $destinations }
 }
 
@@ -404,13 +421,18 @@ if (-not $WorkerDesktop) {
         $newDestinations = @($after.destinations | Where-Object { $_.name -notin $before.destinations.name })
         $realBefore = @($before.destinations | Where-Object name -eq 'c2214d6ebc43ff3f.customDestinations-ms')
         $realAfter = @($after.destinations | Where-Object name -eq 'c2214d6ebc43ff3f.customDestinations-ms')
-        $guardPass = $before.clipboard -eq $after.clipboard -and $newDestinations.Count -eq 0 -and
+        $inputDuringBatch = [uint64]$after.input.IdleMilliseconds -le ([uint64]$after.input.TickCount - [uint64]$before.input.TickCount)
+        $clipboardChanged = $before.clipboard -ne $after.clipboard
+        $clipboardPass = -not $clipboardChanged -or $inputDuringBatch
+        $guardPass = $clipboardPass -and $newDestinations.Count -eq 0 -and
             ($before.files | ConvertTo-Json -Depth 8 -Compress) -ceq ($after.files | ConvertTo-Json -Depth 8 -Compress) -and
             ($realBefore | ConvertTo-Json -Depth 8 -Compress) -ceq ($realAfter | ConvertTo-Json -Depth 8 -Compress)
         Write-Json (Join-Path $OutputDirectory 'summary.json') ([ordered]@{
             pass = ($null -eq $failure -and $workerCode -eq 0 -and $guardPass)
             workerExit = $workerCode; guardPass = $guardPass; error = $failure
             clipboardBefore = $before.clipboard; clipboardAfter = $after.clipboard
+            inputBefore = $before.input; inputAfter = $after.input; inputDuringBatch = $inputDuringBatch
+            clipboardAttribution = $(if (!$clipboardChanged) { 'unchanged' } elseif ($inputDuringBatch) { 'unattributed maintainer activity' } else { 'changed during a batch with no input' })
             executableSha256 = $ExpectedExeSha256
             newDestinations = $newDestinations
         })
@@ -431,6 +453,21 @@ Assert-Contract ($env:APPDATA -eq (Join-Path $OutputDirectory 'roam')) 'Worker A
 $fixture = Split-Path -Parent $PortableExe
 $config = Join-Path $fixture 'config.ghostty'
 $clip = [Set91.Native]::GetClipboardSequenceNumber()
+$batchInput = [Set91.Native]::ReadInput()
+$clipObserved = $clip
+function Assert-ClipboardGuard {
+    $sequence = [Set91.Native]::GetClipboardSequenceNumber()
+    if ($sequence -eq $clip) { return }
+    $inputNow = [Set91.Native]::ReadInput()
+    $active = [uint64]$inputNow.IdleMilliseconds -le ([uint64]$inputNow.TickCount - [uint64]$batchInput.TickCount)
+    Assert-Contract $active 'Clipboard changed during a batch with no input; stop launches and report.'
+    if ($sequence -ne $script:clipObserved) {
+        [ordered]@{ utc = [DateTimeOffset]::UtcNow.ToString('o'); before = $script:clipObserved; after = $sequence
+            inputBefore = $batchInput; inputNow = $inputNow; attribution = 'unattributed maintainer activity' } |
+            ConvertTo-Json -Depth 5 -Compress | Add-Content (Join-Path $OutputDirectory 'clipboard-activity.jsonl')
+        $script:clipObserved = $sequence
+    }
+}
 $process = $null
 $settings = [IntPtr]::Zero
 $hostWindow = [IntPtr]::Zero
@@ -458,7 +495,7 @@ $cases = @(
     @(207, 421, 'ComboBox', 'Auto-update channel', 'auto-update-channel')
 )
 function Start-Fixture {
-    Assert-Contract ([Set91.Native]::GetClipboardSequenceNumber() -eq $clip) 'Clipboard changed; refusing another launch.'
+    Assert-ClipboardGuard
     $class = 'noctty-test-set91-' + [guid]::NewGuid().ToString('N')
     $script:process = [Set91.Native]::Launch($PortableExe, @('--single-instance=false', "--class=$class"),
         $WorkerDesktop, $fixture, [IntPtr]::Zero)
@@ -609,7 +646,7 @@ try {
             $results.Add($record)
             Write-Json (Join-Path $OutputDirectory 'cases.json') @($results.ToArray())
         }
-        Assert-Contract ([Set91.Native]::GetClipboardSequenceNumber() -eq $clip) 'Clipboard changed; stop batch.'
+        Assert-ClipboardGuard
         Assert-Contract (-not $cleanupFailed) 'Cleanup failed; stop batch and inspect the retained fixture.'
     }
     }
