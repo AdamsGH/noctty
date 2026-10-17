@@ -386,7 +386,3 @@ test "fontconfig" {
     defer face.deinit();
     try testing.expect(face.glyphIndex(' ') != null);
 }
-
-test "coretext" {
-    return error.SkipZigTest;
-}

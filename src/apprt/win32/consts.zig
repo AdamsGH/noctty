@@ -482,29 +482,6 @@ pub const TOKEN_QUERY = 0x0008;
 pub const TokenUser = 1;
 pub const TokenIntegrityLevel = 25;
 
-/// Least privilege that still permits `OpenProcessToken` on another
-/// process, used to authenticate the IPC pipe server. Deliberately NOT
-/// `PROCESS_QUERY_INFORMATION`, which additionally grants access this check
-/// has no use for.
-pub const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-
-/// Security quality-of-service flags for `CreateFileW` on a named pipe.
-///
-/// A named-pipe server impersonates at `SecurityImpersonation` BY DEFAULT.
-/// Passing `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` lets the server
-/// learn who we are but not act as us: `ImpersonateNamedPipeClient`'s
-/// documented rule is that impersonation is permitted when "the requested
-/// impersonation level of the token is less than SecurityImpersonation, such
-/// as SecurityIdentification" -- the resulting token can be queried but not
-/// used to open objects on our behalf.
-pub const SECURITY_SQOS_PRESENT = 0x00100000;
-pub const SECURITY_IDENTIFICATION = 0x00010000;
-
-/// Relative identifier of the medium mandatory integrity level
-/// (`S-1-16-8192`). Windows treats an object with no mandatory label as
-/// medium integrity, so a label ACE is only worth adding above this.
-pub const SECURITY_MANDATORY_MEDIUM_RID = 0x2000;
-
 /// `S-1-16-4096`. The lowest level any interactive or service token
 /// carries, used only as a sanity floor in tests.
 pub const SECURITY_MANDATORY_LOW_RID = 0x1000;

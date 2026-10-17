@@ -521,10 +521,6 @@ pub const Theme = struct {
     metrics: ThemeMetrics = .{},
     motion: ThemeMotion = .{},
     chrome_type: ChromeType = .{},
-
-    pub fn fromColors(colors: ThemeColors) Theme {
-        return .{ .colors = colors };
-    }
 };
 
 // ── Theme palettes ──────────────────────────────────────────────────────

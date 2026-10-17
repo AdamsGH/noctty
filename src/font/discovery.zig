@@ -898,18 +898,6 @@ test "fontconfig codepoint" {
     try testing.expect(face.hasCodepoint('B', null));
 }
 
-test "coretext" {
-    return error.SkipZigTest;
-}
-
-test "coretext codepoint" {
-    return error.SkipZigTest;
-}
-
-test "coretext sorting" {
-    return error.SkipZigTest;
-}
-
 test {
     // Include the Windows discovery tests. Its pure helper tests run on
     // all hosts; the end-to-end tests skip themselves off-Windows.
