@@ -1054,9 +1054,9 @@ pub fn pathToWsl(alloc: Allocator, path: []const u8) !?[]const u8 {
     return try buf.toOwnedSlice(alloc);
 }
 
-/// What `defaultCommandWithHost` asks of the machine. Both functions return
-/// an owned path of a shell that can be started, or null, and fail only when
-/// memory runs out: a filesystem error is "not there", never a failed config.
+/// Machine lookups return owned paths or null, and fail only on allocation.
+/// Discovery requires guarded metadata; the final cmd fallback uses the system
+/// path even when that metadata is unavailable, avoiding a current-dir search.
 const DefaultShellHost = struct {
     /// `pwsh.exe` on the process's `PATH`.
     fn findPwsh(alloc: Allocator) !?[]u8 {
@@ -1067,6 +1067,13 @@ const DefaultShellHost = struct {
     /// taken from there, not from `PATH`, so a `powershell.exe` or `cmd.exe`
     /// placed earlier on `PATH` does not become the default shell.
     fn systemShell(alloc: Allocator, relative: []const u8) !?[]u8 {
+        const path = (try systemPath(alloc, relative)) orelse return null;
+        if (isLaunchableFile(path)) return path;
+        alloc.free(path);
+        return null;
+    }
+
+    fn systemPath(alloc: Allocator, relative: []const u8) !?[]u8 {
         if (builtin.os.tag != .windows) return null;
         var buf: [windows.MAX_PATH:0]u16 = undefined;
         const len = windows.kernel32.GetSystemDirectoryW(&buf, buf.len);
@@ -1076,10 +1083,7 @@ const DefaultShellHost = struct {
             else => return null,
         };
         defer alloc.free(dir);
-        const path = try std.fs.path.join(alloc, &.{ dir, relative });
-        if (isLaunchableFile(path)) return path;
-        alloc.free(path);
-        return null;
+        return try std.fs.path.join(alloc, &.{ dir, relative });
     }
 };
 
@@ -1100,10 +1104,10 @@ fn defaultCommandWithHost(alloc: Allocator, comptime Host: type) !Command {
 fn commandPromptWithHost(alloc: Allocator, comptime Host: type, switches: []const []const u8) !Command {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    const found = try Host.systemShell(alloc, "cmd.exe");
+    const found = (try Host.systemShell(alloc, "cmd.exe")) orelse
+        try Host.systemPath(alloc, "cmd.exe");
     defer if (found) |path| alloc.free(path);
-    // Windows without its own cmd.exe cannot start anything anyway; the bare
-    // name is what the launch path resolves and reports.
+    // Only an unavailable system directory leaves a bare-name fallback.
     try argv.append(alloc, found orelse "cmd.exe");
     try argv.appendSlice(alloc, switches);
     return try directCommand(alloc, argv.items);
@@ -2058,6 +2062,10 @@ fn FakeDefaultShellHost(
             }
             return null;
         }
+
+        fn systemPath(_: Allocator, _: []const u8) !?[]u8 {
+            return null;
+        }
     };
 }
 
@@ -2085,6 +2093,27 @@ test "default command prefers pwsh, then Windows PowerShell, then cmd" {
 
 test "default command falls back to the bare cmd.exe when the system directory has no shell" {
     try expectDefaultShell("cmd.exe", try defaultCommandWithHost(std.testing.allocator, FakeDefaultShellHost(null, &.{})));
+}
+
+test "cmd fallback uses absolute system path when guarded discovery rejects it" {
+    const Host = struct {
+        fn findPwsh(_: Allocator) !?[]u8 {
+            return null;
+        }
+        fn systemShell(_: Allocator, _: []const u8) !?[]u8 {
+            return null;
+        }
+        fn systemPath(a: Allocator, relative: []const u8) !?[]u8 {
+            try std.testing.expectEqualStrings("cmd.exe", relative);
+            return try a.dupe(u8, test_cmd);
+        }
+    };
+    const alloc = std.testing.allocator;
+    try expectDefaultShell(test_cmd, try defaultCommandWithHost(alloc, Host));
+    const recovery = try commandPromptWithHost(alloc, Host, &.{"/D"});
+    defer recovery.deinit(alloc);
+    try std.testing.expectEqualStrings(test_cmd, recovery.direct[0]);
+    try std.testing.expectEqualStrings("/D", recovery.direct[1]);
 }
 
 test "default command never picks WSL, which only the picker or an explicit command starts" {

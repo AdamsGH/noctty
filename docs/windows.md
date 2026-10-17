@@ -283,7 +283,8 @@ button retain the recovery command.
 These discovery restrictions do not change explicit commands: paths through
 local junctions (such as Scoop's `current` directory) still work when configured.
 In safe mode, reloading or saving Settings keeps recovery active until restart;
-a saved config repair takes effect at that restart.
+a saved config repair takes effect at that restart. Theme picks in the command
+palette are saved for restart too, without previewing or applying user config.
 Settings still displays the recovery defaults after saving; restart to see the
 repaired file's values. Recovery saves patch the edited keys without loading
 the file for conflict reconciliation.

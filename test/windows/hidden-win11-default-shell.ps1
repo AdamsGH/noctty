@@ -6,8 +6,10 @@ cmd.exe, and cmd.exe in safe mode. Run with -Bin <directory holding a noctty.exe
 and its share folder> and -Run <new evidence directory>.
 
 Cases, each one launch of noctty with no `command` in its config:
-  default           the machine as it is: expects pwsh.exe when it is on PATH
-  no-pwsh           PATH without any pwsh.exe: expects powershell.exe
+  default           a quoted, explicit PowerShell 7 install directory first on
+                    PATH: expects pwsh.exe (inherited PATH follows it so user
+                    profile dependencies remain available)
+  no-pwsh           only Windows system directories on PATH: expects powershell.exe
   restricted-51     the same, with the process execution policy Restricted: the
                     screen must settle with no warning from this app and
                     the injected shell integration must be on the command line (
@@ -22,6 +24,12 @@ that settles proves the shell started and went quiet, not that the integration
 hook ran. That the injected payload loads, under Restricted included, is
 test/windows/powershell-shell-integration.ps1's job; no key is typed here, so no
 shell history is written.
+
+PowerShell7Directory defaults to this script's PowerShell 7 installation ($PSHOME).
+It must be a direct local installation without redirected ancestors, acceptable
+to automatic discovery; an unsuitable fixture fails the default case. The harness
+does not predict discovery from inherited PATH. The Windows PowerShell cases use
+a minimal PATH, so user profiles that require external tools may fail those cases.
 
 Every file the app reads or writes is one this script creates beside a portable
 copy (`noctty.portable`), with LOCALAPPDATA and APPDATA redirected into the run
@@ -42,6 +50,7 @@ param(
     [switch] $Driver,
     [string] $Desktop,
     [string] $AttachExe,
+    [string] $PowerShell7Directory = $PSHOME,
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 300,
     [ValidatePattern('^[0-9a-f]{16}\.customDestinations-ms$')] [string] $MeasureJumpListName,
     [string] $ExpectedStartupHash,
@@ -162,12 +171,12 @@ function Copy-Portable([string] $Source, [string] $Destination) {
     Set-Content -LiteralPath (Join-Path $Destination 'noctty.portable') -Value '' -NoNewline
 }
 # Compile a C helper without a window: the compile runs in the build shell with no console of its own.
-function Compile-Helper([string] $Source, [string] $Exe, [IntPtr] $Job, [string] $Root) {
+function Compile-Helper([string] $Source, [string] $Exe, [IntPtr] $Job, [string] $Root, [string] $Desktop) {
     $script = [IO.Path]::ChangeExtension($Exe, '.cmd')
     @('@echo off', ('call "{0}" cl /nologo /W4 /WX /O2 /DUNICODE /D_UNICODE "{1}" /Fe:"{2}" /Fo:"{3}" > "{4}" 2>&1' -f
         (Join-Path $Root 'scripts\dev-windows.cmd'), $Source, $Exe, ($Exe -replace '\.exe$', '.obj'), ($Exe -replace '\.exe$', '.compile.log')),
         'exit /b %errorlevel%') | Set-Content -LiteralPath $script -Encoding ascii
-    $pi = [Ds]::Launch($env:ComSpec, ('"{0}" /d /c ""{1}""' -f $env:ComSpec, $script), $Root, $null, $Job, $true)
+    $pi = [Ds]::Launch($env:ComSpec, ('"{0}" /d /c ""{1}""' -f $env:ComSpec, $script), $Root, $Desktop, $Job, $true)
     [void][Ds]::WaitForSingleObject($pi.process, 180000)
     [uint32]$code = 1; [void][Ds]::GetExitCodeProcess($pi.process, [ref]$code)
     [void][Ds]::CloseHandle($pi.thread); [void][Ds]::CloseHandle($pi.process)
@@ -179,6 +188,8 @@ if (-not $Driver) {
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     $source = (Resolve-Path -LiteralPath $Bin).Path
     if (-not (Test-Path -LiteralPath (Join-Path $source 'noctty.exe'))) { throw "No noctty.exe in $source." }
+    $PowerShell7Directory = [IO.Path]::GetFullPath($PowerShell7Directory)
+    if (-not (Test-Path -LiteralPath (Join-Path $PowerShell7Directory 'pwsh.exe') -PathType Leaf)) { throw 'PowerShell7Directory must name an installed PowerShell 7 directory.' }
     $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
     $before = Startup-Fingerprint
     $historyBefore = History-Metadata
@@ -192,18 +203,18 @@ if (-not $Driver) {
     Copy-Portable $source $copy
     foreach ($name in @('localappdata','appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
     $attach = Join-Path $Run 'console-attach-info.exe'
-    $compileJob = [Ds]::CreateOwnedJob()
-    try { Compile-Helper (Join-Path $PSScriptRoot 'console-attach-info.c') $attach $compileJob $root } finally { [void][Ds]::StopOwnedJob($compileJob) }
     $desktopName = 'noctty-ds-' + [guid]::NewGuid().ToString('N')
     $desktop = [Ds]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
     if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktop failed.' }
     $oldLocal=$env:LOCALAPPDATA; $oldRoaming=$env:APPDATA
     $pi=$null; $job=[IntPtr]::Zero; $code=1
     try {
+        $compileJob = [Ds]::CreateOwnedJob()
+        try { Compile-Helper (Join-Path $PSScriptRoot 'console-attach-info.c') $attach $compileJob $root "WinSta0\$desktopName" } finally { [void][Ds]::StopOwnedJob($compileJob) }
         $job=[Ds]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
-        $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -AttachExe "{4}" -Desktop "{5}" -Driver' -f $pwsh,$PSCommandPath,$copy,$Run,$attach,"WinSta0\$desktopName"
+        $pwsh=Join-Path $PSHOME 'pwsh.exe'
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -AttachExe "{4}" -Desktop "{5}" -PowerShell7Directory "{6}" -Driver' -f $pwsh,$PSCommandPath,$copy,$Run,$attach,"WinSta0\$desktopName",$PowerShell7Directory
         $pi=[Ds]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job,$true)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -251,10 +262,10 @@ function Check([string]$Case,[string]$Name,[bool]$Passed,$Expected,$Actual) {
     $script:checks.Add(@{ Case=$Case; Name=$Name; Passed=$Passed; Expected=$Expected; Actual=$Actual })
 }
 $shellNames = @('pwsh.exe','powershell.exe','cmd.exe')
-# Names and ids only. The command line of a shell is tested for the integration
+# Names, image paths and ids only. The command line of a shell is tested for the integration
 # payload inside this function and never returned.
 function Find-Shell([int]$RootPid) {
-    $all = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine)
+    $all = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine)
     $ids = [Collections.Generic.HashSet[int]]::new(); [void]$ids.Add($RootPid)
     $grew = $true
     while ($grew) {
@@ -265,7 +276,7 @@ function Find-Shell([int]$RootPid) {
         if ($ids.Contains([int]$p.ProcessId) -and $p.ProcessId -ne $RootPid -and $shellNames -contains $p.Name.ToLowerInvariant()) {
             $integration = ($null -ne $p.CommandLine) -and ($p.CommandLine -match 'integration\.ps1|__ghostty')
             $noAutoRun = ($null -ne $p.CommandLine) -and ($p.CommandLine -match '(?i)\s/d(\s|$)')
-            return @{ Pid=[int]$p.ProcessId; Name=$p.Name.ToLowerInvariant(); Integration=$integration; NoAutoRun=$noAutoRun }
+            return @{ Pid=[int]$p.ProcessId; Name=$p.Name.ToLowerInvariant(); ImagePath=$p.ExecutablePath; Integration=$integration; NoAutoRun=$noAutoRun }
         }
     }
     return $null
@@ -299,7 +310,7 @@ function Launch-Case([string]$Case,[string]$Exe,[string[]]$ExtraArgs,[hashtable]
             if ($null -eq $shell) { Start-Sleep -Milliseconds 100 }
         }
         if ($shell) {
-            $record.Shell = $shell.Name; $record.Integration = $shell.Integration; $record.NoAutoRun = $shell.NoAutoRun
+            $record.Shell = $shell.Name; $record.ShellPath = $shell.ImagePath; $record.Integration = $shell.Integration; $record.NoAutoRun = $shell.NoAutoRun
             $out = Join-Path $dir "screen-$Case.txt"
             # A prompt is the screen holding the same non-empty rows in two reads 750 ms apart: prompts are
             # themed (a starship prompt is `~ ❯`), so no pattern for them is trusted.
@@ -343,14 +354,20 @@ function Launch-Case([string]$Case,[string]$Exe,[string[]]$ExtraArgs,[hashtable]
 
 try {
     $exe = Join-Path $Bin 'noctty.exe'
-    $pathDirs = @($env:PATH -split ';' | Where-Object { $_ })
-    $withPwsh = @($pathDirs | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'pwsh.exe') -PathType Leaf })
-    $withoutPwsh = ($pathDirs | Where-Object { $withPwsh -notcontains $_ }) -join ';'
-    $pwshOnPath = $withPwsh.Count -gt 0
+    # An explicit installed PS7 fixture wins before any inherited entry. Quoting
+    # it also exercises discovery's quoted PATH handling without a second resolver.
+    $withPwsh = '"{0}";{1}' -f $PowerShell7Directory,$env:PATH
+    $withoutPwsh = @(
+        (Join-Path $env:SystemRoot 'System32'),
+        $env:SystemRoot,
+        (Join-Path $env:SystemRoot 'System32\Wbem'),
+        (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
+    ) -join ';'
     $windowsPowerShellModules = Get-InteractiveWin11WindowsPowerShellModulePath $env:PSModulePath
 
-    $r = Launch-Case 'default' $exe @() @{}
-    Check 'default' "the first tab runs $(if($pwshOnPath){'pwsh.exe, which is on PATH'}else{'powershell.exe, as pwsh.exe is not on PATH'})" ($r.Shell -eq $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'})) $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'}) $r.Shell
+    $r = Launch-Case 'default' $exe @() @{ PATH = $withPwsh }
+    $expectedPwsh = Join-Path $PowerShell7Directory 'pwsh.exe'
+    Check 'default' 'the first tab runs pwsh.exe from the explicit quoted PATH fixture' ($r.Shell -eq 'pwsh.exe' -and $r.ShellPath -eq $expectedPwsh) $expectedPwsh $r.ShellPath
     Check 'default' 'the shell integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
     Check 'default' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
     Check 'default' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
@@ -368,7 +385,7 @@ try {
     Check 'restricted-51' 'every row above the prompt is the host or the user profile under Restricted' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'restricted-51' 'no integration warning or PSReadLine load error on the screen' ($r.NocttyWarnings.Count -eq 0 -and -not ($r.Screen -match 'Cannot load PSReadline')) 0 $r.NocttyWarnings
 
-    $r = Launch-Case 'safe-mode' $exe @('--safe-mode') @{}
+    $r = Launch-Case 'safe-mode' $exe @('--safe-mode') @{ PATH = $withPwsh }
     Check 'safe-mode' 'safe mode starts cmd.exe although PowerShell is installed' ($r.Shell -eq 'cmd.exe') 'cmd.exe' $r.Shell
     Check 'safe-mode' 'with /D, which skips the AutoRun command' ($r.NoAutoRun -eq $true) $true $r.NoAutoRun
     Check 'safe-mode' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
@@ -376,7 +393,7 @@ try {
 } catch {
     $script:checks.Add(@{Name='Harness execution'; Passed=$false; Error=$_.Exception.Message})
 } finally {
-    @{ PwshOnPath=$pwshOnPath; Checks=$script:checks; Launches=$script:launches; Limit='One window, one tab per launch; no input; the settle time is from launch until the shell screen stops changing for 750 ms, polled every 250 ms; a settled screen is not proof that the integration hook ran.' } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'default-shell-results.json')
+    @{ PowerShell7FixtureDirectory=$PowerShell7Directory; WindowsPowerShellPath=$withoutPwsh; Checks=$script:checks; Launches=$script:launches; Limit='One window, one tab per launch; no input; the settle time is from launch until the shell screen stops changing for 750 ms, polled every 250 ms; a settled screen is not proof that the integration hook ran. Windows PowerShell cases use a minimal system PATH; profiles requiring external tools may fail.' } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'default-shell-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
 if($failed.Count -or $script:checks.Count -eq 0){exit 1}

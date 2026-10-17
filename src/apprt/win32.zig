@@ -15391,6 +15391,9 @@ const Host = struct {
     }
 
     fn previewPaletteTheme(self: *Host, name: []const u8) !void {
+        // Recovery must not load user files or replace its runtime config.
+        // A theme can still be saved below, to take effect after restart.
+        if (self.app.safe_mode) return;
         if (self.app.config.theme) |current| {
             if (std.mem.eql(u8, current.light, name) and std.mem.eql(u8, current.dark, name)) return;
         }
@@ -15455,7 +15458,7 @@ const Host = struct {
 
         // settingsSaveAndReload may replace/deinit the live app config. Keep
         // the generation borrowed by the visible palette alive first.
-        try self.detachLivePaletteCatalogConfig();
+        if (!self.app.safe_mode) try self.detachLivePaletteCatalogConfig();
 
         if (self.palette_theme_preview_original) |*value| {
             if (self.palette_catalog_config_source == .preview_original) {
@@ -15483,8 +15486,10 @@ const Host = struct {
                 // Roll back without another allocation: `original` is already
                 // an owned deep clone of the pre-preview baseline. Transfer it
                 // into the runtime config and suppress the local deferred deinit.
-                self.replaceRuntimeConfigFromPalette(original);
-                original_owned = false;
+                if (!self.app.safe_mode) {
+                    self.replaceRuntimeConfigFromPalette(original);
+                    original_owned = false;
+                }
                 self.abortPaletteAction(paletteThemeSaveFailureMessage(err));
                 return;
             },
@@ -15497,6 +15502,8 @@ const Host = struct {
                 .action_completed,
                 if (saved_but_masked)
                     "Theme saved; a later config layer masks it"
+                else if (self.app.safe_mode)
+                    "Theme saved; restart noctty to apply it"
                 else
                     "Theme applied",
             );
@@ -53210,6 +53217,44 @@ test "win32 palette theme preview can restore original config clone" {
     var restored = try original.clone(std.testing.allocator);
     defer restored.deinit();
     try std.testing.expectEqualStrings("Original Theme", restored.theme.?.light);
+}
+
+test "win32 safe mode theme selection and acceptance preserve recovery" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{ .core_app = &core, .app = &app, .hosts = &.{.{ .storage = &host }} });
+    defer session.deinit();
+    app.safe_mode = true;
+    try app.config.useWindowsRecoveryCommand();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config", .data = "command = pwsh.exe\n" });
+    const target = try tmp.dir.realpathAlloc(alloc, "config");
+    defer alloc.free(target);
+    // A trap for accidental user-config loading, without touching a profile
+    // or an arbitrary drive: this owned file cannot be a cwd directory.
+    app.startup_cwd = target;
+    defer app.startup_cwd = null;
+    app.cli_config_override_path = target;
+    defer app.cli_config_override_path = null;
+    const command = app.config.command.?.direct;
+    const revision = app.config_revision;
+    try host.previewPaletteTheme("0x96f");
+    try std.testing.expect(host.palette_theme_preview_original == null);
+    try host.commitPaletteTheme("0x96f");
+    // No config swap, including acceptance's catalog detachment, is allowed.
+    try std.testing.expectEqual(revision, app.config_revision);
+    try std.testing.expect(command.ptr == app.config.command.?.direct.ptr);
+    try std.testing.expectEqualStrings("/D", app.config.command.?.direct[1]);
+    try std.testing.expect(app.config.theme == null);
+    const saved = try tmp.dir.readFileAlloc(alloc, "config", 4096);
+    defer alloc.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "theme = 0x96f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "command = pwsh.exe") != null);
 }
 
 test "win32 palette theme commit mutates pending without losing rollback source" {
