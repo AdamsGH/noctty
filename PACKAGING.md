@@ -298,7 +298,11 @@ Recommended order:
    to publish without its hash-bound evidence at the exact release SHA.
 5. Run the Windows 10 22H2 checklist,
    [docs/windows10-release-checklist.md](docs/windows10-release-checklist.md),
-   against the release candidate's artifacts on a Windows 10 machine. No
+   against a candidate built from the intended source SHA on a Windows 10
+   machine. Obtain it through [Local packaging](#local-packaging), or a manual
+   **Release** dispatch with `prerelease = true`; **Release Readiness** produces
+   no artifacts. Record the source SHA and candidate hashes, and repeat affected
+   checks if the source changes before stable publication. No
    hosted image or interactive job covers Windows 10; the checklist is a manual
    release step, not a CI gate. Put its results table in the release notes'
    validation section. The scheduled **Windows 10 branches** workflow is a

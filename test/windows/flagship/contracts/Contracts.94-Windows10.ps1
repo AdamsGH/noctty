@@ -14,8 +14,9 @@ function Remove-ZigNonCode([string] $Text) {
 }
 
 # Every function whose body compares the Windows build to something, on either side of the
-# operator, by name, by an OS_BUILD_ constant or through RtlGetVersion's field. Comparisons in test
-# blocks do not count: tests only set the build to stand in for a machine.
+# operator, for the current os_build spelling, an OS_BUILD_ constant or RtlGetVersion's field.
+# This is a bounded scan, not data-flow analysis: a future gate using another variable name must
+# extend the scanner and fixtures. Comparisons in test blocks do not count.
 function Get-WindowsBuildGateFunctions([string] $ZigText) {
     $code = Remove-ZigNonCode $ZigText
     $build = '(?:\bos_build\b|\bOS_BUILD_\w+\b|\bdwBuildNumber\b)'
@@ -71,17 +72,77 @@ $win10ExpectedIds = @(1..$win10RowIds.Count | ForEach-Object { 'W10-{0:D2}' -f $
 # The workflow's steps, with comments removed so that a comment cannot satisfy a pattern. Each one
 # must stay in the job that runs unconditionally, because a green run is the evidence.
 $win10Job = Get-YamlJobText -Content $win10Workflow -Name 'server-2022' -Source $win10WorkflowPath
-function Get-Win10WorkflowStep([string] $Name) {
-    $step = Get-YamlStepBlock -Content $win10Job -Name $Name -Source $win10WorkflowPath
+function Get-Win10WorkflowStep([string] $Name, [string] $Job = $win10Job) {
+    $step = Get-YamlStepBlock -Content $Job -Name $Name -Source $win10WorkflowPath
     return (($step -split "`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
 }
-$win10WorkflowSteps = [ordered]@{
-    'Require a Windows build below 22000'          = '(?s)-ge 22000\).*?throw'
-    'Full Zig test suite'                          = '(?s)zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all.*?exit \$code'
-    'noctty +version smoke'                        = '(?s)noctty\.com \+version.*?LASTEXITCODE -ne 0.*?throw'
-    'Hidden-desktop WARP lifecycle smoke'          = 'Invoke-RendererParity\.ps1 -Binary \./renderer-smoke/bin/noctty\.exe -OutputDirectory \./renderer-smoke/evidence -WarpOnly'
-    'Require the app to take the Windows 10 branch' = '(?s)Get-ChildItem -Path renderer-smoke/evidence -Recurse -Filter stderr\.txt.*?os_build=\(\\d\+\) integrated_titlebar=\(true\|false\).*?-ge 22000.*?throw'
+function Get-Win10StepCode([string] $Step) {
+    # Inspect the actual run scalar, including inline comments; YAML metadata/comments are not code.
+    $run = [regex]::Match($Step, '(?m)^        run: (?<scalar>[^\r\n]*)\r?$')
+    if (-not $run.Success) { throw 'Windows 10 step lost its run command.' }
+    $code = if ($run.Groups['scalar'].Value.Trim() -eq '|') {
+        (($Step.Substring($run.Index + $run.Length) -split "`n") | Where-Object { $_ -match '^          ' } | ForEach-Object { $_.Substring(10) }) -join "`n"
+    } else { $run.Groups['scalar'].Value }
+    $tokens = $null; $errors = $null
+    [void][Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw 'Windows 10 run command does not parse.' }
+    $builder = [Text.StringBuilder]::new($code)
+    foreach ($token in @($tokens | Where-Object Kind -eq 'Comment' | Sort-Object { $_.Extent.StartOffset } -Descending)) {
+        [void]$builder.Remove($token.Extent.StartOffset, $token.Extent.EndOffset - $token.Extent.StartOffset)
+    }
+    return $builder.ToString()
 }
+$win10WorkflowSteps = [ordered]@{
+    'Require a Windows build below 22000' = @(
+        '(?m)^\$os = Get-CimInstance Win32_OperatingSystem\s*$'
+        '(?m)^\$build = \[int\]\$os\.BuildNumber\s*$'
+        '(?m)^if \(\$build -ge 22000\) \{\s*throw '
+    )
+    'Full Zig test suite' = @(
+        '(?m)^zig build test -Demit-test-exe=true -Dcustom-shaders=true --summary all 2>&1 \| Tee-Object -FilePath zig-test\.log\s*\r?\n\$code = \$LASTEXITCODE\s*$'
+        '(?m)^if \(\$code -ne 0\) \{ exit \$code \}\s*$'
+    )
+    'noctty +version smoke' = @(
+        '(?m)^\$versionText = & \.\\zig-out\\bin\\noctty\.com \+version \| Out-String\s*$'
+        '(?m)^if \(\$LASTEXITCODE -ne 0\) \{ throw '
+        '(?m)^if \(\$versionText -notmatch ''ConPTY''\) \{ throw '
+    )
+    'Hidden-desktop WARP lifecycle smoke' = @(
+        '\A\./test/windows/renderer/Invoke-RendererParity\.ps1 -Binary \./renderer-smoke/bin/noctty\.exe -OutputDirectory \./renderer-smoke/evidence -WarpOnly\s*\z'
+    )
+    'Require the app to take the Windows 10 branch' = @(
+        '(?m)^\$logs = @\(Get-ChildItem -Path renderer-smoke/evidence -Recurse -Filter stderr\.txt\)\s*$'
+        '(?m)^if \(\$logs\.Count -eq 0\) \{ throw '
+        '(?m)^\$lines = \$logs \| Select-String -Pattern ''os_build=\(\\d\+\) integrated_titlebar=\(true\|false\)''\s*$'
+        '(?m)^if \(-not \$lines\) \{ throw '
+        '(?m)^foreach \(\$line in \$lines\) \{\s*\$match = \[regex\]::Match\(\$line\.Line, ''os_build=\(\\d\+\) integrated_titlebar=\(true\|false\)''\)\s*\$build = \[int\]\$match\.Groups\[1\]\.Value\s*if \(\$build -ne \[int\]\$env:windows_build -or \$build -ge 22000 -or \$match\.Groups\[2\]\.Value -ne ''false''\) \{\s*throw '
+    )
+}
+
+function Assert-Win10Step([string] $Name, [string] $Step) {
+    $code = Get-Win10StepCode $Step
+    foreach ($pattern in $win10WorkflowSteps[$Name]) {
+        if ($code -notmatch $pattern) { throw "Windows 10 '$Name' lost a required executable guard." }
+    }
+}
+$win10TriggerPattern = '(?ms)^on:\r?\n  schedule:\r?\n    - cron: "[^"\r\n]+"\r?\n  workflow_dispatch:\r?\n  pull_request:\r?\n    paths:\r?\n      - \.github/workflows/windows10-branches\.yml[ \t]*\r?\n\s*(?=^permissions:|\z)'
+function Assert-Win10Triggers([string] $Workflow) {
+    if ($Workflow -notmatch $win10TriggerPattern) { throw 'Windows 10 trigger block allows extra events or paths.' }
+}
+function Assert-Win10Inventory([string] $Checklist) {
+    $inventory = [regex]::Match($Checklist, '(?ms)^## Gate inventory\r?\n(?<table>.*?)(?=^## |\z)').Groups['table'].Value
+    $rows = @([regex]::Matches($inventory, '(?m)^\|[^\r\n]+\|[ \t]*\r?$') | ForEach-Object { $_.Value })
+    foreach ($symbol in @($win10GateFunctions) + @($win10BuildConstants | ForEach-Object { $_.Groups[1].Value })) {
+        if (-not ($rows | Where-Object { $_ -match ('`' + [regex]::Escape($symbol) + '`') })) { throw "Windows 10 inventory table lost $symbol." }
+    }
+    foreach ($row in $rows | Where-Object { $_ -match 'W10-' }) {
+        foreach ($reference in [regex]::Matches($row, '\bW10-\d{2}\b')) {
+            if ($win10RowIds -cnotcontains $reference.Value) { throw "Windows 10 inventory refers to undefined row $($reference.Value)." }
+        }
+    }
+}
+Assert-Win10Triggers $win10Workflow
+Assert-Win10Inventory $win10Checklist
 
 $win10Contracts = @(
     @{
@@ -122,7 +183,7 @@ $win10Contracts = @(
     @{
         File = $win10WorkflowPath
         Content = { $win10Workflow }
-        Pattern = '(?ms)^on:\s+schedule:.*?workflow_dispatch:\s+pull_request:\s+paths:\s+- \.github/workflows/windows10-branches\.yml\s*$'
+        Pattern = $win10TriggerPattern
         Kind = 'Text'
         Description = 'the Windows 10 workflow runs on a schedule and on demand, and on a pull request only for its own file'
     }
@@ -158,13 +219,14 @@ $win10Contracts = @(
 foreach ($step in $win10WorkflowSteps.Keys) {
     # The text is read here, not in a script block: a block run later cannot see this file's functions.
     $stepText = Get-Win10WorkflowStep $step
-    $win10Contracts += @{
+    Assert-Win10Step $step $stepText
+    foreach ($pattern in $win10WorkflowSteps[$step]) { $win10Contracts += @{
         File = "$win10WorkflowPath :: $step"
-        Content = $stepText
-        Pattern = $win10WorkflowSteps[$step]
+        Content = (Get-Win10StepCode $stepText)
+        Pattern = $pattern
         Kind = 'Text'
         Description = "the Windows 10 workflow's '$step' step runs its check"
-    }
+    } }
     $win10Contracts += @{
         File = "$win10WorkflowPath :: $step"
         Content = $stepText
@@ -173,23 +235,52 @@ foreach ($step in $win10WorkflowSteps.Keys) {
         Description = "the Windows 10 workflow's '$step' step is unconditional and fails the job"
     }
 }
-foreach ($function in $win10GateFunctions) {
-    $win10Contracts += @{
-        File = $win10ChecklistPath
-        Content = { $win10Checklist }
-        Pattern = ('`' + [regex]::Escape($function) + '`')
-        Kind = 'Text'
-        Description = "the checklist's gate inventory names $function, which compares the Windows build"
-    }
-}
-foreach ($constant in $win10BuildConstants) {
-    $win10Contracts += @{
-        File = $win10ChecklistPath
-        Content = { $win10Checklist }
-        Pattern = ('`' + [regex]::Escape($constant.Groups[1].Value) + '`')
-        Kind = 'Text'
-        Description = "the checklist's gate inventory names $($constant.Groups[1].Value)"
-    }
-}
 Invoke-ContractTable -Contracts $win10Contracts
-Write-Host "Windows 10 checklist: $($win10RowIds.Count) rows, $($win10GateFunctions.Count) gate functions ($($win10GateFunctions -join ', '))"
+
+# Negative controls mutate only strings already read above. They never execute workflow commands.
+$win10Mutations = 0
+function Assert-Win10Mutation([string] $Name, [string] $Original, [string] $Mutated, [scriptblock] $Validate) {
+    if ($Original -ceq $Mutated) { throw "Windows 10 mutation '$Name' changed nothing." }
+    & $Validate $Original
+    $rejected = $false
+    try { & $Validate $Mutated } catch { $rejected = $true }
+    if (-not $rejected) { throw "Windows 10 contract accepted '$Name'." }
+    $script:win10Mutations++
+}
+foreach ($case in @(
+    @{ Step = 'Require a Windows build below 22000'; From = '$build = [int]$os.BuildNumber'; To = '$build = 20348' }
+    @{ Step = 'Require a Windows build below 22000'; From = '$build -ge 22000'; To = '$build -lt 22000' }
+    @{ Step = 'Full Zig test suite'; From = '$code = $LASTEXITCODE'; To = '$code = 0' }
+    @{ Step = 'Full Zig test suite'; From = '$code = $LASTEXITCODE'; To = '# $code = $LASTEXITCODE' }
+    @{ Step = 'Full Zig test suite'; From = 'if ($code -ne 0) { exit $code }'; To = '' }
+    @{ Step = 'Full Zig test suite'; From = '$code -ne 0'; To = '$code -eq 0' }
+    @{ Step = 'Full Zig test suite'; From = 'exit $code'; To = 'exit 0' }
+    @{ Step = 'noctty +version smoke'; From = '$LASTEXITCODE -ne 0'; To = '$LASTEXITCODE -eq 0' }
+    @{ Step = 'noctty +version smoke'; From = "if (`$versionText -notmatch 'ConPTY')"; To = "if (`$versionText -match 'ConPTY')" }
+    @{ Step = 'noctty +version smoke'; From = "if (`$versionText -notmatch 'ConPTY')"; To = "# if (`$versionText -notmatch 'ConPTY')" }
+    @{ Step = 'Hidden-desktop WARP lifecycle smoke'; From = 'run: ./test/windows/renderer/Invoke-RendererParity.ps1'; To = 'run: # ./test/windows/renderer/Invoke-RendererParity.ps1' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = '$logs.Count -eq 0'; To = '$logs.Count -lt 0' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = 'if (-not $lines)'; To = 'if ($lines)' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = 'foreach ($line in $lines)'; To = 'foreach ($line in @())' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = '$build -ne [int]$env:windows_build -or '; To = '' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = '$build -ne [int]$env:windows_build'; To = '$build -eq [int]$env:windows_build' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = '$build -ge 22000 -or '; To = '' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = '$build -ge 22000'; To = '$build -lt 22000' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = " -or `$match.Groups[2].Value -ne 'false'"; To = '' }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = "`$match.Groups[2].Value -ne 'false'"; To = "`$match.Groups[2].Value -eq 'false'" }
+    @{ Step = 'Require the app to take the Windows 10 branch'; From = '$build = [int]$match.Groups[1].Value'; To = '$build = [int]$env:windows_build' }
+)) {
+    $stepText = Get-Win10WorkflowStep $case.Step
+    Assert-Win10Mutation "$($case.Step): $($case.From)" $stepText ($stepText.Replace($case.From, $case.To)) {
+        param($text) Assert-Win10Step $case.Step $text
+    }
+}
+Assert-Win10Mutation 'extra push event' $win10Workflow ($win10Workflow.Replace("on:`n", "on:`n  push:`n")) ${function:Assert-Win10Triggers}
+Assert-Win10Mutation 'extra pull request path' $win10Workflow ($win10Workflow.Replace('      - .github/workflows/windows10-branches.yml', "      - .github/workflows/windows10-branches.yml`n      - src/**")) ${function:Assert-Win10Triggers}
+foreach ($symbol in $win10GateFunctions) {
+    $withoutRow = [regex]::Replace($win10Checklist, ('(?m)^\|[^\r\n]*`' + [regex]::Escape($symbol) + '`[^\r\n]*\r?\n'), '')
+    # A prose mention cannot replace an inventory table entry.
+    Assert-Win10Mutation "inventory row $symbol" $win10Checklist ($withoutRow + "`nProse only: ``$symbol``.`n") ${function:Assert-Win10Inventory}
+}
+Assert-Win10Mutation 'undefined inventory row reference' $win10Checklist ($win10Checklist.Replace('| W10-01 ', '| W10-99 ')) ${function:Assert-Win10Inventory}
+Write-Host "Windows 10 checklist: $($win10RowIds.Count) rows, $($win10GateFunctions.Count) gate functions ($($win10GateFunctions -join ', ')); $win10Mutations mutation controls"

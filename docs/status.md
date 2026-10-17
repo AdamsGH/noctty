@@ -32,8 +32,9 @@ noctty is based on post-`v1.3.1` upstream main (`1.3.2-dev`, `ba398dfff`,
   (`windows-11-arm`), and the one interactive job is a self-hosted Windows 11
   machine that runs only on request. GitHub offers no Windows 10 image. A
   weekly, non-required job on Windows Server 2022 (build 20348) runs the unit
-  suite and a hidden-desktop launch below build 22000, which takes every
-  Windows 10 branch of the build gates; a person runs the
+  suite and a hidden-desktop launch below build 22000, which exercises the
+  startup-time Windows 10 branches; unit tests also stand in for older builds.
+  A person runs the
   [Windows 10 release checklist](windows10-release-checklist.md) on a Windows 10
   22H2 machine before a release. Chrome, input and startup changes are
   unmeasured on Windows 10 unless a page says otherwise.

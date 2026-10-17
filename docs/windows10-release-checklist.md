@@ -14,6 +14,12 @@ desktop.
 
 - Before every release, with the release candidate's artifacts (see the
   [release runbook](../PACKAGING.md#release-runbook)).
+- Produce the candidate from the exact intended source SHA with the
+  [local packaging procedure](../PACKAGING.md#local-packaging), or use the
+  **Release** workflow's manual `prerelease = true` output. **Release Readiness**
+  only checks configuration; it produces no candidate artifacts. Record the
+  candidate's source SHA and artifact hashes. A later source change needs a new
+  candidate and the affected rows repeated before stable publication.
 - A release whose diff since the last Windows 10 pass touches none of the files in
   the [gate inventory](#gate-inventory) and no chrome, input or startup code may
   run only the rows marked **Core**. Say in the release notes which pass was run.
@@ -153,8 +159,11 @@ out of date; record it.
 
 **W10-08 Decoration toggle round trip.** From a decorated window run the palette
 action `toggle_window_decorations`, then again. Expected: the caption disappears
-and returns; position and client size stay the same within one frame width. Do the
-round trip from a normal window. A maximised window is a separate observation:
+and returns. The style change preserves the outer window rectangle; the client
+area changes as the caption and frame are removed and restored. Record both
+rectangles during the round trip from a normal window. This expectation comes
+from the `SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED` path, not a Windows 10
+measurement. A maximised window is a separate observation:
 the Windows 10 path rewrites the window style without `WS_MAXIMIZE`
 (`AGENTS.md`, 2026-09-24 entry, trap 4), so toggling while maximised is expected
 to leave an un-maximised window inside the maximised rectangle. Record what you
@@ -212,9 +221,8 @@ Segoe UI (Windows 10 has no Segoe UI Variable), no clipped labels at 100%, 150% 
 **W10-16 Tab-row `+` and `▾` glyphs (Core).** Gate: `createTitlebarIconFont`. In the
 separate tab row, look at the new-tab and dropdown buttons, at 100% and 150%.
 Expected: a plus and a chevron. The code asks GDI for "Segoe Fluent Icons" first and
-for "Segoe MDL2 Assets" only if that fails, but `CreateFontIndirectW` does not fail
-for a missing face; it returns a substitute (the 2026-10-01 entry in `AGENTS.md`
-measured Arial for a missing icon face on Windows 10), and Microsoft does not ship
+for "Segoe MDL2 Assets" only if that fails, but `CreateFontIndirectW` can return
+a substitute for a missing face, and Microsoft does not ship
 Segoe Fluent Icons with Windows 10 ([Segoe Fluent Icons font](https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font)).
 So the MDL2 fallback may never be reached and these two buttons may draw empty or
 as boxes. This is an inference from the code, not a measurement on Windows 10: if
@@ -232,7 +240,10 @@ script whose box remains and the fonts that Windows 10 lacks.
 
 ### ConPTY and shells
 
-**W10-19 ConPTY source (Core).** (a) Run `noctty +version`. Expected: `ConPTY :
+**W10-19 ConPTY source (Core).** Close all noctty windows before each case and
+start each test instance with `--single-instance=false` so an existing instance
+cannot consume the launch with a different environment or ConPTY source.
+(a) Run `noctty +version`. Expected: `ConPTY :
 bundled (<path>)`. Open `cmd`, run `cls` and `dir`, then start a full-screen
 program (for example `more` on a long file). (b) Set `NOCTTY_CONPTY=inbox` in the
 environment and run `noctty +version` and a new instance. Expected: `+version` reads
@@ -279,13 +290,16 @@ values are back to what (b) recorded, and the console opens in Windows Terminal.
 Revert to the snapshot afterwards.
 
 **W10-23 Toasts (installed).** Install with the installer so the Start Menu shortcut
-carries the AppUserModelID. Set `notify-on-command-finish = always`, run `Start-Sleep
-12` and switch to another window. Expected: a toast named "noctty" with the noctty
+carries the AppUserModelID. Set `notify-on-command-finish = always` and
+`notify-on-command-finish-action = notify`, run `Start-Sleep 12` and switch to
+another window. Expected: a toast named "noctty" with the noctty
 icon, in Action Center afterwards; clicking it focuses the pane. Turn Focus Assist
 to "Alarms only" and repeat. Expected: either the toast, or an in-app banner; never
 nothing. Then revert to the clean snapshot and repeat with the portable copy only:
 it creates the AppUserModelID registration where none exists
-([App identity](windows.md#app-identity)), so a toast is expected there too.
+([App identity](windows.md#app-identity)). Portable toast delivery has not been
+confirmed: record whether the toast appears, its icon and Action Center entry,
+and any banner, rather than treating registration alone as proof of delivery.
 
 **W10-24 Jump list (installed).** After `cd` in a few folders, right-click the taskbar
 button. Expected: "Recent" lists the folders, "Profiles" lists the detected shells;
@@ -311,9 +325,9 @@ near 30 fps.
 
 Copy this table into the release notes' validation section or the release PR.
 
-| Row               | Result (pass, fail, n/a) | Build | Evidence (screenshot, log line, note) |
-| ----------------- | ------------------------ | ----- | ------------------------------------- |
-| W10-01 to W10-26  |                          |       |                                       |
-| Machine and image |                          |       | `winver`, VM type, display scaling    |
-| Artifact          |                          |       | version, SHA-256 of the ZIP or setup  |
-| Date and tester   |                          |       |                                       |
+| Row               | Result (pass, fail, n/a) | Build | Evidence (screenshot, log line, note)        |
+| ----------------- | ------------------------ | ----- | -------------------------------------------- |
+| W10-01 to W10-26  |                          |       |                                              |
+| Machine and image |                          |       | `winver`, VM type, display scaling           |
+| Artifact          |                          |       | source SHA, version, SHA-256 of ZIP or setup |
+| Date and tester   |                          |       |                                              |
