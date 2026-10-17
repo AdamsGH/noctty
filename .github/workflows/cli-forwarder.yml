@@ -83,6 +83,8 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseFast -Dcustom-shaders=true -Dcpu=baseline --summary all
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $forwarderBytes = (Get-Item ./zig-out/bin/noctty.com).Length
+          if ($forwarderBytes -gt 131072) { throw "Console forwarder exceeds 128 KiB: $forwarderBytes bytes." }
           New-Item -ItemType File -Path ./zig-out/bin/noctty.portable | Out-Null
 
       - name: Build the windowless desktop fixture
@@ -108,5 +110,8 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: cli-forwarder-${{ matrix.arch }}-${{ github.run_id }}
-          path: zig-out/cli-forwarder-evidence
+          path: |
+            zig-out/cli-forwarder-evidence/**/*.json
+            zig-out/cli-forwarder-evidence/**/*.txt
+          retention-days: 7
           if-no-files-found: warn
