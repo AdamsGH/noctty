@@ -31,16 +31,16 @@ pub fn apply(state: *model.ShellState, intent: Intent) ReduceError!Reduction {
     switch (intent) {
         .create_window => try createWindow(state, &reduction),
         .close_window => |id| try closeWindow(state, &reduction, id),
-        .create_tab => |id| try createTab(state, &reduction, id),
+        .create_tab => |create| try createTab(state, &reduction, create.window, create.index),
         .close_tab => |id| try closeTab(state, &reduction, id),
         .detach_tab => |id| try detachTab(state, &reduction, id),
         .restore_tab => |restore| try restoreTab(state, &reduction, restore.tab, restore.index, restore.activate),
-        .discard_detached_tab => |id| try discardDetachedTab(state, &reduction, id),
+        .discard_detached_tab => |id| try discardDetachedTab(state, id),
         .reorder_tab => |reorder| try reorderTab(state, &reduction, reorder.tab, reorder.index),
         .split_pane => |split| try splitPane(state, &reduction, split.pane, split.direction, split.ratio),
         .transfer_subtree => |transfer| try transferSubtree(state, &reduction, transfer.source_root, transfer.target_pane, transfer.direction, transfer.ratio),
         .set_transfer_applied => |transfer| try setTransferApplied(state, &reduction, transfer.source_root, transfer.applied),
-        .discard_transfer => |source_root| try discardTransfer(state, &reduction, source_root),
+        .discard_transfer => |source_root| try discardTransfer(state, source_root),
         .close_pane => |id| try closePane(state, &reduction, id),
         .focus_window => |id| try focusWindow(state, &reduction, id),
         .focus_tab => |id| try focusTab(state, &reduction, id),
@@ -86,7 +86,7 @@ fn createWindow(state: *model.ShellState, out: *Reduction) !void {
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
-fn createTab(state: *model.ShellState, out: *Reduction, window_id: model.WindowId) !void {
+fn createTab(state: *model.ShellState, out: *Reduction, window_id: model.WindowId, index: ?usize) !void {
     const window = state.window(window_id) orelse return error.StaleId;
     try window.tabs.ensureUnusedCapacity(state.allocator, 1);
     try state.tabs.ensureUnusedCapacity(state.allocator, 1);
@@ -95,12 +95,12 @@ fn createTab(state: *model.ShellState, out: *Reduction, window_id: model.WindowI
     try state.tab_ids.reserve(state.allocator);
     try state.pane_ids.reserve(state.allocator);
     try state.node_ids.reserve(state.allocator);
-    try out.effects.ensureUnusedCapacity(state.allocator, 4);
+    try out.effects.ensureUnusedCapacity(state.allocator, 3);
 
     const tab_id = state.tab_ids.acquireAssumeCapacity();
     const pane_id = state.pane_ids.acquireAssumeCapacity();
     const node_id = state.node_ids.acquireAssumeCapacity();
-    window.tabs.appendAssumeCapacity(tab_id);
+    window.tabs.insertAssumeCapacity(@min(index orelse window.tabs.items.len, window.tabs.items.len), tab_id);
     window.active_tab = tab_id;
     state.tabs.appendAssumeCapacity(.{ .id = tab_id, .window = window_id, .root = node_id, .focused_pane = pane_id });
     state.panes.appendAssumeCapacity(.{ .id = pane_id, .tab = tab_id });
@@ -109,7 +109,6 @@ fn createTab(state: *model.ShellState, out: *Reduction, window_id: model.WindowI
 
     out.effects.appendAssumeCapacity(.{ .create_surface = pane_id });
     out.effects.appendAssumeCapacity(.{ .focus_surface = pane_id });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window_id });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
@@ -118,14 +117,13 @@ fn splitPane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId, d
     const pane = state.pane(pane_id) orelse return error.StaleId;
     const tab = state.tab(pane.tab) orelse return error.StaleId;
     if (activeWindowForTab(state, tab.id) == null) return error.StaleId;
-    const window_id = tab.window;
     const leaf_id = (findPaneNode(state, tab.id, pane_id) orelse return error.StaleId).id;
 
     try state.panes.ensureUnusedCapacity(state.allocator, 1);
     try state.nodes.ensureUnusedCapacity(state.allocator, 2);
     try state.pane_ids.reserve(state.allocator);
     try state.node_ids.reserveMany(state.allocator, 2);
-    try out.effects.ensureUnusedCapacity(state.allocator, 4);
+    try out.effects.ensureUnusedCapacity(state.allocator, 3);
 
     const new_pane = state.pane_ids.acquireAssumeCapacity();
     const old_leaf = state.node_ids.acquireAssumeCapacity();
@@ -149,7 +147,6 @@ fn splitPane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId, d
 
     out.effects.appendAssumeCapacity(.{ .create_surface = new_pane });
     out.effects.appendAssumeCapacity(.{ .focus_surface = new_pane });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window_id });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
@@ -184,7 +181,7 @@ fn transferSubtree(
         (firstPane(state, source_root) orelse return error.StaleId);
 
     try state.transfers.ensureUnusedCapacity(state.allocator, 1);
-    try out.effects.ensureUnusedCapacity(state.allocator, 4);
+    try out.effects.ensureUnusedCapacity(state.allocator, 2);
     if (source_relation.parent == null) {
         try source_window.retained_tabs.ensureUnusedCapacity(state.allocator, 1);
         try state.nodes.ensureUnusedCapacity(state.allocator, 1);
@@ -220,13 +217,13 @@ fn transferSubtree(
     };
     try applyTransferTopology(state, &record);
     state.transfers.appendAssumeCapacity(record);
-    appendTransferEffects(state, out, source_tab.window, target_tab.window, moved_focus);
+    appendTransferEffects(out, moved_focus);
 }
 
 fn setTransferApplied(state: *model.ShellState, out: *Reduction, source_root: model.NodeId, applied: bool) !void {
     const index = transferIndex(state, source_root) orelse return error.StaleId;
     if (state.transfers.items[index].applied == applied) return;
-    try out.effects.ensureUnusedCapacity(state.allocator, 4);
+    try out.effects.ensureUnusedCapacity(state.allocator, 2);
     if (applied) {
         if (state.transfers.items[index].source_parent == null) {
             const source_window = activeWindowForTab(state, state.transfers.items[index].source_tab) orelse return error.InvalidTransfer;
@@ -246,13 +243,11 @@ fn setTransferApplied(state: *model.ShellState, out: *Reduction, source_root: mo
         try undoTransferTopology(state, record);
     }
     const record = &state.transfers.items[index];
-    const focus = if (applied) record.moved_focus else record.source_focus;
-    const source_window = state.tab(record.source_tab).?.window;
-    const target_window = state.tab(record.target_tab).?.window;
-    appendTransferEffects(state, out, source_window, target_window, focus);
+    appendTransferEffects(out, if (applied) record.moved_focus else record.source_focus);
 }
 
-fn discardTransfer(state: *model.ShellState, out: *Reduction, source_root: model.NodeId) !void {
+/// Expiring history changes nothing on screen, so nothing is persisted.
+fn discardTransfer(state: *model.ShellState, source_root: model.NodeId) !void {
     const index = transferIndex(state, source_root) orelse return error.StaleId;
     const record = state.transfers.items[index];
     const discard_source_shell = record.applied and record.source_parent == null;
@@ -267,7 +262,6 @@ fn discardTransfer(state: *model.ShellState, out: *Reduction, source_root: model
         if (remove_window) try state.window_ids.free.ensureUnusedCapacity(state.allocator, 1);
         _ = source_tab;
     }
-    try out.effects.ensureUnusedCapacity(state.allocator, if (remove_window) 2 else 1);
 
     if (discard_source_shell) {
         const source_window = retainingWindowForTab(state, record.source_tab).?;
@@ -279,11 +273,9 @@ fn discardTransfer(state: *model.ShellState, out: *Reduction, source_root: model
             const window_id = source_window_id.?;
             removeWindow(state, window_id);
             try state.window_ids.release(state.allocator, window_id);
-            out.effects.appendAssumeCapacity(.{ .destroy_window = window_id });
         }
     }
     _ = state.transfers.orderedRemove(index);
-    out.effects.appendAssumeCapacity(.persist_session);
 }
 
 fn applyTransferTopology(state: *model.ShellState, record: *model.Transfer) !void {
@@ -374,11 +366,8 @@ fn undoTransferTopology(state: *model.ShellState, record: *model.Transfer) !void
     record.applied = false;
 }
 
-fn appendTransferEffects(state: *model.ShellState, out: *Reduction, source_window: model.WindowId, target_window: model.WindowId, focus: model.PaneId) void {
-    _ = state;
+fn appendTransferEffects(out: *Reduction, focus: model.PaneId) void {
     out.effects.appendAssumeCapacity(.{ .focus_surface = focus });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = source_window });
-    if (!target_window.eql(source_window)) out.effects.appendAssumeCapacity(.{ .relayout_window = target_window });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
@@ -394,23 +383,21 @@ fn focusWindow(state: *model.ShellState, out: *Reduction, window_id: model.Windo
 fn focusTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !void {
     const tab = state.tab(tab_id) orelse return error.StaleId;
     const window = activeWindowForTab(state, tab_id) orelse return error.StaleId;
-    try out.effects.ensureUnusedCapacity(state.allocator, 2);
+    try out.effects.ensureUnusedCapacity(state.allocator, 1);
     window.active_tab = tab_id;
     state.focused_window = window.id;
     out.effects.appendAssumeCapacity(.{ .focus_surface = tab.focused_pane });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window.id });
 }
 
 fn focusPane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !void {
     const pane = state.pane(pane_id) orelse return error.StaleId;
     const tab = state.tab(pane.tab) orelse return error.StaleId;
     const window = activeWindowForTab(state, tab.id) orelse return error.StaleId;
-    try out.effects.ensureUnusedCapacity(state.allocator, 2);
+    try out.effects.ensureUnusedCapacity(state.allocator, 1);
     tab.focused_pane = pane_id;
     window.active_tab = tab.id;
     state.focused_window = window.id;
     out.effects.appendAssumeCapacity(.{ .focus_surface = pane_id });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window.id });
 }
 
 fn closePane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !void {
@@ -430,8 +417,7 @@ fn closePane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !
     const sibling = state.node(sibling_id) orelse return error.StaleId;
     const sibling_value = sibling.value;
     const next_focus = firstPane(state, sibling_id) orelse return error.StaleId;
-    const window_id = tab.window;
-    try out.effects.ensureUnusedCapacity(state.allocator, 4);
+    try out.effects.ensureUnusedCapacity(state.allocator, 2);
     try state.node_ids.free.ensureUnusedCapacity(state.allocator, 2);
     try state.pane_ids.free.ensureUnusedCapacity(state.allocator, 1);
 
@@ -444,21 +430,18 @@ fn closePane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !
     try state.pane_ids.release(state.allocator, pane_id);
     if (tab.focused_pane.eql(pane_id)) tab.focused_pane = next_focus;
 
-    out.effects.appendAssumeCapacity(.{ .destroy_surface = pane_id });
     out.effects.appendAssumeCapacity(.{ .focus_surface = tab.focused_pane });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window_id });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
 fn closeTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !void {
     const tab = state.tab(tab_id) orelse return error.StaleId;
-    const window_id = tab.window;
     const window = activeWindowForTab(state, tab_id) orelse return error.StaleId;
-    if (window.tabs.items.len == 1) return closeWindow(state, out, window_id);
+    if (window.tabs.items.len == 1) return closeWindow(state, out, tab.window);
     const active_index = indexOfId(window.tabs.items, tab_id) orelse return error.StaleId;
 
     const pane_count = selectors.paneCount(state, tab_id);
-    try out.effects.ensureUnusedCapacity(state.allocator, pane_count + 3);
+    try out.effects.ensureUnusedCapacity(state.allocator, 2);
     try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count);
     var node_count: usize = 0;
     for (state.nodes.items) |node| if (node.tab.eql(tab_id)) {
@@ -472,7 +455,6 @@ fn closeTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !voi
         i -= 1;
         if (state.panes.items[i].tab.eql(tab_id)) {
             const id = state.panes.items[i].id;
-            out.effects.appendAssumeCapacity(.{ .destroy_surface = id });
             _ = state.panes.swapRemove(i);
             try state.pane_ids.release(state.allocator, id);
         }
@@ -494,20 +476,18 @@ fn closeTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !voi
     }
     const focused = state.tab(window.active_tab.?).?.focused_pane;
     out.effects.appendAssumeCapacity(.{ .focus_surface = focused });
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window_id });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
 fn detachTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !void {
-    const tab = state.tab(tab_id) orelse return error.StaleId;
     const window = activeWindowForTab(state, tab_id) orelse return error.StaleId;
     const active_index = indexOfId(window.tabs.items, tab_id) orelse return error.StaleId;
     const was_active = window.active_tab != null and window.active_tab.?.eql(tab_id);
     const was_focused_window = state.focused_window != null and state.focused_window.?.eql(window.id);
 
     try window.retained_tabs.ensureUnusedCapacity(state.allocator, 1);
-    // relayout + persist, with one optional replacement focus.
-    try out.effects.ensureUnusedCapacity(state.allocator, 3);
+    // persist, with one optional replacement focus.
+    try out.effects.ensureUnusedCapacity(state.allocator, 2);
 
     _ = window.tabs.orderedRemove(active_index);
     window.retained_tabs.appendAssumeCapacity(tab_id);
@@ -525,7 +505,6 @@ fn detachTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !vo
             }
         }
     }
-    out.effects.appendAssumeCapacity(.{ .relayout_window = tab.window });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
@@ -542,7 +521,7 @@ fn restoreTab(
     const retained_index = indexOfId(window.retained_tabs.items, tab_id) orelse return error.StaleId;
 
     try window.tabs.ensureUnusedCapacity(state.allocator, 1);
-    try out.effects.ensureUnusedCapacity(state.allocator, 3);
+    try out.effects.ensureUnusedCapacity(state.allocator, 2);
 
     _ = window.retained_tabs.orderedRemove(retained_index);
     window.tabs.insertAssumeCapacity(index, tab_id);
@@ -551,11 +530,11 @@ fn restoreTab(
         state.focused_window = window.id;
         out.effects.appendAssumeCapacity(.{ .focus_surface = tab.focused_pane });
     }
-    out.effects.appendAssumeCapacity(.{ .relayout_window = window.id });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
-fn discardDetachedTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !void {
+/// A retained tab was never part of the saved session; nothing to persist.
+fn discardDetachedTab(state: *model.ShellState, tab_id: model.TabId) !void {
     const window = retainingWindowForTab(state, tab_id) orelse return error.StaleId;
     const retained_index = indexOfId(window.retained_tabs.items, tab_id) orelse return error.StaleId;
     const window_id = window.id;
@@ -566,7 +545,6 @@ fn discardDetachedTab(state: *model.ShellState, out: *Reduction, tab_id: model.T
     }
     const remove_window = window.tabs.items.len == 0 and window.retained_tabs.items.len == 1;
 
-    try out.effects.ensureUnusedCapacity(state.allocator, pane_count + @as(usize, if (remove_window) 2 else 1));
     try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count);
     try state.node_ids.free.ensureUnusedCapacity(state.allocator, node_count);
     try state.tab_ids.free.ensureUnusedCapacity(state.allocator, 1);
@@ -578,7 +556,6 @@ fn discardDetachedTab(state: *model.ShellState, out: *Reduction, tab_id: model.T
         i -= 1;
         if (state.panes.items[i].tab.eql(tab_id)) {
             const id = state.panes.items[i].id;
-            out.effects.appendAssumeCapacity(.{ .destroy_surface = id });
             _ = state.panes.swapRemove(i);
             try state.pane_ids.release(state.allocator, id);
         }
@@ -598,22 +575,18 @@ fn discardDetachedTab(state: *model.ShellState, out: *Reduction, tab_id: model.T
     if (remove_window) {
         removeWindow(state, window_id);
         try state.window_ids.release(state.allocator, window_id);
-        out.effects.appendAssumeCapacity(.{ .destroy_window = window_id });
     }
-    out.effects.appendAssumeCapacity(.persist_session);
 }
 
 fn reorderTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId, index: usize) !void {
-    const tab = state.tab(tab_id) orelse return error.StaleId;
     const window = activeWindowForTab(state, tab_id) orelse return error.StaleId;
     if (index >= window.tabs.items.len) return error.InvalidIndex;
     const old_index = indexOfId(window.tabs.items, tab_id) orelse return error.StaleId;
     if (old_index == index) return;
 
-    try out.effects.ensureUnusedCapacity(state.allocator, 2);
+    try out.effects.ensureUnusedCapacity(state.allocator, 1);
     _ = window.tabs.orderedRemove(old_index);
     window.tabs.insertAssumeCapacity(index, tab_id);
-    out.effects.appendAssumeCapacity(.{ .relayout_window = tab.window });
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
@@ -627,7 +600,7 @@ fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.Windo
             node_count += 1;
         };
     };
-    try out.effects.ensureUnusedCapacity(state.allocator, pane_count + 2);
+    try out.effects.ensureUnusedCapacity(state.allocator, 1);
     try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count);
     try state.node_ids.free.ensureUnusedCapacity(state.allocator, node_count);
     try state.tab_ids.free.ensureUnusedCapacity(state.allocator, window.tabs.items.len + window.retained_tabs.items.len);
@@ -643,7 +616,6 @@ fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.Windo
             i -= 1;
             if (state.panes.items[i].tab.eql(tab_id)) {
                 const id = state.panes.items[i].id;
-                out.effects.appendAssumeCapacity(.{ .destroy_surface = id });
                 _ = state.panes.swapRemove(i);
                 try state.pane_ids.release(state.allocator, id);
             }
@@ -662,7 +634,6 @@ fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.Windo
     }
     removeWindow(state, window_id);
     try state.window_ids.release(state.allocator, window_id);
-    out.effects.appendAssumeCapacity(.{ .destroy_window = window_id });
     out.effects.appendAssumeCapacity(.persist_session);
 
     if (state.focused_window == null or state.focused_window.?.eql(window_id)) {
@@ -811,6 +782,32 @@ fn removeTabId(window: *model.Window, id: model.TabId) void {
     };
 }
 
+test "a tab is created where the native strip puts it" {
+    var state = model.ShellState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const window_id = state.focused_window.?;
+    reduction = try apply(&state, .{ .create_tab = .{ .window = window_id } });
+    reduction.deinit(std.testing.allocator);
+    const window = state.window(window_id).?;
+    const first = window.tabs.items[0];
+    const second = window.tabs.items[1];
+
+    // Next to the first tab, as `window-new-tab-position = current` does.
+    reduction = try apply(&state, .{ .create_tab = .{ .window = window_id, .index = 1 } });
+    reduction.deinit(std.testing.allocator);
+    try std.testing.expect(window.tabs.items[0].eql(first));
+    try std.testing.expect(window.tabs.items[1].eql(window.active_tab.?));
+    try std.testing.expect(window.tabs.items[2].eql(second));
+    // An index past the end appends.
+    reduction = try apply(&state, .{ .create_tab = .{ .window = window_id, .index = 9 } });
+    reduction.deinit(std.testing.allocator);
+    try std.testing.expect(window.tabs.items[3].eql(window.active_tab.?));
+    try state.validate();
+}
+
 test "close active tab preserves adjacent focus instead of jumping to first tab" {
     var state = model.ShellState.init(std.testing.allocator);
     defer state.deinit();
@@ -820,7 +817,7 @@ test "close active tab preserves adjacent focus instead of jumping to first tab"
     const window_id = state.focused_window.?;
 
     inline for (0..3) |_| {
-        reduction = try apply(&state, .{ .create_tab = window_id });
+        reduction = try apply(&state, .{ .create_tab = .{ .window = window_id } });
         reduction.deinit(std.testing.allocator);
     }
 
@@ -851,7 +848,7 @@ test "close active last tab preserves previous adjacent focus" {
     reduction.deinit(std.testing.allocator);
     const window_id = state.focused_window.?;
 
-    reduction = try apply(&state, .{ .create_tab = window_id });
+    reduction = try apply(&state, .{ .create_tab = .{ .window = window_id } });
     reduction.deinit(std.testing.allocator);
 
     const window = state.window(window_id).?;

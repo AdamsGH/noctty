@@ -1,6 +1,8 @@
 //! Two-phase bridge between the pure shell reducer and fallible native work.
 //! Prepare mutates an isolated candidate; commit is the sole authoritative
 //! state swap. Dropping a prepared transaction rolls the candidate back.
+//! A committed transaction keeps its reduction's effects until it is
+//! dropped, for the platform to apply (`Prepared.effects`).
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -35,6 +37,7 @@ pub const Runtime = struct {
         return .{
             .next = next,
             .reduction = reduction,
+            .allocator = self.state.allocator,
             .created = createdEntities(&next, &reduction),
             .intent = intent,
             .expected_revision = self.revision,
@@ -78,16 +81,18 @@ pub const Runtime = struct {
 
     /// Emergency close reconciliation after native teardown. The close
     /// reducers reserve every fallible allocation before mutating state, so a
-    /// failure leaves authority unchanged.
-    pub fn forceClose(self: *Runtime, intent: intent_mod.Intent) !void {
+    /// failure leaves authority unchanged. The caller applies the returned
+    /// effects and frees them with the state's allocator.
+    pub fn forceClose(self: *Runtime, intent: intent_mod.Intent) !reducer.Reduction {
         switch (intent) {
             .close_window, .close_tab, .close_pane => {},
             else => return error.InvalidForceIntent,
         }
         var reduction = try reducer.apply(&self.state, intent);
-        defer reduction.deinit(self.state.allocator);
+        errdefer reduction.deinit(self.state.allocator);
         try self.state.validate();
         self.bumpRevision();
+        return reduction;
     }
 
     /// Remove a just-created window after native session restore fails.
@@ -147,22 +152,30 @@ pub const Runtime = struct {
 pub const Prepared = struct {
     next: ?model.ShellState,
     reduction: reducer.Reduction,
+    allocator: std.mem.Allocator,
     created: Created,
     intent: intent_mod.Intent,
     expected_revision: u64,
 
     pub fn deinit(self: *Prepared) void {
         if (self.next) |*next| {
-            self.reduction.deinit(next.allocator);
             next.deinit();
             self.next = null;
         }
+        self.reduction.deinit(self.allocator);
+        self.reduction = .{};
+    }
+
+    /// What the committed transaction asks of the platform. Empty until it
+    /// commits, and when a retry found its work already done.
+    pub fn effects(self: *const Prepared) []const reducer.Effect {
+        if (self.next != null) return &.{};
+        return self.reduction.effects.items;
     }
 
     pub fn commit(self: *Prepared, runtime: *Runtime) !void {
         if (runtime.revision != self.expected_revision) return error.StaleRevision;
         const next = self.next orelse return;
-        self.reduction.deinit(next.allocator);
         runtime.state.deinit();
         runtime.state = next;
         self.next = null;
@@ -181,6 +194,10 @@ pub const Prepared = struct {
                 };
                 defer retry.deinit();
                 try retry.commit(runtime);
+                // What the retry did is what happened.
+                std.mem.swap(reducer.Reduction, &self.reduction, &retry.reduction);
+                if (self.next) |*stale| stale.deinit();
+                self.next = null;
             },
             else => return err,
         };
@@ -231,7 +248,7 @@ test "discarded transaction preserves authoritative state and generations" {
     const window_id = runtime.state.windows.items[0].id;
     const generations = runtime.state.tab_ids.generations.items.len;
 
-    var discarded = try runtime.prepare(.{ .create_tab = window_id });
+    var discarded = try runtime.prepare(.{ .create_tab = .{ .window = window_id } });
     discarded.deinit();
     try runtime.state.validate();
     try std.testing.expectEqual(@as(usize, 1), runtime.state.tabs.items.len);
@@ -281,7 +298,7 @@ test "activating a pane shows it without making its window the focused one" {
     var second = try runtime.prepare(.create_window);
     defer second.deinit();
     try second.commit(&runtime);
-    var other_tab = try runtime.prepare(.{ .create_tab = second.created.window.? });
+    var other_tab = try runtime.prepare(.{ .create_tab = .{ .window = second.created.window.? } });
     defer other_tab.deinit();
     try other_tab.commit(&runtime);
     const first_window = first.created.window.?;
@@ -370,7 +387,7 @@ test "close tab retry preserves focus in the surviving tab" {
     const original_pane = window.created.pane.?;
     const original_tab = window.created.tab.?;
 
-    var second = try runtime.prepare(.{ .create_tab = window_id });
+    var second = try runtime.prepare(.{ .create_tab = .{ .window = window_id } });
     defer second.deinit();
     try second.commit(&runtime);
     const surviving_pane = second.created.pane.?;
@@ -388,6 +405,58 @@ test "close tab retry preserves focus in the surviving tab" {
     try std.testing.expect(runtime.state.tab(surviving_tab) != null);
     try std.testing.expect(runtime.state.window(window_id).?.active_tab.?.eql(surviving_tab));
     try std.testing.expect(runtime.state.tab(surviving_tab).?.focused_pane.eql(surviving_pane));
+}
+
+test "a committed transaction hands its effects to the platform" {
+    const allocator = std.testing.allocator;
+    var runtime = Runtime.init(allocator);
+    defer runtime.deinit();
+
+    var window = try runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&runtime);
+    const first = window.created.pane.?;
+    var split = try runtime.prepare(.{ .split_pane = .{ .pane = first, .direction = .right } });
+    defer split.deinit();
+    try split.commit(&runtime);
+    const second = split.created.pane.?;
+
+    // The focused new pane closes: its sibling takes focus.
+    var close = try runtime.prepare(.{ .close_pane = second });
+    defer close.deinit();
+    try std.testing.expectEqual(@as(usize, 0), close.effects().len);
+    try close.commit(&runtime);
+    try std.testing.expectEqual(@as(usize, 2), close.effects().len);
+    try std.testing.expect(close.effects()[0].focus_surface.eql(first));
+    try std.testing.expectEqual(std.meta.Tag(reducer.Effect).persist_session, std.meta.activeTag(close.effects()[1]));
+
+    // A retry hands over its own effects. In [first / (third | fourth)]
+    // with fourth focused, closing first would keep fourth; the user moved
+    // to third before the close committed, and third is what stays.
+    var again = try runtime.prepare(.{ .split_pane = .{ .pane = first, .direction = .down } });
+    defer again.deinit();
+    try again.commit(&runtime);
+    const third = again.created.pane.?;
+    var last = try runtime.prepare(.{ .split_pane = .{ .pane = third, .direction = .right } });
+    defer last.deinit();
+    try last.commit(&runtime);
+    var stale = try runtime.prepare(.{ .close_pane = first });
+    defer stale.deinit();
+    _ = try runtime.focusPane(third);
+    try stale.commitRetryingInterleavedFocus(&runtime);
+    try std.testing.expect(stale.effects()[0].focus_surface.eql(third));
+
+    // A close another path already made has nothing left to apply.
+    var split_back = try runtime.prepare(.{ .split_pane = .{ .pane = third, .direction = .right } });
+    defer split_back.deinit();
+    try split_back.commit(&runtime);
+    var done = try runtime.prepare(.{ .close_pane = third });
+    defer done.deinit();
+    var current = try runtime.prepare(.{ .close_pane = third });
+    defer current.deinit();
+    try current.commit(&runtime);
+    try done.commitRetryingInterleavedFocus(&runtime);
+    try std.testing.expectEqual(@as(usize, 0), done.effects().len);
 }
 
 test "close retry treats an already removed entity as complete" {

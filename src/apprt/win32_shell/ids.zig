@@ -21,9 +21,8 @@ pub const WindowId = Id("window");
 pub const TabId = Id("tab");
 pub const PaneId = Id("pane");
 pub const NodeId = Id("node");
-pub const EffectId = Id("effect");
 
-/// Slot allocator shared by pure shell entities and pending effects.
+/// Slot allocator for the shell entities.
 pub fn Pool(comptime EntityId: type) type {
     return struct {
         generations: std.ArrayList(u32) = .empty,

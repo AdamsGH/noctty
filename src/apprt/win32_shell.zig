@@ -48,7 +48,7 @@ test "window tab split focus close lifecycle" {
     try std.testing.expectError(error.StaleId, reducer.apply(&state, .{ .focus_pane = first_pane }));
 
     result.deinit(allocator);
-    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result = try reducer.apply(&state, .{ .create_tab = .{ .window = window_id } });
     try state.validate();
     try std.testing.expectEqual(@as(usize, 2), state.tabs.items.len);
 
@@ -167,15 +167,14 @@ test "win32 shell retained multi-pane tab restores exact identity and topology" 
     const nodes_before = try allocator.dupe(model.Node, state.nodes.items);
     defer allocator.free(nodes_before);
 
-    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result = try reducer.apply(&state, .{ .create_tab = .{ .window = window_id } });
     result.deinit(allocator);
     const second_tab = state.window(window_id).?.active_tab.?;
 
     result = try reducer.apply(&state, .{ .detach_tab = retained_tab });
     defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
-    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
+    try std.testing.expectEqual(@as(usize, 1), result.effects.items.len);
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[0]));
     try state.validate();
     try std.testing.expectEqual(@as(usize, 1), state.window(window_id).?.tabs.items.len);
     try std.testing.expect(state.window(window_id).?.tabs.items[0].eql(second_tab));
@@ -187,10 +186,9 @@ test "win32 shell retained multi-pane tab restores exact identity and topology" 
 
     result.deinit(allocator);
     result = try reducer.apply(&state, .{ .restore_tab = .{ .tab = retained_tab, .index = 0 } });
-    try std.testing.expectEqual(@as(usize, 3), result.effects.items.len);
+    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
     try std.testing.expectEqual(.focus_surface, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[1]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[2]));
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
     try state.validate();
     const window = state.window(window_id).?;
     try std.testing.expectEqual(@as(usize, 2), window.tabs.items.len);
@@ -217,9 +215,8 @@ test "win32 shell last active tab becomes retained inactive window and restores"
 
     result = try reducer.apply(&state, .{ .detach_tab = tab_id });
     defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
-    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
+    try std.testing.expectEqual(@as(usize, 1), result.effects.items.len);
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[0]));
     try state.validate();
     const inactive = state.window(window_id).?;
     try std.testing.expectEqual(@as(usize, 0), inactive.tabs.items.len);
@@ -232,10 +229,9 @@ test "win32 shell last active tab becomes retained inactive window and restores"
 
     result.deinit(allocator);
     result = try reducer.apply(&state, .{ .restore_tab = .{ .tab = tab_id, .index = 0 } });
-    try std.testing.expectEqual(@as(usize, 3), result.effects.items.len);
+    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
     try std.testing.expectEqual(.focus_surface, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[1]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[2]));
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
     try state.validate();
     try std.testing.expect(state.focused_window.?.eql(window_id));
     try std.testing.expect(state.window(window_id).?.active_tab.?.eql(tab_id));
@@ -251,7 +247,7 @@ test "win32 shell restoring a tab that closed behind the front one leaves the fr
     result.deinit(allocator);
     const window_id = state.windows.items[0].id;
     const behind = state.tabs.items[0].id;
-    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result = try reducer.apply(&state, .{ .create_tab = .{ .window = window_id } });
     result.deinit(allocator);
     const front = state.window(window_id).?.active_tab.?;
     result = try reducer.apply(&state, .{ .detach_tab = behind });
@@ -260,9 +256,8 @@ test "win32 shell restoring a tab that closed behind the front one leaves the fr
 
     result = try reducer.apply(&state, .{ .restore_tab = .{ .tab = behind, .index = 0, .activate = false } });
     defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
-    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
+    try std.testing.expectEqual(@as(usize, 1), result.effects.items.len);
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[0]));
     try state.validate();
     const window = state.window(window_id).?;
     try std.testing.expect(window.tabs.items[0].eql(behind));
@@ -316,11 +311,8 @@ test "win32 shell discarding detached tab releases complete subtree and retained
     result.deinit(allocator);
     result = try reducer.apply(&state, .{ .discard_detached_tab = tab_id });
     defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 4), result.effects.items.len);
-    try std.testing.expectEqual(.destroy_surface, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.destroy_surface, std.meta.activeTag(result.effects.items[1]));
-    try std.testing.expectEqual(.destroy_window, std.meta.activeTag(result.effects.items[2]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[3]));
+    // Expired history was never on screen or in the saved session.
+    try std.testing.expectEqual(@as(usize, 0), result.effects.items.len);
     try state.validate();
     try std.testing.expectEqual(@as(usize, 0), state.windows.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.tabs.items.len);
@@ -432,18 +424,17 @@ test "win32 shell ordered tab reorder preserves active identity" {
     result.deinit(allocator);
     const window_id = state.windows.items[0].id;
     const first = state.tabs.items[0].id;
-    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result = try reducer.apply(&state, .{ .create_tab = .{ .window = window_id } });
     result.deinit(allocator);
     const second = state.window(window_id).?.active_tab.?;
-    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result = try reducer.apply(&state, .{ .create_tab = .{ .window = window_id } });
     result.deinit(allocator);
     const third = state.window(window_id).?.active_tab.?;
 
     result = try reducer.apply(&state, .{ .reorder_tab = .{ .tab = first, .index = 2 } });
     defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), result.effects.items.len);
-    try std.testing.expectEqual(.relayout_window, std.meta.activeTag(result.effects.items[0]));
-    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[1]));
+    try std.testing.expectEqual(@as(usize, 1), result.effects.items.len);
+    try std.testing.expectEqual(.persist_session, std.meta.activeTag(result.effects.items[0]));
     try state.validate();
     const window = state.window(window_id).?;
     try std.testing.expect(window.tabs.items[0].eql(second));
@@ -498,7 +489,7 @@ test "win32 shell whole tab transfer preserves subtree identities and exact undo
     const source_node_count = shell_runtime.state.nodes.items.len;
     const source_pane_count = shell_runtime.state.panes.items.len;
 
-    prepared = try shell_runtime.prepare(.{ .create_tab = window_id });
+    prepared = try shell_runtime.prepare(.{ .create_tab = .{ .window = window_id } });
     try prepared.commit(&shell_runtime);
     prepared.deinit();
     const target_tab = shell_runtime.state.window(window_id).?.active_tab.?;
@@ -567,7 +558,7 @@ test "win32 shell pane rooted subtree transfer restores source and target focus 
     const moved_pane = state.tab(source_tab).?.focused_pane;
     const moved_root = (findTestPaneNode(&state, source_tab, moved_pane) orelse unreachable).id;
 
-    result = try reducer.apply(&state, .{ .create_tab = window_id });
+    result = try reducer.apply(&state, .{ .create_tab = .{ .window = window_id } });
     result.deinit(allocator);
     const target_tab = state.window(window_id).?.active_tab.?;
     const target_pane = state.tab(target_tab).?.focused_pane;
@@ -621,7 +612,7 @@ test "win32 shell transfer allocation failure and stale commit do not mutate aut
     const window_id = shell_runtime.state.windows.items[0].id;
     const source_root = shell_runtime.state.tabs.items[0].root;
     const source_pane = shell_runtime.state.tabs.items[0].focused_pane;
-    prepared = try shell_runtime.prepare(.{ .create_tab = window_id });
+    prepared = try shell_runtime.prepare(.{ .create_tab = .{ .window = window_id } });
     try prepared.commit(&shell_runtime);
     prepared.deinit();
     const target_pane = shell_runtime.state.tab(shell_runtime.state.window(window_id).?.active_tab.?).?.focused_pane;

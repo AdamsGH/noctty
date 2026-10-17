@@ -124,7 +124,8 @@ dumps, and SSH host cache go there.
   files Noctty does read, `ghostty\config` or `winghostty\config.ghostty`, if
   one exists, rather than creating a new Noctty config.
 - **Session restore:** `session-state.json`, saved when Noctty closes, when
-  you sign out or shut down, and when the display configuration changes, by
+  you sign out or shut down, when the display configuration changes, and
+  one second after a burst of window, tab or pane structural changes settles, by
   the one Noctty process that owns it: one started normally, which holds
   `session-state.json.lock` while it runs. Other Noctty processes (a second
   instance, an "Open noctty here" window, a default terminal handoff) never

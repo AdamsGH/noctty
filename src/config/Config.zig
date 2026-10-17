@@ -2244,7 +2244,8 @@ keybind: Keybinds = .{},
 ///
 ///   * `never` will never save window state.
 ///
-///   * `always` will always save window state whenever Ghostty is exited.
+///   * `always` will save window state on exit and at the Windows checkpoints
+///     described below.
 ///
 /// If you change this value to `never` while Ghostty is not running, the next
 /// Ghostty launch will NOT restore the window state.
@@ -2253,13 +2254,16 @@ keybind: Keybinds = .{},
 /// previous exit saved state, the next Ghostty launch may still restore the
 /// previous state if the runtime keeps compatibility files around.
 ///
-/// If you change this value so that window state is saved while Ghostty is not
-/// running, the previous window state will not be restored because Ghostty only
-/// saves state on exit if this is enabled.
+/// Enabling this while Ghostty is not running cannot recover a previous
+/// session that was never saved while this setting was enabled.
 ///
 /// The default value is `default`.
 ///
-/// On Windows this persists the practical window/session shape on app exit:
+/// On Windows the session's owning process saves on exit, at sign-out or
+/// shutdown, when the display configuration changes, and one second after
+/// a burst of window, tab or pane structural changes settles. Checkpoints
+/// use the same ownership and privacy rules as the exit save and never run
+/// during startup restore. The practical window/session shape includes:
 /// host window rectangle/state plus tab, split, profile, working-directory,
 /// and explicit title metadata. Child process state is not restored. The
 /// opt-in `window-save-state-scrollback` setting can additionally restore a
