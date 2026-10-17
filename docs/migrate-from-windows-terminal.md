@@ -61,15 +61,18 @@ profile inheritance. Copy only the lines you need.
 ### The bell
 
 `bell-features` is a comma-separated list, and a feature with a `no-` prefix is
-off. Windows Terminal's `bellStyle` maps like this:
+off. Unspecified features keep their defaults, so the mappings below explicitly
+turn off noctty's title glyph. Windows Terminal's `bellStyle` maps like this:
 
-| `bellStyle` | `bell-features`                   |
-| ----------- | --------------------------------- |
-| `audible`   | `system`                          |
-| `window`    | `attention`                       |
-| `taskbar`   | `attention`                       |
-| `all`       | `system,attention`                |
-| `none`      | `no-system,no-attention,no-title` |
+| `bellStyle` | `bell-features`                |
+| ----------- | ------------------------------ |
+| `audible`   | `system,no-attention,no-title` |
+| `window`    | `attention,no-title`           |
+| `taskbar`   | `attention,no-title`           |
+| `all`       | `system,attention,no-title`    |
+| `none`      | `false`                        |
+
+The `window` mapping uses the taskbar flash; noctty does not flash the caption.
 
 `system` plays the Windows system sound, `attention` flashes the window's
 taskbar button until the window is in front, and `bellSound` is `audio` with
@@ -77,8 +80,8 @@ taskbar button until the window is in front, and `bellSound` is `audio` with
 equivalent for). Windows Terminal's default is `audible`; noctty's default is
 `attention,title`, which plays nothing and, for a terminal you are not looking
 at, flashes the taskbar button and puts a bell glyph on the tab and the window
-caption until you focus or type into it. Set `bell-features = system` to keep
-Windows Terminal's behaviour. See
+caption until you focus or type into it. Set
+`bell-features = system,no-attention,no-title` to keep Windows Terminal's behaviour. See
 [the capability matrix](windows-capability-matrix.md#notifications-and-progress)
 for the details.
 
