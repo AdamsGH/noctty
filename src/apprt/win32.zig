@@ -9897,6 +9897,7 @@ pub const App = struct {
                 try fresh.setFloatWindow(.on);
                 if (host.hwnd) |top_level| self.showQuickTerminalWindow(top_level, want_focus);
                 self.showHostSurface(fresh, want_focus);
+                self.auditCreationAfterActivation();
                 return;
             };
             const top_level = host.hwnd orelse return;
@@ -27243,12 +27244,20 @@ const QuickTerminalFreshTab = struct {
         calls += 1;
         host_id = opts.host_id;
         const surface = &fixture.fresh;
+        var prepared = (try app.prepareShellSurfaceCreate(&fixture.host, opts)).?;
+        defer prepared.deinit();
         try app.windows.append(app.core_app.alloc, surface);
         try fixture.host.tabs.insert(
             app.core_app.alloc,
             0,
             try Tab.init(app.core_app.alloc, fixture.host.nextTabId(), surface),
         );
+        try prepared.commit(&app.shell_runtime);
+        surface.shell_id = prepared.created.pane;
+        surface.shell_committed = true;
+        fixture.host.tabs.items[0].shell_id = prepared.created.tab;
+        // Surface.init leaves the audit to the caller that shows the tab.
+        app.shell_audit_after_activation = true;
         return surface;
     }
 };
@@ -27262,6 +27271,14 @@ test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing 
             defer fixture.deinit();
             // `close_tab:this` on the only tab keeps the host and the
             // surface for undo, and nothing in the host shows it.
+            fixture.app.shell_runtime_initialized = true;
+            var window = try fixture.app.shell_runtime.prepare(.create_window);
+            defer window.deinit();
+            try window.commit(&fixture.app.shell_runtime);
+            fixture.host.shell_id = window.created.window;
+            var close = try fixture.app.shell_runtime.prepare(.{ .detach_tab = window.created.tab.? });
+            defer close.deinit();
+            try close.commit(&fixture.app.shell_runtime);
             var detached = fixture.host.tabs.orderedRemove(0);
             defer detached.deinit();
             fixture.surface.window_visible = false;
@@ -27278,6 +27295,7 @@ test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing 
 
             // Dismissed, it opens a fresh tab and shows that, never the
             // surface that was detached.
+            defer appendOwnedString(std.testing.allocator, &fixture.host.cached_window_title, null) catch unreachable;
             try fixture.app.toggleQuickTerminal();
             try std.testing.expectEqual(@as(usize, 1), QuickTerminalFreshTab.calls);
             try std.testing.expectEqual(@as(?u32, fixture.host.id), QuickTerminalFreshTab.host_id);
@@ -27285,11 +27303,13 @@ test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing 
             try std.testing.expect(fixture.visible());
             try std.testing.expect(fixture.fresh.window_visible);
             try std.testing.expect(fixture.host.activeSurface() == &fixture.fresh);
+            // Passive showing bypasses activateSurface, but must complete
+            // the pending structural audit before returning to the pump.
+            try std.testing.expect(!fixture.app.shell_audit_after_activation);
+            try fixture.app.validateShellNativeMapping();
             // The window floats with the tab it shows, so a tab switch or
             // undo does not drop it below other windows.
             try std.testing.expect(fixture.fresh.topmost);
-            // Showing it refreshed the chrome, which cached the title.
-            appendOwnedString(std.testing.allocator, &fixture.host.cached_window_title, null) catch unreachable;
         }
     }.body);
 }
@@ -43838,7 +43858,10 @@ const ShellProjectionSteps = struct {
     /// A new tab at `index` (`window-new-tab-position`), or at the end.
     fn newTab(app: *App, host: *Host, id: u32, view: *Surface, index: ?usize) !void {
         const at = requestedTabInsertIndex(index, host.tabs.items.len);
-        var prepared = try app.shell_runtime.prepare(.{ .create_tab = .{ .window = host.shell_id.?, .index = at } });
+        var prepared = (try app.prepareShellSurfaceCreate(host, .{
+            .host_id = host.id,
+            .tab_insert_index = index,
+        })).?;
         defer prepared.deinit();
         try prepared.commit(&app.shell_runtime);
         view.shell_id = prepared.created.pane;
