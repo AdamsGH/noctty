@@ -1,0 +1,80 @@
+name: Windows CLI Forwarder
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: CLI forwarder (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2025
+          - arch: arm64
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Isolate the measurement build's Shell identity
+        shell: pwsh
+        run: |
+          $path = Join-Path $PWD 'src/apprt/win32_aumid.zig'
+          $text = [IO.File]::ReadAllText($path)
+          $text = $text.Replace('"io.github.amanthanvi.noctty"', '"io.github.amanthanvi.noctty.measure"')
+          $signature = 'pub fn registerAumidDisplayName\(alloc: std\.mem\.Allocator, portable: bool\) void \{'
+          if ([regex]::Matches($text, $signature).Count -ne 1) { throw 'AUMID isolation signature changed.' }
+          $text = [regex]::Replace($text, $signature, '$0' + "`n    if (true) return; // MEASUREMENT ONLY")
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+
+      - name: Build native binaries
+        shell: pwsh
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcustom-shaders=true -Dcpu=baseline --summary all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Path ./zig-out/bin/noctty.portable | Out-Null
+
+      - name: Hidden desktop CLI forwarding contracts
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./test/windows/cli-com-forwarder.ps1 -BinDir ./zig-out/bin -OutputDir ./zig-out/cli-forwarder-evidence
+
+      - name: Upload forwarding evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: cli-forwarder-${{ matrix.arch }}-${{ github.run_id }}
+          path: zig-out/cli-forwarder-evidence
+          if-no-files-found: warn
