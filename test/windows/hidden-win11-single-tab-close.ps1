@@ -359,7 +359,7 @@ function Measure-Close($case,[string]$Action,[int]$Seconds=10) {
         [Ds]::Key((Pane $h),0x74)        # F5: close_tab:this
     }
     $timeline=[Collections.Generic.List[object]]::new()
-    $exitedAt=$null; $hostGoneAt=$null; $promptAt=$null; $tabGoneAt=$null
+    $exitCode=$null; $exitedAt=$null; $hostGoneAt=$null; $promptAt=$null; $tabGoneAt=$null
     do {
         $ms=[int]([datetime]::UtcNow-$started).TotalMilliseconds
         $alive=[Ds]::Alive($h)
@@ -372,7 +372,7 @@ function Measure-Close($case,[string]$Action,[int]$Seconds=10) {
         if($av -and $null -eq $promptAt) { $promptAt=$ms }
         if(-not $tv -and $null -eq $tabGoneAt) { $tabGoneAt=$ms }
         if(-not $alive -and $null -eq $hostGoneAt) { $hostGoneAt=$ms }
-        if($exited -and $null -eq $exitedAt) { $exitedAt=$ms }
+        if($exited -and $null -eq $exitedAt) { $exitedAt=$ms; [uint32]$code=0; [void][Ds]::GetExitCodeProcess($case.Pi.process,[ref]$code); $exitCode=$code }
         $timeline.Add(@{Ms=$ms;HostAlive=$alive;HostVisible=$vis;TabShown=$tv;PromptShown=$av;ProcessExited=$exited})
         if($exited) { break }
         Start-Sleep -Milliseconds 100
@@ -383,7 +383,7 @@ function Measure-Close($case,[string]$Action,[int]$Seconds=10) {
         $key="$($s.HostAlive)|$($s.HostVisible)|$($s.TabShown)|$($s.PromptShown)|$($s.ProcessExited)"
         if($key -ne $prev) { $changes.Add($s); $prev=$key }
     }
-    return @{ Action=$Action; TabShownBefore=$tabShown; Dpi=$dpi; TabPromptMs=$promptAt; TabGoneMs=$tabGoneAt; HostGoneMs=$hostGoneAt; ProcessExitedMs=$exitedAt; LastMs=$ms; Changes=$changes }
+    return @{ Action=$Action; TabShownBefore=$tabShown; Dpi=$dpi; TabPromptMs=$promptAt; TabGoneMs=$tabGoneAt; HostGoneMs=$hostGoneAt; ProcessExitedMs=$exitedAt; ExitCode=$exitCode; LastMs=$ms; Changes=$changes }
 }
 
 
@@ -409,7 +409,7 @@ try {
         Check 'idle X: no prompt for an idle shell' ($null -eq $r.TabPromptMs) $null $r.TabPromptMs
         Check 'idle X: the window closes within 3 s' ($null -ne $r.HostGoneMs -and $r.HostGoneMs -lt 3000) '< 3000' $r.HostGoneMs
         Check 'idle X: no empty window stays on screen' ((Empty-Frame-Ms $r) -lt 1000) '< 1000' (Empty-Frame-Ms $r)
-        Check 'idle X: the process exits' ($null -ne $r.ProcessExitedMs -and $r.ProcessExitedMs -lt 3000) '< 3000' $r.ProcessExitedMs
+        Check 'idle X: the process exits cleanly' ($null -ne $r.ProcessExitedMs -and $r.ProcessExitedMs -lt 3000 -and $r.ExitCode -eq 0) 'exit 0 in < 3000 ms' @{Ms=$r.ProcessExitedMs;Code=$r.ExitCode}
     } finally { Close-Case $case }
 
     # With a process running it asks once, for the window; Cancel keeps
@@ -429,8 +429,9 @@ try {
         $r2=Measure-Close $case 'x' 3                  # ask again, then accept
         Check 'busy X: the X asks again' ($null -ne $r2.TabPromptMs) 'prompt' $r2.TabPromptMs
         Press-Prompt $h 2003                           # Close
-        $closed=Wait-Until { -not [Ds]::Alive($h) -or [Ds]::WaitForSingleObject($case.Pi.process,0) -ne 258 } 8
-        Check 'busy X: Close ends the window and the process' $closed $true $closed
+        $closed=Wait-Until { -not [Ds]::Alive($h) -and [Ds]::WaitForSingleObject($case.Pi.process,0) -ne 258 } 8
+        [uint32]$busyCode=0xFFFF; [void][Ds]::GetExitCodeProcess($case.Pi.process,[ref]$busyCode)
+        Check 'busy X: Close ends the window and the process, cleanly' ($closed -and $busyCode -eq 0) 'window gone, exit 0' @{Closed=$closed;Code=$busyCode}
     } finally { Close-Case $case }
 
     if($Scenario -eq 'full') {
