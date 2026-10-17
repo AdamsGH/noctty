@@ -457,10 +457,12 @@ pub const Face = struct {
                 // rounds to zero. Two units are its smallest useful stroke.
                 amount = @max(amount, @max(2, @ceil(pixels_per_em * 2 * fraction)));
             }
-            if (amount > 0 and freetype.c.FT_Outline_Embolden(
-                &glyph.*.outline,
-                @intFromFloat(amount),
-            ) != 0) return error.GlyphEmboldenFailed;
+            if (amount > 0) {
+                // Preserve synthetic bold's fallback for outlines FreeType
+                // cannot orient (for example, zero-area contours): render
+                // the original glyph rather than failing its cache entry.
+                _ = freetype.c.FT_Outline_Embolden(&glyph.*.outline, @intFromFloat(amount));
+            }
         }
 
         // We get a rect that represents the position
