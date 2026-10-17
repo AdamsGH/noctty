@@ -62,9 +62,10 @@ $Profile = @($Profile | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $desktopName = [HiddenWin]::CurrentDesktopName()
 if (-not $desktopName.StartsWith('noctty-hw-')) { throw "Driver is not on its own desktop (found '$desktopName')." }
 $sentinel = [HiddenWin]::CreateDriverSentinel()
-$driverFailure = $null; $job = [IntPtr]::Zero
+$driverFailure = $null; $job = [IntPtr]::Zero; $driverApproved = $false
 try {
 Wait-HiddenDriverApproval -Run $Run -DesktopName $desktopName
+$driverApproved = $true
 $job = [HiddenWin]::CreateOwnedJob()
 $desktopReceipt = Join-Path $Run 'profile-desktops.jsonl'
 $checks = [Collections.Generic.List[object]]::new()
@@ -343,4 +344,4 @@ Check 'matrix' 'at least one profile ran' ($anyRan -gt 0) '>= 1' $anyRan
     ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'profile-matrix-results.json')
 $failed = @($checks | Where-Object { -not $_.Passed })
 if ($failed.Count) { exit 1 }
-} catch { $driverFailure = $_; throw } finally { Close-HiddenDriverSentinel -Sentinel $sentinel -Run $Run -WaitForParent -PrimaryFailure $driverFailure -OwnedJob $job }
+} catch { $driverFailure = $_; throw } finally { Close-HiddenDriverSentinel -Sentinel $sentinel -Run $Run -WaitForParent:$driverApproved -PrimaryFailure $driverFailure -OwnedJob $job }

@@ -275,6 +275,7 @@ public static class HiddenWin {
     }
     public sealed class DesktopWindowObservation {
         public int ProcessId, ThreadId;
+        public bool CompletedAttempt;
     }
     // EnumWindows sees the calling thread's desktop. Call only from the outer Default driver.
     // No window titles or unrelated window metadata are retained.
@@ -282,6 +283,7 @@ public static class HiddenWin {
         var ids = new HashSet<int>(JobProcessIds(job));
         var rows = new List<DesktopWindowObservation>();
         for (int attempt = 0; attempt < 3; attempt++) {
+            int attemptStart = rows.Count;
             bool ownerFailed = false; int ownerError = 0;
             SetLastError(0);
             bool complete = EnumWindows((h, p) => {
@@ -291,7 +293,10 @@ public static class HiddenWin {
                 return true;
             }, IntPtr.Zero);
             int error = ownerFailed ? ownerError : Marshal.GetLastWin32Error();
-            if (complete && !ownerFailed) return rows.ToArray();
+            if (complete && !ownerFailed) {
+                for (int i = attemptStart; i < rows.Count; i++) rows[i].CompletedAttempt = true;
+                return rows.ToArray();
+            }
             if (error == 1400 && attempt < 2) continue; // A window disappeared during this enumeration.
             var failure = new System.ComponentModel.Win32Exception(error, ownerFailed ? "GetWindowThreadProcessId" : "EnumWindows");
             failure.Data["ObservedWindows"] = rows.ToArray();
@@ -309,6 +314,7 @@ public static class HiddenWin {
         System.ComponentModel.Win32Exception cleanupFailure = null;
         try {
             for (int attempt = 0; attempt < 3; attempt++) {
+                int attemptStart = rows.Count;
                 bool ownerFailed = false; int ownerError = 0;
                 SetLastError(0);
                 bool complete = EnumDesktopWindows(desktop, (h, p) => {
@@ -318,7 +324,10 @@ public static class HiddenWin {
                     return true;
                 }, IntPtr.Zero);
                 int error = ownerFailed ? ownerError : Marshal.GetLastWin32Error();
-                if (complete && !ownerFailed) break;
+                if (complete && !ownerFailed) {
+                    for (int i = attemptStart; i < rows.Count; i++) rows[i].CompletedAttempt = true;
+                    break;
+                }
                 if (error == 1400 && attempt < 2) continue;
                 var queryFailure = new System.ComponentModel.Win32Exception(error, ownerFailed ? "GetWindowThreadProcessId" : "EnumDesktopWindows");
                 queryFailure.Data["ObservedWindows"] = rows.ToArray();
@@ -393,7 +402,7 @@ function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $Re
     }
     @{ At = [datetime]::UtcNow.ToString('o'); ExpectedDesktop = $DesktopName; Oracle = 'EnumDesktopWindows'; Windows = $rows; RequiredWindowPid = $RequiredWindowPid } |
         ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath $ReceiptPath
-    if ($RequiredWindowPid -gt 0 -and ($ids -notcontains $RequiredWindowPid -or @($rows | Where-Object ProcessId -eq $RequiredWindowPid).Count -eq 0)) {
+    if ($RequiredWindowPid -gt 0 -and ($ids -notcontains $RequiredWindowPid -or @($rows | Where-Object { $_.ProcessId -eq $RequiredWindowPid -and $_.CompletedAttempt -eq $true }).Count -eq 0)) {
         throw 'Window startup required process window is absent; further input is blocked.'
     }
     if ($NoWindows -and $rows.Count) { throw 'Hidden desktop unexpected private job window; further launches are blocked.' }

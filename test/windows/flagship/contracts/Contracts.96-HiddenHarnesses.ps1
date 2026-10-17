@@ -248,7 +248,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class TYPE_NAME {
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
-    public class DesktopWindowObservation { public int ProcessId, ThreadId; }
+    public class DesktopWindowObservation { public int ProcessId, ThreadId; public bool CompletedAttempt; }
     public static bool OpenFails, EnumFails, OwnerFails, CloseFails;
     public static int Opens, Enums, Closes;
     static int[] JobProcessIds(IntPtr job) { if (job != new IntPtr(7)) throw new Exception("wrong job"); return new[] { 41, 42 }; }
@@ -278,7 +278,7 @@ METHOD
         try { $rows = @($type::PrivateJobWindows([IntPtr]7, 'actual-private')) } catch { $failure = $_.Exception.InnerException }
         if ([bool]$failure -ne [bool]$fixture.Api -or ($failure -and ($failure.Message -cne $fixture.Api -or $failure.NativeErrorCode -ne $fixture.Code))) { throw 'Private desktop API failure changed or was accepted.' }
         if ($type::Opens -ne 1 -or $type::Closes -ne [int](-not $fixture.OpenFails)) { throw 'Private desktop read handle was leaked.' }
-        if (-not $failure -and ($type::Enums -ne 1 -or $rows.Count -ne 2 -or @($rows | Where-Object ProcessId -ne 42).Count)) { throw 'Private desktop oracle omitted actual windows or accepted wrong PID.' }
+        if (-not $failure -and ($type::Enums -ne 1 -or $rows.Count -ne 2 -or @($rows | Where-Object { $_.ProcessId -ne 42 -or -not $_.CompletedAttempt }).Count)) { throw 'Private desktop oracle omitted actual windows or accepted wrong PID.' }
         if ($fixture.Cleanup -and ($failure.Data['CleanupApi'] -cne 'CloseDesktop' -or $failure.Data['CleanupCode'] -ne 6)) { throw 'Private desktop oracle lost secondary cleanup error.' }
     }
 }
@@ -297,7 +297,7 @@ using System.Runtime.InteropServices;
 public static class TYPE_NAME {
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
     public static int Calls, FailuresLeft, ErrorCode;
-    public static bool OwnerFailure, RetainObservation;
+    public static bool OwnerFailure, RetainObservation, CurrentObservation;
     static int[] JobProcessIds(IntPtr job) { return new[] { 42 }; }
     static void SetLastError(uint code) { Marshal.SetLastPInvokeError((int)code); }
     static IntPtr OpenDesktopW(string n, uint flags, bool inherit, uint access) { return new IntPtr(8); }
@@ -314,6 +314,7 @@ public static class TYPE_NAME {
             if (OwnerFailure) { cb(new IntPtr(2), state); return false; }
             Marshal.SetLastPInvokeError(ErrorCode); return false;
         }
+        if (CurrentObservation) cb(new IntPtr(1), state);
         return true;
     }
     static bool EnumWindows(EnumWindow cb, IntPtr state) { return RunEnum(cb, state); }
@@ -323,21 +324,25 @@ METHODS
 '@
     $type = Add-Type -TypeDefinition ($support.Replace('TYPE_NAME', $typeName).Replace('METHODS', $Methods)) -PassThru | Where-Object Name -eq $typeName
     foreach ($mode in @('Default', 'Private')) { foreach ($owner in @($false, $true)) { foreach ($fixture in @(
-        @{ Failures = 0; Code = 0; Calls = 1 }, @{ Failures = 1; Code = 1400; Calls = 2; Retain = $true }
+        @{ Failures = 0; Code = 0; Calls = 1 }, @{ Failures = 0; Code = 0; Calls = 1; Current = $true }
+        @{ Failures = 1; Code = 1400; Calls = 2; Retain = $true; Current = $true }, @{ Failures = 1; Code = 1400; Calls = 2; Retain = $true }
         @{ Failures = 2; Code = 1400; Calls = 3; Retain = $true }, @{ Failures = 9; Code = 1400; Calls = 3; Retain = $true; Blocked = $true }
         @{ Failures = 1; Code = 5; Calls = 1; Retain = $true; Blocked = $true }, @{ Failures = 1; Code = 0; Calls = 1; Retain = $true; Blocked = $true }
     )) {
         $type::Calls = 0; $type::FailuresLeft = $fixture.Failures; $type::ErrorCode = $fixture.Code; $type::OwnerFailure = $owner; $type::RetainObservation = [bool]$fixture.Retain
+        $type::CurrentObservation = [bool]$fixture.Current
         $failure = $null; $rows = @()
         try { $rows = @(if ($mode -eq 'Default') { $type::DefaultJobWindows([IntPtr]7) } else { $type::PrivateJobWindows([IntPtr]7, 'private') }) } catch { $failure = $_.Exception.InnerException }
         if ([bool]$failure -ne [bool]$fixture.Blocked -or $type::Calls -ne $fixture.Calls -or ($failure -and $failure.NativeErrorCode -ne $fixture.Code)) { throw 'Desktop enumeration lost exact 1400 retry bounds or accepted an unknown error.' }
         $observed = if ($failure) { @($failure.Data['ObservedWindows']) } else { $rows }
-        if ($observed.Count -ne [int][bool]$fixture.Retain -or ($fixture.Retain -and ($observed[0].ProcessId -ne 42 -or $observed[0].ThreadId -ne 123))) { throw 'Desktop enumeration discarded a previously observed owned window during retry/failure.' }
+        if ($observed.Count -ne ([int][bool]$fixture.Retain + [int][bool]$fixture.Current) -or @($observed | Where-Object { $_.ProcessId -ne 42 -or $_.ThreadId -ne 123 }).Count) { throw 'Desktop enumeration discarded a previously observed owned window during retry/failure.' }
+        if (@($observed | Where-Object CompletedAttempt).Count -ne [int][bool]$fixture.Current) { throw 'Desktop enumeration accepted a retained failed-attempt observation as current.' }
     } } }
 }
 Assert-HiddenMutation 'window retry accepts arbitrary errors' $retryMethods ($retryMethods.Replace('error == 1400 && attempt < 2', 'attempt < 2')) ${function:Test-WindowEnumerationRetry}
 Assert-HiddenMutation 'window retry exceeds three attempts' $retryMethods ($retryMethods.Replace('attempt < 3', 'attempt < 4').Replace('attempt < 2', 'attempt < 3')) ${function:Test-WindowEnumerationRetry}
 Assert-HiddenMutation 'window retry loses observed failure evidence' $retryMethods ($retryMethods.Replace('failure.Data["ObservedWindows"] = rows.ToArray();', '').Replace('queryFailure.Data["ObservedWindows"] = rows.ToArray();', '')) ${function:Test-WindowEnumerationRetry}
+Assert-HiddenMutation 'window retry marks stale observations current' $retryMethods ($retryMethods.Replace('int i = attemptStart;', 'int i = 0;')) ${function:Test-WindowEnumerationRetry}
 
 # Compile the real observer against a managed process/thread snapshot seam. Query
 # failures only excuse a TID conclusively absent after refreshing the retained process.
@@ -589,6 +594,7 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         @{ ZeroTid = $true; Blocked = $true }, @{ QueryFails = $true; Blocked = $true }
         @{ WrongCurrent = $true; Blocked = $true }, @{ BadName = $true; Blocked = $true }
         @{ NoWindows = $true; Blocked = $true }, @{ Empty = $true; NoWindows = $true }
+        @{ Stale = $true }, @{ Stale = $true; Required = 42; Blocked = $true }, @{ Stale = $true; NoWindows = $true; Blocked = $true }
         @{ Native = 'OpenDesktopW'; Code = 5; Blocked = $true }
         @{ Native = 'EnumDesktopWindows'; Code = 170; Blocked = $true }
         @{ Native = 'GetWindowThreadProcessId'; Code = 1400; Blocked = $true }
@@ -613,7 +619,7 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         }
         if ($fixture.Observed) { [HiddenDesktopContract]::Failure.Data['ObservedWindows'] = @(@{ ProcessId = 42; ThreadId = 123 }, @{ ProcessId = 'secret'; ThreadId = 'secret' }) }
         [HiddenDesktopContract]::Current = if ($fixture.WrongCurrent) { 'Default' } else { $name }
-        [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{ ProcessId = $(if ($fixture.WrongPid) { 99 } else { 42 }); ThreadId = $(if ($fixture.ZeroTid) { 0 } else { 123 }) } })
+        [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{ ProcessId = $(if ($fixture.WrongPid) { 99 } else { 42 }); ThreadId = $(if ($fixture.ZeroTid) { 0 } else { 123 }); CompletedAttempt = -not $fixture.Stale } })
         $blocked = $false
         try { Assert-HiddenDesktop -Job ([IntPtr]7) -DesktopName $(if ($fixture.BadName) { 'Default' } else { $name }) -ReceiptPath 'unused.jsonl' -RequiredWindowPid ([int]$fixture.Required) -NoWindows:([bool]$fixture.NoWindows) } catch { $blocked = $true; if ($fixture.Required -and $_.Exception.Message.StartsWith('Hidden desktop')) { throw 'Missing readiness window must remain an ordinary startup failure.' } }
         if ($blocked -ne [bool]$fixture.Blocked -or $receipts.Count -ne 1 -or $receipts[0].Contains('secret')) { throw 'Private desktop oracle lost failure rejection or sanitized receipt.' }
@@ -638,6 +644,7 @@ function Test-HiddenDesktopAssertion([string] $Code) {
 Assert-HiddenMutation 'private wrong PID accepted' $desktopAssertion ($desktopAssertion.Replace('$ids -notcontains $row.ProcessId', '$false')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private wrong self desktop accepted' $desktopAssertion ($desktopAssertion.Replace('[HiddenDesktopContract]::CurrentDesktopName() -cne $DesktopName', '$false')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private missing ready window accepted' $desktopAssertion ($desktopAssertion.Replace('$RequiredWindowPid -gt 0 -and', '$false -and')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private stale ready window accepted' $desktopAssertion ($desktopAssertion.Replace(' -and $_.CompletedAttempt -eq $true', '')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private idle window accepted' $desktopAssertion ($desktopAssertion.Replace('$NoWindows -and $rows.Count', '$false')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'desktop receipt removed' $desktopAssertion ($desktopAssertion.Replace('Add-Content -LiteralPath $ReceiptPath', 'Out-Null')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private native receipt code lost' $desktopAssertion ($desktopAssertion.Replace('$errorCode = $failure.NativeErrorCode', '$errorCode = $null')) ${function:Test-HiddenDesktopAssertion}
@@ -731,6 +738,39 @@ function Test-SentinelReleaseCleanup([string] $Code) {
 Assert-HiddenMutation 'sentinel destroy omitted after release' $sentinelClose ($sentinelClose.Replace('[SentinelCloseContract]::DestroyDriverSentinel($Sentinel);', '')) ${function:Test-SentinelReleaseCleanup}
 Assert-HiddenMutation 'sentinel release wait exceeds fifteen seconds' $sentinelClose ($sentinelClose.Replace('::UtcNow.AddSeconds(15)', '::UtcNow.AddSeconds(16)')) ${function:Test-SentinelReleaseCleanup}
 Assert-HiddenMutation 'sentinel cleanup masks primary failure' $sentinelClose ($sentinelClose.Replace('$failure -and $null -eq $PrimaryFailure', '$failure')) ${function:Test-SentinelReleaseCleanup}
+
+# Run the real approval initialization, wait, success assignment and cleanup clauses.
+# Replace only the app body with a marker; neither a sentinel nor an app is created.
+function Test-DriverApprovalLifecycle([string] $Code) {
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Code, [ref]$null, [ref]$null)
+    $lifecycle = $ast.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and
+        $n.Finally -and $n.Finally.Extent.Text.Contains('Close-HiddenDriverSentinel') }, $true)
+    if (-not $lifecycle -or $lifecycle.Body.Statements.Count -lt 2) { throw 'Driver approval lifecycle was not found.' }
+    $initialization = @($ast.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Extent.StartOffset -lt $lifecycle.Extent.StartOffset -and $_.Left.VariablePath.UserPath -in @('driverApproved', 'driverFailure', 'job')
+    } | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $body = @($lifecycle.Body.Statements[0..1] | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $clauses = @($lifecycle.CatchClauses | ForEach-Object { $_.Extent.Text }) -join ' '
+    $fixtureCode = $initialization + "`ntry {`n" + $body + "`n`$script:approvalContinued = `$true`n} " + $clauses + ' finally ' + $lifecycle.Finally.Extent.Text
+    foreach ($fails in @($false, $true)) {
+        $script:approvalContinued = $false; $script:approvalCleanup = $null
+        function Wait-HiddenDriverApproval { param($Run, $DesktopName); if ($fails) { throw 'fixture approval failure' } }
+        function Close-HiddenDriverSentinel {
+            param($Sentinel, $Run, [switch]$WaitForParent, $PrimaryFailure, $OwnedJob)
+            $script:approvalCleanup = @{ Wait = [bool]$WaitForParent; Primary = $null -ne $PrimaryFailure }
+        }
+        $sentinel = [IntPtr]8; $Run = 'C:\fixture'; $desktopName = 'fixture'; $blocked = $false
+        try { & ([scriptblock]::Create($fixtureCode)) } catch { $blocked = $true }
+        if ($blocked -ne $fails -or $script:approvalContinued -eq $fails -or $null -eq $script:approvalCleanup -or
+            $script:approvalCleanup.Wait -eq $fails -or $script:approvalCleanup.Primary -ne $fails) { throw 'Unapproved driver waited for parent release or lost its primary approval failure.' }
+    }
+}
+foreach ($scriptPath in $hiddenScripts) {
+    $driverLifecycle = Remove-PowerShellComments (Get-Content -LiteralPath $scriptPath -Raw)
+    Assert-HiddenMutation 'driver release before approval' $driverLifecycle ($driverLifecycle.Replace('-WaitForParent:$driverApproved', '-WaitForParent')) ${function:Test-DriverApprovalLifecycle}
+    Assert-HiddenMutation 'driver marked approved before wait returns' $driverLifecycle ($driverLifecycle.Replace('$driverApproved = $false', '$driverApproved = $true')) ${function:Test-DriverApprovalLifecycle}
+}
 
 if (-not ('HiddenDefaultDesktopContract' -as [type])) {
     Add-Type @'
