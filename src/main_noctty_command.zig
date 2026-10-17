@@ -1,70 +1,123 @@
+//! Console entrypoint. Keep the application in noctty.exe; this binary only
+//! chooses whether to wait and forwards the original Windows command line.
 const std = @import("std");
-const posix = std.posix;
-const Allocator = std.mem.Allocator;
-
+const w = std.os.windows;
+const k = w.kernel32;
 const cli_action = @import("cli/action.zig");
-const cli_ghostty_action = @import("cli/ghostty_action.zig");
-const process_shared = @import("process_shared.zig");
-const state = &@import("global.zig").state;
+const Action = @import("cli/ghostty_action.zig").Action;
+const jobs = @import("apprt/win32_job_object.zig");
 
-pub const std_options: std.Options = process_shared.std_options;
-pub const panic = process_shared.panic;
+pub const panic = std.debug.no_panic;
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const action = cli_action.detectArgs(cli_ghostty_action.Action, alloc) catch |err| {
-        defer posix.exit(1);
-        try process_shared.reportStateInitError(err);
+pub fn main() void {
+    const code = forward() catch |err| {
+        var buffer: [256]u8 = undefined;
+        var writer = std.fs.File.stderr().writer(&buffer);
+        writer.interface.print("noctty command launcher could not start or wait for noctty.exe: {s}\n", .{@errorName(err)}) catch {};
+        writer.interface.flush() catch {};
+        k.ExitProcess(1);
     };
-
-    if (action == null) {
-        spawnGuiProcess(alloc) catch |err| {
-            defer posix.exit(1);
-            try reportGuiLaunchFailure(err);
-        };
-        return;
-    }
-
-    state.init() catch |err| {
-        defer posix.exit(1);
-        try process_shared.reportStateInitError(err);
-    };
-    defer state.deinit();
-
-    posix.exit(process_shared.runCliAction(action.?, state.alloc));
+    k.ExitProcess(code);
 }
 
-fn spawnGuiProcess(alloc: Allocator) !void {
+fn forward() !u32 {
+    const alloc = std.heap.page_allocator;
+    // Detection errors are actions too: noctty.exe owns their diagnostics.
+    const wait = if (cli_action.detectArgs(Action, alloc)) |action| action != null else |_| true;
+    // selfExePath resolves symlinks, preserving the old launcher's sibling rule.
     const self_path = try std.fs.selfExePathAlloc(alloc);
     defer alloc.free(self_path);
+    const image_path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(self_path) orelse return error.ExecutablePathUnavailable, "noctty.exe" });
+    defer alloc.free(image_path);
+    const image_z = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, image_path);
+    defer alloc.free(image_z);
 
-    const dir = std.fs.path.dirname(self_path) orelse return error.FileNotFound;
-    const gui_path = try std.fs.path.join(alloc, &.{ dir, "noctty.exe" });
-    defer alloc.free(gui_path);
-
-    var argv = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, argv);
-
-    var child_argv: std.ArrayList([]const u8) = .empty;
-    defer child_argv.deinit(alloc);
-
-    try child_argv.append(alloc, gui_path);
-    if (argv.len > 1) try child_argv.appendSlice(alloc, argv[1..]);
-
-    var child = std.process.Child.init(child_argv.items, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    // lpApplicationName selects the sibling independently of argv[0]. Do not
+    // parse/requote this buffer: doubled quotes have different CRT and
+    // CommandLineToArgvW interpretations. CreateProcessW needs writable memory.
+    const command_line = std.mem.span(GetCommandLineW());
+    // CreateProcess permits an empty line; supply argv[0] only in that case.
+    const raw = if (std.mem.trim(u16, command_line, &.{ ' ', '\t' }).len == 0) raw: {
+        const value = try alloc.allocSentinel(u16, image_z.len + 2, 0);
+        value[0] = '"';
+        @memcpy(value[1..][0..image_z.len], image_z);
+        value[value.len - 1] = '"';
+        break :raw value;
+    } else try alloc.dupeZ(u16, command_line);
+    defer alloc.free(raw);
+    var parent: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
+    GetStartupInfoW(&parent);
+    var startup: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
+    startup.cb = @sizeOf(w.STARTUPINFOW);
+    startup.lpDesktop = parent.lpDesktop;
+    const handles = if (wait) [3]?w.HANDLE{
+        try inheritableStdHandle(w.STD_INPUT_HANDLE),
+        try inheritableStdHandle(w.STD_OUTPUT_HANDLE),
+        try inheritableStdHandle(w.STD_ERROR_HANDLE),
+    } else [3]?w.HANDLE{ null, null, null };
+    defer for (handles) |handle| {
+        if (handle) |h| if (h != w.INVALID_HANDLE_VALUE) w.CloseHandle(h);
+    };
+    if (wait) {
+        startup.dwFlags = w.STARTF_USESTDHANDLES | w.STARTF_FORCEOFFFEEDBACK;
+        startup.hStdInput = handles[0];
+        startup.hStdOutput = handles[1];
+        startup.hStdError = handles[2];
+        // A real handler is not inherited; the NULL-handler ignore attribute
+        // is. Keep receiving the child's full exit status after Ctrl+C/Break.
+        if (k.SetConsoleCtrlHandler(ignoreControl, w.TRUE) == 0) return error.ConsoleHandlerFailed;
+    }
+    // Keep an action's lifetime tied to the wrapper, as with the old in-process
+    // dispatch. Editors or GUI processes the action launches may outlive it.
+    const job = if (wait) try actionJob() else null;
+    defer if (job) |handle| w.CloseHandle(handle);
+    var process: w.PROCESS_INFORMATION = undefined;
+    if (k.CreateProcessW(image_z, raw, null, null, @intFromBool(wait), .{ .detached_process = !wait, .create_suspended = wait }, null, null, &startup, &process) == 0)
+        return switch (k.GetLastError()) {
+            .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.FileNotFound,
+            .ACCESS_DENIED => error.AccessDenied,
+            .BAD_EXE_FORMAT => error.InvalidExecutable,
+            else => error.CreateProcessFailed,
+        };
+    defer w.CloseHandle(process.hProcess);
+    defer w.CloseHandle(process.hThread);
+    errdefer {
+        _ = k.TerminateProcess(process.hProcess, 1);
+        _ = k.WaitForSingleObject(process.hProcess, w.INFINITE);
+    }
+    if (!wait) return 0;
+    if (jobs.AssignProcessToJobObject(job.?, process.hProcess) == 0) return error.ActionJobFailed;
+    if (ResumeThread(process.hThread) == 0xFFFFFFFF) return error.ResumeFailed;
+    if (k.WaitForSingleObject(process.hProcess, w.INFINITE) != w.WAIT_OBJECT_0) return error.WaitFailed;
+    var code: u32 = undefined;
+    if (k.GetExitCodeProcess(process.hProcess, &code) == 0) return error.ExitCodeUnavailable;
+    return code;
 }
 
-fn reportGuiLaunchFailure(err: anyerror) !void {
-    var buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buffer);
-    const stderr = &stderr_writer.interface;
-    try stderr.print("noctty command launcher could not start noctty.exe: {}\n", .{err});
-    try stderr.flush();
+fn inheritableStdHandle(id: w.DWORD) !?w.HANDLE {
+    const handle = k.GetStdHandle(id);
+    if (handle == null or handle == w.INVALID_HANDLE_VALUE) return handle;
+    var copy: w.HANDLE = undefined;
+    if (k.DuplicateHandle(w.GetCurrentProcess(), handle.?, w.GetCurrentProcess(), &copy, 0, w.TRUE, w.DUPLICATE_SAME_ACCESS) == 0) {
+        if (k.GetLastError() == .INVALID_HANDLE) return null;
+        return error.StandardHandleUnavailable;
+    }
+    return copy;
 }
+
+fn actionJob() !w.HANDLE {
+    const job = jobs.CreateJobObjectW(null, null) orelse return error.ActionJobFailed;
+    errdefer w.CloseHandle(job);
+    var limits: jobs.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = .{};
+    limits.BasicLimitInformation.LimitFlags = jobs.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | 0x1000; // SILENT_BREAKAWAY_OK
+    if (jobs.SetInformationJobObject(job, .extended_limit_information, &limits, @sizeOf(@TypeOf(limits))) == 0) return error.ActionJobFailed;
+    return job;
+}
+
+fn ignoreControl(kind: w.DWORD) callconv(.winapi) w.BOOL {
+    return @intFromBool(kind == 0 or kind == 1); // CTRL_C_EVENT / CTRL_BREAK_EVENT
+}
+
+extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
+extern "kernel32" fn GetStartupInfoW(*w.STARTUPINFOW) callconv(.winapi) void;
+extern "kernel32" fn ResumeThread(w.HANDLE) callconv(.winapi) w.DWORD;

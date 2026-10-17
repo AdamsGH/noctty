@@ -3,7 +3,20 @@ name: Windows CLI Forwarder
 on:
   push:
     branches: [main]
-  pull_request: {}
+  # Not a required check: a PR that touches none of the build, packaging or
+  # resource inputs (docs, site, other workflows) skips the two ReleaseFast builds.
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'pkg/**'
+      - 'vendor/**'
+      - 'include/**'
+      - 'build.zig'
+      - 'build.zig.zon*'
+      - 'dist/windows/**'
+      - 'scripts/*conpty*.ps1'
+      - 'test/windows/cli-com-*'
+      - '.github/workflows/cli-forwarder.yml'
   workflow_dispatch: {}
 
 permissions:
@@ -51,9 +64,15 @@ jobs:
       - name: Isolate the measurement build's Shell identity
         shell: pwsh
         run: |
+          # CI-only working-tree patch of the checkout; it must never be committed.
           $path = Join-Path $PWD 'src/apprt/win32_aumid.zig'
           $text = [IO.File]::ReadAllText($path)
-          $text = $text.Replace('"io.github.amanthanvi.noctty"', '"io.github.amanthanvi.noctty.measure"')
+          if ($text.Contains('MEASUREMENT ONLY') -or $text.Contains('noctty.measure')) { throw 'The AUMID measurement patch is already in the committed source.' }
+          $literal = '"io.github.amanthanvi.noctty"'
+          # aumid_wide, aumid_utf8 and the aumid_utf8 unit test; a new literal needs a decision here.
+          $count = [regex]::Matches($text, [regex]::Escape($literal)).Count
+          if ($count -ne 3) { throw "AUMID literal count changed: expected 3, found $count." }
+          $text = $text.Replace($literal, '"io.github.amanthanvi.noctty.measure"')
           $signature = 'pub fn registerAumidDisplayName\(alloc: std\.mem\.Allocator, portable: bool\) void \{'
           if ([regex]::Matches($text, $signature).Count -ne 1) { throw 'AUMID isolation signature changed.' }
           $text = [regex]::Replace($text, $signature, '$0' + "`n    if (true) return; // MEASUREMENT ONLY")
@@ -66,10 +85,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType File -Path ./zig-out/bin/noctty.portable | Out-Null
 
+      - name: Build the windowless desktop fixture
+        shell: pwsh
+        run: |
+          zig build-exe test/windows/cli-com-fixture.zig -O ReleaseFast -lc -luser32 '-femit-bin=zig-out/cli-com-fixture.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Hidden desktop CLI forwarding contracts
         shell: pwsh
         timeout-minutes: 10
-        run: ./test/windows/cli-com-forwarder.ps1 -BinDir ./zig-out/bin -OutputDir ./zig-out/cli-forwarder-evidence
+        run: ./test/windows/cli-com-forwarder.ps1 -BinDir ./zig-out/bin -OutputDir ./zig-out/cli-forwarder-evidence -DesktopFixture ./zig-out/cli-com-fixture.exe -ThinForwarder
+
+      - name: Only the AUMID measurement patch differs from the checkout
+        if: always()
+        shell: pwsh
+        run: |
+          $changed = @(git status --porcelain --untracked-files=no)
+          if ($changed.Count -ne 1 -or $changed[0] -notmatch 'src/apprt/win32_aumid\.zig$') { throw "Unexpected source changes: $($changed -join '; ')" }
 
       - name: Upload forwarding evidence
         if: always()

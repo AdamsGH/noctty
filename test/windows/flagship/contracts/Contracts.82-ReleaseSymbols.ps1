@@ -118,9 +118,9 @@ Invoke-ContractTable -Contracts @(
     @{
         File = $mainCommandZig82
         Content = { $mainCommandZigText82 }
-        Pattern = 'pub const panic = process_shared\.panic;'
+        Pattern = 'pub const panic = std\.debug\.no_panic;'
         Kind = 'Text'
-        Description = 'noctty.com uses the shared release panic'
+        Description = 'the thin noctty.com forwarder does not link a panic symbolizer'
     }
     @{
         File = $proxyBuild82

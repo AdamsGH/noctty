@@ -22,12 +22,10 @@ pub fn attachParentConsole() void {
     const std_out = -11;
     const std_err = -12;
 
-    if (stdHandleUsable(std_in) and
-        stdHandleUsable(std_out) and
-        stdHandleUsable(std_err)) return;
-
     // ATTACH_PARENT_PROCESS. Fails when the launcher has no console (started
-    // from Explorer, a service, or a detached process), which is fine.
+    // from Explorer, a service, or a detached process), which is fine. A GUI
+    // child can inherit valid console handles without being attached; attach
+    // even then so console control events reach forwarded CLI actions.
     if (AttachConsole(0xFFFFFFFF) == 0) return;
 
     if (!stdHandleUsable(std_in)) bindStdHandleToConsole(std_in, "CONIN$");

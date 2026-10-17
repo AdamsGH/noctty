@@ -1,16 +1,27 @@
 #requires -Version 7.0
 <#
 PKG-74 / D20 baseline and replacement regression harness (x64 and ARM64).
-Requires a measure-AUMID portable directory with noctty.com,
-noctty.exe, noctty.portable and share/ghostty. Does not build anything.
-Run: ./test/windows/cli-com-forwarder.ps1 -BinDir <portable> -OutputDir <new-dir>
+Requires a measure-AUMID portable directory with noctty.com, noctty.exe,
+noctty.portable and share/ghostty, plus the windowless desktop fixture built
+from test/windows/cli-com-fixture.zig. Does not build anything.
+Run: ./test/windows/cli-com-forwarder.ps1 -BinDir <portable> -OutputDir <new-dir> [-DesktopFixture <exe>] [-ThinForwarder]
 Alternatively -ExePath <portable/noctty.com>. Evidence is retained in OutputDir.
+-DesktopFixture defaults to <repo>/zig-out/cli-com-fixture.exe and must exist.
 
-Every harness-created child specifies a private window station's Default
-desktop. Console helpers use CREATE_NO_WINDOW; Ctrl+C uses a console event.
-No profiles, typed shell commands, clipboard operations or real registration.
-ActionOnly explicitly selects a hidden WinSta0 desktop for action-only checks;
-it never runs the old shim's no-action child or claims full coverage.
+Everything runs on ONE new hidden desktop of the current window station
+(WinSta0\noctty-pkg74-<guid>, never switched to, inheritable handle). Every
+harness-created child names it through an explicit lpDesktop. Console helpers
+use CREATE_NO_WINDOW; Ctrl+C uses a console event. No profiles, typed shell
+commands, clipboard operations or real registration.
+
+The first cases are a mandatory setup gate that runs a windowless fixture in
+place of noctty.exe: no real GUI window or failure dialog is created until the
+gate has shown that the launcher keeps the hidden desktop. -ProveDesktopOnly
+stops after the gate. -ThinForwarder adds the fixture cases that only hold for
+the thin CreateProcessW forwarder (raw command line, stdin, full DWORD exit
+code, -e classification, no-action pipe EOF, no show-flag propagation); the old
+in-process shim runs actions itself, so those cases do not apply to it.
+-InheritHiddenDesktop is accepted for compatibility and is now the only mode.
 #>
 [CmdletBinding()]
 param(
@@ -19,13 +30,12 @@ param(
     [Parameter(Mandatory)] [string] $OutputDir,
     [ValidateRange(5,120)] [int] $TimeoutSeconds = 20,
     [ValidateRange(10,100)] [int] $VersionIterations = 10,
-    [switch] $Driver,
-    [string] $StationName,
-    [string] $DesktopName = 'Default',
-    [switch] $ActionOnly,
-    [switch] $InheritHiddenDesktop,
     [string] $DesktopFixture,
+    [switch] $ThinForwarder,
     [switch] $ProveDesktopOnly,
+    [switch] $InheritHiddenDesktop,
+    [switch] $Driver,
+    [string] $DesktopName,
     [switch] $DetachedOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -47,16 +57,11 @@ function Wait-Condition([scriptblock] $Condition, [string] $Description) {
     } while ([datetime]::UtcNow -lt $deadline)
     throw "Timeout: $Description"
 }
-function Read-SharedText([string] $Path) {
-    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-    $reader = [IO.StreamReader]::new($stream)
-    try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
-}
 
 if (-not $Driver) {
-    Assert-Condition (-not ($ActionOnly -and $InheritHiddenDesktop)) 'Choose ActionOnly or InheritHiddenDesktop.'
-    Assert-Condition (-not $ProveDesktopOnly -or ($InheritHiddenDesktop -and $DesktopFixture)) 'ProveDesktopOnly requires InheritHiddenDesktop and DesktopFixture.'
-    if ($DesktopFixture) { $DesktopFixture = (Resolve-Path -LiteralPath $DesktopFixture).Path }
+    if (-not $DesktopFixture) { $DesktopFixture = Join-Path $PSScriptRoot '../../zig-out/cli-com-fixture.exe' }
+    Assert-Condition (Test-Path -LiteralPath $DesktopFixture -PathType Leaf) "Missing windowless desktop fixture '$DesktopFixture'. Build test/windows/cli-com-fixture.zig (see .github/workflows/cli-forwarder.yml) and pass -DesktopFixture."
+    $DesktopFixture = (Resolve-Path -LiteralPath $DesktopFixture).Path
     if ($ExePath) {
         Assert-Condition ([IO.Path]::GetFileName($ExePath) -eq 'noctty.com') 'ExePath must name noctty.com.'
         $BinDir = Split-Path -Parent (Resolve-Path -LiteralPath $ExePath).Path
@@ -89,6 +94,7 @@ if (-not $Driver) {
         'single-instance = false'
         "class = $class"
         'renderer = d3d11-warp'
+        'auto-update = off'
         'confirm-close-surface = false'
         'window-save-state = never'
         'shell-integration = none'
@@ -101,17 +107,13 @@ if (-not $Driver) {
     $clipboardBefore = [ComCliNative]::GetClipboardSequenceNumber()
     $batchStarted = [datetime]::UtcNow
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $station = 'noctty-pkg74-' + [guid]::NewGuid().ToString('N')
-    $handles = $null
+    $DesktopName = 'noctty-pkg74-' + [guid]::NewGuid().ToString('N')
+    $desktopHandle = $null
     $controller = $null
     $saved = @{}
     $failure = $null
     try {
-        if ($ActionOnly -or $InheritHiddenDesktop) {
-            $DesktopName = $station
-            $station = 'WinSta0'
-            $handles = @([IntPtr]::Zero, [ComCliNative]::HiddenDesktop($DesktopName, $InheritHiddenDesktop.IsPresent))
-        } else { $handles = [ComCliNative]::PrivateDesktop($station) }
+        $desktopHandle = [ComCliNative]::HiddenDesktop($DesktopName)
         foreach ($name in @('APPDATA', 'LOCALAPPDATA', 'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'GHOSTTY_RESOURCES_DIR')) {
             $saved[$name] = [Environment]::GetEnvironmentVariable($name)
             $value = switch ($name) {
@@ -124,25 +126,20 @@ if (-not $Driver) {
         }
         $pwsh = (Get-Process -Id $PID).Path
         $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-BinDir', $portable,
-            '-OutputDir', $OutputDir, '-Driver', '-StationName', $station,
-            '-DesktopName', $DesktopName, '-TimeoutSeconds', "$TimeoutSeconds", '-VersionIterations', "$VersionIterations")
-        if ($ActionOnly) { $arguments += '-ActionOnly' }
-        if ($InheritHiddenDesktop) { $arguments += '-InheritHiddenDesktop' }
+            '-OutputDir', $OutputDir, '-Driver', '-DesktopName', $DesktopName, '-DesktopFixture', $DesktopFixture,
+            '-TimeoutSeconds', "$TimeoutSeconds", '-VersionIterations', "$VersionIterations")
+        if ($ThinForwarder) { $arguments += '-ThinForwarder' }
         if ($ProveDesktopOnly) { $arguments += '-ProveDesktopOnly' }
-        if ($DesktopFixture) { $arguments += @('-DesktopFixture', $DesktopFixture) }
         $raw = ($arguments | ForEach-Object { [ComCliNative]::Quote($_) }) -join ' '
-        $controller = [ComCliNative]::Launch($pwsh, $raw, $OutputDir, "$station\$DesktopName", 'files', $null,
+        $controller = [ComCliNative]::Launch($pwsh, $raw, $OutputDir, "WinSta0\$DesktopName", 'files', $null,
             (Join-Path $OutputDir 'controller.stdout.txt'), (Join-Path $OutputDir 'controller.stderr.txt'), 0x08000000)
-        Assert-Condition ($controller.Wait(($TimeoutSeconds * 12 + $VersionIterations * 5) * 1000)) 'Private controller timed out.'
-        Assert-Condition ($controller.ExitCode -eq 0) 'Private controller failed; inspect bounded per-case results.json and private controller capture.'
+        Assert-Condition ($controller.Wait(($TimeoutSeconds * 16 + $VersionIterations * 5) * 1000)) 'Hidden-desktop controller timed out.'
+        Assert-Condition ($controller.ExitCode -eq 0) 'Hidden-desktop controller failed; inspect bounded per-case results.json and the controller capture.'
     } catch { $failure = $_ }
     finally {
         if ($controller) { $controller.Dispose() }
         foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-        if ($handles) {
-            [void][ComCliNative]::CloseDesktop($handles[1])
-            if ($handles[0] -ne [IntPtr]::Zero) { [void][ComCliNative]::CloseWindowStation($handles[0]) }
-        }
+        if ($desktopHandle) { [void][ComCliNative]::CloseDesktop($desktopHandle) }
         $clock.Stop()
         $startupAfter = Get-StateMetadata $startupPath
         $historyAfter = Get-StateMetadata $historyPath
@@ -150,6 +147,7 @@ if (-not $Driver) {
         $receipt = [ordered]@{
             StartedUtc = $batchStarted.ToString('o'); FinishedUtc = [datetime]::UtcNow.ToString('o'); ElapsedMs = $clock.Elapsed.TotalMilliseconds
             Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            Desktop = "WinSta0\$DesktopName"
             StartupBefore = $startupBefore; StartupAfter = $startupAfter
             HistoryBefore = $historyBefore; HistoryAfter = $historyAfter
             ClipboardBefore = $clipboardBefore; ClipboardAfter = $clipboardAfter
@@ -161,27 +159,29 @@ if (-not $Driver) {
             Status = if ($failure) { 'Failed' } else { 'Passed' }
             Failure = if ($failure) { $failure.Exception.Message } else { $null }
             NativeErrorCode = if ($failure -and $failure.Exception.InnerException -is [ComponentModel.Win32Exception]) { $failure.Exception.InnerException.NativeErrorCode } else { $null }
-            Coverage = if ($ProveDesktopOnly) { 'Windowless fixture setup proof only; product coverage owed' } elseif ($ActionOnly) { 'ActionOnly; no-action GUI/raw quoting owed' } else { 'Full' }
+            Coverage = if ($ProveDesktopOnly) { 'Windowless fixture setup gate only; product coverage owed' } elseif ($ThinForwarder) { 'Full + thin forwarder fixture cases' } else { 'Full' }
         }
         $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDir 'isolation.json') -Encoding utf8NoBOM
         Assert-Condition ($receipt.StartupUnchanged -and $receipt.HistoryUnchanged) 'Real state metadata changed; stop launches and report.'
         Assert-Condition $receipt.ClipboardUnchanged 'WinSta0 clipboard sequence changed; stop launches and report.'
     }
     if ($failure) { throw $failure }
-    Write-Host "COM CLI regression: $(if ($ProveDesktopOnly) { 'DESKTOP SETUP PROOF PASSED; product coverage owed' } elseif ($ActionOnly) { 'ACTION SUBSET PASSED; full coverage owed' } else { 'PASS' }); evidence=$OutputDir"
+    Write-Host "COM CLI regression: $(if ($ProveDesktopOnly) { 'DESKTOP SETUP GATE PASSED; product coverage owed' } else { 'PASS' }); evidence=$OutputDir"
     return
 }
 
-$desktopPath = "$StationName\$DesktopName"
+$desktopPath = "WinSta0\$DesktopName"
 if ($DetachedOnly) { [void][ComCliNative]::FreeConsole() }
-$desktopHandle = [ComCliNative]::DriverDesktop($StationName, $DesktopName, ($ActionOnly -or $InheritHiddenDesktop))
-@{ Pid = $PID; DetachedOnly = $DetachedOnly.IsPresent; HasConsole = [ComCliNative]::HasConsole(); Desktop = $DesktopName; Station = $StationName } |
+$desktopHandle = [ComCliNative]::DriverDesktop($DesktopName)
+@{ Pid = $PID; DetachedOnly = $DetachedOnly.IsPresent; HasConsole = [ComCliNative]::HasConsole(); Desktop = $DesktopName } |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDir "driver-$($DetachedOnly.IsPresent).json") -Encoding utf8NoBOM
 $com = Join-Path $BinDir 'noctty.com'
 $gui = Join-Path $BinDir 'noctty.exe'
 $results = [Collections.Generic.List[object]]::new()
 $versionTimes = [Collections.Generic.List[double]]::new()
 $script:caseIndex = 0
+$script:fixtureIndex = 0
+$script:found = $null
 function Test-Case([string] $Name, [scriptblock] $Test) {
     $started = [datetime]::UtcNow
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -191,64 +191,133 @@ function Test-Case([string] $Name, [scriptblock] $Test) {
     finally {
         $watch.Stop(); $entry.ElapsedMs = $watch.Elapsed.TotalMilliseconds
         $results.Add([pscustomobject]$entry)
-        @{ Cases = @($results); Coverage = if ($ProveDesktopOnly) { 'SetupProofOnly' } elseif ($DetachedOnly) { 'DetachedOnly' } elseif ($ActionOnly) { 'ActionOnly' } else { 'Full' }; VersionIterations = $versionTimes.Count; VersionMedianMs = if ($versionTimes.Count) { ($versionTimes | Sort-Object)[[int][math]::Floor($versionTimes.Count / 2)] } else { $null } } |
+        @{ Cases = @($results); Coverage = if ($ProveDesktopOnly) { 'SetupGateOnly' } elseif ($DetachedOnly) { 'DetachedOnly' } elseif ($ThinForwarder) { 'FullThin' } else { 'Full' }; VersionIterations = $versionTimes.Count; VersionMedianMs = if ($versionTimes.Count) { ($versionTimes | Sort-Object)[[int][math]::Floor($versionTimes.Count / 2)] } else { $null } } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDir $(if ($DetachedOnly) { 'detached-results.json' } else { 'results.json' })) -Encoding utf8NoBOM
     }
+}
+# Everything a case started must be gone before its Dispose: a wrapper that
+# dies while its action child lives on would otherwise be hidden by the job's
+# kill-on-close cleanup.
+function Assert-JobEmpty($Child, [string] $What) {
+    Wait-Condition { [ComCliNative]::ActiveProcesses($Child) -eq 0 } "no process left in the owned job after $What"
 }
 function Invoke-Cli([string] $Raw, [string] $Mode = 'pipes', [string] $InputPath, [uint32] $Flags = 0x08000000) {
     $script:caseIndex++
     $out = Join-Path $OutputDir "case-$script:caseIndex.stdout.txt"
     $err = Join-Path $OutputDir "case-$script:caseIndex.stderr.txt"
+    $processClock = [Diagnostics.Stopwatch]::StartNew()
     $child = [ComCliNative]::Launch($com, $Raw, $BinDir, $desktopPath, $Mode, $InputPath, $out, $err, $Flags)
     try {
         Assert-Condition ($child.Wait($TimeoutSeconds * 1000)) 'CLI timed out.'
-        $stdout = if ($child.Output) { $child.Output.GetAwaiter().GetResult() } elseif (Test-Path -LiteralPath $out) { [IO.File]::ReadAllText($out) } else { '' }
-        $stderr = if ($child.Error) { $child.Error.GetAwaiter().GetResult() } elseif (Test-Path -LiteralPath $err) { [IO.File]::ReadAllText($err) } else { '' }
-        return @{ Code = $child.ExitCode; Out = $stdout; Err = $stderr }
+        $processClock.Stop()
+        $stdout = if ($child.Output) { $child.ReadOutput(5000) } else { [ComCliNative]::ReadCapture($out) }
+        $stderr = if ($child.Error) { $child.ReadError(5000) } else { [ComCliNative]::ReadCapture($err) }
+        $code = $child.ExitCode
+        Assert-JobEmpty $child "'$Raw'"
+        return @{ Code = $code; Out = $stdout; Err = $stderr; ProcessElapsedMs = $processClock.Elapsed.TotalMilliseconds }
     } finally { $child.Dispose() }
 }
 function Assert-Version($Result) {
     Assert-Condition ($Result.Code -eq 0 -and $Result.Out.Contains('Build Config') -and $Result.Out.Contains('- channel:') -and $Result.Err.Length -eq 0) 'Version output/status mismatch.'
 }
 function Test-NoHandles {
-        Assert-Condition (-not [ComCliNative]::HasConsole()) 'No-handle test controller must have no console.'
-        $child = [ComCliNative]::Launch($com, '+version', $BinDir, $desktopPath, 'none', $null, $null, $null, 8)
-        try {
-            Wait-Condition { $child.Exited -or @([ComCliNative]::Windows($desktopHandle, '#32770') | Where-Object { [ComCliNative]::Title($_) -eq 'noctty CLI action failed' }).Count -eq 1 } 'detached action failure or failure dialog'
-            if (-not $child.Exited) {
-                $dialog = @([ComCliNative]::Windows($desktopHandle, '#32770') | Where-Object { [ComCliNative]::Title($_) -eq 'noctty CLI action failed' })[0]
-                Assert-Condition ([ComCliNative]::PostMessageW($dialog, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'Private error dialog close failed.'
-            }
-            Assert-Condition ($child.Wait($TimeoutSeconds * 1000)) 'Detached CLI did not return after closing its dialog.'
-            Assert-Condition ($child.ExitCode -eq 1) "Detached CLI failure exit mismatch: $($child.ExitCode)."
-        } finally { $child.Dispose() }
+    Assert-Condition (-not [ComCliNative]::HasConsole()) 'No-handle test controller must have no console.'
+    $title = 'noctty CLI action failed'
+    $child = [ComCliNative]::Launch($com, '+version', $BinDir, $desktopPath, 'none', $null, $null, $null, 8)
+    try {
+        $script:found = $null
+        Wait-Condition {
+            $script:found = @([ComCliNative]::Windows($desktopHandle, '#32770') | Where-Object { [ComCliNative]::Title($_) -eq $title })[0]
+            $null -ne $script:found
+        } 'detached failure dialog (the action must report its failure visibly)'
+        $dialog = $script:found
+        Assert-Condition (-not $child.Exited) 'Detached CLI exited although its failure dialog is still open.'
+        [ComCliNative]::AssertOwned($child, [ComCliNative]::WindowPid($dialog))
+        Assert-Condition ([ComCliNative]::PostMessageW($dialog, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'Failure dialog close failed.'
+        if (-not $child.Wait(2000)) {
+            Assert-Condition ([ComCliNative]::PostMessageW($dialog, 0x0111, [IntPtr]1, [IntPtr]::Zero)) 'Failure dialog IDOK failed.'
+        }
+        Assert-Condition ($child.Wait($TimeoutSeconds * 1000)) 'Detached CLI did not return after closing its dialog.'
+        Assert-Condition ($child.ExitCode -eq 1) "Detached CLI failure exit mismatch: $($child.ExitCode)."
+        Assert-JobEmpty $child 'the detached failure'
+    } finally { $child.Dispose() }
 }
+
+# Fixture cases: a copy of the launcher next to a windowless stand-in for
+# noctty.exe. Returns the launcher child; the caller disposes it.
+$fixtureBin = Join-Path $OutputDir 'fixture-bin'
+$fixtureExe = Join-Path $fixtureBin 'noctty.exe'
+$fixtureCom = Join-Path $fixtureBin 'noctty.com'
+function Initialize-FixtureBin {
+    [void](New-Item -ItemType Directory -Path $fixtureBin)
+    Copy-Item -LiteralPath $com -Destination $fixtureCom
+    Copy-Item -LiteralPath $DesktopFixture -Destination $fixtureExe
+    [IO.File]::WriteAllText((Join-Path $fixtureBin 'noctty.portable'), '')
+}
+function Start-Fixture([string] $Raw, [hashtable] $Knobs = @{}, [string] $Mode = 'files', [string] $InputPath, [switch] $NullCommandLine) {
+    $script:fixtureIndex++
+    $receiptPath = Join-Path $OutputDir "fixture-$script:fixtureIndex.json"
+    $variables = @{ NOCTTY_COM_FIXTURE_RECEIPT = $receiptPath; NOCTTY_COM_FIXTURE_HOLD_MS = '0' }
+    foreach ($key in $Knobs.Keys) { $variables["NOCTTY_COM_FIXTURE_$key"] = [string] $Knobs[$key] }
+    $previous = @{}
+    foreach ($key in $variables.Keys) { $previous[$key] = [Environment]::GetEnvironmentVariable($key); [Environment]::SetEnvironmentVariable($key, $variables[$key]) }
+    try {
+        $child = [ComCliNative]::Launch($fixtureCom, $Raw, $fixtureBin, $desktopPath, $Mode, $InputPath,
+            (Join-Path $OutputDir "fixture-$script:fixtureIndex.stdout.txt"), (Join-Path $OutputDir "fixture-$script:fixtureIndex.stderr.txt"), 0x08000000, 0, $NullCommandLine.IsPresent)
+    } finally { foreach ($key in $previous.Keys) { [Environment]::SetEnvironmentVariable($key, $previous[$key]) } }
+    return @{ Child = $child; Receipt = $receiptPath; Index = $script:fixtureIndex }
+}
+function Read-FixtureReceipt($Run) {
+    $script:found = $null
+    Wait-Condition {
+        try { $script:found = [IO.File]::ReadAllText($Run.Receipt) | ConvertFrom-Json; $true } catch { $false }
+    } 'fixture receipt'
+    return $script:found
+}
+function Assert-FixtureDesktop($Receipt) {
+    Assert-Condition ($Receipt.station -ceq 'WinSta0' -and $Receipt.desktop -ceq $DesktopName) "Fixture left the hidden desktop: $($Receipt.station)\$($Receipt.desktop)."
+    Assert-Condition (@([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host')).Count -eq 0) 'A GUI window exists during the windowless setup gate.'
+}
+$useStdHandles = 0x100
+$useShowWindow = 0x1
+
 try {
-    if ($ProveDesktopOnly -or ($InheritHiddenDesktop -and -not $DetachedOnly)) {
-        Test-Case 'old shim passes inherited hidden desktop to windowless GUI fixture' {
-            $fixtureBin = Join-Path $OutputDir 'fixture-bin'
-            [void](New-Item -ItemType Directory -Path $fixtureBin)
-            Copy-Item -LiteralPath $com -Destination (Join-Path $fixtureBin 'noctty.com')
-            $fixtureExe = Join-Path $fixtureBin 'noctty.exe'
-            Copy-Item -LiteralPath $DesktopFixture -Destination $fixtureExe
-            [IO.File]::WriteAllText((Join-Path $fixtureBin 'noctty.portable'), '')
-            $receiptPath = Join-Path $OutputDir 'desktop-fixture.json'
-            $savedReceipt = $env:NOCTTY_COM_FIXTURE_RECEIPT
-            $env:NOCTTY_COM_FIXTURE_RECEIPT = $receiptPath
-            $launcher = $null; $fixtureChild = $null
+    if (-not $DetachedOnly) {
+        Initialize-FixtureBin
+        # Setup gate 1 (always, before any real GUI or dialog): a no-action
+        # launch passes the hidden desktop to a detached, windowless noctty.exe
+        # and returns at once without waiting for it.
+        Test-Case 'gate: no-action launch keeps the hidden desktop and does not wait' {
+            $run = Start-Fixture '--single-instance=false --class=noctty-test-pkg74-fixture' @{ HOLD_MS = 3000 }
+            $fixtureChild = $null
             try {
-                $launcher = [ComCliNative]::Launch((Join-Path $fixtureBin 'noctty.com'), '--single-instance=false --class=noctty-test-pkg74-fixture', $fixtureBin, $desktopPath, 'files', $null,
-                    (Join-Path $OutputDir 'fixture-launch.stdout.txt'), (Join-Path $OutputDir 'fixture-launch.stderr.txt'), 0x08000000)
-                Assert-Condition ($launcher.Wait(2000) -and $launcher.ExitCode -eq 0) 'Fixture no-action shim failed to return promptly.'
-                Wait-Condition { Test-Path -LiteralPath $receiptPath } 'windowless desktop fixture receipt'
-                $proof = Read-SharedText $receiptPath | ConvertFrom-Json
-                Assert-Condition ($proof.windowless -and $proof.station -ceq $StationName -and $proof.desktop -ceq $DesktopName) 'Windowless fixture desktop/station mismatch.'
-                $fixtureChild = [ComCliNative]::OwnedProcess([uint32]$proof.pid, $fixtureExe)
-                Assert-Condition (-not $fixtureChild.Exited) 'Fixture did not outlive returning shim.'
+                Assert-Condition ($run.Child.Wait(5000) -and $run.Child.ExitCode -eq 0) "Fixture no-action launcher failed to return promptly (exit=$($run.Child.ExitCode))."
+                $receipt = Read-FixtureReceipt $run
+                Assert-FixtureDesktop $receipt
+                $fixtureChild = [ComCliNative]::OwnedProcess([uint32]$receipt.pid, $fixtureExe, $run.Child)
+                Assert-Condition (-not $fixtureChild.Exited) 'Fixture did not outlive the returning launcher.'
+                if ($ThinForwarder) {
+                    Assert-Condition (($receipt.startup_flags -band $useStdHandles) -eq 0) 'The no-action child was handed standard handles.'
+                    Assert-Condition (-not $receipt.console) 'The no-action child is attached to a console.'
+                }
                 Assert-Condition ($fixtureChild.Wait(5000) -and $fixtureChild.ExitCode -eq 0) 'Windowless fixture did not exit naturally.'
-            } finally {
-                if ($fixtureChild) { $fixtureChild.Dispose() }; if ($launcher) { $launcher.Dispose() }
-                $env:NOCTTY_COM_FIXTURE_RECEIPT = $savedReceipt
+                Assert-JobEmpty $run.Child 'the no-action fixture'
+            } finally { if ($fixtureChild) { $fixtureChild.Dispose() }; $run.Child.Dispose() }
+        }
+        # Setup gate 2 (thin forwarder): an action reaches noctty.exe on the same
+        # desktop with inherited standard handles and its exit code comes back.
+        if ($ThinForwarder) {
+            Test-Case 'gate: forwarded action keeps the hidden desktop, stdio and exit code' {
+                $run = Start-Fixture '+version' @{ EXIT = 7; OUT = 1 } 'pipes'
+                try {
+                    Assert-Condition ($run.Child.Wait($TimeoutSeconds * 1000)) 'Fixture action launcher timed out.'
+                    Assert-Condition ($run.Child.ExitCode -eq 7) "Fixture action exit code mismatch: $($run.Child.ExitCode)."
+                    $receipt = Read-FixtureReceipt $run
+                    Assert-FixtureDesktop $receipt
+                    Assert-Condition (($receipt.startup_flags -band $useStdHandles) -ne 0 -and $receipt.console) 'The forwarded action did not inherit stdio/console.'
+                    Assert-Condition ($run.Child.ReadOutput(5000).Contains('fixture-out') -and $run.Child.ReadError(5000).Contains('fixture-err')) 'Forwarded stdout/stderr did not arrive.'
+                    Assert-JobEmpty $run.Child 'the forwarded fixture action'
+                } finally { $run.Child.Dispose() }
             }
         }
         if ($ProveDesktopOnly) { return }
@@ -258,8 +327,7 @@ try {
     Test-Case 'detached no-console/no-standard-handles' {
         $pwsh = (Get-Process -Id $PID).Path
         $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-BinDir', $BinDir,
-            '-OutputDir', $OutputDir, '-Driver', '-StationName', $StationName, '-DesktopName', $DesktopName, '-DetachedOnly', '-TimeoutSeconds', "$TimeoutSeconds")
-        if ($ActionOnly) { $arguments += '-ActionOnly' }; if ($InheritHiddenDesktop) { $arguments += '-InheritHiddenDesktop' }
+            '-OutputDir', $OutputDir, '-Driver', '-DesktopName', $DesktopName, '-DetachedOnly', '-TimeoutSeconds', "$TimeoutSeconds")
         $raw = ($arguments | ForEach-Object { [ComCliNative]::Quote($_) }) -join ' '
         $subcontroller = [ComCliNative]::Launch($pwsh, $raw, $OutputDir, $desktopPath, 'files', $null,
             (Join-Path $OutputDir 'detached-controller.stdout.txt'), (Join-Path $OutputDir 'detached-controller.stderr.txt'), 0x08000000)
@@ -273,6 +341,16 @@ try {
         finally { $subcontroller.Dispose() }
     }
     Test-Case 'stdout file and success exit code' { Assert-Version (Invoke-Cli '+version' 'files') }
+    Test-Case 'version alias and action delimiter' {
+        Assert-Version (Invoke-Cli '--version')
+        Assert-Version (Invoke-Cli '+version -- +pkg74-invalid-action')
+    }
+    Test-Case 'help fallback and multiple-action diagnostics' {
+        $help = Invoke-Cli '--help'
+        Assert-Condition ($help.Code -eq 0 -and $help.Out.Contains('Usage:')) 'Help fallback mismatch.'
+        $invalid = Invoke-Cli '+version +list-themes'
+        Assert-Condition ($invalid.Code -eq 1 -and $invalid.Err.Contains('multiple CLI actions')) 'Multiple-action diagnostic mismatch.'
+    }
     foreach ($mode in @('pipes', 'files')) {
         Test-Case "stderr $mode and failure exit code" {
             $result = Invoke-Cli '+pkg74-invalid-action' $mode
@@ -305,36 +383,113 @@ try {
             [ComCliNative]::CtrlC($child)
             Assert-Condition ($child.Wait($TimeoutSeconds * 1000)) 'Ctrl+C did not end the CLI action.'
             Assert-Condition ($child.ExitCode -eq 0xC000013Au) 'Ctrl+C exit code was not STATUS_CONTROL_C_EXIT.'
+            # A wrapper that died alone would leave the action child running.
+            Assert-JobEmpty $child 'Ctrl+C'
         } finally { $child.Dispose() }
+    }
+    if ($ThinForwarder) {
+        Test-Case 'thin: terminating the wrapper ends its blocked action child' {
+            $child = [ComCliNative]::Launch($com, '+show-config --default --docs --no-pager', $BinDir, $desktopPath, 'blocked', $null, $null, $null, 0)
+            try {
+                Wait-Condition { -not $child.Exited -and [ComCliNative]::Buffered($child) -ge 4096 } 'action output fills stdout before wrapper termination'
+                Assert-Condition ([ComCliNative]::ActiveProcesses($child) -ge 2) 'The probe did not observe a live wrapper and action child.'
+                [ComCliNative]::TerminateOwned($child, 0xD20)
+                Assert-Condition ($child.Wait($TimeoutSeconds * 1000)) 'Terminated wrapper did not exit.'
+                Assert-JobEmpty $child 'terminating the wrapper without closing the harness job'
+            } finally { $child.Dispose() }
+        }
+        Test-Case 'thin: raw command line, stdin, stdout/stderr and full DWORD exit code' {
+            $bytes = [Security.Cryptography.RandomNumberGenerator]::GetBytes(70000)
+            $stdinPath = Join-Path $OutputDir 'fixture-stdin.bin'
+            [IO.File]::WriteAllBytes($stdinPath, $bytes)
+            $expectedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+            $raw = '+version "a ""b"" c" \\"d\" tail\\ 空間 😀 %PATH% ^& *'
+            foreach ($code in @('7', '2147500037', '3221226505', '4294967295')) {
+                $run = Start-Fixture $raw @{ EXIT = $code; STDIN = 1; OUT = 1 } 'pipes' $stdinPath
+                try {
+                    Assert-Condition ($run.Child.Wait($TimeoutSeconds * 1000)) 'Fixture action timed out.'
+                    Assert-Condition ($run.Child.ExitCode -eq [uint32] $code) "Exit code $code was not returned unchanged ($($run.Child.ExitCode))."
+                    $receipt = Read-FixtureReceipt $run
+                    Assert-Condition ($receipt.command_line -ceq ([ComCliNative]::Quote($fixtureCom) + ' ' + $raw)) "Raw command line changed: $($receipt.command_line)"
+                    Assert-Condition ($receipt.stdin_bytes -eq $bytes.Length -and $receipt.stdin_sha256 -ceq $expectedHash) 'Redirected stdin did not arrive intact.'
+                    Assert-Condition ($run.Child.ReadOutput(5000) -ceq "fixture-out`n" -and $run.Child.ReadError(5000) -ceq "fixture-err`n") 'Redirected stdout/stderr mismatch.'
+                    Assert-JobEmpty $run.Child "fixture exit $code"
+                } finally { $run.Child.Dispose() }
+            }
+        }
+        # -e, -- and --help decide wait versus detach exactly like the old shim.
+        Test-Case 'thin: -e and -- stay detached; actions, --help and detection errors wait' {
+            foreach ($case in @(
+                @{ Raw = '-e +version'; Waits = $false }
+                @{ Raw = '-- +version'; Waits = $false }
+                @{ Raw = '+version -e x'; Waits = $true }
+                @{ Raw = '--help'; Waits = $true }
+                @{ Raw = '+pkg74-invalid-action'; Waits = $true }
+            )) {
+                $run = Start-Fixture $case.Raw @{ EXIT = 77; HOLD_MS = $(if ($case.Waits) { 0 } else { 3000 }) }
+                try {
+                    if ($case.Waits) {
+                        Assert-Condition ($run.Child.Wait($TimeoutSeconds * 1000) -and $run.Child.ExitCode -eq 77) "'$($case.Raw)' did not wait for and return the child's exit code."
+                        Assert-Condition (((Read-FixtureReceipt $run).startup_flags -band $useStdHandles) -ne 0) "'$($case.Raw)' did not inherit stdio."
+                        Assert-JobEmpty $run.Child "'$($case.Raw)'"
+                    } else {
+                        Assert-Condition ($run.Child.Wait(2000) -and $run.Child.ExitCode -eq 0) "'$($case.Raw)' waited for the GUI instead of returning at once."
+                        $receipt = Read-FixtureReceipt $run
+                        Assert-Condition (($receipt.startup_flags -band ($useStdHandles -bor $useShowWindow)) -eq 0) "'$($case.Raw)' propagated std-handle or show-window startup flags."
+                        $fixtureChild = [ComCliNative]::OwnedProcess([uint32]$receipt.pid, $fixtureExe, $run.Child)
+                        try { Assert-Condition (-not $fixtureChild.Exited) "'$($case.Raw)' child did not outlive the launcher." } finally { $fixtureChild.Dispose() }
+                    }
+                } finally { $run.Child.Dispose() }
+            }
+        }
+        Test-Case 'thin: no-action launch closes redirected pipes and tolerates an empty command line' {
+            $run = Start-Fixture '--single-instance=false --class=noctty-test-pkg74-fixture' @{ HOLD_MS = 6000 } 'pipes'
+            try {
+                Assert-Condition ($run.Child.Wait(2000) -and $run.Child.ExitCode -eq 0) 'No-action launcher did not return promptly.'
+                $receipt = Read-FixtureReceipt $run
+                $fixtureChild = [ComCliNative]::OwnedProcess([uint32]$receipt.pid, $fixtureExe, $run.Child)
+                try {
+                    Assert-Condition ($run.Child.OutputClosed(1500) -and $run.Child.ErrorClosed(1500)) 'The detached no-action child kept the caller''s stdout/stderr pipes open.'
+                    Assert-Condition (-not $fixtureChild.Exited) 'Pipes closed only because the no-action child exited.'
+                } finally { $fixtureChild.Dispose() }
+            } finally { $run.Child.Dispose() }
+            $run = Start-Fixture '' @{ HOLD_MS = 3000 } 'files' -NullCommandLine
+            try {
+                Assert-Condition ($run.Child.Wait(2000) -and $run.Child.ExitCode -eq 0) 'Empty-command-line launcher did not return promptly.'
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace((Read-FixtureReceipt $run).command_line)) 'Empty command line reached noctty.exe without an argv[0].'
+            } finally { $run.Child.Dispose() }
+        }
     }
     for ($iteration = 0; $iteration -lt $VersionIterations; $iteration++) {
         Test-Case "version timing $iteration" {
-            $watch = [Diagnostics.Stopwatch]::StartNew()
-            Assert-Version (Invoke-Cli '+version')
-            $watch.Stop(); $versionTimes.Add($watch.Elapsed.TotalMilliseconds)
+            $result = Invoke-Cli '+version'
+            Assert-Version $result
+            # Measure through wrapper exit; pipe draining and asynchronous job
+            # accounting are controller cleanup, not application startup.
+            $versionTimes.Add($result.ProcessElapsedMs)
         }
     }
-    if ($ActionOnly) {
-        $results.Add([pscustomobject]@{ Name = 'no-action raw quotes and Unicode title opens GUI and returns promptly'; Status = 'Owed'; Passed = $false; ElapsedMs = 0; Detail = 'ActionOnly explicitly excludes GUI launches; run full private-station mode.' })
-        Test-Case 'action-only completion' { }
-    } else { Test-Case 'no-action raw quotes and Unicode title opens GUI and returns promptly' {
+    Test-Case 'no-action raw quotes and Unicode title opens GUI and returns promptly' {
         $config = [IO.File]::ReadAllText((Join-Path $BinDir 'config.ghostty'))
         $class = [regex]::Match($config, '(?m)^class = (.+)$').Groups[1].Value.Trim()
         $raw = '--single-instance=false --class=' + $class + ' --title="D20 ""quoted"" 空間 😀"'
-        $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir 'gui.stdout.txt'), (Join-Path $OutputDir 'gui.stderr.txt'), 0x08000000)
+        # SW_SHOWNORMAL: the first ShowWindow of a GUI process honors its launcher's flag.
+        $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir 'gui.stdout.txt'), (Join-Path $OutputDir 'gui.stderr.txt'), 0x08000000, 1, $false)
         $guiChild = $null
         try {
-            Assert-Condition ($child.Wait(5000)) 'No-action shim did not return within 5 seconds.'
-            Assert-Condition ($child.ExitCode -eq 0) 'No-action shim returned nonzero.'
-            Wait-Condition { @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host')).Count -eq 1 } 'GUI host on private station desktop'
+            Assert-Condition ($child.Wait(5000)) 'No-action launcher did not return within 5 seconds.'
+            Assert-Condition ($child.ExitCode -eq 0) 'No-action launcher returned nonzero.'
+            Wait-Condition { @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host')).Count -eq 1 } 'GUI host on the hidden desktop'
             $window = @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host'))[0]
-            $guiChild = [ComCliNative]::WindowProcess($window, $gui)
+            $guiChild = [ComCliNative]::WindowProcess($window, $gui, $child)
             Wait-Condition { [ComCliNative]::Title($window).Contains('D20 "quoted" 空間 😀') } 'Unicode/doubled-quote title readback'
-            Assert-Condition (-not $guiChild.Exited) 'GUI exited together with shim.'
+            Wait-Condition { [ComCliNative]::IsWindowVisible($window) } 'GUI host window visible'
+            Assert-Condition (-not $guiChild.Exited) 'GUI exited together with the launcher.'
             Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
             Assert-Condition ($guiChild.Wait($TimeoutSeconds * 1000)) 'Owned GUI did not close.'
+            Assert-JobEmpty $child 'closing the GUI'
         } finally { if ($guiChild) { $guiChild.Dispose() }; $child.Dispose() }
-    } }
+    }
 } finally {
     [void][ComCliNative]::CloseDesktop($desktopHandle)
 }

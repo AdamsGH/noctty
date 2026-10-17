@@ -16,17 +16,43 @@ public static class ComCliNative {
     }
     [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr process,thread; public uint pid,tid; }
     [StructLayout(LayoutKind.Sequential)] struct Security { public int length; public IntPtr descriptor; public int inherit; }
+    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
+        public long processTime,jobTime; public uint flags; public UIntPtr minimum,maximum;
+        public uint active; public UIntPtr affinity; public uint priority,scheduling;
+        public ulong readOps,writeOps,otherOps,readBytes,writeBytes,otherBytes;
+        public UIntPtr processMemory,jobMemory,peakProcessMemory,peakJobMemory;
+    }
+    // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
+        public long userTime,kernelTime,periodUserTime,periodKernelTime;
+        public uint pageFaults,totalProcesses,activeProcesses,terminatedProcesses;
+    }
+    const int CaptureLimit = 1 << 20;
     public sealed class Child : IDisposable {
-        public IntPtr Handle; public uint Pid; public long Created;
+        public IntPtr Handle, Job; public uint Pid; public long Created;
         public string Image; public IntPtr OutputRead;
         public Task<string> Output, Error;
         public bool Exited { get { return WaitForSingleObject(Handle,0)==0; } }
         public uint ExitCode { get { uint code; Check(GetExitCodeProcess(Handle,out code)); return code; } }
         public bool Wait(int ms) { return WaitForSingleObject(Handle,(uint)ms)==0; }
+        // Bounded reads: a drain that never reaches EOF (a descendant kept the
+        // pipe) fails the case instead of hanging the harness.
+        public string ReadOutput(int ms) { return Await(Output,ms,"stdout"); }
+        public string ReadError(int ms) { return Await(Error,ms,"stderr"); }
+        public bool OutputClosed(int ms) { return Output!=null && Output.Wait(ms); }
+        public bool ErrorClosed(int ms) { return Error!=null && Error.Wait(ms); }
+        static string Await(Task<string> task,int ms,string name) {
+            if(task==null) return "";
+            if(!task.Wait(ms)) throw new TimeoutException("Timed out draining "+name);
+            return task.Result;
+        }
         public void Dispose() {
             if(Handle==IntPtr.Zero) return;
             Verify(this);
             if(!Exited) { Check(TerminateProcess(Handle,0xD20)); Wait(5000); }
+            // KILL_ON_JOB_CLOSE reaps whatever the case left behind; cases assert
+            // ActiveProcesses==0 before this point so the reaping hides nothing.
+            if(Job!=IntPtr.Zero) { CloseHandle(Job); Job=IntPtr.Zero; }
             if(OutputRead!=IntPtr.Zero) CloseHandle(OutputRead);
             CloseHandle(Handle); Handle=IntPtr.Zero;
         }
@@ -43,29 +69,33 @@ public static class ComCliNative {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr h,out uint code);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetProcessTimes(IntPtr h,out long created,out long exited,out long kernel,out long user);
     [DllImport("kernel32.dll")] static extern uint GetProcessId(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool QueryFullProcessImageNameW(IntPtr h,uint flags,StringBuilder image,ref uint length);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr h,uint exit);
     [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr h);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes,IntPtr name);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job,int kind,ref JobLimits limits,int size);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job,int kind,out JobAccounting info,int size,IntPtr returned);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool IsProcessInJob(IntPtr process,IntPtr job,out int result);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetConsoleCtrlHandler(ControlHandler handler,bool add);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GenerateConsoleCtrlEvent(uint kind,uint group);
     [DllImport("kernel32.dll")] static extern uint GetConsoleProcessList([Out] uint[] processes,uint count);
     [DllImport("kernel32.dll",SetLastError=true)] public static extern bool FreeConsole();
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ReadConsoleOutputCharacterW(IntPtr h,[Out] char[] text,uint count,uint coordinate,out uint read);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateWindowStationW(string name,uint flags,uint access,IntPtr sa);
     [DllImport("user32.dll")] static extern IntPtr GetProcessWindowStation();
     [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint threadId);
-    [DllImport("user32.dll")] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
+    [DllImport("user32.dll",SetLastError=true)] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr OpenDesktopW(string name,uint flags,bool inherit,uint access);
-    [DllImport("user32.dll",SetLastError=true)] static extern bool SetProcessWindowStation(IntPtr station);
-    [DllImport("user32.dll")] public static extern bool CloseWindowStation(IntPtr station);
     [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateDesktopW(string name,IntPtr device,IntPtr mode,uint flags,uint access,IntPtr sa);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("user32.dll",SetLastError=true)] static extern bool EnumDesktopWindows(IntPtr desktop,EnumWindow callback,IntPtr parameter);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h,StringBuilder name,int count);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h,StringBuilder name,int count);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint message,IntPtr w,IntPtr l);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
@@ -81,53 +111,33 @@ public static class ComCliNative {
         }
         return result.Append('\\',slashes*2).Append('"').ToString();
     }
-    public static IntPtr[] PrivateDesktop(string name) {
-        var station=CreateWindowStationW(name,0,0xF037F,IntPtr.Zero);
-        if(station==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateWindowStationW failed");
-        var original=GetProcessWindowStation(); var desktop=IntPtr.Zero;
-        try {
-            if(!SetProcessWindowStation(station)) throw new Win32Exception(Marshal.GetLastWin32Error(),"SetProcessWindowStation failed");
-            desktop=CreateDesktopW("Default",IntPtr.Zero,IntPtr.Zero,0,0xF01FF,IntPtr.Zero);
-            if(desktop==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateDesktopW failed");
-        } catch { SetProcessWindowStation(original); CloseWindowStation(station); throw; }
-        finally { Check(SetProcessWindowStation(original)); }
-        return new [] {station,desktop};
-    }
-    // Setup-only diagnostic: request fewer rights, immediately close, never
-    // change token privileges, security descriptors, or desktop visibility.
-    public static int ProbeStationAccess(string name,uint desiredAccess) {
-        var handle=CreateWindowStationW(name,0,desiredAccess,IntPtr.Zero);
-        int error=Marshal.GetLastWin32Error();
-        if(handle==IntPtr.Zero) return error;
-        Check(CloseWindowStation(handle)); return 0;
-    }
-    public static void AssertStation(string expected) {
-        var name=new StringBuilder(256); uint needed;
-        Check(GetUserObjectInformationW(GetProcessWindowStation(),2,name,512,out needed));
-        if(name.ToString()!=expected || expected=="WinSta0") throw new Exception("Private station identity mismatch");
-    }
     static string ObjectName(IntPtr handle) {
         var name=new StringBuilder(256); uint needed;
         Check(GetUserObjectInformationW(handle,2,name,512,out needed)); return name.ToString();
     }
-    public static IntPtr HiddenDesktop(string name,bool inherit=false) {
+    // The only desktop this harness uses: a new, uniquely named desktop on the
+    // current window station. It is never switched to, so it is never visible,
+    // and its handle is inheritable so a driver started with an explicit
+    // lpDesktop can open it. Every child names it through lpDesktop.
+    public static IntPtr HiddenDesktop(string name) {
         if(!name.StartsWith("noctty-pkg74-",StringComparison.Ordinal)) throw new Exception("Unexpected hidden desktop name");
-        var sa=Inheritable(); var pointer=IntPtr.Zero;
+        if(ObjectName(GetProcessWindowStation())!="WinSta0") throw new Exception("Controller is not on WinSta0");
+        var pointer=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Security)));
         try {
-            if(inherit) { pointer=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Security))); Marshal.StructureToPtr(sa,pointer,false); }
+            Marshal.StructureToPtr(Inheritable(),pointer,false);
             var desktop=CreateDesktopW(name,IntPtr.Zero,IntPtr.Zero,0,0xF01FF,pointer);
             if(desktop==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"Create hidden desktop failed");
             return desktop;
-        } finally { if(pointer!=IntPtr.Zero) Marshal.FreeHGlobal(pointer); }
+        } finally { Marshal.FreeHGlobal(pointer); }
     }
-    public static IntPtr DriverDesktop(string station,string desktop,bool actionOnly) {
-        if(ObjectName(GetProcessWindowStation())!=station || ObjectName(GetThreadDesktop(GetCurrentThreadId()))!=desktop) throw new Exception("Driver station/desktop mismatch");
-        if(actionOnly) {
-            var input=OpenInputDesktop(0,false,1);
-            if(input==IntPtr.Zero) throw new Win32Exception();
-            try { if(station!="WinSta0" || ObjectName(input)==desktop || !desktop.StartsWith("noctty-pkg74-",StringComparison.Ordinal)) throw new Exception("Action-only desktop is not hidden"); }
+    public static IntPtr DriverDesktop(string desktop) {
+        if(!desktop.StartsWith("noctty-pkg74-",StringComparison.Ordinal)) throw new Exception("Unexpected hidden desktop name");
+        if(ObjectName(GetProcessWindowStation())!="WinSta0" || ObjectName(GetThreadDesktop(GetCurrentThreadId()))!=desktop) throw new Exception("Driver station/desktop mismatch");
+        var input=OpenInputDesktop(0,false,1);
+        if(input!=IntPtr.Zero) {
+            try { if(ObjectName(input)==desktop) throw new Exception("Hidden desktop is the input desktop"); }
             finally { CloseDesktop(input); }
-        } else AssertStation(station);
+        } else if(Marshal.GetLastWin32Error()!=5) throw new Win32Exception(); // access denied: a secure desktop is input, so ours is not
         var handle=OpenDesktopW(desktop,0,false,0x41);
         if(handle==IntPtr.Zero) throw new Win32Exception(); return handle;
     }
@@ -138,21 +148,42 @@ public static class ComCliNative {
         if(h==new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error(),"Capture open failed: "+Path.GetFileName(path));
         return h;
     }
+    // Keeps at most 1 MiB and keeps reading (discarding) so a noisy child is
+    // never blocked, then fails the read if the cap was exceeded.
     static Task<string> Drain(IntPtr handle) {
         return Task.Run(()=> {
             using(var stream=new FileStream(new SafeFileHandle(handle,true),FileAccess.Read,4096,false))
-            using(var reader=new StreamReader(stream,new UTF8Encoding(false,true))) return reader.ReadToEnd();
+            using(var kept=new MemoryStream()) {
+                var buffer=new byte[4096]; int read; bool over=false;
+                while((read=stream.Read(buffer,0,buffer.Length))>0) {
+                    if(kept.Length+read<=CaptureLimit) kept.Write(buffer,0,read); else over=true;
+                }
+                if(over) throw new InvalidDataException("Captured output exceeded 1 MiB");
+                return new UTF8Encoding(false,true).GetString(kept.ToArray());
+            }
         });
+    }
+    // Capture-file read with the same cap.
+    public static string ReadCapture(string path) {
+        if(!File.Exists(path)) return "";
+        if(new FileInfo(path).Length>CaptureLimit) throw new InvalidDataException("Captured file exceeded 1 MiB: "+Path.GetFileName(path));
+        using(var stream=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete))
+        using(var reader=new StreamReader(stream,new UTF8Encoding(false,true))) return reader.ReadToEnd();
     }
     // mode: files, pipes, blocked (undrained stdout pipe), console, or none.
     // flags always include CREATE_SUSPENDED; console callers deliberately inherit
     // the CREATE_NO_WINDOW driver's private console. Never create a visible one.
+    // show is the launcher's wShowWindow (0 SW_HIDE, 1 SW_SHOWNORMAL).
+    // nullCommandLine passes lpCommandLine NULL (an empty raw line).
     public static Child Launch(string image,string raw,string cwd,string desktop,string mode,string input,string output,string error,uint flags) {
-        if(String.IsNullOrEmpty(desktop) || (desktop.StartsWith("WinSta0\\",StringComparison.OrdinalIgnoreCase) && !desktop.StartsWith("WinSta0\\noctty-pkg74-",StringComparison.Ordinal))) throw new Exception("An explicit isolated desktop is required");
+        return Launch(image,raw,cwd,desktop,mode,input,output,error,flags,0,false);
+    }
+    public static Child Launch(string image,string raw,string cwd,string desktop,string mode,string input,string output,string error,uint flags,int show,bool nullCommandLine) {
+        if(String.IsNullOrEmpty(desktop) || !desktop.StartsWith("WinSta0\\noctty-pkg74-",StringComparison.Ordinal)) throw new Exception("An explicit isolated hidden desktop is required");
         IntPtr stdin=IntPtr.Zero,stdout=IntPtr.Zero,stderr=IntPtr.Zero,outRead=IntPtr.Zero,errRead=IntPtr.Zero;
-        var pi=new ProcessInfo(); bool created=false;
+        var pi=new ProcessInfo(); bool created=false; IntPtr job=IntPtr.Zero;
         try {
-            var si=new Startup { cb=Marshal.SizeOf(typeof(Startup)),desktop=desktop,flags=1,show=0 };
+            var si=new Startup { cb=Marshal.SizeOf(typeof(Startup)),desktop=desktop,flags=1,show=(short)show };
             if(mode=="none") { si.flags|=0x100; si.input=new IntPtr(-1); si.output=new IntPtr(-1); si.error=new IntPtr(-1); }
             if(mode!="none") {
                 stdin=FileHandle(String.IsNullOrEmpty(input)?"NUL":input,true);
@@ -164,18 +195,24 @@ public static class ComCliNative {
                 } else { stdout=FileHandle(output,false); stderr=FileHandle(error,false); }
                 si.flags|=0x100; si.input=stdin; si.output=stdout; si.error=stderr;
             }
-            if(!CreateProcessW(image,new StringBuilder(Quote(image)+" "+raw),IntPtr.Zero,IntPtr.Zero,mode!="none",flags|4,IntPtr.Zero,cwd,ref si,out pi)) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateProcessW failed: "+Path.GetFileName(image));
+            var command=nullCommandLine?null:new StringBuilder(Quote(image)+" "+raw);
+            if(!CreateProcessW(image,command,IntPtr.Zero,IntPtr.Zero,mode!="none",flags|4,IntPtr.Zero,cwd,ref si,out pi)) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateProcessW failed: "+Path.GetFileName(image));
             created=true;
+            job=CreateJobObjectW(IntPtr.Zero,IntPtr.Zero); Check(job!=IntPtr.Zero);
+            var limits=new JobLimits { flags=0x2000 }; // KILL_ON_JOB_CLOSE, owned descendants only
+            Check(SetInformationJobObject(job,9,ref limits,Marshal.SizeOf(typeof(JobLimits))));
+            Check(AssignProcessToJobObject(job,pi.process));
             long born,exited,kernel,user; Check(GetProcessTimes(pi.process,out born,out exited,out kernel,out user));
-            var child=new Child { Handle=pi.process,Pid=pi.pid,Created=born,Image=Path.GetFullPath(image) };
+            var child=new Child { Handle=pi.process,Job=job,Pid=pi.pid,Created=born,Image=Path.GetFullPath(image) };
             Verify(child);
             if(mode=="pipes") { child.Output=Drain(outRead); outRead=IntPtr.Zero; }
             if(mode=="blocked") { child.OutputRead=outRead; outRead=IntPtr.Zero; }
             if(errRead!=IntPtr.Zero) { child.Error=Drain(errRead); errRead=IntPtr.Zero; }
             if(ResumeThread(pi.thread)==0xFFFFFFFF) throw new Win32Exception();
-            return child;
+            job=IntPtr.Zero; return child;
         } catch { if(created) { TerminateProcess(pi.process,0xD20); CloseHandle(pi.process); } throw; }
         finally {
+            if(job!=IntPtr.Zero) CloseHandle(job);
             if(pi.thread!=IntPtr.Zero) CloseHandle(pi.thread);
             foreach(var h in new[]{stdin,stdout,stderr,outRead,errRead}) if(h!=IntPtr.Zero) CloseHandle(h);
         }
@@ -189,10 +226,44 @@ public static class ComCliNative {
             if(!String.Equals(Path.GetFullPath(image.ToString()),child.Image,StringComparison.OrdinalIgnoreCase)) throw new Exception("Owned image identity mismatch");
         }
     }
+    // True when the live process pid is in the launched child's kill-on-close
+    // job (the child itself and everything it started without breaking away).
+    public static bool InJob(Child owner,uint pid) {
+        if(owner==null || owner.Job==IntPtr.Zero) throw new Exception("Owner has no job");
+        var h=OpenProcess(0x101000,false,pid); // QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        if(h==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"OpenProcess failed for pid "+pid);
+        try {
+            if(WaitForSingleObject(h,0)==0) throw new Exception("Process "+pid+" exited during the job check");
+            int inJob; Check(IsProcessInJob(h,owner.Job,out inJob)); return inJob!=0;
+        } finally { CloseHandle(h); }
+    }
+    public static void AssertOwned(Child owner,uint pid) {
+        if(!InJob(owner,pid)) throw new Exception("Process "+pid+" is not in the launched child's job");
+    }
+    public static uint ActiveProcesses(Child owner) {
+        if(owner.Job==IntPtr.Zero) throw new Exception("Owner has no job");
+        JobAccounting info; Check(QueryInformationJobObject(owner.Job,1,out info,Marshal.SizeOf(typeof(JobAccounting)),IntPtr.Zero));
+        return info.activeProcesses;
+    }
+    public static void TerminateOwned(Child child,uint code) {
+        Verify(child);
+        if(child.Exited) throw new Exception("Owned process already exited before termination probe");
+        Check(TerminateProcess(child.Handle,code));
+    }
     public static uint Buffered(Child child) { uint available; Check(PeekNamedPipe(child.OutputRead,IntPtr.Zero,0,IntPtr.Zero,out available,IntPtr.Zero)); return available; }
+    // Every process on the driver's private console must be this driver or in
+    // the launched child's job (the wrapper, the GUI-subsystem action child and
+    // any grandchild it started). Anything else would receive the event too.
     public static void CtrlC(Child child) {
         Verify(child); var processes=new uint[256]; var count=GetConsoleProcessList(processes,256);
-        if(count==0 || count>256 || Array.IndexOf(processes,child.Pid)<0) throw new Exception("CLI is not attached to the driver's console");
+        if(count==0 || count>256) throw new Exception("Console process list is unavailable or too large");
+        uint self=GetCurrentProcessId(); bool found=false;
+        for(int i=0;i<count;i++) {
+            if(processes[i]==self) continue;
+            if(!InJob(child,processes[i])) throw new Exception("Foreign process "+processes[i]+" is attached to the driver's console");
+            if(processes[i]==child.Pid) found=true;
+        }
+        if(!found) throw new Exception("CLI is not attached to the driver's console");
         Check(SetConsoleCtrlHandler(Control,true));
         // CTRL_C_EVENT is sent to this private console, never via GUI input.
         Check(GenerateConsoleCtrlEvent(0,0));
@@ -211,8 +282,13 @@ public static class ComCliNative {
         return windows.ToArray();
     }
     public static string Title(IntPtr window) { var name=new StringBuilder(1024); GetWindowTextW(window,name,1024); return name.ToString(); }
+    public static uint WindowPid(IntPtr window) { uint pid; GetWindowThreadProcessId(window,out pid); return pid; }
     public static Child WindowProcess(IntPtr window,string image) {
-        uint pid; GetWindowThreadProcessId(window,out pid);
+        return OwnedProcess(WindowPid(window),image);
+    }
+    // The window's process must also be in the launched child's job.
+    public static Child WindowProcess(IntPtr window,string image,Child owner) {
+        var pid=WindowPid(window); AssertOwned(owner,pid);
         return OwnedProcess(pid,image);
     }
     public static Child OwnedProcess(uint pid,string image) {
@@ -221,5 +297,9 @@ public static class ComCliNative {
             long born,exit,kernel,user; Check(GetProcessTimes(h,out born,out exit,out kernel,out user));
             var child=new Child { Handle=h,Pid=pid,Created=born,Image=Path.GetFullPath(image) }; Verify(child); return child;
         } catch { CloseHandle(h); throw; }
+    }
+    public static Child OwnedProcess(uint pid,string image,Child owner) {
+        AssertOwned(owner,pid);
+        return OwnedProcess(pid,image);
     }
 }
