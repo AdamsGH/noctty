@@ -254,7 +254,18 @@ pub fn flashTaskbar(hwnd: windows.HWND) void {
 /// One bell sound plays at a time; a bell that rings meanwhile is dropped,
 /// as overlapping copies of the same sound are noise rather than information.
 var busy: std.atomic.Value(bool) = .init(false);
-var warned: std.atomic.Value(bool) = .init(false);
+var warned: AudioWarnings = .{};
+
+const AudioWarnings = struct {
+    seen: std.atomic.Value(u8) = .init(0),
+
+    const Kind = enum(u3) { path, unavailable, playback };
+
+    fn first(self: *AudioWarnings, kind: Kind) bool {
+        const mask = @as(u8, 1) << @intFromEnum(kind);
+        return self.seen.fetchOr(mask, .monotonic) & mask == 0;
+    }
+};
 
 const Job = struct {
     path: []u8,
@@ -268,7 +279,7 @@ const Job = struct {
 /// ends, and the UI thread must not.
 pub fn playFile(path: []const u8, volume: f64) void {
     if (!playablePath(path) or onRemoteDrive(path)) {
-        warnOnce("bell-audio-path is not a local file name; no sound played", .{});
+        warnOnce(.path, "bell-audio-path is not a local file name; no sound played", .{});
         return;
     }
     if (busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
@@ -300,11 +311,11 @@ fn playThread(job: *Job) void {
         busy.store(false, .release);
     }
     if (mci_api == null) mci_api = MciApi.load() catch |err| {
-        warnOnce("bell audio unavailable err={}", .{err});
+        warnOnce(.unavailable, "bell audio unavailable err={}", .{err});
         return;
     };
     playBlocking(alloc, job.path, job.volume) catch |err| {
-        warnOnce("bell sound failed err={}", .{err});
+        warnOnce(.playback, "bell sound failed err={}", .{err});
     };
 }
 
@@ -345,8 +356,8 @@ fn check(code: u32) !void {
     return error.MciFailed;
 }
 
-fn warnOnce(comptime fmt: []const u8, args: anytype) void {
-    if (warned.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+fn warnOnce(kind: AudioWarnings.Kind, comptime fmt: []const u8, args: anytype) void {
+    if (!warned.first(kind)) return;
     log.warn(fmt, args);
 }
 
@@ -358,6 +369,18 @@ const Features = configpkg.Config.BellFeatures;
 const away: Context = .{ .window_active = false, .window_visible = true, .in_view = false };
 const watching: Context = .{ .window_active = true, .window_visible = true, .in_view = true };
 const other_tab: Context = .{ .window_active = true, .window_visible = true, .in_view = false };
+
+test "win32 bell audio failures warn once for each category" {
+    var warnings: AudioWarnings = .{};
+    // A failed local file must not hide a later refused path or DLL failure.
+    for ([_]AudioWarnings.Kind{ .playback, .path, .unavailable }) |kind| {
+        try testing.expect(warnings.first(kind));
+        try testing.expect(!warnings.first(kind));
+    }
+    for ([_]AudioWarnings.Kind{ .path, .unavailable, .playback }) |kind| {
+        try testing.expect(!warnings.first(kind));
+    }
+}
 
 test "win32 bell defaults: no sound, flash and glyph when away" {
     const p = plan(.{}, false, away);

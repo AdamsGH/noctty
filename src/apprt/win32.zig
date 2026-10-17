@@ -16847,7 +16847,37 @@ const Host = struct {
         try std.testing.expect(!std.mem.startsWith(u8, host.cached_window_title.?, glyph));
         try std.testing.expectEqualStrings("beta", surface_b.effectiveTitle().?);
 
+        // An IME can commit without WM_KEYDOWN. Empty results leave the
+        // alert alone; real text clears it before the possibly closing call.
+        const ImeTarget = struct {
+            surface: *Surface,
+            commits: usize = 0,
+
+            pub fn preeditCallback(_: *@This(), _: ?[]const u8) void {}
+
+            pub fn keyCallback(self: *@This(), event: input.KeyEvent) !CoreSurface.InputEffect {
+                try std.testing.expect(!self.surface.bell_ringing);
+                try std.testing.expectEqualStrings("\u{65e5}", event.utf8);
+                self.commits += 1;
+                return .closed;
+            }
+
+            pub fn noteInput(_: *@This(), _: []const u8) void {
+                unreachable; // A closed target must never be used again.
+            }
+        };
+        var ime_target: ImeTarget = .{ .surface = &surface_b };
+        try std.testing.expectEqual(CoreSurface.InputEffect.ignored, surface_b.commitImeResult(&ime_target, ""));
+        try std.testing.expect(surface_b.bell_ringing);
+        try std.testing.expectEqual(@as(usize, 0), ime_target.commits);
+        try std.testing.expectEqual(CoreSurface.InputEffect.closed, surface_b.commitImeResult(&ime_target, "\u{65e5}"));
+        try std.testing.expectEqual(@as(usize, 1), ime_target.commits);
+        try std.testing.expect(!surface_b.bell_ringing);
+        try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
+        try std.testing.expectEqualStrings("", Host.tabItemUiaItemStatus(&host, 2, &status_buf));
+
         // A reload with `no-title` takes the marks away (here for tab B's)...
+        surface_b.setBellRinging(true);
         surface_b.applyBellFeatures(.{ .title = false });
         try std.testing.expect(!surface_b.bell_ringing);
         try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
@@ -39290,8 +39320,15 @@ pub const Surface = struct {
         var utf8_stack: [512]u8 = undefined;
         const text = self.readImeString(alloc, c.GCS_RESULTSTR, &utf8_stack) orelse return .ignored;
         defer text.deinit(alloc);
-        if (text.bytes.len == 0) return .ignored;
-        return win32_input.commitImeText(KeyTarget{ .surface = self }, text.bytes);
+        return self.commitImeResult(KeyTarget{ .surface = self }, text.bytes);
+    }
+
+    fn commitImeResult(self: *Surface, target: anytype, utf8: []const u8) CoreSurface.InputEffect {
+        if (utf8.len == 0) return .ignored;
+        // An IME may commit without a physical key message. Answer the bell
+        // before dispatch, which can close the pane and free this surface.
+        self.clearBell();
+        return win32_input.commitImeText(target, utf8);
     }
 
     fn handleImeComposition(self: *Surface) void {

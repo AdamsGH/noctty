@@ -451,7 +451,9 @@ follows `bell-features`, which defaults to `attention,title`:
   the worker is busy; title and attention cues still work. The DLL loads only
   on the first audio bell, off the UI thread. Volume needs the Windows Media (`mpegvideo`)
   MCI device; where it is missing the file plays at the system volume. WAV was
-  tested; other formats play if Windows Media can play them.
+  tested; other formats play if Windows Media can play them. Refused paths,
+  unavailable audio APIs, and playback failures each log at most one warning per
+  process, so a failed file does not hide a later path refusal after reload.
 - `border` is not implemented.
 
 Whatever features are on, a screen reader is also told "Bell" by a UI Automation
