@@ -250,17 +250,17 @@ new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
 literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
 relative PATH entries such as `.`, still select programs relative to the pane.
 
-With `command` unset, a new tab runs the first of these that can be started:
+With `command` unset, a new tab runs the first of these that is found:
 
 1. `pwsh.exe` (PowerShell 7+) on `PATH`.
 2. Windows PowerShell, from the Windows system directory.
 3. `cmd.exe`, from the Windows system directory.
 
-WSL is never part of this order. The lookup only reads the filesystem and
-launches nothing. It skips relative `PATH` entries and any `PATH` entry that is
-a network share, a device path, a mapped network drive or a link to one, so a
-stale share named in `PATH` cannot stall startup or plant a shell (a link
-higher up in a `PATH` folder's own path is not looked at). A `pwsh.exe` that
+WSL is never part of this order. The lookup only reads filesystem metadata and
+launches nothing. It skips relative `PATH` entries, network shares, device paths,
+mapped network drives and folder links, including links higher up in a `PATH`
+entry. The kernel rejects reparse traversal before reading a target, so an
+unchecked folder link cannot contact a share during detection. A `pwsh.exe` that
 is a Microsoft Store App Execution Alias counts only while the file it points
 at exists; an alias left behind by an uninstalled package is passed over, and
 so is a directory or a symlink named `pwsh.exe`. Windows PowerShell and

@@ -438,11 +438,53 @@ fn windowsNonDirectoryPathExists(path: []const u8) bool {
     return attributes & windows.FILE_ATTRIBUTE_DIRECTORY == 0;
 }
 
-/// The attributes of `path` itself (a reparse point is not followed), or null.
+/// Open only the final object, refusing every reparse ancestor in the kernel.
+/// FILE_OPEN_REPARSE_POINT lets us inspect a final Store alias without following
+/// it. OBJ_DONT_REPARSE prevents even a metadata query from traversing an
+/// ancestor link into a share or an unchecked redirect chain.
+fn openPathNoRedirect(path: []const u8) ?windows.HANDLE {
+    if (!isDriveAbsolutePath(path) or internal_os.path.isNetworkOrDevicePath(path) or
+        internal_os.windows.driveTypeForLetter(path[0]) == internal_os.windows.DRIVE_REMOTE) return null;
+    const wide = windows.sliceToPrefixedFileW(null, path) catch return null;
+    var name: windows.UNICODE_STRING = .{
+        .Length = @intCast(wide.span().len * 2),
+        .MaximumLength = @intCast(wide.span().len * 2),
+        .Buffer = @constCast(wide.span().ptr),
+    };
+    var attrs: windows.OBJECT_ATTRIBUTES = .{
+        .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
+        .RootDirectory = null,
+        .ObjectName = &name,
+        .Attributes = 0x1000, // OBJ_DONT_REPARSE
+        .SecurityDescriptor = null,
+        .SecurityQualityOfService = null,
+    };
+    var io: windows.IO_STATUS_BLOCK = undefined;
+    var handle: windows.HANDLE = undefined;
+    const status = windows.ntdll.NtCreateFile(
+        &handle,
+        windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+        &attrs,
+        &io,
+        null,
+        windows.FILE_ATTRIBUTE_NORMAL,
+        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        windows.FILE_OPEN,
+        windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT,
+        null,
+        0,
+    );
+    return if (status == .SUCCESS) handle else null;
+}
+
+/// Attributes of the final object, with no ancestor or final link followed.
 fn pathAttributes(path: []const u8) ?windows.DWORD {
-    const path_w = windows.sliceToPrefixedFileW(null, path) catch return null;
-    const attributes = windows.kernel32.GetFileAttributesW(path_w.span().ptr);
-    return if (attributes == windows.INVALID_FILE_ATTRIBUTES) null else attributes;
+    const handle = openPathNoRedirect(path) orelse return null;
+    defer windows.CloseHandle(handle);
+    var info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
+    var io: windows.IO_STATUS_BLOCK = undefined;
+    if (windows.ntdll.NtQueryInformationFile(handle, &io, &info, @sizeOf(@TypeOf(info)), .FileAttributeTagInformation) != .SUCCESS) return null;
+    return info.FileAttributes;
 }
 
 /// A file `CreateProcess` can start. The only reparse point accepted is an App
@@ -457,9 +499,6 @@ fn isLaunchableFile(path: []const u8) bool {
     if (attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0) return true;
     return appExecLinkTargetExists(path);
 }
-
-const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa0000003;
-const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000000c;
 
 /// The reparse data of the open reparse point `handle`, as the slice of `buf`
 /// the call filled, or null.
@@ -478,60 +517,12 @@ fn readReparseData(handle: windows.HANDLE, buf: []align(4) u8) ?[]const u8 {
     return buf[0..@min(returned, buf.len)];
 }
 
-/// Whether the folder `dir`, an absolute local-drive `PATH` entry, can be
-/// searched without leaving this machine's disks. A plain folder can. A folder
-/// that is itself a link is read, not followed: a junction names a local volume
-/// by construction, a symbolic link must name a local drive path or stay on its
-/// own volume, and every other reparse point (a cloud placeholder, whose files
-/// can be fetched over the network on first touch) is refused. A link higher up
-/// in `dir`'s path is not detected.
+/// Only ordinary local folders are searched. Reparse ancestors are rejected
+/// by openPathNoRedirect; final folder links and cloud placeholders are skipped.
 fn isLocalSearchDirectory(dir: []const u8) bool {
     const attributes = pathAttributes(dir) orelse return false;
-    if (attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0) return true;
-    const dir_w = windows.sliceToPrefixedFileW(null, dir) catch return false;
-    const handle = windows.kernel32.CreateFileW(
-        dir_w.span().ptr,
-        windows.FILE_READ_ATTRIBUTES,
-        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
-        null,
-        windows.OPEN_EXISTING,
-        windows.FILE_FLAG_OPEN_REPARSE_POINT | windows.FILE_FLAG_BACKUP_SEMANTICS,
-        null,
-    );
-    if (handle == windows.INVALID_HANDLE_VALUE) return false;
-    defer windows.CloseHandle(handle);
-    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
-    const record = readReparseData(handle, &data) orelse return false;
-    return reparseDirectoryIsLocal(record);
-}
-
-/// `isLocalSearchDirectory` for the reparse data `record` of a folder.
-fn reparseDirectoryIsLocal(record: []const u8) bool {
-    if (record.len < 8) return false;
-    const tag = std.mem.readInt(u32, record[0..4], .little);
-    // A junction can only point at a local volume.
-    if (tag == IO_REPARSE_TAG_MOUNT_POINT) return true;
-    if (tag != IO_REPARSE_TAG_SYMLINK or record.len < 20) return false;
-    const offset = 20 + @as(usize, std.mem.readInt(u16, record[8..10], .little));
-    const length = @as(usize, std.mem.readInt(u16, record[10..12], .little));
-    if (length % 2 != 0 or offset + length > record.len) return false;
-    const relative = std.mem.readInt(u32, record[16..20], .little) & 1 != 0; // SYMLINK_FLAG_RELATIVE
-    var name: [260]u8 = undefined;
-    var chars: usize = 0;
-    for (0..length / 2) |i| {
-        const unit = std.mem.readInt(u16, record[offset + 2 * i ..][0..2], .little);
-        // Local-drive syntax is ASCII; a name that is not is not one.
-        if (unit == 0 or unit > 0x7f or chars == name.len) return false;
-        name[chars] = @intCast(unit);
-        chars += 1;
-    }
-    var target: []const u8 = name[0..chars];
-    // A relative link cannot change volume unless it names a drive or a root.
-    if (relative) return target.len > 0 and target[0] != '\\' and target[0] != '/' and
-        std.mem.indexOfScalar(u8, target, ':') == null;
-    if (std.mem.startsWith(u8, target, "\\??\\")) target = target[4..];
-    return isDriveAbsolutePath(target) and !internal_os.path.isNetworkOrDevicePath(target) and
-        internal_os.windows.driveTypeForLetter(target[0]) != internal_os.windows.DRIVE_REMOTE;
+    return attributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0 and
+        attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0;
 }
 
 const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000001b;
@@ -540,17 +531,7 @@ const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000001b;
 /// reparse data and never launches it (an alias to a missing package can open
 /// the Store).
 fn appExecLinkTargetExists(path: []const u8) bool {
-    const path_w = windows.sliceToPrefixedFileW(null, path) catch return false;
-    const handle = windows.kernel32.CreateFileW(
-        path_w.span().ptr,
-        windows.FILE_READ_ATTRIBUTES,
-        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
-        null,
-        windows.OPEN_EXISTING,
-        windows.FILE_FLAG_OPEN_REPARSE_POINT,
-        null,
-    );
-    if (handle == windows.INVALID_HANDLE_VALUE) return false;
+    const handle = openPathNoRedirect(path) orelse return false;
     defer windows.CloseHandle(handle);
     var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
     const record = readReparseData(handle, &data) orelse return false;
@@ -1518,7 +1499,7 @@ fn directCommand(alloc: Allocator, argv: []const []const u8) !Command {
 /// A program by bare name, for the profile list and the SSH lookup. The same
 /// search `defaultCommand` uses for pwsh.exe, so the picker and a new tab agree
 /// on what is installed: local absolute `PATH` entries only, quoted entries
-/// understood, and nothing opened (an App Execution Alias cannot be opened).
+/// understood, and guarded metadata handles (no reparse ancestor is followed).
 fn lookupExecutable(alloc: Allocator, exe: []const u8) !?[]u8 {
     if (builtin.os.tag != .windows or std.mem.indexOfAny(u8, exe, "\\/:") != null)
         return try internal_os.path.expand(alloc, exe);
@@ -2220,57 +2201,32 @@ test "appExecLinkTarget reads the third string and rejects a cut, foreign or odd
     try std.testing.expect(appExecLinkTarget(&zeroed, &out) == null);
 }
 
-/// Reparse data of a symbolic link whose substitute name is `name`.
-fn symlinkRecord(alloc: Allocator, flags: u32, name: []const u8) ![]u8 {
-    const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, name);
-    defer alloc.free(wide);
-    var record: std.ArrayList(u8) = .empty;
-    errdefer record.deinit(alloc);
-    const bytes: u16 = @intCast(wide.len * 2);
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, IO_REPARSE_TAG_SYMLINK)));
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 12 + bytes)));
-    try record.appendSlice(alloc, &.{ 0, 0 });
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 0))); // substitute offset
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, bytes)));
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 0))); // print offset
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, 0)));
-    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, flags)));
-    try record.appendSlice(alloc, std.mem.sliceAsBytes(wide));
-    return try record.toOwnedSlice(alloc);
-}
-
-test "a PATH folder that is a link counts only when it stays on local disks" {
+test "shell discovery refuses reparse ancestors before reading the target" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const relative_flag = 1;
-    const cases = [_]struct { flags: u32, name: []const u8, local: bool }{
-        .{ .flags = 0, .name = "\\??\\C:\\Tools\\shells", .local = true },
-        .{ .flags = 0, .name = "\\??\\UNC\\server\\share\\shells", .local = false },
-        .{ .flags = 0, .name = "\\\\server\\share\\shells", .local = false },
-        .{ .flags = 0, .name = "\\??\\Volume{00000000-0000-0000-0000-000000000000}\\", .local = false },
-        .{ .flags = 0, .name = "\\\\?\\pipe\\x", .local = false },
-        .{ .flags = relative_flag, .name = "..\\shells", .local = true },
-        .{ .flags = relative_flag, .name = "shells", .local = true },
-        .{ .flags = relative_flag, .name = "\\shells", .local = false },
-        .{ .flags = relative_flag, .name = "D:shells", .local = false },
-        .{ .flags = relative_flag, .name = "", .local = false },
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("real/bin");
+    try tmp.dir.writeFile(.{ .sub_path = "real/bin/pwsh.exe", .data = "MZ" });
+    tmp.dir.symLink("real", "link", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
     };
-    for (cases) |case| {
-        const record = try symlinkRecord(alloc, case.flags, case.name);
-        defer alloc.free(record);
-        try std.testing.expectEqual(case.local, reparseDirectoryIsLocal(record));
-        // Cut anywhere short of its name, it is refused rather than guessed at.
-        if (case.name.len > 0) try std.testing.expect(!reparseDirectoryIsLocal(record[0 .. record.len - 2]));
-    }
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}\\link\\bin\\pwsh.exe", .{root});
+    defer alloc.free(path);
+    // Even a local ancestor link is refused: the kernel guard must reject
+    // traversal before any metadata query can contact an unchecked target.
+    try std.testing.expect(pathAttributes(path) == null);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fs.path.dirname(path).?;
+    try std.testing.expect(searchPath(&buf, "pwsh.exe", dir, null, isLaunchableFile) == null);
+}
 
-    // A junction can only name a local volume; any other kind of reparse
-    // point (a cloud placeholder here) is refused.
-    var junction = [_]u8{ 0x03, 0x00, 0x00, 0xa0, 8, 0, 0, 0 };
-    try std.testing.expect(reparseDirectoryIsLocal(&junction));
-    var cloud = [_]u8{ 0x1a, 0x00, 0x00, 0x90, 8, 0, 0, 0 };
-    try std.testing.expect(!reparseDirectoryIsLocal(&cloud));
-    try std.testing.expect(!reparseDirectoryIsLocal(junction[0..4]));
-
+test "shell discovery searches only ordinary local folders" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
     // A real folder passes, a missing one does not (nothing to search).
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
