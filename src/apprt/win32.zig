@@ -15796,6 +15796,10 @@ const Host = struct {
 
     /// Scroll three rows per notch, retaining high-resolution fractions.
     fn scrollPaletteList(self: *Host, delta: i16) void {
+        self.scrollPaletteListAt(delta, sys.GetTickCount64());
+    }
+
+    fn scrollPaletteListAt(self: *Host, delta: i16, now_ms: u64) void {
         const visible_rows = self.palette_list_visible_rows;
         if (visible_rows == 0 or self.palette_list_ranked_count <= visible_rows) {
             self.palette_wheel_steps = .{};
@@ -15803,7 +15807,7 @@ const Host = struct {
         }
         // Chrome has a fixed three-row notch, independent of terminal cell
         // size and the surface's configured wheel multiplier.
-        const step = self.palette_wheel_steps.add(win32_input.chromeWheelDelta(false, delta, 3), sys.GetTickCount64());
+        const step = self.palette_wheel_steps.add(win32_input.chromeWheelDelta(false, delta, 3), now_ms);
         if (step == 0) return;
         const max_scroll = self.palette_list_ranked_count - visible_rows;
         var next: isize = @as(isize, @intCast(self.palette_list_scroll)) - step;
@@ -15846,22 +15850,22 @@ const Host = struct {
         host.palette_list_ranked_count = 20;
         host.palette_list_visible_rows = 5;
         host.palette_list_selected = 3;
-        for (0..3) |_| host.scrollPaletteList(-10);
+        for (0..3) |i| host.scrollPaletteListAt(-10, i);
         try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
-        host.scrollPaletteList(-10);
+        host.scrollPaletteListAt(-10, 3);
         try std.testing.expectEqual(@as(usize, 1), host.palette_list_scroll);
         try std.testing.expectEqual(@as(usize, 3), host.palette_list_selected);
-        host.scrollPaletteList(-120);
+        host.scrollPaletteListAt(-120, 4);
         try std.testing.expectEqual(@as(usize, 4), host.palette_list_scroll);
         try std.testing.expectEqual(@as(usize, 4), host.palette_list_selected);
-        host.scrollPaletteList(120);
+        host.scrollPaletteListAt(120, 5);
         try std.testing.expectEqual(@as(usize, 1), host.palette_list_scroll);
-        host.scrollPaletteList(120);
+        host.scrollPaletteListAt(120, 6);
         try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
         try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
         host.palette_list_ranked_count = 2;
         host.palette_wheel_steps.remainder = 60;
-        host.scrollPaletteList(-10);
+        host.scrollPaletteListAt(-10, 7);
         try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
     }
 
@@ -32030,7 +32034,6 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                 },
                 c.WM_MOUSELEAVE => {
                     v.hideTabTooltip();
-                    v.tab_wheel_steps = .{};
                     if (v.isHoveredButton(hwnd)) v.setHoveredButton(null);
                 },
                 c.WM_KEYDOWN => {
