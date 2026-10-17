@@ -80,12 +80,13 @@ pub const SettingValue = value: {
     } });
 };
 
-/// One descriptor per persisted Config key. `app-notifications` has two scalar
-/// projections, not two independently saved keys. The three owned fields stay
-/// out of SettingValue so replacing a Config arena cannot invalidate a draft.
 /// These are the current form and UIA names, which intentionally differ from
-/// palette/conflict labels. Later native generation must preserve all three.
-pub const NativeNames = struct { form_label: ?[]const u8 = null, accessible_name: []const u8 };
+/// palette/conflict labels. Later native generation must preserve these names.
+pub const NativeNames = struct {
+    form_label: ?[]const u8 = null,
+    caption: ?[]const u8 = null,
+    accessible_name: []const u8,
+};
 /// A composite Config key can expose multiple typed scalar controls without
 /// claiming that key twice in the persistence allowlist.
 pub const Projection = struct {
@@ -97,6 +98,9 @@ pub const Projection = struct {
     native: NativeNames,
 };
 
+/// One descriptor per persisted Config key. `app-notifications` has two scalar
+/// projections, not two independently saved keys. The three owned fields stay
+/// out of SettingValue so replacing a Config arena cannot invalidate a draft.
 pub const Descriptor = struct {
     key: Config.Key,
     field: ?SettingField = null,
@@ -127,7 +131,9 @@ pub const Descriptor = struct {
         if (self.field == null) @compileError("Owned and composite Settings keys require an explicit adapter");
         @field(config, @tagName(self.key)) = value;
     }
-    pub fn writeConfig(comptime self: Descriptor, writer: *std.Io.Writer, config: *const Config) !void {
+    // Standalone test input, not an override serializer: production saves use
+    // patchOrAppendEdits, including its font-family reset and text preservation.
+    fn writeTestEntry(comptime self: Descriptor, writer: *std.Io.Writer, config: *const Config) !void {
         try formatter.formatEntry(self.Value(), @tagName(self.key), self.read(config), writer);
     }
     /// Defaults come from Config.default for this platform/build, never from
@@ -155,11 +161,11 @@ pub const descriptors = [_]Descriptor{
     .{ .key = .@"background-opacity", .native = .{ .form_label = "Background opacity (0.0 .. 1.0)", .accessible_name = "Background opacity" }, .field = .background_opacity, .label = "Background opacity", .section = .appearance, .kind = .number, .apply = .live, .validation = .{ .finite_range = .{ .min = 0, .max = 1 } }, .keywords = "settings preferences configuration background-opacity transparency transparent", .preview = .opacity, .preview_draft = true },
     .{ .key = .@"window-padding-x", .native = .{ .form_label = "Window padding X (left/right or single value)", .accessible_name = "Window padding X" }, .field = .window_padding_x, .label = "Window padding X", .section = .appearance, .kind = .padding, .apply = .new_terminals, .validation = .{ .padding_max = 200 }, .keywords = "settings preferences configuration window-padding-x margin", .preview = .none, .preview_draft = true },
     .{ .key = .@"window-padding-y", .native = .{ .form_label = "Window padding Y (top/bottom or single value)", .accessible_name = "Window padding Y" }, .field = .window_padding_y, .label = "Window padding Y", .section = .appearance, .kind = .padding, .apply = .new_terminals, .validation = .{ .padding_max = 200 }, .keywords = "settings preferences configuration window-padding-y margin", .preview = .none, .preview_draft = true },
-    .{ .key = .@"clipboard-trim-trailing-spaces", .native = .{ .accessible_name = "Clipboard trimming" }, .field = .trim_trailing_spaces, .label = "Trim trailing spaces on copy", .section = .terminal, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-trim-trailing-spaces whitespace copy", .preview = .none, .preview_draft = false },
-    .{ .key = .@"desktop-notifications", .native = .{ .accessible_name = "Terminal notifications" }, .field = .desktop_notifications, .label = "Terminal desktop notifications", .section = .privacy, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration desktop-notifications alerts", .preview = .none, .preview_draft = false },
+    .{ .key = .@"clipboard-trim-trailing-spaces", .native = .{ .caption = "Trim trailing spaces on copy", .accessible_name = "Clipboard trimming" }, .field = .trim_trailing_spaces, .label = "Trim trailing spaces on copy", .section = .terminal, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-trim-trailing-spaces whitespace copy", .preview = .none, .preview_draft = false },
+    .{ .key = .@"desktop-notifications", .native = .{ .form_label = "Notifications", .caption = "Allow terminal desktop notifications", .accessible_name = "Terminal notifications" }, .field = .desktop_notifications, .label = "Terminal desktop notifications", .section = .privacy, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration desktop-notifications alerts", .preview = .none, .preview_draft = false },
     .{ .key = .@"app-notifications", .projections = &.{
-        .{ .field = .app_notify_clipboard, .member = "clipboard-copy", .label = "Clipboard copy notification", .keywords = "settings preferences configuration app-notifications clipboard-copy toast", .default_label = "Clipboard copy", .native = .{ .accessible_name = "Clipboard-copy notification" } },
-        .{ .field = .app_notify_config, .member = "config-reload", .label = "Config reload notification", .keywords = "settings preferences configuration app-notifications config-reload toast", .default_label = "config reload", .native = .{ .accessible_name = "Config-reload notification" } },
+        .{ .field = .app_notify_clipboard, .member = "clipboard-copy", .label = "Clipboard copy notification", .keywords = "settings preferences configuration app-notifications clipboard-copy toast", .default_label = "Clipboard copy", .native = .{ .caption = "Notify when clipboard copy completes", .accessible_name = "Clipboard-copy notification" } },
+        .{ .field = .app_notify_config, .member = "config-reload", .label = "Config reload notification", .keywords = "settings preferences configuration app-notifications config-reload toast", .default_label = "Config reload", .native = .{ .caption = "Notify after config reload", .accessible_name = "Config-reload notification" } },
     }, .label = "App notifications", .section = .privacy, .kind = .notifications, .apply = .live, .keywords = "settings preferences configuration app-notifications clipboard-copy config-reload toast" },
     .{ .key = .@"confirm-close-surface", .native = .{ .form_label = "Close confirmation", .accessible_name = "Close confirmation" }, .field = .confirm_close, .label = "Close confirmation", .section = .terminal, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration confirm-close-surface quit exit running", .preview = .none, .preview_draft = false },
     .{ .key = .@"copy-on-select", .native = .{ .form_label = "Copy on select", .accessible_name = "Copy on select" }, .field = .copy_on_select, .label = "Copy on select", .section = .terminal, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration copy-on-select selection clipboard", .preview = .none, .preview_draft = false },
@@ -170,11 +176,11 @@ pub const descriptors = [_]Descriptor{
     .{ .key = .@"window-theme", .native = .{ .form_label = "Window theme", .accessible_name = "Window theme" }, .field = .window_theme, .label = "Window theme", .section = .appearance, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration window-theme dark light mode", .preview = .theme, .preview_draft = true },
     .{ .key = .@"shell-integration", .native = .{ .form_label = "Shell integration", .accessible_name = "Shell integration" }, .field = .shell_integration, .label = "Shell integration", .section = .shell, .kind = .choice, .apply = .new_terminals, .validation = .typed, .keywords = "settings preferences configuration shell-integration powershell bash prompt", .preview = .none, .preview_draft = false },
     .{ .key = .@"cursor-style", .native = .{ .form_label = "Cursor style", .accessible_name = "Cursor style" }, .field = .cursor_style, .label = "Cursor style", .section = .appearance, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration cursor-style caret block bar underline", .preview = .none, .preview_draft = true },
-    .{ .key = .@"background-blur", .native = .{ .accessible_name = "Background blur" }, .field = .background_blur, .label = "Background blur", .section = .appearance, .kind = .blur, .apply = .live, .supported = false, .validation = .typed, .keywords = "settings preferences configuration background-blur", .preview = .none, .preview_draft = true },
+    .{ .key = .@"background-blur", .native = .{ .caption = "Background blur (not supported on Windows)", .accessible_name = "Background blur" }, .field = .background_blur, .label = "Background blur", .section = .appearance, .kind = .blur, .apply = .live, .supported = false, .validation = .typed, .keywords = "settings preferences configuration background-blur", .preview = .none, .preview_draft = true },
     .{ .key = .@"window-padding-balance", .native = .{ .form_label = "Window padding balance", .accessible_name = "Window padding balance" }, .field = .padding_balance, .label = "Window padding balance", .section = .appearance, .kind = .choice, .apply = .new_terminals, .validation = .typed, .keywords = "settings preferences configuration window-padding-balance margin", .preview = .none, .preview_draft = true },
     .{ .key = .@"auto-update", .native = .{ .form_label = "Auto-update mode", .accessible_name = "Auto-update mode" }, .field = .auto_update, .label = "Auto-update mode", .section = .updates, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration auto-update upgrade", .preview = .none, .preview_draft = false },
     .{ .key = .@"auto-update-channel", .native = .{ .form_label = "Auto-update channel", .accessible_name = "Auto-update channel" }, .field = .auto_update_channel, .label = "Auto-update channel", .section = .updates, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration auto-update-channel stable tip release", .preview = .none, .preview_draft = false },
-    .{ .key = .@"accent-follow-system", .native = .{ .accessible_name = "Follow Windows accent color" }, .field = .accent_follow_system, .label = "Follow Windows accent color", .section = .appearance, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration accent-follow-system accent color highlight tab windows personalization", .preview = .theme, .preview_draft = true },
+    .{ .key = .@"accent-follow-system", .native = .{ .caption = "Follow Windows accent color", .accessible_name = "Follow Windows accent color" }, .field = .accent_follow_system, .label = "Follow Windows accent color", .section = .appearance, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration accent-follow-system accent color highlight tab windows personalization", .preview = .theme, .preview_draft = true },
     .{ .key = .@"font-family", .native = .{ .form_label = "Font family fallbacks (comma-separated)", .accessible_name = "Font family fallbacks" }, .label = "Font family", .section = .appearance, .kind = .font_families, .apply = .live, .validation = .font_families, .keywords = "settings preferences configuration font-family", .default_display = .inherited },
     .{ .key = .theme, .native = .{ .form_label = "Terminal theme name, absolute path, or light/dark pair", .accessible_name = "Terminal theme" }, .label = "Terminal theme", .section = .appearance, .kind = .theme, .apply = .live, .validation = .theme, .keywords = "settings preferences configuration theme", .default_display = .inherited },
     .{ .key = .command, .native = .{ .form_label = "Default command (blank = auto-detect)", .accessible_name = "Default command" }, .label = "Default command", .section = .shell, .kind = .command, .apply = .new_terminals, .validation = .command, .keywords = "settings preferences configuration command", .default_display = .automatic },
@@ -488,11 +494,40 @@ pub fn writeSettingValue(writer: *std.Io.Writer, value: SettingValue) !void {
             .boolean, .notifications => try writeOnOff(writer, payload),
             .choice => try writer.writeAll(Combo(field).labels[Combo(field).toIndex(payload)]),
             .blur => try writeOnOff(writer, payload.win32BlurRequested()),
-            else => unreachable,
+            else => @compileError("Owned Settings values need an explicit formatter"),
         },
     }
 }
 
+/// Shared non-default fixture for model and production patcher contracts.
+pub const round_trip_config =
+    \\scrollback-limit = 123456
+    \\font-size = 13.25
+    \\background-opacity = 0.875
+    \\window-padding-x = 5,7
+    \\window-padding-y = 9,11
+    \\clipboard-trim-trailing-spaces = false
+    \\desktop-notifications = false
+    \\app-notifications = no-clipboard-copy,no-config-reload
+    \\confirm-close-surface = always
+    \\copy-on-select = clipboard
+    \\clipboard-read = deny
+    \\clipboard-write = deny
+    \\link-url = false
+    \\link-previews = osc8
+    \\window-theme = dark
+    \\shell-integration = none
+    \\cursor-style = bar
+    \\background-blur = true
+    \\window-padding-balance = equal
+    \\auto-update = off
+    \\auto-update-channel = tip
+    \\accent-follow-system = false
+    \\font-family = Font #; 🚀
+    \\font-family = Second Font
+    \\theme = light:Light,dark:Dark
+    \\command = direct:pwsh.exe -NoLogo -Command "echo #; literal"
+;
 /// Behavioral round trips use Config's real grammar and formatter, including
 /// composite/owned keys, rather than checking source text or pointer equality.
 pub fn testRoundTrips(alloc: std.mem.Allocator) !void {
@@ -502,35 +537,7 @@ pub fn testRoundTrips(alloc: std.mem.Allocator) !void {
     defer defaults.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const text =
-        \\scrollback-limit = 123456
-        \\font-size = 13.25
-        \\background-opacity = 0.875
-        \\window-padding-x = 5,7
-        \\window-padding-y = 9,11
-        \\clipboard-trim-trailing-spaces = false
-        \\desktop-notifications = false
-        \\app-notifications = no-clipboard-copy,no-config-reload
-        \\confirm-close-surface = always
-        \\copy-on-select = clipboard
-        \\clipboard-read = deny
-        \\clipboard-write = deny
-        \\link-url = false
-        \\link-previews = osc8
-        \\window-theme = dark
-        \\shell-integration = none
-        \\cursor-style = bar
-        \\background-blur = true
-        \\window-padding-balance = equal
-        \\auto-update = off
-        \\auto-update-channel = tip
-        \\accent-follow-system = false
-        \\font-family = Font #; 🚀
-        \\font-family = Second Font
-        \\theme = light:Light,dark:Dark
-        \\command = direct:pwsh.exe -NoLogo -Command "echo #; literal"
-    ;
-    try tmp.dir.writeFile(.{ .sub_path = "source", .data = text });
+    try tmp.dir.writeFile(.{ .sub_path = "source", .data = round_trip_config });
     const path = try tmp.dir.realpathAlloc(alloc, "source");
     defer alloc.free(path);
     try source.loadFile(alloc, path);
@@ -539,7 +546,7 @@ pub fn testRoundTrips(alloc: std.mem.Allocator) !void {
         try std.testing.expect(defaults.changed(&source, spec.key));
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try spec.writeConfig(&out.writer, &source);
+        try spec.writeTestEntry(&out.writer, &source);
         try tmp.dir.writeFile(.{ .sub_path = "source", .data = out.written() });
         var loaded = try Config.default(alloc);
         defer loaded.deinit();
@@ -548,7 +555,7 @@ pub fn testRoundTrips(alloc: std.mem.Allocator) !void {
         try std.testing.expect(!loaded.changed(&source, spec.key));
         var again: std.Io.Writer.Allocating = .init(alloc);
         defer again.deinit();
-        try spec.writeConfig(&again.writer, &loaded);
+        try spec.writeTestEntry(&again.writer, &loaded);
         try std.testing.expectEqualStrings(out.written(), again.written());
         out.clearRetainingCapacity();
         try spec.writeDefault(&out.writer, &defaults);

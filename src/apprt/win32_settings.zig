@@ -415,8 +415,15 @@ const owned_setting_field_count = std.enums.values(OwnedSettingField).len;
 
 test "settings field model covers each Settings-owned Config key exactly once" {
     inline for (field_model.descriptors) |spec| {
-        if (spec.native) |names| try expectNativeFieldNames(names);
-        inline for (spec.projections) |part| try expectNativeFieldNames(part.native);
+        if (spec.native) |names| {
+            try expectNativeFieldNames(names, spec.kind, spec.section);
+            if (names.form_label) |label| {
+                if (std.mem.indexOf(u8, label, "new terminals") != null) {
+                    try std.testing.expectEqual(field_model.ApplyPolicy.new_terminals, spec.apply);
+                }
+            }
+        }
+        inline for (spec.projections) |part| try expectNativeFieldNames(part.native, .boolean, spec.section);
     }
     comptime field_model.assertCoverage(editable_keys);
 }
@@ -427,19 +434,41 @@ test "settings field model round trips every descriptor" {
 
 // Name contracts protect a future generated form from silently using palette
 // wording for UIA or the longer visible field captions. Providers stay intact.
-fn expectNativeFieldNames(names: field_model.NativeNames) !void {
-    var accessible_found = false;
-    for (settings_control_specs) |spec| {
-        if (std.mem.eql(u8, spec.name, names.accessible_name)) accessible_found = true;
+fn expectNativeFieldNames(names: field_model.NativeNames, kind: field_model.Kind, section: field_model.Section) !void {
+    var control_index: ?usize = null;
+    for (settings_control_specs, 0..) |spec, index| {
+        if (!std.mem.eql(u8, spec.name, names.accessible_name)) continue;
+        try std.testing.expect(control_index == null);
+        control_index = index;
+        const role: SettingsControlRole = switch (kind) {
+            .boolean, .blur => .check_box,
+            .choice => .combo_box,
+            else => .edit,
+        };
+        try std.testing.expectEqual(role, spec.role);
     }
-    try std.testing.expect(accessible_found);
-    if (names.form_label) |label| {
-        var label_found = false;
-        for (settings_label_specs) |existing| {
-            if (std.mem.eql(u8, existing, label)) label_found = true;
+    const index = control_index orelse return error.TestExpectedEqual;
+    var model_uses: usize = 0;
+    for (field_model.descriptors) |spec| {
+        if (spec.native) |other| {
+            if (std.mem.eql(u8, other.accessible_name, names.accessible_name)) model_uses += 1;
         }
-        try std.testing.expect(label_found);
+        for (spec.projections) |part| {
+            if (std.mem.eql(u8, part.native.accessible_name, names.accessible_name)) model_uses += 1;
+        }
     }
+    try std.testing.expectEqual(@as(usize, 1), model_uses);
+    var form_uses: usize = 0;
+    for (formItemsForSection(nativeSection(section))) |item| {
+        if (item.control_index != index) continue;
+        form_uses += 1;
+        if (names.form_label) |label| {
+            try std.testing.expectEqualStrings(label, settings_label_specs[item.label_index orelse return error.TestExpectedEqual]);
+        } else try std.testing.expect(item.label_index == null);
+        try std.testing.expectEqual(names.caption != null, item.checkbox);
+        if (names.caption) |caption| try std.testing.expectEqualStrings(caption, checkbox_captions[index].?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), form_uses);
 }
 
 /// The complete persistence allowlist. Effective config contains derived fields
@@ -670,13 +699,8 @@ fn keybindingsHelpText() []const u8 {
             "  keybind = chain=goto_split:left";
 }
 
-// Dropdown items. The position of an item IS the contract with the matching
-// `...FromComboIndex` / `comboIndexFrom...` pair below, and with the order of
-// the config enum's values as the form has always stored them: the text only
-// ever changes how an option reads. What is written to the config file is
-// still the raw token (`false`, `block_hollow`, ...), never this text.
-
-const CursorStyle = @FieldType(Config, "cursor-style");
+// Dropdown items retain the native form's curated order and display wording;
+// typed mappings live in the field model. Config still stores raw tokens.
 const AutoUpdate = @typeInfo(@FieldType(Config, "auto-update")).optional.child;
 const ReleaseChannel = @typeInfo(@FieldType(Config, "auto-update-channel")).optional.child;
 
@@ -857,7 +881,7 @@ const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 /// `scrollback-limit` is a byte budget per terminal, and 0 turns scrollback off
 /// (Config.zig, Screen.zig); there is no "unlimited". Only new terminals read it.
 /// The accessible name stays the prefix, "Scrollback limit".
-const scrollback_label = "Scrollback limit (bytes; 0 = off; new terminals only)";
+const scrollback_label = field_model.forKey(.@"scrollback-limit").?.native.?.form_label.?;
 
 const settings_label_specs = [_][]const u8{
     scrollback_label,
@@ -894,6 +918,21 @@ const link_previews_label = "Link preview popups (not supported on Windows)";
 /// A file-level constant: `open` already spends its comptime branch quota on
 /// the other labels, and one more literal there fails the build.
 const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow Windows accent color");
+const trim_trailing_label = "Trim trailing spaces on copy";
+const desktop_notifications_label = "Allow terminal desktop notifications";
+const notify_clipboard_label = "Notify when clipboard copy completes";
+const notify_config_label = "Notify after config reload";
+// Indexed like settings_control_specs; only native checkbox controls have captions.
+const checkbox_captions = captions: {
+    var result: [settings_control_count]?[]const u8 = @splat(null);
+    result[3] = trim_trailing_label;
+    result[13] = background_blur_label;
+    result[20] = desktop_notifications_label;
+    result[21] = notify_clipboard_label;
+    result[22] = notify_config_label;
+    result[27] = "Follow Windows accent color";
+    break :captions result;
+};
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
 const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
     .{ .role = .edit, .name = "Scrollback limit" },
@@ -4930,28 +4969,28 @@ pub const SettingsWindow = struct {
             form,
             self.handle.hinstance,
             CHK_TRIM_TRAIL,
-            std.unicode.utf8ToUtf16LeStringLiteral("Trim trailing spaces on copy"),
+            std.unicode.utf8ToUtf16LeStringLiteral(trim_trailing_label),
         );
 
         self.chk_desktop_notifications = makeCheckbox(
             form,
             self.handle.hinstance,
             CHK_DESKTOP_NOTIFICATIONS,
-            std.unicode.utf8ToUtf16LeStringLiteral("Allow terminal desktop notifications"),
+            std.unicode.utf8ToUtf16LeStringLiteral(desktop_notifications_label),
         );
 
         self.chk_app_notify_clipboard = makeCheckbox(
             form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CLIPBOARD,
-            std.unicode.utf8ToUtf16LeStringLiteral("Notify when clipboard copy completes"),
+            std.unicode.utf8ToUtf16LeStringLiteral(notify_clipboard_label),
         );
 
         self.chk_app_notify_config = makeCheckbox(
             form,
             self.handle.hinstance,
             CHK_APP_NOTIFY_CONFIG,
-            std.unicode.utf8ToUtf16LeStringLiteral("Notify after config reload"),
+            std.unicode.utf8ToUtf16LeStringLiteral(notify_config_label),
         );
 
         // Comboboxes for enum fields.

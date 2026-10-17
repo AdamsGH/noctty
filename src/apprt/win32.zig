@@ -29099,34 +29099,9 @@ test "win32 settings every editable key round trips through a file" {
     defer defaults.deinit();
     var pending = try configpkg.Config.default(alloc);
     defer pending.deinit();
-    try settingsTestLoadText(&pending,
-        \\scrollback-limit = 123456
-        \\font-size = 13.25
-        \\background-opacity = 0.875
-        \\window-padding-x = 5,7
-        \\window-padding-y = 9,11
-        \\clipboard-trim-trailing-spaces = false
-        \\desktop-notifications = false
-        \\app-notifications = no-clipboard-copy,no-config-reload
-        \\confirm-close-surface = always
-        \\copy-on-select = clipboard
-        \\clipboard-read = deny
-        \\clipboard-write = deny
-        \\link-url = true
-        \\link-previews = false
-        \\window-theme = dark
-        \\shell-integration = none
-        \\cursor-style = bar
-        \\background-blur = true
-        \\window-padding-balance = true
-        \\auto-update = off
-        \\auto-update-channel = tip
-        \\font-family = Font #; 🚀
-        \\font-family = Second Font
-        \\theme = light:Light,dark:Dark
-        \\command = direct:pwsh.exe -NoLogo -Command "echo #; literal"
-    );
+    try settingsTestLoadText(&pending, @import("win32_settings_fields.zig").round_trip_config);
     inline for (win32_settings.editable_keys) |key| {
+        try std.testing.expect(defaults.changed(&pending, key));
         var edited: SettingsEditedKeySet = .initEmpty();
         edited.set(@intFromEnum(key));
         var old: std.Io.Writer.Allocating = .init(alloc);
