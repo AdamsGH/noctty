@@ -422,10 +422,12 @@ lands incrementally.
   desktop with a 60 ms delay injected after the font change, standing in for
   a slow font build in another pane: one resize per pane at its final grid,
   single pane and split, where the hold alone pushed lines on 29 of 30 moves.
-  The two have not been measured together with real input. Tabs hidden during
-  the move, and a pane whose new font cannot be built, still take the font and
-  the size as separate resizes when they catch up, so long lines can still wrap
-  into scrollback there if the font build is slow (inferred, not measured).
+  The two have not been measured together with real input. A tab hidden
+  during the move takes the font and the size as separate resizes when it is
+  shown, so a slow font build there can still wrap long lines into scrollback.
+  A pane whose new font cannot be built gets the new size in the old font at
+  once, which on a move to a lower DPI can do the same, and the font is
+  retried on a later layout (both inferred, not measured).
 - Alt+Space still sends ESC SPACE to the program as well as opening the
   window menu (#381). Once conhost has seen a Win32 input record it holds a
   lone ESC back until more input arrives, as under Windows Terminal (#335).
