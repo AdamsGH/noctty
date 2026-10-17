@@ -442,6 +442,65 @@ Run with:
 powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-session-restore.ps1 -ResetState
 ```
 
+## hidden-win11-profile-matrix.ps1
+
+Starts each shell profile noctty detects (`cmd.exe`, `powershell.exe`,
+`pwsh.exe`, Git Bash) through a restored session on a hidden desktop and checks
+what the profile really started: the process under noctty and a redacted shape of
+its command line (the PowerShell injection, Git Bash's `--login -i`), and the
+working directory the shell reports with OSC 7, read from the `session-state.json`
+noctty saves at close. cmd and Git Bash are sent a directory change as posted keys;
+PowerShell panes are never typed into, because a pwsh in a test pane loads PSReadLine
+and its history file is the real user's (the harness proves that file, the real
+`startup-attempts.json` and the clipboard sequence number did not change). A
+control case runs cmd with `shell-integration = none` and expects the seed to
+survive. WSL and SSH are never started; a profile that is not installed is
+skipped and reported.
+
+```powershell
+pwsh -NoProfile -File .\hidden-win11-profile-matrix.ps1 -Bin <dir with noctty.exe> -Run <new dir>
+```
+
+The binary must carry the measurement AppUserModelID (the jump list is keyed by
+AUMID in the real `%APPDATA%`, which redirection does not move) unless
+`-AllowProductAumid` says the machine is an ephemeral runner. Results are in
+`profile-matrix-results.json`.
+
+## hidden-win11-embedding-idle.ps1
+
+Host-safe lifecycle of `noctty.exe -Embedding`, the process Windows starts to hand
+over a delegated console. It starts one with nothing to hand over, with
+`LOCALAPPDATA` and the portable folder holding seeded `session-state.json`,
+`palette-mru.txt`, `update-state.json`, `jump-list-recents.json`,
+`startup-attempts.json` and `config.ghostty`, and checks that it opens no window,
+exits by itself after its five-second idle timer with code 0, leaves every seeded
+file byte-identical, quarantines nothing and does not touch the console
+delegation values. `-NegativeControl` starts an ordinary instance instead and
+expects the window oracle to fire. It writes no delegation registry value and
+delivers no handoff; journeys that need one need a machine that can be restored.
+
+```powershell
+pwsh -NoProfile -File .\hidden-win11-embedding-idle.ps1 -Bin <dir with noctty.exe> -Run <new dir>
+```
+
+Both scripts share `hidden-win11-lib.ps1` (private desktop, owned job, explicit
+`lpDesktop` for every child, real-state receipts).
+
+## ..\..\scripts\check-test-skips.ps1
+
+Budget for the Zig tests that skip themselves. `zig build test` reports only a
+total, so a font-shaping test that starts skipping on a runner looks like one that
+always did. The script reads the per-test output of `ghostty-test.exe` run
+directly and fails when a test in the guarded family (`font.shaper.`) skips and is
+not on the runner's allowlist in `test-skip-budget.json`, when the total is above
+the runner's budget, or when the log is incomplete.
+
+```powershell
+zig build -Demit-test-exe=true -Dcustom-shaders=true
+.\zig-out\bin\ghostty-test.exe *> ghostty-test.log
+pwsh -NoProfile -File ..\..\scripts\check-test-skips.ps1 -TestLog ghostty-test.log -Runner windows-2025
+```
+
 ## ..\..\scripts\interactive-win11.ps1
 
 Generic repo-local Win11 launcher for ad hoc debugging. It uses the
