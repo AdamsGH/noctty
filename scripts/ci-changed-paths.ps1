@@ -78,6 +78,8 @@ $script:CiPathRules = @(
     @{ Needs = 'none'; Pattern = '^test/windows/(interactive-win11[a-z0-9-]*|hidden-win11-[a-z0-9-]+)\.ps1$' }
     @{ Needs = 'none'; Pattern = '^test/windows/flagship/(?!Invoke-PortableSmoke\.ps1$|scenarios/portable-x64\.json$|result\.schema\.json$)' }
     # What package-portable-cli.ps1 and Invoke-PortableSmoke.ps1 run.
+    # The executable build also runs the emitted-image import contract.
+    @{ Needs = 'zig'; Pattern = '^test/windows/cli-import-contract\.ps1$' }
     @{ Needs = 'package'; Pattern = '^test/windows/(package-portable-cli\.ps1|cli-[a-z-]+\.ps1|test_dll_init\.c|flagship/Invoke-PortableSmoke\.ps1|flagship/scenarios/portable-x64\.json|flagship/result\.schema\.json)$' }
     @{ Needs = 'renderer'; Pattern = '^test/windows/renderer/' }
 )
