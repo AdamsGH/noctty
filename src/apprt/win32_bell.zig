@@ -207,10 +207,10 @@ const MciApi = struct {
         ) orelse return error.AudioUnavailable;
         errdefer _ = windows.kernel32.FreeLibrary(module);
         return .{
-            .send = @ptrCast(windows.kernel32.GetProcAddress(module, "mciSendStringW") orelse
-                return error.AudioUnavailable),
-            .error_string = @ptrCast(windows.kernel32.GetProcAddress(module, "mciGetErrorStringW") orelse
-                return error.AudioUnavailable),
+            .send = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(module, "mciSendStringW") orelse
+                return error.AudioUnavailable)),
+            .error_string = @ptrCast(@alignCast(windows.kernel32.GetProcAddress(module, "mciGetErrorStringW") orelse
+                return error.AudioUnavailable)),
         };
     }
 };
