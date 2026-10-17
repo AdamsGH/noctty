@@ -145,7 +145,8 @@ function Invoke-PrivateDesktopControlDriver([string] $Run, [string] $DesktopName
     # Connect only this thread; no child, window, foreground or input operation.
     $actual = [HiddenWin]::CurrentDesktopName()
     if ($actual -cne $DesktopName) { throw 'Private control driver is on the wrong desktop.' }
-    @{ ProcessId = $PID; Desktop = $actual; Connected = $true } | ConvertTo-Json |
+    @{ ProcessId = $PID; Desktop = $actual; Connected = $true; WindowStation = [HiddenWin]::CurrentWindowStationName()
+        SessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $Run 'private-driver-ready.json')
     $deadline = [datetime]::UtcNow.AddSeconds(20)
     while (-not (Test-Path -LiteralPath (Join-Path $Run 'stop-private-control'))) {
@@ -188,6 +189,21 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
             $readyObserved = $ready -and $ready.Connected -eq $true -and $ready.ProcessId -eq $driver.pid -and $ready.Desktop -ceq $desktopName
             if ([datetime]::UtcNow -ge $deadline) { throw 'Private control driver did not report its desktop within fifteen seconds.' }
         } until ($readyObserved)
+        $attachedRows = @(); $attachedError = $null; $attachedErrorApi = $null; $attachedErrorCode = $null
+        try {
+            $ids = @(@([HiddenWin]::JobProcessIds($job)) + $driver.pid | Select-Object -Unique)
+            $attachedRows = @([HiddenWin]::ObserveDesktopThreadsOnDesktop([int[]]$ids, $desktopName))
+        } catch {
+            $attachedError = 'Attached desktop observation failed'
+            if ($_.Exception.InnerException -is [ComponentModel.Win32Exception]) {
+                $attachedErrorApi = $_.Exception.InnerException.Message
+                $attachedErrorCode = $_.Exception.InnerException.NativeErrorCode
+            }
+        }
+        @{ ExpectedDesktop = $desktopName; ParentWindowStation = [HiddenWin]::CurrentWindowStationName()
+            ParentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId; DriverWindowStation = $ready.WindowStation; DriverSessionId = $ready.SessionId
+            AttachedThreads = $attachedRows; Error = $attachedError; ErrorApi = $attachedErrorApi; ErrorCode = $attachedErrorCode } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'private-attached-desktops.json')
         # A distinct receipt bypasses startup sampling throttling and always observes after connection.
         Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl')
         $observed = $true

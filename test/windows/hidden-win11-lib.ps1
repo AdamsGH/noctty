@@ -150,6 +150,9 @@ public static class HiddenWin {
     // SetLastError=true also refreshes .NET's cached last error after this call.
     [DllImport("kernel32.dll", SetLastError=true)] static extern void SetLastError(uint error);
     [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenDesktopW(string name, uint flags, bool inherit, uint access);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool SetThreadDesktop(IntPtr desktop);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetUserObjectInformationW(IntPtr h, int index, StringBuilder name, int length, out int needed);
     public static string CurrentDesktopName() {
@@ -170,6 +173,14 @@ public static class HiddenWin {
         var name = new StringBuilder(256); int needed;
         if (!GetUserObjectInformationW(desktop, 2, name, 512, out needed))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetUserObjectInformationW");
+        return name.ToString();
+    }
+    public static string CurrentWindowStationName() {
+        var station = GetProcessWindowStation();
+        if (station == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetProcessWindowStation");
+        var name = new StringBuilder(256); int needed;
+        if (!GetUserObjectInformationW(station, 2, name, 512, out needed))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Window station GetUserObjectInformationW");
         return name.ToString();
     }
     [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job, int type, IntPtr info, uint size, IntPtr returned);
@@ -247,6 +258,29 @@ public static class HiddenWin {
             }
         }
         return rows.ToArray();
+    }
+    // Diagnostic comparison only. Never move the outer Default oracle's calling thread.
+    public static DesktopObservation[] ObserveDesktopThreadsOnDesktop(int[] ids, string desktopName) {
+        DesktopObservation[] rows = null; Exception failure = null;
+        IntPtr desktop = IntPtr.Zero;
+        var observer = new System.Threading.Thread(() => {
+            try {
+                // Read-only, noninheritable handle, used only on this fresh no-window thread.
+                desktop = OpenDesktopW(desktopName, 0, false, 0x0001);
+                if (desktop == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer OpenDesktopW");
+                if (!SetThreadDesktop(desktop)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer SetThreadDesktop");
+                if (CurrentDesktopName() != desktopName) throw new Exception("Observer desktop mismatch");
+                rows = ObserveDesktopThreads(ids);
+            } catch (Exception error) { failure = error; }
+        });
+        try { observer.Start(); observer.Join(); }
+        finally {
+            // Closing while the worker is attached would fail; join precedes handle cleanup.
+            if (desktop != IntPtr.Zero && !CloseDesktop(desktop))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Observer CloseDesktop");
+        }
+        if (failure != null) throw failure;
+        return rows;
     }
     public sealed class DesktopWindowObservation {
         public int ProcessId, ThreadId;
