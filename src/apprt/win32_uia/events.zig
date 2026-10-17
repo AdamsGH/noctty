@@ -122,12 +122,44 @@ pub fn raiseNotification(
     kind: Notification,
     message: []const u8,
 ) void {
+    raiseNotificationAs(
+        provider,
+        kind,
+        std.unicode.utf8ToUtf16LeStringLiteral("noctty.command-palette"),
+        message,
+    );
+}
+
+/// Under test, how many bell announcements were asked for on this thread
+/// (counted, not raised).
+pub threadlocal var testing_bells: usize = 0;
+
+/// The terminal's bell rang. Its own activity id lets a screen reader treat it
+/// apart from terminal text and palette messages; MostRecent keeps a burst of
+/// bells (a TUI that rings on every redraw) from queueing speech.
+pub fn raiseBellNotification(provider: *com.IRawElementProviderSimple) void {
+    if (builtin.is_test) {
+        testing_bells += 1;
+        return;
+    }
+    raiseNotificationAs(
+        provider,
+        .other,
+        std.unicode.utf8ToUtf16LeStringLiteral("noctty.bell"),
+        "Bell",
+    );
+}
+
+fn raiseNotificationAs(
+    provider: *com.IRawElementProviderSimple,
+    kind: Notification,
+    activity: [*:0]const u16,
+    message: []const u8,
+) void {
     if (!clientsAreListening() or message.len == 0) return;
     const message_bstr = allocNotificationBstr(std.heap.page_allocator, message) catch return;
     defer com.SysFreeString(message_bstr);
-    const activity_id = com.SysAllocString(
-        std.unicode.utf8ToUtf16LeStringLiteral("noctty.command-palette"),
-    ) orelse return;
+    const activity_id = com.SysAllocString(activity) orelse return;
     defer com.SysFreeString(activity_id);
     const hr = com.UiaRaiseNotificationEvent(
         provider,

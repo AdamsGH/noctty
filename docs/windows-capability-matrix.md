@@ -443,12 +443,16 @@ follows `bell-features`, which defaults to `attention,title`:
   `title-report`, saved sessions and automation still see it.
 - `audio`: plays `bell-audio-path` through MCI, at `bell-audio-volume` (0.0 to
   1.0 of the system volume), on a short-lived thread. One sound plays at a
-  time; a bell that rings meanwhile is dropped. The path must be a local file:
-  a network or device path, or one the file cannot be opened from, plays
-  nothing and logs one warning. Volume needs the Windows Media (`mpegvideo`)
+  time; a bell that rings meanwhile is dropped. A UNC, device or
+  mapped-network-drive path plays nothing and logs one warning (a link to a
+  share is not detected); so does a file that cannot be opened. Volume needs the Windows Media (`mpegvideo`)
   MCI device; where it is missing the file plays at the system volume. WAV was
   tested; other formats play if Windows Media can play them.
 - `border` is not implemented.
+
+Whatever features are on, a screen reader is also told "Bell" by a UI Automation
+notification on the terminal, including for the terminal being typed into. It is
+sent unless every one of `system`, `audio`, `attention` and `title` is off.
 
 A silent default is a change from earlier releases, which played the system
 sound on every bell: set `bell-features = system` to get it back.

@@ -11253,6 +11253,7 @@ pub const App = struct {
             inline else => |value| value,
         }, volume);
         if (bell.flash) if (hwnd) |h| win32_bell.flashTaskbar(h);
+        if (bell.announce) if (alerted) |s| s.announceBell();
         if (bell.glyph) if (alerted) |s| s.setBellRinging(true);
     }
 
@@ -16846,9 +16847,15 @@ const Host = struct {
         try std.testing.expect(!std.mem.startsWith(u8, host.cached_window_title.?, glyph));
         try std.testing.expectEqualStrings("beta", surface_b.effectiveTitle().?);
 
-        // Focus or a key press answers the bell and takes every mark away.
-        surface_a.clearBell();
-        surface_b.clearBell();
+        // A reload with `no-title` takes the marks away (here for tab B's)...
+        surface_b.applyBellFeatures(.{ .title = false });
+        try std.testing.expect(!surface_b.bell_ringing);
+        try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
+
+        // ...and gaining focus answers the bell of tab A (the key press path
+        // is the same `clearBell`, run from `handleKeyMessage`, and is
+        // measured on a hidden desktop).
+        surface_a.focusChanged(true);
         try std.testing.expect(std.mem.indexOf(u8, host.tabs.items[0].cached_button_label.?, glyph) == null);
         try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
         try std.testing.expectEqualStrings("", Host.tabItemUiaItemStatus(&host, 1, &status_buf));
@@ -36365,6 +36372,17 @@ pub const Surface = struct {
         if (self.bell_ringing) self.setBellRinging(false);
     }
 
+    /// A reload that turns the title bell off takes the glyph already up
+    /// away, instead of leaving it until this terminal is next focused.
+    fn applyBellFeatures(self: *Surface, features: configpkg.Config.BellFeatures) void {
+        if (!features.title) self.clearBell();
+    }
+
+    /// A screen reader is told "Bell" when it has this terminal's provider.
+    fn announceBell(self: *Surface) void {
+        if (self.terminal_accessibility) |session| session.announceBell();
+    }
+
     fn promptTitle(self: *Surface, kind: apprt.action.PromptTitle) !void {
         const host = self.host orelse return;
         const mode: HostOverlayMode = switch (kind) {
@@ -38464,6 +38482,7 @@ pub const Surface = struct {
     }
 
     fn applyRuntimeConfig(self: *Surface, config: *const configpkg.Config) !void {
+        self.applyBellFeatures(config.@"bell-features");
         if (shouldApplyConfigDecorations(self.decorations_visible_overridden)) {
             self.setDecorationsVisible(decorationsVisibleForConfig(config.@"window-decoration")) catch |err| {
                 log.warn("win32 decoration update failed during config reload err={}", .{err});

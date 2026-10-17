@@ -36,6 +36,12 @@ pub const Plan = struct {
     flash: bool = false,
     /// Mark the terminal's tab and the window caption with the bell glyph.
     glyph: bool = false,
+    /// Tell a screen reader "Bell" (a UI Automation notification). The sound
+    /// that earlier releases played on every bell was the only cue for a
+    /// listener, and the default is silent now; a notification is no sound, so
+    /// it goes out whenever the user has not turned every bell feature off,
+    /// for a terminal in view or not.
+    announce: bool = false,
 };
 
 /// What the bell's target looks like at the moment it rings.
@@ -64,6 +70,7 @@ pub fn plan(features: configpkg.Config.BellFeatures, has_audio_file: bool, ctx: 
         // again on the next key, rewriting the caption and the tab for every
         // failed tab completion.
         .glyph = features.title and !ctx.in_view,
+        .announce = features.system or features.audio or features.attention or features.title,
     };
 }
 
@@ -87,15 +94,25 @@ pub fn mciVolume(volume: f64) u32 {
     return @intFromFloat(@round(v * 1000.0));
 }
 
-/// Whether `path` is a file name MCI may be handed: a local path with no
-/// quote (a file name cannot hold one, and one would end the quoted argument
-/// early) and no control character. A network or device shape is refused as
-/// everywhere a path reaches an open (AGENTS.md 2026-10-06): the open would
-/// otherwise contact the server or the device.
+/// Whether `path` is a file name MCI may be handed: no quote (a file name
+/// cannot hold one, and one would end the quoted argument early) and no
+/// control character. A network or device shape is refused as everywhere a
+/// path reaches an open (AGENTS.md 2026-10-06): the open would otherwise
+/// contact the server or the device. `onRemoteDrive` covers a mapped drive.
 pub fn playablePath(path: []const u8) bool {
     if (path.len == 0) return false;
     for (path) |ch| if (ch < 0x20 or ch == '"') return false;
     return !internal_os.path.isNetworkOrDevicePath(path);
+}
+
+/// A path on a drive letter that maps a network share. `GetDriveTypeW` reads
+/// the local drive table and does not contact the server, so asking costs
+/// nothing even for a disconnected share. A path through a link to a share is
+/// not detected.
+fn onRemoteDrive(path: []const u8) bool {
+    if (path.len < 2 or path[1] != ':' or !std.ascii.isAlphabetic(path[0])) return false;
+    const root = [_:0]u16{ path[0], ':', '\\' };
+    return GetDriveTypeW(&root) == DRIVE_REMOTE;
 }
 
 const alias = "noctty_bell";
@@ -133,7 +150,10 @@ const FLASHWINFO = extern struct {
     dwTimeout: u32,
 };
 
+const DRIVE_REMOTE: u32 = 4;
+
 extern "user32" fn FlashWindowEx(pfwi: *FLASHWINFO) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetDriveTypeW(lpRootPathName: [*:0]const u16) callconv(.winapi) u32;
 extern "winmm" fn mciSendStringW(
     lpstrCommand: [*:0]const u16,
     lpstrReturnString: ?[*]u16,
@@ -177,7 +197,7 @@ const Job = struct {
 /// run on their own thread because `play ... wait` blocks until the sound
 /// ends, and the UI thread must not.
 pub fn playFile(path: []const u8, volume: f64) void {
-    if (!playablePath(path)) {
+    if (!playablePath(path) or onRemoteDrive(path)) {
         warnOnce("bell-audio-path is not a local file name; no sound played", .{});
         return;
     }
@@ -218,14 +238,13 @@ fn playBlocking(alloc: Allocator, path: []const u8, volume: u32) !void {
     // The volume-capable device first. Where Windows Media is not installed
     // (an N edition) it is not there, and the file still plays on whatever
     // device MCI picks for it, at the system volume.
-    var with_volume = true;
-    var open = try openCommand(alloc, path, true);
-    defer alloc.free(open);
-    if (mciSendStringW(open.ptr, null, 0, null) != 0) {
-        with_volume = false;
-        alloc.free(open);
-        open = try openCommand(alloc, path, false);
-        try check(mciSendStringW(open.ptr, null, 0, null));
+    const typed = try openCommand(alloc, path, true);
+    defer alloc.free(typed);
+    const with_volume = mciSendStringW(typed.ptr, null, 0, null) == 0;
+    if (!with_volume) {
+        const untyped = try openCommand(alloc, path, false);
+        defer alloc.free(untyped);
+        try check(mciSendStringW(untyped.ptr, null, 0, null));
     }
     defer send(alloc, "close " ++ alias, .{});
 
@@ -277,7 +296,8 @@ test "win32 bell defaults: no sound, flash and glyph when away" {
 }
 
 test "win32 bell defaults: a terminal being watched does nothing" {
-    try testing.expectEqual(Plan{}, plan(.{}, false, watching));
+    // Only the screen reader hears of a bell in the terminal being typed into.
+    try testing.expectEqual(Plan{ .announce = true }, plan(.{}, false, watching));
 }
 
 test "win32 bell defaults: another tab of the foreground window gets only the glyph" {
@@ -368,6 +388,22 @@ test "win32 bell sound path: local files only" {
     try testing.expect(!playablePath("//server/share/bell.wav"));
     try testing.expect(!playablePath("\\\\.\\pipe\\bell"));
     try testing.expect(!playablePath("\\\\?\\UNC\\server\\share\\bell.wav"));
+}
+
+test "win32 bell announces to a screen reader unless every feature is off" {
+    try testing.expect(plan(.{}, false, watching).announce);
+    try testing.expect(plan(.{ .system = true, .attention = false, .title = false }, false, watching).announce);
+    try testing.expect(plan(.{ .audio = true, .attention = false, .title = false }, false, away).announce);
+    try testing.expect(plan(.{ .attention = false }, false, watching).announce);
+    try testing.expect(!plan(.{ .attention = false, .title = false }, false, away).announce);
+    try testing.expect(!plan(.{ .system = false, .audio = false, .attention = false, .title = false, .border = true }, false, away).announce);
+}
+
+test "win32 bell sound path: a drive letter is local unless it maps a share" {
+    try testing.expect(!onRemoteDrive("C:\\Windows\\Media\\Ding.wav"));
+    try testing.expect(!onRemoteDrive("relative\\bell.wav"));
+    try testing.expect(!onRemoteDrive(""));
+    try testing.expect(!onRemoteDrive("1:\\x"));
 }
 
 test "win32 bell open command quotes the path and names the alias" {
