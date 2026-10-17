@@ -8,6 +8,8 @@ const log = std.log.scoped(.win32_elevation);
 pub const title_prefix = "Administrator: ";
 
 const token_query: windows.DWORD = 0x0008;
+// Query token/image identity with the least process access; the broader
+// PROCESS_QUERY_INFORMATION right is unnecessary.
 const process_query_limited_information: windows.DWORD = 0x1000;
 const token_user_class: c_int = 1;
 const token_elevation_type_class: c_int = 18;
