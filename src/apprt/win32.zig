@@ -13464,6 +13464,8 @@ const Host = struct {
     // Single SetTimer-driven tween scheduler; see Tween scheduler block
     // in the method section. Matches Win32's main-thread-paint model.
     tween_sched: win32_tween.Scheduler = .{},
+    /// Test-local policy; never changes the desktop accessibility settings.
+    test_tween_animations_enabled: if (builtin.is_test) ?bool else void = if (builtin.is_test) null else {},
     quick_terminal_animation: ?QuickTerminalAnimation = null,
     /// Programmatic QT rectangles are already in target-monitor pixels.
     quick_terminal_placing: bool = false,
@@ -14349,6 +14351,9 @@ const Host = struct {
     }
 
     fn effectiveTweenDuration(self: *Host, duration_ms: u16) u16 {
+        if (builtin.is_test) {
+            if (self.test_tween_animations_enabled) |enabled| return if (enabled) duration_ms else 0;
+        }
         return (win32_chrome_state.HighContrastDpiState{
             .high_contrast = isHighContrastActive(),
             .client_animations_enabled = clientAnimationsEnabled(),
@@ -17239,7 +17244,20 @@ const Host = struct {
         try runOnPrivateDesktop(bellGlyphTestBody);
     }
 
+    test "CHROME57 bell caption refresh allocates an underline tween with animations enabled" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(animatedBellGlyphTestBody);
+    }
+
+    fn animatedBellGlyphTestBody() !void {
+        try bellGlyphTestBodyWithAnimations(true);
+    }
+
     fn bellGlyphTestBody() !void {
+        try bellGlyphTestBodyWithAnimations(null);
+    }
+
+    fn bellGlyphTestBodyWithAnimations(animations_enabled: ?bool) !void {
         var core_app: CoreApp = undefined;
         var app: App = undefined;
         var host: Host = undefined;
@@ -17260,6 +17278,7 @@ const Host = struct {
             },
         });
         defer session.deinit();
+        host.test_tween_animations_enabled = animations_enabled;
         const window = try BannerTestWindow.init(&host);
         defer window.deinit(&host);
         _ = sys.MoveWindow(window.parent, 0, 0, 1200, 300, 0);
@@ -17337,6 +17356,10 @@ const Host = struct {
         // is the same `clearBell`, run from `handleKeyMessage`, and is
         // measured on a hidden desktop).
         surface_a.focusChanged(true);
+        if (animations_enabled == true) {
+            try std.testing.expect(host.tween_sched.next_id > 1);
+            try std.testing.expect(host.tween_timer_active);
+        }
         try std.testing.expect(std.mem.indexOf(u8, host.tabs.items[0].cached_button_label.?, glyph) == null);
         try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
         try std.testing.expectEqualStrings("", Host.tabItemUiaItemStatus(&host, 1, &status_buf));
@@ -23551,6 +23574,7 @@ const Host = struct {
             .tabs = &.{ .{ .host = &host, .surface = &first, .id = 1 }, .{ .host = &host, .surface = &second, .id = 2 } },
         });
         defer session.deinit();
+        host.test_tween_animations_enabled = true;
         const window = try BannerTestWindow.init(&host);
         defer window.deinit(&host);
         host.tabs.items[0].button_hwnd = try createTestChromeChild(window.parent, prompt_button_class);
@@ -23565,7 +23589,8 @@ const Host = struct {
         host.tabs.items[1].button_hwnd = try createTestChromeChild(window.parent, prompt_button_class);
         try std.testing.expect(host.layoutChromeForRect(rect, &changed));
         try std.testing.expectEqual(@as(?u32, 2), host.tab_underline.tab_id);
-        if (host.effectiveTweenDuration(160) != 0) try std.testing.expect(host.tab_underline.slide_started_ms != 0);
+        try std.testing.expect(host.tab_underline.slide_started_ms != 0);
+        try std.testing.expect(host.tween_sched.next_id > 1);
     }
 
     test "CHROME57 native activation updates only top chrome and its children" {
@@ -41708,6 +41733,7 @@ const TestSession = struct {
                 .palette_catalog_labels = @splat(@splat(0)),
                 .palette_list_ranked = uninitializedInertStorage([win32_palette.max_ranked]PaletteRanked),
             };
+            host.tween_sched.init(self.allocator);
             self.hosts[self.host_count] = host;
             self.host_count += 1;
             if (host_options.register) try options.app.hosts.append(self.allocator, host);
@@ -41794,6 +41820,8 @@ const TestSession = struct {
                 var tab = host.tabs.orderedRemove(0);
                 tab.deinit();
             }
+            host.killTweenTimer();
+            host.tween_sched.deinit();
             host.tabs.deinit(self.allocator);
         }
 
