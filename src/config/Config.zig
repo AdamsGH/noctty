@@ -3156,6 +3156,12 @@ keybind: Keybinds = .{},
 ///
 /// Example: `audio`, `no-audio`, `system`, `no-system`
 ///
+/// On Windows, `system` plays the sound set in Windows' Sound settings,
+/// `attention` flashes the window's taskbar button until the window is in
+/// front, `title` puts the bell on the tab and the window caption (not for the
+/// terminal you are typing into) and `audio` plays `bell-audio-path` at
+/// `bell-audio-volume`. `border` has no effect. The default plays no sound.
+///
 /// Available since: 1.2.0
 @"bell-features": BellFeatures = .{},
 

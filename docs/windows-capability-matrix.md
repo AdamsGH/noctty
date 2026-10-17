@@ -357,10 +357,8 @@ them changes nothing on Windows:
 - `focus-follows-mouse`, `window-inherit-font-size`, `resize-overlay`,
   `resize-overlay-position` and `resize-overlay-duration`: the Win32 runtime has no code for them (a new
   window or tab does not inherit an adjusted font size).
-- `bell-features`, `bell-audio-path` and `bell-audio-volume`: a bell, and the
-  bell part of `notify-on-command-finish-action`, always plays the system
-  `MessageBeep`; the attention, title and border features and the custom
-  sound are not implemented.
+- `bell-features = border`: accepted and ignored; the other bell features
+  are applied (see [Notifications and progress](#notifications-and-progress)).
 - `quick-terminal-space-behavior`: copied into the quick-terminal settings,
   where nothing reads it.
 - The GTK and X11 keys: `gtk-opengl-debug`, `gtk-single-instance`,
@@ -370,8 +368,8 @@ them changes nothing on Windows:
   `x11-instance-name`, `async-backend` and `_xdg-terminal-exec`.
 
 `background-blur` is the one accepted-but-inert key that does log a warning
-(see [Background blur](#background-blur)). Map a Windows Terminal `bellStyle`
-to nothing: there is no equivalent setting.
+(see [Background blur](#background-blur)). A Windows Terminal `bellStyle` maps
+to `bell-features` (see [the migration guide](migrate-from-windows-terminal.md#the-bell)).
 
 ### Universal palette
 
@@ -430,6 +428,30 @@ activation depends on the installed Start menu shortcut.
 `notify-on-command-finish-after` and the focus policy are applied before the
 bell or toast; command marks come from shell integration or OSC 133, which
 plain `cmd.exe` does not supply (Clink with the shipped script does).
+
+A bell (BEL, and the `bell` action of `notify-on-command-finish-action`)
+follows `bell-features`, which defaults to `attention,title`:
+
+- `system`: `MessageBeep`, the sound set in Windows' Sound settings. Off by
+  default, so the default bell is silent.
+- `attention`: `FlashWindowEx` flashes the window's taskbar button until the
+  window is in front. Only while the window is not the foreground window.
+- `title`: a bell glyph in front of the terminal's tab label and of the window
+  caption, until the terminal is focused or typed into. It is not shown for the
+  terminal you are typing into. A screen reader gets the tab's UI Automation
+  `ItemStatus` "Bell". The title the program set is not changed, so
+  `title-report`, saved sessions and automation still see it.
+- `audio`: plays `bell-audio-path` through MCI, at `bell-audio-volume` (0.0 to
+  1.0 of the system volume), on a short-lived thread. One sound plays at a
+  time; a bell that rings meanwhile is dropped. The path must be a local file:
+  a network or device path, or one the file cannot be opened from, plays
+  nothing and logs one warning. Volume needs the Windows Media (`mpegvideo`)
+  MCI device; where it is missing the file plays at the system volume. WAV was
+  tested; other formats play if Windows Media can play them.
+- `border` is not implemented.
+
+A silent default is a change from earlier releases, which played the system
+sound on every bell: set `bell-features = system` to get it back.
 
 With `progress-style = true`, terminal progress reports map to normal, paused,
 error, or indeterminate taskbar states for the active pane in each host. If

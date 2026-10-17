@@ -100,9 +100,16 @@ pub fn playablePath(path: []const u8) bool {
 
 const alias = "noctty_bell";
 
-/// `open "<path>" alias noctty_bell`, UTF-16, for `mciSendStringW`.
-fn openCommand(alloc: Allocator, path: []const u8) ![:0]u16 {
-    const utf8 = try std.fmt.allocPrint(alloc, "open \"{s}\" alias " ++ alias, .{path});
+/// `open "<path>" [type mpegvideo] alias noctty_bell`, UTF-16, for
+/// `mciSendStringW`. Only the `mpegvideo` device (Windows Media, which plays
+/// WAV, MP3, WMA and more) takes `setaudio ... volume`: the `waveaudio` device
+/// MCI picks for a .wav answers it with "driver cannot recognize the command".
+fn openCommand(alloc: Allocator, path: []const u8, with_volume: bool) ![:0]u16 {
+    const utf8 = try std.fmt.allocPrint(
+        alloc,
+        "open \"{s}\"{s} alias " ++ alias,
+        .{ path, if (with_volume) " type mpegvideo" else "" },
+    );
     defer alloc.free(utf8);
     return std.unicode.utf8ToUtf16LeAllocZ(alloc, utf8);
 }
@@ -208,14 +215,21 @@ fn playThread(job: *Job) void {
 }
 
 fn playBlocking(alloc: Allocator, path: []const u8, volume: u32) !void {
-    const open = try openCommand(alloc, path);
+    // The volume-capable device first. Where Windows Media is not installed
+    // (an N edition) it is not there, and the file still plays on whatever
+    // device MCI picks for it, at the system volume.
+    var with_volume = true;
+    var open = try openCommand(alloc, path, true);
     defer alloc.free(open);
-    try check(mciSendStringW(open.ptr, null, 0, null));
+    if (mciSendStringW(open.ptr, null, 0, null) != 0) {
+        with_volume = false;
+        alloc.free(open);
+        open = try openCommand(alloc, path, false);
+        try check(mciSendStringW(open.ptr, null, 0, null));
+    }
     defer send(alloc, "close " ++ alias, .{});
 
-    // A device without volume control rejects this; the sound then plays at
-    // the system volume rather than not at all.
-    send(alloc, "setaudio " ++ alias ++ " volume to {d}", .{volume});
+    if (with_volume) send(alloc, "setaudio " ++ alias ++ " volume to {d}", .{volume});
     const play = try command(alloc, "play " ++ alias ++ " wait", .{});
     defer alloc.free(play);
     try check(mciSendStringW(play.ptr, null, 0, null));
@@ -357,9 +371,15 @@ test "win32 bell sound path: local files only" {
 }
 
 test "win32 bell open command quotes the path and names the alias" {
-    const cmd = try openCommand(testing.allocator, "C:\\My Sounds\\bell \u{00e9}.wav");
-    defer testing.allocator.free(cmd);
-    const utf8 = try std.unicode.utf16LeToUtf8Alloc(testing.allocator, cmd);
-    defer testing.allocator.free(utf8);
-    try testing.expectEqualStrings("open \"C:\\My Sounds\\bell \u{00e9}.wav\" alias noctty_bell", utf8);
+    const path = "C:\\My Sounds\\bell \u{00e9}.wav";
+    inline for (.{
+        .{ true, "open \"" ++ path ++ "\" type mpegvideo alias noctty_bell" },
+        .{ false, "open \"" ++ path ++ "\" alias noctty_bell" },
+    }) |case| {
+        const cmd = try openCommand(testing.allocator, path, case[0]);
+        defer testing.allocator.free(cmd);
+        const utf8 = try std.unicode.utf16LeToUtf8Alloc(testing.allocator, cmd);
+        defer testing.allocator.free(utf8);
+        try testing.expectEqualStrings(case[1], utf8);
+    }
 }

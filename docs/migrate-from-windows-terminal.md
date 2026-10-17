@@ -56,7 +56,31 @@ profile inheritance. Copy only the lines you need.
 | `historySize`                | `scrollback-limit`                     | Different unit: WT counts lines, Noctty counts bytes. The default is 10 MB.         |
 | `initialCols`, `initialRows` | `window-width`, `window-height`        | Grid cells, as in WT. Both must be set or both are ignored.                         |
 | `backgroundImage`            | `background-image`                     |                                                                                     |
-| `bellStyle`                  | (none)                                 | The bell always plays the system sound; `bell-features` has no effect on Windows.   |
+| `bellStyle`, `bellSound`     | `bell-features`, `bell-audio-path`     | See [The bell](#the-bell) below.                                                    |
+
+### The bell
+
+`bell-features` is a comma-separated list, and a feature with a `no-` prefix is
+off. Windows Terminal's `bellStyle` maps like this:
+
+| `bellStyle` | `bell-features`                   |
+| ----------- | --------------------------------- |
+| `audible`   | `system`                          |
+| `window`    | `attention`                       |
+| `taskbar`   | `attention`                       |
+| `all`       | `system,attention`                |
+| `none`      | `no-system,no-attention,no-title` |
+
+`system` plays the Windows system sound, `attention` flashes the window's
+taskbar button until the window is in front, and `bellSound` is `audio` with
+`bell-audio-path` (and `bell-audio-volume`, which Windows Terminal has no
+equivalent for). Windows Terminal's default is `audible`; noctty's default is
+`attention,title`, which plays nothing and, for a terminal you are not looking
+at, flashes the taskbar button and puts a bell glyph on the tab and the window
+caption until you focus or type into it. Set `bell-features = system` to keep
+Windows Terminal's behaviour. See
+[the capability matrix](windows-capability-matrix.md#notifications-and-progress)
+for the details.
 
 A short starting config:
 

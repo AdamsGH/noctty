@@ -394,7 +394,7 @@ lands incrementally.
   pkg-config `URL` field, the vim syntax-file headers, and a link in the
   generated bash completions point at `ghostty-org/ghostty`.
 - Some upstream config keys are accepted and do nothing on Windows
-  (`focus-follows-mouse`, `window-inherit-font-size`, `bell-features`, the
+  (`focus-follows-mouse`, `window-inherit-font-size`, `bell-features = border`, the
   GTK and X11 keys, and others); the list is in the
   [capability matrix](windows-capability-matrix.md#settings-accepted-without-effect).
 - Crash capture is local-only, and some hard-abort paths may still
