@@ -26,6 +26,9 @@ param(
     [Parameter(Mandatory)] [string] $Run,
     [switch] $Driver,
     [string] $DesktopName,
+    [ValidateSet('full','close-x')] [string] $Scenario = 'full',
+    # Extra configuration lines for every case, separated by ';'.
+    [string] $ExtraConfig = '',
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 300,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
@@ -245,7 +248,7 @@ if (-not $Driver) {
         $job=[Ds]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Scenario {5} -ExtraConfig "{6}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName,$Scenario,$ExtraConfig
         $pi=[Ds]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -303,7 +306,7 @@ function Launch-Case([string]$Name,[string[]]$Extra) {
     # Ctrl is invisible to GetKeyboardState, so the key is bound plain.
     @("working-directory = $dir",'single-instance = false','window-save-state = never',
       'copy-on-select = false','clipboard-read = deny','clipboard-write = deny',
-      'keybind = f5=close_tab:this') + $Extra | Set-Content -LiteralPath $config
+      'keybind = f5=close_tab:this') + $Extra + @($ExtraConfig -split ';' | Where-Object { $_.Trim() }) | Set-Content -LiteralPath $config
     $exe=Join-Path $dir 'noctty.exe'
     $pi=[Ds]::Spawn($exe,('"{0}" --config-file="{1}" --single-instance=false --class={2}' -f $exe,$config,$runClass),$dir,$desktopPath)
     $script:processes.Add(@{Case=$Name;Pid=$pi.pid})
@@ -380,27 +383,70 @@ function Measure-Close($case,[string]$Action,[int]$Seconds=10) {
         $key="$($s.HostAlive)|$($s.HostVisible)|$($s.TabShown)|$($s.PromptShown)|$($s.ProcessExited)"
         if($key -ne $prev) { $changes.Add($s); $prev=$key }
     }
-    return @{ Action=$Action; TabShownBefore=$tabShown; Dpi=$dpi; TabPromptMs=$promptAt; TabGoneMs=$tabGoneAt; HostGoneMs=$hostGoneAt; ProcessExitedMs=$exitedAt; Changes=$changes }
+    return @{ Action=$Action; TabShownBefore=$tabShown; Dpi=$dpi; TabPromptMs=$promptAt; TabGoneMs=$tabGoneAt; HostGoneMs=$hostGoneAt; ProcessExitedMs=$exitedAt; LastMs=$ms; Changes=$changes }
 }
+
 
 $busy=@('command = cmd.exe /d /c ping -n 3600 127.0.0.1 >nul','shell-integration = none')
 $idle=@('command = cmd.exe','shell-integration = detect')
-$cases=@(
-    @{ Name='idle-x';          Action='x';   Extra=$idle + 'confirm-close-surface = true' },
-    @{ Name='idle-key';        Action='key'; Extra=$idle + 'confirm-close-surface = true' },
-    @{ Name='busy-x';          Action='x';   Extra=$busy + 'confirm-close-surface = true' },
-    @{ Name='busy-key';        Action='key'; Extra=$busy + 'confirm-close-surface = true' },
-    @{ Name='busy-undo-off-x';   Action='x';   Extra=$busy + 'confirm-close-surface = true' + 'undo-timeout = 0s' },
-    @{ Name='busy-undo-off-key'; Action='key'; Extra=$busy + 'confirm-close-surface = true' + 'undo-timeout = 0s' }
-)
+function Add-Sample($result,[string]$Name) { $result.Name=$Name; $script:samples.Add($result) }
+function Prompt-Shown($h) { $a=[Ds]::Child($h,$Id.Accept); return $a -ne [IntPtr]::Zero -and [Ds]::Visible($a) }
+function Press-Prompt($h,[int]$Control) { [Ds]::Click([Ds]::Child($h,$Control)) }
+# How long the host stayed up with its tab button gone, in ms; 0 when the tab
+# button went with the window.
+function Empty-Frame-Ms($r) {
+    if($null -eq $r.TabGoneMs) { return 0 }
+    $end=if($null -ne $r.HostGoneMs){$r.HostGoneMs}else{$r.LastMs}
+    return [Math]::Max(0,$end-$r.TabGoneMs)
+}
 try {
-    foreach($case in $cases) {
-        $launched=Launch-Case $case.Name $case.Extra
-        try {
-            $result=Measure-Close $launched $case.Action
-            $result.Name=$case.Name
-            $script:samples.Add($result)
-        } finally { Close-Case $launched }
+    # With nothing running the X closes the window at once: no prompt, and no
+    # empty frame left on screen for the undo window.
+    $case=Launch-Case 'idle-x' ($idle + 'confirm-close-surface = true')
+    try {
+        $r=Measure-Close $case 'x'; Add-Sample $r 'idle-x'
+        Check 'idle X: the only tab has an X to click' $r.TabShownBefore $true $r.TabShownBefore
+        Check 'idle X: no prompt for an idle shell' ($null -eq $r.TabPromptMs) $null $r.TabPromptMs
+        Check 'idle X: the window closes within 3 s' ($null -ne $r.HostGoneMs -and $r.HostGoneMs -lt 3000) '< 3000' $r.HostGoneMs
+        Check 'idle X: no empty window stays on screen' ((Empty-Frame-Ms $r) -lt 1000) '< 1000' (Empty-Frame-Ms $r)
+        Check 'idle X: the process exits' ($null -ne $r.ProcessExitedMs -and $r.ProcessExitedMs -lt 3000) '< 3000' $r.ProcessExitedMs
+    } finally { Close-Case $case }
+
+    # With a process running it asks once, for the window; Cancel keeps
+    # everything, Close ends the process and the window.
+    $case=Launch-Case 'busy-x' ($busy + 'confirm-close-surface = true')
+    try {
+        $h=$case.Host
+        $r=Measure-Close $case 'x' 3; Add-Sample $r 'busy-x'
+        Check 'busy X: it asks first' ($null -ne $r.TabPromptMs -and $r.TabPromptMs -lt 2000) '< 2000' $r.TabPromptMs
+        Check 'busy X: nothing closes while it asks' ($null -eq $r.HostGoneMs -and $null -eq $r.ProcessExitedMs -and $null -eq $r.TabGoneMs) 'nothing' @{Host=$r.HostGoneMs;Process=$r.ProcessExitedMs;Tab=$r.TabGoneMs}
+        Press-Prompt $h 2004                           # Cancel
+        $gone=Wait-Until { -not (Prompt-Shown $h) } 4
+        Check 'busy X: Cancel dismisses the prompt' $gone $true $gone
+        Start-Sleep -Milliseconds 500
+        $tab=[Ds]::Child($h,$Id.Tab0)
+        Check 'busy X: Cancel keeps the tab, the window and the process' ([Ds]::Alive($h) -and $tab -ne [IntPtr]::Zero -and [Ds]::Visible($tab) -and [Ds]::WaitForSingleObject($case.Pi.process,0) -eq 258) $true $null
+        $r2=Measure-Close $case 'x' 3                  # ask again, then accept
+        Check 'busy X: the X asks again' ($null -ne $r2.TabPromptMs) 'prompt' $r2.TabPromptMs
+        Press-Prompt $h 2003                           # Close
+        $closed=Wait-Until { -not [Ds]::Alive($h) -or [Ds]::WaitForSingleObject($case.Pi.process,0) -ne 258 } 8
+        Check 'busy X: Close ends the window and the process' $closed $true $closed
+    } finally { Close-Case $case }
+
+    if($Scenario -eq 'full') {
+    # The keyboard path is unchanged: the tab goes, the window waits out the
+    # undo window, and a running process is not asked about while undo is on.
+    $case=Launch-Case 'busy-key' ($busy + 'confirm-close-surface = true')
+    try {
+        $r=Measure-Close $case 'key'; Add-Sample $r 'busy-key'
+        Check 'busy key: no prompt while undo is on' ($null -eq $r.TabPromptMs) $null $r.TabPromptMs
+        Check 'busy key: the window waits for undo before it goes' ($null -ne $r.HostGoneMs -and $r.HostGoneMs -gt 4000) '> 4000' $r.HostGoneMs
+    } finally { Close-Case $case }
+    $case=Launch-Case 'busy-undo-off-key' ($busy + 'confirm-close-surface = true' + 'undo-timeout = 0s')
+    try {
+        $r=Measure-Close $case 'key' 3; Add-Sample $r 'busy-undo-off-key'
+        Check 'busy key, undo off: it asks' ($null -ne $r.TabPromptMs) 'prompt' $r.TabPromptMs
+    } finally { Close-Case $case }
     }
 } catch {
     $script:checks.Add(@{Name='Harness execution'; Passed=$false; Error=$_.Exception.Message})
@@ -410,4 +456,4 @@ try {
     @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Posted window messages on a never-switched desktop; real pointer and keyboard input, the clipboard and visual composition are not exercised.'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'single-tab-close-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
-if($failed.Count){exit 1}
+if($failed.Count){ $failed | ForEach-Object { Write-Host ("FAIL: " + $_.Name) }; exit 1 }

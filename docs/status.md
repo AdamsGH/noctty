@@ -87,6 +87,10 @@ Win32-validated VT protocol coverage is tracked in
   console's live cursor, and some cases can still leave noctty and ConPTY
   out of step (see [Known caveats](#known-caveats)).
 - Native right-click context menus.
+- A close X on every tab, the only tab of a window included (an undecorated
+  window has no caption buttons). The X of a window's only tab closes the
+  window, as its own close button does, asking first when a process would
+  be lost. `close_tab:this` (Ctrl+Shift+W) still keeps the tab for undo.
 - In-app profile picker for detected shells: PowerShell 7, Windows
   PowerShell, `cmd`, Git Bash, and WSL distributions when WSL responds.
 - Concrete aliases from `%USERPROFILE%\.ssh\config` appear in the profile
@@ -312,7 +316,7 @@ visible geometry, an accurate caret while the live screen remains inside
 that bounded snapshot, and real selections. In deeper scrollback the
 viewport remains available, but the off-window live caret is reported at
 the document end. A text range's `ScrollIntoView` scrolls the terminal, and
-each closable tab has a "Close tab" Button child; both are covered by unit
+each tab has a "Close tab" Button child; both are covered by unit
 tests (and a one-off UI Automation client run recorded in #394), and neither
 the interactive UI Automation harness nor the screen-reader matrix exercises
 them.
