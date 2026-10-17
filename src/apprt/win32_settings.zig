@@ -917,7 +917,8 @@ const background_blur_label = "Background blur (not supported on Windows)";
 const link_previews_label = "Link preview popups (not supported on Windows)";
 /// A file-level constant: `open` already spends its comptime branch quota on
 /// the other labels, and one more literal there fails the build.
-const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral("Follow Windows accent color");
+const accent_follow_caption = "Follow Windows accent color";
+const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral(accent_follow_caption);
 const trim_trailing_label = "Trim trailing spaces on copy";
 const desktop_notifications_label = "Allow terminal desktop notifications";
 const notify_clipboard_label = "Notify when clipboard copy completes";
@@ -930,7 +931,7 @@ const checkbox_captions = captions: {
     result[20] = desktop_notifications_label;
     result[21] = notify_clipboard_label;
     result[22] = notify_config_label;
-    result[27] = "Follow Windows accent color";
+    result[27] = accent_follow_caption;
     break :captions result;
 };
 const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
