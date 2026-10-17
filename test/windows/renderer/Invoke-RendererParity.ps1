@@ -168,6 +168,10 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             $surfaceWindow = [RendererNative]::Surface($hostWindow)
             $case.cachedSurface = & $capture 'cached-surface'
             if ($case.cachedSurface.status.backend -ne 'd3d11' -or !$case.cachedSurface.status.opengl_unavailable -or $case.cachedSurface.status.opengl_context) { throw 'Cached surface did not start on D3D11 without a WGL context.' }
+            # Final renderer state also matches a repeated failed GL attempt.
+            # Count the per-attempt warning to prove the new tab skipped GL.
+            $case.openglStartupAttempts = @(Select-String -LiteralPath (Join-Path $run 'stderr.txt') -Pattern 'OpenGL startup failed err=' -SimpleMatch).Count
+            if ($case.openglStartupAttempts -ne 1) { throw "Expected one OpenGL startup attempt across both surfaces; observed $($case.openglStartupAttempts)." }
             $case.ledger = Get-Content -LiteralPath (Join-Path $bin 'startup-attempts.json') -Raw | ConvertFrom-Json
             if ($case.ledger.attempts[0].phase -ne 'ready' -or $case.ledger.attempts[0].opengl_unavailable_at_unix_ms) { throw 'Successful fallback was not an ordinary ready launch.' }
         }
