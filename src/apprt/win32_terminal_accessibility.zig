@@ -290,6 +290,14 @@ pub const TerminalAccessibilitySession = struct {
         if (self.provider) |provider| win32_uia.events.raiseFocusChanged(&provider.base);
     }
 
+    /// The bell rang: a screen reader is told so when it has asked for this
+    /// terminal's provider. Reading the provider is on the UI thread, as
+    /// `nameChanged` does.
+    pub fn announceBell(self: *TerminalAccessibilitySession) void {
+        const provider = self.provider orelse return;
+        win32_uia.events.raiseBellNotification(&provider.base);
+    }
+
     pub fn nameChanged(self: *TerminalAccessibilitySession) void {
         self.mutex.lock();
         self.cacheName();
@@ -1801,6 +1809,28 @@ test "a screen switch makes the echo check forget typed input at that point of t
     // The same batch with the reset ahead of every byte would speak that echo:
     // what a batch-wide reset flag does, and what the check above tells apart.
     try std.testing.expect(try Consumer.deliver(session, false, true));
+}
+
+test "terminal bell is announced only once a reader has the provider" {
+    var ctx: MutableTestOps.Context = .{ .focused = true, .text = "", .name = "Terminal" };
+    const session = try TerminalAccessibilitySession.create(
+        std.testing.allocator,
+        MutableTestOps.ops(&ctx),
+        0,
+        0,
+    );
+    defer session.deinit();
+
+    win32_uia.events.testing_bells = 0;
+    session.announceBell();
+    try std.testing.expectEqual(@as(usize, 0), win32_uia.events.testing_bells);
+    const provider = try win32_uia.TerminalProvider.create(std.testing.allocator, @ptrFromInt(0x1), session.state());
+    defer _ = win32_uia.TerminalProvider.Release(&provider.base);
+    session.provider = provider;
+    defer session.provider = null;
+    session.announceBell();
+    session.announceBell();
+    try std.testing.expectEqual(@as(usize, 2), win32_uia.events.testing_bells);
 }
 
 test "terminal name cache refreshes without an event listener" {

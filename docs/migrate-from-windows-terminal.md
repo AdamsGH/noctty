@@ -56,7 +56,36 @@ profile inheritance. Copy only the lines you need.
 | `historySize`                | `scrollback-limit`                     | Different unit: WT counts lines, Noctty counts bytes. The default is 10 MB.         |
 | `initialCols`, `initialRows` | `window-width`, `window-height`        | Grid cells, as in WT. Both must be set or both are ignored.                         |
 | `backgroundImage`            | `background-image`                     |                                                                                     |
-| `bellStyle`                  | (none)                                 | The bell always plays the system sound; `bell-features` has no effect on Windows.   |
+| `bellStyle`, `bellSound`     | `bell-features`, `bell-audio-path`     | See [The bell](#the-bell) below.                                                    |
+
+### The bell
+
+`bell-features` is a comma-separated list, and a feature with a `no-` prefix is
+off. Unspecified features keep their defaults, so the mappings below explicitly
+turn off noctty's title glyph. These are the closest equivalents for Windows
+Terminal's `bellStyle`:
+
+| `bellStyle` | `bell-features`                |
+| ----------- | ------------------------------ |
+| `audible`   | `system,no-attention,no-title` |
+| `window`    | `attention,no-title`           |
+| `taskbar`   | `attention,no-title`           |
+| `all`       | `system,attention,no-title`    |
+| `none`      | `false`                        |
+
+The `window` mapping substitutes a taskbar flash for Windows Terminal's window flash.
+
+`system` plays the Windows system sound, `attention` flashes the window's
+taskbar button until the window is in front, and `bellSound` is `audio` with
+`bell-audio-path` (and `bell-audio-volume`, which Windows Terminal has no
+equivalent for). Windows Terminal also accepts an array of sound files and picks
+one at random; noctty accepts one path. Windows Terminal's default is `audible`; noctty's default is
+`attention,title`, which plays nothing and, for a terminal you are not looking
+at, flashes the taskbar button and puts a bell glyph on the tab and the window
+caption until you focus or type into it. Set
+`bell-features = system,no-attention,no-title` to keep Windows Terminal's behaviour. See
+[the capability matrix](windows-capability-matrix.md#notifications-and-progress)
+for the details.
 
 A short starting config:
 
