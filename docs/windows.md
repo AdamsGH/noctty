@@ -200,13 +200,13 @@ XDG helpers still honor `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and
 `XDG_CACHE_HOME` when set on Windows; `%LOCALAPPDATA%` is the fallback in
 the normal packaged app environment.
 
-| Path                                       | Purpose                                                                                                                                                                                                                              |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                |
-| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`. |
-| `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                    |
-| `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                           |
-| `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                           |
+| Path                                       | Purpose                                                                                                                                                                                                                                                           |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                                             |
+| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`.                              |
+| `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                                                 |
+| `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                                                        |
+| `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                                                        |
 
 [PRIVACY.md](../PRIVACY.md) describes the other files and registry entries
 noctty writes, including the jump list, command palette history, and update
@@ -779,7 +779,7 @@ terminfo capability, so a program can check before it reports.
   look, so repeating it works through them. It has no default key binding;
   bind it with, for example,
   `keybind = ctrl+shift+g=goto_attention`. `noctty +perform-action
-goto_attention` runs it from scripts.
+  goto_attention` runs it from scripts.
 - **Screen readers.** Each tab's UI Automation `ItemStatus` reads the status,
   such as "claude needs permission: Allow edit to main.rs?". A new state,
   request or result raises a property-change event; progress updates
