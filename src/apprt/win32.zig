@@ -15023,6 +15023,10 @@ const Host = struct {
         const visible_rows = self.palette_list_visible_rows;
         if (visible_rows == 0) return false;
 
+        // Keyboard, pointer selection and UIA begin a new interaction; none
+        // should complete a precision-wheel gesture from before it.
+        self.palette_wheel_steps = .{};
+
         const changed = self.palette_list_selected != next;
         self.palette_list_selected = next;
         if (next < self.palette_list_scroll) {
@@ -15869,6 +15873,55 @@ const Host = struct {
         try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
     }
 
+    test "chrome pointer gesture resets after non-wheel palette selection" {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        host.overlay_mode = .command_palette;
+        host.palette_list_ranked_count = 20;
+        host.palette_list_visible_rows = 5;
+        host.palette_list_selected = 5;
+        host.palette_list_scroll = 4;
+        host.palette_wheel_steps.remainder = -90;
+        try std.testing.expect(host.setPaletteListSelection(0));
+        try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+        host.palette_wheel_steps.remainder = -90;
+        try std.testing.expect(host.setPaletteListSelection(3));
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+    }
+
+    test "chrome pointer gesture resets when palette layout hides the list" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(paletteHideWheelTestBody);
+    }
+
+    fn paletteHideWheelTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host }} });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        // A real native child is enough to exercise the production layout
+        // visibility path; no custom palette class or ranked rows are needed.
+        host.palette_list_hwnd = window.pane;
+        defer host.palette_list_hwnd = null;
+        host.palette_wheel_steps.remainder = 60;
+        var changed = false;
+        _ = host.layoutChromeForRect(window.content, &changed);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+    }
+
     /// BeginPaint/EndPaint over the list child HWND. Each row shows
     /// title | action | keybind hint. The selected row (Enter target)
     /// gets the accent highlight.
@@ -16260,7 +16313,10 @@ const Host = struct {
         try std.testing.expect(sys.GetWindowRect(host.tabs.items[1].button_hwnd.?, &rect) != 0);
         const x = rect.left + 10;
         try std.testing.expectEqual(@as(?usize, 1), host.tabIndexAtScreenX(x));
+        host.tab_wheel_steps.remainder = 60;
         app.config.@"window-show-tab-bar" = .never;
+        try host.layout();
+        try std.testing.expectEqual(@as(i32, 0), host.tab_wheel_steps.remainder);
         try std.testing.expectEqual(@as(?usize, null), host.tabIndexAtScreenX(x));
     }
 
@@ -23379,6 +23435,7 @@ const Host = struct {
         // and the active tab's accent border over the terminal (#244). Decide
         // the strip's visibility once and gate every child that belongs to it.
         const tab_strip_visible = self.shouldShowTabBar();
+        if (!tab_strip_visible) self.tab_wheel_steps = .{};
         var active_tab_left: ?i32 = null;
         for (self.tabs.items, 0..) |*tab, i| {
             if (tab.button_hwnd) |button_hwnd| {
@@ -23710,6 +23767,7 @@ const Host = struct {
                         paletteListRect(width, list_x, padding, list_y, list_height),
                     ) or changed.*;
                     const show_list = self.palette_list_visible_rows > 0 and has_list_width;
+                    if (!show_list) self.palette_wheel_steps = .{};
                     const list_visibility_changed = applyChildVisibility(
                         list_hwnd,
                         &self.palette_list_placement,
@@ -23723,6 +23781,7 @@ const Host = struct {
                 }
             } else if (self.palette_list_hwnd) |list_hwnd| {
                 self.palette_list_visible_rows = 0;
+                self.palette_wheel_steps = .{};
                 changed.* = applyChildVisibility(
                     list_hwnd,
                     &self.palette_list_placement,
@@ -23786,6 +23845,7 @@ const Host = struct {
             }
             if (self.palette_list_hwnd) |list_hwnd| {
                 self.palette_list_visible_rows = 0;
+                self.palette_wheel_steps = .{};
                 changed.* = applyChildVisibility(
                     list_hwnd,
                     &self.palette_list_placement,
