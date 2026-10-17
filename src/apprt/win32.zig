@@ -3016,6 +3016,8 @@ pub const App = struct {
                 var config = try configpkg.Config.default(core_app.alloc);
                 errdefer config.deinit();
                 try config.finalize();
+                // Recovery runs the shell that reads no startup files of its own.
+                try config.useWindowsRecoveryCommand();
                 break :config config;
             } else try configpkg.Config.load(core_app.alloc),
             .is_elevated = is_elevated,
@@ -8286,6 +8288,14 @@ pub const App = struct {
         for (self.windows.items) |surface| surface.invalidateScrollbarWindow();
         self.theme_rebuilds +%= 1;
         self.settings_window.themeChanged();
+    }
+
+    /// Where the picker starts when nothing was chosen or hinted: the profile
+    /// that runs the shell the automatic default command picked. A `command`
+    /// the user set leaves the choice to the caller.
+    fn defaultShellProfileIndex(self: *const App, profiles: []const windows_shell.Profile) ?usize {
+        if (!self.config._command_defaulted) return null;
+        return windows_shell.profileIndexForDefaultCommand(profiles, self.config.command orelse return null);
     }
 
     fn applyLauncherQuickSlotPreferences(self: *App, profiles: []windows_shell.Profile) void {
@@ -17159,6 +17169,10 @@ const Host = struct {
             _ = try self.setSelectedProfileIndex(index);
             return true;
         }
+        if (self.app.defaultShellProfileIndex(profiles)) |index| {
+            _ = try self.setSelectedProfileIndex(index);
+            return true;
+        }
         if (self.selected_profile >= profiles.len) self.selected_profile = 0;
         _ = try self.setSelectedProfileIndex(self.selected_profile);
         return true;
@@ -17184,6 +17198,10 @@ const Host = struct {
             self.app.launcher_profile_hint,
             self.selected_profile,
         )) |index| {
+            _ = try self.setSelectedProfileIndex(index);
+            return;
+        }
+        if (self.app.defaultShellProfileIndex(profiles)) |index| {
             _ = try self.setSelectedProfileIndex(index);
             return;
         }

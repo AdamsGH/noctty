@@ -4840,7 +4840,8 @@ pub fn finalize(self: *Config) !void {
                 log.info("shell src=config value={}", .{cmd})
             else shell_env: {
                 // Windows shell resolution is handled explicitly below so that
-                // `command = null` consistently follows our WSL-first order.
+                // an unset `command` consistently follows pwsh, then Windows
+                // PowerShell, then cmd.exe (never WSL).
                 if (builtin.os.tag == .windows) break :shell_env;
 
                 // If we were launched from the desktop, our SHELL env var
@@ -4977,10 +4978,21 @@ pub fn finalize(self: *Config) !void {
 /// Resolve the automatic Windows command without hiding whether it was explicit.
 pub fn resolveWindowsDefaultCommand(self: *Config) !void {
     if (self.command != null) return;
-    const cmd = try windows_shell.previewCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-preview value={}", .{cmd});
+    const cmd = try windows_shell.defaultCommand(self._arena.?.allocator());
+    log.info("default shell src=windows-default value={}", .{cmd});
     self.command = cmd;
     self._command_defaulted = true;
+}
+
+/// Replace an automatic Windows command with the one safe mode starts, so a
+/// recovery launch does not run the user's PowerShell profile. A command the
+/// user set stays; safe mode never reads it, because it uses the built-in
+/// config.
+pub fn useWindowsRecoveryCommand(self: *Config) !void {
+    if (!self._command_defaulted) return;
+    const cmd = try windows_shell.recoveryCommand(self._arena.?.allocator());
+    log.info("default shell src=windows-recovery value={}", .{cmd});
+    self.command = cmd;
 }
 
 /// Callback for src/cli/args.zig to allow us to handle special cases
@@ -12045,4 +12057,31 @@ test "compatibility: removed bold-is-bright" {
             cfg.@"bold-color",
         );
     }
+}
+
+test "Windows safe mode swaps only the automatic command for cmd.exe" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // The automatic command is PowerShell or cmd; recovery makes it cmd.exe,
+    // which reads no profile, and it stays marked automatic.
+    var automatic = try Config.default(alloc);
+    defer automatic.deinit();
+    try automatic.resolveWindowsDefaultCommand();
+    try testing.expect(automatic._command_defaulted);
+    try automatic.useWindowsRecoveryCommand();
+    try testing.expect(automatic._command_defaulted);
+    try testing.expect(automatic.command.? == .direct);
+    try testing.expect(std.ascii.eqlIgnoreCase(
+        std.fs.path.basename(automatic.command.?.direct[0]),
+        "cmd.exe",
+    ));
+
+    // A command somebody set is not replaced.
+    var explicit = try Config.default(alloc);
+    defer explicit.deinit();
+    explicit.command = .{ .shell = "pwsh.exe" };
+    try explicit.useWindowsRecoveryCommand();
+    try testing.expectEqualStrings("pwsh.exe", explicit.command.?.shell);
 }

@@ -1024,7 +1024,7 @@ const Subprocess = struct {
         const shell_command: configpkg.Command = shell: {
             const configured_shell_command: configpkg.Command =
                 cfg.command orelse switch (builtin.os.tag) {
-                    .windows => try windows_shell.previewCommand(alloc),
+                    .windows => try windows_shell.defaultCommand(alloc),
                     else => .{ .shell = "sh" },
                 };
             const default_shell_command = if (builtin.os.tag == .windows)

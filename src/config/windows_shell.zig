@@ -19,13 +19,6 @@ var ssh_missing_logged = false;
 const wsl_shell_integration_next_step =
     "Enable shell integration inside the selected WSL shell startup.";
 
-pub const DefaultShell = enum {
-    wsl,
-    pwsh,
-    powershell,
-    cmd,
-};
-
 pub const ProfileKind = windows_shell_types.ProfileKind;
 pub const Utf8Console = windows_shell_types.Utf8Console;
 
@@ -91,30 +84,25 @@ pub const ProfileDiscovery = struct {
     complete: bool,
 };
 
-/// Determine the default shell order for Windows:
-/// WSL -> pwsh -> powershell -> cmd.
-pub fn defaultShell(alloc: Allocator) !DefaultShell {
-    return try defaultShellWithLookupAndProbe(alloc, lookupExecutable, probeWslExecutableCached);
-}
-
-/// Build the default Windows command. This intentionally returns a direct
-/// command so we avoid the extra `cmd.exe /C` trampoline on the hot path.
+/// The command a terminal runs when `command` is unset: PowerShell 7+
+/// (`pwsh.exe`), else Windows PowerShell, else Command Prompt. WSL is never
+/// chosen here, because `wsl.exe --status` can report a healthy installation
+/// when launching a session would still fail; a distribution is picked from
+/// the profile picker or by `command = wsl.exe`.
+///
+/// Nothing is launched and no network or device path is opened, so this is
+/// safe on the UI thread while the configuration loads. A direct command
+/// skips the `cmd.exe /C` trampoline.
 pub fn defaultCommand(alloc: Allocator) !Command {
-    return try defaultCommandWithLookupAndProbe(alloc, lookupExecutable, probeWslExecutableCached);
+    return try defaultCommandWithHost(alloc, DefaultShellHost);
 }
 
-/// Build a safe default Windows command that explicitly skips WSL.
-/// This is used by the Win32 preview runtime while the WSL startup path
-/// is being stabilized independently from renderer bring-up.
-pub fn defaultCommandNoWsl(alloc: Allocator) !Command {
-    return try defaultCommandNoWslWithLookup(alloc, lookupExecutable);
-}
-
-/// Build a conservative preview command for the Win32 runtime.
-/// This prefers `cmd.exe` first because its startup semantics are simpler
-/// than PowerShell while the native Windows runtime is still under bring-up.
-pub fn previewCommand(alloc: Allocator) !Command {
-    return try previewCommandWithLookup(alloc, lookupExecutable);
+/// The command safe mode runs: always Command Prompt. Recovery has to work
+/// when the user's own startup files are what broke, and `cmd.exe` is the one
+/// shell that reads none (PowerShell loads `$PROFILE` even with the shell
+/// integration's `-NoExit -Command`).
+pub fn recoveryCommand(alloc: Allocator) !Command {
+    return try commandPromptWithHost(alloc, DefaultShellHost);
 }
 
 pub fn listProfiles(alloc: Allocator, include_ssh_hosts: bool) ![]Profile {
@@ -183,6 +171,27 @@ fn appendConfiguredSshProfiles(
     }
     defer alloc.free(ssh_path.?);
     return try appendSshProfiles(alloc, shell_profiles, hosts, ssh_path.?);
+}
+
+/// The profile that is the shell `defaultCommand` chose, so the picker's
+/// starting selection names what a new tab really runs instead of the first
+/// entry in the list (WSL, when it is installed). Null when the command is
+/// none of the three shells it chooses between, or the list has no such profile.
+pub fn profileIndexForDefaultCommand(profiles: []const Profile, command: Command) ?usize {
+    if (command != .direct or command.direct.len == 0) return null;
+    const base = std.fs.path.basename(command.direct[0]);
+    const kind: ProfileKind = if (std.ascii.eqlIgnoreCase(base, "pwsh.exe"))
+        .pwsh
+    else if (std.ascii.eqlIgnoreCase(base, "powershell.exe"))
+        .powershell
+    else if (std.ascii.eqlIgnoreCase(base, "cmd.exe"))
+        .cmd
+    else
+        return null;
+    for (profiles, 0..) |profile, index| {
+        if (profile.kind == kind) return index;
+    }
+    return null;
 }
 
 pub fn deinitProfiles(alloc: Allocator, profiles: []Profile) void {
@@ -334,10 +343,31 @@ pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.
     if (builtin.os.tag != .windows or exe.len == 0 or
         std.mem.indexOfAny(u8, exe, "\\/:") != null) return null;
     const path = env.get("PATH") orelse return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const found = searchPath(&buf, exe, path, env.get("PATHEXT"), acceptAnyPath) orelse return null;
+    return try alloc.dupeZ(u8, found);
+}
+
+fn acceptAnyPath(_: []const u8) bool {
+    return true;
+}
+
+/// The first file `exe` names in the `path` list (`PATH` syntax), as a slice of
+/// `buf`. Only absolute local-drive entries are searched: a relative entry
+/// would mean the current directory, and a network or device entry could stall
+/// the caller. `pathext` is `PATHEXT` and only matters when `exe` has no
+/// extension. `accept` can refuse a file that exists, and then the search goes
+/// on in the next directory.
+fn searchPath(
+    buf: *[std.fs.max_path_bytes]u8,
+    exe: []const u8,
+    path: []const u8,
+    pathext: ?[]const u8,
+    accept: anytype,
+) ?[]const u8 {
     const extension = std.fs.path.extension(exe);
     var dirs = std.mem.splitScalar(u8, path, ';');
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    while (dirs.next()) |raw_dir| {
+    dirs: while (dirs.next()) |raw_dir| {
         var dir = std.mem.trim(u8, raw_dir, " \t");
         if (dir.len >= 2 and dir[0] == '"' and dir[dir.len - 1] == '"')
             dir = dir[1 .. dir.len - 1];
@@ -346,7 +376,7 @@ pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.
             (dir[2] != '\\' and dir[2] != '/')) continue;
         if (internal_os.windows.driveTypeForLetter(dir[0]) == internal_os.windows.DRIVE_REMOTE)
             continue;
-        var extensions = std.mem.splitScalar(u8, if (extension.len > 0) "" else env.get("PATHEXT") orelse ".COM;.EXE;.BAT;.CMD", ';');
+        var extensions = std.mem.splitScalar(u8, if (extension.len > 0) "" else pathext orelse ".COM;.EXE;.BAT;.CMD", ';');
         while (extensions.next()) |raw_ext| {
             const ext = std.mem.trim(u8, raw_ext, " \t");
             if (extension.len == 0) {
@@ -359,12 +389,13 @@ pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.
                 };
                 if (!valid) continue;
             }
-            const candidate = std.fmt.bufPrint(&buf, "{s}\\{s}{s}", .{ dir, exe, ext }) catch continue;
+            const candidate = std.fmt.bufPrint(buf, "{s}\\{s}{s}", .{ dir, exe, ext }) catch continue;
             if (!windowsNonDirectoryPathExists(candidate)) continue;
             const found_ext = if (extension.len > 0) extension else ext;
             if (!std.ascii.eqlIgnoreCase(found_ext, ".exe") and
                 !std.ascii.eqlIgnoreCase(found_ext, ".com")) return null;
-            return try alloc.dupeZ(u8, candidate);
+            if (!accept(candidate)) continue :dirs;
+            return candidate;
         }
     }
     return null;
@@ -400,10 +431,89 @@ test "PKG48 only shell wrappers receive the inherited cwd search guard" {
 /// or stat'ed as an ordinary file. Query the path itself, accepting aliases.
 /// Callers must screen network/device paths and remote drives first.
 fn windowsNonDirectoryPathExists(path: []const u8) bool {
-    const path_w = windows.sliceToPrefixedFileW(null, path) catch return false;
+    const attributes = pathAttributes(path) orelse return false;
+    return attributes & windows.FILE_ATTRIBUTE_DIRECTORY == 0;
+}
+
+/// The attributes of `path` itself (a reparse point is not followed), or null.
+fn pathAttributes(path: []const u8) ?windows.DWORD {
+    const path_w = windows.sliceToPrefixedFileW(null, path) catch return null;
     const attributes = windows.kernel32.GetFileAttributesW(path_w.span().ptr);
-    return attributes != windows.INVALID_FILE_ATTRIBUTES and
-        attributes & windows.FILE_ATTRIBUTE_DIRECTORY == 0;
+    return if (attributes == windows.INVALID_FILE_ATTRIBUTES) null else attributes;
+}
+
+/// A file `CreateProcess` can start. The only reparse point accepted is an App
+/// Execution Alias whose package is installed: the Store's PowerShell and the
+/// Python launcher put one on `PATH`, and an alias can stay behind after its
+/// package is gone. Following a symlink or junction would open its target,
+/// which can be on a network share, so those are not accepted.
+/// The caller screens network and device paths first.
+fn isLaunchableShell(path: []const u8) bool {
+    const attributes = pathAttributes(path) orelse return false;
+    if (attributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) return false;
+    if (attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0) return true;
+    return appExecLinkTargetExists(path);
+}
+
+const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000001b;
+
+/// Whether the alias at `path` points at a file that exists. Reads the alias's
+/// reparse data and never launches it (an alias to a missing package can open
+/// the Store).
+fn appExecLinkTargetExists(path: []const u8) bool {
+    const path_w = windows.sliceToPrefixedFileW(null, path) catch return false;
+    const handle = windows.kernel32.CreateFileW(
+        path_w.span().ptr,
+        windows.FILE_READ_ATTRIBUTES,
+        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        null,
+        windows.OPEN_EXISTING,
+        windows.FILE_FLAG_OPEN_REPARSE_POINT,
+        null,
+    );
+    if (handle == windows.INVALID_HANDLE_VALUE) return false;
+    defer windows.CloseHandle(handle);
+    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = undefined;
+    windows.DeviceIoControl(handle, windows.FSCTL_GET_REPARSE_POINT, null, &data) catch return false;
+    var target_w: [1024]u16 = undefined;
+    const target_len = appExecLinkTarget(&data, &target_w) orelse return false;
+    var target_buf: [3 * target_w.len]u8 = undefined;
+    const target_end = std.unicode.utf16LeToUtf8(&target_buf, target_w[0..target_len]) catch return false;
+    const target = target_buf[0..target_end];
+    // A local file only; the screen is the one for any path a program reports.
+    if (!isDriveAbsolutePath(target) or internal_os.path.isNetworkOrDevicePath(target)) return false;
+    if (internal_os.windows.driveTypeForLetter(target[0]) == internal_os.windows.DRIVE_REMOTE) return false;
+    const attributes = pathAttributes(target) orelse return false;
+    return attributes & (windows.FILE_ATTRIBUTE_DIRECTORY | windows.FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
+/// The target of an App Execution Alias, copied as UTF-16 into `out`, from the
+/// output of `FSCTL_GET_REPARSE_POINT`: the reparse header (tag, data length,
+/// reserved), a version `3`, and four NUL-terminated UTF-16 strings, namely
+/// the package family name, the AppUserModelID, the target path and the
+/// application type. Layout as read from the aliases of installed packages
+/// (the same one libuv reads). Returns the length of the target, or null for
+/// any other tag or a record that is cut short.
+fn appExecLinkTarget(data: []const u8, out: []u16) ?usize {
+    if (data.len < 12 or std.mem.readInt(u32, data[0..4], .little) != IO_REPARSE_TAG_APPEXECLINK) return null;
+    const end = 8 + @as(usize, std.mem.readInt(u16, data[4..6], .little));
+    if (end > data.len or end < 12 or std.mem.readInt(u32, data[8..12], .little) != 3) return null;
+    const strings = data[12..end];
+    var index: usize = 0;
+    var start: usize = 0;
+    var field: usize = 0;
+    while (index + 2 <= strings.len) : (index += 2) {
+        if (strings[index] != 0 or strings[index + 1] != 0) continue;
+        if (field == 2) {
+            const len = (index - start) / 2;
+            if (len == 0 or len > out.len) return null;
+            for (0..len) |i| out[i] = std.mem.readInt(u16, strings[start + 2 * i ..][0..2], .little);
+            return len;
+        }
+        field += 1;
+        start = index + 2;
+    }
+    return null;
 }
 
 test "PKG08 round2 child executable lookup respects PATHEXT and local PATH" {
@@ -840,79 +950,64 @@ pub fn pathToWsl(alloc: Allocator, path: []const u8) !?[]const u8 {
     return try buf.toOwnedSlice(alloc);
 }
 
-fn defaultShellWithLookup(
-    alloc: Allocator,
-    lookup: anytype,
-) !DefaultShell {
-    return try defaultShellWithLookupAndProbe(alloc, lookup, probeWslExecutableAlwaysTrue);
-}
-
-fn defaultShellWithLookupAndProbe(
-    alloc: Allocator,
-    lookup: anytype,
-    probe: anytype,
-) !DefaultShell {
-    for (default_shell_candidates) |candidate| {
-        const found = try lookup(alloc, candidate.exe);
-        defer if (found) |path| alloc.free(path);
-        if (found) |path| {
-            if (candidate.shell == .wsl and !try probe(alloc, path)) continue;
-            return candidate.shell;
-        }
+/// What `defaultCommandWithHost` asks of the machine. Both functions return
+/// an owned path of a shell that can be started, or null, and fail only when
+/// memory runs out: a filesystem error is "not there", never a failed config.
+const DefaultShellHost = struct {
+    /// `pwsh.exe` on the process's `PATH`.
+    fn findPwsh(alloc: Allocator) !?[]u8 {
+        if (builtin.os.tag != .windows) return null;
+        const path = std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer alloc.free(path);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const found = searchPath(&buf, "pwsh.exe", path, null, isLaunchableShell) orelse return null;
+        return try alloc.dupe(u8, found);
     }
 
-    return .cmd;
-}
-
-fn defaultCommandWithLookup(
-    alloc: Allocator,
-    lookup: anytype,
-) !Command {
-    return try defaultCommandWithLookupAndProbe(alloc, lookup, probeWslExecutableAlwaysTrue);
-}
-
-fn defaultCommandWithLookupAndProbe(
-    alloc: Allocator,
-    lookup: anytype,
-    probe: anytype,
-) !Command {
-    for (default_shell_candidates) |candidate| {
-        const found = try lookup(alloc, candidate.exe);
-        if (found) |path| {
-            defer alloc.free(path);
-            if (candidate.shell == .wsl and !try probe(alloc, path)) continue;
-            return switch (candidate.shell) {
-                .wsl => try directCommand(alloc, &.{path}),
-                else => try directCommand(alloc, &.{path}),
-            };
-        }
+    /// `relative` below the Windows system directory. The built-in shells are
+    /// taken from there, not from `PATH`, so a `powershell.exe` or `cmd.exe`
+    /// placed earlier on `PATH` does not become the default shell.
+    fn systemShell(alloc: Allocator, relative: []const u8) !?[]u8 {
+        if (builtin.os.tag != .windows) return null;
+        var buf: [windows.MAX_PATH:0]u16 = undefined;
+        const len = windows.kernel32.GetSystemDirectoryW(&buf, buf.len);
+        if (len == 0 or len >= buf.len) return null;
+        const dir = std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..len]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer alloc.free(dir);
+        const path = try std.fs.path.join(alloc, &.{ dir, relative });
+        if (isLaunchableShell(path)) return path;
+        alloc.free(path);
+        return null;
     }
+};
 
-    if (try lookup(alloc, "cmd.exe")) |path| {
+const windows_powershell_relative = "WindowsPowerShell\\v1.0\\powershell.exe";
+
+fn defaultCommandWithHost(alloc: Allocator, comptime Host: type) !Command {
+    if (try Host.findPwsh(alloc)) |path| {
         defer alloc.free(path);
         return try directCommand(alloc, &.{path});
     }
-
-    return try directCommand(alloc, &.{"cmd.exe"});
-}
-
-fn defaultCommandNoWslWithLookup(
-    alloc: Allocator,
-    lookup: anytype,
-) !Command {
-    inline for (default_shell_candidates_no_wsl) |candidate| {
-        const found = try lookup(alloc, candidate.exe);
-        if (found) |path| {
-            defer alloc.free(path);
-            return try directCommand(alloc, &.{path});
-        }
-    }
-
-    if (try lookup(alloc, "cmd.exe")) |path| {
+    if (try Host.systemShell(alloc, windows_powershell_relative)) |path| {
         defer alloc.free(path);
         return try directCommand(alloc, &.{path});
     }
+    return try commandPromptWithHost(alloc, Host);
+}
 
+fn commandPromptWithHost(alloc: Allocator, comptime Host: type) !Command {
+    if (try Host.systemShell(alloc, "cmd.exe")) |path| {
+        defer alloc.free(path);
+        return try directCommand(alloc, &.{path});
+    }
+    // Windows without its own cmd.exe cannot start anything anyway; the bare
+    // name is what the launch path resolves and reports.
     return try directCommand(alloc, &.{"cmd.exe"});
 }
 
@@ -1191,22 +1286,6 @@ fn profileOrderTokenMatches(token: []const u8, profile: Profile) bool {
     };
 }
 
-fn previewCommandWithLookup(
-    alloc: Allocator,
-    lookup: anytype,
-) !Command {
-    if (try lookup(alloc, "cmd.exe")) |path| {
-        defer alloc.free(path);
-        return try directCommand(alloc, &.{path});
-    }
-
-    return try defaultCommandNoWslWithLookup(alloc, lookup);
-}
-
-fn probeWslExecutableAlwaysTrue(_: Allocator, _: []const u8) !bool {
-    return true;
-}
-
 fn probeWslExecutableCached(alloc: Allocator, exe_path: []const u8) !bool {
     if (builtin.os.tag != .windows) return true;
 
@@ -1275,23 +1354,6 @@ fn probeWslExecutable(alloc: Allocator, exe_path: []const u8) !bool {
     };
     return true;
 }
-
-const default_shell_candidates = [_]struct {
-    shell: DefaultShell,
-    exe: []const u8,
-}{
-    .{ .shell = .wsl, .exe = "wsl.exe" },
-    .{ .shell = .pwsh, .exe = "pwsh.exe" },
-    .{ .shell = .powershell, .exe = "powershell.exe" },
-};
-
-const default_shell_candidates_no_wsl = [_]struct {
-    shell: DefaultShell,
-    exe: []const u8,
-}{
-    .{ .shell = .pwsh, .exe = "pwsh.exe" },
-    .{ .shell = .powershell, .exe = "powershell.exe" },
-};
 
 fn prepareWslDirect(
     alloc: Allocator,
@@ -1858,110 +1920,264 @@ fn appendWindowsPath(
     for (path) |c| try buf.append(alloc, if (c == '/') '\\' else c);
 }
 
-test "defaultShellWithLookup prefers wsl first" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
+/// A machine for `defaultCommandWithHost`: the `pwsh.exe` on `PATH` (null when
+/// none is launchable) and which shells live in the system directory. Asking
+/// for `wsl.exe` fails the test: the default never looks for it.
+fn FakeDefaultShellHost(
+    comptime pwsh: ?[]const u8,
+    comptime system_shells: []const []const u8,
+) type {
+    return struct {
+        fn findPwsh(a: Allocator) !?[]u8 {
+            return if (pwsh) |path| try a.dupe(u8, path) else null;
+        }
 
-    const shell = try defaultShellWithLookup(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "wsl.exe")) return try a.dupe(u8, "C:\\Windows\\System32\\wsl.exe");
-            if (std.mem.eql(u8, exe, "pwsh.exe")) return try a.dupe(u8, "C:\\Program Files\\PowerShell\\7\\pwsh.exe");
+        fn systemShell(a: Allocator, relative: []const u8) !?[]u8 {
+            try std.testing.expect(!std.ascii.eqlIgnoreCase(relative, "wsl.exe"));
+            inline for (system_shells) |shell| {
+                if (std.mem.eql(u8, shell, relative))
+                    return try std.fs.path.join(a, &.{ "C:\\WINDOWS\\system32", relative });
+            }
             return null;
         }
-    }.lookup);
-
-    try testing.expectEqual(.wsl, shell);
+    };
 }
 
-test "defaultShellWithLookupAndProbe falls back when wsl probe fails" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const shell = try defaultShellWithLookupAndProbe(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "wsl.exe")) return try a.dupe(u8, "C:\\Windows\\System32\\wsl.exe");
-            if (std.mem.eql(u8, exe, "pwsh.exe")) return try a.dupe(u8, "C:\\Program Files\\PowerShell\\7\\pwsh.exe");
-            return null;
-        }
-    }.lookup, struct {
-        fn probe(_: Allocator, exe: []const u8) !bool {
-            try testing.expectEqualStrings("C:\\Windows\\System32\\wsl.exe", exe);
-            return false;
-        }
-    }.probe);
-
-    try testing.expectEqual(.pwsh, shell);
+fn expectDefaultShell(expected: []const u8, command: Command) !void {
+    defer command.deinit(std.testing.allocator);
+    try std.testing.expect(command == .direct);
+    try std.testing.expectEqual(@as(usize, 1), command.direct.len);
+    try std.testing.expectEqualStrings(expected, command.direct[0]);
 }
 
-test "defaultShellWithLookup falls back to cmd" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
+const test_pwsh = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+const test_windows_powershell = "C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const test_cmd = "C:\\WINDOWS\\system32\\cmd.exe";
 
-    const shell = try defaultShellWithLookup(alloc, struct {
-        fn lookup(_: Allocator, _: []const u8) !?[]u8 {
-            return null;
-        }
-    }.lookup);
+test "default command prefers pwsh, then Windows PowerShell, then cmd" {
+    const alloc = std.testing.allocator;
+    const all_system = [_][]const u8{ windows_powershell_relative, "cmd.exe" };
 
-    try testing.expectEqual(.cmd, shell);
+    try expectDefaultShell(test_pwsh, try defaultCommandWithHost(alloc, FakeDefaultShellHost(test_pwsh, &all_system)));
+    try expectDefaultShell(test_windows_powershell, try defaultCommandWithHost(alloc, FakeDefaultShellHost(null, &all_system)));
+    try expectDefaultShell(test_cmd, try defaultCommandWithHost(alloc, FakeDefaultShellHost(null, &.{"cmd.exe"})));
+    // pwsh and cmd alone: pwsh still wins over the shells that are missing.
+    try expectDefaultShell(test_pwsh, try defaultCommandWithHost(alloc, FakeDefaultShellHost(test_pwsh, &.{"cmd.exe"})));
 }
 
-test "defaultCommandWithLookup prefers absolute wsl path" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
+test "default command falls back to the bare cmd.exe when the system directory has no shell" {
+    try expectDefaultShell("cmd.exe", try defaultCommandWithHost(std.testing.allocator, FakeDefaultShellHost(null, &.{})));
+}
 
-    const command = try defaultCommandWithLookup(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "wsl.exe")) return try a.dupe(u8, "C:\\Windows\\System32\\wsl.exe");
-            return null;
+test "default command never picks WSL, which only the picker or an explicit command starts" {
+    // wsl.exe is installed and answering as far as the profile picker is
+    // concerned; the fake host fails the test if the default asks for it.
+    const alloc = std.testing.allocator;
+    try expectDefaultShell(test_cmd, try defaultCommandWithHost(alloc, FakeDefaultShellHost(null, &.{ "wsl.exe", "cmd.exe" })));
+    try expectDefaultShell(test_pwsh, try defaultCommandWithHost(alloc, FakeDefaultShellHost(test_pwsh, &.{ "wsl.exe", "cmd.exe" })));
+}
+
+test "the picker starts on the profile the default command runs, not on WSL" {
+    const profiles = [_]Profile{
+        .{ .kind = .wsl_default, .key = "wsl-default", .label = "WSL (Default)", .command = .{ .direct = &.{"C:\\WINDOWS\\system32\\wsl.exe"} } },
+        .{ .kind = .wsl_distro, .key = "wsl:Ubuntu", .label = "WSL: Ubuntu", .command = .{ .direct = &.{ "C:\\WINDOWS\\system32\\wsl.exe", "-d", "Ubuntu" } } },
+        .{ .kind = .pwsh, .key = "pwsh.exe", .label = "PowerShell", .command = .{ .direct = &.{test_pwsh} } },
+        .{ .kind = .powershell, .key = "powershell.exe", .label = "Windows PowerShell", .command = .{ .direct = &.{test_windows_powershell} } },
+        .{ .kind = .cmd, .key = "cmd.exe", .label = "Command Prompt", .command = .{ .direct = &.{test_cmd} } },
+    };
+    try std.testing.expectEqual(@as(?usize, 2), profileIndexForDefaultCommand(&profiles, .{ .direct = &.{test_pwsh} }));
+    try std.testing.expectEqual(@as(?usize, 3), profileIndexForDefaultCommand(&profiles, .{ .direct = &.{test_windows_powershell} }));
+    try std.testing.expectEqual(@as(?usize, 4), profileIndexForDefaultCommand(&profiles, .{ .direct = &.{"cmd.exe"} }));
+    // A pwsh that is not in the list (the picker found none) leaves the choice to the caller.
+    try std.testing.expectEqual(@as(?usize, null), profileIndexForDefaultCommand(profiles[0..2], .{ .direct = &.{test_pwsh} }));
+    // A command that is none of the three shells is not this function's to map.
+    try std.testing.expectEqual(@as(?usize, null), profileIndexForDefaultCommand(&profiles, .{ .direct = &.{"C:\\WINDOWS\\system32\\wsl.exe"} }));
+    try std.testing.expectEqual(@as(?usize, null), profileIndexForDefaultCommand(&profiles, .{ .shell = "pwsh.exe" }));
+}
+
+test "recovery command is cmd even when PowerShell is installed" {
+    const alloc = std.testing.allocator;
+    const all_system = [_][]const u8{ windows_powershell_relative, "cmd.exe" };
+    try expectDefaultShell(test_cmd, try commandPromptWithHost(alloc, FakeDefaultShellHost(test_pwsh, &all_system)));
+    try expectDefaultShell("cmd.exe", try commandPromptWithHost(alloc, FakeDefaultShellHost(test_pwsh, &.{windows_powershell_relative})));
+}
+
+/// Creates an empty file `name` in `dir` and makes it an App Execution Alias to
+/// `target`, as the Store does for an installed package. Skips the test where
+/// the volume refuses a reparse point.
+fn createTestAppExecLink(dir: std.fs.Dir, name: []const u8, target: []const u8) !void {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // Reopen it for the reparse write, without following what it will become.
+    (try dir.createFile(name, .{})).close();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try dir.realpath(name, &path_buf);
+    const path_w = try windows.sliceToPrefixedFileW(null, path);
+    const handle = windows.kernel32.CreateFileW(
+        path_w.span().ptr,
+        windows.GENERIC_WRITE,
+        0,
+        null,
+        windows.OPEN_EXISTING,
+        windows.FILE_FLAG_OPEN_REPARSE_POINT,
+        null,
+    );
+    if (handle == windows.INVALID_HANDLE_VALUE) return error.SkipZigTest;
+    defer windows.CloseHandle(handle);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    try body.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, 3)));
+    for ([_][]const u8{ "Test.Pkg_abc", "Test.Pkg_abc!App", target, "0" }) |text| {
+        const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
+        defer alloc.free(wide);
+        try body.appendSlice(alloc, std.mem.sliceAsBytes(wide));
+        try body.appendSlice(alloc, &.{ 0, 0 });
+    }
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(alloc);
+    try buffer.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, IO_REPARSE_TAG_APPEXECLINK)));
+    try buffer.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(body.items.len))));
+    try buffer.appendSlice(alloc, &.{ 0, 0 });
+    try buffer.appendSlice(alloc, body.items);
+
+    const FSCTL_SET_REPARSE_POINT: windows.DWORD = 0x900a4;
+    windows.DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, buffer.items, null) catch return error.SkipZigTest;
+}
+
+test "appExecLinkTarget reads the third string and rejects a cut or foreign record" {
+    const alloc = std.testing.allocator;
+    var record: std.ArrayList(u8) = .empty;
+    defer record.deinit(alloc);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, &.{ 3, 0, 0, 0 });
+    for ([_][]const u8{ "Microsoft.PowerShell_8wekyb3d8bbwe", "Microsoft.PowerShell_8wekyb3d8bbwe!App", "C:\\Program Files\\WindowsApps\\x\\pwsh.exe", "0" }) |text| {
+        const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
+        defer alloc.free(wide);
+        try body.appendSlice(alloc, std.mem.sliceAsBytes(wide));
+        try body.appendSlice(alloc, &.{ 0, 0 });
+    }
+    try record.appendSlice(alloc, &.{ 0x1b, 0x00, 0x00, 0x80 });
+    try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(body.items.len))));
+    try record.appendSlice(alloc, &.{ 0, 0 });
+    try record.appendSlice(alloc, body.items);
+
+    var out: [128]u16 = undefined;
+    const len = appExecLinkTarget(record.items, &out).?;
+    var utf8: [128]u8 = undefined;
+    const end = try std.unicode.utf16LeToUtf8(&utf8, out[0..len]);
+    try std.testing.expectEqualStrings("C:\\Program Files\\WindowsApps\\x\\pwsh.exe", utf8[0..end]);
+
+    // Another tag, a wrong version, a length past the buffer and a target that
+    // is not terminated before the record ends are all refused.
+    var other = try alloc.dupe(u8, record.items);
+    defer alloc.free(other);
+    other[3] = 0xa0;
+    try std.testing.expect(appExecLinkTarget(other, &out) == null);
+    var version = try alloc.dupe(u8, record.items);
+    defer alloc.free(version);
+    version[8] = 2;
+    try std.testing.expect(appExecLinkTarget(version, &out) == null);
+    try std.testing.expect(appExecLinkTarget(record.items[0 .. record.items.len - 40], &out) == null);
+    try std.testing.expect(appExecLinkTarget(record.items[0..8], &out) == null);
+    var tiny: [4]u16 = undefined;
+    try std.testing.expect(appExecLinkTarget(record.items, &tiny) == null);
+}
+
+test "pwsh search skips what cannot start and keeps going down PATH" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 1: a directory named pwsh.exe. 2: an alias whose package is gone.
+    // 3: the real thing. 4: one that must not be reached.
+    try tmp.dir.makePath("dir/pwsh.exe");
+    try tmp.dir.makePath("gone");
+    try createTestAppExecLink(tmp.dir, "gone/pwsh.exe", "C:\\Program Files\\WindowsApps\\Missing.Package_1.0.0.0_x64__abc\\pwsh.exe");
+    try tmp.dir.makePath("real");
+    try tmp.dir.writeFile(.{ .sub_path = "real/pwsh.exe", .data = "MZ" });
+    try tmp.dir.makePath("later");
+    try tmp.dir.writeFile(.{ .sub_path = "later/pwsh.exe", .data = "MZ" });
+
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(
+        alloc,
+        "\\\\server\\share;relative;\\??\\UNC\\server\\share;{s}\\dir;{s}\\gone;\"{s}\\real\";{s}\\later",
+        .{ root, root, root, root },
+    );
+    defer alloc.free(path);
+    const expected = try std.fmt.allocPrint(alloc, "{s}\\real\\pwsh.exe", .{root});
+    defer alloc.free(expected);
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, searchPath(&buf, "pwsh.exe", path, null, isLaunchableShell).?);
+
+    // With only the dead alias and the directory on PATH nothing is found, so
+    // the default moves on to Windows PowerShell instead of a shell that fails.
+    const dead = try std.fmt.allocPrint(alloc, "{s}\\dir;{s}\\gone", .{ root, root });
+    defer alloc.free(dead);
+    try std.testing.expect(searchPath(&buf, "pwsh.exe", dead, null, isLaunchableShell) == null);
+}
+
+test "an App Execution Alias counts only while its target exists" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("pkg");
+    try tmp.dir.writeFile(.{ .sub_path = "pkg/pwsh.exe", .data = "MZ" });
+    try tmp.dir.makePath("pkg/folder");
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const present = try std.fmt.allocPrint(alloc, "{s}\\pkg\\pwsh.exe", .{root});
+    defer alloc.free(present);
+    const missing = try std.fmt.allocPrint(alloc, "{s}\\pkg\\nope.exe", .{root});
+    defer alloc.free(missing);
+    const folder = try std.fmt.allocPrint(alloc, "{s}\\pkg\\folder", .{root});
+    defer alloc.free(folder);
+
+    try createTestAppExecLink(tmp.dir, "to-present.exe", present);
+    try createTestAppExecLink(tmp.dir, "to-missing.exe", missing);
+    try createTestAppExecLink(tmp.dir, "to-folder.exe", folder);
+    try createTestAppExecLink(tmp.dir, "to-network.exe", "\\\\server\\share\\pwsh.exe");
+    try createTestAppExecLink(tmp.dir, "to-relative.exe", "pkg\\pwsh.exe");
+
+    const check = struct {
+        fn launchable(a: Allocator, dir: []const u8, name: []const u8) !bool {
+            const full = try std.fmt.allocPrint(a, "{s}\\{s}", .{ dir, name });
+            defer a.free(full);
+            return isLaunchableShell(full);
         }
-    }.lookup);
+    }.launchable;
+    try std.testing.expect(try check(alloc, root, "to-present.exe"));
+    try std.testing.expect(!try check(alloc, root, "to-missing.exe"));
+    try std.testing.expect(!try check(alloc, root, "to-folder.exe"));
+    try std.testing.expect(!try check(alloc, root, "to-network.exe"));
+    try std.testing.expect(!try check(alloc, root, "to-relative.exe"));
+    // A plain file starts, a folder and a missing name do not.
+    try std.testing.expect(try check(alloc, root, "pkg\\pwsh.exe"));
+    try std.testing.expect(!try check(alloc, root, "pkg\\folder"));
+    try std.testing.expect(!try check(alloc, root, "pkg\\absent.exe"));
+}
+
+test "the real machine yields a default command that exists" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const command = try defaultCommand(alloc);
     defer command.deinit(alloc);
+    try std.testing.expect(command == .direct and command.direct.len == 1);
+    const exe = std.fs.path.basename(command.direct[0]);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(exe, "pwsh.exe") or
+        std.ascii.eqlIgnoreCase(exe, "powershell.exe") or std.ascii.eqlIgnoreCase(exe, "cmd.exe"));
+    try std.testing.expect(isLaunchableShell(command.direct[0]));
 
-    try testing.expect(command == .direct);
-    try testing.expectEqual(@as(usize, 1), command.direct.len);
-    try testing.expectEqualStrings("C:\\Windows\\System32\\wsl.exe", command.direct[0]);
-}
-
-test "defaultCommandWithLookupAndProbe falls back when wsl probe fails" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const command = try defaultCommandWithLookupAndProbe(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "wsl.exe")) return try a.dupe(u8, "C:\\Windows\\System32\\wsl.exe");
-            if (std.mem.eql(u8, exe, "pwsh.exe")) return try a.dupe(u8, "C:\\Program Files\\PowerShell\\7\\pwsh.exe");
-            return null;
-        }
-    }.lookup, struct {
-        fn probe(_: Allocator, exe: []const u8) !bool {
-            try testing.expectEqualStrings("C:\\Windows\\System32\\wsl.exe", exe);
-            return false;
-        }
-    }.probe);
-    defer command.deinit(alloc);
-
-    try testing.expect(command == .direct);
-    try testing.expectEqual(@as(usize, 1), command.direct.len);
-    try testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", command.direct[0]);
-}
-
-test "defaultCommandNoWslWithLookup skips wsl and prefers pwsh" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const command = try defaultCommandNoWslWithLookup(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "wsl.exe")) return try a.dupe(u8, "C:\\Windows\\System32\\wsl.exe");
-            if (std.mem.eql(u8, exe, "pwsh.exe")) return try a.dupe(u8, "C:\\Program Files\\PowerShell\\7\\pwsh.exe");
-            return null;
-        }
-    }.lookup);
-    defer command.deinit(alloc);
-
-    try testing.expect(command == .direct);
-    try testing.expectEqual(@as(usize, 1), command.direct.len);
-    try testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", command.direct[0]);
+    const recovery = try recoveryCommand(alloc);
+    defer recovery.deinit(alloc);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(std.fs.path.basename(recovery.direct[0]), "cmd.exe"));
 }
 
 /// A machine for `lookupGitBashWithHost`: the files that exist and the install
@@ -2418,24 +2634,6 @@ test "listProfilesWithLookupAndProbeAndWslListAndOrder reorders windows profiles
     try testing.expectEqualStrings("WSL: Ubuntu", profiles[2].label);
     try testing.expectEqual(ProfileKind.cmd, profiles[3].kind);
     try testing.expectEqual(ProfileKind.wsl_default, profiles[4].kind);
-}
-
-test "previewCommandWithLookup prefers cmd over powershell" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const command = try previewCommandWithLookup(alloc, struct {
-        fn lookup(a: Allocator, exe: []const u8) !?[]u8 {
-            if (std.mem.eql(u8, exe, "cmd.exe")) return try a.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
-            if (std.mem.eql(u8, exe, "pwsh.exe")) return try a.dupe(u8, "C:\\Program Files\\PowerShell\\7\\pwsh.exe");
-            return null;
-        }
-    }.lookup);
-    defer command.deinit(alloc);
-
-    try testing.expect(command == .direct);
-    try testing.expectEqual(@as(usize, 1), command.direct.len);
-    try testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", command.direct[0]);
 }
 
 test "pathToWsl converts windows drive path" {
