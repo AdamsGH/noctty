@@ -411,13 +411,23 @@ lands incrementally.
   notification time) PresentMon on one machine showed the pane presented as
   composed flip; afterwards it was independent flip, whether or not the
   scrollbar was shown.
-- A real drag across monitors of different DPI can push long lines into
-  scrollback: in 1 of 15 measured drags (D3D11 renderer, `cmd.exe`, 72-column
-  lines, from a 144 DPI monitor to a 96 DPI one and back) the first 16 lines
-  went there, and 0 of 10 before the DPI padding fix. The likely cause (inferred, not confirmed) is
-  the transient size Windows gives the window before the new font is in, which
-  wraps long lines; the counts cannot show whether the fixes made it more
-  likely. It is not fixed.
+- A drag across monitors of different DPI reaches each visible pane of the
+  active tab as one terminal resize, in the new font, at its final size
+  (#426). Windows resizes the window before the new font is in, and the
+  terminal could lay long lines out in that transient size and push them into
+  scrollback. On main with #423, real drags (144 DPI to 96 DPI and back,
+  150-column lines, logging what termio applied) sent an old-font size on
+  30 of 30 drags and pushed lines into scrollback on 20. With the hold that
+  #426 adds, 0 of 30. Its batched font and size were measured on a hidden
+  desktop with a 60 ms delay injected after the font change, standing in for
+  a slow font build in another pane: one resize per pane at its final grid,
+  single pane and split, where the hold alone pushed lines on 29 of 30 moves.
+  The two have not been measured together with real input. A tab hidden
+  during the move takes the font and the size as separate resizes when it is
+  shown, so a slow font build there can still wrap long lines into scrollback.
+  A pane whose new font cannot be built gets the new size in the old font at
+  once, which on a move to a lower DPI can do the same, and the font is
+  retried on a later layout (both inferred, not measured).
 - Alt+Space still sends ESC SPACE to the program as well as opening the
   window menu (#381). Once conhost has seen a Win32 input record it holds a
   lone ESC back until more input arrives, as under Windows Terminal (#335).
