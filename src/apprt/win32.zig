@@ -1338,6 +1338,19 @@ const recovery_session_set_aside_banner_w = blk: {
 const recovery_set_aside_suffix = ".restore-failed";
 const recovery_safe_mode_caption_w = std.unicode.utf8ToUtf16LeStringLiteral("noctty safe mode");
 
+test "win32 safe mode reload keeps recovery without loading config" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // No CoreApp or config is installed: recovery reload must return before
+    // touching either, for hard and soft reloads alike.
+    var app: App = undefined;
+    app.safe_mode = true;
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = false }));
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = true }));
+    var config: configpkg.Config = undefined;
+    try app.settingsReconcileDisk(&config, &config, false);
+    try app.settingsReconcileDisk(&config, &config, true);
+}
+
 /// Filename infix for a startup-ledger record whose write already failed and
 /// whose diagnosis is waiting to be folded into the next startup's append.
 /// Deliberately disjoint from the `.tmp-` infix used for live atomic-replace
@@ -3015,6 +3028,9 @@ pub const App = struct {
             .config = if (safe_mode) config: {
                 var config = try configpkg.Config.default(core_app.alloc);
                 errdefer config.deinit();
+                // Recovery runs `cmd /D`, which loads no profile and skips AutoRun,
+                // and so needs no PATH search.
+                try config.useWindowsRecoveryCommand();
                 try config.finalize();
                 break :config config;
             } else try configpkg.Config.load(core_app.alloc),
@@ -6634,6 +6650,10 @@ pub const App = struct {
             },
 
             .reload_config => {
+                // Recovery keeps its default config and cmd /D until restart.
+                // In particular, a hard reload must not run default discovery
+                // or load the startup files that safe mode bypassed.
+                if (self.safe_mode) return true;
                 if (value.soft) {
                     switch (target) {
                         .app => try self.core_app.updateConfig(self, &self.config),
@@ -8286,6 +8306,14 @@ pub const App = struct {
         for (self.windows.items) |surface| surface.invalidateScrollbarWindow();
         self.theme_rebuilds +%= 1;
         self.settings_window.themeChanged();
+    }
+
+    /// Where the picker starts when nothing was chosen or hinted: the profile
+    /// that runs the shell the automatic default command picked. A `command`
+    /// the user set leaves the choice to the caller.
+    fn defaultShellProfileIndex(self: *const App, profiles: []const windows_shell.Profile) ?usize {
+        if (!self.config._command_defaulted) return null;
+        return windows_shell.profileIndexForDefaultCommand(profiles, self.config.command orelse return null);
     }
 
     fn applyLauncherQuickSlotPreferences(self: *App, profiles: []windows_shell.Profile) void {
@@ -10925,6 +10953,10 @@ pub const App = struct {
         self.settings_failure_detail.clear(alloc);
         try persistSettings(alloc, target_path, pending, user_edited, &self.settings_failure_detail);
 
+        // Saving can repair the config on disk, but recovery applies it only
+        // after restart, as the safe-mode banner promises.
+        if (self.safe_mode) return;
+
         // Mirror the `.reload_config` hard-reload path: re-read from disk and
         // push through CoreApp so every surface's next frame picks up the
         // new values.
@@ -11042,6 +11074,9 @@ pub const App = struct {
         original: *const configpkg.Config,
         apply: bool,
     ) win32_settings.SaveError!void {
+        // Recovery may repair the file, but must never apply its settings live,
+        // including through conflict reconciliation before the save.
+        if (self.safe_mode) return;
         const alloc = self.core_app.alloc;
         self.settings_failure_detail.clear(alloc);
         const user_edited = settingsUserEditedKeys(original, pending);
@@ -15356,6 +15391,9 @@ const Host = struct {
     }
 
     fn previewPaletteTheme(self: *Host, name: []const u8) !void {
+        // Recovery must not load user files or replace its runtime config.
+        // A theme can still be saved below, to take effect after restart.
+        if (self.app.safe_mode) return;
         if (self.app.config.theme) |current| {
             if (std.mem.eql(u8, current.light, name) and std.mem.eql(u8, current.dark, name)) return;
         }
@@ -15420,7 +15458,7 @@ const Host = struct {
 
         // settingsSaveAndReload may replace/deinit the live app config. Keep
         // the generation borrowed by the visible palette alive first.
-        try self.detachLivePaletteCatalogConfig();
+        if (!self.app.safe_mode) try self.detachLivePaletteCatalogConfig();
 
         if (self.palette_theme_preview_original) |*value| {
             if (self.palette_catalog_config_source == .preview_original) {
@@ -15436,7 +15474,8 @@ const Host = struct {
         // The Settings window offers Keep mine / Use disk when the file now
         // says something else for a setting being edited; a palette pick has no
         // such prompt, so a theme that changed on disk is refused instead of
-        // overwritten, and the running config is left as it is.
+        // overwritten, and the running config is left as it is. Recovery skips
+        // reconciliation because its defaults are not a snapshot of that file.
         const save_outcome = win32_settings.saveReloadOutcome(blk: {
             self.app.settingsReconcileDisk(&pending, &original, false) catch |err| break :blk err;
             break :blk self.app.settingsSaveAndReload(&pending, &original);
@@ -15448,8 +15487,10 @@ const Host = struct {
                 // Roll back without another allocation: `original` is already
                 // an owned deep clone of the pre-preview baseline. Transfer it
                 // into the runtime config and suppress the local deferred deinit.
-                self.replaceRuntimeConfigFromPalette(original);
-                original_owned = false;
+                if (!self.app.safe_mode) {
+                    self.replaceRuntimeConfigFromPalette(original);
+                    original_owned = false;
+                }
                 self.abortPaletteAction(paletteThemeSaveFailureMessage(err));
                 return;
             },
@@ -15462,11 +15503,19 @@ const Host = struct {
                 .action_completed,
                 if (saved_but_masked)
                     "Theme saved; a later config layer masks it"
+                else if (self.app.safe_mode)
+                    "Theme saved; restart noctty to apply it"
                 else
                     "Theme applied",
             );
         }
         self.hideOverlay();
+        if (self.app.safe_mode) {
+            runUiActionOrLog(
+                "palette recovery theme banner failed",
+                self.setBanner(.info, "Theme saved; restart noctty to apply it."),
+            );
+        }
         if (saved_but_masked) {
             log.warn("palette theme saved but masked by a later config layer theme={s}", .{theme_name});
             runUiActionOrLog(
@@ -17159,6 +17208,10 @@ const Host = struct {
             _ = try self.setSelectedProfileIndex(index);
             return true;
         }
+        if (self.app.defaultShellProfileIndex(profiles)) |index| {
+            _ = try self.setSelectedProfileIndex(index);
+            return true;
+        }
         if (self.selected_profile >= profiles.len) self.selected_profile = 0;
         _ = try self.setSelectedProfileIndex(self.selected_profile);
         return true;
@@ -17184,6 +17237,10 @@ const Host = struct {
             self.app.launcher_profile_hint,
             self.selected_profile,
         )) |index| {
+            _ = try self.setSelectedProfileIndex(index);
+            return;
+        }
+        if (self.app.defaultShellProfileIndex(profiles)) |index| {
             _ = try self.setSelectedProfileIndex(index);
             return;
         }
@@ -26694,6 +26751,7 @@ fn settingsDeferUiaDisconnectThunk(
 }
 fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const u8) void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    const saved_title = if (app.safe_mode) "Settings saved; restart noctty to apply them" else title;
     // Always show local chrome feedback for the Save button, even
     // when system/reload notifications are disabled.
     const alloc = app.core_app.alloc;
@@ -26703,7 +26761,7 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
     // raised: the Settings status line already says the save went through.
     if (app.config_problems.count() > 0 and app.showConfigProblemsBanner()) return;
     const banner_text = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
-        title,
+        saved_title,
         if (body.len > 0) ": " else "",
         body,
     }) catch null;
@@ -26728,7 +26786,7 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
     // WinRT notification strings must be sentinel-terminated. On
     // allocation failure, keep any banner already shown and skip the
     // system path.
-    const title_z = alloc.dupeZ(u8, title) catch return;
+    const title_z = alloc.dupeZ(u8, saved_title) catch return;
     defer alloc.free(title_z);
     const body_z = alloc.dupeZ(u8, body) catch return;
     defer alloc.free(body_z);
@@ -53119,6 +53177,45 @@ test "win32 palette theme preview can restore original config clone" {
     var restored = try original.clone(std.testing.allocator);
     defer restored.deinit();
     try std.testing.expectEqualStrings("Original Theme", restored.theme.?.light);
+}
+
+test "win32 safe mode theme selection and acceptance preserve recovery" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{ .core_app = &core, .app = &app, .hosts = &.{.{ .storage = &host }} });
+    defer session.deinit();
+    app.safe_mode = true;
+    try app.config.useWindowsRecoveryCommand();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config", .data = "command = pwsh.exe\n" });
+    const target = try tmp.dir.realpathAlloc(alloc, "config");
+    defer alloc.free(target);
+    // A trap for accidental user-config loading, without touching a profile
+    // or an arbitrary drive: this owned file cannot be a cwd directory.
+    app.startup_cwd = target;
+    defer app.startup_cwd = null;
+    app.cli_config_override_path = target;
+    defer app.cli_config_override_path = null;
+    const command = app.config.command.?.direct;
+    const revision = app.config_revision;
+    try host.previewPaletteTheme("0x96f");
+    try std.testing.expect(host.palette_theme_preview_original == null);
+    try host.commitPaletteTheme("0x96f");
+    // No config swap, including acceptance's catalog detachment, is allowed.
+    try std.testing.expectEqual(revision, app.config_revision);
+    try std.testing.expect(command.ptr == app.config.command.?.direct.ptr);
+    try std.testing.expectEqualStrings("/D", app.config.command.?.direct[1]);
+    try std.testing.expect(app.config.theme == null);
+    try std.testing.expectEqualStrings("Theme saved; restart noctty to apply it.", host.banner_text.?);
+    const saved = try tmp.dir.readFileAlloc(alloc, "config", 4096);
+    defer alloc.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "theme = 0x96f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "command = pwsh.exe") != null);
 }
 
 test "win32 palette theme commit mutates pending without losing rollback source" {

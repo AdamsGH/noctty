@@ -82,7 +82,8 @@ pins, are in [verify-release.md](verify-release.md).
 noctty creates `%LOCALAPPDATA%\noctty\` and writes a config template to
 `%LOCALAPPDATA%\noctty\config.ghostty`. In portable mode it uses
 `config.ghostty` beside `noctty.exe` instead, and the `%LOCALAPPDATA%` copy is
-ignored. It picks a default shell for you; see [Shell](#shell) to change it.
+ignored. The first tab runs PowerShell 7 if it is installed, else Windows
+PowerShell, else Command Prompt; see [Shell](#shell) to change it.
 
 ## Font and theme
 
@@ -171,7 +172,10 @@ keybind = ctrl+shift+r=reload_config
 ## Shell
 
 noctty detects PowerShell, cmd, Git Bash, and WSL distributions and lists them
-in the profile picker. To pin one as the default:
+in the profile picker. Without a `command`, a new tab runs `pwsh.exe` (PowerShell
+7) when it is on `PATH`, otherwise Windows PowerShell, otherwise Command Prompt.
+`noctty --safe-mode` always starts `cmd.exe /D`, which loads no PowerShell
+profile and skips cmd's `AutoRun` command. To pin a shell as the default:
 
 ```ini
 command = pwsh.exe

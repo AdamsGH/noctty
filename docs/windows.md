@@ -250,6 +250,45 @@ new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
 literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
 relative PATH entries such as `.`, still select programs relative to the pane.
 
+With `command` unset, a new tab runs the first of these that is found:
+
+1. `pwsh.exe` (PowerShell 7+) on `PATH`.
+2. Windows PowerShell, from the Windows system directory.
+3. `cmd.exe`, from the Windows system directory.
+
+WSL is never part of this order. The lookup only reads filesystem metadata and
+launches nothing. It skips relative `PATH` entries, network shares, device paths,
+mapped network drives, removable/optical media and folder links, including links higher up in a `PATH`
+entry. The kernel rejects reparse traversal before reading a target, so an
+unchecked folder link cannot contact a share during detection. A `pwsh.exe` that
+is a Microsoft Store App Execution Alias counts only while the file it points
+at exists; an alias left behind by an uninstalled package is passed over, and
+so is a directory or a symlink named `pwsh.exe`. Windows PowerShell and
+`cmd.exe` come from the system directory rather than `PATH`, so an earlier
+`PATH` entry cannot replace them. The profile picker finds `pwsh.exe` with the
+same `PATH` search and takes those two shells from the same directory, so it
+lists the executable a new tab runs. `noctty --safe-mode` always starts
+`cmd.exe /D`: recovery must work when the user's PowerShell profile is what
+broke, and Command Prompt loads no profile (`/D` also skips the `AutoRun`
+command that a registry value or Clink can hang there). The profile
+picker, its dropdown check mark and a right or middle click on the new-tab
+button start on the profile this default runs; a `command` you set does not
+move that choice.
+
+Discovery also skips drive aliases that map to a folder, such as `subst` drives.
+In safe mode, right or middle click deliberately opens the plain Command Prompt
+profile, whose arguments do not include `/D`; the first tab and plain new-tab
+button retain the recovery command.
+
+These discovery restrictions do not change explicit commands: paths through
+local junctions (such as Scoop's `current` directory) still work when configured.
+In safe mode, reloading or saving Settings keeps recovery active until restart;
+a saved config repair takes effect at that restart. Theme picks in the command
+palette are saved for restart too, without previewing or applying user config.
+Settings still displays the recovery defaults after saving; restart to see the
+repaired file's values. Recovery saves patch the edited keys without loading
+the file for conflict reconciliation.
+
 The profile picker detects:
 
 - PowerShell 7+ (`pwsh.exe`)

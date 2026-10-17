@@ -1178,6 +1178,14 @@ palette: Palette = .{},
 ///
 ///   * `passwd` entry (user information)
 ///
+/// On Windows the `SHELL` variable and `passwd` do not apply. The default is
+/// PowerShell 7 (`pwsh.exe`) when it is found on `PATH`, else Windows
+/// PowerShell, else Command Prompt (`cmd.exe`). WSL is never the default,
+/// because `wsl.exe --status` can report a healthy installation when starting
+/// a session would still fail; use `command = wsl.exe` to choose it. A launch
+/// with `--safe-mode` always starts `cmd.exe /D`: no PowerShell profile and no
+/// `AutoRun` command can get in the way of recovery.
+///
 /// This can contain additional arguments to run the command with. If additional
 /// arguments are provided, the command will be executed using `/bin/sh -c`
 /// to offload shell argument expansion.
@@ -4840,7 +4848,8 @@ pub fn finalize(self: *Config) !void {
                 log.info("shell src=config value={}", .{cmd})
             else shell_env: {
                 // Windows shell resolution is handled explicitly below so that
-                // `command = null` consistently follows our WSL-first order.
+                // an unset `command` consistently follows pwsh, then Windows
+                // PowerShell, then cmd.exe (never WSL).
                 if (builtin.os.tag == .windows) break :shell_env;
 
                 // If we were launched from the desktop, our SHELL env var
@@ -4977,8 +4986,20 @@ pub fn finalize(self: *Config) !void {
 /// Resolve the automatic Windows command without hiding whether it was explicit.
 pub fn resolveWindowsDefaultCommand(self: *Config) !void {
     if (self.command != null) return;
-    const cmd = try windows_shell.previewCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-preview value={}", .{cmd});
+    const cmd = try windows_shell.defaultCommand(self._arena.?.allocator());
+    log.info("default shell src=windows-default value={}", .{cmd});
+    self.command = cmd;
+    self._command_defaulted = true;
+}
+
+/// Give a config with no `command` the one safe mode starts, so a recovery
+/// launch runs neither the user's PowerShell profile nor AutoRun. Call it before
+/// `finalize`, which then has no default to look for: safe mode searches no
+/// `PATH`. The command stays marked automatic. A command already set stays.
+pub fn useWindowsRecoveryCommand(self: *Config) !void {
+    if (self.command != null) return;
+    const cmd = try windows_shell.recoveryCommand(self._arena.?.allocator());
+    log.info("default shell src=windows-recovery value={}", .{cmd});
     self.command = cmd;
     self._command_defaulted = true;
 }
@@ -12045,4 +12066,33 @@ test "compatibility: removed bold-is-bright" {
             cfg.@"bold-color",
         );
     }
+}
+
+test "Windows safe mode swaps only the automatic command for cmd.exe" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // With no command, recovery gives `cmd.exe /D` (no profile, no AutoRun),
+    // marked automatic, before `finalize` has anything to look up.
+    var automatic = try Config.default(alloc);
+    defer automatic.deinit();
+    try automatic.useWindowsRecoveryCommand();
+    try testing.expect(automatic._command_defaulted);
+    try testing.expect(automatic.command.? == .direct);
+    try testing.expect(std.ascii.eqlIgnoreCase(
+        std.fs.path.basename(automatic.command.?.direct[0]),
+        "cmd.exe",
+    ));
+    try testing.expectEqualStrings("/D", automatic.command.?.direct[1]);
+    // The default lookup leaves a command that is already set alone.
+    try automatic.resolveWindowsDefaultCommand();
+    try testing.expectEqualStrings("/D", automatic.command.?.direct[1]);
+
+    // A command somebody set is not replaced.
+    var explicit = try Config.default(alloc);
+    defer explicit.deinit();
+    explicit.command = .{ .shell = "pwsh.exe" };
+    try explicit.useWindowsRecoveryCommand();
+    try testing.expectEqualStrings("pwsh.exe", explicit.command.?.shell);
 }
