@@ -11,6 +11,27 @@ pub const Section = enum { appearance, terminal, shell, privacy, updates };
 pub const ApplyPolicy = enum { live, new_terminals, restart };
 pub const PreviewEffect = enum { none, theme, opacity };
 pub const Kind = enum { integer, number, padding, boolean, choice, blur, notifications, font_families, theme, command };
+/// Platform availability drives native enablement and all reason labels.
+pub const Support = enum {
+    available,
+    unsupported_on_windows,
+
+    pub fn paletteSubtitle(self: Support) []const u8 {
+        return switch (self) {
+            .available => "Setting",
+            .unsupported_on_windows => "Setting (" ++ windows_reason ++ ")",
+        };
+    }
+
+    fn name(comptime self: Support, comptime text: []const u8) []const u8 {
+        return switch (self) {
+            .available => text,
+            .unsupported_on_windows => text ++ " (" ++ windows_reason ++ ")",
+        };
+    }
+
+    const windows_reason = "not supported on Windows";
+};
 pub const DefaultDisplay = enum { value, inherited, automatic };
 pub const Validation = union(enum) {
     typed,
@@ -110,7 +131,7 @@ pub const Descriptor = struct {
     section: Section,
     kind: Kind,
     apply: ApplyPolicy,
-    supported: bool = true,
+    support: Support = .available,
     validation: Validation = .typed,
     keywords: []const u8,
     default_display: DefaultDisplay = .value,
@@ -118,6 +139,15 @@ pub const Descriptor = struct {
     /// Historical transaction preview into app.config, including fields with
     /// no consumer on an open surface. Do not mistake this for ApplyPolicy.
     preview_draft: bool = false,
+
+    pub fn nativeNames(comptime self: Descriptor) ?NativeNames {
+        const names = self.native orelse return null;
+        return .{
+            .form_label = if (names.form_label) |text| self.support.name(text) else null,
+            .caption = if (names.caption) |text| self.support.name(text) else null,
+            .accessible_name = self.support.name(names.accessible_name),
+        };
+    }
 
     pub fn Value(comptime self: Descriptor) type {
         return Config.Value(self.key);
@@ -172,11 +202,11 @@ pub const descriptors = [_]Descriptor{
     .{ .key = .@"clipboard-read", .native = .{ .form_label = "OSC 52 clipboard read requests", .accessible_name = "OSC 52 clipboard read requests" }, .field = .clipboard_read, .label = "Clipboard read requests (OSC 52)", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-read osc 52 paste", .preview = .none, .preview_draft = false },
     .{ .key = .@"clipboard-write", .native = .{ .form_label = "OSC 52 clipboard write requests", .accessible_name = "OSC 52 clipboard write requests" }, .field = .clipboard_write, .label = "Clipboard write requests (OSC 52)", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-write osc 52 copy", .preview = .none, .preview_draft = false },
     .{ .key = .@"link-url", .native = .{ .form_label = "Clickable URL opening", .accessible_name = "Clickable URL opening" }, .field = .link_url, .label = "Clickable URL opening", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration link-url url hyperlink", .preview = .none, .preview_draft = false },
-    .{ .key = .@"link-previews", .native = .{ .form_label = "Link preview popups", .accessible_name = "Link preview popups" }, .field = .link_previews, .label = "Link preview popups", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration link-previews url hyperlink tooltip", .preview = .none, .preview_draft = false },
+    .{ .key = .@"link-previews", .native = .{ .form_label = "Link preview popups", .accessible_name = "Link preview popups" }, .support = .unsupported_on_windows, .field = .link_previews, .label = "Link preview popups", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration link-previews url hyperlink tooltip", .preview = .none, .preview_draft = false },
     .{ .key = .@"window-theme", .native = .{ .form_label = "Window theme", .accessible_name = "Window theme" }, .field = .window_theme, .label = "Window theme", .section = .appearance, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration window-theme dark light mode", .preview = .theme, .preview_draft = true },
     .{ .key = .@"shell-integration", .native = .{ .form_label = "Shell integration", .accessible_name = "Shell integration" }, .field = .shell_integration, .label = "Shell integration", .section = .shell, .kind = .choice, .apply = .new_terminals, .validation = .typed, .keywords = "settings preferences configuration shell-integration powershell bash prompt", .preview = .none, .preview_draft = false },
     .{ .key = .@"cursor-style", .native = .{ .form_label = "Cursor style", .accessible_name = "Cursor style" }, .field = .cursor_style, .label = "Cursor style", .section = .appearance, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration cursor-style caret block bar underline", .preview = .none, .preview_draft = true },
-    .{ .key = .@"background-blur", .native = .{ .caption = "Background blur (not supported on Windows)", .accessible_name = "Background blur" }, .field = .background_blur, .label = "Background blur", .section = .appearance, .kind = .blur, .apply = .live, .supported = false, .validation = .typed, .keywords = "settings preferences configuration background-blur", .preview = .none, .preview_draft = true },
+    .{ .key = .@"background-blur", .native = .{ .caption = "Background blur", .accessible_name = "Background blur" }, .field = .background_blur, .label = "Background blur", .section = .appearance, .kind = .blur, .apply = .live, .support = .unsupported_on_windows, .validation = .typed, .keywords = "settings preferences configuration background-blur", .preview = .none, .preview_draft = true },
     .{ .key = .@"window-padding-balance", .native = .{ .form_label = "Window padding balance", .accessible_name = "Window padding balance" }, .field = .padding_balance, .label = "Window padding balance", .section = .appearance, .kind = .choice, .apply = .new_terminals, .validation = .typed, .keywords = "settings preferences configuration window-padding-balance margin", .preview = .none, .preview_draft = true },
     .{ .key = .@"auto-update", .native = .{ .form_label = "Auto-update mode", .accessible_name = "Auto-update mode" }, .field = .auto_update, .label = "Auto-update mode", .section = .updates, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration auto-update upgrade", .preview = .none, .preview_draft = false },
     .{ .key = .@"auto-update-channel", .native = .{ .form_label = "Auto-update channel", .accessible_name = "Auto-update channel" }, .field = .auto_update_channel, .label = "Auto-update channel", .section = .updates, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration auto-update-channel stable tip release", .preview = .none, .preview_draft = false },
@@ -241,6 +271,7 @@ pub fn assertCoverage(comptime owned_keys: anytype) void {
         if (std.mem.indexOf(u8, spec.keywords, @tagName(spec.key)) == null) @compileError("Settings keywords must contain the config key");
         if (spec.kind != .notifications and spec.native == null) @compileError("Missing native Settings names");
         if (spec.field != null and spec.projections.len != 0) @compileError("Scalar Settings descriptor also has projections");
+        if (spec.support != .available and spec.field == null) @compileError("Unsupported Settings editors require a scalar field destination");
         for (spec.projections) |part| {
             if (@FieldType(SettingValue, @tagName(part.field)) != @FieldType(T, part.member)) @compileError("Settings projection type differs from Config");
             if (part.label.len == 0 or part.native.accessible_name.len == 0 or std.mem.indexOf(u8, part.keywords, @tagName(spec.key)) == null) @compileError("Missing Settings projection names");
@@ -609,7 +640,8 @@ test "settings model separates saved apply timing from edit previews and Windows
     for (descriptors) |spec| {
         const new_terminal = spec.key == .@"scrollback-limit" or spec.key == .command or spec.key == .@"shell-integration" or spec.key == .@"window-padding-x" or spec.key == .@"window-padding-y" or spec.key == .@"window-padding-balance";
         try std.testing.expectEqual(if (new_terminal) ApplyPolicy.new_terminals else ApplyPolicy.live, spec.apply);
-        try std.testing.expectEqual(spec.key != .@"background-blur", spec.supported);
+        const unavailable = spec.key == .@"background-blur" or spec.key == .@"link-previews";
+        try std.testing.expectEqual(if (unavailable) Support.unsupported_on_windows else Support.available, spec.support);
     }
     try std.testing.expect(descriptor(.font_size).preview_draft);
     try std.testing.expectEqual(PreviewEffect.none, descriptor(.font_size).preview);

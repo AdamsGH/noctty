@@ -415,7 +415,7 @@ const owned_setting_field_count = std.enums.values(OwnedSettingField).len;
 
 test "settings field model covers each Settings-owned Config key exactly once" {
     inline for (field_model.descriptors) |spec| {
-        if (spec.native) |names| {
+        if (spec.nativeNames()) |names| {
             try expectNativeFieldNames(names, spec.kind, spec.section);
             if (names.form_label) |label| {
                 if (std.mem.indexOf(u8, label, "new terminals") != null) {
@@ -449,8 +449,8 @@ fn expectNativeFieldNames(names: field_model.NativeNames, kind: field_model.Kind
     }
     const index = control_index orelse return error.TestExpectedEqual;
     var model_uses: usize = 0;
-    for (field_model.descriptors) |spec| {
-        if (spec.native) |other| {
+    inline for (field_model.descriptors) |spec| {
+        if (spec.nativeNames()) |other| {
             if (std.mem.eql(u8, other.accessible_name, names.accessible_name)) model_uses += 1;
         }
         for (spec.projections) |part| {
@@ -642,7 +642,7 @@ pub fn paletteDescriptor(field: SettingField) palette_catalog.Descriptor {
         .item = .{
             .id = palette_catalog.stableStringId(.setting, key),
             .title = field.label(),
-            .subtitle = if (field_model.descriptor(field).supported) "Setting" else "Setting (not supported on Windows)",
+            .subtitle = field_model.descriptor(field).support.paletteSubtitle(),
             .keywords = field.paletteKeywords(),
         },
         .payload = .{ .setting = key },
@@ -913,8 +913,8 @@ const settings_text_count = 5 + settings_label_specs.len;
 /// Positions in `SettingsWindow.textHwnd`.
 const text_status_index = 2;
 const text_close_prompt_index = 3;
-const background_blur_label = "Background blur (not supported on Windows)";
-const link_previews_label = "Link preview popups (not supported on Windows)";
+const background_blur_label = field_model.descriptor(.background_blur).nativeNames().?.caption.?;
+const link_previews_label = field_model.descriptor(.link_previews).nativeNames().?.form_label.?;
 /// A file-level constant: `open` already spends its comptime branch quota on
 /// the other labels, and one more literal there fails the build.
 const accent_follow_caption = "Follow Windows accent color";
@@ -5042,8 +5042,6 @@ pub const SettingsWindow = struct {
             settings_combo_popup_height,
             &link_previews_labels,
         );
-        // The core emits hover actions, but Windows has no preview tooltip.
-        if (self.combo_link_previews) |combo| _ = EnableWindow(combo, 0);
 
         self.combo_window_theme = makeCombo(
             form,
@@ -5085,7 +5083,6 @@ pub const SettingsWindow = struct {
             CHK_BG_BLUR,
             std.unicode.utf8ToUtf16LeStringLiteral(background_blur_label),
         );
-        if (self.chk_bg_blur) |chk| _ = sys.EnableWindow(chk, 0);
 
         self.combo_pad_balance = makeCombo(
             form,
@@ -5110,6 +5107,16 @@ pub const SettingsWindow = struct {
             settings_combo_popup_height,
             &auto_update_channel_labels,
         );
+
+        // Support is descriptor data; retain values while disabling unsupported
+        // editors before tab order and accessibility providers are initialized.
+        inline for (field_model.descriptors) |spec| {
+            if (spec.support != .available) {
+                if (spec.field) |field| {
+                    if (self.settingDestination(field).hwnd) |control| _ = sys.EnableWindow(control, 0);
+                }
+            }
+        }
 
         // Painted field labels keep the native dark visual treatment, while
         // MSAA annotations give the existing EDIT/COMBO HWNDs stable names
@@ -9590,6 +9597,28 @@ test "settings background blur is shown but cannot be changed" {
             try std.testing.expect(std.mem.indexOf(u8, background_blur_label, "not supported on Windows") != null);
             // The section blurb no longer promises it.
             try std.testing.expect(std.mem.indexOf(u8, Section.appearance.placeholderText(), "blur") == null);
+        }
+    }.body);
+}
+
+test "settings descriptor support matches every native editor enabled state" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            inline for (field_model.descriptors) |spec| {
+                const expected_enabled = spec.support == .available;
+                if (spec.field) |field| {
+                    try std.testing.expectEqual(expected_enabled, sys.IsWindowEnabled(settings.settingDestination(field).hwnd.?) != 0);
+                }
+                inline for (spec.projections) |part| {
+                    try std.testing.expectEqual(expected_enabled, sys.IsWindowEnabled(settings.settingDestination(part.field).hwnd.?) != 0);
+                }
+            }
+            for ([_]?HWND{ settings.edit_font_family, settings.edit_theme, settings.edit_command }) |control| {
+                try std.testing.expect(sys.IsWindowEnabled(control.?) != 0);
+            }
         }
     }.body);
 }
