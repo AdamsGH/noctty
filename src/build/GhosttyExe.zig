@@ -72,7 +72,6 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 .use_llvm = true,
             });
             command.subsystem = .Console;
-            _ = try deps.add(command);
             command_exe = command;
             command_install_step = b.addInstallBinFile(command.getEmittedBin(), "noctty.com");
             // The compiled name is noctty-command, so noctty.com's CodeView

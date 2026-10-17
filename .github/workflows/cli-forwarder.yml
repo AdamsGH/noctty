@@ -1,0 +1,117 @@
+name: Windows CLI Forwarder
+
+on:
+  push:
+    branches: [main]
+  # Not a required check: a PR that touches none of the build, packaging or
+  # resource inputs (docs, site, other workflows) skips the two ReleaseFast builds.
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'pkg/**'
+      - 'vendor/**'
+      - 'include/**'
+      - 'build.zig'
+      - 'build.zig.zon*'
+      - 'dist/windows/**'
+      - 'scripts/*conpty*.ps1'
+      - 'test/windows/cli-com-*'
+      - '.github/workflows/cli-forwarder.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: CLI forwarder (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2025
+          - arch: arm64
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      - name: Configure Zig package cache
+        shell: pwsh
+        run: '"ZIG_GLOBAL_CACHE_DIR=$env:GITHUB_WORKSPACE\.zig-global-cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+
+      - name: Cache Zig dependency packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}\.zig-global-cache/p
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-0.15.2-${{ github.job }}-packages-v1-${{ hashFiles('build.zig.zon', 'pkg/**/build.zig.zon') }}
+
+      - name: Isolate the measurement build's Shell identity
+        shell: pwsh
+        run: |
+          # CI-only working-tree patch of the checkout; it must never be committed.
+          $path = Join-Path $PWD 'src/apprt/win32_aumid.zig'
+          $text = [IO.File]::ReadAllText($path)
+          if ($text.Contains('MEASUREMENT ONLY') -or $text.Contains('noctty.measure')) { throw 'The AUMID measurement patch is already in the committed source.' }
+          $literal = '"io.github.amanthanvi.noctty"'
+          # aumid_wide, aumid_utf8 and the aumid_utf8 unit test; a new literal needs a decision here.
+          $count = [regex]::Matches($text, [regex]::Escape($literal)).Count
+          if ($count -ne 3) { throw "AUMID literal count changed: expected 3, found $count." }
+          $text = $text.Replace($literal, '"io.github.amanthanvi.noctty.measure"')
+          $signature = 'pub fn registerAumidDisplayName\(alloc: std\.mem\.Allocator, portable: bool\) void \{'
+          if ([regex]::Matches($text, $signature).Count -ne 1) { throw 'AUMID isolation signature changed.' }
+          $text = [regex]::Replace($text, $signature, '$0' + "`n    if (true) return; // MEASUREMENT ONLY")
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+
+      - name: Build native binaries
+        shell: pwsh
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcustom-shaders=true -Dcpu=baseline --summary all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $forwarderBytes = (Get-Item ./zig-out/bin/noctty.com).Length
+          if ($forwarderBytes -gt 131072) { throw "Console forwarder exceeds 128 KiB: $forwarderBytes bytes." }
+          New-Item -ItemType File -Path ./zig-out/bin/noctty.portable | Out-Null
+
+      - name: Build the windowless desktop fixture
+        shell: pwsh
+        run: |
+          zig build-exe test/windows/cli-com-fixture.zig -O ReleaseFast -lc -luser32 '-femit-bin=zig-out/cli-com-fixture.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Hidden desktop CLI forwarding contracts
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./test/windows/cli-com-forwarder.ps1 -BinDir ./zig-out/bin -OutputDir ./zig-out/cli-forwarder-evidence -DesktopFixture ./zig-out/cli-com-fixture.exe -ThinForwarder
+
+      - name: Only the AUMID measurement patch differs from the checkout
+        if: always()
+        shell: pwsh
+        run: |
+          $changed = @(git status --porcelain --untracked-files=no)
+          if ($changed.Count -ne 1 -or $changed[0] -notmatch 'src/apprt/win32_aumid\.zig$') { throw "Unexpected source changes: $($changed -join '; ')" }
+
+      - name: Upload forwarding evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: cli-forwarder-${{ matrix.arch }}-${{ github.run_id }}
+          path: |
+            zig-out/cli-forwarder-evidence/**/*.json
+            zig-out/cli-forwarder-evidence/**/*.txt
+          retention-days: 7
+          if-no-files-found: warn

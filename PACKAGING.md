@@ -76,6 +76,12 @@ binary users run, and the images are within about 2 KB of a stripped build.
 They are not byte-identical: LLVM generates a few dozen instructions
 differently when it keeps debug info (99 more in a 3.1 million instruction
 `noctty.exe`).
+The `noctty.com` measurements above describe the former full console runtime.
+It is now a native forwarder (38,400 bytes in the measured x64 ReleaseFast
+build) that starts its sibling `noctty.exe`; it does not link the application's
+runtime dependencies or `process_shared.zig` panic handler. Its entrypoint uses
+`std.debug.no_panic`. The installed filename and `noctty-command.pdb` name stay
+the same, and CI caps the forwarder at 128 KiB to catch an accidental runtime link.
 The PDBs stay out of the portable ZIP and the installer (the packager stages
 an explicit file list). `scripts/symbols-verification.ps1` reads each shipped
 PE's CodeView record and the PDB's info stream and requires the same GUID and
