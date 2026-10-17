@@ -11,15 +11,12 @@ const sys = @import("sys.zig");
 
 const BOOL = win32_types.BOOL;
 const DWORD = win32_types.DWORD;
-const HMODULE = win32_types.HMODULE;
 const HWND = win32_types.HWND;
 const LPCWSTR = win32_types.LPCWSTR;
 const UINT = win32_types.UINT;
 
 const log = std.log.scoped(.win32);
 const windows = std.os.windows;
-
-pub var opengl32_module: HMODULE = null;
 
 pub const StartupLoaderErrorDialogSuppression = struct {
     previous_mode: DWORD = 0,

@@ -515,7 +515,6 @@ const titlebar_glyph_close = std.unicode.utf8ToUtf16LeStringLiteral("\u{E8BB}");
 const titlebar_glyph_new_tab = std.unicode.utf8ToUtf16LeStringLiteral("\u{E710}");
 const titlebar_glyph_dropdown = std.unicode.utf8ToUtf16LeStringLiteral("\u{E70D}");
 const host_banner_inspector_inactive = labels.host_banner_inspector_inactive;
-const opengl32_name: [*:0]const u8 = "opengl32.dll";
 const shell_open: LPCWSTR = std.unicode.utf8ToUtf16LeStringLiteral("open");
 const shell_runas: LPCWSTR = std.unicode.utf8ToUtf16LeStringLiteral("runas");
 
@@ -1141,15 +1140,13 @@ pub fn getProcAddress(name: [*:0]const u8) callconv(.c) ?*const anyopaque {
         if (raw > 3 and raw != std.math.maxInt(usize)) return ptr;
     }
 
-    if (gl_startup.opengl32_module == null) {
-        gl_startup.opengl32_module = sys.LoadLibraryA(opengl32_name);
-        if (gl_startup.opengl32_module == null) {
-            recordOpenGLStartupWin32Failure(.load_opengl32, windows.kernel32.GetLastError());
-        }
+    const wgl = @import("win32/wgl.zig");
+    const ptr = wgl.coreProcAddress(name);
+    const load_error = wgl.lastLoadError();
+    if (load_error != .SUCCESS) {
+        recordOpenGLStartupWin32Failure(.load_opengl32, load_error);
     }
-
-    const module = gl_startup.opengl32_module orelse return null;
-    return sys.GetProcAddress(module, name);
+    return ptr;
 }
 
 const UpdateNotice = struct {
