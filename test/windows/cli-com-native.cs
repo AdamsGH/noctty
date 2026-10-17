@@ -175,11 +175,13 @@ public static class ComCliNative {
     // flags always include CREATE_SUSPENDED; console callers deliberately inherit
     // the CREATE_NO_WINDOW driver's private console. Never create a visible one.
     // show is the launcher's wShowWindow (0 SW_HIDE, 1 SW_SHOWNORMAL).
-    // nullCommandLine passes lpCommandLine NULL (an empty raw line).
+    // rawCommandLine passes the supplied text in a non-null mutable buffer,
+    // without adding argv[0]. Windows substitutes argv[0] for both NULL and an
+    // empty buffer; a whitespace-only buffer reaches the wrapper unchanged.
     public static Child Launch(string image,string raw,string cwd,string desktop,string mode,string input,string output,string error,uint flags) {
         return Launch(image,raw,cwd,desktop,mode,input,output,error,flags,0,false);
     }
-    public static Child Launch(string image,string raw,string cwd,string desktop,string mode,string input,string output,string error,uint flags,int show,bool nullCommandLine) {
+    public static Child Launch(string image,string raw,string cwd,string desktop,string mode,string input,string output,string error,uint flags,int show,bool rawCommandLine) {
         if(String.IsNullOrEmpty(desktop) || !desktop.StartsWith("WinSta0\\noctty-pkg74-",StringComparison.Ordinal)) throw new Exception("An explicit isolated hidden desktop is required");
         IntPtr stdin=IntPtr.Zero,stdout=IntPtr.Zero,stderr=IntPtr.Zero,outRead=IntPtr.Zero,errRead=IntPtr.Zero;
         var pi=new ProcessInfo(); bool created=false; IntPtr job=IntPtr.Zero;
@@ -196,7 +198,7 @@ public static class ComCliNative {
                 } else { stdout=FileHandle(output,false); stderr=FileHandle(error,false); }
                 si.flags|=0x100; si.input=stdin; si.output=stdout; si.error=stderr;
             }
-            var command=nullCommandLine?null:new StringBuilder(Quote(image)+" "+raw);
+            var command=new StringBuilder(rawCommandLine?raw:Quote(image)+" "+raw);
             if(!CreateProcessW(image,command,IntPtr.Zero,IntPtr.Zero,mode!="none",flags|4,IntPtr.Zero,cwd,ref si,out pi)) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateProcessW failed: "+Path.GetFileName(image));
             created=true;
             job=CreateJobObjectW(IntPtr.Zero,IntPtr.Zero); Check(job!=IntPtr.Zero);

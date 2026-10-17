@@ -254,7 +254,7 @@ function Initialize-FixtureBin {
     Copy-Item -LiteralPath $DesktopFixture -Destination $fixtureExe
     [IO.File]::WriteAllText((Join-Path $fixtureBin 'noctty.portable'), '')
 }
-function Start-Fixture([string] $Raw, [hashtable] $Knobs = @{}, [string] $Mode = 'files', [string] $InputPath, [switch] $NullCommandLine) {
+function Start-Fixture([string] $Raw, [hashtable] $Knobs = @{}, [string] $Mode = 'files', [string] $InputPath, [switch] $RawCommandLine) {
     $script:fixtureIndex++
     $receiptPath = Join-Path $OutputDir "fixture-$script:fixtureIndex.json"
     $variables = @{ NOCTTY_COM_FIXTURE_RECEIPT = $receiptPath; NOCTTY_COM_FIXTURE_HOLD_MS = '0' }
@@ -263,7 +263,7 @@ function Start-Fixture([string] $Raw, [hashtable] $Knobs = @{}, [string] $Mode =
     foreach ($key in $variables.Keys) { $previous[$key] = [Environment]::GetEnvironmentVariable($key); [Environment]::SetEnvironmentVariable($key, $variables[$key]) }
     try {
         $child = [ComCliNative]::Launch($fixtureCom, $Raw, $fixtureBin, $desktopPath, $Mode, $InputPath,
-            (Join-Path $OutputDir "fixture-$script:fixtureIndex.stdout.txt"), (Join-Path $OutputDir "fixture-$script:fixtureIndex.stderr.txt"), 0x08000000, 0, $NullCommandLine.IsPresent)
+            (Join-Path $OutputDir "fixture-$script:fixtureIndex.stdout.txt"), (Join-Path $OutputDir "fixture-$script:fixtureIndex.stderr.txt"), 0x08000000, 0, $RawCommandLine.IsPresent)
     } finally { foreach ($key in $previous.Keys) { [Environment]::SetEnvironmentVariable($key, $previous[$key]) } }
     return @{ Child = $child; Receipt = $receiptPath; Index = $script:fixtureIndex }
 }
@@ -456,11 +456,17 @@ try {
                     Assert-Condition (-not $fixtureChild.Exited) 'Pipes closed only because the no-action child exited.'
                 } finally { $fixtureChild.Dispose() }
             } finally { $run.Child.Dispose() }
-            $run = Start-Fixture '' @{ HOLD_MS = 3000 } 'files' -NullCommandLine
-            try {
-                Assert-Condition ($run.Child.Wait(2000) -and $run.Child.ExitCode -eq 0) 'Empty-command-line launcher did not return promptly.'
-                Assert-Condition (-not [string]::IsNullOrWhiteSpace((Read-FixtureReceipt $run).command_line)) 'Empty command line reached noctty.exe without an argv[0].'
-            } finally { $run.Child.Dispose() }
+            foreach ($raw in @('', " `t ")) {
+                $run = Start-Fixture $raw @{ HOLD_MS = 3000 } 'files' -RawCommandLine
+                try {
+                    Assert-Condition ($run.Child.Wait(2000) -and $run.Child.ExitCode -eq 0) 'Blank-command-line launcher did not return promptly.'
+                    # Windows normalizes a non-null empty buffer to the launcher
+                    # path. Whitespace survives CreateProcessW and exercises the
+                    # wrapper's blank-line fallback to the quoted sibling path.
+                    $expected = if ($raw.Length -eq 0) { $fixtureCom } else { $fixtureExe }
+                    Assert-Condition ((Read-FixtureReceipt $run).command_line -ceq [ComCliNative]::Quote($expected)) 'Blank command line did not become the exact quoted executable path.'
+                } finally { $run.Child.Dispose() }
+            }
         }
     }
     for ($iteration = 0; $iteration -lt $VersionIterations; $iteration++) {
