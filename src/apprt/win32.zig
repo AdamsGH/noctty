@@ -13375,6 +13375,8 @@ const Host = struct {
     tab_drag_start_x: i32 = 0,
     tab_drag_start_y: i32 = 0,
     tab_drag_active: bool = false,
+    tab_wheel_steps: win32_input.WheelSteps = .{},
+    tab_wheel_horizontal: bool = false,
     tab_drop_operation: win32_tab_drop_zones.Operation = .none,
     tab_drop_target_surface: ?*Surface = null,
     tab_drop_preview_hwnd: ?HWND = null,
@@ -13419,6 +13421,7 @@ const Host = struct {
     /// lower than `palette_max_visible_rows` at large DPI or in short windows.
     palette_list_visible_rows: usize = 0,
     palette_list_scroll: usize = 0,
+    palette_wheel_steps: win32_input.WheelSteps = .{},
     /// Currently-selected row (absolute index into ranked). Enter runs
     /// this entry; click overrides both selection and invocation.
     palette_list_selected: usize = 0,
@@ -14956,6 +14959,7 @@ const Host = struct {
         // invariant alone.
         self.palette_list_ranked_count = @min(ranked.len, self.palette_list_ranked.len);
         self.palette_list_scroll = 0;
+        self.palette_wheel_steps = .{};
         self.palette_list_selected = 0;
 
         const transition = paletteListTransition(
@@ -15018,6 +15022,10 @@ const Host = struct {
         if (next >= self.palette_list_ranked_count) return false;
         const visible_rows = self.palette_list_visible_rows;
         if (visible_rows == 0) return false;
+
+        // Keyboard, pointer selection and UIA begin a new interaction; none
+        // should complete a precision-wheel gesture from before it.
+        self.palette_wheel_steps = .{};
 
         const changed = self.palette_list_selected != next;
         self.palette_list_selected = next;
@@ -15790,19 +15798,27 @@ const Host = struct {
         }
     }
 
-    /// Scroll the visible window by `delta` wheel units (120 = one line).
+    /// Scroll three rows per notch, retaining high-resolution fractions.
     fn scrollPaletteList(self: *Host, delta: i16) void {
+        self.scrollPaletteListAt(delta, sys.GetTickCount64());
+    }
+
+    fn scrollPaletteListAt(self: *Host, delta: i16, now_ms: u64) void {
         const visible_rows = self.palette_list_visible_rows;
-        if (visible_rows == 0) return;
-        if (self.palette_list_ranked_count <= visible_rows) return;
-        const lines_per_notch: i32 = 3;
-        const step: i32 = @intFromFloat(@as(f32, @floatFromInt(delta)) / 120.0 * @as(f32, @floatFromInt(lines_per_notch)));
+        if (visible_rows == 0 or self.palette_list_ranked_count <= visible_rows) {
+            self.palette_wheel_steps = .{};
+            return;
+        }
+        // Chrome has a fixed three-row notch, independent of terminal cell
+        // size and the surface's configured wheel multiplier.
+        const step = self.palette_wheel_steps.add(win32_input.chromeWheelDelta(false, delta, 3), now_ms);
         if (step == 0) return;
         const max_scroll = self.palette_list_ranked_count - visible_rows;
         var next: isize = @as(isize, @intCast(self.palette_list_scroll)) - step;
         if (next < 0) next = 0;
         if (next > @as(isize, @intCast(max_scroll))) next = @intCast(max_scroll);
         const new_scroll: usize = @intCast(next);
+        if (new_scroll == 0 or new_scroll == max_scroll) self.palette_wheel_steps = .{};
         if (new_scroll == self.palette_list_scroll) return;
         self.palette_list_scroll = new_scroll;
         // Clamp the selected row into the visible window. Without this,
@@ -15822,6 +15838,88 @@ const Host = struct {
             self.previewSelectedPaletteTheme();
             self.refreshPalettePresentation();
         }
+    }
+
+    test "chrome pointer palette scroll retains small deltas and resets at bounds" {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        host.palette_list_ranked_count = 20;
+        host.palette_list_visible_rows = 5;
+        host.palette_list_selected = 3;
+        for (0..3) |i| host.scrollPaletteListAt(-10, i);
+        try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
+        host.scrollPaletteListAt(-10, 3);
+        try std.testing.expectEqual(@as(usize, 1), host.palette_list_scroll);
+        try std.testing.expectEqual(@as(usize, 3), host.palette_list_selected);
+        host.scrollPaletteListAt(-120, 4);
+        try std.testing.expectEqual(@as(usize, 4), host.palette_list_scroll);
+        try std.testing.expectEqual(@as(usize, 4), host.palette_list_selected);
+        host.scrollPaletteListAt(120, 5);
+        try std.testing.expectEqual(@as(usize, 1), host.palette_list_scroll);
+        host.scrollPaletteListAt(120, 6);
+        try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+        host.palette_list_ranked_count = 2;
+        host.palette_wheel_steps.remainder = 60;
+        host.scrollPaletteListAt(-10, 7);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+    }
+
+    test "chrome pointer gesture resets after non-wheel palette selection" {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        host.overlay_mode = .command_palette;
+        host.palette_list_ranked_count = 20;
+        host.palette_list_visible_rows = 5;
+        host.palette_list_selected = 5;
+        host.palette_list_scroll = 4;
+        host.palette_wheel_steps.remainder = -90;
+        try std.testing.expect(host.setPaletteListSelection(0));
+        try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+        host.palette_wheel_steps.remainder = -90;
+        try std.testing.expect(host.setPaletteListSelection(3));
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
+    }
+
+    test "chrome pointer gesture resets when palette layout hides the list" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(paletteHideWheelTestBody);
+    }
+
+    fn paletteHideWheelTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host }} });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        // A real native child is enough to exercise the production layout
+        // visibility path; no custom palette class or ranked rows are needed.
+        host.palette_list_hwnd = window.pane;
+        defer host.palette_list_hwnd = null;
+        host.palette_wheel_steps.remainder = 60;
+        var changed = false;
+        _ = host.layoutChromeForRect(window.content, &changed);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
     }
 
     /// BeginPaint/EndPaint over the list child HWND. Each row shows
@@ -16158,7 +16256,9 @@ const Host = struct {
     }
 
     fn tabIndexAtScreenX(self: *Host, screen_x: i32) ?usize {
+        if (!self.shouldShowTabBar()) return null;
         for (self.tabs.items, 0..) |tab, i| {
+            if (!tab.button_placement.visible_known or !tab.button_placement.visible) continue;
             const btn = tab.button_hwnd orelse continue;
             var rect: RECT = undefined;
             if (sys.GetWindowRect(btn, &rect) == 0) continue;
@@ -16166,6 +16266,58 @@ const Host = struct {
             if (screen_x >= rect.left and screen_x < rect.right) return i;
         }
         return null;
+    }
+
+    test "chrome pointer drag ignores hidden buttons with stale rectangles" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(tabDragHiddenButtonTestBody);
+    }
+
+    fn tabDragHiddenButtonTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host },
+                .{ .storage = &surface_b, .host = &host },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = try host.syncTabButtons();
+        // Hidden overflow buttons retain their old rect. Put one under the
+        // visible button so an unfiltered lookup incorrectly returns index 0.
+        for (host.tabs.items, 0..) |*tab, i| {
+            const button = tab.button_hwnd.?;
+            _ = applyChildRect(button, &tab.button_placement, .{
+                .left = 20,
+                .top = 0,
+                .right = 120,
+                .bottom = 32,
+            });
+            _ = applyChildVisibility(button, &tab.button_placement, i == 1);
+        }
+        var rect: RECT = undefined;
+        try std.testing.expect(sys.GetWindowRect(host.tabs.items[1].button_hwnd.?, &rect) != 0);
+        const x = rect.left + 10;
+        try std.testing.expectEqual(@as(?usize, 1), host.tabIndexAtScreenX(x));
+        host.tab_wheel_steps.remainder = 60;
+        app.config.@"window-show-tab-bar" = .never;
+        try host.layout();
+        try std.testing.expectEqual(@as(i32, 0), host.tab_wheel_steps.remainder);
+        try std.testing.expectEqual(@as(?usize, null), host.tabIndexAtScreenX(x));
     }
 
     fn swapTabs(self: *Host, a: usize, b: usize) void {
@@ -17381,6 +17533,17 @@ const Host = struct {
         if (self.tabs.items.len <= 1) return false;
         const index = desiredTabIndex(self.tabs.items.len, self.active_tab, goto) orelse return false;
         return self.activateTabIndex(index);
+    }
+
+    fn scrollTabStrip(self: *Host, horizontal: bool, delta: i16) void {
+        if (horizontal != self.tab_wheel_horizontal) self.tab_wheel_steps = .{};
+        self.tab_wheel_horizontal = horizontal;
+        const normalized = win32_input.chromeWheelDelta(horizontal, delta, 1);
+        const steps = self.tab_wheel_steps.add(normalized, sys.GetTickCount64());
+        // Keep the existing next/previous wrap convention, once per complete
+        // notch rather than once per precision-wheel message.
+        const direction = tabDirectionFromWheelDelta(if (steps > 0) 120 else -120);
+        for (0..@abs(steps)) |_| _ = self.activateTabByDirection(direction);
     }
 
     fn dismissActiveSearch(self: *Host) bool {
@@ -20197,6 +20360,7 @@ const Host = struct {
         self.palette_list_ranked_count = 0;
         self.palette_list_visible_rows = 0;
         self.palette_list_scroll = 0;
+        self.palette_wheel_steps = .{};
         if (self.palette_catalog) |*catalog| catalog.reset();
         self.resetPaletteCatalogConfigOwner();
         self.clearPaletteInstalledThemes();
@@ -23271,6 +23435,7 @@ const Host = struct {
         // and the active tab's accent border over the terminal (#244). Decide
         // the strip's visibility once and gate every child that belongs to it.
         const tab_strip_visible = self.shouldShowTabBar();
+        if (!tab_strip_visible) self.tab_wheel_steps = .{};
         var active_tab_left: ?i32 = null;
         for (self.tabs.items, 0..) |*tab, i| {
             if (tab.button_hwnd) |button_hwnd| {
@@ -23602,6 +23767,7 @@ const Host = struct {
                         paletteListRect(width, list_x, padding, list_y, list_height),
                     ) or changed.*;
                     const show_list = self.palette_list_visible_rows > 0 and has_list_width;
+                    if (!show_list) self.palette_wheel_steps = .{};
                     const list_visibility_changed = applyChildVisibility(
                         list_hwnd,
                         &self.palette_list_placement,
@@ -23615,6 +23781,7 @@ const Host = struct {
                 }
             } else if (self.palette_list_hwnd) |list_hwnd| {
                 self.palette_list_visible_rows = 0;
+                self.palette_wheel_steps = .{};
                 changed.* = applyChildVisibility(
                     list_hwnd,
                     &self.palette_list_placement,
@@ -23678,6 +23845,7 @@ const Host = struct {
             }
             if (self.palette_list_hwnd) |list_hwnd| {
                 self.palette_list_visible_rows = 0;
+                self.palette_wheel_steps = .{};
                 changed.* = applyChildVisibility(
                     list_hwnd,
                     &self.palette_list_placement,
@@ -31891,8 +32059,12 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                         else
                             v.tab_drag_start_y - mouse_y;
 
-                        // Activate drag after 5px threshold
-                        if (!v.tab_drag_active and dx + dy > 5) {
+                        if (!v.tab_drag_active and win32_input.tabDragThresholdExceeded(
+                            dx,
+                            dy,
+                            sys.GetSystemMetricsForDpi(c.SM_CXDRAG, v.current_dpi),
+                            sys.GetSystemMetricsForDpi(c.SM_CYDRAG, v.current_dpi),
+                        )) {
                             v.tab_drag_active = true;
                             v.hideTabTooltip();
                         }
@@ -32976,9 +33148,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                     .y = signedHighWord(lParamBits(lParam)),
                 };
                 if (sys.ScreenToClient(hwnd, &point) != 0 and point.y >= 0 and point.y < v.tabBarHeight()) {
-                    _ = v.activateTabByDirection(tabDirectionFromWheelDelta(signedHighWord(wParam)));
+                    v.scrollTabStrip(msg == c.WM_MOUSEHWHEEL or msg == c.WM_POINTERHWHEEL, wheelDeltaFromWParam(wParam));
                     return 0;
                 }
+                v.tab_wheel_steps = .{};
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },

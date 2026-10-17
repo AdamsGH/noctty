@@ -37,6 +37,89 @@ pub const NormalizedWheelScroll = struct {
     mods: input.ScrollMods = .{},
 };
 
+/// Whole chrome rows/tabs, retaining precision-wheel fractions between events.
+pub const WheelSteps = struct {
+    // Native wheel deltas are integral 120ths of a notch. Keep those units
+    // after normalization: summing 120 floating-point 1/120 values can
+    // round below one and lose a complete step.
+    remainder: i32 = 0,
+    last_ms: ?u64 = null,
+
+    pub fn add(self: *WheelSteps, delta: f64, now_ms: u64) i32 {
+        const units: i32 = @intFromFloat(@round(delta * c.WHEEL_DELTA));
+        if (units == 0) return 0;
+        if (self.last_ms) |last| {
+            if (now_ms -| last >= 500 or
+                (self.remainder < 0 and units > 0) or
+                (self.remainder > 0 and units < 0)) self.remainder = 0;
+        }
+        self.last_ms = now_ms;
+        self.remainder += units;
+        const steps = @divTrunc(self.remainder, c.WHEEL_DELTA);
+        self.remainder = @rem(self.remainder, c.WHEEL_DELTA);
+        return steps;
+    }
+};
+
+/// Chrome uses fixed logical units rather than terminal cells. Positive
+/// horizontal messages mean right/next, the opposite of vertical up/previous.
+pub fn chromeWheelDelta(horizontal: bool, delta: i16, units_per_notch: u32) f64 {
+    const normalized = normalizeWheelDelta(.{
+        .settings = .{ .lines = 1, .chars = 1 },
+        .cell_size = .{ .width = units_per_notch, .height = units_per_notch },
+    }, if (horizontal) .horizontal else .vertical, delta);
+    return if (horizontal) -normalized.xoff else normalized.yoff;
+}
+
+pub fn tabDragThresholdExceeded(dx: i32, dy: i32, width: i32, height: i32) bool {
+    // SM_CXDRAG / SM_CYDRAG are the allowed distance on EACH side of
+    // the press point (GetSystemMetrics), not the full rectangle width.
+    return dx > @max(1, width) or dy > @max(1, height);
+}
+
+test "win32 chrome pointer wheel retains fractions and resets a gesture" {
+    var steps: WheelSteps = .{};
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 0));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 10));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 20));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(0.25, 30));
+    try std.testing.expectEqual(@as(i32, -2), steps.add(-2.5, 40));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.75, 50));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(0.25, 60));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.75, 70));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0.25, 600));
+    try std.testing.expectEqual(@as(i32, 0), steps.add(0, 610));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(0.75, 620));
+}
+
+test "win32 chrome pointer drag uses each DPI metric axis" {
+    try std.testing.expect(!tabDragThresholdExceeded(3, 3, 12, 16));
+    try std.testing.expect(!tabDragThresholdExceeded(12, 16, 12, 16));
+    try std.testing.expect(tabDragThresholdExceeded(13, 0, 12, 16));
+    try std.testing.expect(tabDragThresholdExceeded(0, 17, 12, 16));
+    try std.testing.expect(!tabDragThresholdExceeded(0, 0, 0, 0));
+}
+
+test "win32 chrome pointer wheel keeps complete notches made of single units" {
+    var steps: WheelSteps = .{};
+    for (0..119) |i| try std.testing.expectEqual(@as(i32, 0), steps.add(chromeWheelDelta(false, 1, 1), i));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(chromeWheelDelta(false, 1, 1), 119));
+    try std.testing.expectEqual(@as(i32, 0), steps.remainder);
+    for (0..119) |i| try std.testing.expectEqual(@as(i32, 0), steps.add(chromeWheelDelta(false, -1, 1), i + 120));
+    try std.testing.expectEqual(@as(i32, -1), steps.add(chromeWheelDelta(false, -1, 1), 239));
+    try std.testing.expectEqual(@as(i32, 0), steps.remainder);
+}
+
+test "win32 chrome pointer wheel normalizes horizontal direction and palette rows" {
+    try std.testing.expectEqual(@as(f64, 1), chromeWheelDelta(false, 120, 1));
+    try std.testing.expectEqual(@as(f64, -1), chromeWheelDelta(true, 120, 1));
+    try std.testing.expectEqual(@as(f64, 1), chromeWheelDelta(true, -120, 1));
+    try std.testing.expectEqual(@as(f64, 3), chromeWheelDelta(false, 120, 3));
+    var steps: WheelSteps = .{};
+    for (0..3) |i| try std.testing.expectEqual(@as(i32, 0), steps.add(chromeWheelDelta(false, 10, 3), i));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(chromeWheelDelta(false, 10, 3), 3));
+}
+
 pub const GlobalHotkeySpec = struct {
     modifiers: UINT,
     vk: UINT,
