@@ -443,9 +443,13 @@ follows `bell-features`, which defaults to `attention,title`:
   `title-report`, saved sessions and automation still see it.
 - `audio`: plays `bell-audio-path` through MCI, at `bell-audio-volume` (0.0 to
   1.0 of the system volume), on a short-lived thread. One sound plays at a
-  time; a bell that rings meanwhile is dropped. A UNC, device or
+  time; a bell that rings meanwhile is dropped. Playback runs to the end of
+  the configured media, with no duration cap. A UNC, device or
   mapped-network-drive path plays nothing and logs one warning (a link to a
-  share is not detected); so does a file that cannot be opened. Volume needs the Windows Media (`mpegvideo`)
+  share is not detected and may stall the sound worker); so does a file that
+  cannot be opened. Long or stalled media suppresses further audio bells while
+  the worker is busy; title and attention cues still work. The DLL loads only
+  on the first audio bell, off the UI thread. Volume needs the Windows Media (`mpegvideo`)
   MCI device; where it is missing the file plays at the system volume. WAV was
   tested; other formats play if Windows Media can play them.
 - `border` is not implemented.

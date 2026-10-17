@@ -27003,10 +27003,11 @@ fn tabStatusHeadline(tab: *const Tab) ?TabProgramStatus {
     return best;
 }
 
-/// What a screen reader is told about a tab's status, as a hash that
-/// progress alone doesn't change; never 0, which stands for no status.
+/// An even status key cannot collide with a program status's odd hash.
 const tab_bell_status_key: u64 = 2;
 
+/// What a screen reader is told about a tab's status, as a hash that
+/// progress alone doesn't change; never 0, which stands for no status.
 fn tabStatusKey(status: TabProgramStatus) u64 {
     var hasher = std.hash.Wyhash.init(0);
     win32_program_status.hashAnnounced(&hasher, &status.surface.program_status, status.record);

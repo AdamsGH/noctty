@@ -193,17 +193,48 @@ const DRIVE_REMOTE: u32 = 4;
 
 extern "user32" fn FlashWindowEx(pfwi: *FLASHWINFO) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn GetDriveTypeW(lpRootPathName: [*:0]const u16) callconv(.winapi) u32;
-extern "winmm" fn mciSendStringW(
+const MciApi = struct {
+    send: *const fn ([*:0]const u16, ?[*]u16, u32, ?windows.HWND) callconv(.winapi) u32,
+    error_string: *const fn (u32, [*]u16, u32) callconv(.winapi) windows.BOOL,
+
+    fn load() !MciApi {
+        // Audio is off by default. Load its optional DLL on the sound worker,
+        // from System32 only, and retain it until process exit.
+        const module = windows.kernel32.LoadLibraryExW(
+            std.unicode.utf8ToUtf16LeStringLiteral("winmm.dll"),
+            null,
+            0x00000800, // LOAD_LIBRARY_SEARCH_SYSTEM32
+        ) orelse return error.AudioUnavailable;
+        errdefer _ = windows.kernel32.FreeLibrary(module);
+        return .{
+            .send = @ptrCast(windows.kernel32.GetProcAddress(module, "mciSendStringW") orelse
+                return error.AudioUnavailable),
+            .error_string = @ptrCast(windows.kernel32.GetProcAddress(module, "mciGetErrorStringW") orelse
+                return error.AudioUnavailable),
+        };
+    }
+};
+
+// Only the sound worker accesses this; `busy` serializes workers and publishes
+// their writes to the next one. No DLL is loaded for a default, silent bell.
+var mci_api: ?MciApi = null;
+
+fn mciSendStringW(
     lpstrCommand: [*:0]const u16,
     lpstrReturnString: ?[*]u16,
     uReturnLength: u32,
     hwndCallback: ?windows.HWND,
-) callconv(.winapi) u32;
-extern "winmm" fn mciGetErrorStringW(
+) u32 {
+    return mci_api.?.send(lpstrCommand, lpstrReturnString, uReturnLength, hwndCallback);
+}
+
+fn mciGetErrorStringW(
     fdwError: u32,
     pszText: [*]u16,
     cchText: u32,
-) callconv(.winapi) windows.BOOL;
+) windows.BOOL {
+    return mci_api.?.error_string(fdwError, pszText, cchText);
+}
 
 /// Flash `hwnd`'s taskbar button until the window comes to the front. The
 /// caption is left alone (`FLASHW_TRAY` only), as the title glyph already
@@ -268,6 +299,10 @@ fn playThread(job: *Job) void {
         alloc.destroy(job);
         busy.store(false, .release);
     }
+    if (mci_api == null) mci_api = MciApi.load() catch |err| {
+        warnOnce("bell audio unavailable err={}", .{err});
+        return;
+    };
     playBlocking(alloc, job.path, job.volume) catch |err| {
         warnOnce("bell sound failed err={}", .{err});
     };
