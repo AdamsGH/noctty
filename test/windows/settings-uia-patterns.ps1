@@ -398,6 +398,30 @@ namespace SettingsPatterns
                                 info.Size = (uint)Marshal.SizeOf(typeof(ComboInfo));
                                 Require(GetComboBoxInfo((IntPtr)hwnd, ref info) && info.List != IntPtr.Zero,
                                     "Combo popup unavailable");
+                                IntPtr currentIndex, itemHeight, topIndex, ignored;
+                                Require(ReadComboMessage((IntPtr)hwnd, 0x0147, IntPtr.Zero, IntPtr.Zero, 3, 2000, out currentIndex) != IntPtr.Zero,
+                                    "Cannot read initial combo selection");
+                                int hoverIndex = currentIndex.ToInt32() == 0 ? 1 : 0;
+                                Require(ReadComboMessage(info.List, 0x01A1, (IntPtr)hoverIndex, IntPtr.Zero, 3, 2000, out itemHeight) != IntPtr.Zero,
+                                    "Cannot read popup item height");
+                                Require(ReadComboMessage(info.List, 0x018E, IntPtr.Zero, IntPtr.Zero, 3, 2000, out topIndex) != IntPtr.Zero,
+                                    "Cannot read popup top index");
+                                int hoverY = (hoverIndex - topIndex.ToInt32()) * itemHeight.ToInt32() + itemHeight.ToInt32() / 2;
+                                Require(itemHeight.ToInt32() > 0 && hoverY >= 0, "Hover row is not visible");
+                                ReadComboMessage(info.List, 0x0200, IntPtr.Zero, (IntPtr)((hoverY << 16) | 10), 3, 2000, out ignored);
+                                result["hoverValue"] = ReadCombo(value, selection);
+                                IntPtr hoverSave = GetDlgItem(GetAncestor((IntPtr)hwnd, 2), 301);
+                                result["hoverSaveBeforeModifier"] = IsWindowEnabled(hoverSave);
+                                ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x11, (IntPtr)1, 3, 2000, out ignored);
+                                result["hoverSaveEnabled"] = IsWindowEnabled(hoverSave);
+                                Require(!Convert.ToBoolean(result["hoverSaveEnabled"]), "Hover plus modifier dirtied pending config");
+                                ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x1B, (IntPtr)1, 3, 2000, out ignored);
+                                ((IExpandCollapse)expand).Collapse();
+                                result["cancelValue"] = ReadCombo(value, selection);
+                                result["cancelSaveEnabled"] = IsWindowEnabled(hoverSave);
+                                Require(!Convert.ToBoolean(result["cancelSaveEnabled"]), "Cancelled hover dirtied pending config");
+                                Require(Object.Equals(before, result["cancelValue"]), "Cancel changed the combo value");
+                                ((IExpandCollapse)expand).Expand();
                                 IElement list = null;
                                 try
                                 {

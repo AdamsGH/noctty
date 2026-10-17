@@ -9671,7 +9671,27 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                     var expanded: i32 = 0;
                     try std.testing.expectEqual(com.S_OK, expand.vtbl.get_ExpandCollapseState(expand, &expanded));
                     try std.testing.expectEqual(@as(i32, 1), expanded);
+                    if (control == settings.combo_window_theme.?) {
+                        var popup: SettingsComboPopup.Info = .{};
+                        try std.testing.expect(SettingsComboPopup.GetComboBoxInfo(control, &popup) != 0);
+                        const before_hover = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
+                        const height = sys.SendMessageW(popup.list.?, 0x01A1, 1, 0); // LB_GETITEMHEIGHT
+                        try std.testing.expect(height > 0);
+                        _ = sys.SendMessageW(popup.list.?, WM_MOUSEMOVE, 0, ((height + @divTrunc(height, 2)) << 16) | 10);
+                        const hovered = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
+                        try std.testing.expect(hovered != before_hover);
+                        _ = sys.SendMessageW(control, WM_KEYDOWN, 0x11, 1); // Control, without accepting the row
+                        try std.testing.expect(!settings.hasPendingChanges());
+                        try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+                        // Choosing the already-hovered row explicitly still
+                        // commits: observation must not consume its cache change.
+                        var hovered_label: [128:0]u16 = @splat(0);
+                        _ = sys.SendMessageW(control, 0x0148, @intCast(hovered), @bitCast(@intFromPtr(&hovered_label)));
+                        try std.testing.expectEqual(com.S_OK, value.vtbl.SetValue(value, &hovered_label));
+                        try std.testing.expect(settings.hasPendingChanges());
+                    }
                     try std.testing.expectEqual(com.S_OK, expand.vtbl.Collapse(expand));
+                    settings.discardChangesNow();
                     const old_index = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
                     var label: [128:0]u16 = @splat(0);
                     const next_index: usize = if (old_index == 0) 1 else 0;
@@ -10111,7 +10131,7 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
                     WM_LBUTTONDOWN,
                     0x0202,
                     WM_KILLFOCUS,
-                    => if (settings.control_uia_providers[index]) |provider| provider.syncNativeState(true),
+                    => if (settings.control_uia_providers[index]) |provider| provider.syncNativeState(if (msg == CB_SETCURSEL or msg == SettingsComboPopup.sync_message) .explicit_selection else .observe),
                     else => {},
                 }
                 return result;
@@ -10814,7 +10834,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             defer if (lParam != 0) {
                 if (owner) |o| {
                     if (o.controlIndex(@ptrFromInt(@as(usize, @bitCast(lParam))))) |index| {
-                        if (o.control_uia_providers[index]) |provider| provider.syncNativeState(notify != CBN_SELCHANGE);
+                        if (o.control_uia_providers[index]) |provider| provider.syncNativeState(if (notify == CBN_SELCHANGE) .native_notification else .observe);
                     }
                 }
             };

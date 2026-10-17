@@ -1179,6 +1179,7 @@ pub const SettingsControlProvider = struct {
     pub const action_message: u32 = 0x8000 + 0x10C;
     pub const action_success: isize = 1;
     const Action = enum(usize) { toggle, select, expand, collapse };
+    pub const SelectionSync = enum { observe, native_notification, explicit_selection };
 
     const BM_GETCHECK: u32 = 0x00F0;
     const BM_SETCHECK: u32 = 0x00F1;
@@ -1548,18 +1549,18 @@ pub const SettingsControlProvider = struct {
                 if (self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
                 if (index < 0 or index >= SendMessageW(self.hwnd, CB_GETCOUNT, 0, 0)) return com.E_INVALIDARG;
                 _ = SendMessageW(self.hwnd, CB_SETCURSEL, @intCast(index), 0);
-                self.syncNativeState(true);
+                self.syncNativeState(.explicit_selection);
                 return com.S_OK;
             },
             .expand, .collapse => {
                 if (self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
                 _ = SendMessageW(self.hwnd, CB_SHOWDROPDOWN, @intFromBool(action == .expand), 0);
-                self.syncNativeState(true);
+                self.syncNativeState(.observe);
                 return com.S_OK;
             },
         }
         _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))), @bitCast(@intFromPtr(self.hwnd)));
-        self.syncNativeState(false);
+        self.syncNativeState(.observe);
         return com.S_OK;
     }
 
@@ -1592,7 +1593,7 @@ pub const SettingsControlProvider = struct {
 
     /// The native HWND thread owns this cache. Compare after native mutations
     /// as well as UIA actions, so mouse/keyboard and Discard announce changes.
-    pub fn syncNativeState(self: *SettingsControlProvider, notify_selection: bool) void {
+    pub fn syncNativeState(self: *SettingsControlProvider, selection_sync: SelectionSync) void {
         if (!self.available()) return;
         if (self.role == .check_box) {
             const next: i32 = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
@@ -1604,6 +1605,10 @@ pub const SettingsControlProvider = struct {
             const old_expanded = self.last_expanded;
             self.last_expanded = expanded;
             if (expanded != old_expanded) events.raisePropertyChanged(&self.base, constants.UIA_ExpandCollapseExpandCollapseStatePropertyId, com.VARIANT.fromI4(old_expanded), com.VARIANT.fromI4(expanded));
+            // A dropped list tracks its hovered row before the user chooses
+            // it. Observation must neither commit nor cache that provisional
+            // selection: a later explicit SelectionItem.Select may choose it.
+            if (expanded != 0 and selection_sync == .observe) return;
             const selected = SendMessageW(self.hwnd, CB_GETCURSEL, 0, 0);
             if (self.last_selection != selected) {
                 self.last_selection = selected;
@@ -1611,7 +1616,7 @@ pub const SettingsControlProvider = struct {
                 // index without CBN_SELCHANGE. Keep its native state and the
                 // Settings draft together, using the same parent handler.
                 // Update the cache first: the handler may refresh controls.
-                if (notify_selection) {
+                if (selection_sync == .explicit_selection) {
                     if (GetParent(self.hwnd)) |parent| {
                         _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))) | (@as(usize, 1) << 16), @bitCast(@intFromPtr(self.hwnd)));
                     }
