@@ -29659,8 +29659,6 @@ const visibleTabRange = labels.visibleTabRange;
 
 const buildTabButtonLabel = labels.buildTabButtonLabel;
 
-const buildSearchOverlayLabel = labels.buildSearchOverlayLabel;
-
 const buildSearchBarResultsText = labels.buildSearchBarResultsText;
 
 const SearchBarResultsVisual = labels.SearchBarResultsVisual;
