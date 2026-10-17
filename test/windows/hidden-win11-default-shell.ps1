@@ -10,8 +10,8 @@ Cases, each one launch of noctty with no `command` in its config:
   no-pwsh           PATH without any pwsh.exe: expects powershell.exe
   restricted-51     the same, with the process execution policy Restricted: the
                     screen must settle with no warning from this app and
-                    the injected shell integration must be on the command line (the
-                    host's own PSReadLine and profile.ps1 errors are expected there)
+                    the injected shell integration must be on the command line (
+                    only a policy-blocked user profile.ps1 is expected there)
   safe-mode         --safe-mode: expects cmd.exe whatever else is installed
 Per case the results hold the shell's image name, whether the integration
 payload was supplied on its command line (a boolean; the command line itself is
@@ -244,6 +244,7 @@ if (-not $Driver) {
 }
 
 # Driver: runs only on the private desktop, inside the owned job.
+. (Join-Path $PSScriptRoot '..\..\scripts\interactive-win11-lib.ps1')
 $script:checks=[Collections.Generic.List[object]]::new()
 $script:launches=[Collections.Generic.List[object]]::new()
 function Check([string]$Case,[string]$Name,[bool]$Passed,$Expected,$Actual) {
@@ -319,10 +320,11 @@ function Launch-Case([string]$Case,[string]$Exe,[string[]]$ExtraArgs,[hashtable]
                 }
                 Start-Sleep -Milliseconds 250
             }
-            # Lines from the shell host or the user's own profile are not ours: Windows PowerShell under Restricted
-            # cannot load PSReadLine or a profile.ps1 in any terminal. A line naming this app is.
+            # Only a policy-blocked user profile is expected under Restricted.
+            # PSReadLine errors must fail, including inherited PS7 module-path failures.
             $record.NocttyWarnings = @($record.Screen | Where-Object { $_ -match '(?i)noctty|integration (skipped|could not)|could not load' })
-            $record.HostNoise = @($record.Screen | Where-Object { $_ -match '(?i)PSReadline|profile\.ps1|about_Execution_Policies|SecurityError|UnauthorizedAccess|FullyQualifiedErrorId|^\s*\+ |^At line:|^because running scripts|^about_Execution' })
+            $profileBlocked = ($record.Screen -join "`n") -match '(?i)profile\.ps1.*cannot be loaded'
+            $record.HostNoise = @($record.Screen | Where-Object { $Case -eq 'restricted-51' -and $profileBlocked -and $_ -notmatch '(?i)PSReadLine|noctty|integration' -and $_ -match '(?i)profile\.ps1|about_Execution_Policies|SecurityError|UnauthorizedAccess|FullyQualifiedErrorId|^\s*\+ |^At line:|^because running scripts|^about_Execution' })
             # Every row but the last (the prompt) must be a row the host explains; wrapped lines of the profile error count.
             $record.Unexplained = @($record.Screen | Select-Object -SkipLast 1 | Where-Object { $record.HostNoise -notcontains $_ -and $_ -notmatch '^(because|about_|\. :|File )' })
         }
@@ -345,6 +347,7 @@ try {
     $withPwsh = @($pathDirs | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'pwsh.exe') -PathType Leaf })
     $withoutPwsh = ($pathDirs | Where-Object { $withPwsh -notcontains $_ }) -join ';'
     $pwshOnPath = $withPwsh.Count -gt 0
+    $windowsPowerShellModules = Get-InteractiveWin11WindowsPowerShellModulePath $env:PSModulePath
 
     $r = Launch-Case 'default' $exe @() @{}
     Check 'default' "the first tab runs $(if($pwshOnPath){'pwsh.exe, which is on PATH'}else{'powershell.exe, as pwsh.exe is not on PATH'})" ($r.Shell -eq $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'})) $(if($pwshOnPath){'pwsh.exe'}else{'powershell.exe'}) $r.Shell
@@ -353,17 +356,17 @@ try {
     Check 'default' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'default' 'no warning from this app on the screen' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
 
-    $r = Launch-Case 'no-pwsh' $exe @() @{ PATH = $withoutPwsh }
+    $r = Launch-Case 'no-pwsh' $exe @() @{ PATH = $withoutPwsh; PSModulePath = $windowsPowerShellModules }
     Check 'no-pwsh' 'without pwsh.exe on PATH the first tab runs Windows PowerShell' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
     Check 'no-pwsh' 'nothing unexplained above the prompt' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
     Check 'no-pwsh' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
 
-    $r = Launch-Case 'restricted-51' $exe @() @{ PATH = $withoutPwsh; PSExecutionPolicyPreference = 'Restricted' }
+    $r = Launch-Case 'restricted-51' $exe @() @{ PATH = $withoutPwsh; PSExecutionPolicyPreference = 'Restricted'; PSModulePath = $windowsPowerShellModules }
     Check 'restricted-51' 'Windows PowerShell 5.1 starts under the Restricted policy' ($r.Shell -eq 'powershell.exe') 'powershell.exe' $r.Shell
     Check 'restricted-51' 'the integration payload is on its command line' ($r.Integration -eq $true) $true $r.Integration
     Check 'restricted-51' 'the shell starts and its screen settles' ($null -ne $r.PromptMs) 'settled' $r.PromptLine
     Check 'restricted-51' 'every row above the prompt is the host or the user profile under Restricted' ($r.Unexplained.Count -eq 0) 0 $r.Unexplained
-    Check 'restricted-51' 'no warning from this app on the screen (the host and profile lines below it are Restricted behaviour in any terminal)' ($r.NocttyWarnings.Count -eq 0) 0 $r.NocttyWarnings
+    Check 'restricted-51' 'no integration warning or PSReadLine load error on the screen' ($r.NocttyWarnings.Count -eq 0 -and -not ($r.Screen -match 'Cannot load PSReadline')) 0 $r.NocttyWarnings
 
     $r = Launch-Case 'safe-mode' $exe @('--safe-mode') @{}
     Check 'safe-mode' 'safe mode starts cmd.exe although PowerShell is installed' ($r.Shell -eq 'cmd.exe') 'cmd.exe' $r.Shell

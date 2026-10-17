@@ -1338,6 +1338,16 @@ const recovery_session_set_aside_banner_w = blk: {
 const recovery_set_aside_suffix = ".restore-failed";
 const recovery_safe_mode_caption_w = std.unicode.utf8ToUtf16LeStringLiteral("noctty safe mode");
 
+test "win32 safe mode reload keeps recovery without loading config" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // No CoreApp or config is installed: recovery reload must return before
+    // touching either, for hard and soft reloads alike.
+    var app: App = undefined;
+    app.safe_mode = true;
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = false }));
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = true }));
+}
+
 /// Filename infix for a startup-ledger record whose write already failed and
 /// whose diagnosis is waiting to be folded into the next startup's append.
 /// Deliberately disjoint from the `.tmp-` infix used for live atomic-replace
@@ -6637,6 +6647,10 @@ pub const App = struct {
             },
 
             .reload_config => {
+                // Recovery keeps its default config and cmd /D until restart.
+                // In particular, a hard reload must not run default discovery
+                // or load the startup files that safe mode bypassed.
+                if (self.safe_mode) return true;
                 if (value.soft) {
                     switch (target) {
                         .app => try self.core_app.updateConfig(self, &self.config),
@@ -10935,6 +10949,10 @@ pub const App = struct {
 
         self.settings_failure_detail.clear(alloc);
         try persistSettings(alloc, target_path, pending, user_edited, &self.settings_failure_detail);
+
+        // Saving can repair the config on disk, but recovery applies it only
+        // after restart, as the safe-mode banner promises.
+        if (self.safe_mode) return;
 
         // Mirror the `.reload_config` hard-reload path: re-read from disk and
         // push through CoreApp so every surface's next frame picks up the

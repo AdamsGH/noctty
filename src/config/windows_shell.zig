@@ -346,7 +346,7 @@ pub fn lookupChildExecutable(alloc: Allocator, exe: []const u8, env: *const std.
         std.mem.indexOfAny(u8, exe, "\\/:") != null) return null;
     const path = env.get("PATH") orelse return null;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const found = searchPath(&buf, exe, path, env.get("PATHEXT"), acceptAnyPath) orelse return null;
+    const found = searchPath(&buf, exe, path, env.get("PATHEXT"), false, acceptAnyPath) orelse return null;
     return try alloc.dupeZ(u8, found);
 }
 
@@ -365,8 +365,17 @@ fn searchPath(
     exe: []const u8,
     path: []const u8,
     pathext: ?[]const u8,
+    comptime discovery: bool,
     accept: anytype,
 ) ?[]const u8 {
+    const error_mode = struct {
+        extern "kernel32" fn SetThreadErrorMode(mode: u32, previous: ?*u32) callconv(.winapi) windows.BOOL;
+    };
+    var previous_mode: u32 = 0;
+    const suppressed = error_mode.SetThreadErrorMode(0x0001 | 0x8000, &previous_mode) != 0;
+    defer if (suppressed) {
+        _ = error_mode.SetThreadErrorMode(previous_mode, null);
+    };
     const extension = std.fs.path.extension(exe);
     var dirs = std.mem.splitScalar(u8, path, ';');
     dirs: while (dirs.next()) |raw_dir| {
@@ -376,9 +385,12 @@ fn searchPath(
         if (internal_os.path.isNetworkOrDevicePath(dir) or dir.len < 3 or
             !std.ascii.isAlphabetic(dir[0]) or dir[1] != ':' or
             (dir[2] != '\\' and dir[2] != '/')) continue;
-        if (internal_os.windows.driveTypeForLetter(dir[0]) == internal_os.windows.DRIVE_REMOTE)
-            continue;
-        if (!isLocalSearchDirectory(dir)) continue;
+        const drive_type = internal_os.windows.driveTypeForLetter(dir[0]);
+        if (drive_type == internal_os.windows.DRIVE_REMOTE) continue;
+        // Discovery never spins up removable/optical media on the UI thread.
+        if (discovery and drive_type != internal_os.windows.DRIVE_FIXED and
+            drive_type != internal_os.windows.DRIVE_RAMDISK) continue;
+        if (discovery and !isLocalSearchDirectory(dir)) continue;
         var extensions = std.mem.splitScalar(u8, if (extension.len > 0) "" else pathext orelse ".COM;.EXE;.BAT;.CMD", ';');
         while (extensions.next()) |raw_ext| {
             const ext = std.mem.trim(u8, raw_ext, " \t");
@@ -393,7 +405,10 @@ fn searchPath(
                 if (!valid) continue;
             }
             const candidate = std.fmt.bufPrint(buf, "{s}\\{s}{s}", .{ dir, exe, ext }) catch continue;
-            if (!windowsNonDirectoryPathExists(candidate)) continue;
+            if (discovery) {
+                const attributes = pathAttributes(candidate) orelse continue;
+                if (attributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) continue;
+            } else if (!windowsNonDirectoryPathExists(candidate)) continue;
             const found_ext = if (extension.len > 0) extension else ext;
             if (!std.ascii.eqlIgnoreCase(found_ext, ".exe") and
                 !std.ascii.eqlIgnoreCase(found_ext, ".com")) return null;
@@ -434,7 +449,11 @@ test "PKG48 only shell wrappers receive the inherited cwd search guard" {
 /// or stat'ed as an ordinary file. Query the path itself, accepting aliases.
 /// Callers must screen network/device paths and remote drives first.
 fn windowsNonDirectoryPathExists(path: []const u8) bool {
-    const attributes = pathAttributes(path) orelse return false;
+    // Explicit commands retain Windows link semantics, including Scoop's
+    // current junction and paths with spaces. Only discovery refuses redirects.
+    const path_w = windows.sliceToPrefixedFileW(null, path) catch return false;
+    const attributes = windows.kernel32.GetFileAttributesW(path_w.span().ptr);
+    if (attributes == windows.INVALID_FILE_ATTRIBUTES) return false;
     return attributes & windows.FILE_ATTRIBUTE_DIRECTORY == 0;
 }
 
@@ -478,26 +497,38 @@ fn openPathNoRedirect(path: []const u8) ?windows.HANDLE {
 }
 
 /// Attributes of the final object, with no ancestor or final link followed.
-fn pathAttributes(path: []const u8) ?windows.DWORD {
+fn pathInfo(path: []const u8) ?windows.FILE_ATTRIBUTE_TAG_INFO {
     const handle = openPathNoRedirect(path) orelse return null;
     defer windows.CloseHandle(handle);
     var info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
     var io: windows.IO_STATUS_BLOCK = undefined;
     if (windows.ntdll.NtQueryInformationFile(handle, &io, &info, @sizeOf(@TypeOf(info)), .FileAttributeTagInformation) != .SUCCESS) return null;
-    return info.FileAttributes;
+    return info;
 }
 
-/// A file `CreateProcess` can start. The only reparse point accepted is an App
+fn pathAttributes(path: []const u8) ?windows.DWORD {
+    return (pathInfo(path) orelse return null).FileAttributes;
+}
+
+/// A file `CreateProcess` can start. Besides local data reparse tags, accept an App
 /// Execution Alias whose package is installed: the Store's PowerShell and the
 /// Python launcher put one on `PATH`, and an alias can stay behind after its
 /// package is gone. Following a symlink or junction would open its target,
 /// which can be on a network share, so those are not accepted.
 /// The caller screens network and device paths first.
 fn isLaunchableFile(path: []const u8) bool {
-    const attributes = pathAttributes(path) orelse return false;
-    if (attributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) return false;
-    if (attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0) return true;
+    const info = pathInfo(path) orelse return false;
+    if (isLocalExecutableInfo(info)) return true;
+    if (info.FileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) return false;
     return appExecLinkTargetExists(path);
+}
+
+/// WOF compression and deduplication keep file data on the local volume.
+/// Neither is a name redirect or a cloud placeholder that can fetch data.
+fn isLocalExecutableInfo(info: windows.FILE_ATTRIBUTE_TAG_INFO) bool {
+    if (info.FileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) return false;
+    return info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 or
+        info.ReparseTag == 0x80000017 or info.ReparseTag == 0x80000013;
 }
 
 /// The reparse data of the open reparse point `handle`, as the slice of `buf`
@@ -543,8 +574,7 @@ fn appExecLinkTargetExists(path: []const u8) bool {
     // A local file only; the screen is the one for any path a program reports.
     if (!isDriveAbsolutePath(target) or internal_os.path.isNetworkOrDevicePath(target)) return false;
     if (internal_os.windows.driveTypeForLetter(target[0]) == internal_os.windows.DRIVE_REMOTE) return false;
-    const attributes = pathAttributes(target) orelse return false;
-    return attributes & (windows.FILE_ATTRIBUTE_DIRECTORY | windows.FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    return isLocalExecutableInfo(pathInfo(target) orelse return false);
 }
 
 /// The target of an App Execution Alias, copied as UTF-16 into `out`, from the
@@ -1516,7 +1546,7 @@ fn lookupExecutable(alloc: Allocator, exe: []const u8) !?[]u8 {
     };
     defer alloc.free(path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const found = searchPath(&buf, exe, path, null, isLaunchableFile) orelse return null;
+    const found = searchPath(&buf, exe, path, null, true, isLaunchableFile) orelse return null;
     return try alloc.dupe(u8, found);
 }
 
@@ -2221,7 +2251,7 @@ test "shell discovery refuses reparse ancestors before reading the target" {
     try std.testing.expect(pathAttributes(path) == null);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = std.fs.path.dirname(path).?;
-    try std.testing.expect(searchPath(&buf, "pwsh.exe", dir, null, isLaunchableFile) == null);
+    try std.testing.expect(searchPath(&buf, "pwsh.exe", dir, null, true, isLaunchableFile) == null);
 }
 
 test "shell discovery searches only ordinary local folders" {
@@ -2236,6 +2266,65 @@ test "shell discovery searches only ordinary local folders" {
     const missing = try std.fmt.allocPrint(alloc, "{s}\\absent", .{root});
     defer alloc.free(missing);
     try std.testing.expect(!isLocalSearchDirectory(missing));
+}
+
+test "explicit commands and child PATH keep junctions with spaces" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("real");
+    try tmp.dir.makePath("current tools");
+    try tmp.dir.writeFile(.{ .sub_path = "real/pwsh.exe", .data = "MZ" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const link = try std.fmt.allocPrint(alloc, "{s}\\current tools", .{root});
+    defer alloc.free(link);
+    const target = try std.fmt.allocPrint(alloc, "\\??\\{s}\\real", .{root});
+    defer alloc.free(target);
+    const target_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, target);
+    defer alloc.free(target_w);
+    const link_w = try windows.sliceToPrefixedFileW(null, link);
+    const handle = windows.kernel32.CreateFileW(link_w.span().ptr, windows.GENERIC_WRITE, 0, null, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT | windows.FILE_FLAG_BACKUP_SEMANTICS, null);
+    if (handle == windows.INVALID_HANDLE_VALUE) return error.AccessDenied;
+    {
+        defer windows.CloseHandle(handle);
+        const bytes: u16 = @intCast(target_w.len * 2);
+        var record: std.ArrayList(u8) = .empty;
+        defer record.deinit(alloc);
+        try record.appendSlice(alloc, &.{ 3, 0, 0, 0xa0 }); // mount point
+        try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, bytes + 12)));
+        try record.appendSlice(alloc, &.{ 0, 0, 0, 0 }); // reserved, substitute offset
+        try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, bytes)));
+        try record.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u16, bytes + 2)));
+        try record.appendSlice(alloc, &.{ 0, 0 }); // empty print name
+        try record.appendSlice(alloc, std.mem.sliceAsBytes(target_w));
+        try record.appendSlice(alloc, &.{ 0, 0, 0, 0 }); // terminators
+        try windows.DeviceIoControl(handle, 0x900a4, record.items, null);
+    }
+    const exe = try std.fmt.allocPrintSentinel(alloc, "{s}\\pwsh.exe", .{link}, 0);
+    defer alloc.free(exe);
+    const command = try executableCommand(alloc, .{ .shell = exe });
+    defer command.deinit(alloc);
+    try std.testing.expect(command == .direct);
+    try std.testing.expectEqualStrings(exe, command.direct[0]);
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("PATH", link);
+    const child = (try lookupChildExecutable(alloc, "pwsh.exe", &env)).?;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings(exe, child);
+    // The same layout is deliberately excluded from automatic discovery.
+    try std.testing.expect(!isLaunchableFile(exe));
+}
+
+test "local executable data reparse tags exclude redirects and cloud files" {
+    for ([_]u32{ 0x80000017, 0x80000013 }) |tag| {
+        try std.testing.expect(isLocalExecutableInfo(.{ .FileAttributes = windows.FILE_ATTRIBUTE_REPARSE_POINT, .ReparseTag = tag }));
+        try std.testing.expect(!isLocalExecutableInfo(.{ .FileAttributes = windows.FILE_ATTRIBUTE_REPARSE_POINT | windows.FILE_ATTRIBUTE_DIRECTORY, .ReparseTag = tag }));
+    }
+    for ([_]u32{ 0xa000000c, 0xa0000003, 0x9000001a, 0x8000001b }) |tag|
+        try std.testing.expect(!isLocalExecutableInfo(.{ .FileAttributes = windows.FILE_ATTRIBUTE_REPARSE_POINT, .ReparseTag = tag }));
 }
 
 test "pwsh search skips what cannot start and keeps going down PATH" {
@@ -2266,13 +2355,13 @@ test "pwsh search skips what cannot start and keeps going down PATH" {
     defer alloc.free(expected);
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings(expected, searchPath(&buf, "pwsh.exe", path, null, isLaunchableFile).?);
+    try std.testing.expectEqualStrings(expected, searchPath(&buf, "pwsh.exe", path, null, true, isLaunchableFile).?);
 
     // With only the dead alias and the directory on PATH nothing is found, so
     // the default moves on to Windows PowerShell instead of a shell that fails.
     const dead = try std.fmt.allocPrint(alloc, "{s}\\dir;{s}\\gone", .{ root, root });
     defer alloc.free(dead);
-    try std.testing.expect(searchPath(&buf, "pwsh.exe", dead, null, isLaunchableFile) == null);
+    try std.testing.expect(searchPath(&buf, "pwsh.exe", dead, null, true, isLaunchableFile) == null);
 }
 
 test "an App Execution Alias counts only while its target exists" {

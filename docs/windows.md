@@ -258,7 +258,7 @@ With `command` unset, a new tab runs the first of these that is found:
 
 WSL is never part of this order. The lookup only reads filesystem metadata and
 launches nothing. It skips relative `PATH` entries, network shares, device paths,
-mapped network drives and folder links, including links higher up in a `PATH`
+mapped network drives, removable/optical media and folder links, including links higher up in a `PATH`
 entry. The kernel rejects reparse traversal before reading a target, so an
 unchecked folder link cannot contact a share during detection. A `pwsh.exe` that
 is a Microsoft Store App Execution Alias counts only while the file it points
@@ -274,6 +274,11 @@ command that a registry value or Clink can hang there). The profile
 picker, its dropdown check mark and a right or middle click on the new-tab
 button start on the profile this default runs; a `command` you set does not
 move that choice.
+
+These discovery restrictions do not change explicit commands: paths through
+local junctions (such as Scoop's `current` directory) still work when configured.
+In safe mode, reloading or saving Settings keeps recovery active until restart;
+a saved config repair takes effect at that restart.
 
 The profile picker detects:
 
