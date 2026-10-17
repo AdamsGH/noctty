@@ -40,6 +40,7 @@ const win32_undo = @import("win32_undo.zig");
 const win32_toast_winrt = @import("win32_toast_winrt.zig");
 const win32_taskbar_progress = @import("win32_taskbar_progress.zig");
 const win32_program_status = @import("win32_program_status.zig");
+const win32_bell = @import("win32_bell.zig");
 const win32_jump_list = @import("win32_jump_list.zig");
 const win32_powershell_install = @import("win32_powershell_install.zig");
 const win32_terminfo = @import("win32_terminfo.zig");
@@ -123,6 +124,7 @@ test {
     _ = @import("win32/first_frame.zig");
     _ = @import("win32_aumid.zig");
     _ = @import("win32_program_status.zig");
+    _ = @import("win32_bell.zig");
 }
 
 const ThemeColors = win32_theme.ThemeColors;
@@ -11215,10 +11217,43 @@ pub const App = struct {
         }.body);
     }
 
+    /// Ring the bell as `bell-features` says; see `win32_bell`. A surface
+    /// target uses its own configuration, `.app` the app's, and only a
+    /// surface target marks a terminal with the title glyph.
     fn ringBell(self: *App, target: apprt.Target) void {
-        _ = self;
-        _ = target;
-        _ = sys.MessageBeep(c.MB_ICONINFORMATION);
+        const surface = self.findSurfaceForTarget(target);
+        const alerted: ?*Surface = switch (target) {
+            .surface => surface,
+            .app => null,
+        };
+        const features: configpkg.Config.BellFeatures, const audio_path: ?configpkg.Path, const volume: f64 =
+            if (alerted) |s| .{
+                s.core().config.bell_features,
+                s.core().config.bell_audio_path,
+                s.core().config.bell_audio_volume,
+            } else .{
+                self.config.@"bell-features",
+                self.config.@"bell-audio-path",
+                self.config.@"bell-audio-volume",
+            };
+
+        const hwnd = if (surface) |s| s.windowHwnd() else null;
+        const window_active = if (hwnd) |h|
+            sys.GetForegroundWindow() == h and sys.IsIconic(h) == 0
+        else
+            false;
+        const bell = win32_bell.plan(features, audio_path != null, .{
+            .window_active = window_active,
+            .window_visible = if (hwnd) |h| sys.IsWindowVisible(h) != 0 else false,
+            .in_view = if (alerted) |s| window_active and s.host_active and s.window_focused else false,
+        });
+
+        if (bell.system) _ = sys.MessageBeep(c.MB_ICONINFORMATION);
+        if (bell.audio) if (audio_path) |path| win32_bell.playFile(switch (path) {
+            inline else => |value| value,
+        }, volume);
+        if (bell.flash) if (hwnd) |h| win32_bell.flashTaskbar(h);
+        if (bell.glyph) if (alerted) |s| s.setBellRinging(true);
     }
 
     fn showDesktopNotificationWithLaunch(
@@ -12860,6 +12895,8 @@ const Tab = struct {
     button_prev_proc: ?*const anyopaque = null,
     uia_provider: ?*win32_uia.ChromeControlProvider = null,
     cached_button_title: ?[:0]const u8 = null,
+    /// The label was built with the bell glyph; see `Host.syncTabButtons`.
+    cached_button_bell: bool = false,
     cached_button_label: ?[:0]const u8 = null,
     cached_button_index: usize = 0,
     cached_button_active: bool = false,
@@ -12922,6 +12959,14 @@ const Tab = struct {
         var it = self.tree.iterator();
         while (it.next()) |_| count += 1;
         return count;
+    }
+
+    /// A terminal in the tab rang the bell and has not been focused or typed
+    /// into since (`bell-features = title`).
+    fn bellRinging(self: *const Tab) bool {
+        var it = self.tree.iterator();
+        while (it.next()) |entry| if (entry.view.bell_ringing) return true;
+        return false;
     }
 
     fn clearRedoHistory(self: *Tab) void {
@@ -13091,6 +13136,8 @@ const Host = struct {
     cached_overlay_paint_label_w: ?[:0]const u16 = null,
     cached_overlay_paint_feedback_w: ?[:0]const u16 = null,
     cached_window_title: ?[:0]const u8 = null,
+    /// The caption currently carries the bell glyph; see `syncWindowTitle`.
+    caption_bell: bool = false,
 
     overflow_hwnd: ?HWND = null, // dropdown chevron (▾)
     overflow_uia_provider: ?*win32_uia.ChromeControlProvider = null,
@@ -16735,6 +16782,78 @@ const Host = struct {
         try std.testing.expectEqual(first_left, host.tabs.items[0].button_placement.rect.left);
     }
 
+    test "bell glyph marks the alerted tab and the caption, and nothing stored" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(bellGlyphTestBody);
+    }
+
+    fn bellGlyphTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host, .register = true },
+            },
+            .tabs = &.{
+                .{ .host = &host, .surface = &surface_a, .id = 1 },
+                .{ .host = &host, .surface = &surface_b, .id = 2 },
+            },
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        _ = sys.MoveWindow(window.parent, 0, 0, 1200, 300, 0);
+        surface_a.title = "alpha";
+        surface_b.title = "beta";
+        defer if (host.cached_window_title) |value| std.testing.allocator.free(value);
+        try host.refreshChrome();
+
+        const glyph = win32_bell.title_glyph;
+        var status_buf: [64]u8 = undefined;
+        var caption: [128]u16 = undefined;
+        var utf8: [256]u8 = undefined;
+        const caption_text = struct {
+            fn read(hwnd: HWND, wide: *[128]u16, out: *[256]u8) ![]const u8 {
+                const len: usize = @intCast(sys.GetWindowTextW(hwnd, wide, wide.len));
+                return out[0..try std.unicode.utf16LeToUtf8(out, wide[0..len])];
+            }
+        }.read;
+        try std.testing.expect(!std.mem.startsWith(u8, host.tabs.items[0].cached_button_label.?, glyph));
+        try std.testing.expectEqualStrings("", Host.tabItemUiaItemStatus(&host, 1, &status_buf));
+
+        // A background tab rings: its label and UIA status carry the glyph and
+        // "Bell"; the caption (tab B) and the stored titles do not.
+        surface_a.setBellRinging(true);
+        try std.testing.expect(std.mem.indexOf(u8, host.tabs.items[0].cached_button_label.?, glyph) != null);
+        try std.testing.expectEqualStrings("alpha", host.tabs.items[0].cached_button_title.?);
+        try std.testing.expectEqualStrings("alpha", surface_a.effectiveTitle().?);
+        try std.testing.expect(std.mem.indexOf(u8, host.tabs.items[1].cached_button_label.?, glyph) == null);
+        try std.testing.expectEqualStrings("Bell", Host.tabItemUiaItemStatus(&host, 1, &status_buf));
+        try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
+
+        // The active tab rings: the caption leads with the glyph, while the
+        // title automation reads stays as it was.
+        surface_b.setBellRinging(true);
+        try std.testing.expect(std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
+        try std.testing.expect(!std.mem.startsWith(u8, host.cached_window_title.?, glyph));
+        try std.testing.expectEqualStrings("beta", surface_b.effectiveTitle().?);
+
+        // Focus or a key press answers the bell and takes every mark away.
+        surface_a.clearBell();
+        surface_b.clearBell();
+        try std.testing.expect(std.mem.indexOf(u8, host.tabs.items[0].cached_button_label.?, glyph) == null);
+        try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
+        try std.testing.expectEqualStrings("", Host.tabItemUiaItemStatus(&host, 1, &status_buf));
+    }
+
     test "a background tab close that asks leaves the keyboard on its prompt" {
         if (builtin.os.tag != .windows) return error.SkipZigTest;
         try runOnPrivateDesktop(backgroundCloseAskTestBody);
@@ -17021,7 +17140,14 @@ const Host = struct {
             }
             if (tab.button_hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
         }
-        const key = if (status) |value| tabStatusKey(value) else 0;
+        // A bell no program status outranks is the tab's status too ("Bell"
+        // in `tabItemUiaItemStatus`); its key is even, a program status's odd.
+        const key = if (status) |value|
+            tabStatusKey(value)
+        else if (tab.bellRinging())
+            tab_bell_status_key
+        else
+            0;
         if (key != tab.status_key) {
             tab.status_key = key;
             if (self.shouldShowTabBar()) {
@@ -18977,7 +19103,9 @@ const Host = struct {
     fn tabItemUiaItemStatus(ctx: *anyopaque, tab_id: usize, buf: []u8) []const u8 {
         const self: *Host = @ptrCast(@alignCast(ctx));
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return "";
-        const status = tabStatusHeadline(&self.tabs.items[index]) orelse return "";
+        const tab = &self.tabs.items[index];
+        const status = tabStatusHeadline(tab) orelse
+            return if (tab.bellRinging()) win32_bell.uia_item_status else "";
         var writer: std.Io.Writer = .fixed(buf);
         win32_program_status.writeStatusLine(
             &writer,
@@ -22749,9 +22877,16 @@ const Host = struct {
             self.app.is_elevated,
         );
         defer alloc.free(host_base_title);
-        if (!windowTitleSyncChanged(self.cached_window_title, host_base_title)) return false;
+        // The bell glyph is display only: `cached_window_title` stays the
+        // title without it, which is what automation reports.
+        const bell = if (self.activeTab()) |tab| tab.bellRinging() else false;
+        if (!windowTitleSyncChanged(self.cached_window_title, host_base_title) and
+            bell == self.caption_bell) return false;
+        const caption = if (bell) try win32_bell.withTitleGlyph(alloc, host_base_title) else null;
+        defer if (caption) |value| alloc.free(value);
         try appendOwnedString(alloc, &self.cached_window_title, host_base_title);
-        const title_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, host_base_title);
+        self.caption_bell = bell;
+        const title_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, caption orelse host_base_title);
         defer alloc.free(title_w);
         _ = sys.SetWindowTextW(hwnd, title_w.ptr);
         return true;
@@ -22780,6 +22915,7 @@ const Host = struct {
             const surface = tab.focusedSurface() orelse continue;
             const title = if (surface.effectiveTitle()) |value| value else null;
             const active = i == self.active_tab;
+            const bell = tab.bellRinging();
             const pane_count = tab.leafCount();
             const show_pane_count = shouldShowPaneCount(button_width, pane_count);
             // A program status badge takes its slot out of the label's room,
@@ -22796,6 +22932,7 @@ const Host = struct {
             const label_inputs_unchanged = tab.button_hwnd != null and
                 tab.button_label_cache_valid and
                 title_unchanged and
+                tab.cached_button_bell == bell and
                 tab.cached_button_index == i and
                 tab.cached_button_active == active and
                 tab.cached_button_pane_count == pane_count and
@@ -22825,9 +22962,17 @@ const Host = struct {
                 // made an animated title flicker the popup: `refreshTabTooltip`.
                 if (shown == tab.id) tooltip_title_changed = !title_unchanged;
             }
+            // The glyph is part of the drawn title, so the label's budget
+            // pays for it; the cached title (tooltip, UIA name, palette) and
+            // the pane's own title stay without it.
+            const bell_title = if (bell)
+                try win32_bell.withTitleGlyph(self.app.core_app.alloc, title orelse "noctty")
+            else
+                null;
+            defer if (bell_title) |value| self.app.core_app.alloc.free(value);
             const label = try buildTabButtonLabel(
                 self.app.core_app.alloc,
-                title,
+                bell_title orelse title,
                 i,
                 active,
                 pane_count,
@@ -22872,6 +23017,7 @@ const Host = struct {
             // `cached_button_title`, so raising first announced the PREVIOUS
             // title -- the one the rename was replacing.
             try appendOwnedString(self.app.core_app.alloc, &tab.cached_button_title, title);
+            tab.cached_button_bell = bell;
             tab.cached_button_index = i;
             tab.cached_button_active = active;
             tab.cached_button_pane_count = pane_count;
@@ -26853,6 +26999,8 @@ fn tabStatusHeadline(tab: *const Tab) ?TabProgramStatus {
 
 /// What a screen reader is told about a tab's status, as a hash that
 /// progress alone doesn't change; never 0, which stands for no status.
+const tab_bell_status_key: u64 = 2;
+
 fn tabStatusKey(status: TabProgramStatus) u64 {
     var hasher = std.hash.Wyhash.init(0);
     win32_program_status.hashAnnounced(&hasher, &status.surface.program_status, status.record);
@@ -33957,6 +34105,9 @@ pub const Surface = struct {
     mouse_visible: bool = true,
     hovered_link: ?[:0]const u8 = null,
     window_focused: bool = false,
+    /// The bell rang here while the user was not looking; the tab label and
+    /// the window caption carry the glyph until `clearBell`.
+    bell_ringing: bool = false,
     decorations_visible: bool = true,
     decorations_visible_overridden: bool = false,
     fullscreen: bool = false,
@@ -36192,6 +36343,26 @@ pub const Surface = struct {
 
     fn effectiveTitle(self: *const Surface) ?[:0]const u8 {
         return resolveWindowBaseTitle(self.title, self.title_override, self.tab_title_override);
+    }
+
+    /// Mark or unmark the terminal as alerted by the bell. Only the DISPLAY
+    /// of the title changes (`syncWindowTitle`, `syncTabButtons`): the stored
+    /// title, `effectiveTitle` and everything that reads it (`title-report`,
+    /// sessions, automation, notifications) stay as the program set them.
+    fn setBellRinging(self: *Surface, ringing: bool) void {
+        if (self.bell_ringing == ringing) return;
+        self.bell_ringing = ringing;
+        self.refreshWindowTitle() catch |err| {
+            log.warn("win32 bell title refresh failed err={}", .{err});
+        };
+        // The tab's UIA ItemStatus says "Bell" while it rings.
+        if (self.app.findTabForSurface(self)) |found| found.host.refreshTabStatus(found.index);
+    }
+
+    /// The user focused this terminal or typed into it: the bell has been
+    /// answered.
+    fn clearBell(self: *Surface) void {
+        if (self.bell_ringing) self.setBellRinging(false);
     }
 
     fn promptTitle(self: *Surface, kind: apprt.action.PromptTitle) !void {
@@ -38945,6 +39116,8 @@ pub const Surface = struct {
         // incremented, so it could never fire.
         self.render_trace.noteSurfaceFocusChanged(focused);
         const focus_state_changed = if (focused) self.app.noteSurfaceFocused(self) else false;
+        // After the tab is active, so the caption it rewrites is this tab's.
+        if (focused) self.clearBell();
         if (!self.core_initialized) return;
         if (focused) self.app.core_app.focusSurface(self.core());
         self.core_surface.focusCallback(focused) catch |err| {
@@ -38975,6 +39148,9 @@ pub const Surface = struct {
         typed: *const win32_input.TypedChars,
     ) void {
         if (!self.core_initialized) return;
+        // A press answers the bell; a release does not (it can belong to the
+        // key that ran the command that rang it).
+        if (msg == c.WM_KEYDOWN or msg == c.WM_SYSKEYDOWN) self.clearBell();
 
         // Under Kitty `report_all` the text must ride on the physical key
         // event so press and release keep one identity, and under Win32
