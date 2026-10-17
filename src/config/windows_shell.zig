@@ -469,16 +469,7 @@ fn openPathNoRedirect(path: []const u8) ?windows.HANDLE {
     // Older Windows also treats the DOS drive-letter mapping as a reparse.
     // Resolve just that mapping without opening a filesystem target, and accept
     // only a direct local volume device. The rest keeps the kernel guard.
-    const drive_w: [2:0]u16 = .{ path[0], ':' };
-    var device_buf: [512]u16 = undefined;
-    const device = internal_os.windows.directVolumeDeviceName(&drive_w, &device_buf) orelse return null;
-    if (wide.len < 7 or wide.data[5] != ':' or wide.data[6] != '\\') return null;
-    const final_len = device.len + wide.len - 6;
-    if (final_len >= wide.data.len) return null;
-    std.mem.copyBackwards(u16, wide.data[device.len..final_len], wide.data[6..wide.len]);
-    @memcpy(wide.data[0..device.len], device);
-    wide.len = final_len;
-    wide.data[final_len] = 0;
+    if (!internal_os.windows.directVolumePath(&wide)) return null;
     var name: windows.UNICODE_STRING = .{
         .Length = @intCast(wide.span().len * 2),
         .MaximumLength = @intCast(wide.span().len * 2),

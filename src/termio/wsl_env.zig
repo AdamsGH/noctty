@@ -272,9 +272,14 @@ fn isLocalAbsolute(path: []const u8) bool {
 /// final component with FILE_OPEN_REPARSE_POINT would not protect ancestors.
 const LocalPath = enum { safe, missing, unsafe };
 fn localPathState(path: []const u8) LocalPath {
+    return localPathStateWithMapping(path, os_windows.directVolumePath);
+}
+
+fn localPathStateWithMapping(path: []const u8, comptime map: anytype) LocalPath {
     if (comptime builtin.os.tag != .windows) return .unsafe;
     if (!isLocalAbsolute(path)) return .unsafe;
-    const wide = windows.sliceToPrefixedFileW(null, path) catch return .unsafe;
+    var wide = windows.sliceToPrefixedFileW(null, path) catch return .unsafe;
+    if (!map(&wide)) return .unsafe;
     const span = wide.span();
     var name: windows.UNICODE_STRING = .{
         .Length = @intCast(span.len * 2),
@@ -807,6 +812,25 @@ test "probeKey distinguishes forwarded HOME and cwd independent of map order" {
     const forwarded = try probeKey(alloc, &a, argv, "C:\\one");
     try a.put("GHOSTTY_SURFACE_ID", "3");
     try std.testing.expect(forwarded != try probeKey(alloc, &a, argv, "C:\\one"));
+}
+
+test "WSL guarded paths map DOS roots without an unchecked fallback" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const Reject = struct {
+        fn map(_: *windows.PathSpace) bool {
+            return false;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "safe.txt", .data = "safe" });
+    const path = try tmp.dir.realpathAlloc(alloc, "safe.txt");
+    defer alloc.free(path);
+    try std.testing.expectEqual(LocalPath.unsafe, localPathStateWithMapping(path, Reject.map));
+    try std.testing.expectEqual(LocalPath.safe, localPathStateWithMapping(path, os_windows.directVolumePath));
+    try tmp.dir.deleteFile("safe.txt");
+    try std.testing.expectEqual(LocalPath.missing, localPathStateWithMapping(path, os_windows.directVolumePath));
 }
 
 test "localExecutable refuses remote device and ambiguous search paths" {

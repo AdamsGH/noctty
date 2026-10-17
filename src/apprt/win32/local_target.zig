@@ -12,8 +12,15 @@ const IO_REPARSE_TAG_CLOUD = 0x9000001a;
 extern "kernel32" fn GetFinalPathNameByHandleW(handle: windows.HANDLE, path: [*]u16, size: u32, flags: u32) callconv(.winapi) u32;
 
 pub fn open(alloc: std.mem.Allocator, path: []const u8, read_data: bool) ?std.fs.File {
-    if (localRoot(path) == null) return null;
-    const wide = windows.sliceToPrefixedFileW(null, path) catch return null;
+    return openWithMapping(alloc, path, read_data, os_windows.directVolumePath);
+}
+
+fn openWithMapping(alloc: std.mem.Allocator, path: []const u8, read_data: bool, comptime map: anytype) ?std.fs.File {
+    const root_len = localRoot(path) orelse return null;
+    var wide = windows.sliceToPrefixedFileW(null, path) catch return null;
+    // Windows 10 can reject the DOS drive alias itself under OBJ_DONT_REPARSE.
+    // Resolve only that alias; all filesystem components retain the guard.
+    if (root_len == 3 and !map(&wide)) return null;
     var handle: windows.HANDLE = undefined;
     const status = create(wide.span(), null, OBJ_DONT_REPARSE, false, read_data, false, &handle);
     if (status == .SUCCESS) return .{ .handle = handle };
@@ -23,7 +30,7 @@ pub fn open(alloc: std.mem.Allocator, path: []const u8, read_data: bool) ?std.fs
     // scan followed by a normal open would follow unchecked target chains and
     // could race into a share during that scan, before the final-path check.
     var remaining: usize = 256;
-    const file = walk(alloc, path, read_data, 0, &remaining) orelse return null;
+    const file = walk(alloc, path, read_data, 0, &remaining, map) orelse return null;
     if (!hasLocalFinalPath(file.handle)) {
         file.close();
         return null;
@@ -63,10 +70,11 @@ fn create(name_w: []const u16, parent: ?windows.HANDLE, attributes: u32, no_foll
     );
 }
 
-fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usize, remaining: *usize) ?std.fs.File {
+fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usize, remaining: *usize, comptime map: anytype) ?std.fs.File {
     if (depth >= 32) return null;
     const root_len = localRoot(path) orelse return null;
     var root_w = windows.sliceToPrefixedFileW(null, path[0..root_len]) catch return null;
+    if (root_len == 3 and !map(&root_w)) return null;
     if (root_len == 49) {
         // OBJ_DONT_REPARSE rejects the mount manager's Volume{GUID} alias.
         // Read that mapping without opening it, accept only a direct volume
@@ -85,7 +93,7 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
     if (create(root_w.span(), null, OBJ_DONT_REPARSE, true, false, false, &parent) != .SUCCESS) return null;
     var own_parent = true;
     defer if (own_parent) windows.CloseHandle(parent);
-    if (root_len == 49) {
+    {
         var info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
         var io: windows.IO_STATUS_BLOCK = undefined;
         if (windows.ntdll.NtQueryInformationFile(parent, &io, &info, @sizeOf(@TypeOf(info)), .FileAttributeTagInformation) != .SUCCESS or
@@ -126,7 +134,7 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
                 const joined = std.fs.path.resolve(alloc, &.{ target, path[if (last) end else end + 1..] }) catch return null;
                 defer alloc.free(joined);
                 // Keep the reparse handle alive while resolving its target.
-                return walk(alloc, joined, read_data, depth + 1, remaining);
+                return walk(alloc, joined, read_data, depth + 1, remaining, map);
             }
             // Cloud tags differ only in their 4-bit variant field. They are
             // provider placeholders, not name-surrogate redirects. Reopen just
@@ -217,6 +225,35 @@ fn hasLocalFinalPath(handle: windows.HANDLE) bool {
     return localRoot(path) != null;
 }
 
+test "link opener maps DOS roots on fast and walked opens without fallback" {
+    const Reject = struct {
+        fn map(_: *windows.PathSpace) bool {
+            return false;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "safe.txt", .data = "safe" });
+    const path = try tmp.dir.realpathAlloc(alloc, "safe.txt");
+    defer alloc.free(path);
+    // On Windows 11 the unconverted DOS path would succeed. Refusing its
+    // mapping must stop both entry points before they can open that path.
+    try std.testing.expectEqual(null, openWithMapping(alloc, path, true, Reject.map));
+    var remaining: usize = 256;
+    try std.testing.expectEqual(null, walk(alloc, path, true, 0, &remaining, Reject.map));
+    const fast = openWithMapping(alloc, path, true, os_windows.directVolumePath) orelse return error.TestUnexpectedResult;
+    defer fast.close();
+    const walked = walk(alloc, path, true, 0, &remaining, os_windows.directVolumePath) orelse return error.TestUnexpectedResult;
+    defer walked.close();
+    for ([_]std.fs.File{ fast, walked }) |file| {
+        var data: [4]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 4), try file.read(&data));
+        try std.testing.expectEqualStrings("safe", &data);
+        try std.testing.expect(hasLocalFinalPath(file.handle));
+    }
+}
+
 test "link opener allows only the cloud reparse tag family" {
     for (0..16) |variant| {
         try std.testing.expect(isCloudTag(IO_REPARSE_TAG_CLOUD | (@as(u32, @intCast(variant)) << 12)));
@@ -242,7 +279,7 @@ test "link opener walks local volume GUID mount targets" {
     defer alloc.free(normalized);
     try std.testing.expect(localRoot(normalized) != null);
     var remaining: usize = 256;
-    const opened = walk(alloc, normalized, false, 0, &remaining) orelse return error.TestUnexpectedResult;
+    const opened = walk(alloc, normalized, false, 0, &remaining, os_windows.directVolumePath) orelse return error.TestUnexpectedResult;
     defer opened.close();
     try std.testing.expect(hasLocalFinalPath(opened.handle));
 }
