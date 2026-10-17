@@ -16355,6 +16355,22 @@ const Host = struct {
         return false;
     }
 
+    /// Close tab `index` for a gesture of the tab strip: see
+    /// `tabCloseAction`. A window's only tab closes the window, which asks
+    /// once, like the window's own close button, when a process in it would
+    /// be lost. `self` may be gone when this returns true.
+    fn closeTabFromStrip(self: *Host, index: usize) bool {
+        switch (tabCloseAction(self.tabs.items.len)) {
+            .none => return false,
+            .close_tab => return self.closeTabInPlace(index),
+            .close_window => {
+                if (index >= self.tabs.items.len) return false;
+                self.close();
+                return true;
+            },
+        }
+    }
+
     /// Close tab `index` from its own button (its X, a middle click, Delete)
     /// where it is, without selecting it first, so closing a background tab
     /// leaves the active tab in front. `close_tab:this` keeps the tab for
@@ -18782,7 +18798,7 @@ const Host = struct {
 
     fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        if (self.tabs.items.len <= 1 or !self.shouldShowTabBar()) return null;
+        if (tabCloseAction(self.tabs.items.len) == .none or !self.shouldShowTabBar()) return null;
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return null;
         const hwnd = self.tabs.items[index].button_hwnd orelse return null;
         if (sys.IsWindowVisible(hwnd) == 0) return null;
@@ -18801,7 +18817,7 @@ const Host = struct {
 
     fn tabCloseUiaInvoke(ctx: *anyopaque, tab_id: usize) bool {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        if (self.tabs.items.len <= 1 or !self.shouldShowTabBar()) return false;
+        if (tabCloseAction(self.tabs.items.len) == .none or !self.shouldShowTabBar()) return false;
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return false;
         const hwnd = self.tabs.items[index].button_hwnd orelse return false;
         if (sys.IsWindowVisible(hwnd) == 0) return false;
@@ -18888,8 +18904,8 @@ const Host = struct {
         host.notifyTabListUiaChanged();
         try std.testing.expect(!provider.close_child_present);
         app.config.@"window-show-tab-bar" = show_tab_bar;
-        // Execute stale queued messages through the production handler. A
-        // mismatched ID after reorder and a newly sole tab must be harmless.
+        // Execute a stale queued message through the production handler: a
+        // mismatched ID after reorder must be harmless.
         setWindowData(button, &host);
         const tab_id = host.tabs.items[1].id;
         host.tabs.items[1].id = 99;
@@ -18900,10 +18916,14 @@ const Host = struct {
         defer host.tabs.items.len = 2;
         host.tabs.items[0].button_hwnd = button;
         defer host.tabs.items[0].button_hwnd = null;
+        // The tab that went away has no element any more. The one left has
+        // its own, as the only tab (`soleTabCloseTestBody` closes it).
         try std.testing.expect(state.close_bounds.?(state.ctx, state.tag) == null);
         try std.testing.expect(!state.close_invoke.?(state.ctx, state.tag));
-        _ = tabButtonProc(button, win32_uia.widgets.tab_close_message, 1, 0);
-        try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+        const sole = host.tabItemUiaState(1);
+        try std.testing.expect(sole.close_bounds.?(sole.ctx, sole.tag) != null);
+        try std.testing.expect(sole.close_invoke.?(sole.ctx, sole.tag));
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
     }
 
     test "PKG71 queued close rejects a tab hidden after Invoke" {
@@ -18991,6 +19011,122 @@ const Host = struct {
         _ = tabButtonProc(button, queued.message, queued.wParam, queued.lParam);
         try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
         host.invokeConfirmCancel();
+    }
+
+    test "TABX the only tab draws its close X, offers it to UIA and closes the window" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(soleTabCloseTestBody);
+    }
+
+    fn soleTabCloseTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+            .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+        });
+        defer session.deinit();
+        try app.ensurePaletteListClass();
+        defer _ = sys.UnregisterClassW(palette_list_class_name, app.hinstance);
+        defer for ([_]*?[:0]const u8{
+            &host.cached_overlay_edit,
+            &host.cached_overlay_label,
+            &host.cached_overlay_hint,
+            &host.cached_overlay_preview,
+            &host.cached_overlay_accept,
+            &host.cached_overlay_cancel,
+            &host.cached_window_title,
+        }) |slot| {
+            if (slot.*) |value| std.testing.allocator.free(value);
+            slot.* = null;
+        };
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        defer host.invokeConfirmCancel();
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        const width: i32 = 200;
+        const height: i32 = 34;
+        const button = try createTestChromeChild(window.parent, prompt_button_class);
+        _ = sys.MoveWindow(button, 0, 0, width, height, 0);
+        setWindowData(button, &host);
+        host.tabs.items[0].button_hwnd = button;
+        defer host.tabs.items[0].button_hwnd = null;
+        const zone = host.scaled(host_tab_close_zone_width);
+
+        // UIA: the tab has its close child, over the same zone the pointer
+        // uses, and Invoke queues the close.
+        const state = host.tabItemUiaState(1);
+        const bounds = state.close_bounds.?(state.ctx, state.tag) orelse return error.TestUnexpectedResult;
+        var rect: RECT = undefined;
+        try std.testing.expect(sys.GetWindowRect(button, &rect) != 0);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(zone)), bounds.width);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(rect.right)), bounds.left + bounds.width);
+        try std.testing.expect(state.close_invoke.?(state.ctx, state.tag));
+        var queued: sys.MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&queued, button, win32_uia.widgets.tab_close_message, win32_uia.widgets.tab_close_message, c.PM_REMOVE) != 0);
+
+        // Paint: the X is ink in the close zone, on a background the tab
+        // paints uniformly there.
+        const canvas = try BannerTestCanvas.init(width, height);
+        defer canvas.deinit();
+        fillSolidRect(canvas.dc, .{ .left = 0, .top = 0, .right = width, .bottom = height }, BannerTestCanvas.untouched);
+        const draw: DRAWITEMSTRUCT = .{
+            .CtlType = c.ODT_BUTTON,
+            .CtlID = 1000,
+            .itemID = 0,
+            .itemAction = 0,
+            .itemState = 0,
+            .hwndItem = button,
+            .hDC = canvas.dc,
+            .rcItem = .{ .left = 0, .top = 0, .right = width, .bottom = height },
+            .itemData = 0,
+        };
+        host.drawButton(&draw);
+        _ = BannerTestCanvas.raw.GdiFlush();
+        const ink = canvas.inked(
+            .{ .left = width - zone + 3, .top = 6, .right = width - 3, .bottom = height - 6 },
+            canvas.pixel(width - zone + 1, @divTrunc(height, 2)),
+        );
+        try std.testing.expect(ink > 0);
+
+        // Every gesture that closes a tab from the strip closes the window
+        // when the tab is the only one: a process the setting asks about
+        // makes it ask once for the window, and the tab is not detached.
+        // With no active tab the prompt has no terminal to bring forward,
+        // which the fixture's has no renderer to wake for.
+        host.active_tab = 1;
+        defer host.active_tab = 0;
+        surface.core_surface.readonly = true;
+        surface.core_initialized = true;
+        defer surface.core_initialized = false;
+        _ = tabButtonProc(button, win32_uia.widgets.tab_close_message, 1, 0);
+        try expectSoleTabWindowPrompt(&host);
+        // The first gesture laid the strip out, so measure the button again.
+        var client: RECT = undefined;
+        try std.testing.expect(sys.GetClientRect(button, &client) != 0);
+        const point: LPARAM = (@as(LPARAM, @divTrunc(client.bottom, 2)) << 16) | @as(LPARAM, client.right - @divTrunc(zone, 2));
+        _ = tabButtonProc(button, c.WM_LBUTTONDOWN, 1, point);
+        _ = tabButtonProc(button, c.WM_LBUTTONUP, 0, point);
+        try expectSoleTabWindowPrompt(&host);
+        _ = tabButtonProc(button, c.WM_MBUTTONUP, 0, point);
+        try expectSoleTabWindowPrompt(&host);
+        _ = tabButtonProc(button, c.WM_KEYDOWN, c.VK_DELETE, 0);
+        try expectSoleTabWindowPrompt(&host);
+    }
+
+    fn expectSoleTabWindowPrompt(host: *Host) !void {
+        try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+        try std.testing.expectEqualStrings("Close this window?", host.confirm_payload.?.title);
+        try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+        try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+        host.invokeConfirmCancel();
+        try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
     }
 
     fn activeTabUiaProvider(ctx: *anyopaque) ?*win32_uia.ChromeControlProvider {
@@ -20381,8 +20517,8 @@ const Host = struct {
         _ = sys.AppendMenuW(menu, c.MF_STRING, c.CTX_TAB_MOVE_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Move Tab Right"));
         _ = sys.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
 
-        // Only allow closing if there's more than one tab
-        const close_flag: UINT = if (self.tabs.items.len > 1) c.MF_STRING else c.MF_GRAYED;
+        // The only tab closes too: its window goes with it (`tabCloseAction`).
+        const close_flag: UINT = if (tabCloseAction(self.tabs.items.len) != .none) c.MF_STRING else c.MF_GRAYED;
         _ = sys.AppendMenuW(menu, close_flag, c.CTX_TAB_CLOSE, std.unicode.utf8ToUtf16LeStringLiteral("Close Tab"));
         _ = sys.AppendMenuW(menu, if (self.tabs.items.len > 1) c.MF_STRING else c.MF_GRAYED, c.CTX_TAB_CLOSE_OTHERS, std.unicode.utf8ToUtf16LeStringLiteral("Close Other Tabs"));
 
@@ -20403,6 +20539,7 @@ const Host = struct {
                 runUiActionOrLog("tab context rename failed", surface.promptTitle(.tab));
             },
             c.CTX_TAB_CLOSE => {
+                if (tabCloseAction(self.tabs.items.len) == .close_window) return self.close();
                 _ = self.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
                     log.warn("close_tab action failed err={}", .{err});
                 };
@@ -21266,7 +21403,7 @@ const Host = struct {
         }
 
         // Per-tab close button: reserve space and determine if close zone is active
-        const can_close_tab = tab_button and !overlay and self.tabs.items.len > 1;
+        const can_close_tab = tab_button and !overlay and tabCloseAction(self.tabs.items.len) != .none;
         const close_zone_width = if (can_close_tab) self.scaled(host_tab_close_zone_width) else 0;
 
         var text_buf: [160]u16 = undefined;
@@ -31125,10 +31262,10 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                 win32_uia.widgets.tab_close_message => {
                     // Revalidate closability after Invoke waited in the queue:
                     // the tab may have moved, scrolled out, or become hidden.
-                    if (v.tabs.items.len > 1 and v.tabs.items[index].id == wParam and
+                    if (tabCloseAction(v.tabs.items.len) != .none and v.tabs.items[index].id == wParam and
                         v.shouldShowTabBar() and sys.IsWindowVisible(hwnd) != 0)
                     {
-                        _ = v.closeTabInPlace(index);
+                        _ = v.closeTabFromStrip(index);
                     }
                     return 0;
                 },
@@ -31146,7 +31283,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                     var btn_rect: RECT = undefined;
                     _ = sys.GetClientRect(hwnd, &btn_rect);
                     const close_left = btn_rect.right - v.scaled(host_tab_close_zone_width);
-                    if (down_x >= close_left and v.tabs.items.len > 1) {
+                    if (down_x >= close_left and tabCloseAction(v.tabs.items.len) != .none) {
                         // Click in close zone — capture for mouseup but don't start drag
                         _ = sys.SetCapture(hwnd);
                     } else {
@@ -31191,7 +31328,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                         .activate => {
                             _ = v.activateTabIndex(index);
                         },
-                        .close => _ = v.closeTabInPlace(index),
+                        .close => _ = v.closeTabFromStrip(index),
                         .none => {},
                     }
                     return 0;
@@ -31342,7 +31479,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                                 }
                             },
                             .close => {
-                                if (v.tabs.items.len > 1 and v.closeTabInPlace(index)) return 0;
+                                if (v.closeTabFromStrip(index)) return 0;
                             },
                             .overview => {
                                 if (v.activateTabIndex(index)) {
@@ -31356,7 +31493,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                     }
                 },
                 c.WM_MBUTTONUP => {
-                    if (v.tabs.items.len > 1 and v.closeTabInPlace(index)) return 0;
+                    if (v.closeTabFromStrip(index)) return 0;
                 },
                 c.WM_LBUTTONDBLCLK => {
                     if (v.activateTabIndex(index)) {
@@ -32385,8 +32522,32 @@ fn tabButtonMouseUpAction(
     if (drag_index != null) {
         return if (was_drag) .none else .activate;
     }
-    if (tab_count > 1 and click_x >= close_left) return .close;
+    if (tabCloseAction(tab_count) != .none and click_x >= close_left) return .close;
     return .none;
+}
+
+const TabCloseAction = enum {
+    /// There is no tab to close.
+    none,
+    /// Close that tab and leave the window to the others.
+    close_tab,
+    /// The tab is the window's only one: close the window.
+    close_window,
+};
+
+/// What a window with `tab_count` tabs does when its tab strip closes a tab:
+/// the X, a middle click, Delete on a focused tab, the context menu's
+/// "Close Tab" and a UIA Invoke of the close element. Every tab has the
+/// close X, the only one included, since an undecorated window has no caption
+/// button to close it with. The only tab closes the window the way the window's
+/// own close button does, because `close_tab:this` on it keeps an empty frame
+/// on screen for `undo-timeout` (measured, TABX).
+fn tabCloseAction(tab_count: usize) TabCloseAction {
+    return switch (tab_count) {
+        0 => .none,
+        1 => .close_window,
+        else => .close_tab,
+    };
 }
 
 fn desiredMoveIndex(total: usize, current: usize, amount: isize) ?usize {
@@ -52436,6 +52597,37 @@ test "win32 tab button mouse-up only closes when released in close zone" {
     try std.testing.expectEqual(
         TabButtonMouseUpAction.none,
         tabButtonMouseUpAction(null, false, 40, 100, 3),
+    );
+}
+
+test "TABX a window's only tab closes the window and any other tab closes itself" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    try std.testing.expectEqual(TabCloseAction.none, tabCloseAction(0));
+    try std.testing.expectEqual(TabCloseAction.close_window, tabCloseAction(1));
+    try std.testing.expectEqual(TabCloseAction.close_tab, tabCloseAction(2));
+    try std.testing.expectEqual(TabCloseAction.close_tab, tabCloseAction(40));
+    // No close zone, no close, with nothing to close.
+    try std.testing.expectEqual(
+        TabButtonMouseUpAction.none,
+        tabButtonMouseUpAction(null, false, 100, 100, 0),
+    );
+}
+
+test "TABX the close zone of the only tab closes it, and a click elsewhere does not" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    try std.testing.expectEqual(
+        TabButtonMouseUpAction.close,
+        tabButtonMouseUpAction(null, false, 100, 100, 1),
+    );
+    try std.testing.expectEqual(
+        TabButtonMouseUpAction.none,
+        tabButtonMouseUpAction(null, false, 40, 100, 1),
+    );
+    try std.testing.expectEqual(
+        TabButtonMouseUpAction.activate,
+        tabButtonMouseUpAction(0, false, 40, 100, 1),
     );
 }
 
