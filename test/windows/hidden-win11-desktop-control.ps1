@@ -142,9 +142,12 @@ public static class HiddenDesktopControlWindow {
 function Invoke-PrivateDesktopControlDriver([string] $Run, [string] $DesktopName) {
     Assert-HiddenRunner
     if ($DesktopName -cnotmatch '^noctty-hw-[0-9a-f]{32}$') { throw 'Invalid private control desktop.' }
-    # Connect only this thread; no child, window, foreground or input operation.
+    # Connect this thread, then retain a hidden sentinel on its assigned desktop.
     $actual = [HiddenWin]::CurrentDesktopName()
     if ($actual -cne $DesktopName) { throw 'Private control driver is on the wrong desktop.' }
+    $sentinel = [HiddenWin]::CreateDriverSentinel()
+    $driverFailure = $null
+    try {
     @{ ProcessId = $PID; Desktop = $actual; Connected = $true; WindowStation = [HiddenWin]::CurrentWindowStationName()
         SessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $Run 'private-driver-ready.json')
@@ -153,6 +156,7 @@ function Invoke-PrivateDesktopControlDriver([string] $Run, [string] $DesktopName
         if ([datetime]::UtcNow -ge $deadline) { throw 'Private control driver exceeded twenty seconds.' }
         Start-Sleep -Milliseconds 50
     }
+    } catch { $driverFailure = $_; throw } finally { Close-HiddenDriverSentinel -Sentinel $sentinel -Run $Run -PrimaryFailure $driverFailure }
 }
 
 function Invoke-PrivateDesktopControlParent([string] $Run) {
@@ -163,7 +167,7 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
     [void](New-Item -ItemType Directory -Path $Run)
     $desktopName = 'noctty-hw-' + [guid]::NewGuid().ToString('N')
     $desktop = [IntPtr]::Zero; $job = [IntPtr]::Zero; $driver = $null
-    $readyObserved = $false; $observed = $false; $passed = $false; $cleaned = $false; $count = 0; $observationFailure = $null
+    $readyObserved = $false; $observed = $false; $passed = $false; $cleaned = $false; $count = 0
     try {
         $desktop = [HiddenWin]::CreateInheritedDesktop($desktopName)
         $job = [HiddenWin]::CreateOwnedJob()
@@ -174,13 +178,6 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
         do {
             if ([HiddenWin]::WaitForSingleObject($driver.process, 100) -ne 258) { throw 'Private control driver exited before observation.' }
             Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'private-default-windows.jsonl')
-            try {
-                Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-startup-desktops.jsonl')
-            } catch {
-                # Retain the first failure and fail the control after collecting readiness evidence.
-                # This helper can only connect/query its own desktop; no further launch is allowed.
-                if ($null -eq $observationFailure) { $observationFailure = $_ }
-            }
             $ready = $null
             $readyPath = Join-Path $Run 'private-driver-ready.json'
             if (Test-Path -LiteralPath $readyPath) {
@@ -192,9 +189,8 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
         if ($ready.WindowStation -cne [HiddenWin]::CurrentWindowStationName() -or
             $ready.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId -or
             @([HiddenWin]::JobProcessIds($job)) -notcontains $driver.pid) { throw 'Private control driver identity mismatch.' }
-        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl') -NoWindows
+        Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $driver.pid -ReceiptPath (Join-Path $Run 'private-ready-desktops.jsonl') -RequiredWindowPid $driver.pid
         $observed = $true
-        if ($null -ne $observationFailure) { throw $observationFailure }
         Set-Content -LiteralPath (Join-Path $Run 'stop-private-control') -Value ''
         if ([HiddenWin]::WaitForSingleObject($driver.process, 5000) -ne 0) { throw 'Private control driver stop exceeded five seconds.' }
         [uint32]$exitCode = 0
@@ -208,7 +204,7 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
             if ($desktop -ne [IntPtr]::Zero) { [void][HiddenWin]::CloseDesktop($desktop) }
             @{ Passed = ($passed -and $cleaned)
                 ExpectedDesktop = $desktopName; DriverPid = $(if ($driver) { $driver.pid } else { 0 }); MainThreadId = $(if ($driver) { $driver.tid } else { 0 })
-                DriverConnected = $readyObserved; ReadyObservationPassed = $observed; StartupObservationFailed = ($null -ne $observationFailure)
+                DriverConnected = $readyObserved; ReadyObservationPassed = $observed; DriverWindowObserved = $observed
                 OwnedJobCleanedUp = $cleaned; OwnedProcessCount = $count } | ConvertTo-Json |
                 Set-Content -LiteralPath (Join-Path $Run 'private-desktop-control-results.json')
         }

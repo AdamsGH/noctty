@@ -52,6 +52,9 @@ if (-not $Driver) {
 
 $desktopName = [HiddenWin]::CurrentDesktopName()
 if (-not $desktopName.StartsWith('noctty-hw-')) { throw "Driver is not on its own desktop (found '$desktopName')." }
+$sentinel = [HiddenWin]::CreateDriverSentinel()
+$driverFailure = $null; $job = [IntPtr]::Zero
+try {
 Wait-HiddenDriverApproval -Run $Run -DesktopName $desktopName
 $job = [HiddenWin]::CreateOwnedJob()
 $checks = [Collections.Generic.List[object]]::new()
@@ -149,3 +152,4 @@ if ($NegativeControl) {
     if ($fired) { exit 0 } else { exit 1 }
 }
 if ($failed.Count) { exit 1 }
+} catch { $driverFailure = $_; throw } finally { Close-HiddenDriverSentinel -Sentinel $sentinel -Run $Run -WaitForParent -PrimaryFailure $driverFailure -OwnedJob $job }

@@ -206,6 +206,38 @@ Assert-HiddenMutation 'current desktop never connected' $nativeCode ($nativeCode
 Assert-HiddenMutation 'unrelated default window counted' $nativeCode ($nativeCode.Replace('if (ids.Contains(id))', 'if (true)')) ${function:Test-HiddenNativeCode}
 Assert-HiddenMutation 'invisible default job window omitted' $nativeCode ($nativeCode.Replace('if (ids.Contains(id))', 'if (ids.Contains(id) && IsWindowVisible(h))')) ${function:Test-HiddenNativeCode}
 
+$sentinelMethods = ([regex]::Matches($hiddenLibText, '(?ms)^    public static (?:IntPtr CreateDriverSentinel|void DestroyDriverSentinel)\(.*?^    }') | ForEach-Object Value) -join "`n"
+function Test-DriverSentinelNative([string] $Methods) {
+    $typeName = 'DriverSentinelContract' + [guid]::NewGuid().ToString('N')
+    $support = @'
+using System;
+using System.Runtime.InteropServices;
+public static class TYPE_NAME {
+    public static bool CreateFails, DestroyFails, RunnerDenied;
+    static class Environment { public static string GetEnvironmentVariable(string name) { return RunnerDenied ? "denied" : name == "GITHUB_ACTIONS" ? "true" : "github-hosted"; } }
+    public static int Creates, Destroys;
+    static IntPtr CreateWindowExW(uint ex, string cls, string title, uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr parameter) {
+        Creates++;
+        if (ex != 0x08000080 || cls != "STATIC" || title != "" || style != 0x80000000 || x != 0 || y != 0 || width != 1 || height != 1 || parent != IntPtr.Zero) throw new Exception("Sentinel must be hidden, nonactivating, top-level and tiny");
+        Marshal.SetLastPInvokeError(5); return CreateFails ? IntPtr.Zero : new IntPtr(8);
+    }
+    static bool DestroyWindow(IntPtr hwnd) { if (hwnd != new IntPtr(8)) throw new Exception("Wrong sentinel"); Destroys++; Marshal.SetLastPInvokeError(1400); return !DestroyFails; }
+METHODS
+}
+'@
+    $type = Add-Type -TypeDefinition ($support.Replace('TYPE_NAME', $typeName).Replace('METHODS', $Methods)) -PassThru | Where-Object Name -eq $typeName
+    foreach ($fixture in @(@{}, @{ RunnerDenied = $true; Api = 'Driver sentinel requires an ephemeral GitHub-hosted runner' }, @{ CreateFails = $true; Api = 'Create driver sentinel'; Code = 5 }, @{ DestroyFails = $true; Api = 'Destroy driver sentinel'; Code = 1400 })) {
+        $type::Creates = $type::Destroys = 0; $type::CreateFails = [bool]$fixture.CreateFails; $type::DestroyFails = [bool]$fixture.DestroyFails; $type::RunnerDenied = [bool]$fixture.RunnerDenied
+        $failure = $null
+        try { $hwnd = $type::CreateDriverSentinel(); $type::DestroyDriverSentinel($hwnd) } catch { $failure = $_.Exception.InnerException }
+        if ([bool]$failure -ne [bool]$fixture.Api -or ($failure -and ($failure.Message -cne $fixture.Api -or $failure.NativeErrorCode -ne $fixture.Code)) -or $type::Creates -ne [int](-not $fixture.RunnerDenied) -or $type::Destroys -ne [int](-not ($fixture.CreateFails -or $fixture.RunnerDenied))) { throw 'Sentinel create/destroy lifecycle or native failure evidence changed.' }
+    }
+}
+Assert-HiddenMutation 'driver sentinel made visible' $sentinelMethods ($sentinelMethods.Replace('0x80000000', '0x90000000')) ${function:Test-DriverSentinelNative}
+Assert-HiddenMutation 'driver sentinel can activate' $sentinelMethods ($sentinelMethods.Replace('0x08000080', '0x00000080')) ${function:Test-DriverSentinelNative}
+Assert-HiddenMutation 'driver sentinel destruction omitted' $sentinelMethods ($sentinelMethods.Replace('!DestroyWindow(hwnd)', 'false')) ${function:Test-DriverSentinelNative}
+Assert-HiddenMutation 'driver sentinel native runner guard omitted' $sentinelMethods ($sentinelMethods.Replace('Environment.GetEnvironmentVariable("GITHUB_ACTIONS") != "true" || Environment.GetEnvironmentVariable("RUNNER_ENVIRONMENT") != "github-hosted"', 'false')) ${function:Test-DriverSentinelNative}
+
 # Compile the real named-desktop oracle against callable Win32 seams.
 $privateWindows = [regex]::Match($hiddenLibText, '(?ms)^    public static DesktopWindowObservation\[\] PrivateJobWindows\(.*?^    }').Value
 function Test-PrivateWindowNative([string] $Method) {
@@ -450,7 +482,7 @@ function Test-HiddenDriverCode([string] $Code) {
     $script:defaultOracleCalls = 0; $script:metadataCalls = 0; $script:oracleThrows = $false
     function Assert-HiddenDefaultDesktop { $script:defaultOracleCalls++; if ($script:oracleThrows) { throw 'Hidden desktop fixture visible default window' } }
     function Assert-HiddenDesktop { $script:metadataCalls++ }
-    function Approve-HiddenDriver { return $true }
+    function Approve-HiddenDriver { param($Job, $Run); Set-Content -LiteralPath (Join-Path $Run 'driver-desktop-release-requested') -Value ''; return $true }
     [HiddenDriverContract]::Waits = [HiddenDriverContract]::Stops = [HiddenDriverContract]::ExitReads = 0
     [HiddenDriverContract]::ExitCode = 0; [HiddenDriverContract]::ExitQueryFails = $false
     $fixture = Join-Path ([IO.Path]::GetTempPath()) ('noctty-hidden-contract-' + [guid]::NewGuid().ToString('N'))
@@ -468,6 +500,7 @@ function Test-HiddenDriverCode([string] $Code) {
             [HiddenDriverContract]::Desktop -notmatch '^WinSta0\\noctty-hw-[0-9a-f]{32}$') { throw 'Driver launch lost run-scoped app data or explicit desktop.' }
         if ($env:LOCALAPPDATA -cne $savedLocal -or $env:APPDATA -cne $savedRoaming) { throw 'Driver did not restore its environment.' }
         if ([HiddenDriverContract]::Stops -ne 1) { throw 'Driver must clean up its owned job.' }
+        if (-not (Test-Path -LiteralPath (Join-Path $runPath 'driver-desktop-released'))) { throw 'Parent omitted sentinel release acknowledgment after private observation.' }
         $script:defaultOracleCalls = 0; $script:metadataCalls = 0; $script:oracleThrows = $true
         [HiddenDriverContract]::Waits = [HiddenDriverContract]::Stops = [HiddenDriverContract]::ExitReads = 0
         $blocked = $false
@@ -503,7 +536,7 @@ function Test-HiddenDriverCode([string] $Code) {
 Assert-HiddenMutation 'driver desktop null' $driverFunction ($driverFunction.Replace('"WinSta0\$desktopName"', '$null')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'driver runner gate removed' $driverFunction ($driverFunction.Replace('    Assert-HiddenRunner', '')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'outer window oracle removed' $driverFunction ($driverFunction -replace '(?m)^\s+Assert-HiddenDefaultDesktop[^\r\n]*', '') ${function:Test-HiddenDriverCode}
-Assert-HiddenMutation 'outer thread metadata removed' $driverFunction ($driverFunction -replace '(?m)^\s+Assert-HiddenDesktop[^\r\n]*', '') ${function:Test-HiddenDriverCode}
+Assert-HiddenMutation 'outer private window sampling removed' $driverFunction ($driverFunction -replace '(?m)^\s+Assert-HiddenDesktop[^\r\n]*', '') ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'nonzero driver exit accepted' $driverFunction ($driverFunction.Replace('if ($code -ne 0)', 'if ($false)')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'driver exit API failure accepted' $driverFunction ($driverFunction.Replace("throw 'Hidden driver exit code query failed.'", '$null = 0')) ${function:Test-HiddenDriverCode}
 Assert-HiddenMutation 'owned driver job cleanup removed' $driverFunction ($driverFunction.Replace('$ownedProcessCount = [HiddenDriverContract]::StopOwnedJob($job)', '$ownedProcessCount = 0')) ${function:Test-HiddenDriverCode}
@@ -625,9 +658,9 @@ public static class HiddenApprovalContract {
 $approval = (Get-HiddenFunction $hiddenLibText 'Approve-HiddenDriver').Replace('[HiddenWin]', '[HiddenApprovalContract]').Replace('[Diagnostics.Process]::GetCurrentProcess().SessionId', '42')
 function Test-HiddenApproval([string] $Code) {
     . ([scriptblock]::Create($Code))
-    foreach ($fixture in @(@{}, @{ Missing = $true }, @{ Incomplete = $true }, @{ WrongPid = $true; Blocked = $true }, @{ WrongDesktop = $true; Blocked = $true },
+    foreach ($fixture in @(@{}, @{ Missing = $true }, @{ Incomplete = $true }, @{ MissingWindow = $true; Blocked = $true }, @{ WrongPid = $true; Blocked = $true }, @{ WrongDesktop = $true; Blocked = $true },
         @{ WrongStation = $true; Blocked = $true }, @{ WrongSession = $true; Blocked = $true }, @{ MissingMember = $true; Blocked = $true })) {
-        $name = 'noctty-hw-' + ('a' * 32); $script:approvalWrites = 0
+        $name = 'noctty-hw-' + ('a' * 32); $script:approvalWrites = 0; $script:approvalWindowChecks = 0
         [HiddenApprovalContract]::MissingMember = [bool]$fixture.MissingMember
         function Test-Path { return -not $fixture.Missing }
         function Get-Content {
@@ -636,16 +669,68 @@ function Test-HiddenApproval([string] $Code) {
                 WindowStation = $(if ($fixture.WrongStation) { 'wrong' } else { 'fixture-station' }); SessionId = $(if ($fixture.WrongSession) { 99 } else { 42 }) } | ConvertTo-Json
         }
         function Set-Content { param($LiteralPath, $Value); if ($LiteralPath -cne 'C:\fixture\driver-desktop-approved') { throw 'Wrong approval path' }; $script:approvalWrites++ }
+        function Assert-HiddenDesktop {
+            param($Job, $DesktopName, $DriverPid, $RequiredWindowPid, $ReceiptPath)
+            $script:approvalWindowChecks++
+            if ($script:approvalWrites -or $DriverPid -ne 41 -or $RequiredWindowPid -ne 41 -or $DesktopName -cne $name -or $fixture.MissingWindow) { throw 'Driver sentinel was not independently observed before approval' }
+        }
         $blocked = $false; $approved = $false
         try { $approved = Approve-HiddenDriver -Job ([IntPtr]7) -Run 'C:\fixture' -DesktopName $name -DriverPid 41 } catch { $blocked = $true }
         $expected = -not ($fixture.Blocked -or $fixture.Missing -or $fixture.Incomplete)
         if ($blocked -ne [bool]$fixture.Blocked -or $approved -ne $expected -or $script:approvalWrites -ne [int]$expected) { throw 'Driver approval accepted missing/wrong identity or omitted the exact approval handshake.' }
+        if ($script:approvalWindowChecks -ne [int]($expected -or $fixture.MissingWindow)) { throw 'Parent must enumerate the sentinel only after a complete correct self-receipt.' }
     }
 }
 Assert-HiddenMutation 'driver receipt wrong PID approved' $approval ($approval.Replace('$receipt.ProcessId -ne $DriverPid', '$false')) ${function:Test-HiddenApproval}
 Assert-HiddenMutation 'driver receipt wrong desktop approved' $approval ($approval.Replace('$receipt.Desktop -cne $DesktopName', '$false')) ${function:Test-HiddenApproval}
 Assert-HiddenMutation 'driver receipt wrong station approved' $approval ($approval.Replace('$receipt.WindowStation -cne [HiddenApprovalContract]::CurrentWindowStationName()', '$false')) ${function:Test-HiddenApproval}
 Assert-HiddenMutation 'driver receipt wrong session approved' $approval ($approval.Replace('$receipt.SessionId -ne 42', '$false')) ${function:Test-HiddenApproval}
+Assert-HiddenMutation 'driver sentinel proof before approval omitted' $approval ($approval -replace '(?m)^    Assert-HiddenDesktop[^\r\n]*', '') ${function:Test-HiddenApproval}
+
+if (-not ('SentinelCloseContract' -as [type])) {
+    Add-Type @'
+using System;
+public static class SentinelCloseContract {
+    public static DateTime UtcNow;
+    public static int Stops, Destroys;
+    public static bool StopFails, DestroyFails;
+    public static uint StopOwnedJob(IntPtr job) { if (job != new IntPtr(7)) throw new Exception("wrong job"); Stops++; if (StopFails) throw new Exception("fixture cleanup secret"); return 1; }
+    public static void DestroyDriverSentinel(IntPtr hwnd) { if (hwnd != new IntPtr(8)) throw new Exception("wrong sentinel"); Destroys++; if (DestroyFails) throw new Exception("fixture destroy secret"); }
+}
+'@
+}
+$sentinelClose = (Get-HiddenFunction $hiddenLibText 'Close-HiddenDriverSentinel').Replace('[HiddenWin]', '[SentinelCloseContract]').Replace('[datetime]::UtcNow', '[SentinelCloseContract]::UtcNow')
+function Test-SentinelReleaseCleanup([string] $Code) {
+    . ([scriptblock]::Create($Code))
+    foreach ($fixture in @(@{}, @{ Wait = $true; Owned = $true }, @{ Wait = $true; Owned = $true; Delay = $true },
+        @{ Wait = $true; MissingRelease = $true; Blocked = $true }, @{ Wait = $true; MissingRelease = $true; Primary = $true },
+        @{ Wait = $true; Owned = $true; StopFails = $true; Blocked = $true }, @{ Wait = $true; Owned = $true; StopFails = $true; Primary = $true },
+        @{ DestroyFails = $true; Blocked = $true }, @{ DestroyFails = $true; Primary = $true })) {
+        [SentinelCloseContract]::UtcNow = [datetime]'2026-01-01T00:00:00Z'; [SentinelCloseContract]::Stops = [SentinelCloseContract]::Destroys = 0
+        [SentinelCloseContract]::StopFails = [bool]$fixture.StopFails; [SentinelCloseContract]::DestroyFails = [bool]$fixture.DestroyFails
+        $script:releaseSleeps = 0; $writes = @{}
+        function Start-Sleep { param($Milliseconds); $script:releaseSleeps++; [SentinelCloseContract]::UtcNow = [SentinelCloseContract]::UtcNow.AddMilliseconds($Milliseconds) }
+        function Test-Path { return -not $fixture.MissingRelease -and (-not $fixture.Delay -or $script:releaseSleeps -ge 3) }
+        function Set-Content {
+            param([Parameter(ValueFromPipeline)]$Value, $LiteralPath)
+            process {
+                if ($LiteralPath.EndsWith('driver-desktop-release-requested') -and ([SentinelCloseContract]::Destroys -or ($fixture.Owned -and [SentinelCloseContract]::Stops -ne 1))) { throw 'Release preceded app-owned job cleanup or sentinel lifetime ended early.' }
+                $writes[(Split-Path -Leaf $LiteralPath)] = $Value
+            }
+        }
+        $primary = if ($fixture.Primary) { [Exception]::new('primary secret') } else { $null }; $blocked = $false
+        try { Close-HiddenDriverSentinel -Sentinel ([IntPtr]8) -Run 'C:\fixture' -WaitForParent:([bool]$fixture.Wait) -PrimaryFailure $primary -OwnedJob $(if ($fixture.Owned) { [IntPtr]7 } else { [IntPtr]::Zero }) } catch { $blocked = $true }
+        if ($blocked -ne [bool]$fixture.Blocked -or [SentinelCloseContract]::Destroys -ne 1 -or [SentinelCloseContract]::Stops -ne [int][bool]$fixture.Owned -or $script:releaseSleeps -gt 300 -or
+            ($fixture.Delay -and $script:releaseSleeps -ne 3)) { throw 'Sentinel release lost bounded cleanup or masked a primary body failure.' }
+        $receiptText = $writes['driver-sentinel-cleanup.json']; $receipt = $receiptText | ConvertFrom-Json
+        if (-not $receipt -or $receiptText.Contains('secret') -or $receipt.Destroyed -ne (-not [bool]$fixture.DestroyFails) -or $receipt.OwnedJobCleanedUp -eq [bool]$fixture.StopFails -or
+            $receipt.PrimaryFailurePreserved -ne [bool]$fixture.Primary -or $receipt.CleanupFailed -ne [bool]($fixture.StopFails -or $fixture.DestroyFails -or $fixture.MissingRelease)) { throw 'Sentinel cleanup lost sanitized success/failure/provenance evidence.' }
+        if ($fixture.StopFails -and $writes.ContainsKey('driver-desktop-release-requested')) { throw 'Failed app cleanup must not request sentinel release.' }
+    }
+}
+Assert-HiddenMutation 'sentinel destroy omitted after release' $sentinelClose ($sentinelClose.Replace('[SentinelCloseContract]::DestroyDriverSentinel($Sentinel);', '')) ${function:Test-SentinelReleaseCleanup}
+Assert-HiddenMutation 'sentinel release wait exceeds fifteen seconds' $sentinelClose ($sentinelClose.Replace('::UtcNow.AddSeconds(15)', '::UtcNow.AddSeconds(16)')) ${function:Test-SentinelReleaseCleanup}
+Assert-HiddenMutation 'sentinel cleanup masks primary failure' $sentinelClose ($sentinelClose.Replace('$failure -and $null -eq $PrimaryFailure', '$failure')) ${function:Test-SentinelReleaseCleanup}
 
 if (-not ('HiddenDefaultDesktopContract' -as [type])) {
     Add-Type @'
@@ -806,7 +891,9 @@ function Test-DesktopControlFunctions([string] $Code) {
         function New-Item { }
         function Set-Content {
             param([Parameter(ValueFromPipeline)]$Value, [string]$LiteralPath)
-            process { $writes[(Split-Path -Leaf $LiteralPath)] = $Value }
+            process {
+                $writes[(Split-Path -Leaf $LiteralPath)] = $Value
+            }
         }
         function Get-Content {
             param([string]$LiteralPath, [switch]$Raw)
@@ -876,12 +963,14 @@ if (-not ('PrivateDesktopContract' -as [type])) {
 using System;
 public static class PrivateDesktopContract {
     public static string Desktop, Current;
-    public static int Gates, Creates, Launches, Stops, Closes, StartupSamples, ReadySamples, DefaultSamples, AttachedSamples;
+    public static int Gates, Creates, Launches, Stops, Closes, StartupSamples, ReadySamples, DefaultSamples, AttachedSamples, SentinelCreates, SentinelDestroys;
     public static bool DriverExited, StopTimeout, ExitFails, CleanupFails, AttachedFails, AttachedNative, AttachedCleanup;
     public static string AttachedStage;
     public static DateTime UtcNow;
     public struct ProcessInfo { public int pid, tid; public IntPtr process, thread; }
     public static string CurrentDesktopName() { return Current; }
+    public static IntPtr CreateDriverSentinel() { SentinelCreates++; return new IntPtr(12); }
+    public static void DestroyDriverSentinel(IntPtr h) { if (h != new IntPtr(12)) throw new Exception("Wrong sentinel"); SentinelDestroys++; }
     public static string CurrentWindowStationName() { return "fixture-station"; }
     public static int[] JobProcessIds(IntPtr j) { return new[] { 41, 42 }; }
     public static IntPtr CreateInheritedDesktop(string n) { Desktop = n; Creates++; return new IntPtr(8); }
@@ -911,7 +1000,6 @@ function Test-PrivateDesktopControl([string] $Code) {
     foreach ($fixture in @(
         @{ Mode = 'Parent' }, @{ Mode = 'Driver' }
         @{ Mode = 'Parent'; Relative = $true }
-        @{ Mode = 'Parent'; StartupFails = $true; Blocked = $true }
         @{ Mode = 'Parent'; ReadyFails = $true; Blocked = $true }
         @{ Mode = 'Parent'; WrongReadyPid = $true; Blocked = $true }
         @{ Mode = 'Parent'; WrongReadyDesktop = $true; Blocked = $true }
@@ -929,7 +1017,7 @@ function Test-PrivateDesktopControl([string] $Code) {
         @{ Mode = 'Driver'; InvalidDesktop = $true; Blocked = $true }
         @{ Mode = 'Driver'; MissingStop = $true; Blocked = $true }
     )) {
-        foreach ($field in @('Gates', 'Creates', 'Launches', 'Stops', 'Closes', 'StartupSamples', 'ReadySamples', 'DefaultSamples', 'AttachedSamples')) { [PrivateDesktopContract].GetField($field).SetValue($null, 0) }
+        foreach ($field in @('Gates', 'Creates', 'Launches', 'Stops', 'Closes', 'StartupSamples', 'ReadySamples', 'DefaultSamples', 'AttachedSamples', 'SentinelCreates', 'SentinelDestroys')) { [PrivateDesktopContract].GetField($field).SetValue($null, 0) }
         foreach ($field in @('DriverExited', 'StopTimeout', 'ExitFails', 'CleanupFails', 'AttachedFails', 'AttachedNative', 'AttachedCleanup')) { [PrivateDesktopContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
         [PrivateDesktopContract]::AttachedStage = $fixture.AttachedStage
         [PrivateDesktopContract]::UtcNow = [datetime]'2026-01-01T00:00:00Z'
@@ -939,6 +1027,7 @@ function Test-PrivateDesktopControl([string] $Code) {
         [PrivateDesktopContract]::Current = if ($fixture.WrongCurrent) { 'wrong' } elseif ($fixture.Mode -eq 'Driver') { $expectedDesktop } else { 'Default' }
         $writes = @{}
         function Assert-HiddenRunner { [PrivateDesktopContract]::Gates++; if ($fixture.GateFails) { throw 'Fixture gate' } }
+        function Close-HiddenDriverSentinel { param($Sentinel, $Run, $PrimaryFailure); [PrivateDesktopContract]::DestroyDriverSentinel($Sentinel) }
         function New-Item { }
         function Test-Path {
             param([string]$LiteralPath)
@@ -948,7 +1037,10 @@ function Test-PrivateDesktopControl([string] $Code) {
         }
         function Set-Content {
             param([Parameter(ValueFromPipeline)]$Value, [string]$LiteralPath)
-            process { $writes[(Split-Path -Leaf $LiteralPath)] = $Value }
+            process {
+                if ($LiteralPath.EndsWith('private-driver-ready.json') -and ([PrivateDesktopContract]::SentinelCreates -ne 1 -or [PrivateDesktopContract]::SentinelDestroys -ne 0)) { throw 'Private control readiness must follow sentinel creation and precede its destruction.' }
+                $writes[(Split-Path -Leaf $LiteralPath)] = $Value
+            }
         }
         function Get-Content {
             param([string]$LiteralPath, [switch]$Raw)
@@ -957,8 +1049,8 @@ function Test-PrivateDesktopControl([string] $Code) {
         }
         function Assert-HiddenDefaultDesktop { param($Job, $ReceiptPath); [PrivateDesktopContract]::DefaultSamples++; if ($fixture.OracleFails) { throw 'Fixture default oracle' } }
         function Assert-HiddenDesktop {
-            param($Job, $DesktopName, $DriverPid, $ReceiptPath, [switch]$NoWindows)
-            if ($Job -ne [IntPtr]7 -or $DesktopName -cne [PrivateDesktopContract]::Desktop -or $DriverPid -ne 41) { throw 'Wrong private observer arguments' }
+            param($Job, $DesktopName, $DriverPid, $ReceiptPath, [int]$RequiredWindowPid)
+            if ($Job -ne [IntPtr]7 -or $DesktopName -cne [PrivateDesktopContract]::Desktop -or $DriverPid -ne 41 -or $RequiredWindowPid -ne 41 -or -not (Test-Path -LiteralPath (Join-Path $expectedRun 'private-driver-ready.json'))) { throw 'Wrong private observer arguments' }
             if ($ReceiptPath.EndsWith('private-ready-desktops.jsonl')) {
                 [PrivateDesktopContract]::ReadySamples++; if ($fixture.ReadyFails) { throw 'Fixture ready metadata failure' }
             } else { [PrivateDesktopContract]::StartupSamples++; if ($fixture.StartupFails) { throw 'Fixture startup metadata failure' } }
@@ -971,23 +1063,21 @@ function Test-PrivateDesktopControl([string] $Code) {
         } catch { $blocked = $true }
         if ($blocked -ne [bool]$fixture.Blocked) { throw "Private control fixture $($fixture | ConvertTo-Json -Compress) lost its expected result." }
         if ($fixture.GateFails -or $fixture.Existing -or $fixture.WrongCurrent -or $fixture.InvalidDesktop) {
-            if ([PrivateDesktopContract]::Creates -or [PrivateDesktopContract]::Launches -or $writes.Count) { throw 'Rejected private control had side effects.' }
+            if ([PrivateDesktopContract]::Creates -or [PrivateDesktopContract]::Launches -or [PrivateDesktopContract]::SentinelCreates -or $writes.Count) { throw 'Rejected private control had side effects.' }
             continue
         }
         if ($fixture.Mode -eq 'Driver') {
             $ready = $writes['private-driver-ready.json'] | ConvertFrom-Json
-            if (-not $ready.Connected -or $ready.Desktop -cne $expectedDesktop -or $ready.ProcessId -ne $PID) { throw 'Private driver lost its self-connection receipt.' }
+            if ([PrivateDesktopContract]::SentinelCreates -ne 1 -or [PrivateDesktopContract]::SentinelDestroys -ne 1 -or -not $ready.Connected -or $ready.Desktop -cne $expectedDesktop -or $ready.ProcessId -ne $PID) { throw 'Private driver lost its self-connection receipt.' }
             continue
         }
         if ([PrivateDesktopContract]::Launches -ne 1 -or [PrivateDesktopContract]::Creates -ne 1 -or [PrivateDesktopContract]::Stops -ne 1 -or [PrivateDesktopContract]::Closes -ne 3) { throw 'Private control lost bounded owned cleanup.' }
         $receipt = $writes['private-desktop-control-results.json'] | ConvertFrom-Json
         if (-not $receipt -or $receipt.Passed -ne (-not [bool]$fixture.Blocked) -or $receipt.DriverPid -ne 41 -or $receipt.MainThreadId -ne 11 -or
             $receipt.OwnedJobCleanedUp -eq [bool]$fixture.CleanupFails) { throw 'Private control lost its success/failure/cleanup evidence.' }
-        if ($fixture.StartupFails -and (-not $receipt.StartupObservationFailed -or -not $receipt.DriverConnected -or -not $receipt.ReadyObservationPassed)) { throw 'Startup failure was lost or prevented collection of ready-state evidence.' }
-        if (-not $fixture.Blocked -and ([PrivateDesktopContract]::StartupSamples -lt 1 -or [PrivateDesktopContract]::ReadySamples -ne 1 -or [PrivateDesktopContract]::DefaultSamples -lt 1)) { throw 'Private control omitted startup, forced ready, or Default observations.' }
+        if (-not $fixture.Blocked -and ([PrivateDesktopContract]::StartupSamples -ne 0 -or [PrivateDesktopContract]::ReadySamples -ne 1 -or [PrivateDesktopContract]::DefaultSamples -lt 1)) { throw 'Private control must wait for readiness before private enumeration while keeping Default active.' }
     }
 }
-Assert-HiddenMutation 'private control startup failure forgotten' $privateFunctions ($privateFunctions.Replace('if ($null -ne $observationFailure) { throw $observationFailure }', '')) ${function:Test-PrivateDesktopControl}
 Assert-HiddenMutation 'private control relative run not normalized' $privateFunctions ($privateFunctions.Replace('$Run = [IO.Path]::GetFullPath($Run)', '')) ${function:Test-PrivateDesktopControl}
 Assert-HiddenMutation 'private control ready PID ignored' $privateFunctions ($privateFunctions.Replace(' -and $ready.ProcessId -eq $driver.pid', '')) ${function:Test-PrivateDesktopControl}
 Assert-HiddenMutation 'private control ready desktop ignored' $privateFunctions ($privateFunctions.Replace(' -and $ready.Desktop -ceq $desktopName', '')) ${function:Test-PrivateDesktopControl}
@@ -998,7 +1088,7 @@ Assert-HiddenMutation 'private driver self-connection unchecked' $privateFunctio
 
 $embeddingText = Remove-PowerShellComments (Get-Content -LiteralPath $hiddenScripts[1] -Raw)
 $embeddingAst = [Management.Automation.Language.Parser]::ParseInput($embeddingText, [ref]$null, [ref]$null)
-$embeddingPoll = $embeddingAst.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $n.Extent.Text.Contains('FatalDesktopObservation') }, $true).Extent.Text
+$embeddingPoll = $embeddingAst.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $n.Body.Statements[0] -is [Management.Automation.Language.WhileStatementAst] -and $n.Extent.Text.Contains('FatalDesktopObservation') }, $true).Extent.Text
 if (-not $embeddingPoll) { throw 'Embedding desktop failure evidence path was not found.' }
 if (-not ('EmbeddingAbortContract' -as [type])) { Add-Type 'public static class EmbeddingAbortContract { public static string[] VisibleTopLevelClasses(int pid) { return new string[0]; } }' }
 $embeddingPoll = $embeddingPoll.Replace('[HiddenWin]', '[EmbeddingAbortContract]')

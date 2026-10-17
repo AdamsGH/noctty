@@ -49,6 +49,19 @@ public static class HiddenWin {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateDesktopW(string n, IntPtr dev, IntPtr mode, int flags, uint access, ref SecurityAttributes sa);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateWindowExW(uint ex, string cls, string title, uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr parameter);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool DestroyWindow(IntPtr hwnd);
+    public static IntPtr CreateDriverSentinel() {
+        if (Environment.GetEnvironmentVariable("GITHUB_ACTIONS") != "true" || Environment.GetEnvironmentVariable("RUNNER_ENVIRONMENT") != "github-hosted")
+            throw new Exception("Driver sentinel requires an ephemeral GitHub-hosted runner");
+        // Hidden WS_POPUP, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW. Never shown or activated.
+        var hwnd = CreateWindowExW(0x08000080, "STATIC", "", 0x80000000, 0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (hwnd == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Create driver sentinel");
+        return hwnd;
+    }
+    public static void DestroyDriverSentinel(IntPtr hwnd) {
+        if (!DestroyWindow(hwnd)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Destroy driver sentinel");
+    }
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref Startup si, out ProcessInfo pi);
     [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
@@ -398,6 +411,29 @@ function Wait-HiddenDriverApproval([string] $Run, [string] $DesktopName) {
     }
 }
 
+function Close-HiddenDriverSentinel([IntPtr] $Sentinel, [string] $Run, [switch] $WaitForParent, $PrimaryFailure = $null, [IntPtr] $OwnedJob = [IntPtr]::Zero) {
+    $failure = $null; $destroyed = $false; $jobCleaned = $OwnedJob -eq [IntPtr]::Zero
+    if ($OwnedJob -ne [IntPtr]::Zero) {
+        try { $null = [HiddenWin]::StopOwnedJob($OwnedJob); $jobCleaned = $true } catch { $failure = $_ }
+    }
+    if ($WaitForParent -and $jobCleaned) {
+        try {
+            Set-Content -LiteralPath (Join-Path $Run 'driver-desktop-release-requested') -Value ''
+            $deadline = [datetime]::UtcNow.AddSeconds(15)
+            while (-not (Test-Path -LiteralPath (Join-Path $Run 'driver-desktop-released'))) {
+                if ([datetime]::UtcNow -ge $deadline) { throw 'Driver sentinel release timed out' }
+                Start-Sleep -Milliseconds 50
+            }
+        } catch { $failure = $_ }
+    }
+    try { [HiddenWin]::DestroyDriverSentinel($Sentinel); $destroyed = $true } catch { if ($null -eq $failure) { $failure = $_ } }
+    try {
+        @{ Destroyed = $destroyed; OwnedJobCleanedUp = $jobCleaned; ReleaseRequired = [bool]$WaitForParent; CleanupFailed = $null -ne $failure; PrimaryFailurePreserved = $null -ne $PrimaryFailure } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Run 'driver-sentinel-cleanup.json')
+    } catch { if ($null -eq $failure) { $failure = $_ } }
+    if ($failure -and $null -eq $PrimaryFailure) { throw $failure }
+}
+
 function Approve-HiddenDriver([IntPtr] $Job, [string] $Run, [string] $DesktopName, [int] $DriverPid) {
     $path = Join-Path $Run 'driver-desktop.json'
     if (-not (Test-Path -LiteralPath $path)) { return $false }
@@ -405,6 +441,7 @@ function Approve-HiddenDriver([IntPtr] $Job, [string] $Run, [string] $DesktopNam
     if ($receipt.ProcessId -ne $DriverPid -or @([HiddenWin]::JobProcessIds($Job)) -notcontains $DriverPid -or
         $receipt.Desktop -cne $DesktopName -or $receipt.WindowStation -cne [HiddenWin]::CurrentWindowStationName() -or
         $receipt.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId) { throw 'Hidden desktop driver receipt mismatch; further launches are blocked.' }
+    Assert-HiddenDesktop -Job $Job -DesktopName $DesktopName -DriverPid $DriverPid -RequiredWindowPid $DriverPid -ReceiptPath (Join-Path $Run 'driver-sentinel-windows.jsonl')
     Set-Content -LiteralPath (Join-Path $Run 'driver-desktop-approved') -Value ''
     return $true
 }
@@ -525,12 +562,18 @@ function Invoke-HiddenDriver {
         # CREATE_NO_WINDOW (0x08000000) is part of Launch's flags.
         $pi = [HiddenWin]::Launch($pwsh, $line, $Run, "WinSta0\$desktopName", $job, '')
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
-        $approved = $false
+        $approved = $false; $released = $false
         $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
         while ([HiddenWin]::WaitForSingleObject($pi.process, 100) -eq 258) {
             Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')
-            Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $pi.pid -ReceiptPath (Join-Path $Run 'driver-desktops.jsonl')
             if (-not $approved) { $approved = Approve-HiddenDriver -Job $job -Run $Run -DesktopName $desktopName -DriverPid $pi.pid }
+            if ($approved -and -not $released) {
+                Assert-HiddenDesktop -Job $job -DesktopName $desktopName -DriverPid $pi.pid -RequiredWindowPid $pi.pid -ReceiptPath (Join-Path $Run 'driver-desktops.jsonl')
+                if (Test-Path -LiteralPath (Join-Path $Run 'driver-desktop-release-requested')) {
+                    $released = $true
+                    Set-Content -LiteralPath (Join-Path $Run 'driver-desktop-released') -Value ''
+                }
+            }
             if ([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $TimeoutSeconds seconds; the owned process job will be closed." }
         }
         Assert-HiddenDefaultDesktop -Job $job -ReceiptPath (Join-Path $Run 'default-desktop-windows.jsonl')

@@ -503,8 +503,11 @@ It launches no noctty and stops its owned helpers after the check.
 Both scripts share `hidden-win11-lib.ps1` (private desktop, owned job, explicit
 desktop selection for harness launches, inherited desktop handles for direct
 children, and real-state receipts). The parent validates the driver's desktop
-self-report against its PID, job membership, window station and session before
-approving app launch. The outer process independently enumerates the named private
+self-report against its PID, job membership, window station and session, and
+requires its known PID's hidden control window on the named private desktop before
+approving app launch. The control window stays until app-job cleanup and the parent's final private-window
+check acknowledge a bounded release handshake; Default checks continue through exit.
+The outer process independently enumerates the named private
 desktop and rejects job-owned top-level windows on Default, including hidden
 windows. Profile readiness requires the known noctty PID's window on the private
 desktop before posted input.
@@ -514,6 +517,11 @@ pwsh/conhost threads, even with matching WinSta0/session IDs and a fresh observe
 thread attached to the private desktop. That is a hosted API observation, not
 proof of a desktop escape. The window oracle uses documented `OpenDesktopW` and
 `EnumDesktopWindows` instead of interpreting a denied query as safe.
+A fresh empty desktop returned false/error 0 from `EnumDesktopWindows`, both
+locally and on Server 2022. The known driver control window avoids relying on an
+empty enumeration; false/error 0 remains a failure. The parent checks Default
+while awaiting the driver's ready receipt and does not approve app launch until
+the private-window observation succeeds.
 Sampling does not establish desktop membership of windowless foreign threads or
 prove the absence of a window whose whole lifetime falls between samples.
 No external broker journey is exercised; keep bundled and in-box ConPTY
