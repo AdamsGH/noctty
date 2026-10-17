@@ -2531,6 +2531,41 @@ fn sessionRestorePolicyAllows(
 
 const SessionSaveKind = enum { final, checkpoint };
 
+/// How long the session must stay unchanged before a structural change is
+/// saved (`App.scheduleSessionCheckpoint`).
+const session_checkpoint_delay_ms: u32 = 1000;
+
+const shell_audit_warn_interval_ms: u64 = 60 * std.time.ms_per_s;
+
+/// At most one warning per interval; the ones left out are counted and
+/// reported with the next.
+const RateLimitedWarning = struct {
+    last_ms: ?u64 = null,
+    suppressed: u32 = 0,
+
+    /// The count left out since the last warning when one may be logged at
+    /// `now`, else null.
+    fn take(self: *RateLimitedWarning, now: u64, interval_ms: u64) ?u32 {
+        if (self.last_ms) |last| if (now -% last < interval_ms) {
+            self.suppressed +|= 1;
+            return null;
+        };
+        const suppressed = self.suppressed;
+        self.last_ms = now;
+        self.suppressed = 0;
+        return suppressed;
+    }
+};
+
+test "a rate-limited warning logs once per interval and counts the rest" {
+    var warning: RateLimitedWarning = .{};
+    try std.testing.expectEqual(@as(?u32, 0), warning.take(1_000, 60_000));
+    try std.testing.expectEqual(@as(?u32, null), warning.take(2_000, 60_000));
+    try std.testing.expectEqual(@as(?u32, null), warning.take(60_999, 60_000));
+    try std.testing.expectEqual(@as(?u32, 2), warning.take(61_000, 60_000));
+    try std.testing.expectEqual(@as(?u32, null), warning.take(61_001, 60_000));
+}
+
 /// An empty snapshot ends the saved session only on the owner's final save;
 /// a checkpoint keeps the file. True when the file was removed.
 fn removeEmptySessionState(path: []const u8, kind: SessionSaveKind) bool {
@@ -2759,6 +2794,9 @@ pub const App = struct {
     session_ending: bool = false,
     /// `GetTickCount64` of the last `checkpointSessionState`.
     session_checkpoint_ms: ?u64 = null,
+    /// Thread timer that saves the session once a burst of structural
+    /// changes settles (`scheduleSessionCheckpoint`).
+    session_checkpoint_timer_id: ?UINT_PTR = null,
     /// True only while the app is synchronously draining every host during
     /// shutdown. Child HWND teardown still repairs native split trees, but it
     /// must not diagnose the intentionally absent per-pane close preflight as
@@ -2909,6 +2947,12 @@ pub const App = struct {
     shell_compositor_initialized: bool = false,
     shell_runtime: win32_shell.runtime.Runtime = undefined,
     shell_runtime_initialized: bool = false,
+    /// Release builds warn about a shell/native divergence at most once per
+    /// `shell_audit_warn_interval_ms`.
+    shell_audit_warning: RateLimitedWarning = .{},
+    /// A tab or split was created in an existing window; the activation
+    /// that shows it audits the shell/native mapping (`Surface.init`).
+    shell_audit_after_activation: bool = false,
 
     const DeferredOpen = union(enum) {
         target: []u8,
@@ -3455,6 +3499,12 @@ pub const App = struct {
                         continue;
                     }
                 }
+                if (self.session_checkpoint_timer_id) |timer_id| {
+                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
+                        self.onSessionCheckpointTimer();
+                        continue;
+                    }
+                }
                 if (self.update_recheck_timer_id) |timer_id| {
                     if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
                         self.onUpdateRecheckTimer();
@@ -3515,6 +3565,7 @@ pub const App = struct {
         self.stopRecoveryRetryTimer();
         self.stopProgramStatusNotifyTimer();
         self.stopUpdateRecheckTimer();
+        self.stopSessionCheckpointTimer();
         if (self.update_notice) |*notice| {
             notice.deinit(self.core_app.alloc);
             self.update_notice = null;
@@ -3717,6 +3768,36 @@ pub const App = struct {
         const now = sys.GetTickCount64();
         if (self.session_checkpoint_ms) |last| if (now -% last < 1000) return;
         self.session_checkpoint_ms = now;
+        _ = self.saveSessionState(.checkpoint);
+    }
+
+    /// The shell model's `persist_session`: a window, tab or pane opened,
+    /// closed or moved. Saved as crash insurance (Windows Terminal saves its
+    /// layout automatically for the same reason) once the change settles,
+    /// so a burst such as a layout launch or repeated undo writes once, and
+    /// the last step of the burst is the one on disk. Re-arming the thread
+    /// timer restarts its interval. Nothing is armed for a process that
+    /// does not own the saved session, including one still restoring it.
+    fn scheduleSessionCheckpoint(self: *App) void {
+        if (!self.sessionStateEnabled()) return;
+        const timer_id = sys.SetTimer(null, self.session_checkpoint_timer_id orelse 0, session_checkpoint_delay_ms, null);
+        if (timer_id == 0) {
+            log.warn("failed to start session checkpoint timer err={}", .{windows.kernel32.GetLastError()});
+            return;
+        }
+        self.session_checkpoint_timer_id = timer_id;
+    }
+
+    fn stopSessionCheckpointTimer(self: *App) void {
+        if (self.session_checkpoint_timer_id) |timer_id| {
+            _ = sys.KillTimer(null, timer_id);
+            self.session_checkpoint_timer_id = null;
+        }
+    }
+
+    fn onSessionCheckpointTimer(self: *App) void {
+        self.stopSessionCheckpointTimer();
+        self.session_checkpoint_ms = sys.GetTickCount64();
         _ = self.saveSessionState(.checkpoint);
     }
 
@@ -4419,34 +4500,68 @@ pub const App = struct {
         tab_index: usize,
         transaction: *SessionRestoreTransaction,
     ) !*Surface {
-        var tab_surface: ?*Surface = null;
-        var created: usize = 0;
-        var selected_surface: ?*Surface = null;
-        const node_surfaces = try self.core_app.alloc.alloc(?*Surface, saved_tab.layout.nodes.len);
+        const layout = saved_tab.layout;
+        if (layout.root >= layout.nodes.len) return error.EmptyLayout;
+        const node_surfaces = try self.core_app.alloc.alloc(?*Surface, layout.nodes.len);
         defer self.core_app.alloc.free(node_surfaces);
         @memset(node_surfaces, null);
 
-        for (saved_tab.layout.nodes, 0..) |node, node_index| {
-            const pane = switch (node) {
-                .pane => |value| value,
-                .split => continue,
-            };
-            const surface = try self.restoreSessionPane(
-                pane,
-                existing_host,
-                tab_surface,
-                tab_index,
-                preferredSplitDirection(saved_tab.layout),
-                transaction,
-            );
-            node_surfaces[node_index] = surface;
-            if (tab_surface == null) tab_surface = surface;
-            if (created == saved_tab.selected_leaf) selected_surface = surface;
-            created += 1;
+        // The panes are made in the saved tree's shape: each split's second
+        // half is split off the pane standing for its first half, before that
+        // pane is split further, so later splits nest inside the first half.
+        // The shell model and the native tree then have the saved topology,
+        // and closing a restored pane focuses the pane beside it on screen.
+        // The native tree takes the saved ratios below.
+        const Pending = struct { node: usize, leaf: *Surface };
+        const pending = try self.core_app.alloc.alloc(Pending, layout.nodes.len);
+        defer self.core_app.alloc.free(pending);
+        const first_index = firstSessionLayoutPane(layout, layout.root) orelse return error.EmptyLayout;
+        const first = try self.restoreSessionPane(
+            layout.nodes[first_index].pane,
+            existing_host,
+            null,
+            tab_index,
+            .right,
+            transaction,
+        );
+        pending[0] = .{ .node = layout.root, .leaf = first };
+        var pending_len: usize = 1;
+        while (pending_len > 0) {
+            pending_len -= 1;
+            const item = pending[pending_len];
+            switch (layout.nodes[item.node]) {
+                .pane => node_surfaces[item.node] = item.leaf,
+                .split => |split| {
+                    const second_index = firstSessionLayoutPane(layout, split.second) orelse return error.EmptyLayout;
+                    const second = try self.restoreSessionPane(
+                        layout.nodes[second_index].pane,
+                        existing_host,
+                        item.leaf,
+                        tab_index,
+                        switch (split.axis) {
+                            .horizontal => .right,
+                            .vertical => .down,
+                        },
+                        transaction,
+                    );
+                    if (pending_len + 2 > pending.len) return error.InvalidTreeShape;
+                    pending[pending_len] = .{ .node = split.second, .leaf = second };
+                    pending[pending_len + 1] = .{ .node = split.first, .leaf = item.leaf };
+                    pending_len += 2;
+                },
+            }
         }
 
-        const first = tab_surface orelse return error.EmptyLayout;
-        const selected = selected_surface orelse first;
+        // `selected_leaf` counts panes in the saved node order.
+        var selected = first;
+        var leaf_index: usize = 0;
+        for (layout.nodes, node_surfaces) |node, surface| switch (node) {
+            .pane => {
+                if (leaf_index == saved_tab.selected_leaf) selected = surface orelse first;
+                leaf_index += 1;
+            },
+            .split => {},
+        };
         if (self.findTabForSurface(selected)) |found| {
             // No errdefer: nothing can fail before the tab takes the tree, and
             // from then on the tab frees it, also when `layout` fails.
@@ -4458,6 +4573,9 @@ pub const App = struct {
             found.tab.tree.deinit();
             found.tab.tree = restored_tree;
             if (found.tab.findHandle(selected)) |handle| found.tab.focused = handle;
+            // The model made each new pane its tab's focus; the saved
+            // selection is this tab's.
+            self.commitShellSurfaceActivation(selected);
             try found.host.layout();
         }
         return selected;
@@ -4956,19 +5074,19 @@ pub const App = struct {
         return if (host.quick_terminal) &.{} else host.tabs.items;
     }
 
-    fn preferredSplitDirection(
-        layout: win32_session_state.LayoutTree,
-    ) SplitTreeSurface.Split.Direction {
-        if (layout.root < layout.nodes.len) {
-            switch (layout.nodes[layout.root]) {
-                .split => |split| return switch (split.axis) {
-                    .horizontal => .right,
-                    .vertical => .down,
-                },
-                .pane => {},
+    /// The node index of the first pane under `index`, following each
+    /// split's first half. Null for an index or chain the layout does not
+    /// hold, which validation rejects before a restore.
+    fn firstSessionLayoutPane(layout: win32_session_state.LayoutTree, index: usize) ?usize {
+        var current = index;
+        var steps: usize = 0;
+        while (current < layout.nodes.len and steps < layout.nodes.len) : (steps += 1) {
+            switch (layout.nodes[current]) {
+                .pane => return current,
+                .split => |split| current = split.first,
             }
         }
-        return .right;
+        return null;
     }
 
     fn buildRestoredSessionSplitTree(
@@ -8265,7 +8383,10 @@ pub const App = struct {
         const host = existing_host orelse return try self.shell_runtime.prepare(.create_window);
         if (opts.tab_id == null) {
             const window_id = host.shell_id orelse return error.ShellStateOutOfSync;
-            return try self.shell_runtime.prepare(.{ .create_tab = window_id });
+            return try self.shell_runtime.prepare(.{ .create_tab = .{
+                .window = window_id,
+                .index = requestedTabInsertIndex(opts.tab_insert_index, host.tabs.items.len),
+            } });
         }
 
         const source = opts.clone_state_from orelse return error.ShellStateOutOfSync;
@@ -8282,11 +8403,20 @@ pub const App = struct {
         } });
     }
 
+    /// Checks the native windows against the shell model after a
+    /// structural change, in every build: a divergence is where the wrong
+    /// pane ends up focused. Debug builds log an error, which fails a test;
+    /// release builds warn, rate-limited. Never per frame: only structural
+    /// commits call it.
     fn auditShellNativeMapping(self: *App, context: []const u8) void {
-        if (comptime builtin.mode != .Debug) return;
         if (!self.shell_runtime_initialized) return;
         self.validateShellNativeMapping() catch |err| {
-            log.err("shell/native invariant failed context={s} err={}", .{ context, err });
+            if (comptime builtin.mode == .Debug) {
+                log.err("shell/native invariant failed context={s} err={}", .{ context, err });
+                return;
+            }
+            const suppressed = self.shell_audit_warning.take(sys.GetTickCount64(), shell_audit_warn_interval_ms) orelse return;
+            log.warn("shell/native invariant failed context={s} err={} suppressed={d}", .{ context, err, suppressed });
         };
     }
 
@@ -8312,6 +8442,9 @@ pub const App = struct {
                 const tab_id = native_tab.shell_id orelse return error.MissingShellTab;
                 if (!window.tabs.items[index].eql(tab_id)) return error.TabOrderMismatch;
                 const tab = state.tabConst(tab_id) orelse return error.MissingShellTab;
+                if (native_tab.tree.nodes.len == 0 or
+                    !shellTopologyMatches(state, tab.root, &native_tab.tree, .root))
+                    return error.TopologyMismatch;
                 var native_panes: usize = 0;
                 var focused_found = false;
                 var it = native_tab.tree.iterator();
@@ -8332,6 +8465,31 @@ pub const App = struct {
             }
         }
         if (mapped_hosts != state.windows.items.len) return error.WindowCountMismatch;
+    }
+
+    /// The native split tree has the model's shape: the same panes in the
+    /// same places, split along the same axes. Ratios and zoom are native
+    /// only; a resize does not go through the model.
+    fn shellTopologyMatches(
+        state: *const win32_shell.model.ShellState,
+        node_id: win32_shell.model.NodeId,
+        tree: *const SplitTreeSurface,
+        handle: SplitTreeSurface.Node.Handle,
+    ) bool {
+        if (handle.idx() >= tree.nodes.len) return false;
+        const node = state.nodeConst(node_id) orelse return false;
+        return switch (tree.nodes[handle.idx()]) {
+            .leaf => |view| switch (node.value) {
+                .pane => |pane| if (view.shell_id) |id| id.eql(pane) else false,
+                .split => false,
+            },
+            .split => |split| switch (node.value) {
+                .pane => false,
+                .split => |model_split| (model_split.axis == .horizontal) == (split.layout == .horizontal) and
+                    shellTopologyMatches(state, model_split.first, tree, split.left) and
+                    shellTopologyMatches(state, model_split.second, tree, split.right),
+            },
+        };
     }
 
     fn createHost(self: *App, title: LPCWSTR, clone_state_from: ?*const Surface, quick_terminal: bool) !*Host {
@@ -8944,6 +9102,7 @@ pub const App = struct {
     }
 
     fn activateSurface(self: *App, surface: *Surface) void {
+        defer self.auditCreationAfterActivation();
         const was_windows_hidden = self.windows_hidden;
         self.windows_hidden = false;
         if (self.findTabForSurface(surface)) |found| {
@@ -8977,6 +9136,12 @@ pub const App = struct {
         self.commitShellSurfaceFocusIn(surface, true);
     }
 
+    fn auditCreationAfterActivation(self: *App) void {
+        if (!self.shell_audit_after_activation) return;
+        self.shell_audit_after_activation = false;
+        self.auditShellNativeMapping("surface-create");
+    }
+
     /// For a surface shown without taking the keyboard: the window shows it,
     /// but is not recorded as the focused window.
     fn commitShellSurfaceActivation(self: *App, surface: *Surface) void {
@@ -8990,34 +9155,61 @@ pub const App = struct {
         // message until the prepared create transaction is authoritative.
         if (!surface.shell_committed) return;
         const pane_id = surface.shell_id orelse return;
+        // No audit: a focus message can arrive between a structural
+        // change's native half and its commit (hiding a closing tab's panes
+        // moves the keyboard), where the two disagree by design. The
+        // structural commit audits once both halves are in.
         _ = (if (take_window) self.shell_runtime.focusPane(pane_id) else self.shell_runtime.activatePane(pane_id)) catch |err| {
             log.err("shell focus transaction rejected pane={d}:{d} err={}", .{ pane_id.index, pane_id.generation, err });
             return;
         };
-        self.auditShellNativeMapping("focus");
     }
 
-    /// After a close the shell model has chosen what is focused: the pane
-    /// and tab that were survive, and when one of them closed, the first
-    /// pane of the closed pane's sibling or the tab now at the closed tab's
-    /// place takes over. Native focus follows that choice (decision D7),
-    /// matched by stable ID, since a close renumbers split-tree handles and
-    /// shifts tab indices.
-    fn followShellFocus(self: *App, host: *Host) void {
-        if (!self.shell_runtime_initialized) return;
+    /// What a committed shell transaction asks of the platform (decision
+    /// D7). `create_*` were read at prepare (`Prepared.created`). A creation
+    /// leaves `focus_surface` to the caller, whose activation shows and
+    /// focuses the new pane; `focus = false` says so.
+    fn applyShellEffects(
+        self: *App,
+        effects: []const win32_shell.effect.Effect,
+        opts: struct { focus: bool = true },
+    ) void {
+        for (effects) |effect| switch (effect) {
+            .create_window, .create_surface => {},
+            .focus_surface => |pane| if (opts.focus) self.followShellFocus(pane),
+            .persist_session => self.scheduleSessionCheckpoint(),
+        };
+    }
+
+    /// The shell model chose `pane_id` as its tab's focused pane, and maybe
+    /// its tab as the window's active one: after a close the pane and tab
+    /// that were survive, and when one of them closed, the first pane of the
+    /// closed pane's sibling or the tab now at the closed tab's place takes
+    /// over. Native focus follows, matched by stable ID, since a structural
+    /// change renumbers split-tree handles and shifts tab indices. Nothing
+    /// is shown or focused here; the caller activates what it shows.
+    fn followShellFocus(self: *App, pane_id: win32_shell.model.PaneId) void {
         const state = &self.shell_runtime.state;
-        const window = state.windowConst(host.shell_id orelse return) orelse return;
-        for (host.tabs.items, 0..) |*tab, index| {
-            const tab_id = tab.shell_id orelse continue;
-            if (window.active_tab) |active| {
-                if (active.eql(tab_id)) host.active_tab = index;
+        const pane = state.paneConst(pane_id) orelse return;
+        const model_tab = state.tabConst(pane.tab) orelse return;
+        const window = state.windowConst(model_tab.window) orelse return;
+        for (self.hosts.items) |host| {
+            const window_id = host.shell_id orelse continue;
+            if (!window_id.eql(window.id)) continue;
+            for (host.tabs.items, 0..) |*tab, index| {
+                const tab_id = tab.shell_id orelse continue;
+                if (!tab_id.eql(pane.tab)) continue;
+                var it = tab.tree.iterator();
+                while (it.next()) |entry| {
+                    const id = entry.view.shell_id orelse continue;
+                    if (id.eql(pane_id)) tab.focused = entry.handle;
+                }
+                if (window.active_tab) |active| if (active.eql(tab_id)) {
+                    host.active_tab = index;
+                };
+                return;
             }
-            const focused_pane = (state.tabConst(tab_id) orelse continue).focused_pane;
-            var it = tab.tree.iterator();
-            while (it.next()) |entry| {
-                const pane_id = entry.view.shell_id orelse continue;
-                if (pane_id.eql(focused_pane)) tab.focused = entry.handle;
-            }
+            return;
         }
     }
 
@@ -9096,6 +9288,7 @@ pub const App = struct {
     /// window, so windows hidden by `toggle_visibility` stay hidden and
     /// `windows_hidden` stays true.
     fn activateSurfaceNoFocus(self: *App, surface: *Surface) void {
+        defer self.auditCreationAfterActivation();
         const was_windows_hidden = self.windows_hidden;
         if (self.findTabForSurface(surface)) |found| {
             const handle = found.tab.findHandle(surface) orelse found.tab.focused;
@@ -9220,8 +9413,8 @@ pub const App = struct {
                         // Focus stays on a pane that survives; the handles
                         // are renumbered, so find it again. When the focused
                         // pane itself closed, the shell model picks the next
-                        // one (`followShellFocus`) and the first pane stands
-                        // in until then.
+                        // one (its `focus_surface`, applied below) and the
+                        // first pane stands in until then.
                         var first = tab.tree.iterator();
                         tab.focused = (if (focused) |kept| tab.findHandle(kept) else null) orelse
                             first.next().?.handle;
@@ -9240,17 +9433,24 @@ pub const App = struct {
             var shell_mapping_changed = false;
             if (surface.pending_shell_close) |*prepared| {
                 const close_intent = prepared.intent;
-                prepared.commitRetryingInterleavedFocus(&self.shell_runtime) catch |err| {
+                prepared.commitRetryingInterleavedFocus(&self.shell_runtime) catch |err| forced: {
                     log.err("shell close retry failed after native teardown err={}; forcing reconciliation", .{err});
-                    self.shell_runtime.forceClose(close_intent) catch |force_err| switch (force_err) {
-                        error.StaleId, error.LastPane => {},
-                        else => log.err("forced shell close reconciliation failed err={}", .{force_err}),
+                    var reduction = self.shell_runtime.forceClose(close_intent) catch |force_err| {
+                        switch (force_err) {
+                            error.StaleId, error.LastPane => {},
+                            else => log.err("forced shell close reconciliation failed err={}", .{force_err}),
+                        }
+                        break :forced;
                     };
+                    defer reduction.deinit(self.shell_runtime.state.allocator);
+                    self.applyShellEffects(reduction.effects.items, .{});
                 };
+                // Native focus follows the model's choice before the
+                // replacement below is activated.
+                self.applyShellEffects(prepared.effects(), .{});
                 prepared.deinit();
                 surface.pending_shell_close = null;
                 shell_mapping_changed = true;
-                self.followShellFocus(host);
             }
             host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
             if (tab_removed) host.notifyTabListUiaChanged();
@@ -9482,6 +9682,7 @@ pub const App = struct {
                 try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
                 return err;
             };
+            self.applyShellEffects(prepared.effects(), .{});
             self.auditShellNativeMapping("tab-detach");
             break :shell;
         }
@@ -9603,6 +9804,7 @@ pub const App = struct {
             found.host.active_tab = current_idx;
             return err;
         };
+        if (shell_prepared) |*prepared| self.applyShellEffects(prepared.effects(), .{});
         self.auditShellNativeMapping("tab-reorder");
         const surface = found.host.tabs.items[desired].focusedSurface() orelse return false;
         self.activateSurface(surface);
@@ -13550,6 +13752,7 @@ const Host = struct {
             self.active_tab = previous_active;
             return err;
         };
+        if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
         // Detaching destroys the tab button and its UIA provider. Rebuild the
         // restored button before raising the selected-item notification so
         // assistive clients receive the event from a live provider.
@@ -13557,7 +13760,6 @@ const Host = struct {
         self.layout() catch |err| log.warn("tab restore layout sync failed err={}", .{err});
         self.refreshChrome() catch |err| log.warn("tab restore chrome sync failed err={}", .{err});
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.app.auditShellNativeMapping("tab-restore");
         return self.activeSurface() != null;
     }
 
@@ -13607,9 +13809,9 @@ const Host = struct {
             while (restored_it.next()) |entry| entry.view.host_active = true;
             return err;
         };
+        if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
         self.notifyTabListUiaChanged();
-        self.app.auditShellNativeMapping("tab-redetach");
         return true;
     }
 
@@ -13644,10 +13846,15 @@ const Host = struct {
             log.err("split-create undo shell commit failed err={}", .{err});
             return err;
         };
+        // Focus after the undo follows the close rule: the user's pane stays
+        // focused unless it was the one removed.
+        if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
+        // The neighbours take the removed pane's space now: activating a pane
+        // that is already focused and shown takes a fast path with no layout.
+        self.layout() catch |err| log.warn("split-create undo layout failed err={}", .{err});
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
         value.created_surface.shell_id = null;
         value.created_surface.shell_committed = false;
-        self.app.auditShellNativeMapping("split-create-undo");
         return true;
     }
 
@@ -13701,9 +13908,9 @@ const Host = struct {
             };
             value.created_surface.shell_id = prepared.created.pane;
             value.created_surface.shell_committed = true;
+            self.app.applyShellEffects(prepared.effects(), .{});
         }
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
-        self.app.auditShellNativeMapping("split-create-redo");
         return true;
     }
 
@@ -13746,6 +13953,7 @@ const Host = struct {
             self.active_tab = old_active;
             return err;
         };
+        if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
         // The moved pane stayed visible throughout the drag, so the normal
         // activation fast path cannot infer that the restored target tab must
         // be hidden. Re-establish tab visibility and recreate the detached
@@ -13754,7 +13962,6 @@ const Host = struct {
         self.layout() catch |err| log.warn("tab split transfer undo layout sync failed err={}", .{err});
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
         self.refreshChrome() catch |err| log.warn("tab split transfer undo chrome sync failed err={}", .{err});
-        self.app.auditShellNativeMapping("tab-subtree-transfer-undo");
         return true;
     }
 
@@ -13800,18 +14007,21 @@ const Host = struct {
             self.active_tab = old_active;
             return err;
         };
+        if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
         self.notifyTabListUiaChanged();
         self.prepareActiveTabVisibility(self.active_tab);
         self.layout() catch |err| log.warn("tab split transfer redo layout sync failed err={}", .{err});
         self.refreshChrome() catch |err| log.warn("tab split transfer redo chrome sync failed err={}", .{err});
-        self.app.auditShellNativeMapping("tab-subtree-transfer-redo");
         return true;
     }
 
     fn applyLatestStructuralUndo(self: *Host) !?[]const u8 {
         // Replays move panes between tabs; their status badges follow.
         defer self.refreshAllTabStatus();
+        // Once the replay's activation is done: an undo may show another
+        // tab than the model has in front until it activates it.
+        defer self.app.auditShellNativeMapping("structural-undo");
         const entry = (try self.popStructuralUndo()) orelse return null;
         errdefer self.restoreLastStructuralUndoPop();
 
@@ -13834,7 +14044,8 @@ const Host = struct {
                     _ = self.discardNewestStructuralRedo();
                     return null;
                 }
-                self.app.activateSurface(value.source_surface);
+                // The tab the split was in, at the pane the model kept.
+                self.app.activateSurface(self.activeSurface() orelse value.source_surface);
                 return "New split undone.";
             },
 
@@ -13858,6 +14069,7 @@ const Host = struct {
     fn applyLatestStructuralRedo(self: *Host) !?[]const u8 {
         // Replays move panes between tabs; their status badges follow.
         defer self.refreshAllTabStatus();
+        defer self.app.auditShellNativeMapping("structural-redo");
         const entry = (try self.popStructuralRedo()) orelse return null;
         errdefer self.restoreLastStructuralRedoPop();
 
@@ -15795,6 +16007,7 @@ const Host = struct {
             log.err("tab drag reorder shell commit failed err={}", .{err});
             return;
         };
+        if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
         self.tabs.items[a].clearRedoHistory();
         self.tabs.items[b].clearRedoHistory();
         self.app.auditShellNativeMapping("tab-drag-reorder");
@@ -16299,6 +16512,7 @@ const Host = struct {
             log.err("tab split transfer shell commit failed err={}", .{err});
             return false;
         };
+        self.app.applyShellEffects(shell_prepared.effects(), .{});
         const committed_entry = &self.structural_undo_entries.items[self.structural_undo_entries.items.len - 1];
         if (committed_entry.payload.tab_subtree_transfer.source_tab) |*source_tab| {
             source_tab.clearRedoHistory();
@@ -34197,12 +34411,18 @@ pub const Surface = struct {
         if (shell_prepared) |*prepared| {
             try prepared.commit(&app.shell_runtime);
             self.shell_committed = true;
+            // The caller's activation shows and focuses the new pane, which
+            // is the model's `focus_surface`.
+            app.applyShellEffects(prepared.effects(), .{ .focus = false });
             if (self.window_focused) app.commitShellSurfaceFocus(self);
         }
         // Existing-host tab/split creation is intentionally provisional here:
         // the shell reducer selects the new entity before the caller activates
-        // its native surface. The activation path performs the stable audit.
-        if (opts.host_id == null) app.auditShellNativeMapping("surface-create");
+        // its native surface. The next activation performs the stable audit.
+        if (opts.host_id == null)
+            app.auditShellNativeMapping("surface-create")
+        else
+            app.shell_audit_after_activation = true;
         // Only now does WM_DESTROY own the Surface: it runs `destroy`, which
         // frees it. Set any earlier, a failed step above has its unwinding
         // DestroyWindow free the Surface under these errdefers, and then
@@ -43590,6 +43810,354 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
     try app.validateShellNativeMapping();
 }
 
+/// Native and shell-model halves of the structural steps the projection
+/// tests drive: each mirrors what the runtime does on both sides.
+const ShellProjectionSteps = struct {
+    fn split(app: *App, tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
+        var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
+        defer inserted.deinit();
+        const next = try tab.tree.split(std.testing.allocator, tab.findHandle(at).?, direction, 0.5, &inserted);
+        tab.tree.deinit();
+        tab.tree = next;
+        tab.focused = tab.findHandle(view).?;
+        var prepared = try app.shell_runtime.prepare(.{ .split_pane = .{
+            .pane = at.shell_id.?,
+            .direction = switch (direction) {
+                .left => .left,
+                .right => .right,
+                .up => .up,
+                .down => .down,
+            },
+        } });
+        defer prepared.deinit();
+        try prepared.commit(&app.shell_runtime);
+        view.shell_id = prepared.created.pane;
+        view.shell_committed = true;
+    }
+
+    /// A new tab at `index` (`window-new-tab-position`), or at the end.
+    fn newTab(app: *App, host: *Host, id: u32, view: *Surface, index: ?usize) !void {
+        const at = requestedTabInsertIndex(index, host.tabs.items.len);
+        var prepared = try app.shell_runtime.prepare(.{ .create_tab = .{ .window = host.shell_id.?, .index = at } });
+        defer prepared.deinit();
+        try prepared.commit(&app.shell_runtime);
+        view.shell_id = prepared.created.pane;
+        view.shell_committed = true;
+        var tab = try Tab.init(std.testing.allocator, id, view);
+        tab.shell_id = prepared.created.tab;
+        try host.tabs.insert(std.testing.allocator, at, tab);
+        host.active_tab = at;
+    }
+
+    /// What `Surface.requestClose` prepares before it destroys the pane.
+    fn closePane(app: *App, tab: *Tab, view: *Surface) !void {
+        view.pending_close_tree = try tab.tree.remove(std.testing.allocator, tab.findHandle(view).?);
+        view.pending_shell_close = try app.shell_runtime.prepare(.{ .close_pane = view.shell_id.? });
+        app.windowDestroyed(view);
+    }
+
+    /// The user focuses `view`, as a focus message reports it.
+    fn focus(app: *App, view: *Surface) void {
+        _ = app.noteSurfaceFocused(view);
+    }
+
+    /// The model and the native windows describe the same windows, tabs,
+    /// topology and focus, and `expected` is the focused pane in front.
+    fn expectEqual(app: *App, host: *Host, expected: *Surface) !void {
+        try app.validateShellNativeMapping();
+        try std.testing.expectEqual(@as(?*Surface, expected), host.activeSurface());
+    }
+};
+
+test "win32 shell and native projections agree over split, move, close and restore" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var surface_d: Surface = undefined;
+    var surface_e: Surface = undefined;
+    var surface_f: Surface = undefined;
+    var surface_g: Surface = undefined;
+    var surface_h: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+            .{ .storage = &surface_d, .host = &host, .register = true },
+            .{ .storage = &surface_e, .host = &host, .register = true },
+            .{ .storage = &surface_f, .host = &host, .register = true },
+            .{ .storage = &surface_g, .host = &host, .register = true },
+            .{ .storage = &surface_h, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+    const Step = ShellProjectionSteps;
+
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    surface_a.shell_id = window.created.pane;
+    surface_a.shell_committed = true;
+    var first_tab = try Tab.init(std.testing.allocator, 1, &surface_a);
+    first_tab.shell_id = window.created.tab;
+    try host.tabs.append(std.testing.allocator, first_tab);
+
+    // Split: [A | (B / C)], the user in B. A second tab, [D], in front.
+    try Step.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
+    try Step.split(&app, &host.tabs.items[0], &surface_b, .down, &surface_c);
+    Step.focus(&app, &surface_b);
+    try Step.expectEqual(&app, &host, &surface_b);
+    try Step.newTab(&app, &host, 2, &surface_d, null);
+    Step.focus(&app, &surface_d);
+    try Step.expectEqual(&app, &host, &surface_d);
+
+    // Move: D's tab to the front of the strip.
+    host.swapTabs(1, 0);
+    try std.testing.expectEqual(@as(?*Surface, &surface_d), host.tabs.items[0].focusedSurface());
+    try Step.expectEqual(&app, &host, &surface_d);
+
+    // Close: D's tab, in front, goes to undo history; the split tab comes to
+    // the front with B still its focused pane. Restore: undo brings D back
+    // in front.
+    try std.testing.expect(host.closeTabInPlace(0));
+    try Step.expectEqual(&app, &host, &surface_b);
+    _ = try host.applyLatestStructuralUndo();
+    try Step.expectEqual(&app, &host, &surface_d);
+
+    // A tab opened at the front of the strip, then closed: the tab now at
+    // its place (D) comes to the front, in the model as natively. A model
+    // that appended the tab would have handed the front to the split tab.
+    try Step.newTab(&app, &host, 3, &surface_h, 0);
+    Step.focus(&app, &surface_h);
+    try Step.expectEqual(&app, &host, &surface_h);
+    try std.testing.expect(host.closeTabInPlace(0));
+    try Step.expectEqual(&app, &host, &surface_d);
+
+    // Close in a background tab: C's program exits behind D. D stays in
+    // front and B stays the split tab's focused pane.
+    const split_tab = &host.tabs.items[1];
+    try Step.closePane(&app, split_tab, &surface_c);
+    try Step.expectEqual(&app, &host, &surface_d);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), host.tabs.items[1].focusedSurface());
+
+    // Close of the focused pane: the user goes back to the split tab and
+    // B exits. Its sibling A takes focus.
+    Step.focus(&app, &surface_b);
+    try Step.expectEqual(&app, &host, &surface_b);
+    try Step.closePane(&app, &host.tabs.items[1], &surface_b);
+    try Step.expectEqual(&app, &host, &surface_a);
+
+    // Undo of a split the user has moved away from: split A right (E) and A
+    // down (F); only E's split is in history. The user is in F when E's
+    // split is undone: F keeps focus, as for any close of a pane that is
+    // not focused. The undo used to focus A, the pane E was split from.
+    try Step.split(&app, &host.tabs.items[1], &surface_a, .right, &surface_e);
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .split_create,
+        .timestamp_ms = sys.GetTickCount64(),
+        .payload = .{ .split_create = .{
+            .source_surface = &surface_a,
+            .created_surface = &surface_e,
+            .direction = .right,
+        } },
+    });
+    try Step.split(&app, &host.tabs.items[1], &surface_a, .down, &surface_f);
+    Step.focus(&app, &surface_f);
+    try Step.expectEqual(&app, &host, &surface_f);
+    _ = try host.applyLatestStructuralUndo();
+    try Step.expectEqual(&app, &host, &surface_f);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items[1].leafCount());
+
+    // Undo from another tab: split F right (G), go to D's tab, undo. The
+    // undo shows the split tab, with focus where the model puts it (G was
+    // that tab's focus, so its sibling F). Native and model only agree once
+    // the undo's activation is done, which is where it is audited.
+    try Step.split(&app, &host.tabs.items[1], &surface_f, .right, &surface_g);
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .split_create,
+        .timestamp_ms = sys.GetTickCount64(),
+        .payload = .{ .split_create = .{
+            .source_surface = &surface_f,
+            .created_surface = &surface_g,
+            .direction = .right,
+        } },
+    });
+    Step.focus(&app, &surface_d);
+    try Step.expectEqual(&app, &host, &surface_d);
+    _ = try host.applyLatestStructuralUndo();
+    try Step.expectEqual(&app, &host, &surface_f);
+}
+
+test "win32 a restored tab has the saved shape in the shell model, so closing a pane focuses its neighbour" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_x: Surface = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_x, .host = &host, .register = true },
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+    const host_hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(host_hwnd);
+    host.hwnd = host_hwnd;
+
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    surface_x.shell_id = window.created.pane;
+    surface_x.shell_committed = true;
+    var first_tab = try Tab.init(std.testing.allocator, 1, &surface_x);
+    first_tab.shell_id = window.created.tab;
+    try host.tabs.append(std.testing.allocator, first_tab);
+
+    // What `Surface.init` does for each restored pane, natively and in the
+    // shell model: a new tab, or a split at the pane it is cloned from.
+    const Hook = struct {
+        var panes: [3]*Surface = undefined;
+        var created: usize = 0;
+
+        fn createSurface(
+            hook_app: *App,
+            _: *const configpkg.Config,
+            _: LPCWSTR,
+            opts: SurfaceInitOptions,
+        ) anyerror!*Surface {
+            const alloc = hook_app.core_app.alloc;
+            const surface = panes[created];
+            created += 1;
+            const target = hook_app.findHostById(opts.host_id.?).?;
+            var prepared = (try hook_app.prepareShellSurfaceCreate(target, opts)).?;
+            defer prepared.deinit();
+            if (opts.clone_state_from) |source| {
+                const found = hook_app.findTabForSurface(@constCast(source)).?;
+                var inserted = try SplitTreeSurface.init(alloc, surface);
+                defer inserted.deinit();
+                const next = try found.tab.tree.split(alloc, found.tab.findHandle(@constCast(source)).?, opts.split_direction, 0.5, &inserted);
+                found.tab.tree.deinit();
+                found.tab.tree = next;
+                found.tab.focused = found.tab.findHandle(surface).?;
+            } else {
+                var tab = try Tab.init(alloc, target.nextTabId(), surface);
+                errdefer tab.deinit();
+                tab.shell_id = prepared.created.tab;
+                try target.tabs.append(alloc, tab);
+            }
+            try prepared.commit(&hook_app.shell_runtime);
+            surface.shell_id = prepared.created.pane;
+            surface.shell_committed = true;
+            return surface;
+        }
+    };
+    Hook.panes = .{ &surface_a, &surface_b, &surface_c };
+    Hook.created = 0;
+    app.test_create_window_surface = &Hook.createSurface;
+
+    // [A | (B / C)], saved with C selected.
+    const nodes = [_]win32_session_state.Node{
+        .{ .split = .{ .axis = .horizontal, .ratio = 0.3, .first = 1, .second = 2 } },
+        .{ .pane = .{} },
+        .{ .split = .{ .axis = .vertical, .ratio = 0.6, .first = 3, .second = 4 } },
+        .{ .pane = .{} },
+        .{ .pane = .{} },
+    };
+    var transaction = SessionRestoreTransaction.init(&app);
+    const selected = try app.restoreSessionTab(
+        .{ .selected_leaf = 2, .layout = .{ .root = 0, .nodes = &nodes } },
+        &host,
+        1,
+        &transaction,
+    );
+    try std.testing.expectEqual(&surface_c, selected);
+    const restored = &host.tabs.items[1];
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), restored.focusedSurface());
+    try std.testing.expectEqual(@as(f16, 0.3), restored.tree.nodes[0].split.ratio);
+    host.active_tab = 1;
+    _ = try app.shell_runtime.activatePane(surface_c.shell_id.?);
+    try app.validateShellNativeMapping();
+
+    // C exits: B, beside it in the saved tree, takes focus. A model built
+    // as a chain of splits off A put C beside A, and focus went to A.
+    try ShellProjectionSteps.closePane(&app, restored, &surface_c);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), host.tabs.items[1].focusedSurface());
+    try app.validateShellNativeMapping();
+}
+
+test "win32 the shell/native cross-check compares split topology" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    surface_a.shell_id = window.created.pane;
+    surface_a.shell_committed = true;
+    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
+    tab.shell_id = window.created.tab;
+    try host.tabs.append(std.testing.allocator, tab);
+    try ShellProjectionSteps.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
+    try app.validateShellNativeMapping();
+
+    // The same panes stacked instead of side by side: the counts and the
+    // focus still match, the shape does not.
+    const native_tab = &host.tabs.items[0];
+    var stacked = try SplitTreeSurface.init(std.testing.allocator, &surface_a);
+    defer stacked.deinit();
+    var inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+    defer inserted.deinit();
+    const next = try stacked.split(std.testing.allocator, .root, .down, 0.5, &inserted);
+    std.mem.swap(SplitTreeSurface, &native_tab.tree, &stacked);
+    stacked.deinit();
+    stacked = next;
+    std.mem.swap(SplitTreeSurface, &native_tab.tree, &stacked);
+    native_tab.focused = native_tab.findHandle(&surface_b).?;
+    try std.testing.expectError(error.TopologyMismatch, app.validateShellNativeMapping());
+}
+
 test "win32 a background tab's exit keeps the active tab" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -43620,7 +44188,7 @@ test "win32 a background tab's exit keeps the active tab" {
     host.shell_id = window.created.window;
     const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c };
     for (surfaces, 0..) |surface, index| {
-        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = window.created.window.? });
+        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
         defer if (created) |*prepared| prepared.deinit();
         if (created) |*prepared| try prepared.commit(&app.shell_runtime);
         surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
@@ -43673,7 +44241,7 @@ test "win32 undoing then redoing an in-place tab close leaves the same tab in fr
     host.shell_id = window.created.window;
     const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c, &surface_d };
     for (surfaces, 0..) |surface, index| {
-        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = window.created.window.? });
+        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
         defer if (created) |*prepared| prepared.deinit();
         if (created) |*prepared| try prepared.commit(&app.shell_runtime);
         surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
@@ -43760,7 +44328,7 @@ test "win32 a window brought up without focus is not recorded as the focused one
     var window_b = try app.shell_runtime.prepare(.create_window);
     defer window_b.deinit();
     try window_b.commit(&app.shell_runtime);
-    var tab_b2 = try app.shell_runtime.prepare(.{ .create_tab = window_b.created.window.? });
+    var tab_b2 = try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window_b.created.window.? } });
     defer tab_b2.deinit();
     try tab_b2.commit(&app.shell_runtime);
     host_a.shell_id = window_a.created.window;
@@ -49805,6 +50373,54 @@ test "win32 session state is saved only by the process that owns it" {
     try std.testing.expect(!app.sessionStateEnabled());
     app.config.@"window-save-state" = .always;
     try std.testing.expect(app.sessionStateEnabled());
+}
+
+test "win32 a structural change arms one session checkpoint, only in the session's owner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(state_path);
+
+    var core_app: CoreApp = undefined;
+    core_app.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.safe_mode = false;
+    app.embedding_mode = false;
+    app.startup_profile_picker = false;
+    app.explicit_startup_working_directory = false;
+    app.config.@"window-save-state" = .always;
+    app.config.@"initial-window" = true;
+    app.config.@"initial-command" = null;
+    app.session_state_excluded_for_elevation = false;
+    app.session_ending = false;
+    app.session_state_saved_before_last_host_close = false;
+    app.session_checkpoint_ms = null;
+    app.session_checkpoint_timer_id = null;
+    defer app.stopSessionCheckpointTimer();
+    const persist = [_]win32_shell.effect.Effect{.persist_session};
+
+    // A process that does not own the saved session, or is still restoring
+    // it, arms nothing.
+    app.session_owner = null;
+    app.applyShellEffects(&persist, .{});
+    try std.testing.expectEqual(@as(?UINT_PTR, null), app.session_checkpoint_timer_id);
+
+    app.session_owner = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    defer app.releaseSessionOwnership();
+    app.applyShellEffects(&persist, .{});
+    const armed = app.session_checkpoint_timer_id.?;
+    // The next change in a burst restarts the same timer.
+    app.applyShellEffects(&persist, .{});
+    try std.testing.expectEqual(armed, app.session_checkpoint_timer_id.?);
+
+    // When it fires, the session is saved once and the timer stops. (A
+    // test has no LOCALAPPDATA, so nothing reaches the disk.)
+    app.onSessionCheckpointTimer();
+    try std.testing.expectEqual(@as(?UINT_PTR, null), app.session_checkpoint_timer_id);
+    try std.testing.expect(app.session_checkpoint_ms != null);
 }
 
 test "win32 a session a newer build wrote, or one too large to be ours, is left alone and never owned" {

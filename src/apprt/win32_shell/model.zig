@@ -332,7 +332,7 @@ test "shell state clone owns independent model and id pool storage" {
     defer copy.deinit();
 
     const window_id = original.windows.items[0].id;
-    var added = try reducer.apply(&copy, .{ .create_tab = window_id });
+    var added = try reducer.apply(&copy, .{ .create_tab = .{ .window = window_id } });
     defer added.deinit(allocator);
 
     try original.validate();

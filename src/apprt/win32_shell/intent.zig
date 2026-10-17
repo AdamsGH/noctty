@@ -3,7 +3,12 @@ const model = @import("model.zig");
 pub const Intent = union(enum) {
     create_window,
     close_window: model.WindowId,
-    create_tab: model.WindowId,
+    create_tab: struct {
+        window: model.WindowId,
+        /// Where the tab goes in the window's order, as the native strip
+        /// inserts it (`window-new-tab-position`); null appends.
+        index: ?usize = null,
+    },
     close_tab: model.TabId,
     detach_tab: model.TabId,
     restore_tab: struct {
