@@ -9684,6 +9684,7 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                         try std.testing.expect(!settings.hasPendingChanges());
                         try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
                         try std.testing.expectEqual(com.S_OK, expand.vtbl.Collapse(expand));
+                        try std.testing.expectEqual(before_hover, sys.SendMessageW(control, CB_GETCURSEL, 0, 0));
                         try std.testing.expectEqual(before_hover, provider.last_selection);
                         try std.testing.expect(!settings.hasPendingChanges());
                         // Choosing the already-hovered row explicitly still
@@ -9702,6 +9703,7 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                     try std.testing.expectEqual(com.S_OK, value.vtbl.SetValue(value, &label));
                     try std.testing.expectEqual(@as(isize, @intCast(next_index)), sys.SendMessageW(control, CB_GETCURSEL, 0, 0));
                     try std.testing.expectEqual(com.E_INVALIDARG, value.vtbl.SetValue(value, std.unicode.utf8ToUtf16LeStringLiteral("not a Settings option")));
+                    try std.testing.expectEqual(com.E_INVALIDARG, value.vtbl.SetValue(value, null));
                 }
                 try std.testing.expect(settings.hasPendingChanges());
                 try std.testing.expect(events.testing_property_changes > changes_before);
@@ -10097,6 +10099,8 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
             const previous = settings.control_uia_prev_procs[index];
             if (msg == win32_uia.SettingsControlProvider.action_message) {
                 if (settings.control_uia_providers[index]) |provider| {
+                    if (wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.expand) and sys.IsWindowEnabled(hwnd) != 0)
+                        settings.ensureControlVisible(hwnd);
                     const hr = provider.handleAction(wParam, lParam);
                     return if (hr == @import("win32_uia/com.zig").S_OK) win32_uia.SettingsControlProvider.action_success else hr;
                 }

@@ -1178,7 +1178,7 @@ pub const SettingsControlProvider = struct {
     /// a Toggle is one UI-thread operation, not a racy read/set/notify sequence.
     pub const action_message: u32 = 0x8000 + 0x10C;
     pub const action_success: isize = 1;
-    const Action = enum(usize) { toggle, select, expand, collapse };
+    pub const Action = enum(usize) { toggle, select, expand, collapse };
     pub const SelectionSync = enum { observe, native_notification, explicit_selection };
 
     const BM_GETCHECK: u32 = 0x00F0;
@@ -1475,7 +1475,7 @@ pub const SettingsControlProvider = struct {
 
     fn SetValue(
         p: *com.IValueProvider,
-        value: [*:0]const u16,
+        value_arg: ?[*:0]const u16,
     ) callconv(.winapi) com.HRESULT {
         const self = fromValue(p);
         const precondition = setValuePrecondition(
@@ -1485,6 +1485,7 @@ pub const SettingsControlProvider = struct {
         );
         if (precondition != com.S_OK) return precondition;
         if (self.readOnly()) return com.UIA_E_INVALIDOPERATION;
+        const value = value_arg orelse return com.E_INVALIDARG;
         if (self.role == .combo_box) {
             // Keep the borrowed string alive until the native lookup returns,
             // including same-process cross-thread calls. A timed-out send could
@@ -3548,12 +3549,13 @@ pub const TerminalProvider = struct {
 
     fn SetValue(
         self_value: *com.IValueProvider,
-        value_w: [*:0]const u16,
+        value_arg: ?[*:0]const u16,
     ) callconv(.winapi) com.HRESULT {
         const self = fromValue(self_value);
         if (self.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.state.role != .edit) return com.UIA_E_INVALIDOPERATION;
         const set_value = self.state.set_value orelse return com.UIA_E_INVALIDOPERATION;
+        const value_w = value_arg orelse return com.E_INVALIDARG;
         const value_len = std.mem.len(value_w);
         const value = std.unicode.utf16LeToUtf8Alloc(self.alloc, value_w[0..value_len]) catch |err| {
             return if (err == error.OutOfMemory) com.E_OUTOFMEMORY else com.E_INVALIDARG;

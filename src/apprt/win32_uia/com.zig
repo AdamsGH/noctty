@@ -297,7 +297,7 @@ pub const IValueProviderVtbl = extern struct {
     Release: *const fn (*IValueProvider) callconv(.winapi) u32,
 
     // IValueProvider
-    SetValue: *const fn (*IValueProvider, [*:0]const u16) callconv(.winapi) HRESULT,
+    SetValue: *const fn (*IValueProvider, ?[*:0]const u16) callconv(.winapi) HRESULT,
     get_Value: *const fn (*IValueProvider, *?[*:0]u16) callconv(.winapi) HRESULT,
     get_IsReadOnly: *const fn (*IValueProvider, *BOOL) callconv(.winapi) HRESULT,
 };

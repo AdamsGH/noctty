@@ -148,6 +148,10 @@ namespace SettingsPatterns
         [DllImport("user32.dll")]
         static extern bool GetComboBoxInfo(IntPtr hwnd, ref ComboInfo info);
         [DllImport("user32.dll")]
+        static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
+        [DllImport("user32.dll")]
+        static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")]
         static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
         [DllImport("user32.dll")]
         static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
@@ -165,6 +169,9 @@ namespace SettingsPatterns
             uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")]
         static extern IntPtr ReadComboText(IntPtr hwnd, uint message, IntPtr w, StringBuilder text,
+            uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")]
+        static extern IntPtr ReadItemRect(IntPtr hwnd, uint message, IntPtr w, ref Rect rect,
             uint flags, uint timeout, out IntPtr result);
 
         static void Release(object value)
@@ -283,6 +290,7 @@ namespace SettingsPatterns
         static void RunCore(long hwnd, string desktop, string kind, string expected, bool exercise, bool useSelectionItem,
             Dictionary<string, object> result)
         {
+            Require(SetThreadDpiAwarenessContext((IntPtr)(-4)) != IntPtr.Zero, "PMv2 DPI context unavailable");
             uint pid, needed;
             uint thread = GetWindowThreadProcessId((IntPtr)hwnd, out pid);
             var actual = new StringBuilder(256);
@@ -398,17 +406,25 @@ namespace SettingsPatterns
                                 info.Size = (uint)Marshal.SizeOf(typeof(ComboInfo));
                                 Require(GetComboBoxInfo((IntPtr)hwnd, ref info) && info.List != IntPtr.Zero,
                                     "Combo popup unavailable");
-                                IntPtr currentIndex, itemHeight, topIndex, ignored;
+                                IntPtr currentIndex, ignored;
                                 Require(ReadComboMessage((IntPtr)hwnd, 0x0147, IntPtr.Zero, IntPtr.Zero, 3, 2000, out currentIndex) != IntPtr.Zero,
                                     "Cannot read initial combo selection");
                                 int hoverIndex = currentIndex.ToInt32() == 0 ? 1 : 0;
-                                Require(ReadComboMessage(info.List, 0x01A1, (IntPtr)hoverIndex, IntPtr.Zero, 3, 2000, out itemHeight) != IntPtr.Zero,
-                                    "Cannot read popup item height");
-                                Require(ReadComboMessage(info.List, 0x018E, IntPtr.Zero, IntPtr.Zero, 3, 2000, out topIndex) != IntPtr.Zero,
-                                    "Cannot read popup top index");
-                                int hoverY = (hoverIndex - topIndex.ToInt32()) * itemHeight.ToInt32() + itemHeight.ToInt32() / 2;
-                                Require(itemHeight.ToInt32() > 0 && hoverY >= 0, "Hover row is not visible");
-                                int initialY = (currentIndex.ToInt32() - topIndex.ToInt32()) * itemHeight.ToInt32() + itemHeight.ToInt32() / 2;
+                                ReadComboMessage(info.List, 0x0197, (IntPtr)hoverIndex, IntPtr.Zero, 3, 2000, out ignored); // LB_SETTOPINDEX
+                                Rect targetRect = new Rect(), currentRect = new Rect();
+                                Require(ReadItemRect(info.List, 0x0198, (IntPtr)hoverIndex, ref targetRect, 3, 2000, out ignored) != IntPtr.Zero && ignored.ToInt64() >= 0,
+                                    "Cannot read hover row rectangle"); // LB_GETITEMRECT
+                                Require(ReadItemRect(info.List, 0x0198, currentIndex, ref currentRect, 3, 2000, out ignored) != IntPtr.Zero && ignored.ToInt64() >= 0,
+                                    "Cannot read current row rectangle");
+                                int hoverY = (targetRect.Top + targetRect.Bottom) / 2;
+                                Require(targetRect.Bottom > targetRect.Top && hoverY >= 0, "Hover row is not visible");
+                                int initialY = (currentRect.Top + currentRect.Bottom) / 2;
+                                result["hoverIndex"] = hoverIndex;
+                                result["hoverY"] = hoverY;
+                                Rect popupClient;
+                                Require(GetClientRect(info.List, out popupClient), "Popup client unavailable");
+                                result["popupHeight"] = popupClient.Bottom;
+                                result["popupWidth"] = popupClient.Right;
                                 ReadComboMessage(info.List, 0x0200, IntPtr.Zero, (IntPtr)((initialY << 16) | 11), 3, 2000, out ignored);
                                 ReadComboMessage(info.List, 0x0200, IntPtr.Zero, (IntPtr)((hoverY << 16) | 10), 3, 2000, out ignored);
                                 result["hoverValue"] = ReadCombo(value, selection);
@@ -419,7 +435,6 @@ namespace SettingsPatterns
                                 ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x11, (IntPtr)1, 3, 2000, out ignored);
                                 result["hoverSaveEnabled"] = IsWindowEnabled(hoverSave);
                                 Require(!Convert.ToBoolean(result["hoverSaveEnabled"]), "Hover plus modifier dirtied pending config");
-                                ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x1B, (IntPtr)1, 3, 2000, out ignored);
                                 ((IExpandCollapse)expand).Collapse();
                                 result["cancelValue"] = ReadCombo(value, selection);
                                 result["cancelSaveEnabled"] = IsWindowEnabled(hoverSave);
