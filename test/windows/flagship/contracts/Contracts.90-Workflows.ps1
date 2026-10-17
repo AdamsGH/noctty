@@ -15,9 +15,9 @@ Invoke-ContractTable -Contracts @(
         Description = 'push CI is main-only while pull-request CI remains enabled'
     }
     @{
-        File = "$testWorkflow :: windows site checks"
+        File = "$testWorkflow :: checks site checks"
         Content = {
-            (Get-YamlJobText -Content $testWorkflowText -Name 'windows' -Source $testWorkflow)
+            (Get-YamlJobText -Content $testWorkflowText -Name 'checks' -Source $testWorkflow)
         }
         Pattern = '(?ms)- name: Deterministic site asset check.*?node scripts/build-site-assets\.mjs --check.*?if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}.*?- name: Site unit tests.*?node --test "site/tests/\*\*/\*\.test\.mjs".*?if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}'
         Kind = 'Text'
@@ -31,30 +31,6 @@ Invoke-ContractTable -Contracts @(
         Pattern = '(?ms)env:\s+GH_TOKEN: \$\{\{ github\.token \}\}.*?CheckRemoteLatest'
         Kind = 'Text'
         Description = 'scheduled remote verification authenticates gh'
-    }
-    @{
-        File = "$testWorkflow :: windows :: Setup Zig"
-        Content = {
-            (Get-YamlStepBlock `
-                    -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows' -Source $testWorkflow) `
-                    -Name 'Setup Zig' `
-                    -Source "$testWorkflow :: windows")
-        }
-        Pattern = '(?ms)with:\s+version: 0\.15\.2\s+.*?use-cache: false'
-        Kind = 'Text'
-        Description = 'hosted Windows tests cannot restore failed Zig build caches'
-    }
-    @{
-        File = "$testWorkflow :: windows-portable-smoke :: Setup Zig"
-        Content = {
-            (Get-YamlStepBlock `
-                    -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows-portable-smoke' -Source $testWorkflow) `
-                    -Name 'Setup Zig' `
-                    -Source "$testWorkflow :: windows-portable-smoke")
-        }
-        Pattern = '(?ms)with:\s+version: 0\.15\.2\s+.*?use-cache: false'
-        Kind = 'Text'
-        Description = 'portable smoke cannot restore failed Zig build caches'
     }
     @{
         File = "$releaseWorkflow :: windows-release :: Setup Zig"
@@ -108,13 +84,13 @@ if ($releaseWindowsJob -match 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24') {
 }
 $windowsArmWorkflow = Join-Path $repoRoot '.github\workflows\windows-arm64.yml'
 $windowsArmWorkflowText = Get-Content -LiteralPath $windowsArmWorkflow -Raw
-$windowsHostedJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows' -Source $testWorkflow
+$checksJob = Get-YamlJobText -Content $testWorkflowText -Name 'checks' -Source $testWorkflow
 foreach ($shellCase in @(
         @{ Name = 'PowerShell shell integration tests (PowerShell 7)'; Shell = 'pwsh'; Script = 'powershell-shell-integration' },
         @{ Name = 'PowerShell shell integration tests (Windows PowerShell 5.1)'; Shell = 'powershell'; Script = 'powershell-shell-integration' },
         @{ Name = 'Bash shell integration tests (Git Bash)'; Shell = 'pwsh'; Script = 'bash-shell-integration' }
     )) {
-    $step = Get-YamlStepBlock -Content $windowsHostedJob -Name $shellCase.Name -Source $testWorkflow
+    $step = Get-YamlStepBlock -Content $checksJob -Name $shellCase.Name -Source $testWorkflow
     # Step fields sit at eight spaces; the lines of a `run: |` body sit deeper,
     # so a script name in a comment or string there does not count.
     if ($step -notmatch ('(?m)^ {8}shell: ' + $shellCase.Shell + '\s*$') -or
@@ -122,9 +98,13 @@ foreach ($shellCase in @(
         throw "Missing behavioural shell-integration coverage: $($shellCase.Name)"
     }
 }
-$hintsStep = Get-YamlStepBlock -Content $windowsHostedJob -Name 'Interactive hints contract checks' -Source $testWorkflow
+$hintsStep = Get-YamlStepBlock -Content $checksJob -Name 'Interactive hints contract checks' -Source $testWorkflow
 if ($hintsStep -notmatch 'run: ./test/windows/Test-InteractiveWin11HintsContracts\.ps1') {
     throw 'Hosted CI must run the hints contracts.'
+}
+$pathFilterStep = Get-YamlStepBlock -Content $checksJob -Name 'CI script tests (path filter, gate, reports)' -Source $testWorkflow
+if ($pathFilterStep -notmatch '(?m)^        run: \./test/windows/ci-scripts\.ps1\s*$') {
+    throw 'The checks job must run the CI script tests.'
 }
 $libVtJob = Get-YamlJobText -Content $testWorkflowText -Name 'windows-lib-vt' -Source $testWorkflow
 $libVtStep = Get-YamlStepBlock -Content $libVtJob -Name 'Run libghostty-vt and C API tests' -Source $testWorkflow
@@ -148,14 +128,15 @@ function Test-MandatoryWorkflowCoverage {
 }
 $coverageMutationCount = 0
 foreach ($coverage in @(
-        @{ Job = $windowsHostedJob; Steps = @(
+        @{ Job = $checksJob; Steps = @(
+                'Flagship verification contract checks',
                 'PowerShell shell integration tests (PowerShell 7)',
                 'PowerShell shell integration tests (Windows PowerShell 5.1)',
                 'Bash shell integration tests (Git Bash)',
                 'Cmd and Clink integration tests (portable)',
-                'Interactive hints contract checks'
-            ) },
-        @{ Job = $libVtJob; Steps = @('Run libghostty-vt and C API tests') }
+                'Interactive hints contract checks',
+                'CI script tests (path filter, gate, reports)'
+            ) }
     )) {
     if (-not (Test-MandatoryWorkflowCoverage -JobText $coverage.Job -StepNames $coverage.Steps)) {
         throw 'Required shell, hints, and library coverage must be unconditional and fail closed.'
@@ -189,7 +170,176 @@ if ($conptyJob -notmatch '(?m)^    continue-on-error: true\s*$' -or
 }
 foreach ($probeVariable in @('NOCTTY_RUN_CONPTY_TRANSPORT_TEST', 'NOCTTY_CONPTY_TRANSPORT_PROBE', 'NOCTTY_CONPTY_KEY_INPUT_PROBE')) {
     if ($conptyStep -notmatch ($probeVariable + ": '1'")) { throw "Missing scoped probe variable: $probeVariable" }
-    if ($windowsHostedJob -match $probeVariable) { throw 'ConPTY probe variables must stay out of the required Windows job.' }
+    if ($testWorkflowText.Replace($conptyJob, '') -match $probeVariable) { throw 'ConPTY probe variables must stay out of the required Windows jobs.' }
+}
+
+# The compiled jobs are filtered by path. A filter may skip a job, never weaken
+# it: the only job-level condition is the changes flag, nothing may ignore a
+# failure, and its mandatory steps stay unconditional. The gate then requires
+# exactly the jobs that carry a flag.
+function Test-FilteredJobCoverage {
+    param(
+        [Parameter(Mandatory)] [string] $JobText,
+        [Parameter(Mandatory)] [string] $Flag,
+        [Parameter(Mandatory)] [string[]] $StepNames
+    )
+
+    if ($JobText -notmatch '(?m)^    needs: changes\s*$') { return $false }
+    if ($JobText -notmatch ("(?m)^    if: needs\.changes\.outputs\.$Flag == 'true'\s*$")) { return $false }
+    if ($JobText -match '(?m)^    [''"]?continue-on-error[''"]?[ \t]*:') { return $false }
+    foreach ($name in $StepNames) {
+        $step = Get-YamlStepBlock -Content $JobText -Name $name -Source 'filtered job coverage'
+        if ($step -match '(?m)^        [''"]?(?:if|continue-on-error)[''"]?[ \t]*:') { return $false }
+    }
+    return $true
+}
+$filteredJobs = @(
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'tests'; Flag = 'tests'; Steps = @('Zig formatting', 'Full Zig test suite', 'Native Win32 compositor tests') }
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'bench'; Flag = 'bench'; Steps = @('Headless benchmark regression gates') }
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'build'; Flag = 'build'; Steps = @('Build executable', 'Verify default source-build shader mode', 'Verify source build stages the pinned ConPTY', 'Build without D3D11 beta') }
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'renderer-smoke'; Flag = 'renderer_smoke'; Steps = @('Build D3D11 lifecycle smoke tools', 'Hidden-desktop x64 WARP lifecycle smoke') }
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'cross-arm64'; Flag = 'cross_arm64'; Steps = @('Build ARM64 executable', 'Verify ARM64 source build stages the pinned ConPTY') }
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'windows-lib-vt'; Flag = 'lib_vt'; Steps = @('Run libghostty-vt and C API tests') }
+    @{ Workflow = $testWorkflow; Text = $testWorkflowText; Job = 'windows-portable-smoke'; Flag = 'portable_smoke'; Steps = @('Run portable package CLI smoke') }
+    @{ Workflow = $windowsArmWorkflow; Text = $windowsArmWorkflowText; Job = 'arm64-tests'; Flag = 'arm64_tests'; Steps = @('Verify native ARM64 runner', 'Run ARM64 Zig tests') }
+    @{ Workflow = $windowsArmWorkflow; Text = $windowsArmWorkflowText; Job = 'arm64-build'; Flag = 'arm64_build'; Steps = @('Verify native ARM64 runner', 'Build and package ARM64 binaries', 'Run ARM64 CLI smoke', 'Build ARM64 D3D11 smoke tools', 'Hidden-desktop ARM64 WARP lifecycle smoke', 'Run packaged ARM64 CLI smoke') }
+)
+$filteredMutationCount = 0
+foreach ($filtered in $filteredJobs) {
+    $jobText = Get-YamlJobText -Content $filtered.Text -Name $filtered.Job -Source $filtered.Workflow
+    if (-not (Test-FilteredJobCoverage -JobText $jobText -Flag $filtered.Flag -StepNames $filtered.Steps)) {
+        throw "Filtered job '$($filtered.Job)' must carry exactly its changes flag '$($filtered.Flag)' and keep its mandatory steps unconditional and fail closed ($($filtered.Workflow))."
+    }
+    $mutations = @(
+        $jobText.Replace("    if: needs.changes.outputs.$($filtered.Flag) == 'true'", '    if: true')
+        $jobText.Replace("    if: needs.changes.outputs.$($filtered.Flag) == 'true'", "    if: needs.changes.outputs.$($filtered.Flag) != 'false'")
+        $jobText.Replace('    needs: changes', '    needs: []')
+        $jobText.Replace('    steps:', "    continue-on-error: true`n    steps:")
+    )
+    foreach ($name in $filtered.Steps) {
+        foreach ($setting in @('if: false', 'continue-on-error: true')) {
+            $mutations += $jobText.Replace("      - name: $name", "      - name: $name`n        $setting")
+        }
+    }
+    foreach ($mutation in $mutations) {
+        if (Test-FilteredJobCoverage -JobText $mutation -Flag $filtered.Flag -StepNames $filtered.Steps) {
+            throw "Filtered job '$($filtered.Job)' accepted a weakened mutation."
+        }
+        $filteredMutationCount++
+    }
+}
+Write-Host "Filtered job coverage: $filteredMutationCount/$filteredMutationCount weakening mutations rejected"
+
+# Every Zig job restores only verified dependency packages, never build output
+# (a failed or cancelled job can save incomplete generated files).
+foreach ($zigJob in @(
+        @{ Workflow = $testWorkflow; Text = $testWorkflowText; Jobs = @('tests', 'bench', 'build', 'renderer-smoke', 'cross-arm64', 'windows-lib-vt', 'windows-conpty-probes', 'windows-portable-smoke', 'bench-trend') }
+        @{ Workflow = $windowsArmWorkflow; Text = $windowsArmWorkflowText; Jobs = @('arm64-tests', 'arm64-build') }
+    )) {
+    foreach ($jobName in $zigJob.Jobs) {
+        $jobText = Get-YamlJobText -Content $zigJob.Text -Name $jobName -Source $zigJob.Workflow
+        $setup = Get-YamlStepBlock -Content $jobText -Name 'Setup Zig' -Source "$($zigJob.Workflow) :: $jobName"
+        if ($setup -notmatch '(?ms)with:\s+version: 0\.15\.2\s+.*?use-cache: false') {
+            throw "$($zigJob.Workflow) job '$jobName': Zig builds must not restore failed Zig build caches."
+        }
+        $cache = Get-YamlStepBlock -Content $jobText -Name 'Cache Zig dependency packages' -Source "$($zigJob.Workflow) :: $jobName"
+        if ($cache -notmatch '(?m)^ {10}path: \$\{\{ github\.workspace \}\}\\\.zig-global-cache/p\s*$') {
+            throw "$($zigJob.Workflow) job '$jobName': only the verified dependency package directory may be cached."
+        }
+    }
+}
+
+# The gate's own steps decide whether a skipped or failed job fails the run, so
+# neither may be conditional or ignore failure, and the validating step must
+# read the needs context it was given.
+function Test-GateJobShape {
+    param([Parameter(Mandatory)] [string] $JobText)
+
+    if ($JobText -match '(?m)^        [''"]?(?:if|continue-on-error)[''"]?[ \t]*:') { return $false }
+    $step = Get-YamlStepBlock -Content $JobText -Name 'Every needed job succeeded and every skipped job was not needed' -Source 'gate job'
+    return ($step -match '(?m)^          NEEDS_JSON: \$\{\{ toJSON\(needs\) \}\}\s*$') -and
+        ($step -match '(?m)^        run: \./scripts/ci-gate\.ps1 -NeedsJson \$env:NEEDS_JSON -Expect \S+\s*$') -and
+        ($step -match '(?m)^        shell: pwsh\s*$')
+}
+
+# The path filter, its outputs and the gates agree. The flags the workflows
+# read are the ones Get-CiJobFlags prints, the changes job exposes each of them,
+# and each gate requires exactly the jobs that carry one.
+$knownFlags = & {
+    . (Join-Path $repoRoot 'scripts\ci-changed-paths.ps1') -LibraryOnly
+    @((Get-CiJobFlags -Selection (New-CiSelection $true)).Keys)
+}
+foreach ($gated in @(
+        @{ Workflow = $testWorkflow; Text = $testWorkflowText; Gate = 'windows'; GateName = 'Windows Build And Tests'
+            # Their own checks; the gate covers what the single serial job used to.
+            Own = @('windows-lib-vt', 'windows-conpty-probes', 'windows-portable-smoke') }
+        @{ Workflow = $windowsArmWorkflow; Text = $windowsArmWorkflowText; Gate = 'native-arm64'; GateName = 'Native Windows ARM64 Tests'; Own = @() }
+    )) {
+    $changesJob = Get-YamlJobText -Content $gated.Text -Name 'changes' -Source $gated.Workflow
+    if ($changesJob -notmatch '(?m)^\s+run: \./scripts/ci-changed-paths\.ps1 -EventName \$env:EVENT_NAME -BaseSha \$env:BASE_SHA -HeadSha \$env:HEAD_SHA\s*$' -or
+        $changesJob -notmatch '(?m)^\s+fetch-depth: 0\s*$' -or
+        $changesJob -notmatch '(?m)^    runs-on: ubuntu-') {
+        throw "$($gated.Workflow): the changes job must run the path filter on a full-history checkout."
+    }
+    $outputNames = @([regex]::Matches($changesJob, '(?m)^      (\w+): \$\{\{ steps\.filter\.outputs\.(\w+) \}\}\s*$') | ForEach-Object {
+            if ($_.Groups[1].Value -cne $_.Groups[2].Value) { throw "$($gated.Workflow): changes output '$($_.Groups[1].Value)' reads '$($_.Groups[2].Value)'." }
+            $_.Groups[1].Value
+        })
+    foreach ($output in $outputNames) {
+        if ($output -cnotin $knownFlags) { throw "$($gated.Workflow): changes output '$output' is not a flag of scripts/ci-changed-paths.ps1." }
+    }
+    $gateJob = Get-YamlJobText -Content $gated.Text -Name $gated.Gate -Source $gated.Workflow
+    if ($gateJob -notmatch ("(?m)^    name: " + [regex]::Escape($gated.GateName) + "\s*$") -or
+        $gateJob -notmatch '(?m)^    if: \$\{\{ !cancelled\(\) \}\}\s*$' -or
+        $gateJob -notmatch '(?m)^    runs-on: ubuntu-' -or
+        $gateJob -match '(?m)^    continue-on-error:') {
+        throw "$($gated.Workflow): the gate job '$($gated.Gate)' must keep the name '$($gated.GateName)', run when not cancelled and never ignore failure."
+    }
+    if (-not (Test-GateJobShape -JobText $gateJob)) {
+        throw "$($gated.Workflow): the gate job '$($gated.Gate)' must run scripts/ci-gate.ps1 on toJSON(needs) in an unconditional step that cannot ignore failure."
+    }
+    $gateMutations = @(
+        $gateJob.Replace('      - name: Every needed job', "      - name: Every needed job`n        continue-on-error: true")
+        $gateJob.Replace('      - name: Every needed job', "      - name: Every needed job`n        if: false")
+        $gateJob.Replace('      - name: Checkout the gate script', "      - name: Checkout the gate script`n        continue-on-error: true")
+        $gateJob.Replace('NEEDS_JSON: ${{ toJSON(needs) }}', "NEEDS_JSON: '{}'")
+        $gateJob.Replace('-NeedsJson $env:NEEDS_JSON', '-NeedsJson ''{}''')
+        $gateJob.Replace('./scripts/ci-gate.ps1', './scripts/ci-gate-disabled.ps1')
+    )
+    foreach ($gateMutation in $gateMutations) {
+        if (Test-GateJobShape -JobText $gateMutation) { throw "$($gated.Workflow): the gate job accepted a weakened mutation." }
+    }
+    $expectMatch = [regex]::Match($gateJob, '(?m)-Expect (?<list>\S+)\s*$')
+    if (-not $expectMatch.Success) { throw "$($gated.Workflow): the gate job has no -Expect list." }
+    $expected = @{}
+    foreach ($entry in ($expectMatch.Groups['list'].Value -split ',')) {
+        $job, $flag = $entry -split ':', 2
+        $expected[$job] = $flag
+    }
+    $needsMatch = [regex]::Match($gateJob, '(?m)^    needs: \[(?<list>[^\]]*)\]\s*$')
+    $needed = @($needsMatch.Groups['list'].Value -split ',\s*' | Where-Object { $_ })
+    $neededText = ($needed | Sort-Object) -join ','
+    $expectedText = ((@('changes') + @($expected.Keys)) | Sort-Object) -join ','
+    if ($neededText -cne $expectedText) {
+        throw "$($gated.Workflow): the gate's needs [$($needed -join ', ')] must be changes plus the jobs in -Expect [$(@($expected.Keys) -join ', ')]."
+    }
+    # Every job in the workflow that waits for the changes job is either gated
+    # or named as having a check of its own.
+    foreach ($jobMatch in [regex]::Matches($gated.Text, '(?m)^  (?<id>[\w-]+):\s*$')) {
+        $id = $jobMatch.Groups['id'].Value
+        $text = Get-YamlJobText -Content $gated.Text -Name $id -Source $gated.Workflow
+        $flagMatch = [regex]::Match($text, "(?m)^    if: needs\.changes\.outputs\.(\w+) == 'true'\s*$")
+        if (-not $flagMatch.Success) { continue }
+        if ($flagMatch.Groups[1].Value -cnotin $knownFlags) { throw "$($gated.Workflow) job '$id' reads the unknown flag '$($flagMatch.Groups[1].Value)'." }
+        if ($id -in $gated.Own) { continue }
+        if (-not $expected.ContainsKey($id) -or $expected[$id] -cne $flagMatch.Groups[1].Value) {
+            throw "$($gated.Workflow) job '$id' is filtered by '$($flagMatch.Groups[1].Value)' but the gate does not require it with that flag."
+        }
+    }
+    foreach ($job in $expected.Keys) {
+        if ($expected[$job] -ceq 'always') { continue }
+        if ($expected[$job] -cnotin $knownFlags) { throw "$($gated.Workflow): the gate expects '$job' under the unknown flag '$($expected[$job])'." }
+    }
 }
 $armTestStep = Get-YamlStepBlock -Content $windowsArmWorkflowText -Name 'Run ARM64 Zig tests' -Source $windowsArmWorkflow
 $armBuildStep = Get-YamlStepBlock -Content $windowsArmWorkflowText -Name 'Build and package ARM64 binaries' -Source $windowsArmWorkflow
