@@ -533,24 +533,32 @@ if (-not ('HiddenControlContract' -as [type])) {
 using System;
 using System.Collections.Generic;
 public static class HiddenControlContract {
-    public static int Gates, Creates, Launches, Waits, Runs;
-    public static bool WrongWindow, MissingMember, OracleFails, StopFails;
+    public static int Gates, Creates, Launches, Waits, Runs, CleanupPolls;
+    public static bool WrongWindow, MissingMember, OracleFails, StopFails, CleanupLeak, DelayedCleanup, NestedExited;
+    public static string StderrPath;
+    public static DateTime UtcNow;
     public static List<long> Stopped = new List<long>();
     public struct ProcessInfo { public int pid; public IntPtr process, thread; }
     public static string CurrentDesktopName() { return "Default"; }
     public static IntPtr CreateOwnedJob() { Creates++; return new IntPtr(7); }
     public static ProcessInfo Launch(string a, string c, string w, string d, IntPtr j, string e) {
         if (Gates == 0 || d != "WinSta0\\Default" || j != new IntPtr(7)) throw new Exception("Invalid control launch");
-        Launches++; return new ProcessInfo { pid = c.EndsWith("Window") ? 42 : 41, process = new IntPtr(9) };
+        StderrPath = e; Launches++; return new ProcessInfo { pid = c.EndsWith("Window") ? 42 : 41, process = new IntPtr(9) };
     }
-    public static int[] JobProcessIds(IntPtr j) { return MissingMember ? new int[] { 41 } : new int[] { 41, 42 }; }
+    public static int[] JobProcessIds(IntPtr j) {
+        if (NestedExited) {
+            CleanupPolls++;
+            return CleanupLeak || (DelayedCleanup && CleanupPolls <= 2) ? new int[] { 41, 42 } : new int[] { 41 };
+        }
+        return MissingMember ? new int[] { 41 } : new int[] { 41, 42 };
+    }
     public class Window { public int ProcessId; }
     public static Window[] VisibleJobWindows(IntPtr j) {
         if (OracleFails) throw new Exception("fixture oracle failure");
         return new Window[] { new Window { ProcessId = WrongWindow ? 99 : 42 } };
     }
     public static uint WaitForSingleObject(IntPtr p, uint ms) { return ms == 10000 || Waits++ > 0 ? 0u : 258u; }
-    public static bool GetExitCodeProcess(IntPtr p, out uint code) { code = 0; return true; }
+    public static bool GetExitCodeProcess(IntPtr p, out uint code) { NestedExited = true; code = 0; return true; }
     public static uint StopOwnedJob(IntPtr j) { Stopped.Add(j.ToInt64()); if (StopFails) throw new Exception("fixture stop failure"); return 1; }
     public static bool CloseHandle(IntPtr p) { return true; }
     public static void Run() { Runs++; }
@@ -558,6 +566,8 @@ public static class HiddenControlContract {
 '@
 }
 $controlFunctions = $controlFunctions.Replace('[HiddenWin]', '[HiddenControlContract]').Replace('[HiddenDesktopControlWindow]::Run()', '[HiddenControlContract]::Run()')
+# Advance only the extracted control functions' clock in managed polling fixtures.
+$controlFunctions = $controlFunctions.Replace('[datetime]::UtcNow', '[HiddenControlContract]::UtcNow')
 function Test-DesktopControlFunctions([string] $Code) {
     . ([scriptblock]::Create($Code))
     $controlScript = 'C:\fixture\control.ps1'
@@ -565,6 +575,8 @@ function Test-DesktopControlFunctions([string] $Code) {
     function Add-Type { }
     foreach ($fixture in @(
         @{ Mode = 'Parent' }, @{ Mode = 'Nested' }, @{ Mode = 'Window' }
+        @{ Mode = 'Parent'; DelayedCleanup = $true }
+        @{ Mode = 'Parent'; CleanupLeak = $true; Blocked = $true }
         @{ Mode = 'Parent'; WrongWindow = $true; Blocked = $true }
         @{ Mode = 'Parent'; MissingMember = $true; Blocked = $true }
         @{ Mode = 'Nested'; MissingMember = $true; Blocked = $true }
@@ -578,9 +590,18 @@ function Test-DesktopControlFunctions([string] $Code) {
         @{ Mode = 'Helper'; GateFails = $true; Blocked = $true }
     )) {
         [HiddenControlContract]::Gates = [HiddenControlContract]::Creates = [HiddenControlContract]::Launches = [HiddenControlContract]::Waits = [HiddenControlContract]::Runs = 0
+        [HiddenControlContract]::CleanupPolls = 0; [HiddenControlContract]::NestedExited = $false; [HiddenControlContract]::StderrPath = ''
+        [HiddenControlContract]::UtcNow = [datetime]'2026-01-01T00:00:00Z'
         [HiddenControlContract]::Stopped.Clear()
-        foreach ($field in @('WrongWindow', 'MissingMember', 'OracleFails', 'StopFails')) { [HiddenControlContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
+        foreach ($field in @('WrongWindow', 'MissingMember', 'OracleFails', 'StopFails', 'CleanupLeak', 'DelayedCleanup')) { [HiddenControlContract].GetField($field).SetValue($null, [bool]$fixture[$field]) }
         $writes = @{}
+        function Start-Sleep {
+            param([int]$Milliseconds)
+            $script:controlPollSleeps++
+            if ($Milliseconds -ne 50 -or $script:controlPollSleeps -gt 40) { throw 'Managed cleanup poll exceeded two seconds.' }
+            [HiddenControlContract]::UtcNow = [HiddenControlContract]::UtcNow.AddMilliseconds($Milliseconds)
+        }
+        $script:controlPollSleeps = 0; $script:controlCleanupReceiptReads = 0
         function Assert-HiddenRunner { [HiddenControlContract]::Gates++; if ($fixture.GateFails) { throw 'fixture runner gate' } }
         function Test-Path {
             param([string]$LiteralPath)
@@ -595,6 +616,7 @@ function Test-DesktopControlFunctions([string] $Code) {
         function Get-Content {
             param([string]$LiteralPath, [switch]$Raw)
             if ($LiteralPath.EndsWith('window-helper.json')) { return '{"WindowPid":42,"InnerMember":true}' }
+            $script:controlCleanupReceiptReads++
             return '{"InnerJobCleanedUp":true,"OwnedProcessCount":1}'
         }
         $blocked = $false
@@ -605,7 +627,10 @@ function Test-DesktopControlFunctions([string] $Code) {
                 'Window' { Invoke-DesktopControlWindow }
                 'Helper' { $null = Start-DesktopControlHelper -Job ([IntPtr]7) -Run 'C:\fixture\run' -HelperMode 'Nested' }
             }
-        } catch { $blocked = $true }
+        } catch {
+            $blocked = $true
+            if ($fixture.CleanupLeak -and $_.Exception.Message -cne 'Window helper remained in outer job after nested cleanup.') { throw 'Leaked helper must fail at the independent bounded membership check.' }
+        }
         if ($blocked -ne [bool]$fixture.Blocked) { throw "Desktop control fixture $($fixture | ConvertTo-Json -Compress) lost its expected result." }
         if ($fixture.GateFails -or $fixture.Existing) {
             if ([HiddenControlContract]::Launches -or [HiddenControlContract]::Creates -or [HiddenControlContract]::Runs -or $writes.Count) { throw 'Blocked control must not launch, create jobs/windows or write receipts.' }
@@ -617,11 +642,19 @@ function Test-DesktopControlFunctions([string] $Code) {
         }
         if ([HiddenControlContract]::Gates -ne 2 -or [HiddenControlContract]::Creates -ne 1 -or [HiddenControlContract]::Launches -ne 1 -or
             [HiddenControlContract]::Stopped.Count -ne 1 -or [HiddenControlContract]::Stopped[0] -ne 7) { throw 'Parent/nested control lost gate, owned job, helper launch or exact-job cleanup.' }
+        $helperMode = if ($fixture.Mode -eq 'Parent') { 'Nested' } else { 'Window' }
+        if ([HiddenControlContract]::StderrPath -cne (Join-Path 'C:\fixture\run' "$helperMode-stderr.log")) { throw 'Helper launch lost its mode-specific stderr artifact.' }
         if ($fixture.Mode -eq 'Parent') {
+            if ($fixture.CleanupLeak -and ([HiddenControlContract]::CleanupPolls -ne 41 -or $script:controlPollSleeps -ne 40 -or $script:controlCleanupReceiptReads -ne 0)) {
+                throw 'Cleanup leak must exhaust the two-second poll before reading the inner receipt.'
+            }
+            if (-not $fixture.Blocked -and ([HiddenControlContract]::CleanupPolls -ne $(if ($fixture.DelayedCleanup) { 3 } else { 1 }) -or
+                $script:controlPollSleeps -ne $(if ($fixture.DelayedCleanup) { 2 } else { 0 }) -or $script:controlCleanupReceiptReads -ne 1)) { throw 'Successful cleanup must independently observe the helper disappear before accepting its receipt.' }
             $receipt = $writes['desktop-control-results.json'] | ConvertFrom-Json
             if (-not $receipt -or $receipt.Passed -ne (-not [bool]$fixture.Blocked) -or
                 ($receipt.Passed -and ($receipt.WindowPid -ne 42 -or -not $receipt.DefaultOracleDetectedWindow -or -not $receipt.OuterJobContainsNestedWindow -or
-                    -not $receipt.InnerJobCleanedUp -or -not $receipt.OuterJobCleanedUp))) { throw 'Parent control lost its sanitized result/cleanup receipt.' }
+                    -not $receipt.WindowHelperExitedBeforeOuterCleanup -or -not $receipt.InnerJobCleanedUp -or -not $receipt.OuterJobCleanedUp)) -or
+                ($fixture.CleanupLeak -and ($receipt.WindowHelperExitedBeforeOuterCleanup -or $receipt.InnerJobCleanedUp -or -not $receipt.OuterJobCleanedUp))) { throw 'Parent control lost its sanitized result/cleanup receipt.' }
         } else {
             $receipt = $writes['nested-cleanup.json'] | ConvertFrom-Json
             if (-not $receipt -or $receipt.InnerJobCleanedUp -eq [bool]$fixture.StopFails) { throw 'Nested cleanup receipt lost success/failure evidence.' }
@@ -635,6 +668,11 @@ Assert-HiddenMutation 'desktop control default oracle removed' $controlFunctions
 Assert-HiddenMutation 'desktop control known window PID ignored' $controlFunctions ($controlFunctions.Replace('Where-Object ProcessId -eq $windowPid', 'Where-Object ProcessId -ne $windowPid')) ${function:Test-DesktopControlFunctions}
 Assert-HiddenMutation 'desktop control owned cleanup removed' $controlFunctions ($controlFunctions.Replace('[HiddenControlContract]::StopOwnedJob($inner)', '0').Replace('[HiddenControlContract]::StopOwnedJob($outer)', '0')) ${function:Test-DesktopControlFunctions}
 Assert-HiddenMutation 'desktop control existing directory allowed' $controlFunctions ($controlFunctions.Replace("if (Test-Path -LiteralPath `$Run) { throw 'Run directory must be new.' }", '')) ${function:Test-DesktopControlFunctions}
+$cleanupPoll = [regex]::Match($controlFunctions, '(?ms)^        while \(@\(\[HiddenControlContract\]::JobProcessIds\(\$outer\)\) -contains \$windowPid\) \{.*?^        }').Value
+if (-not $cleanupPoll) { throw 'Desktop control cleanup membership poll was not found.' }
+Assert-HiddenMutation 'desktop control cleanup leak accepted' $controlFunctions ($controlFunctions.Replace($cleanupPoll, '')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control cleanup poll exceeds two seconds' $controlFunctions ($controlFunctions.Replace('::UtcNow.AddSeconds(2)', '::UtcNow.AddSeconds(3)')) ${function:Test-DesktopControlFunctions}
+Assert-HiddenMutation 'desktop control helper stderr omitted' $controlFunctions ($controlFunctions.Replace('(Join-Path $Run "$HelperMode-stderr.log")', "''")) ${function:Test-DesktopControlFunctions}
 
 $embeddingText = Remove-PowerShellComments (Get-Content -LiteralPath $hiddenScripts[1] -Raw)
 $embeddingArguments = [regex]::Match($embeddingText, '(?ms)^\$uniqueClass =.*?(?=^Assert-EmbeddingDelegationSafe|^\$started =)').Value

@@ -21,7 +21,7 @@ function Start-DesktopControlHelper([IntPtr] $Job, [string] $Run, [string] $Help
     $pwsh = (Get-Command pwsh.exe).Source
     $line = '"{0}" -NoProfile -NonInteractive -File "{1}" -Run "{2}" -Mode {3}' -f $pwsh, $controlScript, $Run, $HelperMode
     # Launch supplies CREATE_NO_WINDOW, suspended assignment, then resume; no breakaway.
-    return [HiddenWin]::Launch($pwsh, $line, $Run, 'WinSta0\Default', $Job, '')
+    return [HiddenWin]::Launch($pwsh, $line, $Run, 'WinSta0\Default', $Job, (Join-Path $Run "$HelperMode-stderr.log"))
 }
 
 function Invoke-DesktopControlNested([string] $Run) {
@@ -56,7 +56,7 @@ function Invoke-DesktopControlParent([string] $Run) {
     $Run = [IO.Path]::GetFullPath($Run)
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     [void](New-Item -ItemType Directory -Path $Run)
-    $outer = [IntPtr]::Zero; $nested = $null; $seen = $false; $innerCleaned = $false; $outerCleaned = $false; $count = 0; $windowPid = 0
+    $outer = [IntPtr]::Zero; $nested = $null; $seen = $false; $windowExited = $false; $innerCleaned = $false; $outerCleaned = $false; $count = 0; $windowPid = 0
     try {
         $outer = [HiddenWin]::CreateOwnedJob()
         $nested = Start-DesktopControlHelper -Job $outer -Run $Run -HelperMode 'Nested'
@@ -81,6 +81,13 @@ function Invoke-DesktopControlParent([string] $Run) {
         if ([HiddenWin]::WaitForSingleObject($nested.process, 10000) -ne 0) { throw 'Nested cleanup exceeded ten seconds.' }
         [uint32]$exitCode = 0
         if (-not [HiddenWin]::GetExitCodeProcess($nested.process, [ref]$exitCode) -or $exitCode -ne 0) { throw 'Nested control failed.' }
+        # Independently confirm inner cleanup before outer cleanup could mask a leak.
+        $cleanupDeadline = [datetime]::UtcNow.AddSeconds(2)
+        while (@([HiddenWin]::JobProcessIds($outer)) -contains $windowPid) {
+            if ([datetime]::UtcNow -ge $cleanupDeadline) { throw 'Window helper remained in outer job after nested cleanup.' }
+            Start-Sleep -Milliseconds 50
+        }
+        $windowExited = $true
         $cleanup = Get-Content -LiteralPath (Join-Path $Run 'nested-cleanup.json') -Raw | ConvertFrom-Json
         $innerCleaned = $cleanup.InnerJobCleanedUp -eq $true -and $cleanup.OwnedProcessCount -ge 1
         if (-not $innerCleaned) { throw 'Nested owned job cleanup was not confirmed.' }
@@ -90,7 +97,7 @@ function Invoke-DesktopControlParent([string] $Run) {
         } finally {
             if ($nested) { [void][HiddenWin]::CloseHandle($nested.thread); [void][HiddenWin]::CloseHandle($nested.process) }
             @{ Passed = ($seen -and $innerCleaned -and $outerCleaned); WindowPid = $windowPid; OuterJobContainsNestedWindow = $seen
-                DefaultOracleDetectedWindow = $seen; InnerJobCleanedUp = $innerCleaned; OuterJobCleanedUp = $outerCleaned; OwnedProcessCount = $count } |
+                DefaultOracleDetectedWindow = $seen; WindowHelperExitedBeforeOuterCleanup = $windowExited; InnerJobCleanedUp = $innerCleaned; OuterJobCleanedUp = $outerCleaned; OwnedProcessCount = $count } |
                 ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Run 'desktop-control-results.json')
         }
     }
