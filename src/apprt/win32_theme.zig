@@ -937,19 +937,6 @@ pub fn profileKindHintColor(kind: ProfileKind, is_dark: bool) u32 {
     return profileChromeAccent(kind, is_dark).active_border;
 }
 
-pub fn quickSlotChipColors(kind: ProfileKind, is_dark: bool, hovered: bool) ButtonColors {
-    const accent = profileChromeAccent(kind, is_dark);
-    return .{
-        .bg = if (hovered) accent.hover_bg else accent.idle_bg,
-        .border = if (hovered) accent.hover_border else accent.idle_border,
-        .fg = if (hovered) profileKindHintColor(kind, is_dark) else profileKindLabelColor(kind, is_dark),
-    };
-}
-
-pub fn pinnedChipMarkerColor(kind: ProfileKind, is_dark: bool, hovered: bool) u32 {
-    return if (hovered) profileKindLabelColor(kind, is_dark) else profileKindHintColor(kind, is_dark);
-}
-
 // ── Accent-follow helpers ───────────────────────────────────────────────
 // Registry read: win32.zig:resolveSystemAccentColor.
 // Blend: 60% system / 40% semantic, S clamped [0.45, 0.75], V clamped

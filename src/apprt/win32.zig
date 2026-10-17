@@ -142,8 +142,6 @@ const profileKindFocusRingColor = win32_theme.profileKindFocusRingColor;
 const profileChromeStripeColor = win32_theme.profileChromeStripeColor;
 const profileKindLabelColor = win32_theme.profileKindLabelColor;
 const profileKindHintColor = win32_theme.profileKindHintColor;
-const quickSlotChipColors = win32_theme.quickSlotChipColors;
-const pinnedChipMarkerColor = win32_theme.pinnedChipMarkerColor;
 const rgb = win32_theme.rgb;
 
 const rectEquals = chrome_layout.rectEquals;
@@ -29795,22 +29793,6 @@ const buildDropdownProfileLabel = labels.buildDropdownProfileLabel;
 
 const buttonLabelRightInset = labels.buttonLabelRightInset;
 
-fn paintPinnedChipMarker(hdc: HDC, chip_rect: RECT, color: u32, dpi: u32) void {
-    const s = Host.scaledBy;
-    fillSolidRect(hdc, .{
-        .left = chip_rect.left + s(3, dpi),
-        .top = chip_rect.top + s(3, dpi),
-        .right = chip_rect.left + s(9, dpi),
-        .bottom = chip_rect.top + s(5, dpi),
-    }, color);
-    fillSolidRect(hdc, .{
-        .left = chip_rect.left + s(3, dpi),
-        .top = chip_rect.top + s(3, dpi),
-        .right = chip_rect.left + s(5, dpi),
-        .bottom = chip_rect.top + s(9, dpi),
-    }, color);
-}
-
 const pinnedSlotBadgeDigit = labels.pinnedSlotBadgeDigit;
 
 fn paintPinnedSlotBadge(hdc: HDC, rect: RECT, digit: u8, border: u32, bg: u32, fg: u32, dpi: u32) void {
@@ -29840,28 +29822,6 @@ const profileOpenTargetMarkerColor = labels.profileOpenTargetMarkerColor;
 const profileOpenTargetBadgeGlyph = labels.profileOpenTargetBadgeGlyph;
 
 fn paintTargetButtonBadge(hdc: HDC, rect: RECT, glyph: u8, border: u32, bg: u32, fg: u32, dpi: u32) void {
-    const s = Host.scaledBy;
-    const badge_rect = RECT{
-        .left = rect.right - s(13, dpi),
-        .top = rect.bottom - s(13, dpi),
-        .right = rect.right - s(3, dpi),
-        .bottom = rect.bottom - s(3, dpi),
-    };
-    drawRoundedRect(hdc, badge_rect, bg, border, s(3, dpi));
-    var text_buf = [_]u16{ glyph, 0 };
-    _ = sys.SetBkMode(hdc, c.TRANSPARENT);
-    _ = sys.SetTextColor(hdc, fg);
-    var text_rect = badge_rect;
-    _ = sys.DrawTextW(
-        hdc,
-        @ptrCast(&text_buf),
-        1,
-        &text_rect,
-        c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOPREFIX,
-    );
-}
-
-fn paintTargetChipBadge(hdc: HDC, rect: RECT, glyph: u8, border: u32, bg: u32, fg: u32, dpi: u32) void {
     const s = Host.scaledBy;
     const badge_rect = RECT{
         .left = rect.right - s(13, dpi),
@@ -32138,6 +32098,22 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                             }
                         }
                     },
+                    // Foreground-free harness hooks also used by interactive
+                    // verification; these have no visible toolbar controls.
+                    1901 => {
+                        if (v.activeSurface()) |surface| {
+                            runUiActionOrLog("toolbar command palette failed", surface.toggleCommandPalette());
+                        }
+                        return 0;
+                    },
+                    1907 => {
+                        _ = v.activateTabByDirection(.previous);
+                        return 0;
+                    },
+                    1908 => {
+                        _ = v.activateTabByDirection(.next);
+                        return 0;
+                    },
                     1904 => {
                         v.postDeferredNewTab();
                         return 0;
@@ -32435,52 +32411,6 @@ fn movedIndexAfterReorder(active: usize, from: usize, to: usize) usize {
     if (from < to and active > from and active <= to) return active - 1;
     if (from > to and active >= to and active < from) return active + 1;
     return active;
-}
-
-const quickSlotProfileIndex = labels.quickSlotProfileIndex;
-
-fn nextQuickSlotFocus(
-    profiles_len: usize,
-    selected_index: ?usize,
-    current_profile_index: ?usize,
-    reverse: bool,
-    max_slots: usize,
-) ?usize {
-    var visible_count: usize = 0;
-    var slot_ordinal: usize = 0;
-    while (slot_ordinal < max_slots) : (slot_ordinal += 1) {
-        if (quickSlotProfileIndex(profiles_len, selected_index, slot_ordinal, max_slots)) |_| {
-            visible_count += 1;
-        } else break;
-    }
-    if (visible_count == 0) return null;
-
-    if (current_profile_index) |current| {
-        var current_ordinal: ?usize = null;
-        slot_ordinal = 0;
-        while (slot_ordinal < visible_count) : (slot_ordinal += 1) {
-            if (quickSlotProfileIndex(profiles_len, selected_index, slot_ordinal, max_slots)) |index| {
-                if (index == current) {
-                    current_ordinal = slot_ordinal;
-                    break;
-                }
-            }
-        }
-        if (current_ordinal) |ordinal| {
-            const next_ordinal = if (reverse)
-                if (ordinal == 0) visible_count - 1 else ordinal - 1
-            else
-                (ordinal + 1) % visible_count;
-            return quickSlotProfileIndex(profiles_len, selected_index, next_ordinal, max_slots);
-        }
-    }
-
-    return quickSlotProfileIndex(
-        profiles_len,
-        selected_index,
-        if (reverse) visible_count - 1 else 0,
-        max_slots,
-    );
 }
 
 fn applyQuickSlotPreferenceOrder(
@@ -51037,53 +50967,6 @@ test "win32 prepareActiveTabVisibility hides inactive tab surfaces first" {
     try std.testing.expect(!surface_a.host_active);
     try std.testing.expect(surface_b.host_active);
     try std.testing.expect(!surface_c.host_active);
-}
-
-test "win32 quickSlotChipColors follow profile hover accent" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    // Dark mode
-    const idle = quickSlotChipColors(.git_bash, true, false);
-    try std.testing.expectEqual(rgb(48, 40, 31), idle.bg);
-    try std.testing.expectEqual(rgb(212, 156, 92), idle.border);
-    try std.testing.expectEqual(rgb(255, 224, 178), idle.fg);
-
-    const hovered = quickSlotChipColors(.git_bash, true, true);
-    try std.testing.expectEqual(rgb(58, 48, 37), hovered.bg);
-    try std.testing.expectEqual(rgb(236, 182, 118), hovered.border);
-    try std.testing.expectEqual(rgb(248, 202, 134), hovered.fg);
-
-    // Light mode
-    const idle_light = quickSlotChipColors(.git_bash, false, false);
-    try std.testing.expectEqual(rgb(252, 244, 228), idle_light.bg);
-    try std.testing.expectEqual(rgb(168, 120, 24), idle_light.border);
-    try std.testing.expectEqual(rgb(120, 80, 4), idle_light.fg);
-}
-
-test "win32 pinnedChipMarkerColor follows profile accent" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    // Dark mode
-    try std.testing.expectEqual(rgb(248, 202, 134), pinnedChipMarkerColor(.git_bash, true, false));
-    try std.testing.expectEqual(rgb(255, 224, 178), pinnedChipMarkerColor(.git_bash, true, true));
-    try std.testing.expectEqual(rgb(136, 216, 242), pinnedChipMarkerColor(.pwsh, true, false));
-
-    // Light mode
-    try std.testing.expectEqual(rgb(140, 96, 8), pinnedChipMarkerColor(.git_bash, false, false));
-    try std.testing.expectEqual(rgb(120, 80, 4), pinnedChipMarkerColor(.git_bash, false, true));
-}
-
-test "win32 nextQuickSlotFocus cycles visible painted quick slots" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(@as(?usize, 1), nextQuickSlotFocus(5, 0, null, false, 3));
-    try std.testing.expectEqual(@as(?usize, 3), nextQuickSlotFocus(5, 0, null, true, 3));
-    try std.testing.expectEqual(@as(?usize, 2), nextQuickSlotFocus(5, 0, 1, false, 3));
-    try std.testing.expectEqual(@as(?usize, 3), nextQuickSlotFocus(5, 0, 2, false, 3));
-    try std.testing.expectEqual(@as(?usize, 1), nextQuickSlotFocus(5, 0, 3, false, 3));
-    try std.testing.expectEqual(@as(?usize, 3), nextQuickSlotFocus(5, 0, 1, true, 3));
-    try std.testing.expectEqual(@as(?usize, 0), nextQuickSlotFocus(5, 3, null, false, 3));
-    try std.testing.expectEqual(@as(?usize, null), nextQuickSlotFocus(1, 0, null, false, 3));
 }
 
 test "win32 applyQuickSlotPreferenceOrder promotes pinned launcher profiles" {
