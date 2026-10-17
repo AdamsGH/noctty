@@ -655,17 +655,12 @@ pub extern "advapi32" fn RegQueryValueExW(hKey: HKEY, lpValueName: LPCWSTR, lpRe
 
 pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) i32;
 
-pub extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) HGLRC;
-
-pub extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
-
-pub extern "opengl32" fn wglGetCurrentContext() callconv(.winapi) HGLRC;
-
-pub extern "opengl32" fn wglGetCurrentDC() callconv(.winapi) HDC;
-
-pub extern "opengl32" fn wglGetProcAddress(lpszProc: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-
-pub extern "opengl32" fn wglMakeCurrent(hdc: HDC, hglrc: HGLRC) callconv(.winapi) BOOL;
+pub const wglCreateContext = @import("wgl.zig").wglCreateContext;
+pub const wglDeleteContext = @import("wgl.zig").wglDeleteContext;
+pub const wglGetCurrentContext = @import("wgl.zig").wglGetCurrentContext;
+pub const wglGetCurrentDC = @import("wgl.zig").wglGetCurrentDC;
+pub const wglGetProcAddress = @import("wgl.zig").wglGetProcAddress;
+pub const wglMakeCurrent = @import("wgl.zig").wglMakeCurrent;
 
 pub extern "dwmapi" fn DwmDefWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM, plResult: *LRESULT) callconv(.winapi) BOOL;
 
