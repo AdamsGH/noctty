@@ -26424,31 +26424,8 @@ fn settingsPreviewFieldThunk(
     value: win32_settings.SettingValue,
 ) void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    switch (field) {
-        .scrollback_limit => app.config.@"scrollback-limit" = value.scrollback_limit,
-        .font_size => app.config.@"font-size" = value.font_size,
-        .background_opacity => app.config.@"background-opacity" = value.background_opacity,
-        .window_padding_x => app.config.@"window-padding-x" = value.window_padding_x,
-        .window_padding_y => app.config.@"window-padding-y" = value.window_padding_y,
-        .trim_trailing_spaces => app.config.@"clipboard-trim-trailing-spaces" = value.trim_trailing_spaces,
-        .desktop_notifications => app.config.@"desktop-notifications" = value.desktop_notifications,
-        .app_notify_clipboard => app.config.@"app-notifications".@"clipboard-copy" = value.app_notify_clipboard,
-        .app_notify_config => app.config.@"app-notifications".@"config-reload" = value.app_notify_config,
-        .confirm_close => app.config.@"confirm-close-surface" = value.confirm_close,
-        .copy_on_select => app.config.@"copy-on-select" = value.copy_on_select,
-        .clipboard_read => app.config.@"clipboard-read" = value.clipboard_read,
-        .clipboard_write => app.config.@"clipboard-write" = value.clipboard_write,
-        .link_url => app.config.@"link-url" = value.link_url,
-        .link_previews => app.config.@"link-previews" = value.link_previews,
-        .window_theme => app.config.@"window-theme" = value.window_theme,
-        .shell_integration => app.config.@"shell-integration" = value.shell_integration,
-        .cursor_style => app.config.@"cursor-style" = value.cursor_style,
-        .background_blur => app.config.@"background-blur" = value.background_blur,
-        .padding_balance => app.config.@"window-padding-balance" = value.padding_balance,
-        .auto_update => app.config.@"auto-update" = value.auto_update,
-        .auto_update_channel => app.config.@"auto-update-channel" = value.auto_update_channel,
-        .accent_follow_system => app.config.@"accent-follow-system" = value.accent_follow_system,
-    }
+    std.debug.assert(std.meta.activeTag(value) == field);
+    win32_settings.setSettingValue(&app.config, value);
     switch (win32_settings.previewEffect(field)) {
         .none => {},
         .theme => app.reconfigureTheme(),
