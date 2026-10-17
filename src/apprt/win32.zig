@@ -15858,11 +15858,11 @@ const Host = struct {
         try std.testing.expectEqual(@as(usize, 1), host.palette_list_scroll);
         host.scrollPaletteList(120);
         try std.testing.expectEqual(@as(usize, 0), host.palette_list_scroll);
-        try std.testing.expectEqual(@as(f64, 0), host.palette_wheel_steps.remainder);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
         host.palette_list_ranked_count = 2;
-        host.palette_wheel_steps.remainder = 0.5;
+        host.palette_wheel_steps.remainder = 60;
         host.scrollPaletteList(-10);
-        try std.testing.expectEqual(@as(f64, 0), host.palette_wheel_steps.remainder);
+        try std.testing.expectEqual(@as(i32, 0), host.palette_wheel_steps.remainder);
     }
 
     /// BeginPaint/EndPaint over the list child HWND. Each row shows

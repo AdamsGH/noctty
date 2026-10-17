@@ -39,20 +39,24 @@ pub const NormalizedWheelScroll = struct {
 
 /// Whole chrome rows/tabs, retaining precision-wheel fractions between events.
 pub const WheelSteps = struct {
-    remainder: f64 = 0,
+    // Native wheel deltas are integral 120ths of a notch. Keep those units
+    // after normalization: summing 120 floating-point 1/120 values can
+    // round below one and lose a complete step.
+    remainder: i32 = 0,
     last_ms: ?u64 = null,
 
     pub fn add(self: *WheelSteps, delta: f64, now_ms: u64) i32 {
-        if (delta == 0) return 0;
+        const units: i32 = @intFromFloat(@round(delta * c.WHEEL_DELTA));
+        if (units == 0) return 0;
         if (self.last_ms) |last| {
             if (now_ms -| last >= 500 or
-                (self.remainder < 0 and delta > 0) or
-                (self.remainder > 0 and delta < 0)) self.remainder = 0;
+                (self.remainder < 0 and units > 0) or
+                (self.remainder > 0 and units < 0)) self.remainder = 0;
         }
         self.last_ms = now_ms;
-        self.remainder += delta;
-        const steps: i32 = @intFromFloat(self.remainder);
-        self.remainder -= @floatFromInt(steps);
+        self.remainder += units;
+        const steps = @divTrunc(self.remainder, c.WHEEL_DELTA);
+        self.remainder = @rem(self.remainder, c.WHEEL_DELTA);
         return steps;
     }
 };
@@ -68,9 +72,9 @@ pub fn chromeWheelDelta(horizontal: bool, delta: i16, units_per_notch: u32) f64 
 }
 
 pub fn tabDragThresholdExceeded(dx: i32, dy: i32, width: i32, height: i32) bool {
-    // SM_CXDRAG / SM_CYDRAG describe a rectangle centered on the press.
-    return dx > @divTrunc(@max(2, width), 2) or
-        dy > @divTrunc(@max(2, height), 2);
+    // SM_CXDRAG / SM_CYDRAG are the allowed distance on EACH side of
+    // the press point (GetSystemMetrics), not the full rectangle width.
+    return dx > @max(1, width) or dy > @max(1, height);
 }
 
 test "win32 chrome pointer wheel retains fractions and resets a gesture" {
@@ -90,10 +94,20 @@ test "win32 chrome pointer wheel retains fractions and resets a gesture" {
 
 test "win32 chrome pointer drag uses each DPI metric axis" {
     try std.testing.expect(!tabDragThresholdExceeded(3, 3, 12, 16));
-    try std.testing.expect(!tabDragThresholdExceeded(6, 8, 12, 16));
-    try std.testing.expect(tabDragThresholdExceeded(7, 0, 12, 16));
-    try std.testing.expect(tabDragThresholdExceeded(0, 9, 12, 16));
+    try std.testing.expect(!tabDragThresholdExceeded(12, 16, 12, 16));
+    try std.testing.expect(tabDragThresholdExceeded(13, 0, 12, 16));
+    try std.testing.expect(tabDragThresholdExceeded(0, 17, 12, 16));
     try std.testing.expect(!tabDragThresholdExceeded(0, 0, 0, 0));
+}
+
+test "win32 chrome pointer wheel keeps complete notches made of single units" {
+    var steps: WheelSteps = .{};
+    for (0..119) |i| try std.testing.expectEqual(@as(i32, 0), steps.add(chromeWheelDelta(false, 1, 1), i));
+    try std.testing.expectEqual(@as(i32, 1), steps.add(chromeWheelDelta(false, 1, 1), 119));
+    try std.testing.expectEqual(@as(i32, 0), steps.remainder);
+    for (0..119) |i| try std.testing.expectEqual(@as(i32, 0), steps.add(chromeWheelDelta(false, -1, 1), i + 120));
+    try std.testing.expectEqual(@as(i32, -1), steps.add(chromeWheelDelta(false, -1, 1), 239));
+    try std.testing.expectEqual(@as(i32, 0), steps.remainder);
 }
 
 test "win32 chrome pointer wheel normalizes horizontal direction and palette rows" {
