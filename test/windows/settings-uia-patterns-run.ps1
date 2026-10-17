@@ -439,7 +439,7 @@ if (-not $WorkerDesktop) {
     }
     Assert-Contract $guardPass 'Real startup/history, shell destination metadata or clipboard sequence changed; stop launches and inspect guard artifacts.'
     Assert-Contract ($null -eq $failure) "Runner failed: $failure"
-    Assert-Contract ($workerCode -eq 0) 'SET91 regression failed; inspect cases.json and per-control JSON.'
+    Assert-Contract ($workerCode -eq 0) 'SET91 regression failed; inspect cases.json, per-control JSON and clipboard-activity.jsonl.'
     'SET91 regression PASS (18 controls, 30 operation cases; guard metadata unchanged)'
     return
 }
@@ -460,13 +460,14 @@ function Assert-ClipboardGuard {
     if ($sequence -eq $clip) { return }
     $inputNow = [Set91.Native]::ReadInput()
     $active = [uint64]$inputNow.IdleMilliseconds -le ([uint64]$inputNow.TickCount - [uint64]$batchInput.TickCount)
-    Assert-Contract $active 'Clipboard changed during a batch with no input; stop launches and report.'
     if ($sequence -ne $script:clipObserved) {
         [ordered]@{ utc = [DateTimeOffset]::UtcNow.ToString('o'); before = $script:clipObserved; after = $sequence
-            inputBefore = $batchInput; inputNow = $inputNow; attribution = 'unattributed maintainer activity' } |
+            inputBefore = $batchInput; inputNow = $inputNow
+            attribution = $(if ($active) { 'unattributed maintainer activity' } else { 'changed during a batch with no input' }) } |
             ConvertTo-Json -Depth 5 -Compress | Add-Content (Join-Path $OutputDirectory 'clipboard-activity.jsonl')
         $script:clipObserved = $sequence
     }
+    Assert-Contract $active 'Clipboard changed during a batch with no input; stop launches and report.'
 }
 $process = $null
 $settings = [IntPtr]::Zero
