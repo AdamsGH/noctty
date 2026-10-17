@@ -40,6 +40,7 @@ foreach ($name in @('noctty.exe', 'noctty.com')) {
             $descriptor += 20
         }
     }
+    if ($imports -inotcontains 'kernel32.dll') { throw "$name import table not parsed" }
     if ($imports -icontains 'opengl32.dll') { throw "$name eagerly imports OPENGL32.dll" }
     Write-Host "$name imports no OPENGL32.dll ($($imports.Count) import descriptors checked)"
 }
