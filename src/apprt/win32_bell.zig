@@ -339,10 +339,8 @@ fn check(code: u32) !void {
     if (code == 0) return;
     var text: [128]u16 = undefined;
     if (mciGetErrorStringW(code, &text, text.len) != 0) {
-        var out: [256]u8 = undefined;
         const len = std.mem.indexOfScalar(u16, &text, 0) orelse text.len;
-        const n = std.unicode.utf16LeToUtf8(&out, text[0..len]) catch 0;
-        log.debug("bell: mci error {d}: {s}", .{ code, out[0..n] });
+        log.debug("bell: mci error {d}: {f}", .{ code, std.unicode.fmtUtf16Le(text[0..len]) });
     }
     return error.MciFailed;
 }
@@ -514,4 +512,26 @@ test "win32 bell open command quotes the path and names the alias" {
         defer testing.allocator.free(utf8);
         try testing.expectEqualStrings(case[1], utf8);
     }
+}
+
+test "win32 bell localized MCI errors can fill the UTF-16 buffer" {
+    const saved = mci_api;
+    defer mci_api = saved;
+    mci_api = .{
+        .send = struct {
+            fn call(_: [*:0]const u16, _: ?[*]u16, _: u32, _: ?windows.HWND) callconv(.winapi) u32 {
+                unreachable;
+            }
+        }.call,
+        .error_string = struct {
+            fn call(_: u32, text: [*]u16, count: u32) callconv(.winapi) windows.BOOL {
+                @memset(text[0 .. count - 1], 0x8b66);
+                text[count - 1] = 0;
+                return 1;
+            }
+        }.call,
+    };
+    // 127 CJK units need 381 UTF-8 bytes. The old 256-byte conversion
+    // overflowed even when the debug log itself was disabled.
+    try testing.expectError(error.MciFailed, check(1));
 }
