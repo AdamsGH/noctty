@@ -2854,6 +2854,7 @@ pub const App = struct {
     /// Singleton settings window. Lazily created by the `open_config`
     /// action; `App.terminate` destroys the HWND if still alive.
     settings_window: win32_settings.SettingsWindow = undefined,
+    settings_open_trace: bench_trace.SettingsOpenTrace = .{},
     /// Stable core surface id that owned focus when Settings opened. Settings
     /// itself clears terminal focus flags, so close must not guess host zero.
     settings_restore_surface_id: ?u64 = null,
@@ -3220,6 +3221,7 @@ pub const App = struct {
         self.syncSystemColorScheme() catch |err| {
             log.warn("initial win32 color scheme sync failed err={}", .{err});
         };
+        self.settings_open_trace = bench_trace.SettingsOpenTrace.init(core_app.alloc);
     }
 
     /// Bring OLE and its STA apartment online for in-process COM consumers
@@ -3578,6 +3580,7 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
+        defer self.settings_open_trace.deinit();
         self.stopUndoPruneTimer();
         self.stopQuitTimer();
         self.stopTerminalHandoffIdleTimer();
@@ -7231,6 +7234,7 @@ pub const App = struct {
             },
 
             .open_config => {
+                self.settings_open_trace.note(.open_config_action);
                 try self.openConfig();
                 return true;
             },
@@ -10950,10 +10954,14 @@ pub const App = struct {
         // shell-out path so `open_config` never becomes a dead action.
         // Skipping the fallback would regress CI / sandboxed flows
         // that previously worked.
+        self.settings_open_trace.note(.settings_open_enter);
         self.settings_window.open() catch |err| {
+            self.settings_open_trace.note(.settings_open_error);
             std.log.warn("settings window unavailable (err={}); falling back to editor", .{err});
             try self.openConfigInEditor();
+            return;
         };
+        self.settings_open_trace.note(.settings_open_ok);
     }
 
     /// Patch the edited settings into the target file (`persistSettings`:
@@ -34564,6 +34572,15 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
     }
 
     const surface = getSurface(hwnd);
+
+    // Record only F9 key-down at the terminal HWND, before character
+    // collection can pump sent messages. This is input observation; the
+    // performAction hook records actual open_config dispatch separately.
+    if ((msg == c.WM_KEYDOWN or msg == c.WM_SYSKEYDOWN) and wParam == c.VK_F1 + 8) {
+        if (surface) |v| if (v.app.settings_open_trace.enabled()) {
+            v.app.settings_open_trace.note(if (v.core_initialized) .f9_keydown else .f9_before_core_initialized);
+        };
+    }
 
     switch (msg) {
         c.WM_WINHOSTTY_WAKE => return 0,

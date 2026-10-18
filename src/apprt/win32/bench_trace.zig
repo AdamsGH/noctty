@@ -1,9 +1,8 @@
-//! Benchmark-only Win32 tracing.
+//! Opt-in Win32 benchmark and stage tracing.
 //!
-//! Nothing here is a product path. It exists so `test/windows/bench-windows.ps1`
-//! can attribute per-pane memory and startup work to exact lifecycle stages
-//! instead of guessing from process totals. The trace is inert unless the
-//! benchmark environment variables are present.
+//! `test/windows/bench-windows.ps1` attributes per-pane memory and startup work
+//! to exact lifecycle stages. Settings-open diagnostics record only ordered
+//! stage names and timestamps. Traces are inert without their environment flags.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,6 +33,135 @@ extern "kernel32" fn K32GetProcessMemoryInfo(
 
 var process_origin_tick_ms = std.atomic.Value(u64).init(0);
 var memory_stage_trace_write_mutex: std.Thread.Mutex = .{};
+
+pub const SettingsOpenStage = enum {
+    f9_keydown,
+    f9_before_core_initialized,
+    open_config_action,
+    settings_open_enter,
+    settings_open_ok,
+    settings_open_error,
+};
+
+/// Ordered App/UI-thread diagnostics, separate from per-surface memory metrics.
+/// Only static stages and timestamps are accepted; no keys, config, or text.
+pub const SettingsOpenTrace = struct {
+    pub const max_records = 1024;
+    pub const max_record_bytes = 128;
+
+    file: ?std.fs.File = null,
+    records: u16 = 0,
+
+    /// Read the opt-in once per App lifetime. An inherited environment must
+    /// not make unit tests write files; tests exercise initPath explicitly.
+    pub fn init(alloc: Allocator) SettingsOpenTrace {
+        if (builtin.is_test) return .{};
+        const path = std.process.getEnvVarOwned(alloc, "NOCTTY_SETTINGS_OPEN_TRACE") catch return .{};
+        defer alloc.free(path);
+        return initPath(path) catch .{};
+    }
+
+    fn initPath(path: []const u8) !SettingsOpenTrace {
+        if (builtin.os.tag == .windows and @import("../../os/path.zig").isNetworkOrDevicePath(path))
+            return error.NetworkOrDeviceTracePath;
+        if (!std.fs.path.isAbsolute(path)) return error.RelativeTracePath;
+        // Zig calls a root-relative Windows path (\trace) absolute, too.
+        // Require a drive/share so the destination cannot depend on cwd.
+        if (builtin.os.tag == .windows and std.fs.path.diskDesignatorWindows(path).len == 0)
+            return error.RelativeTracePath;
+        return .{ .file = try std.fs.createFileAbsolute(path, .{ .exclusive = true, .truncate = false }) };
+    }
+
+    pub fn enabled(self: *const SettingsOpenTrace) bool {
+        return self.file != null;
+    }
+
+    pub fn deinit(self: *SettingsOpenTrace) void {
+        if (self.file) |file| file.close();
+        self.file = null;
+    }
+
+    /// App owns the handle and all calls run on its UI thread. Disabled calls
+    /// only check the handle: no allocation, environment read, or syscall.
+    pub fn note(self: *SettingsOpenTrace, stage: SettingsOpenStage) void {
+        const file = self.file orelse return;
+        var buf: [max_record_bytes]u8 = undefined;
+        const line = formatRecord(&buf, GetTickCount64(), stage) catch {
+            self.deinit();
+            return;
+        };
+        file.writeAll(line) catch {
+            self.deinit();
+            return;
+        };
+        self.records += 1;
+        if (self.records == max_records) self.deinit();
+    }
+
+    fn formatRecord(buf: []u8, tick_ms: u64, stage: SettingsOpenStage) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\"}}\n", .{ tick_ms, @tagName(stage) });
+    }
+};
+
+test "Settings open trace formatter emits only stage and timestamp" {
+    var buf: [SettingsOpenTrace.max_record_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":99,\"stage\":\"f9_keydown\"}\n",
+        try SettingsOpenTrace.formatRecord(&buf, 99, .f9_keydown),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":100,\"stage\":\"settings_open_error\"}\n",
+        try SettingsOpenTrace.formatRecord(&buf, 100, .settings_open_error),
+    );
+    inline for (std.meta.tags(SettingsOpenStage)) |stage| {
+        const line = try SettingsOpenTrace.formatRecord(&buf, std.math.maxInt(u64), stage);
+        try std.testing.expect(line.len < SettingsOpenTrace.max_record_bytes);
+    }
+}
+
+test "Settings open trace refuses relative paths and preserves an existing file" {
+    try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("relative-settings-trace.jsonl"));
+    if (builtin.os.tag == .windows) {
+        for ([_][]const u8{ "\\\\server\\share\\trace", "//server/share/trace", "\\/server/share/trace", "/\\server/share/trace", "\\\\.\\pipe\\trace", "\\??\\UNC\\server\\share\\trace" }) |path|
+            try std.testing.expectError(error.NetworkOrDeviceTracePath, SettingsOpenTrace.initPath(path));
+        try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("C:relative-settings-trace.jsonl"));
+        try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("\\root-relative-settings-trace.jsonl"));
+        try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("/root-relative-settings-trace.jsonl"));
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "trace.jsonl" });
+    defer alloc.free(path);
+    try tmp.dir.writeFile(.{ .sub_path = "trace.jsonl", .data = "preserve-me" });
+    try std.testing.expectError(error.PathAlreadyExists, SettingsOpenTrace.initPath(path));
+    const data = try tmp.dir.readFileAlloc(alloc, "trace.jsonl", 100);
+    defer alloc.free(data);
+    try std.testing.expectEqualStrings("preserve-me", data);
+}
+
+test "Settings open trace caps output and closes its owned handle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "trace.jsonl" });
+    defer alloc.free(path);
+    var trace = try SettingsOpenTrace.initPath(path);
+    defer trace.deinit();
+    for (0..SettingsOpenTrace.max_records + 10) |_| trace.note(.open_config_action);
+    try std.testing.expectEqual(@as(u16, SettingsOpenTrace.max_records), trace.records);
+    try std.testing.expect(!trace.enabled());
+    const data = try tmp.dir.readFileAlloc(alloc, "trace.jsonl", SettingsOpenTrace.max_records * SettingsOpenTrace.max_record_bytes);
+    defer alloc.free(data);
+    try std.testing.expectEqual(@as(usize, SettingsOpenTrace.max_records), std.mem.count(u8, data, "\n"));
+    try std.testing.expectEqual(@as(usize, SettingsOpenTrace.max_records), std.mem.count(u8, data, "\"stage\":\"open_config_action\""));
+    trace.deinit();
+    trace.note(.settings_open_enter);
+}
 
 /// Resolve a trace output path against the current working directory.
 ///
