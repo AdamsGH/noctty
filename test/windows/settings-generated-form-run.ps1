@@ -11,7 +11,8 @@
 
     Requires the lead's verified measurement AUMID / no-HKCU-registration portable
     stage and SHA-256. OutputDirectory must be NEW and inside wt-setform-run.
-    Native GetNextDlgTabItem checks traversal without focusing or injecting Tab.
+    Native GetNextDlgTabItem/GetNextDlgGroupItem check traversal without focusing
+    or injecting keys, including both arrow directions at the labeled checkbox.
     Labeled rows require immediate native STATIC predecessor; other checkboxes
     label themselves through their existing caption. Existing labels/names/IDs
     and section order are deliberately independent of product descriptors.
@@ -58,6 +59,7 @@ namespace SetForm
         [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
         [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] static extern IntPtr GetNextDlgTabItem(IntPtr dialog, IntPtr control, bool previous);
+        [DllImport("user32.dll")] static extern IntPtr GetNextDlgGroupItem(IntPtr dialog, IntPtr control, bool previous);
         [DllImport("user32.dll", CharSet=CharSet.Unicode)]
         static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int length);
         [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageTimeoutW")]
@@ -124,6 +126,15 @@ namespace SetForm
             }
             if (found == 0) throw new InvalidOperationException("Read-only fixture prose row missing");
             return found;
+        }
+        public static int ArrowTarget(IntPtr dialog, IntPtr viewport, IntPtr control, bool reverse)
+        {
+            IntPtr target = GetNextDlgGroupItem(dialog, control, reverse);
+            if (target == IntPtr.Zero || GetParent(target) != viewport ||
+                !IsWindowVisible(target) || !IsWindowEnabled(target) ||
+                (GetWindowLong(target, -16) & 0x10000) == 0 || Class(target) == "Static")
+                throw new InvalidOperationException("Labeled checkbox arrow traversal visits a label, hidden/disabled control or escapes the form");
+            return GetDlgCtrlID(target);
         }
         public static string Cue(IntPtr edit)
         {
@@ -290,6 +301,17 @@ try {
             $record.forwardTabIds = $forward; $record.reverseTabIds = $reverse
             Assert-Contract (($forward -join ',') -ceq ($enabledIds -join ',')) "Tab order differs from visual order: $section"
             Assert-Contract (($reverse -join ',') -ceq ($reversedIds -join ',')) "Reverse Tab order differs from visual order: $section"
+            if ($section -eq 206) {
+                # ID 417 has an immediately preceding STATIC Notifications label.
+                # The native dialog-manager query catches a label being eligible
+                # for arrows even when Tab order and label adjacency both pass.
+                $labeledCheckbox = Ctl $settings 417
+                $arrowPrevious = [SetForm.Layout]::ArrowTarget($settings, $viewport, $labeledCheckbox, $true)
+                $arrowNext = [SetForm.Layout]::ArrowTarget($settings, $viewport, $labeledCheckbox, $false)
+                $record.labeledCheckboxArrowIds = @($arrowPrevious, $arrowNext)
+                Assert-Contract ($arrowPrevious -in $enabledIds -and $arrowNext -in $enabledIds) `
+                    'Labeled checkbox arrow traversal leaves the enabled Privacy form rows.'
+            }
             foreach ($case in $sectionCases) {
                 $row = @($rows | Where-Object Id -eq $case[1])
                 Assert-Contract ($row.Count -eq 1) "Missing or duplicate native control $($case[1])"
@@ -368,7 +390,7 @@ try {
             visibleControlChecks = $visibleChecks; clippedControlChecks = $clippedChecks
             completedSections = $results.Count; passedSections = @($results | Where-Object { $_.pass }).Count
             separate455OperationHarnessRequired = $true
-            runtimeScope = 'read-only patterns, native ordering, native dialog traversal, clipping, prose promises'
+            runtimeScope = 'read-only patterns, native ordering, native tab/arrow traversal, clipping, prose promises'
         })
     }
 }

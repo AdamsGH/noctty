@@ -6,7 +6,7 @@ const std = @import("std");
 const Config = @import("../config/Config.zig");
 const formatter = @import("../config/formatter.zig");
 
-pub const Section = enum { appearance, terminal, shell, privacy, updates };
+pub const Section = enum { appearance, terminal, shell, privacy, updates, keybindings, advanced };
 /// When a saved edit reaches its consumer, independently of draft preview.
 pub const ApplyPolicy = enum { live, new_terminals, restart };
 pub const PreviewEffect = enum { none, theme, opacity };
@@ -110,6 +110,19 @@ pub const NativeNames = struct {
     form_label: ?[]const u8 = null,
     caption: ?[]const u8 = null,
     accessible_name: []const u8,
+};
+
+/// Display-only rows grant no Config ownership and need no edit adapter.
+/// Action behavior remains explicit; a text row is entirely descriptor-driven.
+pub const DisplayRow = struct {
+    kind: enum { action, text },
+    section: Section,
+    native: NativeNames,
+    help: []const u8 = "",
+};
+pub const display_rows = [_]DisplayRow{
+    .{ .kind = .action, .section = .keybindings, .native = .{ .binding = "btn_keybindings_editor", .id = 302, .order = 0, .form_label = "Keybind configuration", .caption = "Open config for keybinds", .accessible_name = "Keybind configuration" } },
+    .{ .kind = .action, .section = .advanced, .native = .{ .binding = "btn_open_editor", .id = 101, .order = 0, .form_label = "Full config editor", .caption = "Open in default editor", .accessible_name = "Full config editor" } },
 };
 /// A composite Config key can expose multiple typed scalar controls without
 /// claiming that key twice in the persistence allowlist.

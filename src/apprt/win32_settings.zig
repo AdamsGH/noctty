@@ -176,7 +176,7 @@ const BS_PUSHLIKE: u32 = 0x1000;
 const BS_OWNERDRAW: u32 = 0xB;
 const SS_LEFT: u32 = 0x0000;
 const SS_NOPREFIX: u32 = 0x0080;
-const BTN_OPEN_EDITOR: usize = 101;
+const BTN_OPEN_EDITOR: usize = displayFieldId("btn_open_editor");
 const BTN_SECTION_APPEARANCE: usize = 201;
 const BTN_SECTION_TERMINAL: usize = 202;
 const BTN_SECTION_SHELL: usize = 203;
@@ -185,7 +185,7 @@ const BTN_SECTION_ADVANCED: usize = 205;
 const BTN_SECTION_PRIVACY: usize = 206;
 const BTN_SECTION_UPDATES: usize = 207;
 const BTN_SAVE: usize = 301;
-const BTN_KEYBINDINGS_EDITOR: usize = 302;
+const BTN_KEYBINDINGS_EDITOR: usize = displayFieldId("btn_keybindings_editor");
 const BTN_CONFLICT_KEEP: usize = 303;
 const BTN_CONFLICT_USE_DISK: usize = 304;
 const BTN_CLOSE_SAVE: usize = 305;
@@ -199,6 +199,10 @@ const BTN_CLOSE_KEEP_EDITING: usize = IDCANCEL;
 fn nativeFieldId(comptime binding: []const u8) usize {
     for (field_model.form_fields) |row| if (std.mem.eql(u8, row.native.binding, binding)) return row.native.id;
     @compileError("Missing Settings native control: " ++ binding);
+}
+fn displayFieldId(comptime binding: []const u8) usize {
+    for (field_model.display_rows) |row| if (std.mem.eql(u8, row.native.binding, binding)) return row.native.id;
+    @compileError("Missing Settings display row: " ++ binding);
 }
 const EDIT_SCROLLBACK: usize = nativeFieldId("edit_scrollback");
 const EDIT_FONT_SIZE: usize = nativeFieldId("edit_font_size");
@@ -612,10 +616,6 @@ pub const editable_keys = .{
     Config.Key.@"font-family",            Config.Key.theme,                Config.Key.command,
     Config.Key.@"accent-follow-system",
 };
-
-comptime {
-    field_model.assertCoverage(editable_keys);
-}
 
 /// Scalar EDIT controls whose raw text can temporarily be invalid and
 /// therefore cannot yet be represented by the typed settings transaction.
@@ -1032,10 +1032,37 @@ fn fieldRole(kind: field_model.Kind) SettingsControlRole {
     };
 }
 
-// The two editor escape hatches are actions, not Config ownership descriptors.
-const settings_form_actions = [_]FormControl{
-    .{ .role = .button, .name = "Keybind configuration", .binding = "btn_keybindings_editor", .id = BTN_KEYBINDINGS_EDITOR, .section = .keybindings, .label = "Keybind configuration", .caption = "Open config for keybinds" },
-    .{ .role = .button, .name = "Full config editor", .binding = "btn_open_editor", .id = BTN_OPEN_EDITOR, .section = .advanced, .label = "Full config editor", .caption = "Open in default editor" },
+fn displayRowSpec(row: field_model.DisplayRow) FormControl {
+    return .{
+        .role = if (row.kind == .action) .button else .text,
+        .name = row.native.accessible_name,
+        .binding = row.native.binding,
+        .id = row.native.id,
+        .section = nativeSection(row.section),
+        .order = row.native.order,
+        .label = row.native.form_label,
+        .caption = row.native.caption,
+        .help = row.help,
+    };
+}
+
+fn makeDisplayControl(parent: HWND, hinstance: HINSTANCE, comptime spec: FormControl) ?HWND {
+    return switch (comptime spec.role) {
+        .button => sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, settings_field_max_width, settings_control_height, parent, @ptrFromInt(spec.id), hinstance, null),
+        .text => blk: {
+            const text = makeStatic(parent, hinstance, spec.caption orelse spec.name);
+            if (text) |control| _ = sys.SetWindowLongPtrW(control, -12, @intCast(spec.id)); // GWLP_ID
+            break :blk text;
+        },
+        else => @compileError("Display-only Settings rows cannot create editable controls"),
+    };
+}
+
+// Display-only rows are independent of persistence ownership and edit adapters.
+const settings_form_actions = rows: {
+    var result: [field_model.display_rows.len]FormControl = undefined;
+    for (field_model.display_rows, 0..) |row, i| result[i] = displayRowSpec(row);
+    break :rows result;
 };
 const settings_action_controls = [_]FormControl{
     .{ .role = .button, .name = "Save", .binding = "btn_save", .id = BTN_SAVE },
@@ -1068,11 +1095,24 @@ const settings_control_count = settings_control_specs.len;
 const settings_header_control_count = settings_action_controls.len;
 const settings_clipped_control_count = settings_control_count - settings_header_control_count;
 
+comptime {
+    for (settings_control_specs, 0..) |spec, i| {
+        for (settings_control_specs[0..i]) |other| {
+            if (spec.id == other.id) @compileError("Duplicate Settings control ID");
+            if (spec.section != null and spec.section == other.section and spec.order == other.order)
+                @compileError("Duplicate Settings form row position");
+        }
+        for (.{ BTN_SECTION_APPEARANCE, BTN_SECTION_TERMINAL, BTN_SECTION_SHELL, BTN_SECTION_KEYBINDINGS, BTN_SECTION_ADVANCED, BTN_SECTION_PRIVACY, BTN_SECTION_UPDATES }) |id| {
+            if (spec.id == id) @compileError("Settings form ID collides with section navigation");
+        }
+    }
+}
+
 const FieldWindows = handles: {
     const empty: ?HWND = null;
-    var members: [field_model.form_fields.len]std.builtin.Type.StructField = undefined;
-    for (field_model.form_fields, 0..) |row, i| members[i] = .{
-        .name = row.native.binding ++ "\x00",
+    var members: [settings_clipped_control_count]std.builtin.Type.StructField = undefined;
+    for (settings_control_specs[0..settings_clipped_control_count], 0..) |row, i| members[i] = .{
+        .name = row.binding ++ "\x00",
         .type = ?HWND,
         .default_value_ptr = @ptrCast(&empty),
         .is_comptime = false,
@@ -1731,7 +1771,6 @@ pub const SettingsWindow = struct {
         self.forgetFormWindows();
         self.deleteUiFont();
         self.theme_adapter.deinit();
-        self.btn_open_editor = null;
         self.btn_section_appearance = null;
         self.btn_section_terminal = null;
         self.btn_section_shell = null;
@@ -1749,7 +1788,6 @@ pub const SettingsWindow = struct {
         self.text_uia_prev_proc = null;
         self.btn_save = null;
         self.btn_discard_changes = null;
-        self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
         self.btn_conflict_use_disk = null;
         self.btn_close_save = null;
@@ -2591,7 +2629,6 @@ pub const SettingsWindow = struct {
         self.text_help = null;
         self.field_labels = [_]?HWND{null} ** settings_label_specs.len;
         self.deleteUiFont();
-        self.btn_open_editor = null;
         self.btn_section_appearance = null;
         self.btn_section_terminal = null;
         self.btn_section_shell = null;
@@ -2605,7 +2642,6 @@ pub const SettingsWindow = struct {
         self.focus_before_deactivate = null;
         self.btn_save = null;
         self.btn_discard_changes = null;
-        self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
         self.btn_conflict_use_disk = null;
         self.btn_close_save = null;
@@ -2770,7 +2806,7 @@ pub const SettingsWindow = struct {
 
     fn controlHwnd(self: *const SettingsWindow, index: usize) ?HWND {
         inline for (settings_control_specs, 0..) |spec, i| if (index == i) {
-            return if (comptime i < field_model.form_fields.len) @field(self.fields, spec.binding) else @field(self, spec.binding);
+            return if (comptime i < settings_clipped_control_count) @field(self.fields, spec.binding) else @field(self, spec.binding);
         };
         return null;
     }
@@ -3114,7 +3150,13 @@ pub const SettingsWindow = struct {
     fn applyTabOrder(self: *SettingsWindow) void {
         for (std.enums.values(Section)) |section| for (formItemsForSection(section), 0..) |item, index| {
             const control = self.controlHwnd(item.control_index) orelse continue;
-            if (item.label_index) |label_index| if (self.field_labels[label_index]) |label| sendToBottom(label);
+            if (item.label_index) |label_index| if (self.field_labels[label_index]) |label| {
+                sendToBottom(label);
+                // Dialog arrow navigation includes STATICs. Isolate the label
+                // from both adjacent control groups while retaining adjacency.
+                startGroup(label);
+                startGroup(control);
+            };
             sendToBottom(control);
             if (index == 0) startGroup(control);
         };
@@ -4114,6 +4156,7 @@ pub const SettingsWindow = struct {
         inline for (field_model.form_fields) |row| {
             @field(field_adapters, row.native.binding).display(self);
         }
+        self.updateSaveEnabled();
     }
 
     fn save(self: *SettingsWindow) void {
@@ -4771,7 +4814,7 @@ pub const SettingsWindow = struct {
                             _ = sys.SendMessageW(control, 0x1501, 0, @bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(row.descriptor.placeholder)))); // EM_SETCUEBANNER
                     }
                 } else {
-                    @field(self, spec.binding) = sys.CreateWindowExW(0, btn_class, std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, settings_field_max_width, settings_control_height, form, @ptrFromInt(spec.id), self.handle.hinstance, null);
+                    @field(self.fields, spec.binding) = makeDisplayControl(form, self.handle.hinstance, spec);
                 }
             }
         }
@@ -7443,7 +7486,7 @@ test "settings action bar follows the form's column once it has two lanes" {
         try std.testing.expect(settingsActionColumnWidth(tight, tight, dpi) >= tight - 1);
         // The right lane's controls end where the column ends.
         var rects: [2]SettingsFieldRects = undefined;
-        settingsFormItemRects(&.{ .{ .control_index = 4, .label_index = 3 }, .{ .control_index = 5, .label_index = 4 } }, wide, dpi, &rects);
+        settingsFormItemRects(formItemsForSection(.appearance)[0..2], wide, dpi, &rects);
         try std.testing.expectEqual(column, rects[1].control.right);
     }
 }
@@ -8175,8 +8218,8 @@ test "settings Enter presses the focused push button and does nothing in a field
             const settings = &fixture.settings;
 
             settings.setActiveSection(.advanced);
-            _ = sys.SetFocus(settings.btn_open_editor.?);
-            try std.testing.expectEqual(settings.btn_open_editor.?, sys.GetFocus().?);
+            _ = sys.SetFocus(settings.fields.btn_open_editor.?);
+            try std.testing.expectEqual(settings.fields.btn_open_editor.?, sys.GetFocus().?);
             try std.testing.expect(fixture.pumpKey(0x0D));
             try std.testing.expectEqual(@as(u32, 1), fixture.editor_opened);
 
@@ -8438,6 +8481,49 @@ test "settings arrow-key groups stop at the rail and the action bar" {
                 settings.btn_section_appearance.?,
                 dialog_test.GetNextDlgGroupItem(hwnd, settings.btn_section_advanced.?, 0).?,
             );
+        }
+    }.body);
+}
+
+test "settings labeled checkbox arrow group never visits its static label" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            settings.setActiveSection(.privacy);
+            for (settings.controlsForRole(.check_box)) |optional| {
+                const control = optional orelse continue;
+                if (sys.IsWindowVisible(control) == 0 or sys.IsWindowEnabled(control) == 0) continue;
+                for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                    const next = dialog_test.GetNextDlgGroupItem(fixture.hwnd(), control, previous).?;
+                    try std.testing.expect(settings.controlIndex(next) != null);
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings display-only text row needs no persistence adapter" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const spec = comptime displayRowSpec(.{ .kind = .text, .section = .advanced, .native = .{
+                .binding = "example_read_only_row",
+                .id = 499,
+                .order = 1,
+                .accessible_name = "Read-only information",
+            } });
+            comptime std.debug.assert(!@hasField(@TypeOf(field_adapters), spec.binding));
+            const control = makeDisplayControl(fixture.settings.viewport.?, fixture.settings.handle.hinstance, spec).?;
+            defer _ = sys.DestroyWindow(control);
+            var text: [64]u8 = undefined;
+            try std.testing.expectEqualStrings(spec.name, readEditUtf8(control, &text).?);
+            try std.testing.expectEqual(@as(LONG_PTR, 499), sys.GetWindowLongPtrW(control, -12));
+            try std.testing.expect(sys.GetWindowLongPtrW(control, GWL_STYLE) & WS_TABSTOP == 0);
+            try std.testing.expect(sys.IsWindowEnabled(fixture.settings.btn_save.?) == 0);
+            try std.testing.expectEqual(@as(usize, 25), editable_keys.len);
         }
     }.body);
 }
