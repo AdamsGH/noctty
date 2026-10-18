@@ -374,11 +374,14 @@ const TestRegistry = struct {
     /// The registration's icon, its last-write time, and the number of keys
     /// under the scratch parent (a leftover pending key shows up here).
     fn snapshot(self: TestRegistry) !Snapshot {
+        const parent = try self.open(null);
+        defer _ = sys.RegCloseKey(parent);
         const key = try self.open(name);
         defer _ = sys.RegCloseKey(key);
-        var out: Snapshot = .{ .siblings = try self.subkeyCount() };
+        var out: Snapshot = .{};
         try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), null, null, @ptrCast(&out.icon), &out.icon_bytes));
         try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(key, null, null, null, null, null, null, null, null, null, null, &out.written));
+        try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(parent, null, null, null, &out.siblings, null, null, null, null, null, null, null));
         return out;
     }
 };
