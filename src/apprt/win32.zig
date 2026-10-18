@@ -36301,8 +36301,7 @@ pub const Surface = struct {
     /// process, `always`, or read-only mode), for a close that ends more
     /// than this pane. A pane whose core is not up has no process to lose.
     fn needsCloseConfirm(self: *Surface) bool {
-        if (!self.core_initialized) return false;
-        return self.core_surface.needsConfirmQuit();
+        return self.core_initialized and self.core_surface.needsConfirmQuit();
     }
 
     fn requestClose(self: *Surface) bool {
@@ -37416,6 +37415,12 @@ pub const Surface = struct {
                 if (sys.PeekMessageW(&message, surface.host.?.hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0) return error.MissingVisibilityRequest;
                 applyConsoleWindowVisibility(message.hwnd, message.wParam != 0);
             }
+            fn drain(owner_hwnd: HWND) void {
+                var message: MSG = undefined;
+                while (sys.PeekMessageW(&message, owner_hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
+                    applyConsoleWindowVisibility(owner_hwnd, message.wParam != 0);
+                }
+            }
         };
         const surfaces = [_]*Surface{ &first, &background };
         try Check.sync(&host, &surfaces, false);
@@ -37432,17 +37437,12 @@ pub const Surface = struct {
         // either native command. The last request must still win.
         try background.core_surface.handleMessage(.{ .window_visibility = false });
         try background.core_surface.handleMessage(.{ .window_visibility = true });
-        var burst: MSG = undefined;
-        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
-            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
-        }
+        Check.drain(hwnd);
         try std.testing.expect(sys.IsIconic(hwnd) == 0);
         _ = sys.ShowWindow(hwnd, c.SW_MINIMIZE);
         try background.core_surface.handleMessage(.{ .window_visibility = true });
         try background.core_surface.handleMessage(.{ .window_visibility = false });
-        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
-            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
-        }
+        Check.drain(hwnd);
         try std.testing.expect(sys.IsIconic(hwnd) != 0);
         _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
         try Check.request(&background, true);
@@ -37478,12 +37478,13 @@ pub const Surface = struct {
         defer _ = sys.DestroyWindow(hwnd);
         host.hwnd = hwnd;
         const termio = @import("../termio.zig");
-        for ([_]*Surface{ &first, &later }) |surface| {
+        const surfaces = [_]*Surface{ &first, &later };
+        for (surfaces) |surface| {
             surface.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
             surface.window_visible = false;
             surface.core_surface.rt_surface = surface;
         }
-        defer for ([_]*Surface{ &first, &later }) |surface| surface.core_surface.io.mailbox.deinit(core_app.alloc);
+        defer for (surfaces) |surface| surface.core_surface.io.mailbox.deinit(core_app.alloc);
         defer {
             first.core_initialized = false;
             later.core_initialized = false;
@@ -37521,7 +37522,7 @@ pub const Surface = struct {
         // adopted one's.
         _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
         host.refreshSurfaceVisibility();
-        for ([_]*Surface{ &first, &later }) |surface| {
+        for (surfaces) |surface| {
             try std.testing.expect(!(try Queue.expectNext(surface)).pty_visibility);
             try Queue.expectEmpty(surface);
         }
@@ -37611,7 +37612,7 @@ pub const Surface = struct {
     /// The user focused this terminal or typed into it: the bell has been
     /// answered.
     fn clearBell(self: *Surface) void {
-        if (self.bell_ringing) self.setBellRinging(false);
+        self.setBellRinging(false);
     }
 
     /// A reload that turns the title bell off takes the glyph already up
@@ -39278,6 +39279,17 @@ pub const Surface = struct {
         return applyChildVisibility(hwnd, self.searchBarButtonPlacement(role), false);
     }
 
+    /// Places a search bar button at `rect` and shows it. The controls
+    /// exist once `ensureSearchBarControls` has run.
+    fn showSearchBarButton(self: *Surface, role: SearchBarButtonRole, rect: RECT) bool {
+        const hwnd = self.searchBarButtonHwnd(role).?;
+        const placement = self.searchBarButtonPlacement(role);
+        // Both run: a move and a show are separate changes.
+        const moved = applyChildRect(hwnd, placement, rect);
+        const shown = applyChildVisibility(hwnd, placement, true);
+        return moved or shown;
+    }
+
     fn layoutSearchBarControls(self: *Surface, frame_rect: RECT, visible: bool) !bool {
         if (!visible or !self.search_bar.visible) return self.hideSearchBarControls();
 
@@ -39300,52 +39312,28 @@ pub const Surface = struct {
         );
         changed = bg_changed or changed;
 
-        changed = applyChildRect(
-            self.search_bar_close_hwnd.?,
-            &self.search_bar_close_placement,
+        changed = self.showSearchBarButton(
+            .close,
             childRect(right - layout.close_w, control_top, layout.close_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_close_hwnd.?,
-            &self.search_bar_close_placement,
-            true,
         ) or changed;
         right -= layout.close_w + layout.close_gap;
 
         if (fit.toggles) {
-            changed = applyChildRect(
-                self.search_bar_word_hwnd.?,
-                &self.search_bar_word_placement,
+            changed = self.showSearchBarButton(
+                .whole_word,
                 childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_word_hwnd.?,
-                &self.search_bar_word_placement,
-                true,
             ) or changed;
             right -= layout.toggle_w + layout.gap;
 
-            changed = applyChildRect(
-                self.search_bar_case_hwnd.?,
-                &self.search_bar_case_placement,
+            changed = self.showSearchBarButton(
+                .case_sensitive,
                 childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_case_hwnd.?,
-                &self.search_bar_case_placement,
-                true,
             ) or changed;
             right -= layout.toggle_w + layout.gap;
 
-            changed = applyChildRect(
-                self.search_bar_regex_hwnd.?,
-                &self.search_bar_regex_placement,
+            changed = self.showSearchBarButton(
+                .regex,
                 childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_regex_hwnd.?,
-                &self.search_bar_regex_placement,
-                true,
             ) or changed;
             right -= layout.toggle_w + layout.section_gap;
         } else {
@@ -39355,27 +39343,15 @@ pub const Surface = struct {
         }
 
         if (fit.nav) {
-            changed = applyChildRect(
-                self.search_bar_next_hwnd.?,
-                &self.search_bar_next_placement,
+            changed = self.showSearchBarButton(
+                .next,
                 childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_next_hwnd.?,
-                &self.search_bar_next_placement,
-                true,
             ) or changed;
             right -= layout.nav_w + layout.gap;
 
-            changed = applyChildRect(
-                self.search_bar_prev_hwnd.?,
-                &self.search_bar_prev_placement,
+            changed = self.showSearchBarButton(
+                .prev,
                 childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_prev_hwnd.?,
-                &self.search_bar_prev_placement,
-                true,
             ) or changed;
             right -= layout.nav_w + layout.section_gap;
         } else {
@@ -39887,21 +39863,11 @@ pub const Surface = struct {
                 // WINDOWPLACEMENT uses workspace coordinates for a normal
                 // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
                 // before the work-area translation, and back afterwards.
-                var normal = placement.rcNormalPosition;
-                const old_dx = source.info.rcWork.left - source.info.rcMonitor.left;
-                const old_dy = source.info.rcWork.top - source.info.rcMonitor.top;
-                normal.left += old_dx;
-                normal.right += old_dx;
-                normal.top += old_dy;
-                normal.bottom += old_dy;
-                normal = fullscreenRestoreRect(normal, source.info.rcWork, info.rcWork, source.dpi, dpi);
-                const new_dx = info.rcWork.left - info.rcMonitor.left;
-                const new_dy = info.rcWork.top - info.rcMonitor.top;
-                normal.left -= new_dx;
-                normal.right -= new_dx;
-                normal.top -= new_dy;
-                normal.bottom -= new_dy;
-                placement.rcNormalPosition = normal;
+                const normal = workspaceToScreenRect(placement.rcNormalPosition, source.info);
+                placement.rcNormalPosition = screenToWorkspaceRect(
+                    fullscreenRestoreRect(normal, source.info.rcWork, info.rcWork, source.dpi, dpi),
+                    info,
+                );
             }
         }
         self.fullscreen = false;
@@ -39936,6 +39902,21 @@ pub const Surface = struct {
     fn maximizeWithPlacement(hwnd: HWND, placement: *const WINDOWPLACEMENT) !void {
         _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
         if (sys.SetWindowPlacement(hwnd, placement) == 0) return lastError();
+    }
+
+    /// `rect` in the workspace coordinates of `info`'s monitor (relative to
+    /// its work area) moved to screen coordinates.
+    fn workspaceToScreenRect(rect: RECT, info: MONITORINFO) RECT {
+        const dx = info.rcWork.left - info.rcMonitor.left;
+        const dy = info.rcWork.top - info.rcMonitor.top;
+        return .{ .left = rect.left + dx, .top = rect.top + dy, .right = rect.right + dx, .bottom = rect.bottom + dy };
+    }
+
+    /// The inverse of `workspaceToScreenRect`.
+    fn screenToWorkspaceRect(rect: RECT, info: MONITORINFO) RECT {
+        const dx = info.rcWork.left - info.rcMonitor.left;
+        const dy = info.rcWork.top - info.rcMonitor.top;
+        return .{ .left = rect.left - dx, .top = rect.top - dy, .right = rect.right - dx, .bottom = rect.bottom - dy };
     }
 
     fn setDecorationsVisible(self: *Surface, visible: bool) !void {
@@ -40572,11 +40553,8 @@ pub const Surface = struct {
             log.warn("win32 drop files format failed err={}", .{err});
             return;
         };
-        if (payload.len == 0) {
-            alloc.free(payload);
-            return;
-        }
         defer alloc.free(payload);
+        if (payload.len == 0) return;
 
         surfaceDropPayloadCallback(self, payload);
     }
@@ -41028,7 +41006,11 @@ pub const Surface = struct {
         };
         const alloc = self.app.core_app.alloc;
         try appendOwnedString(alloc, &self.key_table_name, next_name);
-        self.key_table_copy_mode = if (self.core_initialized) self.core_surface.copy_mode_active else if (next_name) |name| std.mem.eql(u8, name, "copy_mode") else false;
+        self.key_table_copy_mode = copy_mode: {
+            if (self.core_initialized) break :copy_mode self.core_surface.copy_mode_active;
+            const name = next_name orelse break :copy_mode false;
+            break :copy_mode std.mem.eql(u8, name, "copy_mode");
+        };
         if (self.host) |host| try host.refreshModeIndicator();
     }
 
@@ -41419,11 +41401,16 @@ pub const Surface = struct {
         return try lfLineEndings(alloc, try clipboardTextToUtf8(alloc, slice_w));
     }
 
-    fn writeClipboardText(self: *const Surface, text: []const u8) !void {
-        const alloc = self.app.core_app.alloc;
+    /// `text` as CF_UNICODETEXT holds it: UTF-16 with CRLF line endings.
+    fn clipboardTextUtf16(alloc: std.mem.Allocator, text: []const u8) ![:0]u16 {
         const crlf = try crlfLineEndings(alloc, text);
         defer if (crlf) |owned| alloc.free(owned);
-        const text_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, crlf orelse text);
+        return std.unicode.utf8ToUtf16LeAllocZ(alloc, crlf orelse text);
+    }
+
+    fn writeClipboardText(self: *const Surface, text: []const u8) !void {
+        const alloc = self.app.core_app.alloc;
+        const text_w = try clipboardTextUtf16(alloc, text);
         defer alloc.free(text_w);
 
         if (!openClipboard(self.hwnd)) return lastError();
@@ -41486,9 +41473,7 @@ pub const Surface = struct {
         };
         // CRLF for the plain fallback only: CF_HTML's header holds byte
         // offsets into the wrapped fragment.
-        const plain_crlf = try crlfLineEndings(alloc, plain_src);
-        defer if (plain_crlf) |owned| alloc.free(owned);
-        const plain_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, plain_crlf orelse plain_src);
+        const plain_w = try clipboardTextUtf16(alloc, plain_src);
         defer alloc.free(plain_w);
 
         if (!openClipboard(self.hwnd)) return lastError();
