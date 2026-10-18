@@ -878,17 +878,23 @@ function Open-SettingsCommand {
     [void](Wait-For {
         try {
         $queryMatches = [Set91.Native]::FixtureControlText($edit) -ceq $query
-        $singleMatch = [Set91.Native]::FixtureControlText($label) -ceq 'Command 1'
+        $labelText = [Set91.Native]::FixtureControlText($label)
+        $singleMatch = $labelText -ceq 'Command 1'
         $feedback = [Set91.Native]::FixtureControlText($hint)
         $selected = $feedback.StartsWith($paletteTitle + ' — ', [StringComparison]::Ordinal) -or
             $feedback.StartsWith($paletteTitle + '. Enter activates;', [StringComparison]::Ordinal)
+        $script:attempt.paletteSelection = [ordered]@{ queryMatches = $queryMatches; singleMatch = $singleMatch
+            selectedFixtureTitle = $selected; label = $labelText; feedback = $feedback
+            acceptVisible = [Set91.Native]::IsWindowVisible($accept); acceptEnabled = [Set91.Native]::IsWindowEnabled($accept) }
         $queryMatches -and $singleMatch -and $selected -and $feedback.Contains('Enter activates; Escape closes.') -and
-            [Set91.Native]::IsWindowVisible($accept) -and [Set91.Native]::IsWindowEnabled($accept)
+            [Set91.Native]::IsWindowEnabled($accept)
         } catch { Save-Diagnostics 'palette-selection-readback' 'bounded-control-read-failed'; throw }
     } 'palette-exact-action-selected')
     Add-Stage 'palette-action-verified' ([ordered]@{ queryMatches = $true; matchCount = 1; selectedConfiguredOpenConfig = $true })
     Assert-ClipboardGuard
-    Save-CommandReceipt 'palette-accept-click' ([Set91.Native]::CommandMessage($accept, 0xF5, 0, 0))
+    # Palette mode hides this generic accept button. Its existing, identity-checked
+    # WM_COMMAND handler still submits the verified selected action without keys.
+    Save-CommandReceipt 'palette-accept-command' ([Set91.Native]::CommandMessage($hostWindow, 0x111, 2003, $accept.ToInt64()))
 }
 function Stop-Fixture {
     if (-not $script:process) { return }
