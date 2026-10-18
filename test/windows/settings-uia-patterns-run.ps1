@@ -480,6 +480,8 @@ function Add-Stage([string] $Stage, $Data) {
 }
 function Save-Diagnostics([string] $Stage, [string] $Reason) {
     if ($null -eq $script:attempt) { return }
+    # Preserve the first failing boundary when an outer case or cleanup also catches it.
+    if ($script:attempt.Contains('failureStage')) { return }
     $script:attempt.failureStage = $Stage
     $script:attempt.error = $Reason
     if ($null -ne $script:openClock) { $script:attempt.openElapsedMilliseconds = $script:openClock.Elapsed.TotalMilliseconds }
@@ -781,7 +783,7 @@ function Start-Fixture {
             $WorkerDesktop, $fixture, [IntPtr]::Zero)
     } finally { [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', $savedTrace, 'Process') }
     $script:attempt.pid = $process.Pid
-    Add-Stage 'launched' ([ordered]@{ pid = $process.Pid; exitCode = $process.ExitCode()
+    Add-Stage 'launched' ([ordered]@{ pid = $process.Pid; priorityClass = 'BelowNormal'; exitCode = $process.ExitCode()
         waitResult = [Set91.Native]::WaitForSingleObject($process.Handle, 0) })
     [void](Wait-For {
         $script:attempt.startup = Get-NewReadyAttempt -State (Read-StartupAttempt -Path $startupPath) `

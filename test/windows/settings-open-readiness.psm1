@@ -11,7 +11,18 @@ function Read-StartupAttempt {
     if ($PSCmdlet.ParameterSetName -eq 'Path') {
         try {
             if (-not [IO.File]::Exists($Path)) { return [pscustomobject]$result }
-            $Json = [IO.File]::ReadAllText($Path)
+            # The product atomically replaces this ledger while startup advances.
+            # Do not deny its writes or replacement during a readiness poll.
+            $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                if ($stream.Length -gt 128KB) {
+                    $result.stage = 'invalid'; $result.reason = 'ledger-size-limit'
+                    return [pscustomobject]$result
+                }
+                $reader = [IO.StreamReader]::new($stream)
+                try { $Json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            } finally { $stream.Dispose() }
         } catch {
             $result.stage = 'unreadable'; $result.reason = 'ledger-read-failed'
             return [pscustomobject]$result
