@@ -1,6 +1,6 @@
 # Self-Correction Log: Zig, PowerShell and Win32 FFI traps; git, gh and agent tooling
 
-Part of the Self-Correction Log; [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry. Newest first.
+Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 - 2026-05-02: Lowercasing Zig type aliases to satisfy naming review can collide with same-named declarations or locals in Zig's shared declaration namespace; check for helper/local name conflicts before committing mechanical renames.
 - 2026-05-01: In this fork, with both `origin` and `upstream` remotes configured, bare `gh pr view <n>` can resolve the upstream Ghostty PR number; use `-R amanthanvi/noctty` for fork-local PR review/checks.

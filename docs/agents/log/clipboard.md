@@ -1,6 +1,12 @@
 # Self-Correction Log: Clipboard, paste protection, OSC 52 and drag-and-drop
 
-Part of the Self-Correction Log; [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry. Newest first.
+Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+
+Corrected in other files:
+- 2026-04-17 `win32_surface_drop_target.zig` (inline `IDropTarget` storage): superseded by the 2026-10-11 PKG-26 entry in input.md (`DropTarget` is allocated independently and refcounted).
+
+See also:
+- Copy as HTML's OSC 8 anchor allowlist is in the 2026-10-15 PKG-53 entry in terminal-core.md.
 
 - 2026-10-16: An OSC 52 read prompt's explicit Cancel/Escape sends one empty reply with the requested selector, but overlay displacement and tab detach/transfer must stay silent: `cancelConfirmFromTab` used the same action as the Cancel button. Confirmation cancellation now carries an explicit/dismissed reason; `hideOverlay` releases pending state with dismissed, and only the UI Cancel action can complete a live, non-denied OSC 52 read with empty data. Tests observe the real outbound IO mailbox and were red before the fix; Allow bytes, deny (including reload), displacement, detach, teardown, duplicate Cancel and late callbacks are covered. Empty reply and allowed empty clipboard share the same bytes, so Neovim can report an empty register instead of waiting for its timeout.
 - 2026-10-15: Clipboard retry waits use a 5 ms QPC budget (CLIP-02), with at most ten opens spaced 0.5 ms apart and `SwitchToThread` between attempts, instead of nine 5 ms sleeps that round up to timer ticks. All three callers (text read, text write, HTML write) share it. An injected always-busy opener measured 135 ms on main and 4.501 ms median / 4.514 ms maximum over eleven runs after the change; no real clipboard was opened. Clock/yield calls can change `GetLastError`, so the last failed open's error is saved and restored. Scheduling and `OpenClipboard` itself may overrun the budget; the deadline prevents further retries, not OS preemption. Tests use an injected clock for exact-deadline and overshoot checks, and the QPC path with an injected opener. The operation stays synchronous and dispatches no messages, preserving copy/paste order and pending-confirm ownership. Never test contention by holding the real clipboard on a hidden desktop: the window station owns it.

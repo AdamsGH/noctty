@@ -1,6 +1,9 @@
 # Self-Correction Log: Window frame, DPI, placement and quick terminal
 
-Part of the Self-Correction Log; [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry. Newest first.
+Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+
+See also:
+- 2026-09-23 "Item (b) of the #262 entry below": the #262 entry is the 2026-09-23 "Input on the wrong row after minimize/restore" entry in conpty.md.
 
 - 2026-10-16: In a real drag onto a monitor of another DPI, Windows resizes the window to its linearly scaled size before `WM_DPICHANGED`, while the old font is still installed (a 935x644 client at the 144-DPI font, about 66 columns, on its way to 96 DPI). Every `WM_SIZE` handed that size to the core, so termio could wrap long lines into scrollback before the font changed. The host now holds core sizes and fonts from `WM_GETDPISCALEDSIZE` (sent first) to `WM_DPICHANGED`. There each surface takes its font and size inside a core resize batch (`beginResizeBatch`/`endResizeBatch`), which sends termio one resize. Measured with logging of core sizes and termio grids: main + #423 sent an old-font size on 30 of 30 real drags and pushed rows into scrollback on 20 (up to 16 rows); with the hold, 0 of 30. Traps:
   - termio's resize coalescing does not restart its 25 ms timer, so a resize sent first in a burst is applied if the burst outlasts 25 ms. Ordering font before size is not enough; batch them.

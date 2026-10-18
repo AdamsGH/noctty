@@ -2,7 +2,7 @@
   "files": [
     {
       "path": "AGENTS.md",
-      "description": "Repository-specific agent instructions, fork-targeting rules, the cross-cutting rules from the Self-Correction Log and the index of its area files."
+      "description": "Repository-specific agent instructions: commands, running noctty safely, Win32 FFI, fork-targeting rules, and the index of the Self-Correction Log area files."
     },
     {
       "path": "docs/agents/log/conpty.md",
@@ -131,7 +131,8 @@
         "src/Surface.zig",
         "src/config/url.zig",
         "src/apprt/win32/local_target.zig",
-        "src/apprt/win32.zig"
+        "src/apprt/win32.zig",
+        "src/terminal/kitty/graphics_image.zig"
       ]
     },
     {
@@ -189,7 +190,8 @@
         "src/apprt/win32_terminal_handoff*",
         "src/crash/**",
         "src/cli/**",
-        "src/main*.zig"
+        "src/main*.zig",
+        "src/font/face/freetype.zig"
       ]
     },
     {
@@ -206,13 +208,14 @@
       ]
     },
     {
-      "path": "docs/agents/log/docs.md",
-      "description": "Self-Correction Log: claims in docs, README, PRIVACY and site copy.",
+      "path": "docs/agents/log/docs-and-site.md",
+      "description": "Self-Correction Log: site edits and the generated asset hashes, and claims in docs, README, PRIVACY, PACKAGING and install copy.",
       "scope": [
         "README.md",
         "PRIVACY.md",
         "docs/**",
-        "site/**"
+        "site/**",
+        "PACKAGING.md"
       ]
     },
     {
@@ -221,7 +224,8 @@
       "scope": [
         "test/**",
         "scripts/dev-windows.cmd",
-        "scripts/interactive-win11*"
+        "scripts/interactive-win11*",
+        ".github/workflows/**"
       ]
     },
     {

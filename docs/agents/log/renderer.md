@@ -1,6 +1,12 @@
 # Self-Correction Log: Renderer, GPU and fonts
 
-Part of the Self-Correction Log; [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry. Newest first.
+Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+
+Corrected in other files:
+- 2026-10-11 PKG-33 (`App.init` no longer starts the shell compositor): its "BANNER-01 entry above" is the 2026-10-11 BANNER-01 entry in chrome-overlays.md; banners and the update notice are on screen.
+
+See also:
+- `font-thicken` (FreeType embolden strength) is in the 2026-10-17 PKG-66 entry in app-lifecycle.md.
 
 - 2026-10-17: OpenGL32.dll imposed an approximately 61 ms process-exit tail even when a windowless probe merely loaded it and called no GL API; native ExitProcess did not avoid the delay. Avoid its static import for CLI actions and D3D11. Zig 0.15.2 rejected explicit /DELAYLOAD and COFF directives, so six lazy WGL wrappers share a System32-only LoadLibraryExW module with the GL 1.1 fallback. Publish only a complete export table once, preserve failure returns and GetLastError, and keep the module for process lifetime. Preload and pin System32 before GDI pixel-format calls, suppress loader dialogs around that preload, retry failed attempts and use @alignCast for ARM64 function pointers. A hidden desktop can initialize D3D11 while DXGI remains occluded, so do not call its startup timestamp a successful present.
 - 2026-10-17: Automatic GL-to-D3D11 fallback must cover the eager WGL context in `Surface.init` and GL preparation in `Windows.surfaceInit`, before `Windows.init` can try another backend. Keep that early error until the first renderer attempt consumes it. Release failed GL resources without clearing the HWND; preserve the pixel-format record for later retries. Cache only GL that could not start, not a renderer-construction failure on working GL. Let the winning candidate write the notice, so a failed hardware D3D11 attempt cannot replace a WARP fallback banner. The cache controls new surfaces; reloads with configured unsupported features or retained Kitty images and device recovery may still retry GL. A handled dual-renderer startup failure is not a crash; successful D3D11 fallback is an ordinary launch.

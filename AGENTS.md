@@ -6,25 +6,72 @@ Windows-only Ghostty fork.
 ## Commands
 
 - **Build:** `zig build` (also stages the pinned `conpty.dll` and
-  `OpenConsole.exe` beside the exe; see the 2026-10-10 bundled ConPTY entry
-  in `docs/agents/log/conpty.md`)
+  `OpenConsole.exe` beside the exe; staging traps: the 2026-10-10 bundled
+  ConPTY entry in `docs/agents/log/conpty.md`)
 - **Test (Zig):** `zig build test -Demit-test-exe=true --summary all`
   (full suite, ~4.5k tests, about a minute). This is the only invocation that
   is trustworthy on its own, and `--summary all` is part of it: the count is
   the evidence.
   - Bare `zig build test` errors in this fork.
-  - `-Dtest-filter=<token>` runs the tests whose fully qualified name (file
-    path, `.test.`, test name) contains the token, for quick iteration; it is
-    not evidence on its own. Read the count: the `N/M tests passed` line
-    counts the matching tests plus about 70 unnamed `test { ... }` blocks that
-    no filter excludes, so a token that matches nothing still reports about
-    70 passes, not zero. Use `ConPTY` to reach the probe tests in
-    `src/pty_transport_probe.zig`. A filtered build compiles the whole tree,
-    about a minute. `Build Summary: 41/41 steps succeeded` counts build
-    steps, not tests. See the 2026-10-06 filter entry in
-    `docs/agents/log/test-harnesses.md`.
+  - `-Dtest-filter=<token>` (one token: quote it or use a no-space
+    substring, or `zig build` reads the rest as step names) runs the tests
+    whose fully qualified name (file path, `.test.`, test name) contains the
+    token, for quick iteration; it is not evidence on its own. Read the
+    count: the `N/M tests passed` line counts the matching tests plus about
+    70 unnamed `test { ... }` blocks that no filter excludes, so a token that
+    matches nothing still reports about 70 passes, not zero. Use `ConPTY` to
+    reach the probe tests in `src/pty_transport_probe.zig`. A filtered build
+    compiles the whole tree, about a minute. `Build Summary: 41/41 steps
+    succeeded` counts build steps, not tests. Filter traps: the 2026-10-06
+    entry in `docs/agents/log/test-harnesses.md`.
 - **Formatting (Zig):** `zig fmt .`
 - **Formatting (other):** `prettier -w .`
+- Run `zig build*` through `scripts/dev-windows.cmd` (or an equivalent
+  VS-dev + Zig 0.15.2 shell); the ambient shell can miss the native toolchain
+  and fail with misleading dependency errors. A direct `zig test <file>`
+  misses the build graph's generated modules (`build_options` and others).
+  For code that needs those modules, use the full-suite command above or
+  `zig build test -Dtest-filter=<token>` for iteration; filtered passes alone
+  do not establish full-suite success. Pure helpers may use a temporary
+  package-root harness. (test-harnesses.md: 2026-04-18, 2026-05-01.)
+
+## Running noctty
+
+- Run noctty only on a private desktop (`CreateDesktopW`), and pass
+  `lpDesktop = WinSta0\<desktop>` to every process you start: a driver on a
+  private desktop that passes a null one puts the child on the user's
+  desktop, and noctty takes the foreground. Drive it with posted messages;
+  `SendInput` types into whatever window is in front. (window-frame.md:
+  2026-09-24, 2026-09-23; renderer.md: 2026-10-14; input.md: 2026-09-19.)
+- Run a scratch portable copy (`noctty.portable` beside the exe) with
+  `--window-save-state=never` and `LOCALAPPDATA` redirected for that noctty;
+  that isolates session and startup state. If a `zig build` runs under the
+  redirect, pin `ZIG_GLOBAL_CACHE_DIR` to the real Zig cache. A test that
+  reached the real `%LOCALAPPDATA%\noctty` once put the user's launches into
+  safe mode. (window-frame.md and test-harnesses.md: 2026-09-23.) Give each
+  PowerShell you type into a run-local PSReadLine history path or
+  `SaveNothing` before its first read: PSReadLine finds its history through
+  a known folder (test-harnesses.md: 2026-10-11 PKG-13, 2026-10-17 PKG-76).
+  Before a portable-identity or baseline comparison, read app-lifecycle.md,
+  2026-10-16 "A portable copy": portable mode does not give a copy its own
+  AUMID or registry key.
+- Test copy, paste and OSC 52 through a unit seam. A private desktop shares
+  the user's clipboard (it belongs to the window station), and this account
+  cannot create a private window station (`CreateWindowStationW` returns
+  `ERROR_ACCESS_DENIED`). So a run on WinSta0 starts nothing that can copy
+  or fall back to a copy, reads nothing from the clipboard, and logs
+  `GetClipboardSequenceNumber()` before and after. (launch-and-paths.md:
+  2026-10-15; clipboard.md: 2026-10-15.)
+- A null result needs a positive control before it becomes a causal claim.
+  (window-frame.md: 2026-09-14 `background-blur`.)
+
+## Win32 FFI
+
+- An API that returns a `HANDLE` and fails with NULL returns `?HANDLE`
+  (`std.os.windows.HANDLE` is non-null). Before mirroring an SDK struct,
+  check its packing (`pshpack*.h`) and pin its size and offsets in a test.
+  (tooling.md: 2026-05-01; app-lifecycle.md: 2026-10-09 minidump;
+  accessibility.md: 2026-04-16 VARIANT.)
 
 ## libghostty-vt
 
@@ -42,56 +89,64 @@ Windows-only Ghostty fork.
 - Windows packaging: `dist/windows/` + `scripts/package-windows.ps1`
 - libghostty-vt headers: `include/ghostty/`
 
-This fork removed the upstream `macos/` Xcode app and the `src/apprt/gtk`
-runtime. Do not reintroduce them.
+This fork ships only the Win32 runtime (`src/apprt/win32*`): it removed the
+upstream `macos/` Xcode app and the `src/apprt/gtk` runtime, and they stay
+out.
 
 ## Issue and PR Guidelines
 
-- Never create an issue.
+- Never create an issue; report findings in the conversation or the PR
+  instead.
 - Never create a PR to the upstream Ghostty repo; only work against this
   fork, `amanthanvi/noctty`.
 - If the user asks you to create an issue or PR, confirm the target is this
   fork and refuse any upstream publish request. If publishing is still
   disallowed by the active task contract, offer a local patch summary or
   handoff instead.
+- `gh` can resolve upstream `ghostty-org/ghostty` here: pass
+  `--repo amanthanvi/noctty` to every `gh` command that takes it (name it
+  where the repository is positional, as in `gh repo view amanthanvi/noctty`),
+  and push to `origin`. (tooling.md: 2026-05-01, 2026-04-20.)
 
 ## Self-Correction Log
 
-The log is this fork's dated record of measured traps. It lives in
-[`docs/agents/log/`](docs/agents/log/), one file per area of the code, each
-newest first. A code comment or doc that cites "AGENTS.md <date>" means an
-entry there: find it with `git grep -n "^- <date>:" docs/agents/log/` and the
-subject it names (several entries share a date). Older comments cite an
-AGENTS.md line number (`AGENTS.md:75`) from a layout that no longer exists;
-search the log for the symbol they mention instead.
+The log records measured traps: what looked true and was not, the evidence,
+and the rule now. It lives in [`docs/agents/log/`](docs/agents/log/), one
+file per area, newest first.
 
-Before a change, read the file for each area whose trigger below matches it.
-An entry can cover a second subject filed elsewhere, so also
-`git grep -n <symbol> docs/agents/log/` for the symbols you will change.
+Before you change, diagnose or measure anything, read every area file whose
+trigger below matches the work, and run `git grep -n <term> docs/agents/log/`
+for each symbol you will change, each Win32 API you will newly call, and the
+error you are chasing (`AccessDenied`, `FileTooBig`): an entry can cover a
+second subject filed elsewhere. Read each file from the top, header
+included: a newer entry, or an item under "Corrected in other files",
+overrides an older entry on the same subject. A function an entry calls
+load-bearing may have lost its callers since, so re-verify call sites before
+relying on it.
 
 - [conpty.md](docs/agents/log/conpty.md): `src/pty.zig`, the pty reader and
-  write pool in `termio/Exec.zig`, `ResizePseudoConsole`, the bundled
-  `conpty.dll`/`OpenConsole.exe` (`scripts/stage-conpty-redist.ps1`), in-box
-  conhost versus bundled ConPTY, what ConPTY's buffer holds after a resize,
-  minimize, clear or undo.
+  write pool in `termio/Exec.zig`, `ResizePseudoConsole`, in-box conhost
+  versus the bundled `conpty.dll`/`OpenConsole.exe`
+  (`scripts/stage-conpty-redist.ps1`), what ConPTY's buffer holds after a
+  resize, minimize, clear or undo.
 - [shell-integration.md](docs/agents/log/shell-integration.md): scripts under
-  `src/shell-integration/` (PowerShell `integration.ps1`, cmd/Clink) and their
-  injection (`termio/shell_integration.zig` argv analysis,
-  `win32_powershell_install.zig`): the OSC 133 and OSC 7 marks a shell emits,
-  PSReadLine hooks, execution policy.
+  `src/shell-integration/` (PowerShell `integration.ps1`, cmd/Clink, Git
+  Bash's `ghostty.bash`) and their injection (`termio/shell_integration.zig`
+  argv analysis, `win32_powershell_install.zig`): the OSC 133 and OSC 7 marks
+  a shell emits, PSReadLine hooks, execution policy.
 - [terminal-core.md](docs/agents/log/terminal-core.md): `src/terminal/` (VT
   parser limits, `PageList`, OSC parsers, OSC 133 exit codes, prompt typeahead
   in `semantic_command.zig`, the scrollback search thread,
   `TerminalFormatter`/`ScreenFormatter` output for undo snapshots and Copy as
   HTML), OSC 7 and OSC 9;9 cwd reports (`termio/stream_handler.zig`,
-  `os.hostname.isLocal`), `src/Surface.zig` locking around links.
+  `os.hostname.isLocal`, `windows_shell.conemuPathToLocal`),
+  `src/Surface.zig` locking around links.
 - [renderer.md](docs/agents/log/renderer.md): `src/renderer/` (OpenGL/WGL,
   the D3D11 beta and GL-to-D3D11 fallback, `Thread.zig` pacing and follow-up
   timers, synchronized output, vsync, `RenderPass` viewport, cursor sprites,
-  search highlights after a resize), `win32/pixel_format.zig`, font fallback,
-  renderer wakeups from `termio` and typing latency, repaint during live
-  resize. `font-thicken` is in the 2026-10-17 PKG-66 entry in
-  app-lifecycle.md; showing and hiding pane surfaces is in tabs-panes.md.
+  search highlights after a resize), `win32/pixel_format.zig`, font fallback
+  and `font-thicken`, renderer wakeups from `termio` and typing latency,
+  repaint during live resize.
 - [window-frame.md](docs/agents/log/window-frame.md): the top-level window:
   `WM_NCCALCSIZE`/`WM_NCHITTEST` (`win32_nc_layout.zig`), integrated titlebar
   and caption buttons, `window-decoration = none`, resize bands, maximize,
@@ -119,9 +174,7 @@ An entry can cover a second subject filed elsewhere, so also
   pane surfaces (occlusion, overlapping WGL children), `windowDestroyed`,
   close and close-confirm flows, focus after a close, shell reducer effects,
   local and structural undo/redo (`win32_undo.zig`,
-  `win32_structural_history.zig`, `undo-timeout`; the snapshot formatter is in
-  terminal-core.md). Background-tab close prompts and the undo-off banner are
-  in the 2026-10-15 SMALL-04 A entry in accessibility.md.
+  `win32_structural_history.zig`, `undo-timeout`).
 - [input.md](docs/agents/log/input.md): `win32/input.zig` and key messages
   (`WM_KEYDOWN`/`WM_CHAR`/`WM_SYSCHAR`, dead keys, `ToUnicode`, non-Latin
   layouts), default Windows keybindings, Win32 input mode (DEC 9001), IME,
@@ -132,98 +185,85 @@ An entry can cover a second subject filed elsewhere, so also
   `cmd.exe /D`, `CreateProcessW` name resolution, Git Bash discovery, WSL
   (`wsl_env.zig`, terminfo probe, `TERM`), the terminfo install
   (`win32_terminfo.zig`); path safety (`os.path.isNetworkOrDevicePath`,
-  `OBJ_DONT_REPARSE`) and link and quick-select path detection and opening.
+  `OBJ_DONT_REPARSE`) for every program-reported path before it is opened
+  (OSC 7/9;9/1337 pwd, kitty graphics `t=f`/`t=t` files in
+  `terminal/kitty/graphics_image.zig`); link and quick-select path detection
+  and opening.
 - [clipboard.md](docs/agents/log/clipboard.md): clipboard reads and writes,
   CF_HTML (`win32_clipboard_html.zig`), open retries, OSC 52 prompts and
   replies, paste protection (`win32_paste_protection.zig`), drag-and-drop
-  (`win32_surface_drop*.zig`), pending clipboard confirmations. The
-  `IDropTarget` lifetime rule there is superseded by the 2026-10-11 PKG-26
-  entry in input.md.
+  (`win32_surface_drop*.zig`), pending clipboard confirmations.
 - [settings.md](docs/agents/log/settings.md): the Settings window
   (`win32_settings.zig`, `win32_settings_fields.zig`): its controls, dialog
   manager, viewport, live preview, its own UIA patterns, and the save path
   (`settingsSaveAndReload`, `patchOrAppendEdits`, save target, masked values).
-- [accessibility.md](docs/agents/log/accessibility.md): UIA providers under
-  `src/apprt/win32_uia/` (COM identity and refcounts, BSTR and VARIANT
-  ownership, `events.zig`), terminal text (`win32_terminal_accessibility.zig`,
-  TextPattern, ScrollIntoView, the echo queue), palette and tab-list UIA. The
-  Settings window's controls are in settings.md.
+- [accessibility.md](docs/agents/log/accessibility.md): new widgets and UI
+  events (adding a native widget, or changing its focus, children or
+  notifiable properties); UIA providers under `src/apprt/win32_uia/` (COM
+  identity and refcounts, BSTR and VARIANT ownership, `events.zig`); terminal
+  text (`win32_terminal_accessibility.zig`, TextPattern, ScrollIntoView, the
+  echo queue), palette and tab-list UIA.
 - [config.md](docs/agents/log/config.md): config loading and reload outside
   the Settings window: `--config-file` and `startup_cwd` on reload,
   diagnostics shown in the GUI, conditional replay, `newConfig` shallow
   clones, `+edit-config` and opening the config file, adding config keys.
-- [app-lifecycle.md](docs/agents/log/app-lifecycle.md): process-level
-  behaviour: `App.init` and startup stalls, startup attempts and safe mode,
-  session state and state-file schemas, IPC and single instance
-  (`win32/ipc_server.zig`), AUMID and portable identity, the jump list,
-  toasts and desktop notifications, the bell, taskbar progress and icon, crash
-  minidumps and Sentry, the COM apartment, default-terminal handoff, the CLI
-  and the `noctty.com` wrapper. Toast title and body UTF-8 truncation is in
-  the 2026-10-11 PKG-27 entry in terminal-core.md.
+- [app-lifecycle.md](docs/agents/log/app-lifecycle.md): `App.init` and
+  startup stalls, startup attempts and safe mode, session state and
+  state-file schemas, IPC and single instance (`win32/ipc_server.zig`), AUMID
+  and portable identity, the jump list, toasts and desktop notifications, the
+  bell, taskbar progress and icon, crash minidumps and Sentry, the COM
+  apartment, default-terminal handoff, the CLI and the `noctty.com` wrapper.
 - [build-release-ci.md](docs/agents/log/build-release-ci.md): `build.zig`
-  and resources, packaging (`scripts/package-windows.ps1`,
-  `dist/windows/noctty.iss`), signing, the updater, release workflows and
-  package managers (WinGet, Scoop, Chocolatey), GitHub Actions CI (path
-  filter, caching, runners), line endings.
-- [docs.md](docs/agents/log/docs.md): changing what README.md, PRIVACY.md,
-  `docs/*.md`, `site/` or install copy claims about behaviour.
-- [test-harnesses.md](docs/agents/log/test-harnesses.md): running and reading
-  tests (`scripts/dev-windows.cmd`, filters, counts), and writing or running
-  `test/windows/` harnesses: hidden desktops, the foreground, sandboxes, the
-  interactive composite, the flagship contracts.
-- [tooling.md](docs/agents/log/tooling.md): Zig language and Win32 FFI
-  declaration traps, PowerShell language traps, `gh`, git and codex tooling.
+  and resources, the Windows target floor (`src/build/Config.zig`,
+  `-Dtarget` `win10` versus `win10_rs5`: `posix.renameatW` and
+  `AccessDenied` on a rename over an open file), packaging
+  (`scripts/package-windows.ps1`, `dist/windows/noctty.iss`), signing, the
+  updater, release workflows and package managers (WinGet, Scoop,
+  Chocolatey), GitHub Actions CI (path filter, caching, runners), CRLF and
+  `.gitattributes` in shipped files.
+- [docs-and-site.md](docs/agents/log/docs-and-site.md): site edits (`site/`,
+  including styles, scripts and the generated CSP/asset hashes); changing
+  what README.md, PRIVACY.md, PACKAGING.md, `docs/*.md` or install copy
+  claims about behaviour.
+- [test-harnesses.md](docs/agents/log/test-harnesses.md): writing or running
+  `test/windows/` harnesses (hidden desktops, the foreground, sandboxes, the
+  interactive composite, the flagship contracts), CI test steps, and a test
+  count or result that contradicts the code.
+- [tooling.md](docs/agents/log/tooling.md): declaring `extern` functions or
+  structs, casting Win32 handles and `LPARAM`/`LRESULT` (`@intCast`,
+  `@bitCast`, `@ptrFromInt`), passing `[:0]u16` to text APIs, renaming Zig
+  declarations, `union(enum)` tests, PowerShell language traps (others are
+  filed where found: a one-element array that unrolls to a string, so `[0]`
+  is its first character, is in build-release-ci.md 2026-10-17 item 6;
+  `@($a + 1, $b)` is in window-frame.md 2026-10-16), and `gh`, git and codex
+  commands.
 
-### Rules from the log that apply everywhere
-
-- Run the Commands above through `scripts/dev-windows.cmd` (or an equivalent
-  VS-dev + Zig 0.15.2 shell); when you use `-Dtest-filter`, pass its value as
-  one token. A direct `zig test <file>` misses the build graph's generated
-  modules, so verify with `zig build test` unless the code is a pure helper
-  in a temporary package-root harness. (test-harnesses.md: 2026-04-18,
-  2026-05-01; the count rules come from its 2026-10-06 and 2026-09-21
-  entries.)
-- `gh` can resolve upstream `ghostty-org/ghostty` here: pass
-  `--repo amanthanvi/noctty` to `gh pr`, `gh run` and the other commands that
-  take it, name the repository where it is positional
-  (`gh repo view amanthanvi/noctty`), and push and open PRs against `origin`.
-  (tooling.md: 2026-05-01, 2026-04-20.)
-- Win32 FFI: an API that returns a `HANDLE` and fails with NULL returns
-  `?HANDLE` (`std.os.windows.HANDLE` is non-null). Before mirroring an SDK
-  struct, check its packing (`pshpack*.h`) and pin its size and offsets in a
-  test. (tooling.md: 2026-05-01; app-lifecycle.md: 2026-10-09 minidump;
-  accessibility.md: 2026-04-16 VARIANT.)
-- Never show noctty on the user's desktop or take the foreground: run it on a
-  private desktop and pass `lpDesktop = WinSta0\<desktop>` to every process
-  you start (a null one from a driver on a private desktop lands on the
-  visible desktop); `SendInput` reaches whatever window is in front.
-  (window-frame.md: 2026-09-24, 2026-09-23; renderer.md: 2026-10-14;
-  input.md: 2026-09-19.)
-- Keep runs off the real profile: launch a portable copy (`noctty.portable`
-  beside the exe) with `--window-save-state=never` and a redirected
-  `LOCALAPPDATA`; a test that reached the real `%LOCALAPPDATA%\noctty` once
-  put the user's launches into safe mode. (window-frame.md: 2026-09-23;
-  test-harnesses.md: 2026-09-23.)
-- The clipboard belongs to the window station, so a hidden desktop shares the
-  user's: nothing that can copy (or falls back to a copy) runs there, nothing
-  reads it, and a run logs `GetClipboardSequenceNumber()` before and after;
-  use a unit seam or a private window station. (launch-and-paths.md:
-  2026-10-15; clipboard.md: 2026-10-15.)
-- A null result needs a positive control before it becomes a causal claim.
-  (window-frame.md: 2026-09-14 `background-blur`.)
-- Later entries correct earlier ones, sometimes in another area file, and a
-  function an entry calls load-bearing may have lost its callers since:
-  re-verify call sites before relying on one. (chrome-overlays.md:
-  2026-08-20, 2026-09-10.)
+A comment that cites AGENTS.md (by date, issue number, symbol or an old line
+number such as `AGENTS.md:75`) means a log entry: `git grep -n`
+`docs/agents/log/` for the date (`"^- <date>:"`; several entries share a
+date, so match the subject too), the issue or the symbol.
 
 ### How to add a Self-Correction Log entry
 
-Add one bullet, `- YYYY-MM-DD: ...`, at the top of the area file for the code
-the change touches (one file per entry; continuation lines indented, no blank
-lines inside the list). Record what a later agent could not cheaply
-rediscover: the trap (what looked true and was not), the evidence (what was
-measured, on what, with what result, and what is only inferred), and the rule
-(what to do now, naming the files and symbols). Name an earlier entry it
-corrects by date. If no area fits, add a file with the same heading and
-pointer line, give it a line in the index above with a precise trigger, and
-list it in `.greptile/files.json`.
+When work uncovers a trap a later agent could not cheaply rediscover, add one
+bullet, `- YYYY-MM-DD: ...`, to the area file whose trigger names the code
+the rule governs, at its place in newest-first date order (the top unless an
+existing entry is newer); one file per entry, continuation lines indented, no
+blank lines inside the list. State the trap (what looked true and was not),
+the evidence (what was measured, on what, with what result, and what is only
+inferred), and the rule (what to do now, naming files and symbols). The entry
+is done when:
+
+- you have run `git grep -n` across `docs/agents/log/` for every symbol it
+  names and read the hits, and the entry names each earlier entry it corrects
+  or qualifies by date, subject and file;
+- each corrected entry in another area file has a line in that file's
+  "Corrected in other files";
+- when its rule also governs code another area's trigger names, that area
+  file's "See also" names the entry by date, ID and file;
+- its area's trigger above names every task branch the entry adds;
+- a new area file (only when no trigger fits) has the heading
+  `# Self-Correction Log: <area>`, the standard header lines, an index line
+  above whose trigger names paths and symbols, and an entry with `scope`
+  globs in `.greptile/files.json`; a trigger that gains paths gets them in
+  that file's `scope` too.
