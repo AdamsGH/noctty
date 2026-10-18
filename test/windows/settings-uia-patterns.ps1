@@ -432,9 +432,19 @@ namespace SettingsPatterns
                                 IntPtr hoverSave = GetDlgItem(GetAncestor((IntPtr)hwnd, 2), 301);
                                 result["hoverSaveBeforeModifier"] = IsWindowEnabled(hoverSave);
                                 Require(!Convert.ToBoolean(result["hoverSaveBeforeModifier"]), "Hover dirtied pending config");
-                                ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x11, (IntPtr)1, 3, 2000, out ignored);
-                                result["hoverSaveEnabled"] = IsWindowEnabled(hoverSave);
-                                Require(!Convert.ToBoolean(result["hoverSaveEnabled"]), "Hover plus modifier dirtied pending config");
+                                try
+                                {
+                                    Require(ReadComboMessage((IntPtr)hwnd, 0x0100, (IntPtr)0x11, (IntPtr)1, 3, 2000, out ignored) != IntPtr.Zero,
+                                        "Cannot send hover modifier press");
+                                    result["hoverSaveEnabled"] = IsWindowEnabled(hoverSave);
+                                    Require(!Convert.ToBoolean(result["hoverSaveEnabled"]), "Hover plus modifier dirtied pending config");
+                                }
+                                finally
+                                {
+                                    // Pair even a timed-out send: it may have reached the target.
+                                    Require(ReadComboMessage((IntPtr)hwnd, 0x0101, (IntPtr)0x11, (IntPtr)unchecked((int)0xC0000001), 3, 2000, out ignored) != IntPtr.Zero,
+                                        "Cannot send hover modifier release");
+                                }
                                 ((IExpandCollapse)expand).Collapse();
                                 result["cancelValue"] = ReadCombo(value, selection);
                                 result["cancelSaveEnabled"] = IsWindowEnabled(hoverSave);

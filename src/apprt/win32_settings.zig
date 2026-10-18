@@ -9680,9 +9680,13 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                         _ = sys.SendMessageW(popup.list.?, WM_MOUSEMOVE, 0, ((height + @divTrunc(height, 2)) << 16) | 10);
                         const hovered = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
                         try std.testing.expect(hovered != before_hover);
-                        _ = sys.SendMessageW(control, WM_KEYDOWN, 0x11, 1); // Control, without accepting the row
-                        try std.testing.expect(!settings.hasPendingChanges());
-                        try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+                        {
+                            // Match synthetic presses even when an assertion fails.
+                            defer _ = sys.SendMessageW(control, WM_KEYUP, 0x11, @bitCast(@as(usize, 0xC0000001)));
+                            _ = sys.SendMessageW(control, WM_KEYDOWN, 0x11, 1); // Control, without accepting the row
+                            try std.testing.expect(!settings.hasPendingChanges());
+                            try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
+                        }
                         try std.testing.expectEqual(com.S_OK, expand.vtbl.Collapse(expand));
                         try std.testing.expectEqual(before_hover, sys.SendMessageW(control, CB_GETCURSEL, 0, 0));
                         try std.testing.expectEqual(before_hover, provider.last_selection);
