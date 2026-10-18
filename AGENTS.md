@@ -65,7 +65,9 @@ subject it names (several entries share a date). Older comments cite an
 AGENTS.md line number (`AGENTS.md:75`) from a layout that no longer exists;
 search the log for the symbol they mention instead.
 
-Before a change, read the file for each area whose trigger below matches it:
+Before a change, read the file for each area whose trigger below matches it.
+An entry can cover a second subject filed elsewhere, so also
+`git grep -n <symbol> docs/agents/log/` for the symbols you will change.
 
 - [conpty.md](docs/agents/log/conpty.md): `src/pty.zig`, the pty reader and
   write pool in `termio/Exec.zig`, `ResizePseudoConsole`, the bundled
@@ -118,7 +120,8 @@ Before a change, read the file for each area whose trigger below matches it:
   close and close-confirm flows, focus after a close, shell reducer effects,
   local and structural undo/redo (`win32_undo.zig`,
   `win32_structural_history.zig`, `undo-timeout`; the snapshot formatter is in
-  terminal-core.md).
+  terminal-core.md). Background-tab close prompts and the undo-off banner are
+  in the 2026-10-15 SMALL-04 A entry in accessibility.md.
 - [input.md](docs/agents/log/input.md): `win32/input.zig` and key messages
   (`WM_KEYDOWN`/`WM_CHAR`/`WM_SYSCHAR`, dead keys, `ToUnicode`, non-Latin
   layouts), default Windows keybindings, Win32 input mode (DEC 9001), IME,
@@ -133,7 +136,9 @@ Before a change, read the file for each area whose trigger below matches it:
 - [clipboard.md](docs/agents/log/clipboard.md): clipboard reads and writes,
   CF_HTML (`win32_clipboard_html.zig`), open retries, OSC 52 prompts and
   replies, paste protection (`win32_paste_protection.zig`), drag-and-drop
-  (`win32_surface_drop*.zig`), pending clipboard confirmations.
+  (`win32_surface_drop*.zig`), pending clipboard confirmations. The
+  `IDropTarget` lifetime rule there is superseded by the 2026-10-11 PKG-26
+  entry in input.md.
 - [settings.md](docs/agents/log/settings.md): the Settings window
   (`win32_settings.zig`, `win32_settings_fields.zig`): its controls, dialog
   manager, viewport, live preview, its own UIA patterns, and the save path
@@ -153,7 +158,8 @@ Before a change, read the file for each area whose trigger below matches it:
   (`win32/ipc_server.zig`), AUMID and portable identity, the jump list,
   toasts and desktop notifications, the bell, taskbar progress and icon, crash
   minidumps and Sentry, the COM apartment, default-terminal handoff, the CLI
-  and the `noctty.com` wrapper.
+  and the `noctty.com` wrapper. Toast title and body UTF-8 truncation is in
+  the 2026-10-11 PKG-27 entry in terminal-core.md.
 - [build-release-ci.md](docs/agents/log/build-release-ci.md): `build.zig`
   and resources, packaging (`scripts/package-windows.ps1`,
   `dist/windows/noctty.iss`), signing, the updater, release workflows and
@@ -171,13 +177,15 @@ Before a change, read the file for each area whose trigger below matches it:
 ### Rules from the log that apply everywhere
 
 - Run the Commands above through `scripts/dev-windows.cmd` (or an equivalent
-  VS-dev + Zig 0.15.2 shell), with a one-token `-Dtest-filter`; verify through
-  `zig build test`, since a direct `zig test <file>` misses the build graph's
-  generated modules. (test-harnesses.md: 2026-04-18, 2026-05-01; the count
-  rules come from its 2026-10-06 and 2026-09-21 entries.)
+  VS-dev + Zig 0.15.2 shell), and pass a `-Dtest-filter` value as one token. A
+  direct `zig test <file>` misses the build graph's generated modules, so
+  verify with `zig build test` unless the code is a pure helper in a
+  temporary package-root harness. (test-harnesses.md: 2026-04-18, 2026-05-01;
+  the count rules come from its 2026-10-06 and 2026-09-21 entries.)
 - `gh` can resolve upstream `ghostty-org/ghostty` here: pass
-  `--repo amanthanvi/noctty` to `gh pr`, `gh repo` and the other commands that
-  take it, and push and open PRs against `origin`. (tooling.md: 2026-05-01,
+  `--repo amanthanvi/noctty` to `gh pr`, `gh run` and the other commands that
+  take it, name the repository where it is positional
+  (`gh repo view amanthanvi/noctty`), and push and open PRs against `origin`. (tooling.md: 2026-05-01,
   2026-04-20.)
 - Win32 FFI: an API that returns a `HANDLE` and fails with NULL returns
   `?HANDLE` (`std.os.windows.HANDLE` is non-null). Before mirroring an SDK
