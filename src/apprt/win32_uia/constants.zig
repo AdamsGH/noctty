@@ -34,6 +34,7 @@ pub const UIA_TextPattern2Id: i32 = 10024;
 pub const UIA_SelectionItemPatternId: i32 = 10010;
 pub const UIA_RangeValuePatternId: i32 = 10003;
 pub const UIA_TogglePatternId: i32 = 10015;
+pub const UIA_ExpandCollapsePatternId: i32 = 10005;
 
 // ── Properties ──────────────────────────────────────────────────────────
 // UIA_PropertyId values. 30000-series.
@@ -62,6 +63,7 @@ pub const UIA_RangeValueMaximumPropertyId: i32 = 30050;
 pub const UIA_RangeValueLargeChangePropertyId: i32 = 30051;
 pub const UIA_RangeValueSmallChangePropertyId: i32 = 30052;
 pub const UIA_ToggleToggleStatePropertyId: i32 = 30086;
+pub const UIA_ExpandCollapseExpandCollapseStatePropertyId: i32 = 30070;
 pub const UIA_LiveSettingPropertyId: i32 = 30135;
 
 pub const LiveSetting_Off: i32 = 0;
@@ -110,6 +112,7 @@ test "ids match the Windows SDK headers" {
         .{ "UIA_SelectionItemPatternId", 10010 },
         .{ "UIA_RangeValuePatternId", 10003 },
         .{ "UIA_TogglePatternId", 10015 },
+        .{ "UIA_ExpandCollapsePatternId", 10005 },
         .{ "UIA_ControlTypePropertyId", 30003 },
         .{ "UIA_LocalizedControlTypePropertyId", 30004 },
         .{ "UIA_NamePropertyId", 30005 },
@@ -134,6 +137,7 @@ test "ids match the Windows SDK headers" {
         .{ "UIA_RangeValueLargeChangePropertyId", 30051 },
         .{ "UIA_RangeValueSmallChangePropertyId", 30052 },
         .{ "UIA_ToggleToggleStatePropertyId", 30086 },
+        .{ "UIA_ExpandCollapseExpandCollapseStatePropertyId", 30070 },
         .{ "UIA_LiveSettingPropertyId", 30135 },
         .{ "LiveSetting_Off", 0 },
         .{ "LiveSetting_Polite", 1 },

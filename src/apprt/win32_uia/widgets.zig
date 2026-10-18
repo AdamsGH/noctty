@@ -1066,10 +1066,14 @@ pub const SettingsControlProvider = struct {
             iidEqual(iid, &com.IID_IRawElementProviderSimple))
         {
             out.* = @ptrCast(&self.base);
-        } else if (self.role == .edit and iidEqual(iid, &com.IID_IValueProvider)) {
+        } else if ((self.role == .edit or self.role == .combo_box) and iidEqual(iid, &com.IID_IValueProvider)) {
             out.* = @ptrCast(&self.value_iface);
         } else if (self.role == .button and iidEqual(iid, &com.IID_IInvokeProvider)) {
             out.* = @ptrCast(&self.invoke_iface);
+        } else if (self.role == .check_box and iidEqual(iid, &com.IID_IToggleProvider)) {
+            out.* = @ptrCast(&self.toggle_iface);
+        } else if (self.role == .combo_box and iidEqual(iid, &com.IID_IExpandCollapseProvider)) {
+            out.* = @ptrCast(&self.expand_iface);
         } else return com.E_NOINTERFACE;
         _ = AddRef(&self.base);
         return com.S_OK;
@@ -1105,6 +1109,12 @@ pub const SettingsControlProvider = struct {
     base: com.IRawElementProviderSimple,
     value_iface: com.IValueProvider,
     invoke_iface: com.IInvokeProvider,
+    toggle_iface: com.IToggleProvider,
+    expand_iface: com.IExpandCollapseProvider,
+    // Only read/written by the HWND's thread, through syncNativeState.
+    last_toggle: i32 = 0,
+    last_expanded: i32 = 0,
+    last_selection: isize = -1,
     refcount: std.atomic.Value(u32),
     alloc: std.mem.Allocator,
     hwnd: com.HWND,
@@ -1146,6 +1156,40 @@ pub const SettingsControlProvider = struct {
         .Invoke = Invoke,
     };
 
+    const ToggleInterface = Object.Interface("toggle_iface");
+    const ExpandInterface = Object.Interface("expand_iface");
+    const toggle_vtbl: com.IToggleProviderVtbl = .{
+        .QueryInterface = ToggleInterface.QueryInterface,
+        .AddRef = ToggleInterface.AddRef,
+        .Release = ToggleInterface.Release,
+        .Toggle = Toggle,
+        .get_ToggleState = GetToggleState,
+    };
+    const expand_vtbl: com.IExpandCollapseProviderVtbl = .{
+        .QueryInterface = ExpandInterface.QueryInterface,
+        .AddRef = ExpandInterface.AddRef,
+        .Release = ExpandInterface.Release,
+        .Expand = Expand,
+        .Collapse = Collapse,
+        .get_ExpandCollapseState = GetExpandedState,
+    };
+
+    /// Pointer-free requests, marshalled to settingsControlProc. In particular,
+    /// a Toggle is one UI-thread operation, not a racy read/set/notify sequence.
+    pub const action_message: u32 = 0x8000 + 0x10C;
+    pub const action_success: isize = 1;
+    pub const Action = enum(usize) { toggle, select, expand, collapse };
+    pub const SelectionSync = enum { observe, native_notification, explicit_selection };
+
+    const BM_GETCHECK: u32 = 0x00F0;
+    const BM_SETCHECK: u32 = 0x00F1;
+    const CB_GETCOUNT: u32 = 0x0146;
+    const CB_GETCURSEL: u32 = 0x0147;
+    const CB_SETCURSEL: u32 = 0x014E;
+    const CB_SHOWDROPDOWN: u32 = 0x014F;
+    const CB_GETDROPPEDSTATE: u32 = 0x0157;
+    const CB_FINDSTRINGEXACT: u32 = 0x0158;
+
     pub fn create(
         alloc: std.mem.Allocator,
         hwnd: com.HWND,
@@ -1157,6 +1201,8 @@ pub const SettingsControlProvider = struct {
             .base = .{ .vtbl = &vtbl },
             .value_iface = .{ .vtbl = &value_vtbl },
             .invoke_iface = .{ .vtbl = &invoke_vtbl },
+            .toggle_iface = .{ .vtbl = &toggle_vtbl },
+            .expand_iface = .{ .vtbl = &expand_vtbl },
             .refcount = std.atomic.Value(u32).init(1),
             .alloc = alloc,
             .hwnd = hwnd,
@@ -1166,6 +1212,8 @@ pub const SettingsControlProvider = struct {
             .disconnected = std.atomic.Value(bool).init(false),
             .viewport_fully_clipped = std.atomic.Value(bool).init(false),
         };
+        if (role == .check_box) self.last_toggle = @intCast(SendMessageW(hwnd, BM_GETCHECK, 0, 0));
+        if (role == .combo_box) self.last_selection = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
         return self;
     }
 
@@ -1283,13 +1331,23 @@ pub const SettingsControlProvider = struct {
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.isText()) return com.S_OK;
-        if (self.role == .edit and pattern_id == constants.UIA_ValuePatternId) {
+        if ((self.role == .edit or self.role == .combo_box) and pattern_id == constants.UIA_ValuePatternId) {
             out.* = @ptrCast(&self.value_iface);
             _ = AddRef(&self.base);
             return com.S_OK;
         }
         if (self.role == .button and pattern_id == constants.UIA_InvokePatternId) {
             out.* = @ptrCast(&self.invoke_iface);
+            _ = AddRef(&self.base);
+            return com.S_OK;
+        }
+        if (self.role == .check_box and pattern_id == constants.UIA_TogglePatternId) {
+            out.* = @ptrCast(&self.toggle_iface);
+            _ = AddRef(&self.base);
+            return com.S_OK;
+        }
+        if (self.role == .combo_box and pattern_id == constants.UIA_ExpandCollapsePatternId) {
+            out.* = @ptrCast(&self.expand_iface);
             _ = AddRef(&self.base);
             return com.S_OK;
         }
@@ -1330,12 +1388,18 @@ pub const SettingsControlProvider = struct {
                     out.* = com.VARIANT.fromBstr(bstr);
                 }
             },
-            constants.UIA_ValueValuePropertyId => if (self.role == .edit) {
+            constants.UIA_ValueValuePropertyId => if (self.role == .edit or self.role == .combo_box) {
                 const value = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(value);
             },
-            constants.UIA_ValueIsReadOnlyPropertyId => if (self.role == .edit) {
+            constants.UIA_ValueIsReadOnlyPropertyId => if (self.role == .edit or self.role == .combo_box) {
                 out.* = com.VARIANT.fromBool(self.readOnly());
+            },
+            constants.UIA_ToggleToggleStatePropertyId => if (self.role == .check_box) {
+                out.* = com.VARIANT.fromI4(@intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0)));
+            },
+            constants.UIA_ExpandCollapseExpandCollapseStatePropertyId => if (self.role == .combo_box) {
+                out.* = com.VARIANT.fromI4(@intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0));
             },
             constants.UIA_LabeledByPropertyId => if (self.labeled_by) |label| {
                 _ = label.vtbl.AddRef(label);
@@ -1381,7 +1445,7 @@ pub const SettingsControlProvider = struct {
 
     fn setValuePrecondition(provider_available: bool, role: Role, enabled: bool) com.HRESULT {
         if (!provider_available) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (role != .edit) return com.UIA_E_INVALIDOPERATION;
+        if (role != .edit and role != .combo_box) return com.UIA_E_INVALIDOPERATION;
         if (!enabled) return com.UIA_E_ELEMENTNOTENABLED;
         return com.S_OK;
     }
@@ -1411,7 +1475,7 @@ pub const SettingsControlProvider = struct {
 
     fn SetValue(
         p: *com.IValueProvider,
-        value: [*:0]const u16,
+        value_arg: ?[*:0]const u16,
     ) callconv(.winapi) com.HRESULT {
         const self = fromValue(p);
         const precondition = setValuePrecondition(
@@ -1421,6 +1485,16 @@ pub const SettingsControlProvider = struct {
         );
         if (precondition != com.S_OK) return precondition;
         if (self.readOnly()) return com.UIA_E_INVALIDOPERATION;
+        const value = value_arg orelse return com.E_INVALIDARG;
+        if (self.role == .combo_box) {
+            // Keep the borrowed string alive until the native lookup returns,
+            // including same-process cross-thread calls. A timed-out send could
+            // return while the control still reads it. The bounded private
+            // mutation request carries only the resulting index.
+            const index = SendMessageW(self.hwnd, CB_FINDSTRINGEXACT, std.math.maxInt(usize), @bitCast(@intFromPtr(value)));
+            if (index < 0) return com.E_INVALIDARG;
+            return self.requestAction(.select, index);
+        }
         return if (com.SetWindowTextW(self.hwnd, value) != 0) com.S_OK else com.E_INVALIDARG;
     }
 
@@ -1431,7 +1505,7 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role != .edit) return com.UIA_E_INVALIDOPERATION;
+        if (self.role != .edit and self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
         out.* = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
         return com.S_OK;
     }
@@ -1443,9 +1517,114 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role != .edit) return com.UIA_E_INVALIDOPERATION;
+        if (self.role != .edit and self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
         out.* = @intFromBool(self.readOnly());
         return com.S_OK;
+    }
+
+    fn requestAction(self: *SettingsControlProvider, action: Action, index: isize) com.HRESULT {
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        var result: usize = 0;
+        if (SendMessageTimeoutW(self.hwnd, action_message, @intFromEnum(action), index, SMTO_BLOCK | SMTO_ABORTIFHUNG, settings_selection_timeout_ms, &result) == 0)
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (result == action_success) return com.S_OK;
+        if (result == 0) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        return @bitCast(@as(u32, @truncate(result)));
+    }
+
+    /// Called only by the native control's owning thread. Route changes through
+    /// the existing BN_CLICKED/CBN_SELCHANGE handlers, including draft tracking,
+    /// preview and Save; never write Settings' transaction from a COM thread.
+    pub fn handleAction(self: *SettingsControlProvider, raw_action: usize, index: isize) com.HRESULT {
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        if (IsWindowEnabled(self.hwnd) == 0) return com.UIA_E_ELEMENTNOTENABLED;
+        const action = std.meta.intToEnum(Action, raw_action) catch return com.E_INVALIDARG;
+        const parent = GetParent(self.hwnd) orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        switch (action) {
+            .toggle => {
+                if (self.role != .check_box) return com.UIA_E_INVALIDOPERATION;
+                const checked = SendMessageW(self.hwnd, BM_GETCHECK, 0, 0) != 0;
+                _ = SendMessageW(self.hwnd, BM_SETCHECK, @intFromBool(!checked), 0);
+            },
+            .select => {
+                if (self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+                if (index < 0 or index >= SendMessageW(self.hwnd, CB_GETCOUNT, 0, 0)) return com.E_INVALIDARG;
+                _ = SendMessageW(self.hwnd, CB_SETCURSEL, @intCast(index), 0);
+                self.syncNativeState(.explicit_selection);
+                return com.S_OK;
+            },
+            .expand, .collapse => {
+                if (self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+                _ = SendMessageW(self.hwnd, CB_SHOWDROPDOWN, @intFromBool(action == .expand), 0);
+                self.syncNativeState(.observe);
+                return com.S_OK;
+            },
+        }
+        _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))), @bitCast(@intFromPtr(self.hwnd)));
+        self.syncNativeState(.observe);
+        return com.S_OK;
+    }
+
+    fn Toggle(p: *com.IToggleProvider) callconv(.winapi) com.HRESULT {
+        const self: *SettingsControlProvider = @fieldParentPtr("toggle_iface", p);
+        return self.requestAction(.toggle, 0);
+    }
+    fn GetToggleState(p: *com.IToggleProvider, out: *i32) callconv(.winapi) com.HRESULT {
+        const self: *SettingsControlProvider = @fieldParentPtr("toggle_iface", p);
+        out.* = 0;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        out.* = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+        return com.S_OK;
+    }
+    fn Expand(p: *com.IExpandCollapseProvider) callconv(.winapi) com.HRESULT {
+        const self: *SettingsControlProvider = @fieldParentPtr("expand_iface", p);
+        return self.requestAction(.expand, 0);
+    }
+    fn Collapse(p: *com.IExpandCollapseProvider) callconv(.winapi) com.HRESULT {
+        const self: *SettingsControlProvider = @fieldParentPtr("expand_iface", p);
+        return self.requestAction(.collapse, 0);
+    }
+    fn GetExpandedState(p: *com.IExpandCollapseProvider, out: *i32) callconv(.winapi) com.HRESULT {
+        const self: *SettingsControlProvider = @fieldParentPtr("expand_iface", p);
+        out.* = 0;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        out.* = @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+        return com.S_OK;
+    }
+
+    /// The native HWND thread owns this cache. Compare after native mutations
+    /// as well as UIA actions, so mouse/keyboard and Discard announce changes.
+    pub fn syncNativeState(self: *SettingsControlProvider, selection_sync: SelectionSync) void {
+        if (!self.available()) return;
+        if (self.role == .check_box) {
+            const next: i32 = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+            const old = self.last_toggle;
+            self.last_toggle = next;
+            if (old != next) events.raisePropertyChanged(&self.base, constants.UIA_ToggleToggleStatePropertyId, com.VARIANT.fromI4(old), com.VARIANT.fromI4(next));
+        } else if (self.role == .combo_box) {
+            const expanded: i32 = @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+            const old_expanded = self.last_expanded;
+            self.last_expanded = expanded;
+            if (expanded != old_expanded) events.raisePropertyChanged(&self.base, constants.UIA_ExpandCollapseExpandCollapseStatePropertyId, com.VARIANT.fromI4(old_expanded), com.VARIANT.fromI4(expanded));
+            // A list tracks its hovered row before the user chooses it, even
+            // during close notifications. Only a committed native notification
+            // or explicit selection may consume the selection-cache change.
+            if (selection_sync == .observe) return;
+            const selected = SendMessageW(self.hwnd, CB_GETCURSEL, 0, 0);
+            if (self.last_selection != selected) {
+                self.last_selection = selected;
+                // The stock popup's SelectionItem proxy can set a combo's
+                // index without CBN_SELCHANGE. Keep its native state and the
+                // Settings draft together, using the same parent handler.
+                // Update the cache first: the handler may refresh controls.
+                if (selection_sync == .explicit_selection) {
+                    if (GetParent(self.hwnd)) |parent| {
+                        _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))) | (@as(usize, 1) << 16), @bitCast(@intFromPtr(self.hwnd)));
+                    }
+                }
+                events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ValueValuePropertyId);
+            }
+        }
     }
 
     fn getHostRawElementProvider(
@@ -3370,12 +3549,13 @@ pub const TerminalProvider = struct {
 
     fn SetValue(
         self_value: *com.IValueProvider,
-        value_w: [*:0]const u16,
+        value_arg: ?[*:0]const u16,
     ) callconv(.winapi) com.HRESULT {
         const self = fromValue(self_value);
         if (self.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.state.role != .edit) return com.UIA_E_INVALIDOPERATION;
         const set_value = self.state.set_value orelse return com.UIA_E_INVALIDOPERATION;
+        const value_w = value_arg orelse return com.E_INVALIDARG;
         const value_len = std.mem.len(value_w);
         const value = std.unicode.utf16LeToUtf8Alloc(self.alloc, value_w[0..value_len]) catch |err| {
             return if (err == error.OutOfMemory) com.E_OUTOFMEMORY else com.E_INVALIDARG;
@@ -7680,7 +7860,7 @@ test "ChromeControlProvider disconnect latches only after UIA releases it" {
     try std.testing.expect(provider.disconnected.load(.acquire));
 }
 
-test "SettingsControlProvider exposes ValueProvider only for edit controls" {
+test "SettingsControlProvider exposes ValueProvider for edits and combos" {
     try std.testing.expectEqual(
         com.UIA_E_ELEMENTNOTAVAILABLE,
         SettingsControlProvider.setValuePrecondition(false, .edit, true),
