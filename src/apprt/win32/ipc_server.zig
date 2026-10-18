@@ -143,10 +143,29 @@ fn tokenUserSidBytes(
     return buf[0..sid_len];
 }
 
+/// The token's mandatory integrity label SID as a string, or null when the
+/// token or the conversion fails. OS-allocated; free it with `sys.LocalFree`.
+fn tokenIntegritySidString(token: windows.HANDLE) ?[*:0]u16 {
+    var label_buf: [256]u8 align(@alignOf(sys.TOKEN_MANDATORY_LABEL)) = undefined;
+    var label_len: u32 = 0;
+    if (sys.GetTokenInformation(
+        token,
+        c.TokenIntegrityLevel,
+        &label_buf,
+        label_buf.len,
+        &label_len,
+    ) == 0) return null;
+    const label: *const sys.TOKEN_MANDATORY_LABEL = @ptrCast(&label_buf);
+
+    var sid_string: ?[*:0]u16 = null;
+    if (sys.ConvertSidToStringSidW(label.Label.Sid, &sid_string) == 0) return null;
+    return sid_string;
+}
+
 /// Mandatory integrity level of a token, as an `S-1-16-<rid>` RID: the
 /// numeric value, which the comparison below needs.
 fn tokenIntegrityRid(token: windows.HANDLE) ?u32 {
-    const sid = allocIpcPipeIntegritySid(token) catch return null;
+    const sid = tokenIntegritySidString(token) orelse return null;
     defer _ = sys.LocalFree(@ptrCast(sid));
     return integrityRidFromSidString(std.mem.span(sid));
 }
@@ -1159,24 +1178,7 @@ fn buildIpcPipeSddl(
 ///
 /// The returned string is OS-allocated; free it with `sys.LocalFree`.
 fn allocIpcPipeIntegritySid(token: windows.HANDLE) ![*:0]u16 {
-    var label_buf: [256]u8 align(@alignOf(sys.TOKEN_MANDATORY_LABEL)) = undefined;
-    var label_len: u32 = 0;
-    if (sys.GetTokenInformation(
-        token,
-        c.TokenIntegrityLevel,
-        &label_buf,
-        label_buf.len,
-        &label_len,
-    ) == 0) return error.IpcSecurityDescriptorFailed;
-    const label: *const sys.TOKEN_MANDATORY_LABEL = @ptrCast(&label_buf);
-
-    var sid_string: ?[*:0]u16 = null;
-    if (sys.ConvertSidToStringSidW(
-        label.Label.Sid,
-        &sid_string,
-    ) == 0) return error.IpcSecurityDescriptorFailed;
-    const sid = sid_string orelse return error.IpcSecurityDescriptorFailed;
-
+    const sid = tokenIntegritySidString(token) orelse return error.IpcSecurityDescriptorFailed;
     _ = integrityRidFromSidString(std.mem.span(sid)) orelse {
         _ = sys.LocalFree(@ptrCast(sid));
         return error.IpcSecurityDescriptorFailed;
