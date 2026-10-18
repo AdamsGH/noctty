@@ -20,6 +20,7 @@ param(
     [Parameter(Mandatory)] [string] $Bin,
     [Parameter(Mandatory)] [string] $Run,
     [switch] $Driver,
+    [string] $DesktopName,
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 420,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
@@ -150,6 +151,21 @@ public static class Sr {
         try { if(!SetWindowPos(h,IntPtr.Zero,x,y,w,ht,0x14)) throw new Exception("SetWindowPos failed"); }
         finally { SetThreadDpiAwarenessContext(old); }
     }
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint tid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformationW(IntPtr h,int index,StringBuilder value,int length,out int needed);
+    // The name of the desktop of the thread that owns `h`.
+    public static string WindowDesktop(IntPtr h) {
+        int pid; int tid=GetWindowThreadProcessId(h,out pid); var name=new StringBuilder(256); int needed;
+        if(tid==0 || !GetUserObjectInformationW(GetThreadDesktop((uint)tid),2,name,512,out needed)) throw new Exception("Window desktop query failed");
+        return name.ToString();
+    }
+    // Starts a process on the named desktop, with no console window.
+    public static ProcessInfo Spawn(string app,string command,string cwd,string desktop) {
+        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
+        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000000,IntPtr.Zero,cwd,ref si,out pi))
+            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
+        return pi;
+    }
     public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job) {
         var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
         // Assign the suspended driver before it can spawn children. The job
@@ -196,7 +212,7 @@ if (-not $Driver) {
         $job=[Sr]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName
         $pi=[Sr]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -273,12 +289,18 @@ function New-Case([string]$Name,[hashtable]$Files,[string]$Extra='') {
 }
 function Start-Case($case,[switch]$NoLedgerWait) {
     $exe=Join-Path $case.Dir 'noctty.exe'
-    $p=Start-Process -FilePath $exe -ArgumentList @("--config-file=`"$($case.Config)`"") -WorkingDirectory $case.Dir -WindowStyle Hidden -PassThru
+    # An explicit lpDesktop: a child that a private-desktop driver starts with a null desktop can
+    # land on the interactive desktop. The Process object holds its own handle before the launch
+    # handles close, so it stays this launch's process.
+    $pi=[Sr]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$case.Config),$case.Dir,"WinSta0\$DesktopName")
+    try { $p=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$p.Handle }
+    finally { [void][Sr]::CloseHandle($pi.thread); [void][Sr]::CloseHandle($pi.process) }
     $script:processes.Add(@{Case=$case.Name;Pid=$p.Id;StartTime=$p.StartTime.ToUniversalTime().ToString('o');Executable=$p.ProcessName})
     $case.Process=$p
     $deadline=[datetime]::UtcNow.AddSeconds(20)
     do {
         $hosts=@([Sr]::Hosts($p.Id))
+        if($hosts.Count -and [Sr]::WindowDesktop($hosts[0]) -ne $DesktopName) { Stop-Case $case; throw "Case $($case.Name) window is not on the private desktop." }
         $ready=$NoLedgerWait.IsPresent
         $ledger=Join-Path $case.Dir 'startup-attempts.json'
         if(-not $ready -and (Test-Path -LiteralPath $ledger)) {
