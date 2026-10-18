@@ -409,13 +409,7 @@ if (-not $PortableExe -or -not $OutputDirectory -or -not $ExpectedExeSha256) {
     throw 'PortableExe, ExpectedExeSha256 and a new OutputDirectory are required.'
 }
 function Write-Json([string] $Path, $Value) {
-    # Publish only a fully flushed receipt. Temporary siblings are retained on write failure.
-    $temporary = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $Value -Depth 16))
-    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
-    finally { $stream.Dispose() }
-    [IO.File]::Move($temporary, $Path, $true)
+    Write-SettingsOpenReceipt -Path $Path -Value $Value
 }
 function Assert-Contract([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }

@@ -1,5 +1,20 @@
-# Pure ledger selection and trace parsing for Settings harnesses. No process, window or input access.
+# Task-file helpers for Settings harnesses. No process, window or input access.
 Set-StrictMode -Version Latest
+
+function Write-SettingsOpenReceipt {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][AllowNull()] $Value)
+    # The caller owns a NEW output directory and is its sole writer.
+    # Keep the flushed temporary sibling if publication fails.
+    $temporary = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $Value -Depth 16))
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+    finally { $stream.Dispose() }
+    if ([IO.File]::Exists($Path)) {
+        # Move(overwrite) fails on an open Windows target even with delete sharing.
+        [IO.File]::Replace($temporary, $Path, [NullString]::Value)
+    } else { [IO.File]::Move($temporary, $Path) }
+}
 
 function Read-StartupAttempt {
     [CmdletBinding(DefaultParameterSetName = 'Path')]
@@ -176,4 +191,4 @@ function Test-SettingsOpenTraceParser {
     "Settings open trace parser PASS ($checks checks; no files, runtime or input queries)."
 }
 
-Export-ModuleMember -Function Read-StartupAttempt, Get-NewReadyAttempt, ConvertFrom-SettingsOpenTrace, Test-SettingsOpenTraceParser
+Export-ModuleMember -Function Read-StartupAttempt, Get-NewReadyAttempt, ConvertFrom-SettingsOpenTrace, Test-SettingsOpenTraceParser, Write-SettingsOpenReceipt

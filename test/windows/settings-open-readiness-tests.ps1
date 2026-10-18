@@ -1,5 +1,5 @@
 #Requires -Version 7.0
-<# Pure regression checks; no processes, desktops, input, or user-state writes. #>
+<# Regression checks; receipt files use a new private temporary folder only. #>
 [CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'
@@ -78,4 +78,24 @@ Check ($result.ready -and $result.attempt.started_at_unix_ms -eq 1700) 'trimming
 $state = State (@($attempts) + @((Attempt 1800 'ready' 1820)))
 Check ($state.stage -eq 'invalid') 'oversized ledger is rejected'
 
-"Settings startup readiness PASS ($checks checks; runtime NOT RUN)."
+$receiptRoot = Join-Path ([IO.Path]::GetTempPath()) ('noctty-settings-receipt-' + [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($receiptRoot)
+$receiptPath = Join-Path $receiptRoot 'receipt.json'
+try {
+    Write-SettingsOpenReceipt -Path $receiptPath -Value @{ stage = 'first' }
+    Check (([IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json).stage -eq 'first') 'first receipt publishes complete JSON'
+    $held = [IO.FileStream]::new($receiptPath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        Write-SettingsOpenReceipt -Path $receiptPath -Value @{ stage = 'second' }
+        Check (([IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json).stage -eq 'second') 'replacement succeeds while a reader shares delete'
+        $reader = [IO.StreamReader]::new($held)
+        try { Check (($reader.ReadToEnd() | ConvertFrom-Json).stage -eq 'first') 'held reader retains a complete previous snapshot' }
+        finally { $reader.Dispose() }
+    } finally { $held.Dispose() }
+    Check (@([IO.Directory]::GetFiles($receiptRoot)).Count -eq 1) 'successful publication consumes temporary siblings'
+} finally {
+    [IO.File]::Delete($receiptPath)
+    [IO.Directory]::Delete($receiptRoot, $false)
+}
+"Settings readiness and receipts PASS ($checks checks; app runtime NOT RUN)."
