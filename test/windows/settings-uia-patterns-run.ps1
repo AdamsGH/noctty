@@ -418,7 +418,7 @@ function Get-TraceSummary {
     param([string] $Path, [AllowEmptyCollection()][string[]] $Lines, [AllowEmptyString()][string] $Text)
     # Lines models complete records; Text models a possibly partial writer snapshot, without file access.
     $inMemory = $PSBoundParameters.ContainsKey('Lines') -or $PSBoundParameters.ContainsKey('Text')
-    $summary = [ordered]@{ path = $Path; exists = $inMemory -or [IO.File]::Exists($Path); rows = 0; invalidRows = 0; tags = @{}
+    $summary = [ordered]@{ file = [IO.Path]::GetFileName($Path); exists = $inMemory -or [IO.File]::Exists($Path); rows = 0; invalidRows = 0; tags = @{}
         pendingFinalLine = $false; readable = $false; records = [Collections.Generic.List[object]]::new() }
     if (-not $summary.exists) { return $summary }
     try {
@@ -454,7 +454,7 @@ function Save-Attempt {
     param([switch] $UpdateIndex)
     if ($null -eq $script:attempt) { return }
     $script:attempt.elapsedMilliseconds = $script:attemptClock.Elapsed.TotalMilliseconds
-    $script:attempt.trace = Get-TraceSummary $script:attempt.tracePath
+    $script:attempt.trace = Get-TraceSummary (Join-Path $OutputDirectory $script:attempt.traceFile)
     Write-Json (Join-Path $OutputDirectory ('attempt-{0:D4}.json' -f $script:attempt.index)) $script:attempt
     if ($UpdateIndex) {
         # Compact index only at attempt completion/failure; individual receipts hold the complete stages.
@@ -755,8 +755,8 @@ function Start-Fixture {
     $class = 'noctty-test-set91-' + [guid]::NewGuid().ToString('N')
     $tracePath = Join-Path $OutputDirectory ('settings-open-' + [guid]::NewGuid().ToString('N') + '.jsonl')
     $script:attemptClock.Restart()
-    $script:attempt = [ordered]@{ index = $attempts.Count + 1; pid = 0; classArgument = $class
-        desktop = $WorkerDesktop; tracePath = $tracePath; previousStartedAt = $null
+    $script:attempt = [ordered]@{ index = $attempts.Count + 1; pid = 0
+        desktop = $WorkerDesktop; traceFile = [IO.Path]::GetFileName($tracePath); previousStartedAt = $null
         stage = 'baseline'; stages = [Collections.Generic.List[object]]::new(); f9 = @()
         elapsedMilliseconds = 0; trace = $null; cleanup = $null; startup = $null }
     $attempts.Add($script:attempt)
@@ -904,8 +904,10 @@ function Stop-Fixture {
         if ([Set91.Native]::IsWindow($hostWindow)) {
             [void][Set91.Native]::PostMessageW($hostWindow, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
             [void](Wait-For {
-                [Set91.Native]::WaitForSingleObject($process.Handle, 0) -eq 0 -or
-                    [Set91.Native]::Child($hostWindow, 2003, '') -ne [IntPtr]::Zero
+                if ([Set91.Native]::WaitForSingleObject($process.Handle, 0) -eq 0) { return $true }
+                $candidate = [Set91.Native]::Child($hostWindow, 2003, '')
+                $candidate -ne [IntPtr]::Zero -and [Set91.Native]::IsWindowVisible($candidate) -and
+                    [Set91.Native]::IsCloseButton($candidate)
             } 'fixture close or confirmation')
             # The Close confirmation case can have saved true/always. Accept only
             # this exact Close button after our WM_CLOSE, never another prompt.
