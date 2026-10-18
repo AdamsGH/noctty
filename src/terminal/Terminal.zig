@@ -1305,11 +1305,7 @@ pub fn semanticPrompt(
             // nested shell needs reset. Without PSReadLine, noctty's
             // PowerShell integration writes no C either, and the same
             // inference serves its `redraw=0` prompts.
-            if (redraw) |v| {
-                self.flags.shell_redraws_prompt = v;
-            } else if (new_prompt) {
-                self.flags.shell_redraws_prompt = .true;
-            }
+            self.semanticPromptApplyRedraw(redraw, new_prompt);
 
             click: {
                 // Handle click_events as a priority over cl. click_events
@@ -1373,11 +1369,7 @@ pub fn semanticPrompt(
             const redraw = cmd.readOption(.redraw);
             const new_prompt = kind == .initial and
                 self.screens.active.semanticPromptMarkStart((redraw orelse .true) == .false);
-            if (redraw) |v| {
-                self.flags.shell_redraws_prompt = v;
-            } else if (new_prompt) {
-                self.flags.shell_redraws_prompt = .true;
-            }
+            self.semanticPromptApplyRedraw(redraw, new_prompt);
 
             self.screens.active.cursorSetSemanticContent(.{ .prompt = kind });
         },
@@ -1429,6 +1421,21 @@ pub fn semanticPrompt(
             // state but the spec doesn't really say what to do.
             self.screens.active.cursorSetSemanticContent(.output);
         },
+    }
+}
+
+/// Apply the `redraw` option of a prompt-start mark. An explicit value always
+/// applies; a mark without one resets the setting to its default only when
+/// it starts a new prompt. See the A arm of `semanticPrompt` for why.
+fn semanticPromptApplyRedraw(
+    self: *Terminal,
+    redraw: ?osc.semantic_prompt.Redraw,
+    new_prompt: bool,
+) void {
+    if (redraw) |v| {
+        self.flags.shell_redraws_prompt = v;
+    } else if (new_prompt) {
+        self.flags.shell_redraws_prompt = .true;
     }
 }
 
