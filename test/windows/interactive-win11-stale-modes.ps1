@@ -28,11 +28,7 @@ if ($Scenario -eq 'Paste' -and $Shells -contains 'pwsh') { throw 'Paste supports
 if (-not $Worker -and $Scenario -eq 'All' -and $Shells -notcontains 'cmd') { throw 'All requires cmd for its paste check; use -Shells cmd,pwsh.' }
 if ($ExerciseParentTimeout -and $Scenario -ne 'Modes') { throw 'Timeout exercise requires -Scenario Modes.' }
 
-function Get-Fingerprint([string] $Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
-    $item = Get-Item -LiteralPath $Path
-    return "$($item.LastWriteTimeUtc.Ticks):$($item.Length):$((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash)"
-}
+. (Join-Path $PSScriptRoot 'interactive-win11-hidden-desktop-lib.ps1')
 
 if (-not ('StaleModesNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -41,73 +37,12 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class StaleModesNative {
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct SI {
-        public int cb; public string reserved, desktop, title;
-        public int x,y,xsize,ysize,xchars,ychars,fill,flags;
-        public short show, cbReserved; public IntPtr reserved2, stdin, stdout, stderr;
-    }
-    [StructLayout(LayoutKind.Sequential)] public struct PI { public IntPtr process, thread; public int pid, tid; }
-    public delegate bool EnumProc(IntPtr hwnd, IntPtr arg);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string name, IntPtr device, IntPtr mode, int flags, uint access, IntPtr security);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateWindowStationW(string name, uint flags, uint access, IntPtr security);
     [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation();
     [DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessWindowStation(IntPtr station);
     [DllImport("user32.dll")] public static extern bool CloseWindowStation(IntPtr station);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateProcessW(string application, StringBuilder command, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr environment, string cwd, ref SI startup, out PI info);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr security, string name);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-    [DllImport("kernel32.dll")] public static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr process, uint code);
-    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    public static int[] JobPids(IntPtr job) {
-        // This harness has few children. MORE_DATA fails closed rather than
-        // truncating an unexpectedly large process list.
-        int size=8+IntPtr.Size*256; IntPtr buffer=Marshal.AllocHGlobal(size);
-        try {
-            uint returned;
-            if(!QueryInformationJobObject(job,3,buffer,(uint)size,out returned)) throw new Exception("Query owned job failed: "+Marshal.GetLastWin32Error());
-            int count=Marshal.ReadInt32(buffer,4); var ids=new int[count];
-            for(int i=0;i<count;i++) ids[i]=(int)Marshal.ReadIntPtr(buffer,8+i*IntPtr.Size);
-            return ids;
-        } finally { Marshal.FreeHGlobal(buffer); }
-    }
-    public static int[] ReapOwnedJob(IntPtr job) {
-        var stopped=new List<int>();
-        for(int round=0;round<8;round++) {
-            int[] ids=JobPids(job); if(ids.Length==0) return stopped.ToArray();
-            foreach(int id in ids) {
-                // Hold the exact process handle and freshly verify membership
-                // before terminating. A reused PID outside our job is skipped.
-                IntPtr handle=OpenProcess(0x00101001,false,id);
-                if(handle==IntPtr.Zero) continue;
-                try {
-                    bool member;
-                    if(!IsProcessInJob(handle,job,out member)) throw new Exception("Owned job membership query failed");
-                    if(!member) continue;
-                    uint code;
-                    if(!GetExitCodeProcess(handle,out code)) throw new Exception("Owned process query failed");
-                    if(code!=259) continue;
-                    if(!TerminateProcess(handle,1)) {
-                        if(!GetExitCodeProcess(handle,out code) || code==259) throw new Exception("Owned process termination failed");
-                    } else stopped.Add(id);
-                    if(WaitForSingleObject(handle,10000)!=0) throw new Exception("Owned process did not exit");
-                } finally { CloseHandle(handle); }
-            }
-        }
-        if(JobPids(job).Length!=0) throw new Exception("Owned job still has processes after cleanup");
-        return stopped.ToArray();
-    }
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr arg);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr arg);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int pid);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int capacity);
-    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int pid);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint type);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern short VkKeyScanW(char ch);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
@@ -122,18 +57,8 @@ public static class StaleModesNative {
     [DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr memory);
     [DllImport("kernel32.dll")] public static extern bool GlobalUnlock(IntPtr memory);
     [DllImport("kernel32.dll")] public static extern IntPtr GlobalFree(IntPtr memory);
-    public static string ClassOf(IntPtr hwnd) { var s=new StringBuilder(256); GetClassNameW(hwnd,s,256); return s.ToString(); }
-    public static IntPtr Host(int pid) {
-        IntPtr found=IntPtr.Zero;
-        EnumWindows((h,a)=> { int p; GetWindowThreadProcessId(h,out p); if(p==pid && ClassOf(h)=="noctty.win32.host") found=h; return true; },IntPtr.Zero);
-        return found;
-    }
-    public static IntPtr Surface(IntPtr host) {
-        IntPtr found=IntPtr.Zero;
-        EnumChildWindows(host,(h,a)=> { if(ClassOf(h)=="noctty.win32") found=h; return true; },IntPtr.Zero);
-        return found;
-    }
-    public static void Send(IntPtr hwnd,uint msg,int value,long bits) {
+    // HiddenDesktopNative.Send, for KeyInternal (a separately compiled class cannot call it).
+    static void Send(IntPtr hwnd,uint msg,int value,long bits) {
         UIntPtr result;
         if(SendMessageTimeoutW(hwnd,msg,(UIntPtr)(uint)value,(IntPtr)bits,2,5000,out result)==IntPtr.Zero)
             throw new Exception("SendMessageTimeout failed: "+Marshal.GetLastWin32Error());
@@ -181,47 +106,6 @@ public static class StaleModesNative {
     }
 }
 '@
-}
-
-function Start-Hidden([string] $Application, [string] $Command, [string] $Directory, [string] $Desktop, [IntPtr] $OwnerJob = [IntPtr]::Zero) {
-    $si = [StaleModesNative+SI]::new()
-    $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][StaleModesNative+SI])
-    $si.desktop = $Desktop
-    $pi = [StaleModesNative+PI]::new()
-    $flags = if ($OwnerJob -ne [IntPtr]::Zero) { 0x08004004 } else { 0x08004000 }
-    if (-not [StaleModesNative]::CreateProcessW($Application, [Text.StringBuilder]::new($Command),
-            [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, [IntPtr]::Zero, $Directory, [ref]$si, [ref]$pi)) {
-        throw "CreateProcessW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-    }
-    try {
-        # Assign the suspended driver before its first instruction: every
-        # descendant inherits containment even if the worker cannot finalize.
-        if ($OwnerJob -ne [IntPtr]::Zero) {
-            if (-not [StaleModesNative]::AssignProcessToJobObject($OwnerJob, $pi.process)) {
-                [void][StaleModesNative]::TerminateProcess($pi.process, 1)
-                throw 'Assigning suspended driver to owned job failed.'
-            }
-            if ([StaleModesNative]::ResumeThread($pi.thread) -eq [uint32]::MaxValue) {
-                [void][StaleModesNative]::TerminateProcess($pi.process, 1)
-                throw 'Resuming contained driver failed.'
-            }
-        }
-    }
-    finally {
-        [void][StaleModesNative]::CloseHandle($pi.thread)
-        [void][StaleModesNative]::CloseHandle($pi.process)
-    }
-    return [Diagnostics.Process]::GetProcessById($pi.pid)
-}
-
-function Stop-Owned([Diagnostics.Process] $Process, [string] $ExpectedPath, [datetime] $StartTime) {
-    # Re-read the exact PID immediately before termination; reject PID reuse
-    # and executable changes. No name/pattern or system-wide tree kill.
-    $fresh = Get-Process -Id $Process.Id -ErrorAction SilentlyContinue
-    if (-not $fresh) { return }
-    if ($fresh.StartTime -ne $StartTime -or $fresh.Path -ne $ExpectedPath) { throw "PID identity changed: $($Process.Id)" }
-    $fresh.Kill()
-    if (-not $fresh.WaitForExit(10000)) { throw "Owned process $($fresh.Id) did not exit." }
 }
 
 if (-not $Worker) {
@@ -324,7 +208,7 @@ class Fixture {
             $desktop = [IntPtr]::Zero
             try {
                 if ($station -ne [IntPtr]::Zero -and -not [StaleModesNative]::SetProcessWindowStation($station)) { throw 'SetProcessWindowStation failed.' }
-                $desktop = [StaleModesNative]::CreateDesktopW($desktopLeaf, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
+                $desktop = [HiddenDesktopNative]::CreateDesktopW($desktopLeaf, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
                 if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktopW failed.' }
             }
             finally {
@@ -335,7 +219,7 @@ class Fixture {
             [IO.File]::WriteAllText((Join-Path $caseRoot 'desktop.txt'), $deskName)
             $driver = $null
             $driverHandle = [IntPtr]::Zero
-            $ownerJob = [StaleModesNative]::CreateJobObjectW([IntPtr]::Zero, [NullString]::Value)
+            $ownerJob = [HiddenDesktopNative]::CreateJobObjectW([IntPtr]::Zero, [NullString]::Value)
             if ($ownerJob -eq [IntPtr]::Zero) { throw 'Creating owned driver job failed.' }
             $timedOut = $false
             try {
@@ -344,7 +228,7 @@ class Fixture {
                 if ($ExerciseParentTimeout) { $command += ' -ExerciseParentTimeout' }
                 $driver = Start-Hidden $pwsh $command $caseRoot $deskName $ownerJob
                 $started = $driver.StartTime
-                $driverHandle = [StaleModesNative]::OpenProcess(0x00101000, $false, $driver.Id)
+                $driverHandle = [HiddenDesktopNative]::OpenProcess(0x00101000, $false, $driver.Id)
                 if ($driverHandle -eq [IntPtr]::Zero) { throw 'Opening driver wait/query handle failed.' }
                 $driverWaitMilliseconds = ($TimeoutSeconds * 20 + 60) * 1000
                 if ($ExerciseParentTimeout) {
@@ -366,19 +250,19 @@ class Fixture {
                 # Process.ExitCode can remain null after WaitForExit in the
                 # managed desktop harness. Read the native code as well.
                 $driverExit = [uint32]259
-                if (-not [StaleModesNative]::GetExitCodeProcess($driverHandle, [ref]$driverExit)) { throw 'GetExitCodeProcess failed.' }
+                if (-not [HiddenDesktopNative]::GetExitCodeProcess($driverHandle, [ref]$driverExit)) { throw 'GetExitCodeProcess failed.' }
                 if ($driverExit -ne 0 -or $result.status -ne 'PASS') { throw "Hidden $shell checks failed (exit $driverExit): $($result.error)" }
             }
             finally {
                 try {
-                    $stopped = @([StaleModesNative]::ReapOwnedJob($ownerJob))
-                    [pscustomobject]@{ timedOut = $timedOut; terminatedPids = $stopped; remainingPids = @([StaleModesNative]::JobPids($ownerJob)) } |
+                    $stopped = @([HiddenDesktopNative]::ReapOwnedJob($ownerJob))
+                    [pscustomobject]@{ timedOut = $timedOut; terminatedPids = $stopped; remainingPids = @([HiddenDesktopNative]::JobPids($ownerJob)) } |
                         ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $caseRoot 'cleanup.json')
                 }
                 finally {
-                    [void][StaleModesNative]::CloseHandle($ownerJob)
-                    if ($driverHandle -ne [IntPtr]::Zero) { [void][StaleModesNative]::CloseHandle($driverHandle) }
-                    [void][StaleModesNative]::CloseDesktop($desktop)
+                    [void][HiddenDesktopNative]::CloseHandle($ownerJob)
+                    if ($driverHandle -ne [IntPtr]::Zero) { [void][HiddenDesktopNative]::CloseHandle($driverHandle) }
+                    [void][HiddenDesktopNative]::CloseDesktop($desktop)
                     if ($station -ne [IntPtr]::Zero) { [void][StaleModesNative]::CloseWindowStation($station) }
                     if ((Get-Fingerprint $realStartup) -ne $startupBefore) { throw 'Real startup-attempts.json changed.' }
                     foreach ($path in $realHistories) { if ((Get-Fingerprint $path) -ne $historyBefore[$path]) { throw 'Real PSReadLine history changed.' } }
@@ -469,11 +353,11 @@ try {
     $appStart = $app.StartTime
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($hostWindow -eq [IntPtr]::Zero) {
-        $hostWindow = [StaleModesNative]::Host($app.Id)
+        $hostWindow = [HiddenDesktopNative]::Host($app.Id)
         if ($app.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'No hidden noctty host appeared.' }
         Start-Sleep -Milliseconds 50
     }
-    $surface = [StaleModesNative]::Surface($hostWindow)
+    $surface = [HiddenDesktopNative]::Surface($hostWindow)
     if ($surface -eq [IntPtr]::Zero) { throw 'No terminal surface appeared.' }
     if ($shell -eq 'pwsh') { Wait-Marker (Join-Path $RunRoot 'boot.ready') }
     Wait-Prompt
@@ -543,7 +427,7 @@ catch { $result.error = $_.Exception.Message }
 finally {
     if ($app) {
         try {
-            if (-not $app.HasExited -and $hostWindow -ne [IntPtr]::Zero) { [StaleModesNative]::Send($hostWindow, 0x10, 0, 0) }
+            if (-not $app.HasExited -and $hostWindow -ne [IntPtr]::Zero) { [HiddenDesktopNative]::Send($hostWindow, 0x10, 0, 0) }
             if (-not $app.WaitForExit(10000)) { Stop-Owned $app $runExe $appStart }
         }
         catch { $result.status = 'FAIL'; $result.error = "Cleanup: $($_.Exception.Message); earlier: $($result.error)" }

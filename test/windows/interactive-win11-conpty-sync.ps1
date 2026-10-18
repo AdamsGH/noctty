@@ -511,7 +511,7 @@ if ($Inner) {
             $Exe, $historyPath, $ExtraOptions, $integration)
     }
 
-    function Start-SyncNoctty([string] $Name, [string] $Shell, [string] $PSReadLineOptions = '', [string[]] $History = @(), [int] $Cols = 80, [int] $Rows = 22) {
+    function Start-SyncNoctty([string] $Name, [string] $Shell, [string] $PSReadLineOptions = '', [string[]] $History = @()) {
         $shellCommand = switch ($Shell) {
             'cmd' { 'cmd.exe' }
             'powershell' { Get-SyncPowerShellCommand 'powershell.exe' $Name $PSReadLineOptions $History }
@@ -527,8 +527,8 @@ if ($Inner) {
             'quit-after-last-window-closed = true'
             'auto-update = off'
             'font-size = 12'
-            "window-width = $Cols"
-            "window-height = $Rows"
+            'window-width = 80'
+            'window-height = 22'
             'working-directory = C:\'
             "command = $shellCommand"
         )
@@ -667,6 +667,21 @@ if ($Inner) {
         Wait-SyncCondition -Description 'left the alternate screen' -Condition { -not (((Read-SyncNoctty $Ctx.Surface) -join "`n").Contains('ALT SCREEN')) }
     }
 
+    # Open a split below the pane, wait for its shell, close it again, and
+    # wait for the grid to give the rows back.
+    function Invoke-SyncSplitAndClose($Ctx) {
+        $before = Read-SyncConpty $Ctx.ShellPid
+        Send-SyncBinding $Ctx 'new_split:down'
+        Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $Ctx).Count -eq 2 }
+        [void](Wait-SyncGrid $Ctx { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
+        $other = @(Get-SyncSurfaces $Ctx | Where-Object { $_ -ne $Ctx.Surface })[0]
+        Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $Ctx).Count -eq 2 }
+        Start-Sleep -Milliseconds 500
+        Send-SyncBinding $Ctx 'close_surface' $other
+        Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $Ctx).Count -eq 1 }
+        [void](Wait-SyncGrid $Ctx { param($d) $d.Rows -eq $before.Rows } 'rows back')
+    }
+
     function Get-SyncVim {
         $vim = Get-Command vim.exe -ErrorAction Ignore | Select-Object -First 1
         if ($vim) { return $vim.Source }
@@ -765,19 +780,7 @@ if ($Inner) {
             Name = 'split-cmd'; Shell = 'cmd'; Expect = 'sync'; Finding = 'F015'
             Description = 'open a split below and close it again'
             Setup = { param($c) Invoke-SyncFill $c }
-            Trigger = {
-                param($c)
-                $before = Read-SyncConpty $c.ShellPid
-                Send-SyncBinding $c 'new_split:down'
-                Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $c).Count -eq 2 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
-                $other = @(Get-SyncSurfaces $c | Where-Object { $_ -ne $c.Surface })[0]
-                Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $c).Count -eq 2 }
-                Start-Sleep -Milliseconds 500
-                Send-SyncBinding $c 'close_surface' $other
-                Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $c).Count -eq 1 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -eq $before.Rows } 'rows back')
-            }
+            Trigger = { param($c) Invoke-SyncSplitAndClose $c }
         }
         [pscustomobject]@{
             Name = 'maximize-cmd'; Shell = 'cmd'; Expect = 'sync'; Finding = 'F015'
@@ -816,19 +819,7 @@ if ($Inner) {
                 Send-SyncText $c.Surface 'Get-Help about_P'
                 Wait-SyncText $c 'about_Providers'
             }
-            Trigger = {
-                param($c)
-                $before = Read-SyncConpty $c.ShellPid
-                Send-SyncBinding $c 'new_split:down'
-                Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $c).Count -eq 2 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
-                $other = @(Get-SyncSurfaces $c | Where-Object { $_ -ne $c.Surface })[0]
-                Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $c).Count -eq 2 }
-                Start-Sleep -Milliseconds 500
-                Send-SyncBinding $c 'close_surface' $other
-                Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $c).Count -eq 1 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -eq $before.Rows } 'rows back')
-            }
+            Trigger = { param($c) Invoke-SyncSplitAndClose $c }
         }
         [pscustomobject]@{
             Name = 'listview-narrow-pwsh'; Shell = 'pwsh'; Expect = 'sync'; Finding = 'control'

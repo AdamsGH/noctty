@@ -188,7 +188,7 @@ public static class ComCliNative {
         try {
             var si=new Startup { cb=Marshal.SizeOf(typeof(Startup)),desktop=desktop,flags=1,show=(short)show };
             if(mode=="none") { si.flags|=0x100; si.input=new IntPtr(-1); si.output=new IntPtr(-1); si.error=new IntPtr(-1); }
-            if(mode!="none") {
+            else {
                 stdin=FileHandle(String.IsNullOrEmpty(input)?"NUL":input,true);
                 if(mode=="pipes" || mode=="blocked" || mode=="restricted") {
                     var sa=Inheritable(); Check(CreatePipe(out outRead,out stdout,ref sa,4096)); Check(SetHandleInformation(outRead,1,0));
@@ -291,9 +291,6 @@ public static class ComCliNative {
     }
     public static string Title(IntPtr window) { var name=new StringBuilder(1024); GetWindowTextW(window,name,1024); return name.ToString(); }
     public static uint WindowPid(IntPtr window) { uint pid; GetWindowThreadProcessId(window,out pid); return pid; }
-    public static Child WindowProcess(IntPtr window,string image) {
-        return OwnedProcess(WindowPid(window),image);
-    }
     // The window's process must also be in the launched child's job.
     public static Child WindowProcess(IntPtr window,string image,Child owner) {
         var pid=WindowPid(window); AssertOwned(owner,pid);

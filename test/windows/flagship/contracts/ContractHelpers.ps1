@@ -250,7 +250,6 @@ function Get-ZigFixtureProblems {
                 [Text.RegularExpressions.RegexOptions]::RightToLeft)
             [pscustomobject]@{
                 Name = $header.Groups['name'].Value
-                Total = [int]$header.Groups['total'].Value
                 Outcome = if ($outcome.Success) { $outcome.Groups['outcome'].Value } else { 'UNFINISHED' }
                 Detail = ($rest -split '\r?\n' | Select-Object -First 25) -join "`n"
             }
@@ -260,19 +259,16 @@ function Get-ZigFixtureProblems {
     # named ones are `<path>.test.<name>`.
     $namedTests = @($tests | Where-Object { $_.Name -notmatch '\.test_\d+$' })
     $filters = @($Fixtures | ForEach-Object { $_.Filter })
+    $matchesAnyFilter = { param([string] $Name) @($filters | Where-Object { $Name.Contains($_, [StringComparison]::Ordinal) }).Count -gt 0 }
 
     if ($tests.Count -eq 0) {
         $problems.Add('The Zig test executable listed no tests; it ran nothing or its output was not captured.')
     }
-    elseif ($tests[$tests.Count - 1].Total -ne $tests.Count -and $ExitCode -eq 0) {
-        $problems.Add("The Zig test executable announced $($tests[$tests.Count - 1].Total) tests but listed $($tests.Count).")
+    elseif ($runTotal -ne $tests.Count -and $ExitCode -eq 0) {
+        $problems.Add("The Zig test executable announced $runTotal tests but listed $($tests.Count).")
     }
     foreach ($test in $namedTests) {
-        $matchesAFilter = $false
-        foreach ($filter in $filters) {
-            if ($test.Name.Contains($filter, [StringComparison]::Ordinal)) { $matchesAFilter = $true; break }
-        }
-        if (-not $matchesAFilter) {
+        if (-not (& $matchesAnyFilter $test.Name)) {
             $problems.Add(
                 "Test '$($test.Name)' ran although it matches none of the fixture filters; the batch did not run the filtered build."
             )
@@ -307,11 +303,7 @@ function Get-ZigFixtureProblems {
     # Any failing test fails the run, including the unnamed ones no filter
     # claims and a leak, which the runner reports only through its exit code.
     if ($ExitCode -ne 0) {
-        $unattributed = @($tests | Where-Object {
-            $test = $_
-            $_.Outcome -ceq 'FAIL' -and
-                -not @($filters | Where-Object { $test.Name.Contains($_, [StringComparison]::Ordinal) }).Count
-        })
+        $unattributed = @($tests | Where-Object { $_.Outcome -ceq 'FAIL' -and -not (& $matchesAnyFilter $_.Name) })
         $unfinished = @($tests | Where-Object { $_.Outcome -ceq 'UNFINISHED' })
         $reason = if ($unattributed.Count -gt 0) {
             "failed: $($unattributed.Name -join ', ')`n$($unattributed[0].Detail)"
