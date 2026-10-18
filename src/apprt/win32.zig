@@ -45430,7 +45430,8 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
 
     // [A | (B / C)], natively and in the shell model.
     const Step = ShellProjectionSteps;
-    try Step.openWindow(&app, &host, &.{&surface_a});
+    var window = try Step.openWindow(&app, &host, &.{&surface_a});
+    defer window.deinit();
     const native_tab = &host.tabs.items[0];
     try Step.split(&app, native_tab, &surface_a, .right, &surface_b);
     try Step.split(&app, native_tab, &surface_b, .down, &surface_c);
@@ -45458,10 +45459,11 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
 /// tests drive: each mirrors what the runtime does on both sides.
 const ShellProjectionSteps = struct {
     /// A window holding one tab per view, in order, with tab ids 1, 2, ...:
-    /// the first view's tab is the one the window is created with.
-    fn openWindow(app: *App, host: *Host, views: []const *Surface) !void {
+    /// the first view's tab is the one the window is created with. The caller
+    /// deinits the returned committed window transaction.
+    fn openWindow(app: *App, host: *Host, views: []const *Surface) !win32_shell.runtime.Prepared {
         var window = try app.shell_runtime.prepare(.create_window);
-        defer window.deinit();
+        errdefer window.deinit();
         try window.commit(&app.shell_runtime);
         host.shell_id = window.created.window;
         for (views, 0..) |view, index| {
@@ -45474,6 +45476,7 @@ const ShellProjectionSteps = struct {
             tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
             try host.tabs.append(std.testing.allocator, tab);
         }
+        return window;
     }
 
     fn split(app: *App, tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
@@ -45568,7 +45571,8 @@ test "win32 shell and native projections agree over split, move, close and resto
     });
     defer session.deinit();
     const Step = ShellProjectionSteps;
-    try Step.openWindow(&app, &host, &.{&surface_a});
+    var window = try Step.openWindow(&app, &host, &.{&surface_a});
+    defer window.deinit();
 
     // Split: [A | (B / C)], the user in B. A second tab, [D], in front.
     try Step.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
@@ -45683,7 +45687,8 @@ test "win32 a restored tab has the saved shape in the shell model, so closing a 
     const host_hwnd = try createTestHostWindow();
     defer _ = sys.DestroyWindow(host_hwnd);
     host.hwnd = host_hwnd;
-    try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_x});
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_x});
+    defer window.deinit();
 
     // What `Surface.init` does for each restored pane, natively and in the
     // shell model: a new tab, or a split at the pane it is cloned from.
@@ -45778,7 +45783,8 @@ test "win32 the shell/native cross-check compares split topology" {
     });
     defer session.deinit();
 
-    try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_a});
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_a});
+    defer window.deinit();
     try ShellProjectionSteps.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
     try app.validateShellNativeMapping();
 
@@ -45822,7 +45828,8 @@ test "win32 a background tab's exit keeps the active tab" {
     defer session.deinit();
 
     // Tabs [A, B, C] with B active, natively and in the shell model.
-    try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c });
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c });
+    defer window.deinit();
     host.active_tab = 1;
     _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
     try app.validateShellNativeMapping();
@@ -45861,7 +45868,8 @@ test "win32 undoing then redoing an in-place tab close leaves the same tab in fr
     defer session.deinit();
 
     // Tabs [A, B, C, D] with C active, natively and in the shell model.
-    try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c, &surface_d });
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c, &surface_d });
+    defer window.deinit();
     host.active_tab = 2;
     _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
     try app.validateShellNativeMapping();
@@ -47248,6 +47256,39 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
     // Maximizing shows a window, so these live on a desktop of their own and
     // never reach the user's.
     try runOnHiddenDesktop(struct {
+        fn window(app: *App, origin: i32) !Surface {
+            var surface: Surface = undefined;
+            surface.app = app;
+            surface.host = null;
+            surface.hwnd = sys.CreateWindowExW(
+                0,
+                prompt_label_class,
+                std.unicode.utf8ToUtf16LeStringLiteral(""),
+                WS_OVERLAPPEDWINDOW,
+                origin,
+                origin,
+                640,
+                480,
+                null,
+                null,
+                sys.GetModuleHandleW(null),
+                null,
+            ) orelse return lastError();
+            surface.decorations_visible = true;
+            surface.fullscreen = false;
+            surface.topmost = false;
+            surface.background_opacity_default = 1.0;
+            surface.background_opacity_force_opaque = false;
+            return surface;
+        }
+
+        fn normalRect(hwnd: HWND) !RECT {
+            var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            placement.length = @sizeOf(WINDOWPLACEMENT);
+            if (sys.GetWindowPlacement(hwnd, &placement) == 0) return lastError();
+            return placement.rcNormalPosition;
+        }
+
         const Monitors = struct {
             handles: [8]sys.HMONITOR = undefined,
             count: usize = 0,
@@ -47264,14 +47305,14 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
             var app = placementTestApp();
-            var surface = try placementTestSurface(&app, 100, 100);
+            var surface = try window(&app, 100);
             const hwnd = surface.hwnd.?;
             defer _ = sys.DestroyWindow(hwnd);
 
             _ = sys.ShowWindow(hwnd, c.SW_SHOW);
             var normal_rect: RECT = undefined;
             try std.testing.expect(sys.GetWindowRect(hwnd, &normal_rect) != 0);
-            const normal = try testNormalRect(hwnd);
+            const normal = try normalRect(hwnd);
 
             // Before the fix, the maximized rect became the normal one.
             for ([_]bool{ false, true }) |maximized| {
@@ -47285,7 +47326,7 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                 var rect: RECT = undefined;
                 try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
                 try std.testing.expectEqualDeep(before, rect);
-                try std.testing.expectEqualDeep(normal, try testNormalRect(hwnd));
+                try std.testing.expectEqualDeep(normal, try normalRect(hwnd));
                 if (maximized) _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
                 try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
                 try std.testing.expectEqualDeep(normal_rect, rect);
@@ -47293,12 +47334,12 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
 
             // new_window from a maximized window, into a window created
             // elsewhere, so it has to take the source's normal rect.
-            var clone = try placementTestSurface(&app, 200, 200);
+            var clone = try window(&app, 200);
             defer _ = sys.DestroyWindow(clone.hwnd.?);
             _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
             try clone.inheritWindowStateFrom(&surface);
             try std.testing.expect(sys.IsZoomed(clone.hwnd.?) != 0);
-            try std.testing.expectEqualDeep(normal, try testNormalRect(clone.hwnd.?));
+            try std.testing.expectEqualDeep(normal, try normalRect(clone.hwnd.?));
 
             // Exercise real monitor/DPI transitions on this hidden desktop.
             var monitors: Monitors = .{};
@@ -47327,7 +47368,7 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                             const expected_left = @max(dest_info.work_area.left, @min(before.left + dest_info.work_area.left - source_info.work_area.left, dest_info.work_area.right - width));
                             const expected_top = @max(dest_info.work_area.top, @min(before.top + dest_info.work_area.top - source_info.work_area.top, dest_info.work_area.bottom - height));
                             if (maximized) {
-                                const placed = try testNormalRect(hwnd);
+                                const placed = try normalRect(hwnd);
                                 try std.testing.expectEqual(expected_left - (dest_info.work_area.left - dest_info.full_rect.left), placed.left);
                                 try std.testing.expectEqual(expected_top - (dest_info.work_area.top - dest_info.full_rect.top), placed.top);
                                 try std.testing.expectEqual(width, placed.right - placed.left);
@@ -47358,14 +47399,6 @@ fn placementTestApp() App {
     app.config = .{};
     app.hosts = .empty;
     return app;
-}
-
-/// The rect `hwnd` goes back to when it is restored.
-fn testNormalRect(hwnd: HWND) !RECT {
-    var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
-    placement.length = @sizeOf(WINDOWPLACEMENT);
-    try std.testing.expect(sys.GetWindowPlacement(hwnd, &placement) != 0);
-    return placement.rcNormalPosition;
 }
 
 /// A hostless surface whose top-level window sits at (`left`, `top`) and is
@@ -47494,14 +47527,19 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
 
             // A source minimized from maximized restores to maximized, so
             // the new window is maximized, with the source's normal rect.
-            const normal = try testNormalRect(source_hwnd);
+            var normal_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            normal_placement.length = @sizeOf(WINDOWPLACEMENT);
+            try std.testing.expect(sys.GetWindowPlacement(source_hwnd, &normal_placement) != 0);
             _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
             _ = sys.ShowWindow(source_hwnd, c.SW_SHOWMINNOACTIVE);
             try std.testing.expect(sys.IsIconic(source_hwnd) != 0);
             try clone.inheritWindowStateFrom(&source);
             try std.testing.expect(sys.IsIconic(clone_hwnd) == 0);
             try std.testing.expect(sys.IsZoomed(clone_hwnd) != 0);
-            try std.testing.expectEqualDeep(normal, try testNormalRect(clone_hwnd));
+            var clone_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+            clone_placement.length = @sizeOf(WINDOWPLACEMENT);
+            try std.testing.expect(sys.GetWindowPlacement(clone_hwnd, &clone_placement) != 0);
+            try std.testing.expectEqualDeep(normal_placement.rcNormalPosition, clone_placement.rcNormalPosition);
         }
     }.body);
 }
@@ -47923,10 +47961,24 @@ test "win32 host content rect keeps its size while the window is minimized" {
 test "win32 new host starts with the client area its first frame change keeps" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    var fixture: SafeModeAppFixture = .{};
-    try fixture.init();
-    defer fixture.deinit();
-    const app = &fixture.app;
+    const alloc = std.testing.allocator;
+
+    var core = try CoreApp.create(alloc);
+    defer core.destroy();
+    var app: App = undefined;
+    // Safe mode starts from the default config rather than the developer's
+    // own, whose tab bar or decoration settings could turn the integrated
+    // titlebar off.
+    try app.init(core, .{ .safe_mode = true });
+    const hinstance = app.hinstance;
+    defer {
+        app.terminate();
+        // `createHost` registers these and nothing unregisters them, so a
+        // later test could not create a host of its own.
+        _ = sys.UnregisterClassW(host_class_name, hinstance);
+        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+    }
     // The Windows 11 caption row lives inside the client area. Force it on so
     // an older test machine takes the same path.
     app.use_integrated_titlebar = true;
