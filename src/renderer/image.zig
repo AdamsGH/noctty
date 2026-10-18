@@ -53,8 +53,6 @@ pub const PendingImage = struct {
     };
 };
 
-const CpuPending = PendingImage;
-
 /// Image resources belong to the graphics API that owns their renderer.
 pub fn ForAPI(comptime GraphicsAPI: type) type {
     return struct {
@@ -786,7 +784,7 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
             };
 
             /// Pending image data that needs to be uploaded to the GPU.
-            pub const Pending = CpuPending;
+            pub const Pending = PendingImage;
 
             pub fn deinit(self: Image, alloc: Allocator) void {
                 switch (self) {

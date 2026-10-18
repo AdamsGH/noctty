@@ -788,6 +788,13 @@ fn drawFrame(self: *Thread, now: bool) void {
     _ = self.drawFrameWithReservation(now, false);
 }
 
+/// Release a repaint reservation no paint will complete.
+fn cancelRepaintReservation(self: *Thread) void {
+    if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
+        self.surface.cancelRendererRepaintRequest();
+    }
+}
+
 /// Returns whether a paint was queued (or, off the app thread, drawn).
 fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) bool {
     // A caller-held reservation must be released on every path that does not
@@ -796,11 +803,7 @@ fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) bo
     // is never finished and the pane stops updating until a resize-settle or
     // health recovery cancels it.
     var reservation_held = repaint_reserved;
-    defer if (reservation_held) {
-        if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
-            self.surface.cancelRendererRepaintRequest();
-        }
-    };
+    defer if (reservation_held) self.cancelRepaintReservation();
 
     const interval_ms = self.minimumPresentIntervalMs() orelse return false;
 
@@ -831,9 +834,7 @@ fn drawFrameWithReservation(self: *Thread, now: bool, repaint_reserved: bool) bo
             .{ .redraw_surface = self.surface },
             .{ .instant = {} },
         ) == 0) {
-            if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
-                self.surface.cancelRendererRepaintRequest();
-            }
+            self.cancelRepaintReservation();
             return false;
         }
         self.notePresentRequest(interval_ms);
@@ -1002,11 +1003,7 @@ fn renderOnce(self: *Thread, pass: RenderPass) bool {
     const held = if (frame_update) |update| update.synchronized_output else false;
     if (held) self.frame_update_deferred = true;
     if (held and !self.held_frame.presents(pass, self.draw_active)) {
-        if (repaint_reserved) {
-            if (comptime @hasDecl(apprt.Surface, "cancelRendererRepaintRequest")) {
-                self.surface.cancelRendererRepaintRequest();
-            }
-        }
+        if (repaint_reserved) self.cancelRepaintReservation();
         return true;
     }
 

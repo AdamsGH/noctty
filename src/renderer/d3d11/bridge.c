@@ -75,6 +75,9 @@ struct NocttyD3D {
 };
 
 #if NOCTTY_RENDERER_TEST_TOOLS
+/* readback.c: swaps RGBA to BGRA in place, saves NOCTTY_RENDERER_CAPTURE_PATH
+ * and draws into dc; nonzero when either succeeded. */
+int noctty_renderer_blit(void *dc, unsigned char *rgba, uint32_t w, uint32_t h, int bottom_up);
 static uint64_t elapsed_ns(NocttyD3D *d, LARGE_INTEGER start, LARGE_INTEGER end) {
     return (uint64_t)((end.QuadPart - start.QuadPart) * 1000000000.0 / d->frequency.QuadPart);
 }
@@ -99,6 +102,12 @@ static int device_lost(HRESULT hr) {
     return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
         hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
 }
+/* Recovery rebuilds every GPU resource, so no target holds a presentable frame. */
+static void mark_recovery_pending(NocttyD3D *d) {
+    d->stats.recovery_pending = 1;
+    d->last_rendered = NULL;
+    for (NocttyD3DTarget *t = d->targets; t; t = t->next) t->rendered = 0;
+}
 /* Resource allocations, resize, Present and Map all route failures here. Void
  * context calls are checked at frame boundaries via GetDeviceRemovedReason. */
 static HRESULT record_result(NocttyD3D *d, HRESULT hr) {
@@ -107,9 +116,7 @@ static HRESULT record_result(NocttyD3D *d, HRESULT hr) {
     d->stats.last_error = hr;
     if (device_lost(hr) || FAILED(reason)) {
         d->stats.removed_reason = FAILED(reason) ? reason : hr;
-        d->stats.recovery_pending = 1;
-        d->last_rendered = NULL;
-        for (NocttyD3DTarget *t = d->targets; t; t = t->next) t->rendered = 0;
+        mark_recovery_pending(d);
     } else if (hr == E_INVALIDARG || hr == DXGI_ERROR_INVALID_CALL) {
         // Bridge contract errors are not device loss or a WARP retry trigger.
         fprintf(stderr, "d3d11 contract failure hr=0x%08lx\n", (unsigned long)hr);
@@ -117,9 +124,7 @@ static HRESULT record_result(NocttyD3D *d, HRESULT hr) {
         /* A hardware allocation/Present failure can still succeed on WARP.
          * It gets one bounded software reconstruction before OpenGL. */
         d->hardware_retry_after_ms = GetTickCount64() + 60000;
-        d->stats.recovery_pending = 1;
-        d->last_rendered = NULL;
-        for (NocttyD3DTarget *t = d->targets; t; t = t->next) t->rendered = 0;
+        mark_recovery_pending(d);
     } else {
         d->stats.unavailable = 1;
     }
@@ -132,6 +137,11 @@ static HRESULT device_status(NocttyD3D *d) {
     HRESULT hr = ID3D11Device_GetDeviceRemovedReason(d->device);
     if (SUCCEEDED(hr) && d->composition) hr = noctty_composition_check_state(d->composition);
     return record_result(d, hr);
+}
+/* A pending recovery recreates GPU resources from their CPU copies, so a
+ * failure now is not final. An unavailable device never recovers. */
+static int recovery_will_rebuild(const NocttyD3D *d) {
+    return d->stats.recovery_pending && !d->stats.unavailable;
 }
 static HRESULT buffer_gpu(NocttyD3DBuffer *b) {
     if (!b->owner->device) return E_FAIL;
@@ -347,29 +357,26 @@ static HRESULT resize_swapchain(NocttyD3D *d, uint32_t width, uint32_t height) {
     return hr;
 }
 
+/* Keep a failed candidate's diagnosis, then release everything it made. */
+static void discard_candidate(NocttyD3D *d, HRESULT hr) {
+    d->stats.last_error = hr;
+    if (d->device) {
+        HRESULT reason = ID3D11Device_GetDeviceRemovedReason(d->device);
+        if (FAILED(reason)) d->stats.removed_reason = reason;
+    }
+    release_device(d);
+}
 /* Each candidate owns every resource or none. Hardware recovery has a bounded
  * retry window; an explicit software preference never probes hardware. */
 static HRESULT create_candidates(NocttyD3D *d, uint32_t try_hardware) {
-    HRESULT hr = E_FAIL;
+    HRESULT hr;
     if (try_hardware) {
         hr = create_device(d, 0);
         if (SUCCEEDED(hr)) return hr;
-        d->stats.last_error = hr;
-        if (d->device) {
-            HRESULT reason = ID3D11Device_GetDeviceRemovedReason(d->device);
-            if (FAILED(reason)) d->stats.removed_reason = reason;
-        }
-        release_device(d);
+        discard_candidate(d, hr);
     }
     hr = create_device(d, 1);
-    if (FAILED(hr)) {
-        d->stats.last_error = hr;
-        if (d->device) {
-            HRESULT reason = ID3D11Device_GetDeviceRemovedReason(d->device);
-            if (FAILED(reason)) d->stats.removed_reason = reason;
-        }
-        release_device(d);
-    }
+    if (FAILED(hr)) discard_candidate(d, hr);
     return hr;
 }
 NocttyD3D *noctty_d3d11_create(void *hwnd, uint32_t force_warp) {
@@ -606,71 +613,32 @@ static HRESULT readback(NocttyD3D *d, unsigned char **pixels, uint32_t *width, u
     memset(&mapped, 0, sizeof(mapped));
     hr = ID3D11DeviceContext_Map(d->context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) { RELEASE(staging); return record_result(d, hr); }
+    /* Tightly packed RGBA rows, top row first. */
     size_t row_size = (size_t)desc.Width * 4;
-    unsigned char *bgra = (unsigned char *)malloc(row_size * desc.Height);
-    if (!bgra) {
+    unsigned char *rgba = (unsigned char *)malloc(row_size * desc.Height);
+    if (!rgba) {
         ID3D11DeviceContext_Unmap(d->context, (ID3D11Resource *)staging, 0);
         RELEASE(staging);
         return E_OUTOFMEMORY;
     }
     for (UINT y = 0; y < desc.Height; ++y) {
-        const unsigned char *source = (const unsigned char *)mapped.pData + (size_t)y * mapped.RowPitch;
-        unsigned char *dest = bgra + (size_t)y * row_size;
-        for (UINT x = 0; x < desc.Width; ++x) {
-            dest[x * 4 + 0] = source[x * 4 + 2];
-            dest[x * 4 + 1] = source[x * 4 + 1];
-            dest[x * 4 + 2] = source[x * 4 + 0];
-            dest[x * 4 + 3] = 255;
-        }
+        memcpy(rgba + (size_t)y * row_size, (const unsigned char *)mapped.pData + (size_t)y * mapped.RowPitch, row_size);
     }
     ID3D11DeviceContext_Unmap(d->context, (ID3D11Resource *)staging, 0);
     RELEASE(staging);
-    *pixels = bgra; *width = desc.Width; *height = desc.Height;
+    *pixels = rgba; *width = desc.Width; *height = desc.Height;
     return S_OK;
-}
-static HRESULT save_bmp(const uint16_t *path, const unsigned char *pixels, uint32_t width, uint32_t height) {
-    if (!path || !*path) return E_INVALIDARG;
-    BITMAPFILEHEADER file;
-    BITMAPINFOHEADER image;
-    memset(&file, 0, sizeof(file)); memset(&image, 0, sizeof(image));
-    image.biSize = sizeof(image); image.biWidth = (LONG)width; image.biHeight = -(LONG)height;
-    image.biPlanes = 1; image.biBitCount = 32; image.biCompression = BI_RGB;
-    image.biSizeImage = width * height * 4;
-    file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(image);
-    file.bfSize = file.bfOffBits + image.biSizeImage;
-    HANDLE handle = CreateFileW((const WCHAR *)path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
-    DWORD written;
-    HRESULT hr = S_OK;
-    if (!WriteFile(handle, &file, sizeof(file), &written, NULL) || written != sizeof(file) ||
-        !WriteFile(handle, &image, sizeof(image), &written, NULL) || written != sizeof(image) ||
-        !WriteFile(handle, pixels, image.biSizeImage, &written, NULL) || written != image.biSizeImage) hr = E_FAIL;
-    CloseHandle(handle);
-    return hr;
 }
 #endif
 int32_t noctty_d3d11_capture(NocttyD3D *d, void *hdc) {
 #if NOCTTY_RENDERER_TEST_TOOLS
-    unsigned char *bgra = NULL;
+    unsigned char *rgba = NULL;
     uint32_t width, height;
-    HRESULT hr = readback(d, &bgra, &width, &height);
+    HRESULT hr = readback(d, &rgba, &width, &height);
     if (FAILED(hr)) return hr;
-    BITMAPINFO info;
-    memset(&info, 0, sizeof(info));
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = (LONG)width;
-    info.bmiHeader.biHeight = -(LONG)height;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    WCHAR path[32768];
-    DWORD count = GetEnvironmentVariableW(L"NOCTTY_RENDERER_CAPTURE_PATH", path, ARRAYSIZE(path));
-    HRESULT saved = count && count < ARRAYSIZE(path) ? save_bmp((const uint16_t *)path, bgra, width, height) : E_FAIL;
-    int rows = hdc ? StretchDIBits((HDC)hdc, 0, 0, (int)width, (int)height,
-        0, 0, (int)width, (int)height, bgra, &info, DIB_RGB_COLORS, SRCCOPY) : 0;
-    free(bgra);
-    return SUCCEEDED(saved) || (rows != 0 && rows != GDI_ERROR) ? S_OK : E_FAIL;
+    int captured = noctty_renderer_blit(hdc, rgba, width, height, 0);
+    free(rgba);
+    return captured ? S_OK : E_FAIL;
 #else
     (void)d; (void)hdc;
     return E_NOTIMPL;
@@ -705,7 +673,7 @@ int32_t noctty_d3d11_buffer_reserve(NocttyD3DBuffer *b, size_t size) {
     b->cpu = cpu; b->size = size;
     HRESULT hr = device_status(b->owner);
     if (SUCCEEDED(hr)) hr = record_result(b->owner, buffer_gpu(b));
-    if (FAILED(hr) && (!b->owner->stats.recovery_pending || b->owner->stats.unavailable)) {
+    if (FAILED(hr) && !recovery_will_rebuild(b->owner)) {
         free(cpu); b->cpu = old_cpu; b->size = old_size; return hr;
     }
     /* Keep the enlarged CPU copy during loss. Recovery creates the GPU buffer
@@ -720,7 +688,7 @@ int32_t noctty_d3d11_buffer_write(NocttyD3DBuffer *b, size_t offset, const void 
     // A failed device recreation must still retain subsequent CPU preparation;
     // begin() retries recovery before anything is drawn with these resources.
     HRESULT hr = device_status(b->owner);
-    if (FAILED(hr)) return b->owner->stats.recovery_pending && !b->owner->stats.unavailable ? S_OK : hr;
+    if (FAILED(hr)) return recovery_will_rebuild(b->owner) ? S_OK : hr;
     if (!b->owner->context || !b->gpu) return record_result(b->owner, E_FAIL);
     if (b->uniform) {
         ID3D11DeviceContext_UpdateSubresource(b->owner->context, (ID3D11Resource *)b->gpu, 0, NULL, b->cpu, 0, 0);
@@ -739,16 +707,18 @@ NocttyD3DTexture *noctty_d3d11_texture_create(NocttyD3D *d, uint32_t width, uint
     if (!t) { (void)record_result(d, E_OUTOFMEMORY); return NULL; }
     t->owner = d; t->width = width; t->height = height;
     t->pixel_size = format == 0 ? 1 : 4;
-    t->format = format == 0 ? DXGI_FORMAT_R8_UNORM : format == 1
-        ? (srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM)
-        : (srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM);
+    switch (format) {
+    case 0: t->format = DXGI_FORMAT_R8_UNORM; break;
+    case 1: t->format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    default: t->format = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM; break;
+    }
     size_t bytes = (size_t)width * height * t->pixel_size;
     t->cpu = (unsigned char *)calloc(1, bytes);
     if (!t->cpu) { free(t); (void)record_result(d, E_OUTOFMEMORY); return NULL; }
     if (data) memcpy(t->cpu, data, bytes);
     HRESULT hr = device_status(d);
     if (SUCCEEDED(hr)) hr = record_result(d, texture_gpu(t));
-    if (FAILED(hr) && (!d->stats.recovery_pending || d->stats.unavailable)) { RELEASE(t->srv); RELEASE(t->gpu); free(t->cpu); free(t); return NULL; }
+    if (FAILED(hr) && !recovery_will_rebuild(d)) { RELEASE(t->srv); RELEASE(t->gpu); free(t->cpu); free(t); return NULL; }
     t->next = d->textures; d->textures = t;
     d->stats.upload_bytes += data ? bytes : 0;
     return t;
@@ -765,7 +735,7 @@ int32_t noctty_d3d11_texture_write(NocttyD3DTexture *t, uint32_t x, uint32_t y, 
     size_t pitch = (size_t)width * t->pixel_size;
     for (uint32_t row = 0; row < height; ++row) memcpy(t->cpu + ((size_t)(y + row) * t->width + x) * t->pixel_size, (const unsigned char *)data + row * pitch, pitch);
     HRESULT hr = device_status(t->owner);
-    if (FAILED(hr)) return t->owner->stats.recovery_pending && !t->owner->stats.unavailable ? S_OK : hr;
+    if (FAILED(hr)) return recovery_will_rebuild(t->owner) ? S_OK : hr;
     if (!t->owner->context || !t->gpu) return record_result(t->owner, E_FAIL);
     D3D11_BOX box = { x, y, 0, x + width, y + height, 1 };
     /* Upload from the mirror recovery rebuilds from, as buffer writes do. */
@@ -783,7 +753,7 @@ NocttyD3DTarget *noctty_d3d11_target_create(NocttyD3D *d, uint32_t width, uint32
     t->owner = d; t->width = width; t->height = height; t->linear = linear;
     HRESULT hr = device_status(d);
     if (SUCCEEDED(hr)) hr = record_result(d, target_gpu(t));
-    if (FAILED(hr) && (!d->stats.recovery_pending || d->stats.unavailable)) { RELEASE(t->rtv); RELEASE(t->gpu); free(t); return NULL; }
+    if (FAILED(hr) && !recovery_will_rebuild(d)) { RELEASE(t->rtv); RELEASE(t->gpu); free(t); return NULL; }
     t->next = d->targets; d->targets = t;
     return t;
 }
