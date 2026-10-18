@@ -26,6 +26,7 @@ param(
     [string] $ExpectedStartupModified
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'hidden-win11-local-lib.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -35,21 +36,10 @@ public static class Sr {
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
     public class State { public Rect Rect; public uint Dpi; public bool Visible,Iconic,Zoomed; }
     [StructLayout(LayoutKind.Sequential)] struct MonInfo { public int cb; public Rect monitor, work; public uint flags; }
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct Startup {
-        public int cb; public string reserved,desktop,title;
-        public int x,y,cx,cy,charsX,charsY,fill,flags; public short show,reservedBytes;
-        public IntPtr reservedPointer,input,output,error;
-    }
-    [StructLayout(LayoutKind.Sequential)] public struct ProcessInfo { public IntPtr process,thread; public int pid,tid; }
-    public delegate bool EnumWindow(IntPtr h, IntPtr p);
     delegate bool EnumMonitor(IntPtr m, IntPtr dc, ref Rect r, IntPtr p);
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow cb, IntPtr p);
-    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumWindow cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, EnumMonitor cb, IntPtr p);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MonInfo info);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out Rect r);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
@@ -60,68 +50,6 @@ public static class Sr {
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int ht,uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int show);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr dev,IntPtr mode,int flags,uint access,IntPtr sa);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
-    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
-    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h,uint ms);
-    [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h,out uint code);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr a,string name);
-    [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job,int type,ref JobLimits limits,uint size);
-    [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
-    [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process,uint code);
-    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job,uint code);
-    [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job,int type,out JobAccounting accounting,uint size,IntPtr returned);
-    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
-        public long userTime,kernelTime,periodUserTime,periodKernelTime;
-        public uint pageFaults,totalProcesses,activeProcesses,terminatedProcesses;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
-        public long processTime,jobTime; public uint flags;
-        public UIntPtr minWorking,maxWorking; public uint activeProcesses;
-        public UIntPtr affinity; public uint priority,scheduling;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong readOps,writeOps,otherOps,readBytes,writeBytes,otherBytes; }
-    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
-        public BasicLimits basic; public IoCounters io;
-        public UIntPtr processMemory,jobMemory,peakProcessMemory,peakJobMemory;
-    }
-    public static IntPtr CreateOwnedJob() {
-        var job=CreateJobObjectW(IntPtr.Zero,null);
-        if(job==IntPtr.Zero) throw new Exception("CreateJobObject failed");
-        var limits=new JobLimits(); limits.basic.flags=0x2000; // KILL_ON_JOB_CLOSE
-        if(!SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf<JobLimits>())) {
-            CloseHandle(job); throw new Exception("SetInformationJobObject failed");
-        }
-        return job;
-    }
-    public static uint StopOwnedJob(IntPtr job) {
-        try {
-            if(!TerminateJobObject(job,1)) throw new Exception("Terminate owned job failed");
-            var deadline=DateTime.UtcNow.AddSeconds(5);
-            do {
-                JobAccounting accounting;
-                if(!QueryInformationJobObject(job,1,out accounting,(uint)Marshal.SizeOf<JobAccounting>(),IntPtr.Zero))
-                    throw new Exception("Query owned job failed");
-                if(accounting.activeProcesses==0) return accounting.totalProcesses;
-                System.Threading.Thread.Sleep(10);
-            } while(DateTime.UtcNow<deadline);
-            throw new Exception("Owned job cleanup exceeded five seconds");
-        } finally { CloseHandle(job); }
-    }
-    static string Class(IntPtr h) { var s=new StringBuilder(128); GetClassNameW(h,s,128); return s.ToString(); }
-    public static IntPtr[] Hosts(int pid) {
-        var list=new List<IntPtr>(); EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id);
-            if(id==pid && Class(h)=="noctty.win32.host") list.Add(h); return true;
-        },IntPtr.Zero); return list.ToArray();
-    }
-    public static IntPtr[] Surfaces(IntPtr host) {
-        var list=new List<IntPtr>();
-        EnumChildWindows(host,(c,p)=> { if(Class(c)=="noctty.win32") list.Add(c); return true; },IntPtr.Zero);
-        return list.ToArray();
-    }
     public static bool Alive(IntPtr h) { return IsWindow(h); }
     public static Rect PrimaryWork() {
         Rect r; if(!SystemParametersInfoW(0x30,0,out r,0)) throw new Exception("SPI_GETWORKAREA failed"); return r;
@@ -151,83 +79,44 @@ public static class Sr {
         try { if(!SetWindowPos(h,IntPtr.Zero,x,y,w,ht,0x14)) throw new Exception("SetWindowPos failed"); }
         finally { SetThreadDpiAwarenessContext(old); }
     }
-    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint tid);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformationW(IntPtr h,int index,StringBuilder value,int length,out int needed);
-    // The name of the desktop of the thread that owns `h`.
-    public static string WindowDesktop(IntPtr h) {
-        int pid; int tid=GetWindowThreadProcessId(h,out pid); var name=new StringBuilder(256); int needed;
-        if(tid==0 || !GetUserObjectInformationW(GetThreadDesktop((uint)tid),2,name,512,out needed)) throw new Exception("Window desktop query failed");
-        return name.ToString();
-    }
-    // Starts a process on the named desktop, with no console window.
-    public static ProcessInfo Spawn(string app,string command,string cwd,string desktop) {
-        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
-        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000000,IntPtr.Zero,cwd,ref si,out pi))
-            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
-        return pi;
-    }
-    public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job) {
-        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
-        // Assign the suspended driver before it can spawn children. The job
-        // owns only this launch and its descendants, including terminal shells.
-        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08004004,IntPtr.Zero,cwd,ref si,out pi))
-            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
-        if(!AssignProcessToJobObject(job,pi.process)||ResumeThread(pi.thread)==0xFFFFFFFF) {
-            TerminateProcess(pi.process,1); CloseHandle(pi.thread); CloseHandle(pi.process);
-            throw new Exception("Assign/resume owned driver failed");
-        }
-        return pi;
-    }
 }
 '@
-function Startup-Fingerprint {
-    $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
-    if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
-    return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
-}
-function Copy-Portable([string] $Source, [string] $Destination) {
-    [void](New-Item -ItemType Directory -Path $Destination)
-    Get-ChildItem -LiteralPath $Source -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $Destination }
-    $share = Join-Path (Split-Path -Parent $Source) 'share'
-    if (Test-Path -LiteralPath $share) { Copy-Item -LiteralPath $share -Destination (Join-Path (Split-Path -Parent $Destination) 'share') -Recurse }
-    Set-Content -LiteralPath (Join-Path $Destination 'noctty.portable') -Value '' -NoNewline
-}
 if (-not $Driver) {
     $Bin = (Resolve-Path -LiteralPath $Bin).Path
     $Run = [IO.Path]::GetFullPath($Run)
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Source Bin must contain noctty.exe.' }
     $before = Startup-Fingerprint
-    $clipboardBefore = [Sr]::GetClipboardSequenceNumber()
+    $clipboardBefore = [HiddenLocal]::GetClipboardSequenceNumber()
     if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
     [void](New-Item -ItemType Directory -Path $Run)
     Copy-Portable $Bin (Join-Path $Run 'source\bin')
     foreach ($name in @('localappdata','appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
     $desktopName = 'noctty-sr-' + [guid]::NewGuid().ToString('N')
-    $desktop = [Sr]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
+    $desktop = [HiddenLocal]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
     if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktop failed.' }
     $oldLocal=$env:LOCALAPPDATA; $oldRoaming=$env:APPDATA
     $pi=$null; $job=[IntPtr]::Zero
     try {
-        $job=[Sr]::CreateOwnedJob()
+        $job=[HiddenLocal]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
         $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName
-        $pi=[Sr]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
+        $pi=[HiddenLocal]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
-        while ([Sr]::WaitForSingleObject($pi.process,1000) -eq 258) {
+        while ([HiddenLocal]::WaitForSingleObject($pi.process,1000) -eq 258) {
             if([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $DriverTimeoutSeconds seconds; owned process job will be closed." }
         }
-        [uint32]$code=0; [void][Sr]::GetExitCodeProcess($pi.process,[ref]$code)
+        [uint32]$code=0; [void][HiddenLocal]::GetExitCodeProcess($pi.process,[ref]$code)
     } finally {
         $env:LOCALAPPDATA=$oldLocal; $env:APPDATA=$oldRoaming
         $cleanupError=$null; $ownedProcessCount=0
-        if($job -ne [IntPtr]::Zero) { try { $ownedProcessCount=[Sr]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
-        if($pi) { [void][Sr]::CloseHandle($pi.thread); [void][Sr]::CloseHandle($pi.process) }
-        [void][Sr]::CloseDesktop($desktop)
+        if($job -ne [IntPtr]::Zero) { try { $ownedProcessCount=[HiddenLocal]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
+        if($pi) { [void][HiddenLocal]::CloseHandle($pi.thread); [void][HiddenLocal]::CloseHandle($pi.process) }
+        [void][HiddenLocal]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
-        $clipboardAfter=[Sr]::GetClipboardSequenceNumber()
+        $clipboardAfter=[HiddenLocal]::GetClipboardSequenceNumber()
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
         @{ Before=$before; After=$after; Unchanged=$unchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
         if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
@@ -244,19 +133,11 @@ if (-not $Driver) {
 $script:checks=[Collections.Generic.List[object]]::new()
 $script:samples=[Collections.Generic.List[object]]::new()
 $script:processes=[Collections.Generic.List[object]]::new()
-function Check([string]$Name,[bool]$Passed,$Expected,$Actual) {
-    $script:checks.Add(@{ Name=$Name; Passed=$Passed; Expected=$Expected; Actual=$Actual })
-}
-function Rect-Array($r) { return @($r.Left,$r.Top,$r.Right,$r.Bottom) }
-function Rect-Same($a,$b,[int]$Tolerance=2) {
-    return [Math]::Abs($a.Left-$b.Left) -le $Tolerance -and [Math]::Abs($a.Top-$b.Top) -le $Tolerance -and [Math]::Abs($a.Right-$b.Right) -le $Tolerance -and [Math]::Abs($a.Bottom-$b.Bottom) -le $Tolerance
-}
 function Inside-AWork($r,$works) {
     foreach($w in $works) { if($r.Left -ge $w.Left -and $r.Top -ge $w.Top -and $r.Right -le $w.Right -and $r.Bottom -le $w.Bottom) { return $true } }
     return $false
 }
 function Sample([string]$Name,$h) { $s=[Sr]::Read($h); $script:samples.Add(@{Name=$Name; State=$s}); return $s }
-function Hash-Of([string]$Path) { if(Test-Path -LiteralPath $Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() } return $null }
 function Siblings([string]$Dir,[string]$Pattern) { return @(Get-ChildItem -LiteralPath $Dir -Filter $Pattern -File -ErrorAction SilentlyContinue | ForEach-Object Name) }
 
 # A sample session this script writes itself: one window of one tab and one
@@ -292,15 +173,15 @@ function Start-Case($case,[switch]$NoLedgerWait) {
     # An explicit lpDesktop: a child that a private-desktop driver starts with a null desktop can
     # land on the interactive desktop. The Process object holds its own handle before the launch
     # handles close, so it stays this launch's process.
-    $pi=[Sr]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$case.Config),$case.Dir,"WinSta0\$DesktopName")
+    $pi=[HiddenLocal]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$case.Config),$case.Dir,"WinSta0\$DesktopName")
     try { $p=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$p.Handle }
-    finally { [void][Sr]::CloseHandle($pi.thread); [void][Sr]::CloseHandle($pi.process) }
+    finally { [void][HiddenLocal]::CloseHandle($pi.thread); [void][HiddenLocal]::CloseHandle($pi.process) }
     $script:processes.Add(@{Case=$case.Name;Pid=$p.Id;StartTime=$p.StartTime.ToUniversalTime().ToString('o');Executable=$p.ProcessName})
     $case.Process=$p
     $deadline=[datetime]::UtcNow.AddSeconds(20)
     do {
-        $hosts=@([Sr]::Hosts($p.Id))
-        if($hosts.Count -and [Sr]::WindowDesktop($hosts[0]) -ne $DesktopName) { Stop-Case $case; throw "Case $($case.Name) window is not on the private desktop." }
+        $hosts=@([HiddenLocal]::Hosts($p.Id))
+        if($hosts.Count -and [HiddenLocal]::WindowDesktop($hosts[0]) -ne $DesktopName) { Stop-Case $case; throw "Case $($case.Name) window is not on the private desktop." }
         $ready=$NoLedgerWait.IsPresent
         $ledger=Join-Path $case.Dir 'startup-attempts.json'
         if(-not $ready -and (Test-Path -LiteralPath $ledger)) {
@@ -309,7 +190,7 @@ function Start-Case($case,[switch]$NoLedgerWait) {
                 $ready=$attempts.Count -gt 0 -and $attempts[-1].phase -eq 'ready' -and $null -ne $attempts[-1].ready_at_unix_ms
             } catch { } # A concurrent ledger write may be incomplete; retry within the deadline.
         }
-        if($ready -and $hosts.Count -and @([Sr]::Surfaces($hosts[0])).Count -gt 0) {
+        if($ready -and $hosts.Count -and @([HiddenLocal]::Surfaces($hosts[0])).Count -gt 0) {
             Start-Sleep -Milliseconds 600
             $case.Host=$hosts[0]
             return $case
@@ -322,7 +203,7 @@ function Start-Case($case,[switch]$NoLedgerWait) {
     throw "Window startup failed for case $($case.Name).$(if($cleanup){" Cleanup: $cleanup"})"
 }
 function Stop-Case($case) {
-    foreach($h in [Sr]::Hosts($case.Process.Id)) { [void][Sr]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
+    foreach($h in [HiddenLocal]::Hosts($case.Process.Id)) { [void][Sr]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
     if(-not $case.Process.WaitForExit(8000)) {
         $p=Get-Process -Id $case.Process.Id -ErrorAction SilentlyContinue
         if(-not $p) { return }   # It exited between the wait and the lookup.

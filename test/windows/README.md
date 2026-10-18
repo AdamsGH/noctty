@@ -527,6 +527,19 @@ prove the absence of a window whose whole lifetime falls between samples.
 No external broker journey is exercised; keep bundled and in-box ConPTY
 desktop evidence separate. The Server 2022 run is not a Windows 10 desktop pass.
 
+## hidden-win11-local-lib.ps1
+
+Shared by the hidden-desktop harnesses that run on a developer machine
+(`hidden-win11-docked-search.ps1`, `-single-tab-close`, `-dpi-geometry`,
+`-quick-terminal-identity`, `-session-restore`, `-default-shell`,
+`-restore-quarantine` and `-app-delivery`); each dot-sources it and still runs on
+its own. It holds the private desktop, the owned kill-on-close job, the two
+explicit-desktop launches (`Launch` for the driver, `Spawn` for a case),
+`Invoke-LocalHiddenDriver` (the outer half: run the harness again as its driver
+on a new private desktop with LOCALAPPDATA and APPDATA redirected into the run
+directory, then check the real `startup-attempts.json` and, where the harness asks,
+the clipboard sequence number), and the small helpers those harnesses had copied.
+
 ## ..\..\scripts\check-test-skips.ps1
 
 Budget for the Zig tests that skip themselves. `zig build test` reports only a
