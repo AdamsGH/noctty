@@ -38,6 +38,7 @@ const key_input_run_env_name = "NOCTTY_CONPTY_KEY_INPUT_PROBE";
 const key_input_ready_marker = "NOCTTY-KEYS-READY";
 const key_input_begin_marker = "NOCTTY-KEYS-BEGIN";
 const key_input_end_marker = "NOCTTY-KEYS-END";
+const key_input_report_marker = "NOCTTY-KEYS-REPORT";
 
 /// The child writes nothing but lowercase hex digits between the key-input
 /// markers, but the in-box conhost re-renders that output and can put its
@@ -189,6 +190,16 @@ pub fn runChildIfRequested() void {
         child_env_name,
     ) catch return;
     defer std.heap.page_allocator.free(child);
+    if (!std.mem.eql(u8, child, graphics_child_mode) and
+        !std.mem.eql(u8, child, key_input_child_mode) and
+        !std.mem.eql(u8, child, "1")) return;
+
+    // The stock test runner starts a std.Progress renderer before child
+    // dispatch. Its stderr shares the pseudo console with stdout, so a
+    // redraw can replace/interleave any probe protocol. Hold the public
+    // progress lock through these noreturn children, including final output.
+    // Their native writes do not acquire this lock.
+    std.Progress.lockStdErr();
     if (std.mem.eql(u8, child, graphics_child_mode)) {
         const GraphicsChild = struct {
             extern "kernel32" fn GetConsoleMode(
@@ -304,6 +315,22 @@ pub fn runChildIfRequested() void {
                     len += 1;
                 }
 
+                // Record what ReadFile actually returned, independently of
+                // the hex transcript conhost is about to render. A short
+                // decoded transcript can then be distinguished from input
+                // loss without logging environment or arbitrary child data.
+                var final_input_mode: windows.DWORD = 0;
+                const final_mode_available = GetConsoleMode(stdin, &final_input_mode) != 0;
+                var report_buffer: [256]u8 = undefined;
+                const report = std.fmt.bufPrint(&report_buffer, key_input_report_marker ++
+                    ":bytes={d}:input_mode=0x{x}:final_mode_available={}:final_input_mode=0x{x}:fnv1a64={x}\r\n", .{
+                    len,
+                    input_mode,
+                    final_mode_available,
+                    final_input_mode,
+                    std.hash.Fnv1a_64.hash(received[0..len]),
+                }) catch std.process.exit(89);
+                writeAll(stdout, report);
                 writeAll(stdout, key_input_begin_marker);
                 const digits = "0123456789abcdef";
                 for (received[0..len]) |byte| {
@@ -317,7 +344,6 @@ pub fn runChildIfRequested() void {
 
         KeyInputChild.run();
     }
-    if (!std.mem.eql(u8, child, "1")) return;
 
     const Child = struct {
         const enable_processed_input: windows.DWORD = 0x0001;
@@ -1064,6 +1090,25 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
 
             var output: std.ArrayList(u8) = .empty;
             defer output.deinit(allocator);
+            var stage: enum { ready, write_payload, write_delimiter, sentinel, read_report, decode, compare, exit } = .ready;
+            var case_index: usize = 0;
+            var timer = try std.time.Timer.start();
+            errdefer {
+                var exit_code: windows.DWORD = 0;
+                const have_exit_code = windows.kernel32.GetExitCodeProcess(process, &exit_code) != 0;
+                const child_running = windows.kernel32.WaitForSingleObject(process, 0) == std.os.windows.WAIT_TIMEOUT;
+                std.debug.print("key-input-probe failure stage={t} case_index={d} elapsed_ns={d} output_bytes={d} child_running={} child_exit_available={} child_exit={d}\n", .{
+                    stage, case_index, timer.read(), output.items.len, child_running, have_exit_code, exit_code,
+                });
+                if (std.mem.indexOf(u8, output.items, key_input_report_marker)) |report_start| {
+                    const tail = output.items[report_start..];
+                    const report_end = std.mem.indexOfAny(u8, tail, "\r\n") orelse @min(tail.len, 512);
+                    printHex("key-input-probe child_report_hex", tail[0..@min(report_end, 512)]);
+                    std.debug.print("\n", .{});
+                } else {
+                    std.debug.print("key-input-probe child_report=absent\n", .{});
+                }
+            }
             try readUntilMarker(
                 &pty,
                 &output,
@@ -1075,16 +1120,21 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
             // written on its own. ConPTY's input state machine flushes a
             // partial escape at the end of every write, so a lone ESC is not
             // held waiting for the delimiter that follows it.
-            for (key_input_cases) |case| {
+            for (key_input_cases, 0..) |case, index| {
+                case_index = index;
+                stage = .write_payload;
                 try writeFragment(pty.in_pipe, case.payload, 2000);
                 std.Thread.sleep(settle_ms * std.time.ns_per_ms);
                 try pump(&pty, &output);
+                stage = .write_delimiter;
                 try writeFragment(pty.in_pipe, &[_]u8{case.delimiter}, 2000);
                 std.Thread.sleep(settle_ms * std.time.ns_per_ms);
                 try pump(&pty, &output);
             }
+            stage = .sentinel;
             try writeFragment(pty.in_pipe, &[_]u8{key_input_sentinel}, 2000);
 
+            stage = .read_report;
             try readUntilMarker(
                 &pty,
                 &output,
@@ -1100,6 +1150,7 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
                 key_input_end_marker,
             ) orelse return error.KeyInputProbeEndMarkerMissing);
             const region = output.items[begin..end];
+            stage = .decode;
             // A rejected region is printed whole, so the next one can be read.
             const digits = keyInputHexDigits(allocator, region) catch |err| {
                 printHex("key-input-probe rejected_region_hex", region);
@@ -1119,14 +1170,30 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
             printHex("key-input-probe received_hex", received);
             std.debug.print("\n", .{});
 
+            stage = .compare;
+            std.debug.print("key-input-probe decoded_bytes={d} fnv1a64={x}\n", .{
+                received.len, std.hash.Fnv1a_64.hash(received),
+            });
+            errdefer {
+                // Later exit-stage pumping may reallocate output; retain
+                // offsets rather than the slice captured before that pump.
+                printHex("key-input-probe comparison_region_hex", output.items[begin..end]);
+                std.debug.print("\n", .{});
+            }
             var cursor: usize = 0;
             var failures: usize = 0;
-            for (key_input_cases) |case| {
+            for (key_input_cases, 0..) |case, index| {
+                case_index = index;
                 const relative = std.mem.indexOfScalar(
                     u8,
                     received[cursor..],
                     case.delimiter,
-                ) orelse return error.KeyInputProbeDelimiterMissing;
+                ) orelse {
+                    std.debug.print("key-input-probe missing delimiter case={s} delimiter=0x{x} cursor={d} remaining={d}\n", .{
+                        case.name, case.delimiter, cursor, received.len - cursor,
+                    });
+                    return error.KeyInputProbeDelimiterMissing;
+                };
                 const observed = received[cursor..][0..relative];
                 cursor += relative + 1;
                 const survival = classify(observed, case.payload, case.legacy_equivalent);
@@ -1152,6 +1219,7 @@ test "Windows ConPTY input transport probe reports key encoding survival" {
             try std.testing.expectEqual(received.len, cursor);
             try std.testing.expectEqual(@as(usize, 0), failures);
 
+            stage = .exit;
             try readUntilMarker(&pty, &output, key_input_end_marker, std.time.ns_per_s);
             switch (windows.kernel32.WaitForSingleObject(process, 5000)) {
                 std.os.windows.WAIT_OBJECT_0 => child_finished = true,
