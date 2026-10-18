@@ -3,8 +3,9 @@ param()
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "common.ps1")
-$siteRoot = Join-Path (Get-RepoRoot) "site"
-$verifyDoc = Join-Path (Get-RepoRoot) "docs/verify-release.md"
+$repoRoot = Get-RepoRoot
+$siteRoot = Join-Path $repoRoot "site"
+$verifyDoc = Join-Path $repoRoot "docs/verify-release.md"
 
 if (-not (Test-Path $siteRoot)) {
     throw "Site root not found: $siteRoot"
@@ -105,9 +106,9 @@ $wingetStateWords = "pending|planned|unpublished|coming\s+soon|not\s+(?:yet\s+)?
 $wingetPendingPattern = "(?is)\bwinget\b(?![-_]|create)[^.;,]{0,80}?\b(?:$wingetStateWords)\b|\b(?:$wingetStateWords)\b[^.;,]{0,80}?\bwinget\b(?![-_]|create)"
 $wingetPendingReason = "The WinGet package AmanThanvi.noctty is published; do not describe it as pending, planned or unpublished."
 $wingetCopyFiles = @($textFiles.FullName) + @(
-    (Join-Path (Get-RepoRoot) "README.md"),
-    (Join-Path (Get-RepoRoot) "PACKAGING.md")
-) + @(Get-ChildItem -Path (Join-Path (Get-RepoRoot) "docs") -Filter "*.md" -File | ForEach-Object FullName)
+    (Join-Path $repoRoot "README.md"),
+    (Join-Path $repoRoot "PACKAGING.md")
+) + @(Get-ChildItem -Path (Join-Path $repoRoot "docs") -Filter "*.md" -File | ForEach-Object FullName)
 foreach ($file in $wingetCopyFiles) {
     $text = Get-Content -LiteralPath $file -Raw
     foreach ($m in [regex]::Matches($text, $wingetPendingPattern)) {
