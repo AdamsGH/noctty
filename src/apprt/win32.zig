@@ -3241,9 +3241,10 @@ pub const App = struct {
         }
     }
 
-    /// Whether `msg` is the tick of thread timer `timer_id`. A thread timer
-    /// (`SetTimer(null, ...)`) posts with a null hwnd; checking that keeps a
-    /// window timer whose numeric id happens to collide from being taken.
+    /// Whether the WM_TIMER `msg` is the tick of thread timer `timer_id`;
+    /// call it only for WM_TIMER. A thread timer (`SetTimer(null, ...)`)
+    /// posts with a null hwnd. Checking that keeps a window timer whose
+    /// numeric id happens to collide from being taken.
     fn threadTimerFired(msg: *const MSG, timer_id: ?UINT_PTR) bool {
         const id = timer_id orelse return false;
         return @intFromPtr(msg.hwnd) == 0 and msg.wParam == id;
@@ -3406,8 +3407,10 @@ pub const App = struct {
 
         if (!self.embedding_mode) self.initializeJumpList();
         if (!self.embedding_mode) self.scheduleGlobalHotkeySync();
-        if (!self.embedding_mode and self.windows.items.len == 0) self.syncDirtyGlobalHotkeys();
-        if (!self.embedding_mode and self.windows.items.len == 0) self.startQuitTimer();
+        if (!self.embedding_mode and self.windows.items.len == 0) {
+            self.syncDirtyGlobalHotkeys();
+            self.startQuitTimer();
+        }
 
         // Initial window creation must not start a check until the swapped
         // build is healthy and authoritative. Later windows retain the usual
@@ -4311,8 +4314,9 @@ pub const App = struct {
         );
     }
 
-    /// The `render` action for one surface: repaint it, then pass what the
-    /// renderer produced on to its terminal accessibility session.
+    /// The `render` action for one surface: request a repaint, drain the
+    /// terminal output its accessibility session waits for, and tell that
+    /// session the renderer updated.
     fn renderSurface(self: *App, surface: *Surface) !void {
         try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
         surface.drainTerminalAccessibilityOutput();
@@ -8798,8 +8802,7 @@ pub const App = struct {
 
     fn activeSurfaceForHost(self: *App, host_id: u32) ?*Surface {
         const host = self.findHostById(host_id) orelse return null;
-        const tab = host.activeTab() orelse return null;
-        return tab.focusedSurface();
+        return host.activeSurface();
     }
 
     fn findSurfaceById(self: *App, surface_id: u64) ?*Surface {
@@ -9279,11 +9282,7 @@ pub const App = struct {
                         return surface;
                     }
                 }
-                if (host.activeTab()) |tab| {
-                    if (tab.focusedSurface()) |surface| {
-                        return surface;
-                    }
-                }
+                if (host.activeSurface()) |surface| return surface;
             }
         }
 
@@ -9690,12 +9689,26 @@ pub const App = struct {
             try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
             return err;
         };
-        if (self.shell_runtime_initialized) {
-            self.commitShellTabDetach(stored_entry.payload.close_tab.shell_id) catch |err| {
+        if (self.shell_runtime_initialized) shell: {
+            const shell_tab_id = stored_entry.payload.close_tab.shell_id orelse {
+                var failed = host.structural_undo_entries.pop().?;
+                try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
+                return error.ShellStateOutOfSync;
+            };
+            var prepared = self.shell_runtime.prepare(.{ .detach_tab = shell_tab_id }) catch |err| {
                 var failed = host.structural_undo_entries.pop().?;
                 try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
                 return err;
             };
+            defer prepared.deinit();
+            prepared.commit(&self.shell_runtime) catch |err| {
+                var failed = host.structural_undo_entries.pop().?;
+                try self.rollbackTabClose(host, &failed.payload.close_tab, previous_active);
+                return err;
+            };
+            self.applyShellEffects(prepared.effects(), .{});
+            self.auditShellNativeMapping("tab-detach");
+            break :shell;
         }
         // Only now: a close that rolled back above left the list as it was.
         host.notifyTabListUiaChanged();
@@ -9729,18 +9742,6 @@ pub const App = struct {
             );
         }
         return true;
-    }
-
-    /// The shell model's half of `closeTabUndoable`: detach the tab it knows
-    /// as `shell_tab_id`. On an error nothing was committed, and the caller
-    /// puts the native tab back.
-    fn commitShellTabDetach(self: *App, shell_tab_id: ?win32_shell.model.TabId) !void {
-        const tab_id = shell_tab_id orelse return error.ShellStateOutOfSync;
-        var prepared = try self.shell_runtime.prepare(.{ .detach_tab = tab_id });
-        defer prepared.deinit();
-        try prepared.commit(&self.shell_runtime);
-        self.applyShellEffects(prepared.effects(), .{});
-        self.auditShellNativeMapping("tab-detach");
     }
 
     /// Puts back a tab that `close_tab:this` detached when the close cannot
@@ -10351,7 +10352,7 @@ pub const App = struct {
                 }
                 break :loaded @import("win32/wgl.zig").ensureLoaded();
             };
-            if (!loaded) return openGLStartupWin32Error(.load_opengl32);
+            if (!loaded) return windows.unexpectedError(recordOpenGLStartupLastError(.load_opengl32));
         }
 
         const hdc = sys.GetDC(hwnd) orelse {
@@ -10384,7 +10385,7 @@ pub const App = struct {
                 );
 
                 if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0)
-                    return openGLStartupWin32Error(.set_pixel_format);
+                    return windows.unexpectedError(recordOpenGLStartupLastError(.set_pixel_format));
                 pixel_format.validatePixelFormatSetTransition(
                     format_before,
                     selection.pixel_format,
@@ -10399,10 +10400,12 @@ pub const App = struct {
             },
         };
 
-        const hglrc = sys.wglCreateContext(hdc) orelse return openGLStartupWin32Error(.create_context);
+        const hglrc = sys.wglCreateContext(hdc) orelse
+            return windows.unexpectedError(recordOpenGLStartupLastError(.create_context));
         errdefer _ = sys.wglDeleteContext(hglrc);
 
-        if (sys.wglMakeCurrent(hdc, hglrc) == 0) return openGLStartupWin32Error(.initial_make_current);
+        if (sys.wglMakeCurrent(hdc, hglrc) == 0)
+            return windows.unexpectedError(recordOpenGLStartupLastError(.initial_make_current));
 
         return .{
             .hdc = hdc,
@@ -10412,11 +10415,13 @@ pub const App = struct {
     }
 
     /// Record that OpenGL startup failed at `step` with the thread's last
-    /// Win32 error, and return that error.
-    fn openGLStartupWin32Error(step: OpenGLStartupStep) error{Unexpected} {
+    /// Win32 error, and return that error code. The caller turns it into
+    /// `error.Unexpected` with `windows.unexpectedError`, so a Debug build's
+    /// stack dump still starts at the failing call.
+    fn recordOpenGLStartupLastError(step: OpenGLStartupStep) windows.Win32Error {
         const err = windows.kernel32.GetLastError();
         recordOpenGLStartupWin32Failure(step, err);
-        return windows.unexpectedError(err);
+        return err;
     }
 
     /// Checks the target now, so a refused one still fails at the caller,
