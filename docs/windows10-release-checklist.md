@@ -167,14 +167,15 @@ rectangles during the round trip from a normal window. This expectation comes
 from the `SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED` path, not a Windows 10
 measurement. A maximised window is a separate observation:
 the Windows 10 path rewrites the window style without `WS_MAXIMIZE`
-(`AGENTS.md`, 2026-09-24 entry, trap 4), so toggling while maximised is expected
-to leave an un-maximised window inside the maximised rectangle. Record what you
+(`docs/agents/log/window-frame.md`, 2026-09-24 entry, trap 4), so toggling
+while maximised is expected to leave an un-maximised window inside the maximised rectangle. Record what you
 see; neither outcome is a pass or a fail.
 
 **W10-09 Fullscreen round trip.** Maximise, then `toggle_fullscreen`, leave
 fullscreen, then restore from maximised. Expected: the window returns to its
 normal size and place, not to the maximised rectangle (the 2026-10-06 fullscreen
-entry in `AGENTS.md` describes the Windows 11 failure this guards).
+entry in `docs/agents/log/window-frame.md` describes the Windows 11 failure this
+guards).
 
 **W10-10 Quick terminal.** There is no default key for it. Put `quick-terminal-position
 = top` and `keybind = global:ctrl+alt+q=toggle_quick_terminal` in the config, reload
