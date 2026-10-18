@@ -1160,6 +1160,7 @@ pub const Search = struct {
 const TestUserData = struct {
     const Self = @This();
     reset: std.Thread.ResetEvent = .{},
+    events_seen: std.atomic.Value(u32) = .init(0),
     total: usize = 0,
     total_events: usize = 0,
     invalid: bool = false,
@@ -1188,6 +1189,7 @@ const TestUserData = struct {
     fn callback(event: Event, generation: u64, userdata: ?*anyopaque) void {
         _ = generation;
         const ud: *Self = @ptrCast(@alignCast(userdata.?));
+        _ = ud.events_seen.fetchOr(@as(u32, 1) << @intFromEnum(std.meta.activeTag(event)), .release);
         switch (event) {
             .quit => {},
             .complete => ud.reset.set(),
@@ -1237,32 +1239,60 @@ test {
     });
     defer thread.deinit();
 
-    var os_thread = try std.Thread.spawn(
-        .{},
-        threadMain,
-        .{&thread},
-    );
+    const Worker = struct {
+        thread: *Thread,
+        started: std.atomic.Value(bool) = .init(false),
+        exited: std.atomic.Value(bool) = .init(false),
 
-    // Start our search
-    _ = thread.mailbox.push(
-        .{ .change_query = .{
-            .generation = 1,
-            .options = .{},
-            .req = try .init(
-                alloc,
-                @as([]const u8, "world"),
-            ),
-        } },
-        .forever,
-    );
-    try thread.wakeup.notify();
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            defer self.exited.store(true, .release);
+            self.thread.threadMain();
+        }
+    };
+    var worker: Worker = .{ .thread = &thread };
+    var timer = try std.time.Timer.start();
+    {
+        const os_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        // In particular, a timed-out wait must not free the mailbox, IOCP
+        // loop or callback data while the search thread still uses them.
+        defer {
+            thread.stop.notify() catch |err| {
+                std.debug.print("search-test stop notification failed err={}\n", .{err});
+            };
+            os_thread.join();
+        }
 
-    // Wait for completion
-    try ud.reset.timedWait(100 * std.time.ns_per_ms);
+        // Start our search.
+        _ = thread.mailbox.push(
+            .{ .change_query = .{
+                .generation = 1,
+                .options = .{},
+                .req = try .init(alloc, @as([]const u8, "world")),
+            } },
+            .forever,
+        );
+        try thread.wakeup.notify();
 
-    // Stop the thread
-    try thread.stop.notify();
-    os_thread.join();
+        // Keep the original budget. Atomic observations identify scheduling,
+        // worker exit and the last delivered stages without racing callbacks.
+        ud.reset.timedWait(100 * std.time.ns_per_ms) catch |err| {
+            std.debug.print("search-test wait failed err={} elapsed_ns={d} started={} exited={} events:", .{
+                err,
+                timer.read(),
+                worker.started.load(.acquire),
+                worker.exited.load(.acquire),
+            });
+            const seen = ud.events_seen.load(.acquire);
+            inline for (std.meta.fields(Event)) |field| {
+                if (seen & (@as(u32, 1) << @intFromEnum(@field(std.meta.Tag(Event), field.name))) != 0) {
+                    std.debug.print(" {s}", .{field.name});
+                }
+            }
+            std.debug.print("\n", .{});
+            return err;
+        };
+    }
 
     // 1 total matches
     try testing.expectEqual(1, ud.total);
