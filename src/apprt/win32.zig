@@ -39820,28 +39820,19 @@ pub const Surface = struct {
         self.restore_placement.length = @sizeOf(WINDOWPLACEMENT);
         if (sys.GetWindowPlacement(hwnd, &self.restore_placement) == 0 or
             sys.GetWindowRect(hwnd, &self.restore_rect) == 0) return lastError();
-        const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse
-            return lastError();
-        var info: MONITORINFO = .{
-            .cbSize = @sizeOf(MONITORINFO),
-            .rcMonitor = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-            .rcWork = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-            .dwFlags = 0,
-        };
-        if (sys.GetMonitorInfoW(monitor, &info) == 0) {
-            return lastError();
-        }
-        self.restore_monitor = .{ .monitor = monitor, .info = info, .dpi = sys.GetDpiForWindow(hwnd) };
+        const monitor = try windowMonitor(hwnd);
+        self.restore_monitor = monitor;
         self.fullscreen = true;
         try self.applyWindowStyle();
 
+        const screen = monitor.info.rcMonitor;
         if (sys.SetWindowPos(
             hwnd,
             if (self.topmost) HWND_TOPMOST else null,
-            info.rcMonitor.left,
-            info.rcMonitor.top,
-            info.rcMonitor.right - info.rcMonitor.left,
-            info.rcMonitor.bottom - info.rcMonitor.top,
+            screen.left,
+            screen.top,
+            screen.right - screen.left,
+            screen.bottom - screen.top,
             c.SWP_FRAMECHANGED | c.SWP_NOACTIVATE,
         ) == 0) {
             return lastError();
@@ -39853,20 +39844,16 @@ pub const Surface = struct {
         var rect = self.restore_rect;
         var placement = self.restore_placement;
         if (self.restore_monitor) |source| {
-            const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
-            var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
-            info.cbSize = @sizeOf(MONITORINFO);
-            if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
-            const dpi = sys.GetDpiForWindow(hwnd);
-            if (monitor != source.monitor or dpi != source.dpi) {
-                rect = fullscreenRestoreRect(rect, source.info.rcWork, info.rcWork, source.dpi, dpi);
+            const target = try windowMonitor(hwnd);
+            if (target.monitor != source.monitor or target.dpi != source.dpi) {
+                rect = fullscreenRestoreRect(rect, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi);
                 // WINDOWPLACEMENT uses workspace coordinates for a normal
                 // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
                 // before the work-area translation, and back afterwards.
                 const normal = workspaceToScreenRect(placement.rcNormalPosition, source.info);
                 placement.rcNormalPosition = screenToWorkspaceRect(
-                    fullscreenRestoreRect(normal, source.info.rcWork, info.rcWork, source.dpi, dpi),
-                    info,
+                    fullscreenRestoreRect(normal, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi),
+                    target.info,
                 );
             }
         }
@@ -39902,6 +39889,15 @@ pub const Surface = struct {
     fn maximizeWithPlacement(hwnd: HWND, placement: *const WINDOWPLACEMENT) !void {
         _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
         if (sys.SetWindowPlacement(hwnd, placement) == 0) return lastError();
+    }
+
+    /// The monitor nearest `hwnd`, its info and the window's DPI.
+    fn windowMonitor(hwnd: HWND) !FullscreenMonitor {
+        const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+        var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+        info.cbSize = @sizeOf(MONITORINFO);
+        if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+        return .{ .monitor = monitor, .info = info, .dpi = sys.GetDpiForWindow(hwnd) };
     }
 
     /// `rect` in the workspace coordinates of `info`'s monitor (relative to
