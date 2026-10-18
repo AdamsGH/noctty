@@ -554,10 +554,12 @@ function Get-GuardSnapshot {
 function Assert-ClipboardGuard {
     $sequence = [Set91.Native]::GetClipboardSequenceNumber()
     if ($sequence -eq $script:clipboardBase) { return }
-    Write-Json (Join-Path $OutputDirectory 'clipboard-stop.json') ([ordered]@{
+    # Parent and worker can observe the same change: each owns its receipt.
+    $name = if ($WorkerDesktop) { 'clipboard-stop-worker.json' } else { 'clipboard-stop-parent.json' }
+    Write-Json (Join-Path $OutputDirectory $name) ([ordered]@{
         utc = [DateTimeOffset]::UtcNow.ToString('o'); before = $script:clipboardBase; after = $sequence
         action = 'STOP launches; no attribution; no clipboard contents accessed' })
-    throw 'Clipboard sequence changed: STOP launches and report clipboard-stop.json.'
+    throw "Clipboard sequence changed: STOP launches and report $name."
 }
 
 if (-not $WorkerDesktop) {

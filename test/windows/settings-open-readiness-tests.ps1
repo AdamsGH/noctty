@@ -94,7 +94,20 @@ try {
         finally { $reader.Dispose() }
     } finally { $held.Dispose() }
     Check (@([IO.Directory]::GetFiles($receiptRoot)).Count -eq 1) 'successful publication consumes temporary siblings'
+    $blocked = [IO.FileStream]::new($receiptPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $failed = $false
+        try { Write-SettingsOpenReceipt -Path $receiptPath -Value @{ failureStage = 'settings-visible'; error = 'stage-timeout' } }
+        catch [IO.IOException] { $failed = $true }
+        Check $failed 'reader without delete sharing causes an explicit publication failure'
+        Check (([IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json).stage -eq 'second') 'failed publication keeps the last complete receipt'
+        $retained = @([IO.Directory]::GetFiles($receiptRoot, 'receipt.json.*.tmp'))
+        Check ($retained.Count -eq 1) 'failed publication retains one complete temporary sibling'
+        $failure = [IO.File]::ReadAllText($retained[0]) | ConvertFrom-Json
+        Check ($failure.failureStage -eq 'settings-visible' -and $failure.error -eq 'stage-timeout') 'retained sibling preserves the original timeout boundary and reason'
+    } finally { $blocked.Dispose() }
 } finally {
+    foreach ($temporary in [IO.Directory]::GetFiles($receiptRoot, 'receipt.json.*.tmp')) { [IO.File]::Delete($temporary) }
     [IO.File]::Delete($receiptPath)
     [IO.Directory]::Delete($receiptRoot, $false)
 }
