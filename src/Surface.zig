@@ -912,11 +912,8 @@ pub fn init(
     // Initialize our renderer with our initialized surface.
     try Renderer.surfaceInit(rt_surface);
     if (comptime @hasDecl(apprt.Surface, "noteBenchmarkMemoryStage")) {
-        if (comptime build_config.d3d11) {
-            if (rt_surface.renderer_gl_prepared) rt_surface.noteBenchmarkMemoryStage(.opengl_functions_loaded, null);
-        } else {
+        if (!build_config.d3d11 or rt_surface.renderer_gl_prepared)
             rt_surface.noteBenchmarkMemoryStage(.opengl_functions_loaded, null);
-        }
     }
 
     // Determine our DPI configurations so we can properly configure
@@ -2300,9 +2297,8 @@ fn pushSearchMessage(
     stopping: *const std.atomic.Value(bool),
     msg: apprt.surface.Message,
 ) void {
-    if (!stopping.load(.acquire)) {
-        if (self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
-    }
+    if (!stopping.load(.acquire) and
+        self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
     var dropped = msg;
     dropped.deinit();
 }
@@ -3935,6 +3931,10 @@ const ResizeBatch = struct {
     depth: u8 = 0,
     pending: bool = false,
 
+    fn begin(self: *ResizeBatch) void {
+        self.depth += 1;
+    }
+
     /// Whether a resize must wait for the batch to end.
     fn hold(self: *ResizeBatch) bool {
         if (self.depth == 0) return false;
@@ -3956,14 +3956,14 @@ test "Surface: a resize batch sends one resize when its last level ends" {
     const testing = std.testing;
     var batch: ResizeBatch = .{};
     try testing.expect(!batch.hold());
-    batch.depth += 1;
-    batch.depth += 1;
+    batch.begin();
+    batch.begin();
     try testing.expect(batch.hold());
     try testing.expect(batch.hold());
     try testing.expect(!batch.end());
     try testing.expect(batch.end());
     try testing.expect(!batch.end());
-    batch.depth += 1;
+    batch.begin();
     try testing.expect(!batch.end());
 }
 
@@ -4011,7 +4011,7 @@ test "Surface: resizes inside a batch reach termio once, with the final size and
 /// the new cells, a grid neither monitor uses, which can wrap lines into
 /// scrollback if termio applies it before the second arrives.
 pub fn beginResizeBatch(self: *Surface) void {
-    self.resize_batch.depth += 1;
+    self.resize_batch.begin();
 }
 
 pub fn endResizeBatch(self: *Surface) void {
