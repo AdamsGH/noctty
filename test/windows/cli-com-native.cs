@@ -93,11 +93,13 @@ public static class ComCliNative {
     [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateDesktopW(string name,IntPtr device,IntPtr mode,uint flags,uint access,IntPtr sa);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("user32.dll",SetLastError=true)] static extern bool EnumDesktopWindows(IntPtr desktop,EnumWindow callback,IntPtr parameter);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent,EnumWindow callback,IntPtr parameter);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h,StringBuilder name,int count);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h,StringBuilder name,int count);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll",SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint message,IntPtr w,IntPtr l,uint flags,uint timeout,out UIntPtr result);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint message,IntPtr w,IntPtr l);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
@@ -300,40 +302,62 @@ public static class ComCliNative {
     public static object CloseDiagnostics(Child child,IntPtr desktop,IntPtr window) {
         Verify(child);
         var windows=new List<object>();
-        EnumDesktopWindows(desktop,(h,p)=> {
+        EnumWindow record=(h,p)=> {
             uint pid; uint tid=GetWindowThreadProcessId(h,out pid);
-            if(pid==child.Pid) {
+            if(pid==child.Pid && windows.Count<128) {
                 var name=new StringBuilder(256); GetClassNameW(h,name,256);
                 windows.Add(new {Hwnd=h.ToInt64(),Tid=tid,Class=name.ToString(),Visible=IsWindowVisible(h)});
             }
             return true;
-        },IntPtr.Zero);
+        };
+        EnumDesktopWindows(desktop,record,IntPtr.Zero);
+        if(IsWindow(window)) EnumChildWindows(window,record,IntPtr.Zero);
+        UIntPtr response;
+        bool responsive=IsWindow(window) && SendMessageTimeoutW(window,0,IntPtr.Zero,IntPtr.Zero,2,250,out response)!=IntPtr.Zero;
+        return new {Pid=child.Pid,Exited=child.Exited,HostExists=IsWindow(window),HostVisible=IsWindowVisible(window),Responsive=responsive,Windows=windows};
+    }
+    // Hold a separate process handle until the worker finishes, even when the
+    // caller times out and cleans up its Child. Synchronous WCT has no deadline.
+    public static object CloseWaitChains(Child child,int timeoutMs) {
+        Verify(child);
+        var process=System.Diagnostics.Process.GetProcessById((int)child.Pid);
+        try { var handle=process.Handle; }
+        catch { process.Dispose(); throw; }
+        var task=Task.Run(()=> {
+            using(process) { return CollectWaitChains(process,timeoutMs); }
+        });
+        if(!task.Wait(timeoutMs)) return new {TimedOut=true};
+        return new {TimedOut=false,Snapshot=task.Result};
+    }
+    static object CollectWaitChains(System.Diagnostics.Process process,int timeoutMs) {
         var chains=new List<object>();
+        var clock=System.Diagnostics.Stopwatch.StartNew();
         var session=OpenThreadWaitChainSession(0,IntPtr.Zero);
         int sessionError=session==IntPtr.Zero?Marshal.GetLastWin32Error():0;
         // WAITCHAIN_NODE_INFO is two DWORD enums plus a union whose largest
         // member is WCHAR[128], LARGE_INTEGER, BOOL (272 bytes, align 8).
         IntPtr nodes=Marshal.AllocHGlobal(280*16);
         try {
-            if(session!=IntPtr.Zero && !child.Exited) {
-                using(var process=System.Diagnostics.Process.GetProcessById((int)child.Pid)) {
-                    int sampled=0;
-                    foreach(System.Diagnostics.ProcessThread thread in process.Threads) {
-                        if(sampled++==64) break;
+            if(session!=IntPtr.Zero && !process.HasExited) {
+                int sampled=0;
+                foreach(System.Diagnostics.ProcessThread thread in process.Threads) {
+                    if(sampled++==64 || clock.ElapsedMilliseconds>=timeoutMs) break;
+                    try {
                         uint count=16; bool cycle;
-                        bool ok=GetThreadWaitChain(session,UIntPtr.Zero,0,(uint)thread.Id,ref count,nodes,out cycle);
+                        bool ok=GetThreadWaitChain(session,UIntPtr.Zero,7,(uint)thread.Id,ref count,nodes,out cycle);
                         int error=ok?0:Marshal.GetLastWin32Error();
                         var entries=new List<object>();
-                        if(ok) for(int i=0;i<Math.Min(count,16);i++) {
+                        if(ok || error==234 || error==164) for(int i=0;i<Math.Min(count,16);i++) {
                             IntPtr node=IntPtr.Add(nodes,i*280); int type=Marshal.ReadInt32(node);
-                            entries.Add(new {Type=type,Status=Marshal.ReadInt32(node,4),Pid=type==8?Marshal.ReadInt32(node,8):0,Tid=type==8?Marshal.ReadInt32(node,12):0});
+                            entries.Add(new {Type=type,Status=Marshal.ReadInt32(node,4),Pid=type==8?Marshal.ReadInt32(node,8):0,Tid=type==8?Marshal.ReadInt32(node,12):0,WaitTime=type==8?Marshal.ReadInt32(node,16):0,ContextSwitches=type==8?Marshal.ReadInt32(node,20):0});
                         }
-                        chains.Add(new {Tid=thread.Id,Ok=ok,Error=error,Cycle=cycle,Nodes=entries});
-                    }
+                        var state=thread.ThreadState;
+                        chains.Add(new {Tid=thread.Id,State=state.ToString(),WaitReason=state==System.Diagnostics.ThreadState.Wait?thread.WaitReason.ToString():null,CpuMs=thread.TotalProcessorTime.TotalMilliseconds,Ok=ok,Error=error,Cycle=cycle,Nodes=entries});
+                    } catch(Exception error) { chains.Add(new {Tid=thread.Id,ErrorType=error.GetType().FullName}); }
                 }
             }
         } finally { Marshal.FreeHGlobal(nodes); if(session!=IntPtr.Zero) CloseThreadWaitChainSession(session); }
-        return new {Pid=child.Pid,Exited=child.Exited,HostExists=IsWindow(window),HostVisible=IsWindowVisible(window),Windows=windows,WaitChainSessionError=sessionError,WaitChains=chains};
+        return new {SessionError=sessionError,WaitChains=chains};
     }
     // The window's process must also be in the launched child's job.
     public static Child WindowProcess(IntPtr window,string image,Child owner) {

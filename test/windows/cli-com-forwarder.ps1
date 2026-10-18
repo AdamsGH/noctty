@@ -30,6 +30,7 @@ param(
     [Parameter(Mandatory)] [string] $OutputDir,
     [ValidateRange(5,120)] [int] $TimeoutSeconds = 20,
     [ValidateRange(10,100)] [int] $VersionIterations = 10,
+    [ValidateRange(1,100)] [int] $GuiIterations = 1,
     [string] $DesktopFixture,
     [switch] $ThinForwarder,
     [switch] $ProveDesktopOnly,
@@ -127,13 +128,14 @@ if (-not $Driver) {
         $pwsh = (Get-Process -Id $PID).Path
         $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-BinDir', $portable,
             '-OutputDir', $OutputDir, '-Driver', '-DesktopName', $DesktopName, '-DesktopFixture', $DesktopFixture,
-            '-TimeoutSeconds', "$TimeoutSeconds", '-VersionIterations', "$VersionIterations")
+            '-TimeoutSeconds', "$TimeoutSeconds", '-VersionIterations', "$VersionIterations", '-GuiIterations', "$GuiIterations")
         if ($ThinForwarder) { $arguments += '-ThinForwarder' }
         if ($ProveDesktopOnly) { $arguments += '-ProveDesktopOnly' }
         $raw = ($arguments | ForEach-Object { [ComCliNative]::Quote($_) }) -join ' '
         $controller = [ComCliNative]::Launch($pwsh, $raw, $OutputDir, "WinSta0\$DesktopName", 'files', $null,
             (Join-Path $OutputDir 'controller.stdout.txt'), (Join-Path $OutputDir 'controller.stderr.txt'), 0x08000000)
-        Assert-Condition ($controller.Wait(($TimeoutSeconds * 16 + $VersionIterations * 5) * 1000)) 'Hidden-desktop controller timed out.'
+        $controllerBudget = $TimeoutSeconds * 16 + $VersionIterations * 5 + ($GuiIterations - 1) * ($TimeoutSeconds * 5 + 15)
+        Assert-Condition ($controller.Wait($controllerBudget * 1000)) 'Hidden-desktop controller timed out.'
         Assert-Condition ($controller.ExitCode -eq 0) 'Hidden-desktop controller failed; inspect bounded per-case results.json and the controller capture.'
     } catch { $failure = $_ }
     finally {
@@ -478,14 +480,27 @@ try {
             $versionTimes.Add($result.ProcessElapsedMs)
         }
     }
-    Test-Case 'no-action raw quotes and Unicode title opens GUI and returns promptly' {
+    for ($guiIteration = 0; $guiIteration -lt $GuiIterations; $guiIteration++) {
+    Test-Case "no-action raw quotes and Unicode title opens GUI and returns promptly [$guiIteration]" {
         $config = [IO.File]::ReadAllText((Join-Path $BinDir 'config.ghostty'))
         $class = [regex]::Match($config, '(?m)^class = (.+)$').Groups[1].Value.Trim()
         $raw = '--single-instance=false --class=' + $class + ' --title="D20 ""quoted"" 空間 😀"'
-        # SW_SHOWNORMAL: the first ShowWindow of a GUI process honors its launcher's flag.
-        $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir 'gui.stdout.txt'), (Join-Path $OutputDir 'gui.stderr.txt'), 0x08000000, 1, $false)
+        # The detached GUI does not inherit these captures or the launcher's show flag.
+        $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir "gui-$guiIteration.stdout.txt"), (Join-Path $OutputDir "gui-$guiIteration.stderr.txt"), 0x08000000, 1, $false)
         $guiChild = $null
-        $close = [ordered]@{ Stage = 'launcher'; HostGoneMs = $null; ProcessExitMs = $null; Diagnostics = $null }
+        $close = [ordered]@{ Stage = 'launcher'; PostedUtc = $null; PostMs = $null; StartupAtPost = $null; StartupAtTimeout = $null; HostGoneMs = $null; ProcessExitMs = $null; Diagnostics = $null; WaitChains = $null }
+        $closePath = Join-Path $OutputDir "gui-close-$guiIteration.json"
+        function Save-CloseReceipt {
+            try { $close | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $closePath -Encoding utf8NoBOM }
+            catch { Write-Warning ('Close receipt write failed: ' + $_.Exception.GetType().FullName) }
+        }
+        function Read-StartupPhase {
+            try {
+                $ledger = [IO.File]::ReadAllText((Join-Path $BinDir 'startup-attempts.json')) | ConvertFrom-Json
+                $attempt = @($ledger.attempts)[-1]
+                return @{ Phase = $attempt.phase; StartedUnixMs = $attempt.started_at_unix_ms; ReadyUnixMs = $attempt.ready_at_unix_ms }
+            } catch { return @{ ErrorType = $_.Exception.GetType().FullName } }
+        }
         try {
             Assert-Condition ($child.Wait(5000)) 'No-action launcher did not return within 5 seconds.'
             Assert-Condition ($child.ExitCode -eq 0) 'No-action launcher returned nonzero.'
@@ -497,25 +512,36 @@ try {
             Wait-Condition { [ComCliNative]::IsWindowVisible($window) } 'GUI host window visible'
             Assert-Condition (-not $guiChild.Exited) 'GUI exited together with the launcher.'
             $close.Stage = 'post-close'
-            Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
-            $close.Stage = 'process-exit'
+            $close.StartupAtPost = Read-StartupPhase
+            $close.PostedUtc = [datetime]::UtcNow.ToString('o')
             $closeClock = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
+            $close.PostMs = $closeClock.Elapsed.TotalMilliseconds
+            $close.Stage = 'process-exit'
             do {
                 if ($null -eq $close.HostGoneMs -and -not [ComCliNative]::IsWindow($window)) { $close.HostGoneMs = $closeClock.Elapsed.TotalMilliseconds }
                 if ($guiChild.Wait(25)) { $close.ProcessExitMs = $closeClock.Elapsed.TotalMilliseconds; break }
             } while ($closeClock.Elapsed.TotalSeconds -lt $TimeoutSeconds)
+            if ($null -eq $close.ProcessExitMs -and $guiChild.Wait(0)) { $close.ProcessExitMs = $closeClock.Elapsed.TotalMilliseconds }
             if ($null -eq $close.ProcessExitMs) {
+                $close.Stage = 'close-timeout'
+                $close.StartupAtTimeout = Read-StartupPhase
+                Save-CloseReceipt
                 try { $close.Diagnostics = [ComCliNative]::CloseDiagnostics($guiChild, $desktopHandle, $window) }
                 catch { $close.Diagnostics = @{ ErrorType = $_.Exception.GetType().FullName } }
+                Save-CloseReceipt
+                try { $close.WaitChains = [ComCliNative]::CloseWaitChains($guiChild, 5000) }
+                catch { $close.WaitChains = @{ ErrorType = $_.Exception.GetType().FullName } }
             }
-            Assert-Condition ($null -ne $close.ProcessExitMs) 'Owned GUI did not close; see gui-close.json for host state and bounded thread wait chains.'
+            Assert-Condition ($null -ne $close.ProcessExitMs) "Owned GUI did not close; see gui-close-$guiIteration.json for startup, host state and bounded thread wait chains."
             $close.Stage = 'job-empty'
             Assert-JobEmpty $child 'closing the GUI'
             $close.Stage = 'passed'
         } finally {
-            $close | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $OutputDir 'gui-close.json') -Encoding utf8NoBOM
+            Save-CloseReceipt
             if ($guiChild) { $guiChild.Dispose() }; $child.Dispose()
         }
+    }
     }
 } finally {
     [void][ComCliNative]::CloseDesktop($desktopHandle)
