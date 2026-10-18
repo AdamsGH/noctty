@@ -37,12 +37,16 @@ Windows-only Ghostty fork.
 
 ## Running noctty
 
-- Run noctty only on a private desktop (`CreateDesktopW`), and pass
+- Run noctty on a private desktop (`CreateDesktopW`), and pass
   `lpDesktop = WinSta0\<desktop>` to every process you start: a driver on a
   private desktop that passes a null one puts the child on the user's
   desktop, and noctty takes the foreground. Drive it with posted messages;
   `SendInput` types into whatever window is in front. (window-frame.md:
   2026-09-24, 2026-09-23; renderer.md: 2026-10-14; input.md: 2026-09-19.)
+  What a private desktop cannot show (a D3D11 present, which needs a
+  composed, visible desktop; real input) needs a visible run, and a visible
+  run starts only once the user is away. (search-scrollbar.md: 2026-10-16;
+  window-frame.md: 2026-10-16.)
 - Run a scratch portable copy (`noctty.portable` beside the exe) with
   `--window-save-state=never` and `LOCALAPPDATA` redirected for that noctty;
   that isolates session and startup state. If a `zig build` runs under the
