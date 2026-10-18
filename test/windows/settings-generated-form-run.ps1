@@ -18,6 +18,8 @@
     Bounded traces retain ordered native steps and root/viewport/anchor state,
     window ownership and NULL-return error codes, without window titles. This
     checks native dialog order; it does not inject Tab or call app accelerators.
+    Cue reads use only a fixed remote allocation in the retained fixture process;
+    an unconfirmed send stops that exact fixture before buffer reclamation.
     Labeled rows require immediate native STATIC predecessor; other checkboxes
     label themselves through their existing caption. Existing labels/names/IDs
     and section order are deliberately independent of product descriptors.
@@ -71,9 +73,18 @@ namespace SetForm
         [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageTimeoutW")]
         static extern IntPtr ReadText(IntPtr hwnd, uint message, IntPtr w, StringBuilder text,
             uint flags, uint timeout, out IntPtr result);
-        [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageTimeoutW")]
-        static extern IntPtr ReadCue(IntPtr hwnd, uint message, StringBuilder text, IntPtr length,
+        [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageTimeoutW", SetLastError=true)]
+        static extern IntPtr ReadCue(IntPtr hwnd, uint message, IntPtr text, IntPtr length,
             uint flags, uint timeout, out IntPtr result);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern uint GetProcessId(IntPtr process);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr VirtualAllocEx(IntPtr process,
+            IntPtr address, UIntPtr bytes, uint allocationType, uint protection);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool VirtualFreeEx(IntPtr process,
+            IntPtr address, UIntPtr bytes, uint freeType);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadProcessMemory(IntPtr process,
+            IntPtr address, [Out] byte[] buffer, UIntPtr bytes, out UIntPtr bytesRead);
         static string Class(IntPtr hwnd)
         { var text = new StringBuilder(128); GetClassNameW(hwnd, text, text.Capacity); return text.ToString(); }
         static string StaticText(IntPtr hwnd)
@@ -205,13 +216,81 @@ namespace SetForm
                 throw new InvalidOperationException("Labeled checkbox arrow traversal visits a label, hidden/disabled control or escapes the form");
             return GetDlgCtrlID(target);
         }
-        public static string Cue(IntPtr edit)
+        public sealed class CueRead
         {
-            if (Class(edit) != "Edit") throw new InvalidOperationException("Cue target is not an edit");
-            var text = new StringBuilder(256); IntPtr result;
-            if (ReadCue(edit, 0x1502, text, (IntPtr)text.Capacity, 2, 2000, out result) == IntPtr.Zero || result == IntPtr.Zero)
-                throw new InvalidOperationException("Edit cue banner read failed"); // EM_GETCUEBANNER
-            return text.ToString();
+            public int ControlId;
+            public long GetterResult;
+            public uint ProcessId, ThreadId;
+            public bool GetterSucceeded, AllocationFreed;
+            public string Text;
+        }
+        static uint CueOwner(IntPtr edit, IntPtr process, uint expectedPid)
+        {
+            if (process == IntPtr.Zero || expectedPid == 0 || GetProcessId(process) != expectedPid ||
+                WaitForSingleObject(process, 0) != 258)
+                throw new InvalidOperationException("Cue read requires the retained live owned fixture handle");
+            uint owner;
+            uint thread = GetWindowThreadProcessId(edit, out owner);
+            if (thread == 0 || owner != expectedPid || Class(edit) != "Edit")
+                throw new InvalidOperationException("Cue edit does not belong to the retained fixture process");
+            return thread;
+        }
+        public static CueRead Cue(IntPtr edit, IntPtr process, uint expectedPid)
+        {
+            const int characters = 256, bytes = characters * 2;
+            var observed = new CueRead { ControlId = GetDlgCtrlID(edit), ProcessId = expectedPid,
+                ThreadId = CueOwner(edit, process, expectedPid) };
+            // EM_GETCUEBANNER is above WM_USER: user32 does not marshal wParam.
+            // The only remotely read memory is this new zero-initialized buffer.
+            IntPtr remote = VirtualAllocEx(process, IntPtr.Zero, new UIntPtr((uint)bytes), 0x3000, 0x04);
+            if (remote == IntPtr.Zero)
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Cue VirtualAllocEx");
+            bool sendAttempted = false, sendCompleted = false;
+            try {
+                CueOwner(edit, process, expectedPid);
+                IntPtr result;
+                sendAttempted = true;
+                IntPtr sent = ReadCue(edit, 0x1502, remote, (IntPtr)characters,
+                    0x23, 2000, out result); // BLOCK | ABORTIFHUNG | ERRORONEXIT
+                int sendError = Marshal.GetLastWin32Error();
+                sendCompleted = sent != IntPtr.Zero;
+                if (!sendCompleted)
+                    throw new System.ComponentModel.Win32Exception(sendError, "Cue SendMessageTimeoutW error=" + sendError);
+                CueOwner(edit, process, expectedPid);
+                var buffer = new byte[bytes]; UIntPtr read;
+                if (!ReadProcessMemory(process, remote, buffer, new UIntPtr((uint)bytes), out read))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Cue ReadProcessMemory owned buffer");
+                if (read.ToUInt64() != (ulong)bytes)
+                    throw new InvalidOperationException("Cue owned-buffer read was incomplete");
+                int end = 0;
+                while (end < bytes && (buffer[end] != 0 || buffer[end + 1] != 0)) end += 2;
+                if (end == bytes) throw new InvalidOperationException("Cue exceeded the fixed buffer or lacked its terminator");
+                observed.GetterSucceeded = result != IntPtr.Zero;
+                observed.GetterResult = result.ToInt64();
+                observed.Text = Encoding.Unicode.GetString(buffer, 0, end);
+                if (!observed.GetterSucceeded && observed.Text.Length != 0)
+                    throw new InvalidOperationException("Failed cue getter returned inconsistent nonempty text");
+                return observed;
+            } finally {
+                uint state = WaitForSingleObject(process, 0);
+                if (sendAttempted && !sendCompleted && state == 258) {
+                    // A timed-out send may still be processing its pointer.
+                    // Retire this exact retained fixture before reclamation;
+                    // never free live storage that the receiver may still use.
+                    if (GetProcessId(process) != expectedPid || !TerminateProcess(process, 1))
+                        throw new InvalidOperationException("Cue send failed; owned fixture could not be stopped. Allocation retained for outer cleanup");
+                    state = WaitForSingleObject(process, 5000);
+                }
+                if (state == 0) {
+                    observed.AllocationFreed = true; // Process exit reclaimed it.
+                } else if (state != 258 || (sendAttempted && !sendCompleted)) {
+                    throw new InvalidOperationException("Cue cleanup could not confirm fixture quiescence. Allocation retained for outer cleanup");
+                } else {
+                    if (!VirtualFreeEx(process, remote, UIntPtr.Zero, 0x8000)) // MEM_RELEASE, exact allocation
+                        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Cue VirtualFreeEx");
+                    observed.AllocationFreed = true;
+                }
+            }
         }
     }
 }
@@ -270,7 +349,7 @@ $batchInput = [Set91.Native]::ReadInput()
 $clipObserved = $clip
 $process = $null; $settings = [IntPtr]::Zero; $hostWindow = [IntPtr]::Zero
 $cleanupFailed = $false
-$clippedChecks = 0; $visibleChecks = 0
+$clippedChecks = 0; $visibleChecks = 0; $cueChecks = 0; $absentCueChecks = 0
 $results = [Collections.Generic.List[object]]::new()
 
 # Frozen independent native/UIA compatibility expectations from main 09b79314d.
@@ -306,7 +385,7 @@ $cases = @(
     @(204, 302, 'Button', 'Keybind configuration', 'Keybind configuration', $null),
     @(205, 101, 'Button', 'Full config editor', 'Full config editor', $null)
 )
-$ownedCues = @{ 412 = 'Default font'; 413 = 'Default theme'; 414 = 'Automatic shell' }
+$ownedCues = @{ 412 = 'Default font'; 413 = 'Default theme'; 414 = 'Automatic shell'; 401 = '' }
 # Check meaning-bearing unit/range promises without freezing the whole sentence.
 $helpPromises = @{
     401 = @('bytes', 'zero|0', 'positive integer')
@@ -420,8 +499,19 @@ try {
                 }
                 $hwnd = Ctl $settings $case[1]
                 if ($ownedCues.ContainsKey($case[1])) {
-                    $cue = [SetForm.Layout]::Cue($hwnd)
-                    Assert-Contract ($cue -ceq $ownedCues[$case[1]]) "Owned edit cue missing or changed: $($case[1])"
+                    [Set91.Native]::AssertDesktop($hwnd, $WorkerDesktop)
+                    $cue = [SetForm.Layout]::Cue($hwnd, $process.Handle, [uint32]$process.Pid)
+                    Write-Json (Join-Path $OutputDirectory "control-$($case[1])-cue.json") $cue
+                    Assert-Contract $cue.AllocationFreed "Owned cue buffer was not reclaimed: $($case[1])"
+                    if ($ownedCues[$case[1]].Length -gt 0) {
+                        Assert-Contract $cue.GetterSucceeded "Owned edit cue getter failed: $($case[1])"
+                    }
+                    # Preserve FALSE separately from the text observation; it
+                    # never satisfies a positive cue expectation. Edit 401 must
+                    # leave the completed read's owned buffer empty.
+                    Assert-Contract ($cue.Text -ceq $ownedCues[$case[1]]) "Owned edit cue missing, unexpected or changed: $($case[1])"
+                    $cueChecks++
+                    if ($case[1] -eq 401) { $absentCueChecks++ }
                 }
                 $disabled = $case[1] -in 410, 425
                 Assert-Contract ([Set91.Native]::IsWindowEnabled($hwnd) -eq (-not $disabled)) "Wrong native enablement: $($case[1])"
@@ -482,12 +572,14 @@ try {
     }
     Assert-Contract ($clippedChecks -gt 0) 'No fully clipped control observed; clipping coverage is absent.'
     Assert-Contract ($visibleChecks -eq 28) 'Incomplete form control coverage.'
+    Assert-Contract ($cueChecks -eq 4 -and $absentCueChecks -eq 1) 'Incomplete positive/absent owned edit cue coverage.'
 } finally {
     try { Stop-Fixture }
     finally {
         Write-Json (Join-Path $OutputDirectory 'form-coverage.json') ([ordered]@{
             expectedEditableProjections = 26; expectedEditorRows = 2; expectedReadOnlyProseRows = 2
             visibleControlChecks = $visibleChecks; clippedControlChecks = $clippedChecks
+            expectedCueChecks = 4; cueChecks = $cueChecks; absentCueChecks = $absentCueChecks
             completedSections = $results.Count; passedSections = @($results | Where-Object { $_.pass }).Count
             separate455OperationHarnessRequired = $true
             runtimeScope = 'read-only patterns, native ordering, native tab/arrow traversal, clipping, prose promises'
