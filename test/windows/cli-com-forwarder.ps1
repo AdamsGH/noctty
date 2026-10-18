@@ -135,6 +135,8 @@ if (-not $Driver) {
         $controller = [ComCliNative]::Launch($pwsh, $raw, $OutputDir, "WinSta0\$DesktopName", 'files', $null,
             (Join-Path $OutputDir 'controller.stdout.txt'), (Join-Path $OutputDir 'controller.stderr.txt'), 0x08000000)
         $controllerBudget = $TimeoutSeconds * 16 + $VersionIterations * 5 + ($GuiIterations - 1) * ($TimeoutSeconds * 5 + 15)
+        # Leave the ten-minute CI step time to write guards and reap the job.
+        if ($GuiIterations -gt 1) { $controllerBudget = [math]::Min(540, $controllerBudget) }
         Assert-Condition ($controller.Wait($controllerBudget * 1000)) 'Hidden-desktop controller timed out.'
         Assert-Condition ($controller.ExitCode -eq 0) 'Hidden-desktop controller failed; inspect bounded per-case results.json and the controller capture.'
     } catch { $failure = $_ }
@@ -488,7 +490,7 @@ try {
         # The detached GUI does not inherit these captures or the launcher's show flag.
         $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir "gui-$guiIteration.stdout.txt"), (Join-Path $OutputDir "gui-$guiIteration.stderr.txt"), 0x08000000, 1, $false)
         $guiChild = $null
-        $close = [ordered]@{ Stage = 'launcher'; PostedUtc = $null; PostMs = $null; StartupAtPost = $null; StartupAtTimeout = $null; HostGoneMs = $null; ProcessExitMs = $null; Diagnostics = $null; WaitChains = $null }
+        $close = [ordered]@{ Stage = 'launcher'; PostedUtc = $null; PostMs = $null; StartupAfterPost = $null; StartupAtTimeout = $null; HostGoneMs = $null; ProcessExitMs = $null; JobActiveProcesses = $null; Diagnostics = $null; WaitChains = $null }
         $closePath = Join-Path $OutputDir "gui-close-$guiIteration.json"
         function Save-CloseReceipt {
             try { $close | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $closePath -Encoding utf8NoBOM }
@@ -496,9 +498,13 @@ try {
         }
         function Read-StartupPhase {
             try {
-                $ledger = [IO.File]::ReadAllText((Join-Path $BinDir 'startup-attempts.json')) | ConvertFrom-Json
+                # The ready marker replaces this file. Never deny delete sharing.
+                $stream = [IO.FileStream]::new((Join-Path $BinDir 'startup-attempts.json'), [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                try { $reader = [IO.StreamReader]::new($stream); try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() } }
+                finally { $stream.Dispose() }
+                $ledger = $text | ConvertFrom-Json
                 $attempt = @($ledger.attempts)[-1]
-                return @{ Phase = $attempt.phase; StartedUnixMs = $attempt.started_at_unix_ms; ReadyUnixMs = $attempt.ready_at_unix_ms }
+                return @{ SampledUtc = [datetime]::UtcNow.ToString('o'); Phase = $attempt.phase; StartedUnixMs = $attempt.started_at_unix_ms; ReadyUnixMs = $attempt.ready_at_unix_ms; LastWin32Error = $attempt.last_win32_error; AttemptCount = @($ledger.attempts).Count; UnresolvedCount = @($ledger.attempts | Where-Object { $null -eq $_.ready_at_unix_ms -and $null -eq $_.opengl_unavailable_at_unix_ms }).Count }
             } catch { return @{ ErrorType = $_.Exception.GetType().FullName } }
         }
         try {
@@ -512,11 +518,11 @@ try {
             Wait-Condition { [ComCliNative]::IsWindowVisible($window) } 'GUI host window visible'
             Assert-Condition (-not $guiChild.Exited) 'GUI exited together with the launcher.'
             $close.Stage = 'post-close'
-            $close.StartupAtPost = Read-StartupPhase
             $close.PostedUtc = [datetime]::UtcNow.ToString('o')
             $closeClock = [Diagnostics.Stopwatch]::StartNew()
             Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
             $close.PostMs = $closeClock.Elapsed.TotalMilliseconds
+            $close.StartupAfterPost = Read-StartupPhase
             $close.Stage = 'process-exit'
             do {
                 if ($null -eq $close.HostGoneMs -and -not [ComCliNative]::IsWindow($window)) { $close.HostGoneMs = $closeClock.Elapsed.TotalMilliseconds }
@@ -526,6 +532,7 @@ try {
             if ($null -eq $close.ProcessExitMs) {
                 $close.Stage = 'close-timeout'
                 $close.StartupAtTimeout = Read-StartupPhase
+                $close.JobActiveProcesses = [ComCliNative]::ActiveProcesses($child)
                 Save-CloseReceipt
                 try { $close.Diagnostics = [ComCliNative]::CloseDiagnostics($guiChild, $desktopHandle, $window) }
                 catch { $close.Diagnostics = @{ ErrorType = $_.Exception.GetType().FullName } }
@@ -536,6 +543,12 @@ try {
             Assert-Condition ($null -ne $close.ProcessExitMs) "Owned GUI did not close; see gui-close-$guiIteration.json for startup, host state and bounded thread wait chains."
             $close.Stage = 'job-empty'
             Assert-JobEmpty $child 'closing the GUI'
+            if ($GuiIterations -gt 1) {
+                # Each repeated cold launch starts with a fresh recovery history.
+                # Preserve the completed ledger after the entire owned job exits.
+                $ledgerPath = Join-Path $BinDir 'startup-attempts.json'
+                if (Test-Path -LiteralPath $ledgerPath) { Move-Item -LiteralPath $ledgerPath -Destination (Join-Path $OutputDir "startup-attempts-$guiIteration.json") }
+            }
             $close.Stage = 'passed'
         } finally {
             Save-CloseReceipt
