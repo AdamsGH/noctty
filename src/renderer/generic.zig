@@ -85,41 +85,8 @@ test "renderer target recreation tracks custom shader presence" {
     }));
 }
 
-/// Create a renderer type with the provided graphics API wrapper.
-///
-/// The graphics API wrapper must provide the interface outlined below.
-/// Specific details for the interfaces are documented on the existing
-/// implementations (`OpenGL`).
-///
-/// Hierarchy of graphics abstractions:
-///
-/// [ GraphicsAPI ] - Responsible for configuring the runtime surface
-///    |     |        and providing render `Target`s that draw to it,
-///    |     |        as well as `Frame`s and `Pipeline`s.
-///    |     V
-///    | [ Target ] - Represents an abstract target for rendering, which
-///    |              could be a surface directly but is also used as an
-///    |              abstraction for off-screen frame buffers.
-///    V
-/// [ Frame ] - Represents the context for drawing a given frame,
-///    |        provides `RenderPass`es for issuing draw commands
-///    |        to, and reports the frame health when complete.
-///    V
-/// [ RenderPass ] - Represents a render pass in a frame, consisting of
-///   :              one or more `Step`s applied to the same target(s),
-/// [ Step ] - - - - each describing the input buffers and textures and
-///   :              the vertex/fragment functions and geometry to use.
-///   :_ _ _ _ _ _ _ _ _ _/
-///   v
-/// [ Pipeline ] - Describes a vertex and fragment function to be used
-///                for a `Step`; the `GraphicsAPI` is responsible for
-///                these and they should be constructed and cached
-///                ahead of time.
-///
-/// [ Buffer ] - An abstraction over a GPU buffer.
-///
-/// [ Texture ] - An abstraction over a GPU texture.
-///
+/// The renderer configuration derived from the main configuration, shared
+/// by every graphics API (`Renderer(API).DerivedConfig`).
 pub const CommonDerivedConfig = struct {
     const DerivedConfig = @This();
     renderer_backend: configpkg.Config.RendererBackend = .opengl,
@@ -246,6 +213,7 @@ pub const CommonDerivedConfig = struct {
     }
 };
 
+/// What `updateFrame` reports, shared by every graphics API.
 pub const CommonFrameUpdate = struct {
     cursor_blinking: bool,
     output_progress: ?renderer.State.OutputProgress = null,
@@ -254,6 +222,41 @@ pub const CommonFrameUpdate = struct {
     synchronized_output: bool = false,
 };
 
+/// Create a renderer type with the provided graphics API wrapper.
+///
+/// The graphics API wrapper must provide the interface outlined below.
+/// Specific details for the interfaces are documented on the existing
+/// implementations (`OpenGL`).
+///
+/// Hierarchy of graphics abstractions:
+///
+/// [ GraphicsAPI ] - Responsible for configuring the runtime surface
+///    |     |        and providing render `Target`s that draw to it,
+///    |     |        as well as `Frame`s and `Pipeline`s.
+///    |     V
+///    | [ Target ] - Represents an abstract target for rendering, which
+///    |              could be a surface directly but is also used as an
+///    |              abstraction for off-screen frame buffers.
+///    V
+/// [ Frame ] - Represents the context for drawing a given frame,
+///    |        provides `RenderPass`es for issuing draw commands
+///    |        to, and reports the frame health when complete.
+///    V
+/// [ RenderPass ] - Represents a render pass in a frame, consisting of
+///   :              one or more `Step`s applied to the same target(s),
+/// [ Step ] - - - - each describing the input buffers and textures and
+///   :              the vertex/fragment functions and geometry to use.
+///   :_ _ _ _ _ _ _ _ _ _/
+///   v
+/// [ Pipeline ] - Describes a vertex and fragment function to be used
+///                for a `Step`; the `GraphicsAPI` is responsible for
+///                these and they should be constructed and cached
+///                ahead of time.
+///
+/// [ Buffer ] - An abstraction over a GPU buffer.
+///
+/// [ Texture ] - An abstraction over a GPU texture.
+///
 pub fn Renderer(comptime GraphicsAPI: type) type {
     const imagepkg = @import("image.zig").ForAPI(GraphicsAPI);
     const ImageState = imagepkg.State;
