@@ -16,7 +16,6 @@ const themepkg = @import("../config/theme.zig");
 const windows_shell = @import("../config/windows_shell.zig");
 const windows_ssh_hosts = @import("../config/windows_ssh_hosts.zig");
 const input = @import("../input.zig");
-const homedir = @import("../os/homedir.zig");
 const internal_os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -617,14 +616,14 @@ test "win32 clipboard text gets LF line endings" {
 /// one line. Returns null when `text` has no bare LF to expand.
 fn crlfLineEndings(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
     var bare: usize = 0;
-    for (text, 0..) |byte, i| {
-        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) bare += 1;
+    for (0..text.len) |i| {
+        if (isBareLf(text, i)) bare += 1;
     }
     if (bare == 0) return null;
     const out = try alloc.alloc(u8, text.len + bare);
     var o: usize = 0;
     for (text, 0..) |byte, i| {
-        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) {
+        if (isBareLf(text, i)) {
             out[o] = '\r';
             o += 1;
         }
@@ -632,6 +631,10 @@ fn crlfLineEndings(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
         o += 1;
     }
     return out;
+}
+
+fn isBareLf(text: []const u8, i: usize) bool {
+    return text[i] == '\n' and (i == 0 or text[i - 1] != '\r');
 }
 
 test "win32 clipboard writes get CRLF line endings" {
@@ -1384,12 +1387,7 @@ const RecoveryLedgerLock = struct {
     /// sibling file itself being unusable, which usually means the ledger
     /// directory is too.
     fn acquire(alloc: Allocator, ledger_path: []const u8, wait_ms: u32) !?RecoveryLedgerLock {
-        if (std.fs.path.dirname(ledger_path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
-        }
+        try makeParentDirAbsolute(ledger_path);
         const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{ledger_path});
         defer alloc.free(lock_path);
         // Open-if-exists, never truncate: the file's bytes are irrelevant and
@@ -1747,6 +1745,16 @@ fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
     return true;
 }
 
+/// Create the directory `path` sits in when it is missing. Only that one
+/// level: its own parent must already exist.
+fn makeParentDirAbsolute(path: []const u8) !void {
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
 fn unixMillis() u64 {
     return @intCast(@max(std.time.milliTimestamp(), 0));
 }
@@ -1783,13 +1791,12 @@ fn settingsEditedValueMasked(
     reloaded: *const configpkg.Config,
     comptime key: SettingsConfigKey,
 ) bool {
-    if (key == .command and pending.command == null and reloaded._command_defaulted) return false;
     if (key == SettingsConfigKey.@"auto-update-channel") {
         const expected = pending.@"auto-update-channel" orelse build_config.release_channel;
         const actual = reloaded.@"auto-update-channel" orelse build_config.release_channel;
         return expected != actual;
     }
-    return pending.changed(reloaded, comptime key);
+    return settingsDiskValueDiffers(pending, reloaded, key);
 }
 
 /// The most bytes `settingsMaskedKeyNames` writes: every editable key, and a
@@ -1892,16 +1899,26 @@ fn settingsFileProbe(
         error.IsDir => return true,
         else => {
             log.warn("settings save: could not open {s} to check it for edits path={s} err={}", .{ what, path, err });
-            if (detail) |d| {
-                const text = std.fmt.allocPrint(alloc, "{s} {s}", .{ what, path }) catch return error.OutOfMemory;
-                defer alloc.free(text);
-                d.set(alloc, text);
-            }
+            try setSettingsFailureDetail(alloc, detail, "{s} {s}", .{ what, path });
             return error.FileUnopenable;
         },
     };
     file.close();
     return true;
+}
+
+/// Tell `detail`, when the caller gave one, which file a refused save is
+/// about, for the Settings status line.
+fn setSettingsFailureDetail(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    comptime fmt: []const u8,
+    args: anytype,
+) error{OutOfMemory}!void {
+    const d = detail orelse return;
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    d.set(alloc, text);
 }
 
 /// `settingsFileOpenable` for every file the loaded config pulled in: the
@@ -1980,11 +1997,7 @@ fn settingsDiskVerdict(
     // A UTF-16 file that does not decode is skipped whole, with a diagnostic
     // and everything it set missing: as incomplete as one that will not open.
     if (disk._undecodable_file) |path| {
-        if (detail) |d| {
-            const text = std.fmt.allocPrint(alloc, "the file {s}", .{path}) catch return error.OutOfMemory;
-            defer alloc.free(text);
-            d.set(alloc, text);
-        }
+        try setSettingsFailureDetail(alloc, detail, "the file {s}", .{path});
         return error.UnsupportedEncoding;
     }
     return settingsDiskEditConflict(original, pending, disk, state, user_edited);
@@ -2372,12 +2385,7 @@ fn persistRecoveryRecordAtPath(
     path: []const u8,
     attempts: []win32_recovery.StartupAttempt,
 ) !void {
-    if (std.fs.path.dirname(path)) |dir| {
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
+    try makeParentDirAbsolute(path);
     const encoded = try win32_recovery.encodeAlloc(alloc, .{ .attempts = attempts });
     defer alloc.free(encoded);
     const nonce = unixMillis();
@@ -2600,12 +2608,7 @@ const SessionOwnerLock = struct {
 
     /// Null when another live process holds it.
     fn acquire(alloc: Allocator, state_path: []const u8) !?SessionOwnerLock {
-        if (std.fs.path.dirname(state_path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
-        }
+        try makeParentDirAbsolute(state_path);
         const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{state_path});
         defer alloc.free(lock_path);
         const file = std.fs.createFileAbsolute(lock_path, .{
@@ -26808,10 +26811,9 @@ fn rendererTickRepaintMode(
 }
 
 fn surfaceSizeChangeRepaintMode(host: ?*const Host, now_ms: u64) SurfaceRepaintRequestMode {
-    const h = host orelse return surfaceRepaintRequestMode(null, now_ms);
-    if (h.is_live_resize.load(.acquire)) return .update_now;
-    if (resizeSettleActive(h, now_ms)) return .update_now;
-    return surfaceRepaintRequestMode(h, now_ms);
+    const h = host orelse return .queue;
+    if (h.is_live_resize.load(.acquire) or resizeSettleActive(h, now_ms)) return .update_now;
+    return .queue;
 }
 
 fn surfaceSizeChangePrimesRenderer(repaint_mode: SurfaceRepaintRequestMode) bool {
@@ -27015,23 +27017,24 @@ fn isSystemDarkMode() bool {
 
 const immersive_color_set_w = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet");
 
+/// The setting a `WM_SETTINGCHANGE` names in its lParam, or null when it
+/// names none.
+fn settingChangeName(lParam: LPARAM) ?[:0]const u16 {
+    if (lParam == 0) return null;
+    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lParam)));
+    return std.mem.span(name);
+}
+
 fn settingChangeIsImmersiveColorSet(lParam: LPARAM) bool {
-    if (lParam == 0) return false;
-    const raw: usize = @bitCast(lParam);
-    const setting_name: [*:0]const u16 = @ptrFromInt(raw);
-    return std.mem.eql(
-        u16,
-        std.mem.span(setting_name),
-        immersive_color_set_w[0..immersive_color_set_w.len],
-    );
+    const name = settingChangeName(lParam) orelse return false;
+    return std.mem.eql(u16, name, immersive_color_set_w);
 }
 
 fn settingChangeAffectsTheme(lparam: LPARAM) bool {
-    if (lparam == 0) return true;
-    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    const name = settingChangeName(lparam) orelse return true;
     inline for (.{ "Environment", "intl", "Policy" }) |irrelevant| {
         const value = std.unicode.utf8ToUtf16LeStringLiteral(irrelevant);
-        if (std.mem.eql(u16, std.mem.span(name), value)) return false;
+        if (std.mem.eql(u16, name, value)) return false;
     }
     return true;
 }
@@ -28890,13 +28893,14 @@ const FullscreenMonitor = struct {
 };
 
 fn fullscreenRestoreRect(rect: RECT, old_work: RECT, new_work: RECT, old_dpi: u32, new_dpi: u32) RECT {
-    const scaled_width = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.right - rect.left, @intCast(new_dpi), @intCast(old_dpi)) else rect.right - rect.left;
-    const scaled_height = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.bottom - rect.top, @intCast(new_dpi), @intCast(old_dpi)) else rect.bottom - rect.top;
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+    const scale = old_dpi > 0 and new_dpi > 0;
     return fitRectInWork(
         rect.left + new_work.left - old_work.left,
         rect.top + new_work.top - old_work.top,
-        scaled_width,
-        scaled_height,
+        if (scale) sys.MulDiv(width, @intCast(new_dpi), @intCast(old_dpi)) else width,
+        if (scale) sys.MulDiv(height, @intCast(new_dpi), @intCast(old_dpi)) else height,
         new_work,
     );
 }
@@ -29001,24 +29005,17 @@ fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?H
     const step = cascadeStep(sys.GetDpiForWindow(source));
     // One step off the source, and on past any window already there: every
     // new window of a forwarded launch is opened from the same first window.
-    var placed = fitRectInWork(
-        rect.left + step,
-        rect.top + step,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        info.rcWork,
-    );
+    var placed = cascadedRect(rect, step, info.rcWork);
     var steps: u8 = 0;
     while (steps < 8 and app.windowStartsAt(placed, destination)) : (steps += 1) {
-        placed = fitRectInWork(
-            placed.left + step,
-            placed.top + step,
-            placed.right - placed.left,
-            placed.bottom - placed.top,
-            info.rcWork,
-        );
+        placed = cascadedRect(placed, step, info.rcWork);
     }
     return .{ .rect = placed, .maximize = null };
+}
+
+/// `rect` moved `step` down and right, kept inside `work`.
+fn cascadedRect(rect: RECT, step: i32, work: RECT) RECT {
+    return fitRectInWork(rect.left + step, rect.top + step, rect.right - rect.left, rect.bottom - rect.top, work);
 }
 
 test "win32 fullscreen restore translates work areas and scales size to fit" {
@@ -29376,13 +29373,10 @@ fn appendSettingsPayload(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
 /// it leaves a file that mixes encodings, of which the loader reads only the
 /// appended lines. A byte-order mark, or a NUL byte anywhere (UTF-16 and UTF-32
 /// without one), marks such a file; a config never contains NUL.
-fn settingsTextPatchable(raw: []const u8) bool {
-    return settingsTextProblem(raw) == null;
-}
-
-/// Why `raw` cannot be patched, named for the status line: a byte order mark
-/// says UTF-16 (what Windows PowerShell 5.1 writes), bare NUL bytes say a
-/// binary file or UTF-16/UTF-32 without a mark.
+///
+/// Why `raw` cannot be patched, or null when it can, named for the status
+/// line: a byte order mark says UTF-16 (what Windows PowerShell 5.1 writes),
+/// bare NUL bytes say a binary file or UTF-16/UTF-32 without a mark.
 fn settingsTextProblem(raw: []const u8) ?win32_settings.SaveError {
     if (std.mem.startsWith(u8, raw, "\xff\xfe") or std.mem.startsWith(u8, raw, "\xfe\xff")) return error.UnsupportedEncoding;
     if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.BinaryConfig;
@@ -29435,11 +29429,7 @@ fn persistSettings(
     };
     defer alloc.free(raw_before);
     if (settingsTextProblem(raw_before)) |problem| {
-        if (detail) |d| {
-            const text = std.fmt.allocPrint(alloc, "the config file {s}", .{target.path}) catch return error.OutOfMemory;
-            defer alloc.free(text);
-            d.set(alloc, text);
-        }
+        try setSettingsFailureDetail(alloc, detail, "the config file {s}", .{target.path});
         return problem;
     }
 
@@ -29495,7 +29485,6 @@ fn patchOrAppendEdits(
     out: *std.ArrayListUnmanaged(u8),
 ) !void {
     @setEvalBranchQuota(10_000);
-    const ConfigFormatter = @import("../config/formatter.zig");
     const keys_total = comptime std.enums.values(SettingsConfigKey).len;
     var last_line: [keys_total]usize = @splat(std.math.maxInt(usize));
     var lines: std.ArrayListUnmanaged([]const u8) = .{};
@@ -29528,10 +29517,7 @@ fn patchOrAppendEdits(
                 if (last_line[@intFromEnum(key)] == index) {
                     var scratch: std.Io.Writer.Allocating = .init(alloc);
                     defer scratch.deinit();
-                    // An empty list's formatter already emits its reset.
-                    if (repeatable and @field(pending, field.name).list.items.len != 0)
-                        try scratch.writer.print("{s} = \n", .{field.name});
-                    try ConfigFormatter.formatEntry(field.type, field.name, @field(pending, field.name), &scratch.writer);
+                    try writeSettingsEntry(field, @field(pending, field.name), &scratch.writer);
                     const payload = std.mem.trimEnd(u8, scratch.written(), "\n");
                     const has_cr = std.mem.endsWith(u8, line, "\r");
                     const ending: []const u8 = if (has_cr) "\r\n" else if (index + 1 < lines.items.len) "\n" else dominant_ending;
@@ -29561,12 +29547,23 @@ fn patchOrAppendEdits(
                 try out.appendSlice(alloc, dominant_ending);
             var scratch: std.Io.Writer.Allocating = .init(alloc);
             defer scratch.deinit();
-            if (field.type == configpkg.Config.RepeatableString and @field(pending, field.name).list.items.len != 0)
-                try scratch.writer.print("{s} = \n", .{field.name});
-            try ConfigFormatter.formatEntry(field.type, field.name, @field(pending, field.name), &scratch.writer);
+            try writeSettingsEntry(field, @field(pending, field.name), &scratch.writer);
             try appendSettingsPayload(alloc, out, scratch.written(), dominant_ending);
         }
     }
+}
+
+/// One edited setting as config text, each line ending in a newline. A
+/// repeatable list that is not empty starts with `<key> = `, which resets
+/// what lower layers set; an empty list's formatter already emits that reset.
+fn writeSettingsEntry(
+    comptime field: std.builtin.Type.StructField,
+    value: field.type,
+    writer: *std.Io.Writer,
+) !void {
+    if (field.type == configpkg.Config.RepeatableString and value.list.items.len != 0)
+        try writer.print("{s} = \n", .{field.name});
+    try @import("../config/formatter.zig").formatEntry(field.type, field.name, value, writer);
 }
 
 test "win32 settings automatic command is not masked by default resolution" {
@@ -29754,6 +29751,13 @@ test "win32 a config with an unknown key, a bad value, a missing include and a m
     try std.testing.expect(std.mem.startsWith(u8, banner, "4 config problems: "));
 }
 
+/// Free what reporting config problems leaves on `app`: the banner text, then
+/// the problems.
+fn testFreeConfigProblems(app: *App, alloc: Allocator) void {
+    if (app.config_problems_banner) |text| alloc.free(text);
+    app.config_problems.deinit(alloc);
+}
+
 test "win32 config problems raise an error banner that only a clean load takes down" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -29771,8 +29775,7 @@ test "win32 config problems raise an error banner that only a clean load takes d
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29820,8 +29823,7 @@ test "win32 config problems reach every host even without a primary surface" {
         },
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .key = "theme", .message = "missing theme" });
     try std.testing.expect(app.reportConfigProblems(&app.config));
     try std.testing.expectEqual(HostBannerKind.err, first.banner_kind);
@@ -29844,8 +29846,7 @@ test "win32 config problems preserve a pending launch-layout error until dismiss
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     try host.setBanner(.err, "Layout could not be opened.");
     try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
     try std.testing.expect(app.reportConfigProblems(&app.config));
@@ -29871,8 +29872,7 @@ test "win32 config problems wait for a later host and clear queued errors on a c
         .hosts = &.{ .{ .storage = &first }, .{ .storage = &later } },
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     app.config.@"initial-window" = false;
     try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
     // No hosts exist when an initial-window=false process loads its config.
@@ -29909,8 +29909,7 @@ test "win32 config problems list configured fonts once per load without any term
         .hosts = &.{.{ .storage = &host }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     const arena = app.config._arena.?.allocator();
     try app.config.@"font-family".parseCLI(arena, "Consolas");
     try app.config.@"font-family".parseCLI(arena, "Small05 Missing Fallback");
@@ -29946,8 +29945,7 @@ test "win32 a config change that brings other problems refreshes the list and sp
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
 
     // The system switched to dark under `theme = light:Installed,dark:Missing`:
     // the config now in effect carries the other half's problem.
@@ -29993,8 +29991,7 @@ test "win32 a Settings save does not replace the config problems banner with its
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
 
     // No problems: the save says so, as an info banner.
     settingsNotifySuccessThunk(&app, "Settings saved", "");
@@ -30521,14 +30518,14 @@ test "win32 settings save refuses UTF-16 text and leaves the file as it was" {
 }
 
 test "win32 settings text is patchable unless a UTF-16 or UTF-32 marker or NUL says it is not" {
-    try std.testing.expect(settingsTextPatchable(""));
-    try std.testing.expect(settingsTextPatchable("font-size = 14\n"));
-    try std.testing.expect(settingsTextPatchable("\xef\xbb\xbffont-size = 14\n"));
-    try std.testing.expect(settingsTextPatchable("# caf\xe9\n"));
-    try std.testing.expect(!settingsTextPatchable("\xff\xfe"));
-    try std.testing.expect(!settingsTextPatchable("\xfe\xff"));
-    try std.testing.expect(!settingsTextPatchable("a\x00"));
-    try std.testing.expect(!settingsTextPatchable("\x00a"));
+    try std.testing.expect(settingsTextProblem("") == null);
+    try std.testing.expect(settingsTextProblem("font-size = 14\n") == null);
+    try std.testing.expect(settingsTextProblem("\xef\xbb\xbffont-size = 14\n") == null);
+    try std.testing.expect(settingsTextProblem("# caf\xe9\n") == null);
+    try std.testing.expect(settingsTextProblem("\xff\xfe") != null);
+    try std.testing.expect(settingsTextProblem("\xfe\xff") != null);
+    try std.testing.expect(settingsTextProblem("a\x00") != null);
+    try std.testing.expect(settingsTextProblem("\x00a") != null);
 }
 
 test "win32 settings clone does not edit include or shader paths" {
@@ -31193,7 +31190,7 @@ const searchBarSearchedStateForSelected = labels.searchBarSearchedStateForSelect
 
 const searchBarDisplayStateChanged = labels.searchBarDisplayStateChanged;
 
-const profileChromeVisible = labels.profileChromeVisible;
+const profileChromeVisible = win32_chrome_state.profileVisible;
 
 const inspectorVisibilityChangeNeedsHostRelayout = labels.inspectorVisibilityChangeNeedsHostRelayout;
 
@@ -31212,7 +31209,7 @@ const OverlayFocusSlot = labels.OverlayFocusSlot;
 
 const nextVisibleOverlayFocusSlot = labels.nextVisibleOverlayFocusSlot;
 
-const inspectorChromeVisible = labels.inspectorChromeVisible;
+const inspectorChromeVisible = win32_chrome_state.inspectorVisible;
 
 const inspectorBannerStateChanged = labels.inspectorBannerStateChanged;
 
@@ -31700,9 +31697,6 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
 /// Native modal delivery tests run on a private desktop without a shell,
 /// renderer, clipboard operation, or COM initialization.
 const Pkg19NativeDeliveryTest = struct {
-    extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
-    extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
-    extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
     extern "user32" fn EndMenu() callconv(.winapi) BOOL;
 
     const FakeUia = struct {
@@ -31784,24 +31778,6 @@ const Pkg19NativeDeliveryTest = struct {
             }
         }
     };
-
-    fn run(comptime body: anytype) !void {
-        const Thread = struct {
-            fn entry(desktop: *anyopaque, result: *anyerror!void) void {
-                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
-            }
-        };
-        var name_buf: [80]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "noctty-pkg19-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
-        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
-        defer std.testing.allocator.free(wide_name);
-        const desktop = CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
-        defer _ = CloseDesktop(desktop);
-        var result: anyerror!void = {};
-        const thread = try std.Thread.spawn(.{}, Thread.entry, .{ desktop, &result });
-        thread.join();
-        try result;
-    }
 
     fn pending(fake: *FakeUia) !*DeferredUiaDisconnect {
         const value = try std.heap.page_allocator.create(DeferredUiaDisconnect);
@@ -32008,12 +31984,12 @@ const Pkg19NativeDeliveryTest = struct {
 
 test "win32 App delivery drains title and UIA in native popup while close and quit wait" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.popupBody);
+    try runOnHiddenDesktop(Pkg19NativeDeliveryTest.popupBody);
 }
 
 test "win32 App delivery validates owned tokens by kind HWND and single consumption" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.capabilitiesBody);
+    try runOnHiddenDesktop(Pkg19NativeDeliveryTest.capabilitiesBody);
 }
 
 fn postDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) bool {
@@ -32400,6 +32376,11 @@ fn bannerButtonMouse(host: *Host, hwnd: HWND, button: BannerButton, msg: UINT, l
     }
 }
 
+fn paintBannerClient(host: *Host, hwnd: HWND, hdc: HDC) void {
+    var client: RECT = undefined;
+    if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+}
+
 fn hostBannerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     if (getHost(hwnd)) |host| {
         switch (msg) {
@@ -32423,14 +32404,11 @@ fn hostBannerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 var ps: PAINTSTRUCT = undefined;
                 const hdc = sys.BeginPaint(hwnd, &ps) orelse return 0;
                 defer _ = sys.EndPaint(hwnd, &ps);
-                var client: RECT = undefined;
-                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                paintBannerClient(host, hwnd, hdc);
                 return 0;
             },
             c.WM_PRINTCLIENT => {
-                const hdc: HDC = @ptrFromInt(wParam);
-                var client: RECT = undefined;
-                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                paintBannerClient(host, hwnd, @ptrFromInt(wParam));
                 return 0;
             },
             c.WM_MOUSEMOVE => {
@@ -32734,7 +32712,7 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 if (msg == c.WM_SYSKEYDOWN) {
                     v.noteChromeKeyInput(c.VK_TAB);
                     if (searchToggleKey(surface, wParam, lParam)) return 0;
-                } else if (surface.search_toggle_keys.consumeChar(wParam, lParamBits(lParam))) {
+                } else if (surface.search_toggle_keys.consumeChar(lParamBits(lParam))) {
                     return 0;
                 }
             }
@@ -33160,7 +33138,7 @@ fn searchEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             },
             // The WM_SYSCHAR of Alt+R / Alt+C / Alt+W; see below.
             c.WM_SYSCHAR => {
-                if (surface.search_toggle_keys.consumeChar(wParam, lParamBits(lParam))) return 0;
+                if (surface.search_toggle_keys.consumeChar(lParamBits(lParam))) return 0;
             },
             c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
                 v.noteChromeKeyInput(wParam);
@@ -33409,14 +33387,13 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             // belt-and-braces path for a missed or unavailable hook: a
             // cloaked host renders nothing, so a stale `surfaces_visible`
             // would otherwise mean a permanently frozen window.
-            if (host) |v| v.refreshSurfaceVisibility();
-            if ((wParam & 0xFFFF) != c.WA_INACTIVE) {
-                // The user brought this window forward: its active tab is
-                // seen even if focus lands on the chrome, not a terminal.
-                if (host) |v| v.app.acknowledgeTab(v, v.active_tab);
-            }
-            if ((wParam & 0xFFFF) == c.WA_INACTIVE) {
-                if (host) |v| {
+            if (host) |v| {
+                v.refreshSurfaceVisibility();
+                if ((wParam & 0xFFFF) != c.WA_INACTIVE) {
+                    // The user brought this window forward: its active tab is
+                    // seen even if focus lands on the chrome, not a terminal.
+                    v.app.acknowledgeTab(v, v.active_tab);
+                } else {
                     // The tab tooltip is a top-level popup, so losing the
                     // window is not enough to take it down: a pointer that
                     // never left the tab sends no WM_MOUSELEAVE, and the popup
@@ -35117,18 +35094,18 @@ fn terminalAccessibilityScroll(ctx: *anyopaque, request: win32_uia.widgets.Scrol
     if (!surface.core_initialized) return error.ElementNotAvailable;
     const core = &surface.core_surface;
     if (!core.renderer_state.mutex.tryLock()) return error.WouldBlock;
-    const scrolled = @import("win32_uia/text.zig").scrollFrozenRange(
-        core.alloc,
-        core.renderer_state.terminal,
-        request.token,
-        request.document_window,
-        request.absolute_row,
-        request.align_to_top,
-    ) catch |err| {
-        core.renderer_state.mutex.unlock();
-        return err;
+    const scrolled = scrolled: {
+        // Unlocked before the refresh below.
+        defer core.renderer_state.mutex.unlock();
+        break :scrolled try @import("win32_uia/text.zig").scrollFrozenRange(
+            core.alloc,
+            core.renderer_state.terminal,
+            request.token,
+            request.document_window,
+            request.absolute_row,
+            request.align_to_top,
+        );
     };
-    core.renderer_state.mutex.unlock();
     if (scrolled) try core.refreshCallback();
 }
 

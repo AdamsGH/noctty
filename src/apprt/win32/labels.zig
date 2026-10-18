@@ -299,8 +299,8 @@ pub const SearchToggleKeys = struct {
         return role;
     }
 
-    pub fn consumeChar(self: *SearchToggleKeys, ch: WPARAM, bits: usize) bool {
-        _ = ch;
+    /// `bits` is the WM_SYSCHAR's lParam; its character does not matter.
+    pub fn consumeChar(self: *SearchToggleKeys, bits: usize) bool {
         const pending = self.pending_scan;
         self.pending_scan = null;
         return if (pending) |scan| scan == ((bits >> 16) & 0x1FF) else false;
@@ -470,10 +470,6 @@ pub fn searchBarDisplayStateChanged(
         search_bar.selected != selected;
 }
 
-pub fn profileChromeVisible(overlay_mode: HostOverlayMode) bool {
-    return win32_chrome_state.profileVisible(overlay_mode);
-}
-
 pub fn inspectorVisibilityChangeNeedsHostRelayout(changed: bool) bool {
     return changed;
 }
@@ -609,10 +605,6 @@ pub fn nextVisibleOverlayFocusSlot(
         )) return candidate;
     }
     return null;
-}
-
-pub fn inspectorChromeVisible(overlay_mode: HostOverlayMode) bool {
-    return win32_chrome_state.inspectorVisible(overlay_mode);
 }
 
 pub fn inspectorBannerStateChanged(
@@ -4276,18 +4268,19 @@ test "win32 search toggle accelerators need Alt without Ctrl, Shift or AltGr" {
     const r_scan = 0x13 << 16;
     const c_scan = 0x2E << 16;
     try std.testing.expectEqual(@as(?SearchBarButtonRole, .regex), keys.keyDown('R', alt, r_scan));
-    // Cyrillic K on the R key is consumed just like Latin r.
-    try std.testing.expect(keys.consumeChar(0x041A, r_scan));
-    try std.testing.expect(!keys.consumeChar('r', r_scan));
+    // The character is never read, so Cyrillic K on the R key is consumed
+    // just like Latin r: only the one character the press typed, though.
+    try std.testing.expect(keys.consumeChar(r_scan));
+    try std.testing.expect(!keys.consumeChar(r_scan));
     _ = keys.keyDown('C', alt, c_scan);
-    try std.testing.expect(keys.consumeChar('C', c_scan));
+    try std.testing.expect(keys.consumeChar(c_scan));
     _ = keys.keyDown('R', alt, r_scan);
-    try std.testing.expect(!keys.consumeChar('c', c_scan));
+    try std.testing.expect(!keys.consumeChar(c_scan));
     _ = keys.keyDown('R', .{ .alt = true, .ctrl = true }, r_scan);
-    try std.testing.expect(!keys.consumeChar(0x20AC, r_scan));
+    try std.testing.expect(!keys.consumeChar(r_scan));
     _ = keys.keyDown('R', alt, r_scan);
     _ = keys.keyDown('X', alt, r_scan);
-    try std.testing.expect(!keys.consumeChar('x', r_scan));
+    try std.testing.expect(!keys.consumeChar(r_scan));
 }
 
 test "win32 a tab context menu hands focus back to the strip only from the keyboard and without an overlay" {
@@ -4487,22 +4480,6 @@ test "win32 overlayPaintCacheDirty ignores repaint-only dirtiness" {
     try std.testing.expect(overlayPaintCacheDirty(true, .search, cached, cached, null));
     try std.testing.expect(overlayPaintCacheDirty(false, .search, null, cached, null));
     try std.testing.expect(overlayPaintCacheDirty(false, .profile, cached, cached, null));
-}
-
-test "win32 profile chrome visibility requires the profile overlay" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    inline for (std.meta.tags(HostOverlayMode)) |mode| {
-        try std.testing.expectEqual(mode == .profile, profileChromeVisible(mode));
-    }
-}
-
-test "win32 inspector chrome visibility requires no overlay" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    inline for (std.meta.tags(HostOverlayMode)) |mode| {
-        try std.testing.expectEqual(mode == .none, inspectorChromeVisible(mode));
-    }
 }
 
 test "win32 inspector visibility changes require host relayout" {
