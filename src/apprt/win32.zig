@@ -14673,19 +14673,23 @@ const Host = struct {
         // Arm a one-shot WM_NCMOUSELEAVE so we can clear the hover
         // when the cursor exits the non-client area. Without this the
         // last-hovered button would paint highlighted indefinitely.
-        if (!self.caption_track_armed) {
-            var track: TRACKMOUSEEVENT = .{
-                .cbSize = @sizeOf(TRACKMOUSEEVENT),
-                .dwFlags = c.TME_LEAVE | c.TME_NONCLIENT,
-                .hwndTrack = hwnd,
-                .dwHoverTime = 0,
-            };
-            if (sys.TrackMouseEvent(&track) != 0) {
-                self.caption_track_armed = true;
-            }
+        if (!self.caption_track_armed and trackMouseLeave(hwnd, c.TME_LEAVE | c.TME_NONCLIENT)) {
+            self.caption_track_armed = true;
         }
 
         return null; // fall through to DefWindowProcW for native feedback
+    }
+
+    /// `TrackMouseEvent` for `hwnd` with `flags` (a leave, its non-client or
+    /// cancel form), no hover. True when it succeeded.
+    fn trackMouseLeave(hwnd: HWND, flags: DWORD) bool {
+        var track: TRACKMOUSEEVENT = .{
+            .cbSize = @sizeOf(TRACKMOUSEEVENT),
+            .dwFlags = flags,
+            .hwndTrack = hwnd,
+            .dwHoverTime = 0,
+        };
+        return sys.TrackMouseEvent(&track) != 0;
     }
 
     fn handleNcMouseLeave(self: *Host) void {
@@ -17808,22 +17812,7 @@ const Host = struct {
             try appendOwnedString(self.app.core_app.alloc, &self.selected_profile_key, null);
             return false;
         }
-        if (preferredProfileIndex(
-            profiles,
-            self.selected_profile_key,
-            self.app.launcher_profile_key,
-            self.app.launcher_profile_hint,
-            self.selected_profile,
-        )) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return true;
-        }
-        if (self.app.defaultShellProfileIndex(profiles)) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return true;
-        }
-        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-        _ = try self.setSelectedProfileIndex(self.selected_profile);
+        try self.selectPreferredProfile(profiles);
         return true;
     }
 
@@ -17840,22 +17829,24 @@ const Host = struct {
         const profiles = self.profiles orelse return;
         if (profiles.len == 0) return;
         self.app.applyLauncherQuickSlotPreferences(profiles);
-        if (preferredProfileIndex(
+        try self.selectPreferredProfile(profiles);
+    }
+
+    /// Select the profile `preferredProfileIndex` picks, else the default
+    /// shell's, else the one at the current index (the first when that is
+    /// past the end). `profiles` is not empty.
+    fn selectPreferredProfile(self: *Host, profiles: []const windows_shell.Profile) !void {
+        const index = preferredProfileIndex(
             profiles,
             self.selected_profile_key,
             self.app.launcher_profile_key,
             self.app.launcher_profile_hint,
             self.selected_profile,
-        )) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return;
-        }
-        if (self.app.defaultShellProfileIndex(profiles)) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return;
-        }
-        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-        _ = try self.setSelectedProfileIndex(self.selected_profile);
+        ) orelse self.app.defaultShellProfileIndex(profiles) orelse current: {
+            if (self.selected_profile >= profiles.len) self.selected_profile = 0;
+            break :current self.selected_profile;
+        };
+        _ = try self.setSelectedProfileIndex(index);
     }
 
     /// For actions that need a list now (open a profile by key or index,
@@ -17868,10 +17859,7 @@ const Host = struct {
         {
             return try self.reloadProfiles();
         }
-        const profiles = self.profiles.?;
-        if (profiles.len == 0) return false;
-        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-        return true;
+        return self.clampSelectedProfile();
     }
 
     /// The picker's and the palette's way to a list: never discovers on
@@ -17883,6 +17871,12 @@ const Host = struct {
             // With no worker to run it, the discovery ran on this thread.
             if (self.profiles == null) return false;
         }
+        return self.clampSelectedProfile();
+    }
+
+    /// Whether the loaded list has a profile to select, with the selection
+    /// moved to the first one when it is past the end.
+    fn clampSelectedProfile(self: *Host) bool {
         const profiles = self.profiles.?;
         if (profiles.len == 0) return false;
         if (self.selected_profile >= profiles.len) self.selected_profile = 0;
@@ -18523,11 +18517,15 @@ const Host = struct {
 
     fn refreshModeIndicatorAt(self: *Host, now_ms: u64) !void {
         const surface = self.activeSurface();
-        const since = if (surface) |s| s.key_sequence_since_ms else null;
-        const delay: ?u32 = if (since) |start|
-            if (now_ms -| start < 250) @intCast(250 - (now_ms -| start)) else null
-        else
-            null;
+        // A pending key sequence shows in the banner only after this long;
+        // until then a timer comes back for it.
+        const sequence_delay_ms = 250;
+        const delay: ?u32 = delay: {
+            const active = surface orelse break :delay null;
+            const start = active.key_sequence_since_ms orelse break :delay null;
+            const elapsed = now_ms -| start;
+            break :delay if (elapsed < sequence_delay_ms) @intCast(sequence_delay_ms - elapsed) else null;
+        };
         // Recompute from the active surface on every tick. A queued tick from
         // a canceled sequence or another tab cannot resurrect its indicator.
         if (self.hwnd) |hwnd| {
@@ -18770,10 +18768,8 @@ const Host = struct {
         if (text.len == 0) return 0;
         const hdc = sys.GetDC(hwnd) orelse return 0;
         defer _ = sys.ReleaseDC(hwnd, hdc);
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(hdc, pf);
-        };
+        const prev_font = self.selectChromeFont(hdc);
+        defer restoreFont(hdc, prev_font);
         var rect = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         _ = sys.DrawTextW(hdc, text.ptr, @intCast(text.len), &rect, c.DT_CALCRECT | c.DT_SINGLELINE | c.DT_NOPREFIX);
         return rect.right - rect.left;
@@ -18798,13 +18794,7 @@ const Host = struct {
             if (self.banner_pointer_inside) {
                 // A leave armed before the hide could otherwise arrive after
                 // the next show and start a countdown under a resting pointer.
-                var track: TRACKMOUSEEVENT = .{
-                    .cbSize = @sizeOf(TRACKMOUSEEVENT),
-                    .dwFlags = c.TME_LEAVE | c.TME_CANCEL,
-                    .hwndTrack = hwnd,
-                    .dwHoverTime = 0,
-                };
-                _ = sys.TrackMouseEvent(&track);
+                _ = trackMouseLeave(hwnd, c.TME_LEAVE | c.TME_CANCEL);
                 self.banner_pointer_inside = false;
             }
             // A leave for a hidden button may never come; a stale hover
@@ -18881,13 +18871,7 @@ const Host = struct {
     fn bannerPointerMoved(self: *Host) void {
         if (self.banner_pointer_inside) return;
         const hwnd = self.banner_hwnd orelse return;
-        var track: TRACKMOUSEEVENT = .{
-            .cbSize = @sizeOf(TRACKMOUSEEVENT),
-            .dwFlags = c.TME_LEAVE,
-            .hwndTrack = hwnd,
-            .dwHoverTime = 0,
-        };
-        _ = sys.TrackMouseEvent(&track);
+        _ = trackMouseLeave(hwnd, c.TME_LEAVE);
         self.banner_pointer_inside = true;
         self.syncBannerExpiry();
     }
@@ -18991,10 +18975,8 @@ const Host = struct {
         const accent = if (self.banner_text != null and self.banner_kind == .err) theme.error_fg else theme.info_fg;
         fillSolidRect(hdc, parts.stripe, accent);
 
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(hdc, pf);
-        };
+        const prev_font = self.selectChromeFont(hdc);
+        defer restoreFont(hdc, prev_font);
         const prev_bk_mode = sys.SetBkMode(hdc, c.TRANSPARENT);
         defer _ = sys.SetBkMode(hdc, prev_bk_mode);
         const prev_color = sys.SetTextColor(hdc, accent);
@@ -19036,10 +19018,8 @@ const Host = struct {
                 .bottom = draw.rcItem.bottom - inset,
             }, colors.bg, if (primary) theme.button_accept_focus_ring else theme.button_overlay_focus_ring, self.scaled(3));
         }
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(draw.hDC, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(draw.hDC, pf);
-        };
+        const prev_font = self.selectChromeFont(draw.hDC);
+        defer restoreFont(draw.hDC, prev_font);
         _ = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
         _ = sys.SetTextColor(draw.hDC, if (bare) theme.text_secondary else colors.fg);
         const label = self.bannerButtonLabel(button);
@@ -19849,12 +19829,19 @@ const Host = struct {
         return false;
     }
 
-    fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
-        const self: *Host = @ptrCast(@alignCast(ctx));
+    /// The on-screen button of tab `tab_id` while the tab strip offers its
+    /// close button, which is what its UIA close element stands for.
+    fn closableTabButton(self: *Host, tab_id: usize) ?HWND {
         if (tabCloseAction(self.tabs.items.len) == .none or !self.shouldShowTabBar()) return null;
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return null;
         const hwnd = self.tabs.items[index].button_hwnd orelse return null;
         if (sys.IsWindowVisible(hwnd) == 0) return null;
+        return hwnd;
+    }
+
+    fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        const hwnd = self.closableTabButton(tab_id) orelse return null;
         var rect: RECT = undefined;
         if (sys.GetWindowRect(hwnd, &rect) == 0) return null;
         // Same close zone as the pointer path, always at full alpha. An
@@ -19870,10 +19857,7 @@ const Host = struct {
 
     fn tabCloseUiaInvoke(ctx: *anyopaque, tab_id: usize) bool {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        if (tabCloseAction(self.tabs.items.len) == .none or !self.shouldShowTabBar()) return false;
-        const index = self.findTabIndexById(@intCast(tab_id)) orelse return false;
-        const hwnd = self.tabs.items[index].button_hwnd orelse return false;
-        if (sys.IsWindowVisible(hwnd) == 0) return false;
+        const hwnd = self.closableTabButton(tab_id) orelse return false;
         return sys.PostMessageW(hwnd, win32_uia.widgets.tab_close_message, tab_id, 0) != 0;
     }
 
@@ -20377,10 +20361,8 @@ const Host = struct {
         // cache and is released when the control's `WM_PAINT` returns, so
         // nothing leaks today, but leaving half the state changed is how
         // the next handler added here inherits a surprise.
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(draw.hDC, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(draw.hDC, pf);
-        };
+        const prev_font = self.selectChromeFont(draw.hDC);
+        defer restoreFont(draw.hDC, prev_font);
         const prev_bk_mode = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
         defer _ = sys.SetBkMode(draw.hDC, prev_bk_mode);
         const prev_color = sys.SetTextColor(draw.hDC, self.confirmPromptTextColor(title));
@@ -21331,6 +21313,17 @@ const Host = struct {
             self.search_icon_font_resolved = true;
         }
         return self.search_icon_font;
+    }
+
+    /// Select the chrome font into `hdc`, returning what it replaced for
+    /// `restoreFont`; null, and nothing selected, when there is none.
+    fn selectChromeFont(self: *const Host, hdc: HDC) HGDIOBJ {
+        const font = self.chrome_font orelse return null;
+        return sys.SelectObject(hdc, font);
+    }
+
+    fn restoreFont(hdc: HDC, previous: HGDIOBJ) void {
+        if (previous) |font| _ = sys.SelectObject(hdc, font);
     }
 
     /// Monospace font for the confirm preview. `window-title-font-family`
@@ -23048,8 +23041,7 @@ const Host = struct {
     /// a 0 px caption row. Its top band lies inside the client area, where
     /// a terminal pane with no tab bar above it covers the band.
     fn resizesFrom(self: *Host, lParam: LPARAM) bool {
-        if ((self.clientCaptionHeight() orelse return false) != 0) return false;
-        const ht = self.handleNcHitTest(self.hwnd orelse return false, lParam) orelse return false;
+        const ht = self.zeroCaptionHitTest(lParam) orelse return false;
         return ht >= c.HTLEFT and ht <= c.HTBOTTOMRIGHT;
     }
 
@@ -23059,9 +23051,15 @@ const Host = struct {
     /// which is narrower above 96 DPI (13 vs 16 px at 192), so a side strip
     /// overlaps a button's outer columns there; the button keeps those.
     fn resizesFromTop(self: *Host, lParam: LPARAM) bool {
-        if ((self.clientCaptionHeight() orelse return false) != 0) return false;
-        const ht = self.handleNcHitTest(self.hwnd orelse return false, lParam) orelse return false;
+        const ht = self.zeroCaptionHitTest(lParam) orelse return false;
         return ht == c.HTTOP or ht == c.HTTOPLEFT or ht == c.HTTOPRIGHT;
+    }
+
+    /// The host's `WM_NCHITTEST` answer at `lParam` when it has a 0 px
+    /// caption row, else null.
+    fn zeroCaptionHitTest(self: *Host, lParam: LPARAM) ?LRESULT {
+        if ((self.clientCaptionHeight() orelse return null) != 0) return null;
+        return self.handleNcHitTest(self.hwnd orelse return null, lParam);
     }
 
     fn tabBarHeight(self: *Host) i32 {
@@ -23295,14 +23293,13 @@ const Host = struct {
     /// `prompt` borrows; null leaves the prompt as it was (the tab in front,
     /// or no memory for the words).
     fn nameBackgroundTab(self: *Host, prompt: *ConfirmPrompt, count: usize, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
-        const found = self.app.findTabForSurface(surface) orelse return null;
-        if (found.host != self or found.index == self.active_tab) return null;
+        const index = self.backgroundTabIndex(surface) orelse return null;
         // The title needs no memory, so it names the tab even if the body cannot.
-        prompt.title = labels.backgroundTabClosePromptTitle(title_buf, found.index + 1);
+        prompt.title = labels.backgroundTabClosePromptTitle(title_buf, index + 1);
         const body = labels.buildBackgroundTabClosePromptBody(
             self.app.core_app.alloc,
             count,
-            found.index + 1,
+            index + 1,
             surface.effectiveTitle(),
         ) catch return null;
         prompt.body = body;
@@ -23312,17 +23309,24 @@ const Host = struct {
     /// The same for the prompt of a terminal that closes by itself, which
     /// `Surface.close` raises whatever tab the terminal is in.
     fn nameBackgroundTerminal(self: *Host, prompt: *ConfirmPrompt, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
-        const found = self.app.findTabForSurface(surface) orelse return null;
-        if (found.host != self or found.index == self.active_tab) return null;
-        prompt.title = labels.backgroundTerminalClosePromptTitle(title_buf, found.index + 1);
+        const index = self.backgroundTabIndex(surface) orelse return null;
+        prompt.title = labels.backgroundTerminalClosePromptTitle(title_buf, index + 1);
         const body = labels.buildBackgroundTerminalClosePromptBody(
             self.app.core_app.alloc,
-            found.index + 1,
+            index + 1,
             surface.effectiveTitle(),
             surface.core_initialized and surface.core_surface.child_exited,
         ) catch return null;
         prompt.body = body;
         return body;
+    }
+
+    /// The index of the tab of this window that holds `surface`, unless
+    /// that tab is the one in front.
+    fn backgroundTabIndex(self: *Host, surface: *Surface) ?usize {
+        const found = self.app.findTabForSurface(surface) orelse return null;
+        if (found.host != self or found.index == self.active_tab) return null;
+        return found.index;
     }
 
     /// Shown on screen, minimized included; a hidden quick terminal is not.
@@ -23988,13 +23992,7 @@ const Host = struct {
         // Same rect `layout` uses, so a title change while minimized does not
         // cut every label down to a 0 px strip that survives the restore.
         const rect = (try self.layoutClientRect()) orelse return false;
-        const width = @max(0, rect.right - rect.left);
-        const right_buttons_width = self.rightButtonsWidth();
-        const caption_buttons_w = self.captionButtonsWidth();
-        const tab_area_width = @max(1, width - right_buttons_width - caption_buttons_w);
-        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
-        const visible_count = @max(@as(i32, 1), @as(i32, @intCast(tab_range.count)));
-        const button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width));
+        const button_width = self.tabStripGeometry(@max(0, rect.right - rect.left)).button_width;
         const label_max_width = hostTabLabelMaxWidth(button_width, self.current_dpi);
         var tooltip_title_changed = false;
         var button_created = false;
@@ -24145,17 +24143,35 @@ const Host = struct {
         try self.ensureChromeButtons();
     }
 
-    fn layoutChromeForRect(self: *Host, rect: RECT, changed: *bool) bool {
-        const width = @max(0, rect.right - rect.left);
-        const right_buttons_width = self.rightButtonsWidth();
+    const TabStripGeometry = struct {
+        /// The tabs shown, as `visibleTabRange` picks them.
+        start: usize,
+        count: usize,
+        button_width: i32,
+    };
+
+    /// Which tabs the strip shows in a client area `width` px wide, and how
+    /// wide each tab button is. `syncTabButtons` budgets the labels to the
+    /// same width `layoutChromeForRect` gives the buttons.
+    fn tabStripGeometry(self: *const Host, width: i32) TabStripGeometry {
         // When integrated titlebar is active, reserve the rightmost
         // 3 × caption_button_w pixels for min/max/close so the
         // [+][▾] cluster and tab strip don't collide with them.
+        const tab_area_width = @max(1, width - self.rightButtonsWidth() - self.captionButtonsWidth());
+        const range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
+        const visible_count = @max(@as(i32, 1), @as(i32, @intCast(range.count)));
+        return .{
+            .start = range.start,
+            .count = range.count,
+            .button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width)),
+        };
+    }
+
+    fn layoutChromeForRect(self: *Host, rect: RECT, changed: *bool) bool {
+        const width = @max(0, rect.right - rect.left);
         const caption_buttons_w = self.captionButtonsWidth();
-        const tab_area_width = @max(1, width - right_buttons_width - caption_buttons_w);
-        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
-        const visible_count = @max(@as(i32, 1), @as(i32, @intCast(tab_range.count)));
-        const button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width));
+        const tab_strip = self.tabStripGeometry(width);
+        const button_width = tab_strip.button_width;
         const button_y = self.scaled(3);
         // Scale button height with the actual tab-bar height so
         // buttons fill the integrated-titlebar row in Win11 (40 px)
@@ -24175,9 +24191,9 @@ const Host = struct {
             if (tab.button_hwnd) |button_hwnd| {
                 if (tabStripChildVisible(
                     tab_strip_visible,
-                    i >= tab_range.start and i < tab_range.start + tab_range.count,
+                    i >= tab_strip.start and i < tab_strip.start + tab_strip.count,
                 )) {
-                    const visible_index: i32 = @intCast(i - tab_range.start);
+                    const visible_index: i32 = @intCast(i - tab_strip.start);
                     const tab_left = visible_index * button_width;
                     changed.* = applyChromeChildRect(
                         button_hwnd,
@@ -24219,7 +24235,7 @@ const Host = struct {
         // rect so a screen reader reading by position lands on the tabs
         // rather than on a degenerate box at the window origin.
         if (self.tab_container_hwnd) |container_hwnd| {
-            const visible_tabs: i32 = @intCast(tab_range.count);
+            const visible_tabs: i32 = @intCast(tab_strip.count);
             if (tabStripChildVisible(tab_strip_visible, visible_tabs > 0)) {
                 changed.* = applyChromeChildRect(
                     container_hwnd,
@@ -24623,6 +24639,35 @@ const Host = struct {
         );
     }
 
+    /// Put `surface` where `placement` says: its docked search frame (or
+    /// none), its pane, then what a moved or newly shown pane needs
+    /// (`surfaceLayoutRuntimeSync`). A search frame at the top of the
+    /// content area pushes `banner_top` below it. Returns whether anything
+    /// moved.
+    fn applySurfacePlacement(
+        surface: *Surface,
+        placement: win32_layout.SurfacePlacement,
+        content_top: i32,
+        visibility_changed: bool,
+        banner_top: *i32,
+    ) !bool {
+        var changed = false;
+        if (placement.search_frame_rect) |search_frame_rect| {
+            changed = try surface.layoutSearchBarControls(layoutRectToWin32(search_frame_rect), true);
+            if (search_frame_rect.top == content_top) banner_top.* = @max(banner_top.*, search_frame_rect.bottom);
+        } else {
+            changed = surface.hideSearchBarControls();
+        }
+        var pane_rect_changed = false;
+        if (surface.hwnd) |surface_hwnd| {
+            pane_rect_changed = applyChildRect(surface_hwnd, &surface.placement, layoutRectToWin32(placement.pane_rect));
+        }
+        const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
+        if (runtime_sync.scrollbar_refresh) try surface.refreshScrollbarWindow();
+        if (runtime_sync.core_size_sync) surface.syncCoreSizeFromClientRect();
+        return changed or pane_rect_changed;
+    }
+
     fn layout(self: *Host) !void {
         const rect = (try self.layoutClientRect()) orelse return;
         var chrome_layout_changed = false;
@@ -24676,32 +24721,13 @@ const Host = struct {
                     entry.view.search_bar.visible,
                     search_bar_height,
                 );
-                if (placement.search_frame_rect) |search_frame_rect| {
-                    content_layout_changed = (try entry.view.layoutSearchBarControls(
-                        layoutRectToWin32(search_frame_rect),
-                        true,
-                    )) or content_layout_changed;
-                    if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                } else {
-                    content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                }
-                const pane_rect = layoutRectToWin32(placement.pane_rect);
-                var pane_rect_changed = false;
-                if (entry.view.hwnd) |surface_hwnd| {
-                    pane_rect_changed = applyChildRect(
-                        surface_hwnd,
-                        &entry.view.placement,
-                        pane_rect,
-                    );
-                    content_layout_changed = pane_rect_changed or content_layout_changed;
-                }
-                const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                if (runtime_sync.scrollbar_refresh) {
-                    try entry.view.refreshScrollbarWindow();
-                }
-                if (runtime_sync.core_size_sync) {
-                    entry.view.syncCoreSizeFromClientRect();
-                }
+                content_layout_changed = (try applySurfacePlacement(
+                    entry.view,
+                    placement,
+                    content_rect.top,
+                    visibility_changed,
+                    &banner_top,
+                )) or content_layout_changed;
                 entry.view.syncContentScaleToHostDpi();
             }
         } else {
@@ -24717,7 +24743,7 @@ const Host = struct {
                     if (entry.view.window_visible != on_screen) continue;
                     const visibility_changed = !entry.view.window_visible;
                     content_layout_changed = content_layout_changed or visibility_changed;
-                    if (entry.view.hwnd) |surface_hwnd| {
+                    if (entry.view.hwnd != null) {
                         const placement = self.splitPanePlacement(
                             content_rect,
                             spatial,
@@ -24725,29 +24751,13 @@ const Host = struct {
                             has_multi_panes,
                             entry.view.search_bar.visible,
                         );
-                        if (placement.search_frame_rect) |search_frame_rect| {
-                            content_layout_changed = (try entry.view.layoutSearchBarControls(
-                                layoutRectToWin32(search_frame_rect),
-                                true,
-                            )) or content_layout_changed;
-                            if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                        } else {
-                            content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                        }
-                        const pane_rect = layoutRectToWin32(placement.pane_rect);
-                        const pane_rect_changed = applyChildRect(
-                            surface_hwnd,
-                            &entry.view.placement,
-                            pane_rect,
-                        );
-                        content_layout_changed = pane_rect_changed or content_layout_changed;
-                        const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                        if (runtime_sync.scrollbar_refresh) {
-                            try entry.view.refreshScrollbarWindow();
-                        }
-                        if (runtime_sync.core_size_sync) {
-                            entry.view.syncCoreSizeFromClientRect();
-                        }
+                        content_layout_changed = (try applySurfacePlacement(
+                            entry.view,
+                            placement,
+                            content_rect.top,
+                            visibility_changed,
+                            &banner_top,
+                        )) or content_layout_changed;
                     }
                     // In its slot first: shown at the rect it had before, a pane
                     // that came out of a zoom would cover its neighbours.
@@ -25536,10 +25546,8 @@ const Host = struct {
         const alloc = self.app.core_app.alloc;
         const theme = &self.app.resolved_theme;
 
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(hdc, pf);
-        };
+        const prev_font = self.selectChromeFont(hdc);
+        defer restoreFont(hdc, prev_font);
 
         var client_rect: RECT = undefined;
         if (sys.GetClientRect(hwnd, &client_rect) == 0) return;
