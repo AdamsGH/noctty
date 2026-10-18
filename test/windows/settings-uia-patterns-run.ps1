@@ -418,7 +418,8 @@ if (-not $WorkerDesktop) {
         # Other apps may refresh existing jump lists while the maintainer uses
         # this shared host. Portable builds must create no destination, and the
         # real noctty destination must stay unchanged (lead's D12/#417 contract).
-        $newDestinations = @($after.destinations | Where-Object { $_.name -notin $before.destinations.name })
+        $beforeNames = @($before.destinations | ForEach-Object { $_.name })
+        $newDestinations = @($after.destinations | Where-Object { $_.name -notin $beforeNames })
         $realBefore = @($before.destinations | Where-Object name -eq 'c2214d6ebc43ff3f.customDestinations-ms')
         $realAfter = @($after.destinations | Where-Object name -eq 'c2214d6ebc43ff3f.customDestinations-ms')
         $inputDuringBatch = [uint64]$after.input.IdleMilliseconds -le ([uint64]$after.input.TickCount - [uint64]$before.input.TickCount)
