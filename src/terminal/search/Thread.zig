@@ -1258,7 +1258,9 @@ test {
         // loop or callback data while the search thread still uses them.
         defer {
             thread.stop.notify() catch |err| {
-                std.debug.print("search-test stop notification failed err={}\n", .{err});
+                // No safe teardown or join is possible without stopping
+                // the worker. Fail this test process instead of hanging.
+                std.debug.panic("search-test stop notification failed err={}", .{err});
             };
             os_thread.join();
         }
