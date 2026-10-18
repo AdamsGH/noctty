@@ -2672,6 +2672,7 @@ pub const App = struct {
     /// Completed `reconfigureTheme` passes; a test reads it to prove that a
     /// settings preview which cannot change the theme does not run one.
     theme_rebuilds: u32 = 0,
+    system_theme_refresh: SystemThemeRefresh = .{},
     hinstance: HINSTANCE,
     class_atom: ATOM = 0,
     host_class_atom: ATOM = 0,
@@ -8246,6 +8247,24 @@ pub const App = struct {
         try self.core_app.colorSchemeEvent(self, scheme);
     }
 
+    fn reconfigureSystemTheme(self: *App) void {
+        const snapshot = SystemThemeSnapshot.capture(&self.config);
+        const changed = self.system_theme_refresh.accept(snapshot) or !std.meta.eql(snapshot.theme, self.resolved_theme);
+        if (!changed) {
+            const missing_resources = for (self.hosts.items) |host| {
+                if (host.hwnd != null and (host.chrome_brush == null or
+                    host.overlay_brush == null or host.edit_brush == null or
+                    host.chrome_font == null or host.preview_font == null or
+                    host.titlebar_caption_icon_font == null or host.titlebar_action_icon_font == null or
+                    // The search font stays lazy. Only a failed attempt, not
+                    // its intentionally unused state, needs another chance.
+                    (host.search_icon_font_resolved and host.search_icon_font == null))) break true;
+            } else false;
+            if (!missing_resources) return;
+        }
+        self.reconfigureTheme();
+    }
+
     fn reconfigureTheme(self: *App) void {
         const previous_integrated_titlebar = self.use_integrated_titlebar;
         self.use_integrated_titlebar = shouldUseIntegratedTitlebar(
@@ -12771,6 +12790,7 @@ fn titlebarButtonVisual(
     hover_alpha: f32,
     pressed: bool,
     high_contrast: bool,
+    window_active: bool,
 ) TitlebarButtonVisual {
     const active = pressed or hover_alpha > 0.0;
     if (high_contrast) {
@@ -12780,10 +12800,10 @@ fn titlebarButtonVisual(
         };
     }
 
-    const idle_glyph = switch (role) {
+    const idle_glyph = win32_theme.windowChromeTextColor(theme, switch (role) {
         .new_tab, .dropdown => theme.button_chrome_fg,
         else => theme.text_primary,
-    };
+    }, window_active, high_contrast);
     if (!active) return .{ .bg = null, .glyph = idle_glyph };
 
     const target_bg = switch (role) {
@@ -13298,6 +13318,8 @@ const Host = struct {
     /// ring. Any navigation key flips it back (`focus_cue.keyRevealsRing`),
     /// any pointer press on a chrome control clears it.
     focus_input_mode: focus_cue.InputMode = .pointer,
+    /// Native window activation, independent of the selected terminal tab.
+    window_active: bool = false,
     /// Fade state for the tab the user is currently hovering. Paint
     /// reads `alphaAt(now)` + pre-composites the glyph colour against
     /// the tab bg so the close X visibly fades in with
@@ -13308,7 +13330,7 @@ const Host = struct {
     /// `layoutChromeForRect` whenever the active tab's on-screen rect
     /// changes. Slides over `win32_tab_visual.underline_slide_ms`
     /// (160 ms) cubic ease-in-out; snaps instantly on the first
-    /// layout (slide_started_ms == 0) and under reduced-motion
+    /// layout (!positioned), geometry changes and under reduced-motion
     /// (AGENTS.md:58).
     tab_underline: win32_tab_visual.UnderlineState = .{},
     /// Which caption button the cursor is currently hovering, when
@@ -13442,6 +13464,8 @@ const Host = struct {
     // Single SetTimer-driven tween scheduler; see Tween scheduler block
     // in the method section. Matches Win32's main-thread-paint model.
     tween_sched: win32_tween.Scheduler = .{},
+    /// Test-local policy; never changes the desktop accessibility settings.
+    test_tween_animations_enabled: if (builtin.is_test) ?bool else void = if (builtin.is_test) null else {},
     quick_terminal_animation: ?QuickTerminalAnimation = null,
     /// Programmatic QT rectangles are already in target-monitor pixels.
     quick_terminal_placing: bool = false,
@@ -14327,6 +14351,9 @@ const Host = struct {
     }
 
     fn effectiveTweenDuration(self: *Host, duration_ms: u16) u16 {
+        if (builtin.is_test) {
+            if (self.test_tween_animations_enabled) |enabled| return if (enabled) duration_ms else 0;
+        }
         return (win32_chrome_state.HighContrastDpiState{
             .high_contrast = isHighContrastActive(),
             .client_animations_enabled = clientAnimationsEnabled(),
@@ -14489,28 +14516,17 @@ const Host = struct {
     /// `win32_tab_visual.underline_slide_ms`; registers a timer-only tween
     /// so the 16 ms heartbeat stays alive for the slide duration.
     fn retargetTabUnderline(self: *Host, left: i32, width: i32) void {
-        const new_left: f32 = @floatFromInt(left);
-        const new_width: f32 = @floatFromInt(width);
-        if (self.tab_underline.target_left == new_left and
-            self.tab_underline.target_width == new_width) return;
-
-        const reduced = !clientAnimationsEnabled() or isHighContrastActive();
-        if (self.tab_underline.slide_started_ms == 0 or reduced) {
-            // Snap: first layout, or the user opted out of motion.
-            // slide_started_ms stays 0 so the next retarget also
-            // snaps if the user hasn't re-enabled animations. On a
-            // non-reduced path, the first REAL slide runs through
-            // retargetTo below which sets the timestamp.
-            self.tab_underline.target_left = new_left;
-            self.tab_underline.target_width = new_width;
-            self.tab_underline.start_left = new_left;
-            self.tab_underline.start_width = new_width;
+        const now = sys.GetTickCount64();
+        const tab_id = (self.activeTab() orelse return).id;
+        const animate = !self.is_live_resize.load(.acquire) and self.effectiveTweenDuration(@intCast(win32_tab_visual.underline_slide_ms)) != 0;
+        if (self.tab_underline.tab_id == tab_id and self.tab_underline.positioned and
+            self.tab_underline.target_left == @as(f32, @floatFromInt(left)) and
+            self.tab_underline.target_width == @as(f32, @floatFromInt(width)) and
+            (animate or !self.tab_underline.animating(now))) return;
+        if (!self.tab_underline.retarget(tab_id, @floatFromInt(left), @floatFromInt(width), now, animate)) {
             self.repaintTopChrome();
             return;
         }
-
-        const now = sys.GetTickCount64();
-        self.tab_underline.retargetTo(new_left, new_width, now);
         // Keep the 16 ms heartbeat alive for the slide duration so
         // `paintChrome` re-runs every frame and reads the interpolated
         // rect. Mirrors the close-button fade pattern.
@@ -17228,7 +17244,20 @@ const Host = struct {
         try runOnPrivateDesktop(bellGlyphTestBody);
     }
 
+    test "CHROME57 bell caption refresh allocates an underline tween with animations enabled" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(animatedBellGlyphTestBody);
+    }
+
+    fn animatedBellGlyphTestBody() !void {
+        try bellGlyphTestBodyWithAnimations(true);
+    }
+
     fn bellGlyphTestBody() !void {
+        try bellGlyphTestBodyWithAnimations(null);
+    }
+
+    fn bellGlyphTestBodyWithAnimations(animations_enabled: ?bool) !void {
         var core_app: CoreApp = undefined;
         var app: App = undefined;
         var host: Host = undefined;
@@ -17249,6 +17278,7 @@ const Host = struct {
             },
         });
         defer session.deinit();
+        host.test_tween_animations_enabled = animations_enabled;
         const window = try BannerTestWindow.init(&host);
         defer window.deinit(&host);
         _ = sys.MoveWindow(window.parent, 0, 0, 1200, 300, 0);
@@ -17326,6 +17356,10 @@ const Host = struct {
         // is the same `clearBell`, run from `handleKeyMessage`, and is
         // measured on a hidden desktop).
         surface_a.focusChanged(true);
+        if (animations_enabled == true) {
+            try std.testing.expect(host.tween_sched.next_id > 1);
+            try std.testing.expect(host.tween_timer_active);
+        }
         try std.testing.expect(std.mem.indexOf(u8, host.tabs.items[0].cached_button_label.?, glyph) == null);
         try std.testing.expect(!std.mem.startsWith(u8, try caption_text(window.parent, &caption, &utf8), glyph));
         try std.testing.expectEqualStrings("", Host.tabItemUiaItemStatus(&host, 1, &status_buf));
@@ -18206,26 +18240,34 @@ const Host = struct {
         const new_is_tab = if (child) |h| self.isTabButton(h) else false;
         if (prev_was_tab or new_is_tab) {
             const now = sys.GetTickCount64();
+            const animate = self.effectiveTweenDuration(@intCast(win32_tab_visual.close_fade_ms)) != 0;
 
             if (prev_was_tab and new_is_tab) {
                 // Adjacent tab transition: move the previous target
                 // into the fade-out slot so both animations run in
                 // parallel — fade A out while fading B in.
                 self.tab_close_prev = self.tab_close_hover;
-                self.tab_close_prev.setHovered(false, now);
+                self.tab_close_prev.setHoveredWithMotion(false, now, animate);
                 self.tab_close_prev_hwnd = previous;
 
                 self.tab_close_hover = .{};
-                self.tab_close_hover.setHovered(true, now);
+                self.tab_close_hover.setHoveredWithMotion(true, now, animate);
                 self.tab_close_hover_hwnd = child;
             } else {
                 // Single-direction transition: (no tab → tab) fade in,
                 // (tab → no tab) fade out. Previous-slot stays as-is
                 // so an already-in-progress fade-out keeps animating.
-                self.tab_close_hover.setHovered(new_is_tab, now);
+                self.tab_close_hover.setHoveredWithMotion(new_is_tab, now, animate);
                 self.tab_close_hover_hwnd = if (new_is_tab) child else previous;
             }
 
+            // A snapped fade needs only the invalidations above, no timer.
+            if (!animate) {
+                self.tab_close_prev.setHoveredWithMotion(false, now, false);
+                if (self.tab_close_prev_hwnd) |h| _ = sys.InvalidateRect(h, null, 0);
+                self.tab_close_prev_hwnd = null;
+                return;
+            }
             // Dummy tween keeps the 16 ms heartbeat alive for the
             // fade duration; paint reads `CloseState.alphaAt` each
             // frame directly.
@@ -18968,7 +19010,7 @@ const Host = struct {
         const focused = (draw.itemState & c.ODS_FOCUS) != 0 or sys.GetFocus() == draw.hwndItem;
         const ring = self.chromeFocusRingVisible(focused, false);
         const primary = button == .primary;
-        const colors = buttonColorsFromTheme(theme, false, true, hovered, pressed, false, primary);
+        const colors = buttonColorsFromTheme(theme, false, true, hovered, pressed, false, primary, isHighContrastActive());
         fillSolidRect(draw.hDC, draw.rcItem, bannerBackground(theme, isHighContrastActive()));
         // A message's close glyph sits bare until it is pointed at or
         // focused, the way a tab's close button does.
@@ -22022,7 +22064,7 @@ const Host = struct {
         disabled: bool,
     ) ButtonColors {
         const theme = &self.app.resolved_theme;
-        if (disabled) return buttonColorsFromTheme(theme, active, true, hovered, pressed, true, false);
+        if (disabled) return buttonColorsFromTheme(theme, active, true, hovered, pressed, true, false, isHighContrastActive());
 
         const accent = overlayAccentColor(.search, theme.is_dark);
         const toolbar = searchBarToolbarVisual(theme);
@@ -22340,6 +22382,7 @@ const Host = struct {
             self.titlebarHoverAlpha(role, hovered, sys.GetTickCount64()),
             pressed,
             is_hc,
+            self.window_active,
         );
         if (disabled) {
             visual = .{ .bg = null, .glyph = theme.text_disabled };
@@ -22371,6 +22414,7 @@ const Host = struct {
         self.ensureThemeBrushes() catch return;
         if (self.chrome_font) |font| _ = sys.SelectObject(draw.hDC, font);
 
+        const is_hc = isHighContrastActive();
         const disabled = (draw.itemState & c.ODS_DISABLED) != 0;
         const pressed = (draw.itemState & c.ODS_SELECTED) != 0;
         const focused = (draw.itemState & c.ODS_FOCUS) != 0 or sys.GetFocus() == draw.hwndItem;
@@ -22388,7 +22432,7 @@ const Host = struct {
             &self.app.resolved_theme,
             &self.app.config,
             tab_button and self.usingIntegratedTitlebar(),
-            isHighContrastActive(),
+            is_hc,
         );
         const theme = &titlebar_theme;
         if (search_role) |role| {
@@ -22424,11 +22468,12 @@ const Host = struct {
             pressed,
             disabled,
             accept,
+            is_hc,
         );
-        if (profile_kind) |kind| {
+        if (!is_hc) if (profile_kind) |kind| {
             colors = applyProfileChromeAccent(colors, kind, theme.is_dark, active, hovered, pressed, disabled);
-        }
-        if (tab_button and !disabled) {
+        };
+        if (tab_button and !disabled and !is_hc) {
             colors.fg = if (active or hovered) theme.text_primary else theme.button_chrome_fg;
             if (active) {
                 colors.bg = if (theme.is_dark)
@@ -22456,6 +22501,7 @@ const Host = struct {
                     adjustColor(theme.chrome_border, -14, -14, -14);
             }
         }
+        if (tab_button and !disabled) colors.fg = win32_theme.windowChromeTextColor(theme, colors.fg, self.window_active, is_hc);
         const bg = colors.bg;
         const border = colors.border;
         const fg = colors.fg;
@@ -22464,39 +22510,6 @@ const Host = struct {
         const parent_bg = if (overlay) theme.overlay_bg else theme.chrome_bg;
         fillSolidRect(draw.hDC, draw.rcItem, parent_bg);
         drawRoundedRect(draw.hDC, draw.rcItem, bg, border, self.scaled(4));
-        if (profile_kind) |kind| {
-            const stripe = profileChromeStripeColor(kind, theme.is_dark, active, hovered, pressed, disabled);
-            // Inset stripe to fit inside rounded corners
-            const corner_inset = self.scaled(4);
-            fillSolidRect(draw.hDC, .{
-                .left = draw.rcItem.left + 2,
-                .top = draw.rcItem.top + corner_inset,
-                .right = draw.rcItem.left + self.scaled(4),
-                .bottom = draw.rcItem.bottom - corner_inset,
-            }, stripe);
-            if (pinnedSlotBadgeDigit(pinned_slot_ordinal)) |digit| {
-                paintPinnedSlotBadge(
-                    draw.hDC,
-                    draw.rcItem,
-                    digit,
-                    colors.border,
-                    colors.bg,
-                    profileKindLabelColor(kind, theme.is_dark),
-                    self.current_dpi,
-                );
-            }
-            if (launcher_target) |target| {
-                paintTargetButtonBadge(
-                    draw.hDC,
-                    draw.rcItem,
-                    profileOpenTargetBadgeGlyph(target),
-                    colors.border,
-                    colors.bg,
-                    profileOpenTargetMarkerColor(target),
-                    self.current_dpi,
-                );
-            }
-        }
         if (tab_button and !overlay and !disabled and hovered and !active) {
             fillSolidRect(draw.hDC, .{
                 .left = draw.rcItem.left + self.scaled(5),
@@ -22533,9 +22546,42 @@ const Host = struct {
                 .right = draw.rcItem.right - self.scaled(2),
                 .bottom = draw.rcItem.bottom - self.scaled(2),
             };
-            drawRoundedRect(draw.hDC, inset_rect, bg, focus, self.scaled(3));
+            gdi.drawRoundedOutline(draw.hDC, inset_rect, focus, self.scaled(3));
         }
 
+        if (profile_kind) |kind| {
+            const stripe = profileChromeStripeColor(kind, theme.is_dark, active, hovered, pressed, disabled);
+            // Inset stripe to fit inside rounded corners
+            const corner_inset = self.scaled(4);
+            fillSolidRect(draw.hDC, .{
+                .left = draw.rcItem.left + 2,
+                .top = draw.rcItem.top + corner_inset,
+                .right = draw.rcItem.left + self.scaled(4),
+                .bottom = draw.rcItem.bottom - corner_inset,
+            }, stripe);
+            if (pinnedSlotBadgeDigit(pinned_slot_ordinal)) |digit| {
+                paintPinnedSlotBadge(
+                    draw.hDC,
+                    draw.rcItem,
+                    digit,
+                    colors.border,
+                    colors.bg,
+                    profileKindLabelColor(kind, theme.is_dark),
+                    self.current_dpi,
+                );
+            }
+            if (launcher_target) |target| {
+                paintTargetButtonBadge(
+                    draw.hDC,
+                    draw.rcItem,
+                    profileOpenTargetBadgeGlyph(target),
+                    colors.border,
+                    colors.bg,
+                    profileOpenTargetMarkerColor(target),
+                    self.current_dpi,
+                );
+            }
+        }
         // Per-tab close button: reserve space and determine if close zone is active
         const can_close_tab = tab_button and !overlay and tabCloseAction(self.tabs.items.len) != .none;
         const close_zone_width = if (can_close_tab) self.scaled(host_tab_close_zone_width) else 0;
@@ -22612,7 +22658,7 @@ const Host = struct {
                 0.0;
             if (alpha > 0.01) {
                 const close_glyph = comptime std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}"); // ×
-                const close_fg_full = if (hovered or active) theme.text_primary else theme.text_secondary;
+                const close_fg_full = colors.fg;
                 // Alpha-blend the glyph colour against the tab bg —
                 // GDI's DrawTextW has no alpha channel, so we
                 // pre-composite.
@@ -23412,6 +23458,243 @@ const Host = struct {
         self.invalidateChromeMask(hwnd, added);
     }
 
+    test "CHROME57 focused profile Open retains badge ink" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(profileFocusPaintTestBody);
+    }
+
+    fn profileFocusPaintTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host }} });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        const button = try createTestChromeChild(window.parent, prompt_button_class);
+        var profiles = [_]windows_shell.Profile{.{ .kind = .powershell, .key = "chrome57-profile", .label = "PowerShell", .command = .{ .shell = "pwsh" } }};
+        host.profiles = &profiles;
+        defer host.profiles = null;
+        const key = try std.testing.allocator.dupeZ(u8, profiles[0].key);
+        defer std.testing.allocator.free(key);
+        app.launcher_quick_slot_keys[0] = key;
+        defer app.launcher_quick_slot_keys[0] = null;
+        host.overlay_mode = .profile;
+        host.overlay_accept_hwnd = button;
+        defer host.overlay_accept_hwnd = null;
+        for ([_]u32{ 96, 144, 192 }) |dpi| {
+            host.current_dpi = dpi;
+            const width = host.scaled(120);
+            const height = host.scaled(32);
+            const canvas = try BannerTestCanvas.init(width, height);
+            defer canvas.deinit();
+            const draw: DRAWITEMSTRUCT = .{
+                .CtlType = c.ODT_BUTTON,
+                .CtlID = 2003,
+                .itemID = 0,
+                .itemAction = 0,
+                .itemState = c.ODS_FOCUS,
+                .hwndItem = button,
+                .hDC = canvas.dc,
+                .rcItem = .{ .left = 0, .top = 0, .right = width, .bottom = height },
+                .itemData = 0,
+            };
+            const plain_canvas = try BannerTestCanvas.init(width, height);
+            defer plain_canvas.deinit();
+            var plain_draw = draw;
+            plain_draw.hDC = plain_canvas.dc;
+            plain_draw.itemState = 0;
+            host.drawButton(&plain_draw);
+            host.drawButton(&draw);
+            _ = BannerTestCanvas.raw.GdiFlush();
+            try std.testing.expectEqual(profileChromeStripeColor(.powershell, app.resolved_theme.is_dark, false, false, false, false), canvas.pixel(3, host.scaled(16)));
+            const bg = applyProfileChromeAccent(buttonColorsFromTheme(&app.resolved_theme, false, true, false, false, false, true, false), .powershell, app.resolved_theme.is_dark, false, false, false, false).bg;
+            const ring_x = @divTrunc(width, 2);
+            const ring_y = height - host.scaled(2) - 2;
+            try std.testing.expectEqual(profileKindFocusRingColor(.powershell, app.resolved_theme.is_dark), canvas.pixel(ring_x, ring_y));
+            try std.testing.expect(canvas.pixel(ring_x, ring_y) != plain_canvas.pixel(ring_x, ring_y));
+            // Preserve every badge ink pixel, including straight edges.
+            // Rounded corners outside the badge may show the ring beneath.
+            for ([_]RECT{
+                .{ .left = width - host.scaled(15), .top = host.scaled(3), .right = width - host.scaled(4), .bottom = host.scaled(14) },
+                .{ .left = width - host.scaled(13), .top = height - host.scaled(13), .right = width - host.scaled(3), .bottom = height - host.scaled(3) },
+            }) |badge| {
+                var y = badge.top;
+                while (y < badge.bottom) : (y += 1) {
+                    var x = badge.left;
+                    while (x < badge.right) : (x += 1) {
+                        const plain = plain_canvas.pixel(x, y);
+                        if (plain != bg) try std.testing.expectEqual(plain, canvas.pixel(x, y));
+                    }
+                }
+            }
+            // Both badges carry text in the right lane. A background-filled
+            // ring used to erase the entire lane before drawing the label.
+            try std.testing.expect(canvas.inked(.{ .left = width - host.scaled(32), .top = host.scaled(8), .right = width - host.scaled(6), .bottom = height - host.scaled(8) }, bg) > 8);
+        }
+    }
+
+    test "CHROME57 focus outline preserves profile stripe and badge interiors" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        for ([_]u32{ 96, 144, 192 }) |dpi| {
+            const scale = win32_chrome_state.scaled;
+            var canvas = try BannerTestCanvas.init(scale(120, dpi), scale(32, dpi));
+            defer canvas.deinit();
+            const rect = RECT{ .left = 0, .top = 0, .right = canvas.width, .bottom = canvas.height };
+            fillSolidRect(canvas.dc, rect, rgb(20, 30, 40));
+            const stripe = RECT{ .left = scale(3, dpi), .top = scale(8, dpi), .right = scale(5, dpi), .bottom = scale(24, dpi) };
+            const badge = RECT{ .left = scale(100, dpi), .top = scale(10, dpi), .right = scale(114, dpi), .bottom = scale(22, dpi) };
+            fillSolidRect(canvas.dc, stripe, rgb(10, 100, 200));
+            fillSolidRect(canvas.dc, badge, rgb(200, 100, 10));
+            gdi.drawRoundedOutline(canvas.dc, rectInset(rect, scale(2, dpi), scale(2, dpi)), rgb(100, 200, 100), scale(3, dpi));
+            _ = BannerTestCanvas.raw.GdiFlush();
+            try std.testing.expectEqual(rgb(10, 100, 200), canvas.pixel(scale(4, dpi), scale(16, dpi)));
+            try std.testing.expectEqual(rgb(200, 100, 10), canvas.pixel(scale(106, dpi), scale(16, dpi)));
+        }
+    }
+
+    test "CHROME57 new tab keeps the previous underline until its button exists" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(newTabUnderlineTestBody);
+    }
+
+    fn newTabUnderlineTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var first: Surface = undefined;
+        var second: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+            .surfaces = &.{ .{ .storage = &first, .host = &host }, .{ .storage = &second, .host = &host } },
+            .tabs = &.{ .{ .host = &host, .surface = &first, .id = 1 }, .{ .host = &host, .surface = &second, .id = 2 } },
+        });
+        defer session.deinit();
+        host.test_tween_animations_enabled = true;
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        host.tabs.items[0].button_hwnd = try createTestChromeChild(window.parent, prompt_button_class);
+        const rect: RECT = .{ .left = 0, .top = 0, .right = 1000, .bottom = 300 };
+        var changed = false;
+        try std.testing.expect(host.layoutChromeForRect(rect, &changed));
+        try std.testing.expect(host.tab_underline.positioned);
+        host.active_tab = 1;
+        try std.testing.expect(host.layoutChromeForRect(rect, &changed));
+        try std.testing.expect(host.tab_underline.positioned);
+        try std.testing.expectEqual(@as(?u32, 1), host.tab_underline.tab_id);
+        host.tabs.items[1].button_hwnd = try createTestChromeChild(window.parent, prompt_button_class);
+        try std.testing.expect(host.layoutChromeForRect(rect, &changed));
+        try std.testing.expectEqual(@as(?u32, 2), host.tab_underline.tab_id);
+        try std.testing.expect(host.tab_underline.slide_started_ms != 0);
+        try std.testing.expect(host.tween_sched.next_id > 1);
+    }
+
+    test "CHROME57 native activation updates only top chrome and its children" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(activationChromeTestBody);
+    }
+
+    fn activationChromeTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host }} });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        setWindowData(window.parent, &host);
+        defer setWindowData(window.parent, null);
+        // A hidden child has no update region. Show these test HWNDs only
+        // on the private desktop owned by runOnPrivateDesktop.
+        const style = sys.GetWindowLongPtrW(window.parent, c.GWL_STYLE);
+        _ = sys.SetWindowLongPtrW(window.parent, c.GWL_STYLE, style | c.WS_CLIPCHILDREN);
+        _ = sys.MoveWindow(host.new_tab_hwnd.?, 0, 0, 32, 32, 0);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        _ = sys.ShowWindow(host.new_tab_hwnd.?, c.SW_SHOWNOACTIVATE);
+        host.chrome_paint_mask = .{};
+        _ = sys.ValidateRect(window.pane, null);
+        _ = sys.ValidateRect(host.new_tab_hwnd.?, null);
+        _ = hostWindowProc(window.parent, c.WM_NCACTIVATE, 1, 0);
+        try std.testing.expect(host.window_active);
+        try std.testing.expect(host.chrome_paint_mask.top);
+        try std.testing.expect(!host.chrome_paint_mask.content);
+        var update: RECT = undefined;
+        try std.testing.expect(sys.GetUpdateRect(host.new_tab_hwnd.?, &update, 0) != 0);
+        try std.testing.expectEqual(@as(BOOL, 0), sys.GetUpdateRect(window.pane, &update, 0));
+        _ = hostWindowProc(window.parent, c.WM_NCACTIVATE, 0, 0);
+        try std.testing.expect(!host.window_active);
+        // Isolate our child invalidation from DefWindowProc's frame work.
+        _ = sys.ValidateRect(host.new_tab_hwnd.?, null);
+        host.setWindowActive(true);
+        try std.testing.expect(sys.GetUpdateRect(host.new_tab_hwnd.?, &update, 0) != 0);
+    }
+
+    test "CHROME57 unchanged theme messages retry each failed font but keep search lazy" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(themeFontRetryTestBody);
+    }
+
+    fn themeFontRetryTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host, .register = true }} });
+        defer session.deinit();
+        defer {
+            inline for (.{ "chrome_font", "preview_font", "titlebar_caption_icon_font", "titlebar_action_icon_font", "search_icon_font", "chrome_brush", "overlay_brush", "edit_brush" }) |name| {
+                if (@field(host, name)) |object| _ = sys.DeleteObject(object);
+            }
+        }
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        app.reconfigureSystemTheme();
+        // An unused search font is intentionally absent, not a failed resource.
+        const applied = app.theme_rebuilds;
+        try std.testing.expect(host.search_icon_font == null);
+        try std.testing.expect(!host.search_icon_font_resolved);
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(applied, app.theme_rebuilds);
+
+        inline for (.{ "preview_font", "titlebar_caption_icon_font", "titlebar_action_icon_font", "chrome_font" }) |name| {
+            const slot = &@field(host, name);
+            const font = slot.* orelse return error.FontCreateFailed;
+            _ = sys.DeleteObject(font);
+            slot.* = null;
+            const before = app.theme_rebuilds;
+            app.reconfigureSystemTheme();
+            try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+            try std.testing.expect(slot.* != null);
+            app.reconfigureSystemTheme();
+            try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+        }
+        // A previous failed lazy search-font attempt must get another chance.
+        host.search_icon_font_resolved = true;
+        const before = app.theme_rebuilds;
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+        try std.testing.expect(!host.search_icon_font_resolved);
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+    }
+
+    fn setWindowActive(self: *Host, active: bool) void {
+        if (self.window_active == active) return;
+        self.window_active = active;
+        self.repaintTopChrome();
+        // Parent invalidation does not repaint child owner-drawn buttons.
+        for (self.tabs.items) |tab| {
+            if (tab.button_hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
+        }
+        if (self.new_tab_hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
+        if (self.overflow_hwnd) |hwnd| _ = sys.InvalidateRect(hwnd, null, 0);
+    }
+
     fn repaintTopChrome(self: *Host) void {
         self.queueChromeRepaint(.{ .top = true });
     }
@@ -23685,6 +23968,10 @@ const Host = struct {
     }
 
     fn syncTabButtons(self: *Host) !bool {
+        return self.syncTabButtonsWithLayout(true);
+    }
+
+    fn syncTabButtonsWithLayout(self: *Host, relayout: bool) !bool {
         const hwnd = self.hwnd orelse return false;
         try self.ensureChromeButtons();
         // Same rect `layout` uses, so a title change while minimized does not
@@ -23694,10 +23981,10 @@ const Host = struct {
         const right_buttons_width = self.rightButtonsWidth();
         const caption_buttons_w = self.captionButtonsWidth();
         const tab_area_width = @max(1, width - right_buttons_width - caption_buttons_w);
-        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width);
+        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
         const visible_count = @max(@as(i32, 1), @as(i32, @intCast(tab_range.count)));
-        const button_width = @max(1, @divTrunc(tab_area_width, visible_count));
-        const label_max_width = hostTabLabelMaxWidth(button_width);
+        const button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width));
+        const label_max_width = hostTabLabelMaxWidth(button_width, self.current_dpi);
         var tooltip_title_changed = false;
         var button_created = false;
         // A pass that fails after making a button has still changed the list,
@@ -23709,7 +23996,7 @@ const Host = struct {
             const active = i == self.active_tab;
             const bell = tab.bellRinging();
             const pane_count = tab.leafCount();
-            const show_pane_count = shouldShowPaneCount(button_width, pane_count);
+            const show_pane_count = shouldShowPaneCount(button_width, pane_count, self.current_dpi);
             // A program status badge takes its slot out of the label's room,
             // charged in cells after `hostTabLabelMaxWidth` has capped the
             // budget the way the layout caps the button.
@@ -23826,7 +24113,7 @@ const Host = struct {
             }
         }
         var chrome_changed = false;
-        _ = self.layoutChromeForRect(rect, &chrome_changed);
+        if (relayout or button_created) _ = self.layoutChromeForRect(rect, &chrome_changed);
         // Every way a tab joins the strip (a new tab or window, a restored
         // session, an undo, a tab moved in) ends in a button made here, and
         // none of them has to change the selection. Told once, after the
@@ -23855,7 +24142,7 @@ const Host = struct {
         // [+][▾] cluster and tab strip don't collide with them.
         const caption_buttons_w = self.captionButtonsWidth();
         const tab_area_width = @max(1, width - right_buttons_width - caption_buttons_w);
-        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width);
+        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
         const visible_count = @max(@as(i32, 1), @as(i32, @intCast(tab_range.count)));
         const button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width));
         const button_y = self.scaled(3);
@@ -23900,7 +24187,7 @@ const Host = struct {
         }
 
         // Animate the focused-tab underline toward the active tab's
-        // on-screen rect. First retarget (slide_started_ms == 0) snaps
+        // on-screen rect. First retarget (!positioned) snaps
         // so the line doesn't slide in from the left on window open;
         // subsequent retargets slide over underline_slide_ms. Reduced-
         // motion collapses to a snap via `retargetTabUnderline`. A hidden
@@ -23909,6 +24196,8 @@ const Host = struct {
         // heartbeat for a line that is never painted.
         if (active_tab_left) |left| {
             self.retargetTabUnderline(left, button_width);
+        } else if (!tab_strip_visible) {
+            self.tab_underline = .{};
         }
 
         // The tab-strip Selection container is an invisible, hit-transparent
@@ -24327,6 +24616,8 @@ const Host = struct {
         const rect = (try self.layoutClientRect()) orelse return;
         var chrome_layout_changed = false;
         if (!self.layoutChromeForRect(rect, &chrome_layout_changed)) return;
+        // Resize and DPI changes also change label truncation and tooltip policy.
+        if (chrome_layout_changed) _ = chromeSyncOrLog("layout tab label sync failed", self.syncTabButtonsWithLayout(false));
 
         const content_rect = self.contentRectFromClient(rect);
         const layout_content_rect: win32_layout.Rect = .{
@@ -24543,6 +24834,7 @@ const Host = struct {
             self.titlebarHoverAlpha(role, self.caption_hover == caption, now_ms),
             self.caption_pressed == caption,
             high_contrast,
+            self.window_active,
         );
         if (visual.bg) |bg| fillSolidRect(hdc, rect, bg);
         self.drawTitlebarGlyph(hdc, rect, glyph, visual.glyph, true);
@@ -26734,6 +27026,75 @@ fn settingChangeIsImmersiveColorSet(lParam: LPARAM) bool {
     );
 }
 
+fn settingChangeAffectsTheme(lparam: LPARAM) bool {
+    if (lparam == 0) return true;
+    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    inline for (.{ "Environment", "intl", "Policy" }) |irrelevant| {
+        const value = std.unicode.utf8ToUtf16LeStringLiteral(irrelevant);
+        if (std.mem.eql(u16, std.mem.span(name), value)) return false;
+    }
+    return true;
+}
+
+/// Every host receives a broadcast. Compare its resolved inputs so the first
+/// recipient updates all hosts and the others do no resource rebuilds. Fonts
+/// and motion policy belong here too: equal colours alone do not imply an
+/// irrelevant WindowMetrics or accessibility change.
+const SystemThemeSnapshot = struct {
+    theme: ThemeColors,
+    metrics: ?NONCLIENTMETRICSW = null,
+    high_contrast: bool = false,
+    animations: bool = true,
+
+    fn capture(config: *const configpkg.Config) SystemThemeSnapshot {
+        var metrics = std.mem.zeroes(NONCLIENTMETRICSW);
+        metrics.cbSize = @sizeOf(NONCLIENTMETRICSW);
+        return .{
+            .theme = resolveTheme(config),
+            .metrics = if (sys.SystemParametersInfoW(c.SPI_GETNONCLIENTMETRICS, @sizeOf(NONCLIENTMETRICSW), @ptrCast(&metrics), 0) != 0) metrics else null,
+            .high_contrast = isHighContrastActive(),
+            .animations = Host.clientAnimationsEnabled(),
+        };
+    }
+};
+
+const SystemThemeRefresh = struct {
+    previous: ?SystemThemeSnapshot = null,
+
+    fn accept(self: *SystemThemeRefresh, next: SystemThemeSnapshot) bool {
+        if (self.previous) |previous| {
+            if (std.meta.eql(previous, next)) return false;
+        }
+        self.previous = next;
+        return true;
+    }
+};
+
+test "CHROME57 system broadcasts rebuild once and retain font and accessibility changes" {
+    var refresh: SystemThemeRefresh = .{};
+    var next: SystemThemeSnapshot = .{ .theme = darkTheme() };
+    try std.testing.expect(refresh.accept(next));
+    for (0..4) |_| try std.testing.expect(!refresh.accept(next));
+    next.theme = lightTheme();
+    try std.testing.expect(refresh.accept(next));
+    next.metrics = std.mem.zeroes(NONCLIENTMETRICSW);
+    try std.testing.expect(refresh.accept(next));
+    next.metrics.?.lfMessageFont.lfWeight = 700;
+    try std.testing.expect(refresh.accept(next));
+    next.high_contrast = true;
+    try std.testing.expect(refresh.accept(next));
+    next.animations = false;
+    try std.testing.expect(refresh.accept(next));
+    try std.testing.expect(!refresh.accept(next));
+    try std.testing.expect(settingChangeAffectsTheme(0));
+    inline for (.{ "ImmersiveColorSet", "WindowMetrics", "UnknownSetting" }) |name| {
+        try std.testing.expect(settingChangeAffectsTheme(@bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(name)))));
+    }
+    inline for (.{ "Environment", "intl", "Policy" }) |name| {
+        try std.testing.expect(!settingChangeAffectsTheme(@bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(name)))));
+    }
+}
+
 test "issue149 Windows setting change filters terminal color sync" {
     const immersive = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet");
     const unrelated = std.unicode.utf8ToUtf16LeStringLiteral("Environment");
@@ -26980,6 +27341,8 @@ fn clientTitlebarTheme(
     if (config.@"window-titlebar-foreground" != null) {
         const foreground = titlebarTextColor(theme, config);
         result.text_primary = foreground;
+        // Preserve an explicit readable foreground when the window deactivates.
+        result.text_secondary = foreground;
         result.button_chrome_fg = foreground;
     }
     return result;
@@ -27513,6 +27876,27 @@ fn settingsPreviewFieldThunk(
             };
         },
     }
+}
+
+test "CHROME57 repeated host system messages apply the app theme only once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var session: TestSession = .{};
+    try session.init(.{ .core_app = &core_app, .app = &app });
+    defer session.deinit();
+    app.reconfigureSystemTheme();
+    const applied = app.theme_rebuilds;
+    app.reconfigureSystemTheme();
+    app.reconfigureSystemTheme();
+    try std.testing.expectEqual(applied, app.theme_rebuilds);
+    app.config.@"window-theme" = if (app.resolved_theme.is_dark) .light else .dark;
+    // High Contrast intentionally overrides the requested palette.
+    const expected = resolveTheme(&app.config);
+    const changed = !std.meta.eql(expected, app.resolved_theme);
+    app.reconfigureSystemTheme();
+    app.reconfigureSystemTheme();
+    try std.testing.expectEqual(applied + @as(u32, @intFromBool(changed)), app.theme_rebuilds);
 }
 
 test "settings live preview refreshes only what the field shows" {
@@ -33011,6 +33395,12 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             if (host) |v| v.dispatchDeferredNewTab(if (wParam == 0) null else @as(u64, @intCast(wParam)));
             return 0;
         },
+        c.WM_NCACTIVATE => {
+            if (host) |v| {
+                v.setWindowActive(wParam != 0);
+            }
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
         c.WM_ACTIVATE => {
             // Cloak/uncloak (virtual-desktop switches, shell animations)
             // has NO window message -- the documented signal is the
@@ -33209,7 +33599,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             if (host) |v| {
                 v.app.refreshSystemWheelSettings();
                 v.app.refreshSystemScrollbarPreference();
-                v.app.reconfigureTheme();
+                if (settingChangeAffectsTheme(lParam)) v.app.reconfigureSystemTheme();
                 if (settingChangeIsImmersiveColorSet(lParam)) {
                     v.app.syncSystemColorScheme() catch |err| {
                         log.warn("win32 color scheme sync failed err={}", .{err});
@@ -33220,7 +33610,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         },
         c.WM_THEMECHANGED, c.WM_SYSCOLORCHANGE => {
             if (host) |v| {
-                v.app.reconfigureTheme();
+                v.app.reconfigureSystemTheme();
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
@@ -33229,7 +33619,7 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // without requiring a config reload.
         c.WM_DWMCOLORIZATIONCOLORCHANGED => {
             if (host) |v| {
-                v.app.reconfigureTheme();
+                v.app.reconfigureSystemTheme();
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
@@ -41343,6 +41733,7 @@ const TestSession = struct {
                 .palette_catalog_labels = @splat(@splat(0)),
                 .palette_list_ranked = uninitializedInertStorage([win32_palette.max_ranked]PaletteRanked),
             };
+            host.tween_sched.init(self.allocator);
             self.hosts[self.host_count] = host;
             self.host_count += 1;
             if (host_options.register) try options.app.hosts.append(self.allocator, host);
@@ -41429,6 +41820,8 @@ const TestSession = struct {
                 var tab = host.tabs.orderedRemove(0);
                 tab.deinit();
             }
+            host.killTweenTimer();
+            host.tween_sched.deinit();
             host.tabs.deinit(self.allocator);
         }
 
@@ -46338,6 +46731,7 @@ test "win32 titlebar colors honor ghostty overrides" {
     try std.testing.expectEqual(theme.is_dark, foreground_only.is_dark);
     try std.testing.expectEqual(rgb(4, 5, 6), foreground_only.text_primary);
     try std.testing.expectEqual(rgb(4, 5, 6), foreground_only.button_chrome_fg);
+    try std.testing.expectEqual(rgb(4, 5, 6), win32_theme.windowChromeTextColor(&foreground_only, foreground_only.text_primary, false, false));
 
     config.@"window-titlebar-background" = .{ .r = 1, .g = 2, .b = 3 };
 
@@ -53812,16 +54206,16 @@ test "win32 buttonColorsFromTheme reflects hover and active states" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const theme = darkTheme();
-    const hovered = buttonColorsFromTheme(&theme, false, false, true, false, false, false);
+    const hovered = buttonColorsFromTheme(&theme, false, false, true, false, false, false, false);
     // Hover should lighten bg and border from idle
     try std.testing.expect(hovered.bg != theme.button_bg);
     try std.testing.expect(hovered.border != theme.button_border);
 
-    const active_hovered = buttonColorsFromTheme(&theme, true, false, true, false, false, false);
+    const active_hovered = buttonColorsFromTheme(&theme, true, false, true, false, false, false, false);
     try std.testing.expect(active_hovered.bg != theme.button_active_bg);
     try std.testing.expectEqual(theme.accent_hover, active_hovered.border);
 
-    const accept_hovered = buttonColorsFromTheme(&theme, false, false, true, false, false, true);
+    const accept_hovered = buttonColorsFromTheme(&theme, false, false, true, false, false, true, false);
     try std.testing.expect(accept_hovered.bg != theme.button_accept_bg);
     try std.testing.expect(accept_hovered.border != theme.button_accept_border);
 }
@@ -53985,7 +54379,7 @@ test "win32 applyProfileChromeAccent respects profile state" {
 
     // Dark mode
     const theme = darkTheme();
-    const base = buttonColorsFromTheme(&theme, false, false, false, false, false, false);
+    const base = buttonColorsFromTheme(&theme, false, false, false, false, false, false, false);
     const idle = applyProfileChromeAccent(base, .git_bash, true, false, false, false, false);
     try std.testing.expectEqual(rgb(48, 40, 31), idle.bg);
     try std.testing.expectEqual(rgb(212, 156, 92), idle.border);
@@ -54735,23 +55129,23 @@ test "win32 titlebar visual helper returns native idle hover and high contrast s
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const theme = darkTheme();
-    const idle_caption = titlebarButtonVisual(&theme, .minimize, theme.chrome_bg, 0.0, false, false);
+    const idle_caption = titlebarButtonVisual(&theme, .minimize, theme.chrome_bg, 0.0, false, false, true);
     try std.testing.expect(idle_caption.bg == null);
     try std.testing.expectEqual(theme.text_primary, idle_caption.glyph);
 
-    const idle_action = titlebarButtonVisual(&theme, .new_tab, theme.chrome_bg, 0.0, false, false);
+    const idle_action = titlebarButtonVisual(&theme, .new_tab, theme.chrome_bg, 0.0, false, false, true);
     try std.testing.expect(idle_action.bg == null);
     try std.testing.expectEqual(theme.button_chrome_fg, idle_action.glyph);
 
-    const max_hover = titlebarButtonVisual(&theme, .maximize, theme.chrome_bg, 1.0, false, false);
+    const max_hover = titlebarButtonVisual(&theme, .maximize, theme.chrome_bg, 1.0, false, false, true);
     try std.testing.expect(max_hover.bg != null);
     try std.testing.expect(max_hover.bg.? != theme.chrome_bg);
 
-    const close_hover = titlebarButtonVisual(&theme, .close, theme.chrome_bg, 1.0, false, false);
+    const close_hover = titlebarButtonVisual(&theme, .close, theme.chrome_bg, 1.0, false, false, true);
     try std.testing.expectEqual(rgb(0xC4, 0x2B, 0x1C), close_hover.bg.?);
     try std.testing.expectEqual(rgb(0xFF, 0xFF, 0xFF), close_hover.glyph);
 
-    const hc_close = titlebarButtonVisual(&theme, .close, theme.chrome_bg, 1.0, false, true);
+    const hc_close = titlebarButtonVisual(&theme, .close, theme.chrome_bg, 1.0, false, true, true);
     try std.testing.expectEqual(theme.button_active_bg, hc_close.bg.?);
     try std.testing.expectEqual(theme.button_active_fg, hc_close.glyph);
 }
