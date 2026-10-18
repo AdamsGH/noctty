@@ -10,7 +10,7 @@
     Every child has explicit lpDesktop and CREATE_NO_WINDOW. A kill-on-close job
     owns the worker tree; retained process handles bound each UIA client. No
     desktop switch, global input, Narrator, history contents or clipboard content.
-    Real startup/history metadata+hashes and clipboard counter bracket the batch.
+    Real startup hash, history metadata and clipboard counter bracket the batch.
 
     Runtime requires -Run. With both cohort counts zero, the original 30 UIA
     cases run. Otherwise ColdOpenCount independent cold opens and ReloadCount
@@ -527,7 +527,7 @@ function Click([IntPtr] $Hwnd) {
     [void][Set91.Native]::Send($Hwnd, 0xF5, 0, 0)
 }
 function Get-GuardSnapshot {
-    # Hash bytes without reading or printing history contents. Labels replace paths.
+    # Hash only startup; history guards use metadata without opening contents.
     $roam = [Environment]::GetFolderPath('ApplicationData')
     $local = [Environment]::GetFolderPath('LocalApplicationData')
     $docs = [Environment]::GetFolderPath('MyDocuments')
@@ -540,7 +540,7 @@ function Get-GuardSnapshot {
         $item = Get-Item -LiteralPath $paths[$label] -ErrorAction SilentlyContinue
         if ($item) {
             [ordered]@{ label = $label; exists = $true; bytes = $item.Length
-                mtime = $item.LastWriteTimeUtc.Ticks; sha256 = (Get-FileHash -LiteralPath $item.FullName).Hash }
+                mtime = $item.LastWriteTimeUtc.Ticks; sha256 = $(if ($label -eq 'startup') { (Get-FileHash -LiteralPath $item.FullName).Hash } else { $null }) }
         } else { [ordered]@{ label = $label; exists = $false } }
     }
     $destinations = @(Get-ChildItem -LiteralPath (Join-Path $roam 'Microsoft/Windows/Recent/CustomDestinations') `
