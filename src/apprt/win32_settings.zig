@@ -3155,7 +3155,7 @@ pub const SettingsWindow = struct {
             const control = self.controlHwnd(item.control_index) orelse continue;
             const label = if (item.label_index) |label_index| self.field_labels[label_index] else null;
             const text = settings_control_specs[item.control_index].role == .text;
-            orderFormControl(control, label, index == 0 or previous_text or text);
+            orderFormControl(control, label, formGroupStarts(index, previous_text, text));
             previous_text = text;
         };
         // Conflict choices and Discard sit left of Save (never together); the
@@ -6551,7 +6551,7 @@ test "SET UI Automation can request and accept Discard without closing Settings"
             defer fixture.finish();
             const settings = &fixture.settings;
             typeInto(settings.fields.edit_font_size.?, "16");
-            const request = &settings.control_uia_providers[34].?.invoke_iface;
+            const request = &settings.control_uia_providers[settings.controlIndex(settings.btn_discard_changes.?).?].?.invoke_iface;
             try std.testing.expectEqual(@as(HRESULT, 0), request.vtbl.Invoke(request));
             dialog_test.pump();
             try std.testing.expect(settings.close_prompt_visible);
@@ -6560,7 +6560,7 @@ test "SET UI Automation can request and accept Discard without closing Settings"
             // The hidden Save and close action cannot turn Discard into a save.
             settings.saveAndClose();
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
-            const accept = &settings.control_uia_providers[32].?.invoke_iface;
+            const accept = &settings.control_uia_providers[settings.controlIndex(settings.btn_close_discard.?).?].?.invoke_iface;
             try std.testing.expectEqual(@as(HRESULT, 0), accept.vtbl.Invoke(accept));
             dialog_test.pump();
             try std.testing.expect(!settings.hasPendingChanges());
@@ -8543,11 +8543,11 @@ test "settings display-only text row needs no persistence adapter" {
             // Insert the descriptor-only row in a real checkbox run and use
             // the same grouping helper as generated rows on either side.
             fixture.settings.setActiveSection(.privacy);
-            const before = fixture.settings.fields.chk_desktop_notifications.?;
-            const after = fixture.settings.fields.chk_app_notify_clipboard.?;
-            orderFormControl(before, null, true);
-            orderFormControl(control, null, true);
-            orderFormControl(after, null, true);
+            const before = fixture.settings.fields.chk_app_notify_clipboard.?;
+            const after = fixture.settings.fields.chk_app_notify_config.?;
+            orderFormControl(before, null, formGroupStarts(5, false, false));
+            orderFormControl(control, null, formGroupStarts(6, false, true));
+            orderFormControl(after, null, formGroupStarts(7, true, false));
             _ = sys.ShowWindow(control, SW_SHOWNORMAL);
             for ([_]HWND{ before, after }) |checkbox| {
                 for ([_]windows.BOOL{ 0, 1 }) |previous| {
@@ -9635,7 +9635,7 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
             }
             try std.testing.expectEqual(@as(usize, 6), checks);
             try std.testing.expectEqual(@as(usize, 12), combos);
-            const retired = settings.control_uia_providers[3].?;
+            const retired = settings.control_uia_providers[settings.controlIndex(settings.fields.chk_trim_trail.?).?].?;
             retired.detach();
             try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, retired.toggle_iface.vtbl.Toggle(&retired.toggle_iface));
         }
@@ -10234,6 +10234,10 @@ fn wheelScrollPixels(remainder: *i32, delta: i32, notch_px: i32) i32 {
 }
 
 /// Keep labels adjacent while excluding STATIC rows from neighboring arrow groups.
+fn formGroupStarts(index: usize, previous_text: bool, text: bool) bool {
+    return index == 0 or previous_text or text;
+}
+
 fn orderFormControl(control: HWND, label: ?HWND, boundary: bool) void {
     if (label) |text| {
         sendToBottom(text);
