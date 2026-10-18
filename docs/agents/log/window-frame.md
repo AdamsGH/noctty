@@ -1,6 +1,6 @@
 # Self-Correction Log: Window frame, DPI, placement and quick terminal
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 See also:
 - 2026-09-23 "Item (b) of the #262 entry below": the #262 entry is the 2026-09-23 "Input on the wrong row after minimize/restore" entry in conpty.md.

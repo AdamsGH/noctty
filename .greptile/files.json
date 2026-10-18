@@ -220,7 +220,7 @@
     },
     {
       "path": "docs/agents/log/test-harnesses.md",
-      "description": "Self-Correction Log: running and reading tests, and the test/windows harnesses.",
+      "description": "Self-Correction Log: writing or running test/windows harnesses, CI test steps, and test counts that contradict the code.",
       "scope": [
         "test/**",
         "scripts/dev-windows.cmd",

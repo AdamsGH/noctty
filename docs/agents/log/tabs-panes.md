@@ -1,6 +1,6 @@
 # Self-Correction Log: Tabs, panes, close, focus and undo/redo
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 See also:
 - Background-tab close prompts and the undo-off banner are in the 2026-10-15 SMALL-04 A entry in accessibility.md.

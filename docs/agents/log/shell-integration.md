@@ -1,6 +1,6 @@
 # Self-Correction Log: Shell integration scripts
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 See also:
 - Git Bash's `ghostty.bash` (OSTYPE, OSC 7 path shapes, PWD, `D;0`) is in the 2026-10-14 PKG-17 entry in launch-and-paths.md; CRLF in the shipped scripts is in the 2026-10-11 EOL-01 entry in build-release-ci.md.

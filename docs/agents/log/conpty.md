@@ -1,6 +1,6 @@
 # Self-Correction Log: ConPTY, pty I/O and resize
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 Corrected in other files:
 - 2026-09-23 "Base64 typed into Neovim after an OSC 52 paste" (#261): its "OSC 52 matrix entry above" is the 2026-09-23 "After #264 an OSC 52 paste" entry in clipboard.md, which corrects its size threshold and its Neovim 0.10.4 native result.

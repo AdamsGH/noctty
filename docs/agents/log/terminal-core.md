@@ -1,6 +1,6 @@
 # Self-Correction Log: Terminal core
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 Corrected in other files:
 - 2026-10-10 OSC 7501 program status: its "A dev run from `zig-out` has no bundled ConPTY" no longer holds; see the 2026-10-10 bundled ConPTY entry in conpty.md.

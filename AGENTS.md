@@ -1,7 +1,8 @@
 # Agent Development Guide
 
 A file for [guiding coding agents](https://agents.md/) working in this
-Windows-only Ghostty fork.
+Windows-only Ghostty fork. Before you change, diagnose or measure code, do the
+reading step under [Self-Correction Log](#self-correction-log).
 
 ## Commands
 
@@ -31,31 +32,41 @@ Windows-only Ghostty fork.
   and fail with misleading dependency errors. A direct `zig test <file>`
   misses the build graph's generated modules (`build_options` and others).
   For code that needs those modules, use the full-suite command above or
-  `zig build test -Dtest-filter=<token>` for iteration; filtered passes alone
-  do not establish full-suite success. Pure helpers may use a temporary
-  package-root harness. (test-harnesses.md: 2026-04-18, 2026-05-01.)
+  `zig build test -Dtest-filter=<token>` for iteration. Pure helpers may use
+  a temporary package-root harness. (test-harnesses.md: 2026-04-18
+  `scripts/dev-windows.cmd` and raw `zig test`; 2026-05-01 direct
+  `zig test src/apprt.zig`.)
 
 ## Running noctty
 
 - Run noctty on a private desktop (`CreateDesktopW`), and pass
   `lpDesktop = WinSta0\<desktop>` to every process you start: a driver on a
   private desktop that passes a null one puts the child on the user's
-  desktop, and noctty takes the foreground. Drive it with posted messages;
-  `SendInput` types into whatever window is in front. (window-frame.md:
-  2026-09-24, 2026-09-23; renderer.md: 2026-10-14; input.md: 2026-09-19.)
-  What a private desktop cannot show (a D3D11 present, which needs a
-  composed, visible desktop; real input) needs a visible run, and a visible
-  run starts only once the user is away. (search-scrollbar.md: 2026-10-16;
-  window-frame.md: 2026-10-16.)
+  desktop, and noctty takes the foreground. Drive it with posted messages
+  (`SendInput` types into whatever window is in front): a key as a posted
+  `WM_KEYDOWN`/`WM_KEYUP` pair, since a posted triple types it twice and a
+  bare posted `WM_CHAR` types nothing. A posted Alt never reaches
+  `GetKeyboardState`, and a pass from posted input is not a pass for real
+  input. (window-frame.md: 2026-09-24 `window-decoration = none` trap 1,
+  2026-09-23 "Item (b) of the #262 entry" harness notes, 2026-10-16 #285
+  window menu; renderer.md: 2026-10-14 LAT-01; input.md: 2026-09-19 #250;
+  test-harnesses.md: 2026-09-23 #261 trap 3.) What a private desktop cannot
+  show (a D3D11 present, which needs a composed, visible desktop; real input)
+  needs a visible run, and a visible run starts only once the user is away.
+  (search-scrollbar.md: 2026-10-16 D3D11-IFLIP-01; window-frame.md:
+  2026-10-16 real DPI drag, last trap.)
 - Run a scratch portable copy (`noctty.portable` beside the exe) with
   `--window-save-state=never` and `LOCALAPPDATA` redirected for that noctty;
   that isolates session and startup state. If a `zig build` runs under the
   redirect, pin `ZIG_GLOBAL_CACHE_DIR` to the real Zig cache. A test that
   reached the real `%LOCALAPPDATA%\noctty` once put the user's launches into
-  safe mode. (window-frame.md and test-harnesses.md: 2026-09-23.) Give each
-  PowerShell you type into a run-local PSReadLine history path or
-  `SaveNothing` before its first read: PSReadLine finds its history through
-  a known folder (test-harnesses.md: 2026-10-11 PKG-13, 2026-10-17 PKG-76).
+  safe mode. (window-frame.md: 2026-09-23 "Item (b) of the #262 entry";
+  test-harnesses.md: 2026-09-23 #261 trap 2.) Give each PowerShell you type
+  into a run-local PSReadLine history path or `SaveNothing` before its first
+  read: PSReadLine finds its history through a known folder (setting it needs
+  `-Command`, which turns off automatic injection: dot-source
+  `integration.ps1` as `buildCommandValue` does). (test-harnesses.md:
+  2026-10-11 PKG-13, 2026-10-17 PKG-76.)
   Before a portable-identity or baseline comparison, read app-lifecycle.md,
   2026-10-16 "A portable copy": portable mode does not give a copy its own
   AUMID or registry key.
@@ -65,7 +76,7 @@ Windows-only Ghostty fork.
   `ERROR_ACCESS_DENIED`). So a run on WinSta0 starts nothing that can copy
   or fall back to a copy, reads nothing from the clipboard, and logs
   `GetClipboardSequenceNumber()` before and after. (launch-and-paths.md:
-  2026-10-15; clipboard.md: 2026-10-15.)
+  2026-10-15 PKG-42; clipboard.md: 2026-10-15 OSC 52 request, trap 5.)
 - A null result needs a positive control before it becomes a causal claim.
   (window-frame.md: 2026-09-14 `background-blur`.)
 
@@ -74,7 +85,8 @@ Windows-only Ghostty fork.
 - An API that returns a `HANDLE` and fails with NULL returns `?HANDLE`
   (`std.os.windows.HANDLE` is non-null). Before mirroring an SDK struct,
   check its packing (`pshpack*.h`) and pin its size and offsets in a test.
-  (tooling.md: 2026-05-01; app-lifecycle.md: 2026-10-09 minidump;
+  (tooling.md: 2026-05-01 `CreateJobObjectW` and Job Object sizes;
+  app-lifecycle.md: 2026-10-09 minidump;
   accessibility.md: 2026-04-16 VARIANT.)
 
 ## libghostty-vt
@@ -110,23 +122,26 @@ out.
 - `gh` can resolve upstream `ghostty-org/ghostty` here: pass
   `--repo amanthanvi/noctty` to every `gh` command that takes it (name it
   where the repository is positional, as in `gh repo view amanthanvi/noctty`),
-  and push to `origin`. (tooling.md: 2026-05-01, 2026-04-20.)
+  and push to `origin`. (tooling.md: 2026-05-01 `gh pr view`/`gh repo`
+  upstream; 2026-04-20 publish against `origin`.)
 
 ## Self-Correction Log
 
 The log records measured traps: what looked true and was not, the evidence,
 and the rule now. It lives in [`docs/agents/log/`](docs/agents/log/), one
-file per area, newest first.
+file per area, dates descending.
 
 Before you change, diagnose or measure anything, read every area file whose
 trigger below matches the work, and run `git grep -n <term> docs/agents/log/`
 for each symbol you will change, each Win32 API you will newly call, and the
-error you are chasing (`AccessDenied`, `FileTooBig`): an entry can cover a
-second subject filed elsewhere. Read each file from the top, header
-included: a newer entry, or an item under "Corrected in other files",
-overrides an older entry on the same subject. A function an entry calls
-load-bearing may have lost its callers since, so re-verify call sites before
-relying on it.
+error you are chasing (the error name, such as `AccessDenied`): an entry can
+cover a second subject filed elsewhere. Read each file from the top, header
+included: a newer-dated entry, or an item under "Corrected in other files",
+overrides an older one on the same subject; entries that share a date are
+not always newest first, and when they disagree the code decides. A function
+an entry calls load-bearing may have lost its callers since, so re-verify
+call sites before relying on it. You are done when you can name the entries
+that govern each symbol you change, or that none does.
 
 - [conpty.md](docs/agents/log/conpty.md): `src/pty.zig`, the pty reader and
   write pool in `termio/Exec.zig`, `ResizePseudoConsole`, in-box conhost
@@ -150,7 +165,8 @@ relying on it.
   timers, synchronized output, vsync, `RenderPass` viewport, cursor sprites,
   search highlights after a resize), `win32/pixel_format.zig`, font fallback
   and `font-thicken`, renderer wakeups from `termio` and typing latency,
-  repaint during live resize.
+  repaint during live resize, and which DLLs a CLI action or the D3D11
+  backend loads (the OpenGL32 static import).
 - [window-frame.md](docs/agents/log/window-frame.md): the top-level window:
   `WM_NCCALCSIZE`/`WM_NCHITTEST` (`win32_nc_layout.zig`), integrated titlebar
   and caption buttons, `window-decoration = none`, resize bands, maximize,
@@ -219,8 +235,7 @@ relying on it.
   apartment, default-terminal handoff, the CLI and the `noctty.com` wrapper.
 - [build-release-ci.md](docs/agents/log/build-release-ci.md): `build.zig`
   and resources, the Windows target floor (`src/build/Config.zig`,
-  `-Dtarget` `win10` versus `win10_rs5`: `posix.renameatW` and
-  `AccessDenied` on a rename over an open file), packaging
+  `-Dtarget` `win10`/`win10_rs5`, and the std APIs it gates), packaging
   (`scripts/package-windows.ps1`, `dist/windows/noctty.iss`), signing, the
   updater, release workflows and package managers (WinGet, Scoop,
   Chocolatey), GitHub Actions CI (path filter, caching, runners), CRLF and
@@ -236,27 +251,25 @@ relying on it.
 - [tooling.md](docs/agents/log/tooling.md): declaring `extern` functions or
   structs, casting Win32 handles and `LPARAM`/`LRESULT` (`@intCast`,
   `@bitCast`, `@ptrFromInt`), passing `[:0]u16` to text APIs, renaming Zig
-  declarations, `union(enum)` tests, PowerShell language traps (others are
-  filed where found: a one-element array that unrolls to a string, so `[0]`
-  is its first character, is in build-release-ci.md 2026-10-17 item 6;
-  `@($a + 1, $b)` is in window-frame.md 2026-10-16), and `gh`, git and codex
-  commands.
+  declarations, `union(enum)` tests, PowerShell language traps, and `gh`,
+  git and codex commands.
 
 A comment that cites AGENTS.md (by date, issue number, symbol or an old line
-number such as `AGENTS.md:75`) means a log entry: `git grep -n`
-`docs/agents/log/` for the date (`"^- <date>:"`; several entries share a
-date, so match the subject too), the issue or the symbol.
+number such as `AGENTS.md:75`) means a log entry. Run
+`git grep -n "^- <date>" docs/agents/log/` (several entries share a date, so
+match the subject too), or grep the issue or the symbol the comment names,
+then read that file's header: an item there may correct the entry.
 
 ### How to add a Self-Correction Log entry
 
 When work uncovers a trap a later agent could not cheaply rediscover, add one
-bullet, `- YYYY-MM-DD: ...`, to the area file whose trigger names the code
-the rule governs, at its place in newest-first date order (the top unless an
-existing entry is newer); one file per entry, continuation lines indented, no
-blank lines inside the list. State the trap (what looked true and was not),
-the evidence (what was measured, on what, with what result, and what is only
-inferred), and the rule (what to do now, naming files and symbols). The entry
-is done when:
+bullet, `- YYYY-MM-DD: ...`, to the area file whose trigger names the code the
+rule governs, at its place in date order (first in the list, below the header
+blocks, unless an existing entry is newer); one file per entry, continuation
+lines indented, no blank lines inside the list. State the trap (what looked
+true and was not), the evidence (what was measured, on what, with what result,
+and what is only inferred), and the rule (what to do now, naming files and
+symbols). The entry is done when:
 
 - you have run `git grep -n` across `docs/agents/log/` for every symbol it
   names and read the hits, and the entry names each earlier entry it corrects
@@ -264,10 +277,18 @@ is done when:
 - each corrected entry in another area file has a line in that file's
   "Corrected in other files";
 - when its rule also governs code another area's trigger names, that area
-  file's "See also" names the entry by date, ID and file;
-- its area's trigger above names every task branch the entry adds;
+  file's "See also" names the entry by date, subject (and ID, if any) and
+  file;
+- a path or symbol the entry governs that its area's trigger does not name is
+  added to that trigger (and to the file's `scope`); a pointer to another
+  file's entry goes in a header "See also", never in the index;
 - a new area file (only when no trigger fits) has the heading
-  `# Self-Correction Log: <area>`, the standard header lines, an index line
-  above whose trigger names paths and symbols, and an entry with `scope`
-  globs in `.greptile/files.json`; a trigger that gains paths gets them in
-  that file's `scope` too.
+  `# Self-Correction Log: <area>`, a blank line, the pointer line every area
+  file has, a blank line, then any `Corrected in other files:` or
+  `See also:` block (each item a `- ` line naming its entry by date, subject
+  and file; each block ended by a blank line); an index line above whose
+  trigger names paths and symbols;
+  and a `.greptile/files.json` item with `scope` globs;
+- in the same change, any trigger, `scope` glob or header item naming a path
+  or symbol the work renamed or removed is updated, and a header item whose
+  entry no longer holds is removed.

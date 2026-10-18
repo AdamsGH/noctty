@@ -1,6 +1,9 @@
 # Self-Correction Log: Zig, PowerShell and Win32 FFI traps; git, gh and agent tooling
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+
+See also:
+- PowerShell traps filed where they were found: a one-element array from `if`/`switch` unrolls to a scalar (item 6 of the 2026-10-17 "The manual Chocolatey Publish workflow" entry in build-release-ci.md); `@($a + 1, $b)` parses as `$a + (1, $b)` (the 2026-10-16 "The real-input check of #285" entry in window-frame.md, harness traps).
 
 - 2026-05-02: Lowercasing Zig type aliases to satisfy naming review can collide with same-named declarations or locals in Zig's shared declaration namespace; check for helper/local name conflicts before committing mechanical renames.
 - 2026-05-01: In this fork, with both `origin` and `upstream` remotes configured, bare `gh pr view <n>` can resolve the upstream Ghostty PR number; use `-R amanthanvi/noctty` for fork-local PR review/checks.

@@ -1,6 +1,6 @@
 # Self-Correction Log: Chrome tab strip, theme, focus cues and repaint
 
-Newest first: an entry above, or one listed under "Corrected in other files", overrides an older entry on the same subject. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
+Dates descend; entries that share a date are not always newest first. A newer-dated entry, or an item under "Corrected in other files", overrides an older one on the same subject; when same-date entries disagree, the code decides. [AGENTS.md](../../../AGENTS.md) indexes the area files and says how to add an entry.
 
 Corrected in other files:
 - 2026-04-17 `win32_icons.zig` (the geometric icons): for the search bar's buttons it is only the fallback since the 2026-10-01 Codicons entry in search-scrollbar.md.
