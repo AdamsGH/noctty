@@ -177,16 +177,17 @@ An entry can cover a second subject filed elsewhere, so also
 ### Rules from the log that apply everywhere
 
 - Run the Commands above through `scripts/dev-windows.cmd` (or an equivalent
-  VS-dev + Zig 0.15.2 shell), and pass a `-Dtest-filter` value as one token. A
-  direct `zig test <file>` misses the build graph's generated modules, so
-  verify with `zig build test` unless the code is a pure helper in a
-  temporary package-root harness. (test-harnesses.md: 2026-04-18, 2026-05-01;
-  the count rules come from its 2026-10-06 and 2026-09-21 entries.)
+  VS-dev + Zig 0.15.2 shell); when you use `-Dtest-filter`, pass its value as
+  one token. A direct `zig test <file>` misses the build graph's generated
+  modules, so verify with `zig build test` unless the code is a pure helper
+  in a temporary package-root harness. (test-harnesses.md: 2026-04-18,
+  2026-05-01; the count rules come from its 2026-10-06 and 2026-09-21
+  entries.)
 - `gh` can resolve upstream `ghostty-org/ghostty` here: pass
   `--repo amanthanvi/noctty` to `gh pr`, `gh run` and the other commands that
   take it, name the repository where it is positional
-  (`gh repo view amanthanvi/noctty`), and push and open PRs against `origin`. (tooling.md: 2026-05-01,
-  2026-04-20.)
+  (`gh repo view amanthanvi/noctty`), and push and open PRs against `origin`.
+  (tooling.md: 2026-05-01, 2026-04-20.)
 - Win32 FFI: an API that returns a `HANDLE` and fails with NULL returns
   `?HANDLE` (`std.os.windows.HANDLE` is non-null). Before mirroring an SDK
   struct, check its packing (`pshpack*.h`) and pin its size and offsets in a
