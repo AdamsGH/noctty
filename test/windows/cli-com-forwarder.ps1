@@ -41,10 +41,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -Path (Join-Path $PSScriptRoot 'cli-com-native.cs')
 
-function Get-StateMetadata([string] $Path) {
+function Get-StateMetadata([string] $Path, [switch] $MetadataOnly) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @{ Exists = $false } }
     $item = Get-Item -LiteralPath $Path
-    return @{ Exists = $true; Bytes = $item.Length; ModifiedUtc = $item.LastWriteTimeUtc.ToString('o'); Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+    $result = @{ Exists = $true; Bytes = $item.Length; ModifiedUtc = $item.LastWriteTimeUtc.ToString('o') }
+    if (-not $MetadataOnly) { $result.Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+    return $result
 }
 function Assert-Condition([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
@@ -103,7 +105,7 @@ if (-not $Driver) {
     $startupPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty/startup-attempts.json'
     $historyPath = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt'
     $startupBefore = Get-StateMetadata $startupPath
-    $historyBefore = Get-StateMetadata $historyPath
+    $historyBefore = Get-StateMetadata $historyPath -MetadataOnly
     $clipboardBefore = [ComCliNative]::GetClipboardSequenceNumber()
     $batchStarted = [datetime]::UtcNow
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -142,7 +144,7 @@ if (-not $Driver) {
         if ($desktopHandle) { [void][ComCliNative]::CloseDesktop($desktopHandle) }
         $clock.Stop()
         $startupAfter = Get-StateMetadata $startupPath
-        $historyAfter = Get-StateMetadata $historyPath
+        $historyAfter = Get-StateMetadata $historyPath -MetadataOnly
         $clipboardAfter = [ComCliNative]::GetClipboardSequenceNumber()
         $receipt = [ordered]@{
             StartedUtc = $batchStarted.ToString('o'); FinishedUtc = [datetime]::UtcNow.ToString('o'); ElapsedMs = $clock.Elapsed.TotalMilliseconds
@@ -482,22 +484,66 @@ try {
         $config = [IO.File]::ReadAllText((Join-Path $BinDir 'config.ghostty'))
         $class = [regex]::Match($config, '(?m)^class = (.+)$').Groups[1].Value.Trim()
         $raw = '--single-instance=false --class=' + $class + ' --title="D20 ""quoted"" 空間 😀"'
-        # SW_SHOWNORMAL: the first ShowWindow of a GUI process honors its launcher's flag.
+        # The detached GUI does not inherit these captures or the launcher's show flag.
         $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir 'gui.stdout.txt'), (Join-Path $OutputDir 'gui.stderr.txt'), 0x08000000, 1, $false)
         $guiChild = $null
+        $close = [ordered]@{ Stage = 'launcher'; PostedUtc = $null; PostMs = $null; StartupAtTimeout = $null; JobActiveProcesses = $null; Diagnostics = $null; WaitChains = $null }
+        $closePath = Join-Path $OutputDir 'gui-close.json'
+        function Save-CloseReceipt {
+            try { $close | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $closePath -Encoding utf8NoBOM }
+            catch { Write-Warning ('Close receipt write failed: ' + $_.Exception.GetType().FullName) }
+        }
+        function Read-StartupPhase {
+            try {
+                # The ready marker replaces this file. Never deny delete sharing.
+                $stream = [IO.FileStream]::new((Join-Path $BinDir 'startup-attempts.json'), [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                try { $reader = [IO.StreamReader]::new($stream); try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() } }
+                finally { $stream.Dispose() }
+                $ledger = $text | ConvertFrom-Json
+                $attempt = @($ledger.attempts)[-1]
+                return @{ SampledUtc = [datetime]::UtcNow.ToString('o'); Phase = $attempt.phase; StartedUnixMs = $attempt.started_at_unix_ms; ReadyUnixMs = $attempt.ready_at_unix_ms; LastWin32Error = $attempt.last_win32_error; AttemptCount = @($ledger.attempts).Count; UnresolvedCount = @($ledger.attempts | Where-Object { $null -eq $_.ready_at_unix_ms -and $null -eq $_.opengl_unavailable_at_unix_ms }).Count }
+            } catch { return @{ ErrorType = $_.Exception.GetType().FullName } }
+        }
         try {
             Assert-Condition ($child.Wait(5000)) 'No-action launcher did not return within 5 seconds.'
             Assert-Condition ($child.ExitCode -eq 0) 'No-action launcher returned nonzero.'
+            $close.Stage = 'host-window'
             Wait-Condition { @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host')).Count -eq 1 } 'GUI host on the hidden desktop'
             $window = @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host'))[0]
             $guiChild = [ComCliNative]::WindowProcess($window, $gui, $child)
+            $close.Stage = 'title'
             Wait-Condition { [ComCliNative]::Title($window).Contains('D20 "quoted" 空間 😀') } 'Unicode/doubled-quote title readback'
+            $close.Stage = 'visibility'
             Wait-Condition { [ComCliNative]::IsWindowVisible($window) } 'GUI host window visible'
+            $close.Stage = 'gui-alive'
             Assert-Condition (-not $guiChild.Exited) 'GUI exited together with the launcher.'
+            $close.Stage = 'post-close'
+            $close.PostedUtc = [datetime]::UtcNow.ToString('o')
+            $closeClock = [Diagnostics.Stopwatch]::StartNew()
             Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
-            Assert-Condition ($guiChild.Wait($TimeoutSeconds * 1000)) 'Owned GUI did not close.'
+            $close.PostMs = $closeClock.Elapsed.TotalMilliseconds
+            $close.Stage = 'process-exit'
+            $exited = $guiChild.Wait($TimeoutSeconds * 1000)
+            if (-not $exited) {
+                $close.Stage = 'close-timeout'
+                $close.StartupAtTimeout = Read-StartupPhase
+                Save-CloseReceipt
+                try { $close.JobActiveProcesses = [ComCliNative]::ActiveProcesses($child) }
+                catch { $close.JobActiveProcesses = @{ ErrorType = $_.Exception.GetType().FullName } }
+                try { $close.Diagnostics = [ComCliNative]::CloseDiagnostics($guiChild, $desktopHandle, $window) }
+                catch { $close.Diagnostics = @{ ErrorType = $_.Exception.GetType().FullName } }
+                Save-CloseReceipt
+                try { $close.WaitChains = [ComCliNative]::CloseWaitChains($guiChild, 5000) }
+                catch { $close.WaitChains = @{ ErrorType = $_.Exception.GetType().FullName } }
+            }
+            Assert-Condition $exited 'Owned GUI did not close; see gui-close.json for startup, host state and bounded thread wait chains.'
+            $close.Stage = 'job-empty'
             Assert-JobEmpty $child 'closing the GUI'
-        } finally { if ($guiChild) { $guiChild.Dispose() }; $child.Dispose() }
+            $close.Stage = 'passed'
+        } finally {
+            if ($close.Stage -ne 'passed') { Save-CloseReceipt }
+            if ($guiChild) { $guiChild.Dispose() }; $child.Dispose()
+        }
     }
 } finally {
     [void][ComCliNative]::CloseDesktop($desktopHandle)
