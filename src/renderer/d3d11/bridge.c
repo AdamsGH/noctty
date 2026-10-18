@@ -76,7 +76,7 @@ struct NocttyD3D {
 
 #if NOCTTY_RENDERER_TEST_TOOLS
 /* readback.c: swaps RGBA to BGRA in place, saves NOCTTY_RENDERER_CAPTURE_PATH
- * and draws into dc; nonzero when either succeeded. */
+ * and draws into dc unless it is NULL; nonzero when either succeeded. */
 int noctty_renderer_blit(void *dc, unsigned char *rgba, uint32_t w, uint32_t h, int bottom_up);
 static uint64_t elapsed_ns(NocttyD3D *d, LARGE_INTEGER start, LARGE_INTEGER end) {
     return (uint64_t)((end.QuadPart - start.QuadPart) * 1000000000.0 / d->frequency.QuadPart);
