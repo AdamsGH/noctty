@@ -97,10 +97,14 @@ public static class ComCliNative {
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h,StringBuilder name,int count);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint message,IntPtr w,IntPtr l);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
     [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool GetUserObjectInformationW(IntPtr h,int index,StringBuilder name,uint bytes,out uint needed);
+    [DllImport("advapi32.dll",SetLastError=true)] static extern IntPtr OpenThreadWaitChainSession(uint flags,IntPtr callback);
+    [DllImport("advapi32.dll")] static extern void CloseThreadWaitChainSession(IntPtr session);
+    [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetThreadWaitChain(IntPtr session,UIntPtr context,uint flags,uint tid,ref uint count,IntPtr nodes,out bool cycle);
     static void Check(bool ok) { if(!ok) throw new Win32Exception(Marshal.GetLastWin32Error()); }
     static Security Inheritable() { return new Security { length=Marshal.SizeOf(typeof(Security)),inherit=1 }; }
     public static string Quote(string value) {
@@ -291,6 +295,46 @@ public static class ComCliNative {
     }
     public static string Title(IntPtr window) { var name=new StringBuilder(1024); GetWindowTextW(window,name,1024); return name.ToString(); }
     public static uint WindowPid(IntPtr window) { uint pid; GetWindowThreadProcessId(window,out pid); return pid; }
+    // Failure-only, bounded metadata. Never capture titles, object names,
+    // command lines, environment or process memory from a hung GUI.
+    public static object CloseDiagnostics(Child child,IntPtr desktop,IntPtr window) {
+        Verify(child);
+        var windows=new List<object>();
+        EnumDesktopWindows(desktop,(h,p)=> {
+            uint pid; uint tid=GetWindowThreadProcessId(h,out pid);
+            if(pid==child.Pid) {
+                var name=new StringBuilder(256); GetClassNameW(h,name,256);
+                windows.Add(new {Hwnd=h.ToInt64(),Tid=tid,Class=name.ToString(),Visible=IsWindowVisible(h)});
+            }
+            return true;
+        },IntPtr.Zero);
+        var chains=new List<object>();
+        var session=OpenThreadWaitChainSession(0,IntPtr.Zero);
+        int sessionError=session==IntPtr.Zero?Marshal.GetLastWin32Error():0;
+        // WAITCHAIN_NODE_INFO is two DWORD enums plus a union whose largest
+        // member is WCHAR[128], LARGE_INTEGER, BOOL (272 bytes, align 8).
+        IntPtr nodes=Marshal.AllocHGlobal(280*16);
+        try {
+            if(session!=IntPtr.Zero && !child.Exited) {
+                using(var process=System.Diagnostics.Process.GetProcessById((int)child.Pid)) {
+                    int sampled=0;
+                    foreach(System.Diagnostics.ProcessThread thread in process.Threads) {
+                        if(sampled++==64) break;
+                        uint count=16; bool cycle;
+                        bool ok=GetThreadWaitChain(session,UIntPtr.Zero,0,(uint)thread.Id,ref count,nodes,out cycle);
+                        int error=ok?0:Marshal.GetLastWin32Error();
+                        var entries=new List<object>();
+                        if(ok) for(int i=0;i<Math.Min(count,16);i++) {
+                            IntPtr node=IntPtr.Add(nodes,i*280); int type=Marshal.ReadInt32(node);
+                            entries.Add(new {Type=type,Status=Marshal.ReadInt32(node,4),Pid=type==8?Marshal.ReadInt32(node,8):0,Tid=type==8?Marshal.ReadInt32(node,12):0});
+                        }
+                        chains.Add(new {Tid=thread.Id,Ok=ok,Error=error,Cycle=cycle,Nodes=entries});
+                    }
+                }
+            }
+        } finally { Marshal.FreeHGlobal(nodes); if(session!=IntPtr.Zero) CloseThreadWaitChainSession(session); }
+        return new {Pid=child.Pid,Exited=child.Exited,HostExists=IsWindow(window),HostVisible=IsWindowVisible(window),Windows=windows,WaitChainSessionError=sessionError,WaitChains=chains};
+    }
     // The window's process must also be in the launched child's job.
     public static Child WindowProcess(IntPtr window,string image,Child owner) {
         var pid=WindowPid(window); AssertOwned(owner,pid);

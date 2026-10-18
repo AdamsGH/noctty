@@ -485,19 +485,37 @@ try {
         # SW_SHOWNORMAL: the first ShowWindow of a GUI process honors its launcher's flag.
         $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir 'gui.stdout.txt'), (Join-Path $OutputDir 'gui.stderr.txt'), 0x08000000, 1, $false)
         $guiChild = $null
+        $close = [ordered]@{ Stage = 'launcher'; HostGoneMs = $null; ProcessExitMs = $null; Diagnostics = $null }
         try {
             Assert-Condition ($child.Wait(5000)) 'No-action launcher did not return within 5 seconds.'
             Assert-Condition ($child.ExitCode -eq 0) 'No-action launcher returned nonzero.'
             Wait-Condition { @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host')).Count -eq 1 } 'GUI host on the hidden desktop'
             $window = @([ComCliNative]::Windows($desktopHandle, 'noctty.win32.host'))[0]
             $guiChild = [ComCliNative]::WindowProcess($window, $gui, $child)
+            $close.Stage = 'title'
             Wait-Condition { [ComCliNative]::Title($window).Contains('D20 "quoted" 空間 😀') } 'Unicode/doubled-quote title readback'
             Wait-Condition { [ComCliNative]::IsWindowVisible($window) } 'GUI host window visible'
             Assert-Condition (-not $guiChild.Exited) 'GUI exited together with the launcher.'
+            $close.Stage = 'post-close'
             Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
-            Assert-Condition ($guiChild.Wait($TimeoutSeconds * 1000)) 'Owned GUI did not close.'
+            $close.Stage = 'process-exit'
+            $closeClock = [Diagnostics.Stopwatch]::StartNew()
+            do {
+                if ($null -eq $close.HostGoneMs -and -not [ComCliNative]::IsWindow($window)) { $close.HostGoneMs = $closeClock.Elapsed.TotalMilliseconds }
+                if ($guiChild.Wait(25)) { $close.ProcessExitMs = $closeClock.Elapsed.TotalMilliseconds; break }
+            } while ($closeClock.Elapsed.TotalSeconds -lt $TimeoutSeconds)
+            if ($null -eq $close.ProcessExitMs) {
+                try { $close.Diagnostics = [ComCliNative]::CloseDiagnostics($guiChild, $desktopHandle, $window) }
+                catch { $close.Diagnostics = @{ ErrorType = $_.Exception.GetType().FullName } }
+            }
+            Assert-Condition ($null -ne $close.ProcessExitMs) 'Owned GUI did not close; see gui-close.json for host state and bounded thread wait chains.'
+            $close.Stage = 'job-empty'
             Assert-JobEmpty $child 'closing the GUI'
-        } finally { if ($guiChild) { $guiChild.Dispose() }; $child.Dispose() }
+            $close.Stage = 'passed'
+        } finally {
+            $close | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $OutputDir 'gui-close.json') -Encoding utf8NoBOM
+            if ($guiChild) { $guiChild.Dispose() }; $child.Dispose()
+        }
     }
 } finally {
     [void][ComCliNative]::CloseDesktop($desktopHandle)
