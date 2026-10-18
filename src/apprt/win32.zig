@@ -45429,59 +45429,27 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
     defer session.deinit();
 
     // [A | (B / C)], natively and in the shell model.
-    const Split = struct {
-        fn native(tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
-            var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
-            defer inserted.deinit();
-            const next = try tab.tree.split(std.testing.allocator, tab.findHandle(at).?, direction, 0.5, &inserted);
-            tab.tree.deinit();
-            tab.tree = next;
-        }
-        fn shell(target: *App, at: *Surface, direction: win32_shell.model.Direction, view: *Surface) !void {
-            var prepared = try target.shell_runtime.prepare(.{ .split_pane = .{ .pane = at.shell_id.?, .direction = direction } });
-            defer prepared.deinit();
-            try prepared.commit(&target.shell_runtime);
-            view.shell_id = prepared.created.pane;
-            view.shell_committed = true;
-        }
-        /// What `Surface.requestClose` prepares before it destroys the pane.
-        fn close(target: *App, tab: *Tab, view: *Surface) !void {
-            view.pending_close_tree = try tab.tree.remove(std.testing.allocator, tab.findHandle(view).?);
-            view.pending_shell_close = try target.shell_runtime.prepare(.{ .close_pane = view.shell_id.? });
-            target.windowDestroyed(view);
-        }
-    };
-    var window = try app.shell_runtime.prepare(.create_window);
-    defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_a.shell_id = window.created.pane;
-    surface_a.shell_committed = true;
-    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
-    tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, tab);
+    const Step = ShellProjectionSteps;
+    try Step.openWindow(&app, &host, &.{&surface_a});
     const native_tab = &host.tabs.items[0];
-    try Split.native(native_tab, &surface_a, .right, &surface_b);
-    try Split.shell(&app, &surface_a, .right, &surface_b);
-    try Split.native(native_tab, &surface_b, .down, &surface_c);
-    try Split.shell(&app, &surface_b, .down, &surface_c);
+    try Step.split(&app, native_tab, &surface_a, .right, &surface_b);
+    try Step.split(&app, native_tab, &surface_b, .down, &surface_c);
     // The user is in B; C exits in the background. Focus stays on B, not on
     // the tree's first pane, A.
     native_tab.focused = native_tab.findHandle(&surface_b).?;
     _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
     try app.validateShellNativeMapping();
-    try Split.close(&app, native_tab, &surface_c);
+    try Step.closePane(&app, native_tab, &surface_c);
     try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
     try app.validateShellNativeMapping();
 
     // Split B again and close the focused new pane: focus goes to its
     // sibling B, as the shell model chooses, not to A.
-    try Split.native(native_tab, &surface_b, .down, &surface_c);
-    try Split.shell(&app, &surface_b, .down, &surface_c);
+    try Step.split(&app, native_tab, &surface_b, .down, &surface_c);
     native_tab.focused = native_tab.findHandle(&surface_c).?;
     _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
     try app.validateShellNativeMapping();
-    try Split.close(&app, native_tab, &surface_c);
+    try Step.closePane(&app, native_tab, &surface_c);
     try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
     try app.validateShellNativeMapping();
 }
@@ -45489,6 +45457,25 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
 /// Native and shell-model halves of the structural steps the projection
 /// tests drive: each mirrors what the runtime does on both sides.
 const ShellProjectionSteps = struct {
+    /// A window holding one tab per view, in order, with tab ids 1, 2, ...:
+    /// the first view's tab is the one the window is created with.
+    fn openWindow(app: *App, host: *Host, views: []const *Surface) !void {
+        var window = try app.shell_runtime.prepare(.create_window);
+        defer window.deinit();
+        try window.commit(&app.shell_runtime);
+        host.shell_id = window.created.window;
+        for (views, 0..) |view, index| {
+            var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
+            defer if (created) |*prepared| prepared.deinit();
+            if (created) |*prepared| try prepared.commit(&app.shell_runtime);
+            view.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
+            view.shell_committed = true;
+            var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), view);
+            tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
+            try host.tabs.append(std.testing.allocator, tab);
+        }
+    }
+
     fn split(app: *App, tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
         var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
         defer inserted.deinit();
@@ -45581,16 +45568,7 @@ test "win32 shell and native projections agree over split, move, close and resto
     });
     defer session.deinit();
     const Step = ShellProjectionSteps;
-
-    var window = try app.shell_runtime.prepare(.create_window);
-    defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_a.shell_id = window.created.pane;
-    surface_a.shell_committed = true;
-    var first_tab = try Tab.init(std.testing.allocator, 1, &surface_a);
-    first_tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, first_tab);
+    try Step.openWindow(&app, &host, &.{&surface_a});
 
     // Split: [A | (B / C)], the user in B. A second tab, [D], in front.
     try Step.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
@@ -45705,16 +45683,7 @@ test "win32 a restored tab has the saved shape in the shell model, so closing a 
     const host_hwnd = try createTestHostWindow();
     defer _ = sys.DestroyWindow(host_hwnd);
     host.hwnd = host_hwnd;
-
-    var window = try app.shell_runtime.prepare(.create_window);
-    defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_x.shell_id = window.created.pane;
-    surface_x.shell_committed = true;
-    var first_tab = try Tab.init(std.testing.allocator, 1, &surface_x);
-    first_tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, first_tab);
+    try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_x});
 
     // What `Surface.init` does for each restored pane, natively and in the
     // shell model: a new tab, or a split at the pane it is cloned from.
@@ -45809,15 +45778,7 @@ test "win32 the shell/native cross-check compares split topology" {
     });
     defer session.deinit();
 
-    var window = try app.shell_runtime.prepare(.create_window);
-    defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_a.shell_id = window.created.pane;
-    surface_a.shell_committed = true;
-    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
-    tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, tab);
+    try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_a});
     try ShellProjectionSteps.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
     try app.validateShellNativeMapping();
 
@@ -45861,21 +45822,7 @@ test "win32 a background tab's exit keeps the active tab" {
     defer session.deinit();
 
     // Tabs [A, B, C] with B active, natively and in the shell model.
-    var window = try app.shell_runtime.prepare(.create_window);
-    defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c };
-    for (surfaces, 0..) |surface, index| {
-        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
-        defer if (created) |*prepared| prepared.deinit();
-        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
-        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
-        surface.shell_committed = true;
-        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
-        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
-        try host.tabs.append(std.testing.allocator, tab);
-    }
+    try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c });
     host.active_tab = 1;
     _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
     try app.validateShellNativeMapping();
@@ -45914,21 +45861,7 @@ test "win32 undoing then redoing an in-place tab close leaves the same tab in fr
     defer session.deinit();
 
     // Tabs [A, B, C, D] with C active, natively and in the shell model.
-    var window = try app.shell_runtime.prepare(.create_window);
-    defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c, &surface_d };
-    for (surfaces, 0..) |surface, index| {
-        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
-        defer if (created) |*prepared| prepared.deinit();
-        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
-        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
-        surface.shell_committed = true;
-        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
-        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
-        try host.tabs.append(std.testing.allocator, tab);
-    }
+    try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c, &surface_d });
     host.active_tab = 2;
     _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
     try app.validateShellNativeMapping();
@@ -47312,60 +47245,9 @@ test "win32 copySharedWindowStateFrom clones host-scoped window fields" {
 test "win32 leaveFullscreen and new_window keep the normal rect of a maximized window" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const Desktop = struct {
-        extern "user32" fn CreateDesktopW(
-            name: [*:0]const u16,
-            device: ?*anyopaque,
-            mode: ?*anyopaque,
-            flags: u32,
-            access: u32,
-            attributes: ?*anyopaque,
-        ) callconv(.winapi) ?*anyopaque;
-        extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
-        extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
-
-        fn run(desktop: *anyopaque, result: *anyerror!void) void {
-            body(desktop) catch |err| {
-                // The test fails at `try result` on the runner's thread;
-                // the trace shows which check failed.
-                if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
-                result.* = err;
-            };
-        }
-
-        fn window(app: *App, origin: i32) !Surface {
-            var surface: Surface = undefined;
-            surface.app = app;
-            surface.host = null;
-            surface.hwnd = sys.CreateWindowExW(
-                0,
-                prompt_label_class,
-                std.unicode.utf8ToUtf16LeStringLiteral(""),
-                WS_OVERLAPPEDWINDOW,
-                origin,
-                origin,
-                640,
-                480,
-                null,
-                null,
-                sys.GetModuleHandleW(null),
-                null,
-            ) orelse return lastError();
-            surface.decorations_visible = true;
-            surface.fullscreen = false;
-            surface.topmost = false;
-            surface.background_opacity_default = 1.0;
-            surface.background_opacity_force_opaque = false;
-            return surface;
-        }
-
-        fn normalRect(hwnd: HWND) !RECT {
-            var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
-            placement.length = @sizeOf(WINDOWPLACEMENT);
-            if (sys.GetWindowPlacement(hwnd, &placement) == 0) return lastError();
-            return placement.rcNormalPosition;
-        }
-
+    // Maximizing shows a window, so these live on a desktop of their own and
+    // never reach the user's.
+    try runOnHiddenDesktop(struct {
         const Monitors = struct {
             handles: [8]sys.HMONITOR = undefined,
             count: usize = 0,
@@ -47379,23 +47261,17 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             }
         };
 
-        // Maximizing shows a window, so these live on a desktop of their
-        // own and never reach the user's.
-        fn body(desktop: *anyopaque) !void {
-            if (SetThreadDesktop(desktop) == 0) return lastError();
+        fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
-            var surface = try window(&app, 100);
+            var app = placementTestApp();
+            var surface = try placementTestSurface(&app, 100, 100);
             const hwnd = surface.hwnd.?;
             defer _ = sys.DestroyWindow(hwnd);
 
             _ = sys.ShowWindow(hwnd, c.SW_SHOW);
             var normal_rect: RECT = undefined;
             try std.testing.expect(sys.GetWindowRect(hwnd, &normal_rect) != 0);
-            const normal = try normalRect(hwnd);
+            const normal = try testNormalRect(hwnd);
 
             // Before the fix, the maximized rect became the normal one.
             for ([_]bool{ false, true }) |maximized| {
@@ -47409,7 +47285,7 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                 var rect: RECT = undefined;
                 try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
                 try std.testing.expectEqualDeep(before, rect);
-                try std.testing.expectEqualDeep(normal, try normalRect(hwnd));
+                try std.testing.expectEqualDeep(normal, try testNormalRect(hwnd));
                 if (maximized) _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
                 try std.testing.expect(sys.GetWindowRect(hwnd, &rect) != 0);
                 try std.testing.expectEqualDeep(normal_rect, rect);
@@ -47417,12 +47293,12 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
 
             // new_window from a maximized window, into a window created
             // elsewhere, so it has to take the source's normal rect.
-            var clone = try window(&app, 200);
+            var clone = try placementTestSurface(&app, 200, 200);
             defer _ = sys.DestroyWindow(clone.hwnd.?);
             _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
             try clone.inheritWindowStateFrom(&surface);
             try std.testing.expect(sys.IsZoomed(clone.hwnd.?) != 0);
-            try std.testing.expectEqualDeep(normal, try normalRect(clone.hwnd.?));
+            try std.testing.expectEqualDeep(normal, try testNormalRect(clone.hwnd.?));
 
             // Exercise real monitor/DPI transitions on this hidden desktop.
             var monitors: Monitors = .{};
@@ -47451,7 +47327,7 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                             const expected_left = @max(dest_info.work_area.left, @min(before.left + dest_info.work_area.left - source_info.work_area.left, dest_info.work_area.right - width));
                             const expected_top = @max(dest_info.work_area.top, @min(before.top + dest_info.work_area.top - source_info.work_area.top, dest_info.work_area.bottom - height));
                             if (maximized) {
-                                const placed = try normalRect(hwnd);
+                                const placed = try testNormalRect(hwnd);
                                 try std.testing.expectEqual(expected_left - (dest_info.work_area.left - dest_info.full_rect.left), placed.left);
                                 try std.testing.expectEqual(expected_top - (dest_info.work_area.top - dest_info.full_rect.top), placed.top);
                                 try std.testing.expectEqual(width, placed.right - placed.left);
@@ -47471,22 +47347,25 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                 }
             }
         }
-    };
+    }.body);
+}
 
-    const desktop = Desktop.CreateDesktopW(
-        std.unicode.utf8ToUtf16LeStringLiteral("noctty-test-fullscreen"),
-        null,
-        null,
-        0,
-        0x10000000, // GENERIC_ALL
-        null,
-    ) orelse return error.SkipZigTest;
-    defer _ = Desktop.CloseDesktop(desktop);
-    // SetThreadDesktop fails on a thread that already owns a window.
-    var result: anyerror!void = {};
-    const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
-    thread.join();
-    try result;
+/// The hostless app the placement tests' surfaces point at, with only the
+/// fields window placement reads set.
+fn placementTestApp() App {
+    var app: App = undefined;
+    app.os_build = c.OS_BUILD_WIN11_21H2;
+    app.config = .{};
+    app.hosts = .empty;
+    return app;
+}
+
+/// The rect `hwnd` goes back to when it is restored.
+fn testNormalRect(hwnd: HWND) !RECT {
+    var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+    placement.length = @sizeOf(WINDOWPLACEMENT);
+    try std.testing.expect(sys.GetWindowPlacement(hwnd, &placement) != 0);
+    return placement.rcNormalPosition;
 }
 
 /// A hostless surface whose top-level window sits at (`left`, `top`) and is
@@ -47529,10 +47408,7 @@ test "win32 a window opened from a minimized one starts on screen at its restore
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47568,10 +47444,7 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47621,39 +47494,53 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
 
             // A source minimized from maximized restores to maximized, so
             // the new window is maximized, with the source's normal rect.
-            var normal_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
-            normal_placement.length = @sizeOf(WINDOWPLACEMENT);
-            try std.testing.expect(sys.GetWindowPlacement(source_hwnd, &normal_placement) != 0);
+            const normal = try testNormalRect(source_hwnd);
             _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
             _ = sys.ShowWindow(source_hwnd, c.SW_SHOWMINNOACTIVE);
             try std.testing.expect(sys.IsIconic(source_hwnd) != 0);
             try clone.inheritWindowStateFrom(&source);
             try std.testing.expect(sys.IsIconic(clone_hwnd) == 0);
             try std.testing.expect(sys.IsZoomed(clone_hwnd) != 0);
-            var clone_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
-            clone_placement.length = @sizeOf(WINDOWPLACEMENT);
-            try std.testing.expect(sys.GetWindowPlacement(clone_hwnd, &clone_placement) != 0);
-            try std.testing.expectEqualDeep(normal_placement.rcNormalPosition, clone_placement.rcNormalPosition);
+            try std.testing.expectEqualDeep(normal, try testNormalRect(clone_hwnd));
         }
     }.body);
 }
+
+/// A started app for tests that create real hosts with `createHost`. Safe
+/// mode starts from the default config rather than the developer's own,
+/// whose tab bar or decoration settings could turn the integrated titlebar
+/// off.
+const SafeModeAppFixture = struct {
+    core: *CoreApp = undefined,
+    app: App = undefined,
+
+    fn init(self: *SafeModeAppFixture) !void {
+        self.core = try CoreApp.create(std.testing.allocator);
+        errdefer self.core.destroy();
+        try self.app.init(self.core, .{ .safe_mode = true });
+    }
+
+    fn deinit(self: *SafeModeAppFixture) void {
+        const hinstance = self.app.hinstance;
+        self.app.terminate();
+        // `createHost` registers these and nothing unregisters them, so a
+        // later test could not create a host of its own.
+        _ = sys.UnregisterClassW(host_class_name, hinstance);
+        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+        self.core.destroy();
+    }
+};
 
 test "win32 a host opened from a minimized host starts on screen" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            const core = try CoreApp.create(std.testing.allocator);
-            defer core.destroy();
-            var app: App = undefined;
-            try app.init(core, .{ .safe_mode = true });
-            const hinstance = app.hinstance;
-            defer {
-                app.terminate();
-                _ = sys.UnregisterClassW(host_class_name, hinstance);
-                _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-                _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-            }
+            var fixture: SafeModeAppFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
             const title = std.unicode.utf8ToUtf16LeStringLiteral("");
             const source = try app.createHost(title, null, false);
             const hwnd = source.hwnd.?;
@@ -47748,10 +47635,7 @@ test "win32 a new window is not maximized by a restore-to-maximized flag left on
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47786,10 +47670,7 @@ test "win32 a new window from a fullscreen window covers the same monitor" {
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47833,10 +47714,7 @@ test "win32 new windows from one source step past the windows already there" {
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             defer app.hosts.deinit(std.testing.allocator);
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
@@ -48045,24 +47923,10 @@ test "win32 host content rect keeps its size while the window is minimized" {
 test "win32 new host starts with the client area its first frame change keeps" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const alloc = std.testing.allocator;
-
-    var core = try CoreApp.create(alloc);
-    defer core.destroy();
-    var app: App = undefined;
-    // Safe mode starts from the default config rather than the developer's
-    // own, whose tab bar or decoration settings could turn the integrated
-    // titlebar off.
-    try app.init(core, .{ .safe_mode = true });
-    const hinstance = app.hinstance;
-    defer {
-        app.terminate();
-        // `createHost` registers these and nothing unregisters them, so a
-        // later test could not create a host of its own.
-        _ = sys.UnregisterClassW(host_class_name, hinstance);
-        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-    }
+    var fixture: SafeModeAppFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
     // The Windows 11 caption row lives inside the client area. Force it on so
     // an older test machine takes the same path.
     app.use_integrated_titlebar = true;
@@ -48123,25 +47987,16 @@ test "win32 new host starts with the client area its first frame change keeps" {
 test "win32 createHost frames an undecorated host for its Windows build" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const alloc = std.testing.allocator;
-
     // Per-monitor aware, so the hosts are laid out at the monitor's DPI. A
     // DPI-unaware thread gets 96, where the linearly scaled frame happens to
     // equal the system's and the maximized check below could not fail.
     const previous_dpi_context = sys.SetThreadDpiAwarenessContext(-4);
     defer _ = sys.SetThreadDpiAwarenessContext(previous_dpi_context);
 
-    var core = try CoreApp.create(alloc);
-    defer core.destroy();
-    var app: App = undefined;
-    try app.init(core, .{ .safe_mode = true });
-    const hinstance = app.hinstance;
-    defer {
-        app.terminate();
-        _ = sys.UnregisterClassW(host_class_name, hinstance);
-        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-    }
+    var fixture: SafeModeAppFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
     app.config.@"window-decoration" = .none;
 
     // `createHost` as a `new_window` clone calls it: the decoration state
@@ -49587,6 +49442,21 @@ test "security regression win32 link opener PATHEXT live probe on hidden desktop
             const result = sys.ShellExecuteW(null, shell_open, wide.ptr, null, null, c.SW_HIDE);
             if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
         }
+        /// Waits up to five seconds for `probe.cmd` to write its marker, then
+        /// removes it for the next check.
+        fn expectMarker(dir: std.fs.Dir) !void {
+            var seen = false;
+            for (0..100) |_| {
+                dir.access("marker", .{}) catch {
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    continue;
+                };
+                seen = true;
+                break;
+            }
+            try std.testing.expect(seen);
+            try dir.deleteFile("marker");
+        }
         fn run(desktop: *anyopaque, result: *anyerror!void) void {
             result.* = body(desktop);
         }
@@ -49607,17 +49477,7 @@ test "security regression win32 link opener PATHEXT live probe on hidden desktop
                 // Positive control proves this host's ShellExecute really
                 // retries the missing literal with probe.cmd, for both slashes.
                 try shell(path);
-                var seen = false;
-                for (0..100) |_| {
-                    tmp.dir.access("marker", .{}) catch {
-                        std.Thread.sleep(50 * std.time.ns_per_ms);
-                        continue;
-                    };
-                    seen = true;
-                    break;
-                }
-                try std.testing.expect(seen);
-                try tmp.dir.deleteFile("marker");
+                try expectMarker(tmp.dir);
                 var probe: @This() = .{};
                 try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, path, dispatch));
                 try std.testing.expectEqual(@as(usize, 0), probe.calls);
@@ -49636,17 +49496,7 @@ test "security regression win32 link opener PATHEXT live probe on hidden desktop
             const dotfile = try std.fs.path.join(alloc, &.{ root, ".cmd" });
             defer alloc.free(dotfile);
             try shell(dotfile);
-            var seen = false;
-            for (0..100) |_| {
-                tmp.dir.access("marker", .{}) catch {
-                    std.Thread.sleep(50 * std.time.ns_per_ms);
-                    continue;
-                };
-                seen = true;
-                break;
-            }
-            try std.testing.expect(seen);
-            try tmp.dir.deleteFile("marker");
+            try expectMarker(tmp.dir);
             probe = .{};
             try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, dotfile, dispatch));
             std.mem.replaceScalar(u8, dotfile, '\\', '/');
@@ -52360,10 +52210,7 @@ test "win32 session placement saves the normal rect in screen coordinates for ev
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             const surface = try placementTestSurface(&app, 120, 140);
             defer _ = sys.DestroyWindow(surface.hwnd.?);
             const hwnd = surface.hwnd.?;
@@ -52422,10 +52269,7 @@ test "win32 session restore keeps a window on a monitor and brings one back from
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             const surface = try placementTestSurface(&app, 120, 140);
             defer _ = sys.DestroyWindow(surface.hwnd.?);
             const hwnd = surface.hwnd.?;
@@ -53499,42 +53343,34 @@ test "win32 installer apply args double embedded quotes" {
     try std.testing.expect(std.mem.indexOf(u8, args, "/DIR=\"C:\\Program Files\\wing\"\"hostty\"") != null);
 }
 
-test "win32 surfaceRepaintRequestMode flushes renderer paints during resize settle" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, surfaceRepaintRequestMode(null, 1000));
+/// Both the surface's and the renderer's repaint requests queue outside
+/// resize, paint at once while a resize settles, and wait for the flush
+/// during a live resize.
+fn expectSettleRepaintModes(comptime mode: fn (?*const Host, u64) SurfaceRepaintRequestMode) !void {
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, mode(null, 1000));
 
     var host: Host = undefined;
     host.is_live_resize = .init(false);
     host.resize_settle_timer_active = false;
     host.resize_settle_until_ms = 0;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, surfaceRepaintRequestMode(&host, 1000));
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, mode(&host, 1000));
 
     host.resize_settle_timer_active = true;
     host.resize_settle_until_ms = 1000 + resize_settle_deadline_ms;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.update_now, surfaceRepaintRequestMode(&host, 1000));
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.update_now, mode(&host, 1000));
 
     host.is_live_resize = .init(true);
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.defer_until_flush, surfaceRepaintRequestMode(&host, 1000));
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.defer_until_flush, mode(&host, 1000));
+}
+
+test "win32 surfaceRepaintRequestMode flushes renderer paints during resize settle" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectSettleRepaintModes(surfaceRepaintRequestMode);
 }
 
 test "win32 rendererRepaintRequestMode paints synchronously only during resize settle" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, rendererRepaintRequestMode(null, 1000));
-
-    var host: Host = undefined;
-    host.is_live_resize = .init(false);
-    host.resize_settle_timer_active = false;
-    host.resize_settle_until_ms = 0;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, rendererRepaintRequestMode(&host, 1000));
-
-    host.resize_settle_timer_active = true;
-    host.resize_settle_until_ms = 1000 + resize_settle_deadline_ms;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.update_now, rendererRepaintRequestMode(&host, 1000));
-
-    host.is_live_resize = .init(true);
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.defer_until_flush, rendererRepaintRequestMode(&host, 1000));
+    try expectSettleRepaintModes(rendererRepaintRequestMode);
 }
 
 test "win32 resize settle paint mode ends with its timer or at its deadline" {
@@ -53973,24 +53809,16 @@ test "win32 output starts the scrollbar's heartbeat, and a hidden bar hides its 
     // High Contrast always shows the bar: no heartbeat and nothing to hide.
     if (isHighContrastActive()) return error.SkipZigTest;
 
-    const alloc = std.testing.allocator;
-    var core = try CoreApp.create(alloc);
-    defer core.destroy();
-    var app: App = undefined;
-    try app.init(core, .{ .safe_mode = true });
-    const hinstance = app.hinstance;
-    defer {
-        app.terminate();
-        _ = sys.UnregisterClassW(host_class_name, hinstance);
-        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-    }
+    var fixture: SafeModeAppFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
     // The dynamic policy whatever this machine's "Always show scrollbars".
     app.system_dynamic_scrollbars = true;
     // The host stays hidden, so the test never touches the foreground.
     const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, false);
     var surface: Surface = .{
-        .app = &app,
+        .app = app,
         .host = host,
         .window_visible = true,
         .placement = .{ .rect = .{ .left = 0, .top = 0, .right = 400, .bottom = 300 }, .rect_known = true, .visible = true, .visible_known = true },
