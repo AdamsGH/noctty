@@ -359,19 +359,26 @@ const TestRegistry = struct {
         try std.testing.expectEqualStrings(expected, value);
     }
 
+    /// The number of keys under the scratch parent: the registration, plus
+    /// any pending key left behind.
+    fn subkeyCount(self: TestRegistry) !DWORD {
+        const parent = try self.open(null);
+        defer _ = sys.RegCloseKey(parent);
+        var subkeys: DWORD = 99;
+        try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(parent, null, null, null, &subkeys, null, null, null, null, null, null, null));
+        return subkeys;
+    }
+
     const Snapshot = struct { icon: [512]u16 = undefined, icon_bytes: DWORD = 1024, written: u64 = 0, siblings: DWORD = 0 };
 
     /// The registration's icon, its last-write time, and the number of keys
     /// under the scratch parent (a leftover pending key shows up here).
     fn snapshot(self: TestRegistry) !Snapshot {
-        const parent = try self.open(null);
-        defer _ = sys.RegCloseKey(parent);
         const key = try self.open(name);
         defer _ = sys.RegCloseKey(key);
-        var out: Snapshot = .{};
+        var out: Snapshot = .{ .siblings = try self.subkeyCount() };
         try std.testing.expectEqual(ERROR_SUCCESS, sys.RegQueryValueExW(key, std.unicode.utf8ToUtf16LeStringLiteral("IconUri"), null, null, @ptrCast(&out.icon), &out.icon_bytes));
         try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(key, null, null, null, null, null, null, null, null, null, null, &out.written));
-        try std.testing.expectEqual(ERROR_SUCCESS, RegQueryInfoKeyW(parent, null, null, null, &out.siblings, null, null, null, null, null, null, null));
         return out;
     }
 };
@@ -407,13 +414,7 @@ test "aumid registration: installed copies always write, portable copies only cr
         // A portable copy with no icon beside it creates nothing, so the next
         // one can still register with its icon.
         try std.testing.expect(!try register(alloc, reg.parent, TestRegistry.name, bare, true));
-        {
-            const parent = try reg.open(null);
-            defer _ = sys.RegCloseKey(parent);
-            var subkeys: DWORD = 99;
-            try std.testing.expectEqual(ERROR_SUCCESS, TestRegistry.RegQueryInfoKeyW(parent, null, null, null, &subkeys, null, null, null, null, null, null, null));
-            try std.testing.expectEqual(@as(DWORD, 0), subkeys);
-        }
+        try std.testing.expectEqual(@as(DWORD, 0), try reg.subkeyCount());
         try std.testing.expect(try register(alloc, reg.parent, TestRegistry.name, p1, true));
         const key = try reg.open(TestRegistry.name);
         defer _ = sys.RegCloseKey(key);
@@ -518,11 +519,7 @@ test "aumid registration: installed copies always write, portable copies only cr
             break;
         }
         try std.testing.expect(failing.has_induced_failure);
-        const parent = try reg.open(null);
-        defer _ = sys.RegCloseKey(parent);
-        var subkeys: DWORD = 99;
-        try std.testing.expectEqual(ERROR_SUCCESS, TestRegistry.RegQueryInfoKeyW(parent, null, null, null, &subkeys, null, null, null, null, null, null, null));
-        try std.testing.expectEqual(@as(DWORD, 0), subkeys);
+        try std.testing.expectEqual(@as(DWORD, 0), try reg.subkeyCount());
     } else return error.TestUnexpectedResult;
 
     // The guard itself: renaming onto a name that exists fails.
