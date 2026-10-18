@@ -134,9 +134,10 @@ if (-not $Driver) {
         $raw = ($arguments | ForEach-Object { [ComCliNative]::Quote($_) }) -join ' '
         $controller = [ComCliNative]::Launch($pwsh, $raw, $OutputDir, "WinSta0\$DesktopName", 'files', $null,
             (Join-Path $OutputDir 'controller.stdout.txt'), (Join-Path $OutputDir 'controller.stderr.txt'), 0x08000000)
-        $controllerBudget = $TimeoutSeconds * 16 + $VersionIterations * 5 + ($GuiIterations - 1) * ($TimeoutSeconds * 5 + 15)
+        $baseBudget = $TimeoutSeconds * 16 + $VersionIterations * 5
+        $controllerBudget = $baseBudget + ($GuiIterations - 1) * ($TimeoutSeconds * 5 + 15)
         # Leave the ten-minute CI step time to write guards and reap the job.
-        if ($GuiIterations -gt 1) { $controllerBudget = [math]::Min(540, $controllerBudget) }
+        if ($GuiIterations -gt 1) { $controllerBudget = [math]::Max($baseBudget, [math]::Min(540, $controllerBudget)) }
         Assert-Condition ($controller.Wait($controllerBudget * 1000)) 'Hidden-desktop controller timed out.'
         Assert-Condition ($controller.ExitCode -eq 0) 'Hidden-desktop controller failed; inspect bounded per-case results.json and the controller capture.'
     } catch { $failure = $_ }
@@ -490,7 +491,7 @@ try {
         # The detached GUI does not inherit these captures or the launcher's show flag.
         $child = [ComCliNative]::Launch($com, $raw, $BinDir, $desktopPath, 'files', $null, (Join-Path $OutputDir "gui-$guiIteration.stdout.txt"), (Join-Path $OutputDir "gui-$guiIteration.stderr.txt"), 0x08000000, 1, $false)
         $guiChild = $null
-        $close = [ordered]@{ Stage = 'launcher'; PostedUtc = $null; PostMs = $null; StartupAfterPost = $null; StartupAtTimeout = $null; HostGoneMs = $null; ProcessExitMs = $null; JobActiveProcesses = $null; Diagnostics = $null; WaitChains = $null }
+        $close = [ordered]@{ Stage = 'launcher'; PostedUtc = $null; PostMs = $null; StartupAtTimeout = $null; HostGoneMs = $null; ProcessExitMs = $null; JobActiveProcesses = $null; LedgerMoveError = $null; Diagnostics = $null; WaitChains = $null }
         $closePath = Join-Path $OutputDir "gui-close-$guiIteration.json"
         function Save-CloseReceipt {
             try { $close | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $closePath -Encoding utf8NoBOM }
@@ -522,7 +523,6 @@ try {
             $closeClock = [Diagnostics.Stopwatch]::StartNew()
             Assert-Condition ([ComCliNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) 'WM_CLOSE failed.'
             $close.PostMs = $closeClock.Elapsed.TotalMilliseconds
-            $close.StartupAfterPost = Read-StartupPhase
             $close.Stage = 'process-exit'
             do {
                 if ($null -eq $close.HostGoneMs -and -not [ComCliNative]::IsWindow($window)) { $close.HostGoneMs = $closeClock.Elapsed.TotalMilliseconds }
@@ -546,8 +546,21 @@ try {
             if ($GuiIterations -gt 1) {
                 # Each repeated cold launch starts with a fresh recovery history.
                 # Preserve the completed ledger after the entire owned job exits.
-                $ledgerPath = Join-Path $BinDir 'startup-attempts.json'
-                if (Test-Path -LiteralPath $ledgerPath) { Move-Item -LiteralPath $ledgerPath -Destination (Join-Path $OutputDir "startup-attempts-$guiIteration.json") }
+                $close.Stage = 'ledger-archive'
+                try {
+                    $ledgerPath = Join-Path $BinDir 'startup-attempts.json'
+                    if (Test-Path -LiteralPath $ledgerPath) { Move-Item -LiteralPath $ledgerPath -Destination (Join-Path $OutputDir "startup-attempts-$guiIteration.json") }
+                    $pendingIndex = 0
+                    foreach ($file in Get-ChildItem -LiteralPath $BinDir -File) {
+                        if ($file.Name.StartsWith('startup-attempts.json.pending-') -or $file.Name.StartsWith('startup-attempts.json.tmp-')) {
+                            Move-Item -LiteralPath $file.FullName -Destination (Join-Path $OutputDir "startup-attempts-$guiIteration-pending-$pendingIndex.txt")
+                            $pendingIndex++
+                        }
+                    }
+                } catch {
+                    $close.LedgerMoveError = $_.Exception.GetType().FullName
+                    throw 'GUI closed, but archiving its isolated recovery history failed; see close receipt.'
+                }
             }
             $close.Stage = 'passed'
         } finally {

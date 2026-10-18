@@ -382,8 +382,8 @@ public static class ComCliNative {
                         var entry=new Dictionary<string,object> { {"Tid",thread.Id},{"Ok",ok},{"Error",error},{"Cycle",cycle},{"Nodes",entries} };
                         try {
                             var state=thread.ThreadState;
-                            entry["State"]=state.ToString();
-                            entry["WaitReason"]=state==System.Diagnostics.ThreadState.Wait?thread.WaitReason.ToString():null;
+                            entry["SnapshotState"]=state.ToString();
+                            entry["SnapshotWaitReason"]=state==System.Diagnostics.ThreadState.Wait?thread.WaitReason.ToString():null;
                             entry["CpuMs"]=thread.TotalProcessorTime.TotalMilliseconds;
                         } catch(Exception error2) { entry["SchedulingErrorType"]=error2.GetType().FullName; }
                         capture.Chains.Enqueue(entry);
