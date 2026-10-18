@@ -1120,6 +1120,8 @@ pub const SettingsControlProvider = struct {
     hwnd: com.HWND,
     role: Role,
     name: ?[]const u8,
+    /// Static descriptor text; assigned before publishing the provider.
+    help_text: []const u8 = "",
     /// The element that names this one (`UIA_LabeledByPropertyId`). Holds
     /// a reference, released with this provider.
     labeled_by: ?*com.IRawElementProviderSimple = null,
@@ -1387,6 +1389,10 @@ pub const SettingsControlProvider = struct {
                     const bstr = com.SysAllocStringLen(buffer.ptr, @intCast(@max(0, copied))) orelse return com.E_OUTOFMEMORY;
                     out.* = com.VARIANT.fromBstr(bstr);
                 }
+            },
+            constants.UIA_HelpTextPropertyId => if (self.help_text.len != 0) {
+                const bstr = allocBstrFromUtf8(self.alloc, self.help_text) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
             },
             constants.UIA_ValueValuePropertyId => if (self.role == .edit or self.role == .combo_box) {
                 const value = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
