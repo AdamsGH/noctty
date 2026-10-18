@@ -375,7 +375,7 @@ public static class ComCliNative {
                         bool ok=GetThreadWaitChain(session,UIntPtr.Zero,5,(uint)thread.Id,ref count,nodes,out cycle);
                         int error=ok?0:Marshal.GetLastWin32Error();
                         var entries=new List<object>();
-                        if(ok || error==234 || error==164) for(int i=0;i<Math.Min(count,16);i++) {
+                        if(ok || error==234) for(int i=0;i<Math.Min(count,16);i++) {
                             IntPtr node=IntPtr.Add(nodes,i*280); int type=Marshal.ReadInt32(node);
                             entries.Add(new {Type=type,Status=Marshal.ReadInt32(node,4),Pid=type==8?Marshal.ReadInt32(node,8):0,Tid=type==8?Marshal.ReadInt32(node,12):0,WaitTime=type==8?Marshal.ReadInt32(node,16):0,ContextSwitches=type==8?Marshal.ReadInt32(node,20):0});
                         }
