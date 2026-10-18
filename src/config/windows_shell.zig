@@ -315,22 +315,15 @@ pub fn shellIntegrationDiagnostic(kind: ProfileKind) ShellIntegrationDiagnostic 
 /// The result may borrow command; new argv storage belongs to the arena.
 pub fn executableCommand(alloc: Allocator, command: Command) !Command {
     if (builtin.os.tag != .windows or command == .direct) return command;
-    var path = std.mem.trim(u8, command.shell, " \t");
-    if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"')
-        path = path[1 .. path.len - 1];
+    const path = stripOuterQuotes(std.mem.trim(u8, command.shell, " \t"));
     // A relative executable is resolved against the pane's cwd by cmd, not
     // the app's cwd used by this probe and lpApplicationName. Keep that
     // existing contract, including drive-relative and root-relative values.
-    if (path.len < 3 or !std.ascii.isAlphabetic(path[0]) or path[1] != ':' or
-        (path[2] != '\\' and path[2] != '/')) return command;
-    const ext = std.fs.path.extension(path);
-    if (!std.ascii.eqlIgnoreCase(ext, ".exe") and
-        !std.ascii.eqlIgnoreCase(ext, ".com")) return command;
+    if (!isDriveAbsolutePath(path)) return command;
+    if (!isExeOrCom(std.fs.path.extension(path))) return command;
     // Screen these before querying attributes. A command value must not
     // introduce a network timeout on the terminal's startup path.
-    if (internal_os.path.isNetworkOrDevicePath(path)) return command;
-    if (internal_os.windows.driveTypeForLetter(path[0]) == internal_os.windows.DRIVE_REMOTE)
-        return command;
+    if (!isOnLocalDrive(path)) return command;
     if (!windowsNonDirectoryPathExists(path)) return command;
     const argv = try alloc.alloc([:0]const u8, 1);
     errdefer alloc.free(argv);
@@ -379,12 +372,8 @@ fn searchPath(
     const extension = std.fs.path.extension(exe);
     var dirs = std.mem.splitScalar(u8, path, ';');
     dirs: while (dirs.next()) |raw_dir| {
-        var dir = std.mem.trim(u8, raw_dir, " \t");
-        if (dir.len >= 2 and dir[0] == '"' and dir[dir.len - 1] == '"')
-            dir = dir[1 .. dir.len - 1];
-        if (internal_os.path.isNetworkOrDevicePath(dir) or dir.len < 3 or
-            !std.ascii.isAlphabetic(dir[0]) or dir[1] != ':' or
-            (dir[2] != '\\' and dir[2] != '/')) continue;
+        const dir = stripOuterQuotes(std.mem.trim(u8, raw_dir, " \t"));
+        if (internal_os.path.isNetworkOrDevicePath(dir) or !isDriveAbsolutePath(dir)) continue;
         const drive_type = internal_os.windows.driveTypeForLetter(dir[0]);
         if (drive_type == internal_os.windows.DRIVE_REMOTE) continue;
         // Discovery never spins up removable/optical media on the UI thread.
@@ -392,26 +381,19 @@ fn searchPath(
             drive_type != internal_os.windows.DRIVE_RAMDISK) continue;
         if (discovery and !isLocalSearchDirectory(dir)) continue;
         var extensions = std.mem.splitScalar(u8, if (extension.len > 0) "" else pathext orelse ".COM;.EXE;.BAT;.CMD", ';');
-        while (extensions.next()) |raw_ext| {
+        exts: while (extensions.next()) |raw_ext| {
             const ext = std.mem.trim(u8, raw_ext, " \t");
             if (extension.len == 0) {
                 if (ext.len < 2 or ext[0] != '.') continue;
                 // PATHEXT supplies suffixes, not paths or cmd syntax.
-                var valid = true;
-                for (ext[1..]) |c| if (!std.ascii.isAlphanumeric(c)) {
-                    valid = false;
-                    break;
-                };
-                if (!valid) continue;
+                for (ext[1..]) |c| if (!std.ascii.isAlphanumeric(c)) continue :exts;
             }
             const candidate = std.fmt.bufPrint(buf, "{s}\\{s}{s}", .{ dir, exe, ext }) catch continue;
             if (discovery) {
                 const attributes = pathAttributes(candidate) orelse continue;
                 if (attributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0) continue;
             } else if (!windowsNonDirectoryPathExists(candidate)) continue;
-            const found_ext = if (extension.len > 0) extension else ext;
-            if (!std.ascii.eqlIgnoreCase(found_ext, ".exe") and
-                !std.ascii.eqlIgnoreCase(found_ext, ".com")) return null;
+            if (!isExeOrCom(if (extension.len > 0) extension else ext)) return null;
             if (!accept(candidate)) continue :dirs;
             return candidate;
         }
@@ -465,15 +447,37 @@ fn openPathNoRedirect(path: []const u8) ?windows.HANDLE {
     if (!isDriveAbsolutePath(path) or internal_os.path.isNetworkOrDevicePath(path)) return null;
     const drive_type = internal_os.windows.driveTypeForLetter(path[0]);
     if (drive_type != internal_os.windows.DRIVE_FIXED and drive_type != internal_os.windows.DRIVE_RAMDISK) return null;
+    var handle: windows.HANDLE = undefined;
+    const status = ntOpenDontReparse(
+        path,
+        windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+        windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT,
+        &handle,
+    ) orelse return null;
+    return if (status == .SUCCESS) handle else null;
+}
+
+/// `NtCreateFile` opening the existing object at `path` with `access` and
+/// `options`, under `OBJ_DONT_REPARSE`, so the kernel refuses to traverse a
+/// link at any component. The caller screens `path` first. Null when `path`
+/// cannot be named that way; otherwise the status, and on success `handle`
+/// is open for the caller to close.
+pub fn ntOpenDontReparse(
+    path: []const u8,
+    access: windows.ACCESS_MASK,
+    options: windows.ULONG,
+    handle: *windows.HANDLE,
+) ?windows.NTSTATUS {
     var wide = windows.sliceToPrefixedFileW(null, path) catch return null;
     // Older Windows also treats the DOS drive-letter mapping as a reparse.
     // Resolve just that mapping without opening a filesystem target, and accept
     // only a direct local volume device. The rest keeps the kernel guard.
     if (!internal_os.windows.directVolumePath(&wide)) return null;
+    const span = wide.span();
     var name: windows.UNICODE_STRING = .{
-        .Length = @intCast(wide.span().len * 2),
-        .MaximumLength = @intCast(wide.span().len * 2),
-        .Buffer = @constCast(wide.span().ptr),
+        .Length = @intCast(span.len * 2),
+        .MaximumLength = @intCast(span.len * 2),
+        .Buffer = @constCast(span.ptr),
     };
     var attrs: windows.OBJECT_ATTRIBUTES = .{
         .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
@@ -484,21 +488,19 @@ fn openPathNoRedirect(path: []const u8) ?windows.HANDLE {
         .SecurityQualityOfService = null,
     };
     var io: windows.IO_STATUS_BLOCK = undefined;
-    var handle: windows.HANDLE = undefined;
-    const status = windows.ntdll.NtCreateFile(
-        &handle,
-        windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+    return windows.ntdll.NtCreateFile(
+        handle,
+        access,
         &attrs,
         &io,
         null,
         windows.FILE_ATTRIBUTE_NORMAL,
         windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
         windows.FILE_OPEN,
-        windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT,
+        options,
         null,
         0,
     );
-    return if (status == .SUCCESS) handle else null;
 }
 
 /// Attributes of the final object, with no ancestor or final link followed.
@@ -569,17 +571,27 @@ const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000001b;
 fn appExecLinkTargetExists(path: []const u8) bool {
     const handle = openPathNoRedirect(path) orelse return false;
     defer windows.CloseHandle(handle);
-    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
-    const record = readReparseData(handle, &data) orelse return false;
-    var target_w: [1024]u16 = undefined;
-    const target_len = appExecLinkTarget(record, &target_w) orelse return false;
-    var target_buf: [3 * target_w.len]u8 = undefined;
-    const target_end = std.unicode.utf16LeToUtf8(&target_buf, target_w[0..target_len]) catch return false;
-    const target = target_buf[0..target_end];
+    var target_buf: AppExecLinkTargetBuf = undefined;
+    const target = (readAppExecLinkTarget(handle, &target_buf) catch return false) orelse return false;
     // A local file only; the screen is the one for any path a program reports.
-    if (!isDriveAbsolutePath(target) or internal_os.path.isNetworkOrDevicePath(target)) return false;
-    if (internal_os.windows.driveTypeForLetter(target[0]) == internal_os.windows.DRIVE_REMOTE) return false;
+    if (!isOnLocalDrive(target)) return false;
     return isLocalExecutableInfo(pathInfo(target) orelse return false);
+}
+
+/// Room for the longest alias target `readAppExecLinkTarget` reads, as UTF-8.
+const AppExecLinkTargetBuf = [3 * app_exec_link_target_max]u8;
+const app_exec_link_target_max = 1024;
+
+/// The target of the App Execution Alias open at `handle`, as UTF-8 in `buf`,
+/// or null when the reparse data is not such an alias (see `appExecLinkTarget`).
+/// A target that is not valid UTF-16 is an error.
+fn readAppExecLinkTarget(handle: windows.HANDLE, buf: *AppExecLinkTargetBuf) std.unicode.Utf16LeToUtf8Error!?[]const u8 {
+    var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
+    const record = readReparseData(handle, &data) orelse return null;
+    var target_w: [app_exec_link_target_max]u16 = undefined;
+    const target_len = appExecLinkTarget(record, &target_w) orelse return null;
+    const target_end = try std.unicode.utf16LeToUtf8(buf, target_w[0..target_len]);
+    return buf[0..target_end];
 }
 
 /// The target of an App Execution Alias, copied as UTF-16 into `out`, from the
@@ -1644,9 +1656,7 @@ fn lookupGitBashWithHost(alloc: Allocator, lookup: anytype, comptime Host: type)
     for (0..git_registry_hives) |hive| {
         const root = (try Host.registryInstallRoot(alloc, hive)) orelse continue;
         defer alloc.free(root);
-        const candidate = try std.fs.path.join(alloc, &.{ root, "bin", "bash.exe" });
-        if (Host.fileExists(candidate)) return candidate;
-        alloc.free(candidate);
+        if (try bashInInstall(alloc, root, Host)) |path| return path;
     }
 
     const path = (try lookup(alloc, "bash.exe")) orelse return null;
@@ -1681,6 +1691,11 @@ fn gitBashBesideGit(alloc: Allocator, git_path: []const u8, comptime Host: type)
         return null;
     }
 
+    return try bashInInstall(alloc, root, Host);
+}
+
+/// `bin\bash.exe` below the Git install `root`, when that file exists.
+fn bashInInstall(alloc: Allocator, root: []const u8, comptime Host: type) !?[]u8 {
     const candidate = try std.fs.path.join(alloc, &.{ root, "bin", "bash.exe" });
     if (Host.fileExists(candidate)) return candidate;
     alloc.free(candidate);
@@ -1926,6 +1941,26 @@ pub fn isDriveAbsolutePath(path: []const u8) bool {
         isSeparator(path[2]);
 }
 
+/// A drive-absolute path that is not a network or device path and not on a
+/// network drive, so a metadata query cannot wait on a network timeout.
+fn isOnLocalDrive(path: []const u8) bool {
+    return isDriveAbsolutePath(path) and
+        !internal_os.path.isNetworkOrDevicePath(path) and
+        internal_os.windows.driveTypeForLetter(path[0]) != internal_os.windows.DRIVE_REMOTE;
+}
+
+/// `value` without one pair of enclosing double quotes, if it has them.
+fn stripOuterQuotes(value: []const u8) []const u8 {
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"')
+        return value[1 .. value.len - 1];
+    return value;
+}
+
+fn isExeOrCom(extension: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(extension, ".exe") or
+        std.ascii.eqlIgnoreCase(extension, ".com");
+}
+
 /// Return true when a Windows path contains no bytes that can terminate or
 /// split a CreateProcess environment/current-directory value or a window title.
 pub fn isSafeWindowsPath(path: []const u8) bool {
@@ -2005,10 +2040,7 @@ fn drivePathToWindows(alloc: Allocator, drive: u8, rest: []const u8) ![]const u8
 /// network shape; `isSafeWindowsPath` and `os.path.isNetworkOrDevicePath` do
 /// that.
 pub fn conemuPathToLocal(alloc: Allocator, value: []const u8) !?[]const u8 {
-    var path = value;
-    if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
-        path = path[1 .. path.len - 1];
-    }
+    const path = stripOuterQuotes(value);
     // A quote left over is not part of any Windows path.
     if (std.mem.indexOfScalar(u8, path, '"') != null) return null;
     if (isDriveAbsolutePath(path)) return try drivePathToWindows(alloc, path[0], path[3..]);
@@ -2396,13 +2428,8 @@ test "shell discovery accepts a real installed Store execution alias" {
         if (info.ReparseTag != IO_REPARSE_TAG_APPEXECLINK) continue;
         const handle = openPathNoRedirect(path) orelse return error.TestUnexpectedResult;
         defer windows.CloseHandle(handle);
-        var data: [windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(4) = @splat(0);
-        const record = readReparseData(handle, &data) orelse return error.TestUnexpectedResult;
-        var target_w: [1024]u16 = undefined;
-        const len = appExecLinkTarget(record, &target_w) orelse return error.TestUnexpectedResult;
-        var target_buf: [3 * target_w.len]u8 = undefined;
-        const target_len = try std.unicode.utf16LeToUtf8(&target_buf, target_w[0..len]);
-        const target = target_buf[0..target_len];
+        var target_buf: AppExecLinkTargetBuf = undefined;
+        const target = (try readAppExecLinkTarget(handle, &target_buf)) orelse return error.TestUnexpectedResult;
         // Even a real alias's record is untrusted: screen its target before
         // the independent existence check can touch it.
         const checked = openPathNoRedirect(target) orelse {
