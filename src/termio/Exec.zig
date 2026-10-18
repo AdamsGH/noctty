@@ -1200,9 +1200,11 @@ const Subprocess = struct {
             ) orelse break :wsl null;
             try wsl_env.forwardIdentity(&env, term_overridden);
             if (term_overridden or std.mem.eql(u8, cfg.term, "xterm-256color")) break :wsl null;
-            if (!exec_command.windows_cmd_shell and !wsl_env.canProbeDirect(argv[0])) break :wsl null;
-            if (exec_command.windows_cmd_shell and !wsl_env.canProbeShell(exec_command.args[2])) break :wsl null;
-            if (exec_command.windows_cmd_shell and !wsl_env.cmdAutoRunAbsent()) break :wsl null;
+            const can_probe = if (exec_command.windows_cmd_shell)
+                wsl_env.canProbeShell(exec_command.args[2]) and wsl_env.cmdAutoRunAbsent()
+            else
+                wsl_env.canProbeDirect(argv[0]);
+            if (!can_probe) break :wsl null;
             break :wsl .{ .argv = argv, .term = try alloc.dupe(u8, cfg.term), .cwd = cwd };
         } else null;
 

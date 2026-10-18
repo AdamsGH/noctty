@@ -3723,11 +3723,7 @@ pub fn dropLaunchLayoutReplaySteps(self: *Config, from: usize) ?[]const u8 {
     }
     while (i > from) {
         i -= 1;
-        const arg: []const u8 = switch (self._replay_steps.items[i]) {
-            .arg => |value| value.value,
-            .conditional_arg => |value| value.arg,
-            else => continue,
-        };
+        const arg = self._replay_steps.items[i].argText() orelse continue;
         const value = launchLayoutArgValue(arg) orelse continue;
         // Iterating backwards, so the first match is the file's last word.
         if (found == null) found = value;
@@ -3767,11 +3763,7 @@ test "launch-layout is ignored in configuration files" {
         // and `changeConditionalState` both re-run `_replay_steps` through
         // `loadIter`, which does not pass through `loadReader`.
         for (cfg._replay_steps.items) |step| {
-            const arg: []const u8 = switch (step) {
-                .arg => |value| value.value,
-                .conditional_arg => |value| value.arg,
-                else => continue,
-            };
+            const arg = step.argText() orelse continue;
             try testing.expect(!std.mem.startsWith(u8, arg, "--launch-layout"));
         }
 
@@ -3837,11 +3829,7 @@ test "launch-layout is ignored in configuration files" {
         try testing.expectEqualStrings("CLI Layout", cfg.@"launch-layout".?);
 
         for (cfg._replay_steps.items) |step| {
-            const arg: []const u8 = switch (step) {
-                .arg => |value| value.value,
-                .conditional_arg => |value| value.arg,
-                else => continue,
-            };
+            const arg = step.argText() orelse continue;
             try testing.expect(!std.mem.eql(u8, arg, "--launch-layout=Theme Layout"));
         }
     }
@@ -5090,10 +5078,7 @@ pub fn finalize(self: *Config) !void {
 /// Resolve the automatic Windows command without hiding whether it was explicit.
 pub fn resolveWindowsDefaultCommand(self: *Config) !void {
     if (self.command != null) return;
-    const cmd = try windows_shell.defaultCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-default value={}", .{cmd});
-    self.command = cmd;
-    self._command_defaulted = true;
+    self.setAutomaticCommand("windows-default", try windows_shell.defaultCommand(self._arena.?.allocator()));
 }
 
 /// Give a config with no `command` the one safe mode starts, so a recovery
@@ -5102,8 +5087,12 @@ pub fn resolveWindowsDefaultCommand(self: *Config) !void {
 /// `PATH`. The command stays marked automatic. A command already set stays.
 pub fn useWindowsRecoveryCommand(self: *Config) !void {
     if (self.command != null) return;
-    const cmd = try windows_shell.recoveryCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-recovery value={}", .{cmd});
+    self.setAutomaticCommand("windows-recovery", try windows_shell.recoveryCommand(self._arena.?.allocator()));
+}
+
+/// Set `command` to `cmd`, chosen by noctty rather than a config layer.
+fn setAutomaticCommand(self: *Config, comptime src: []const u8, cmd: Command) void {
+    log.info("default shell src=" ++ src ++ " value={}", .{cmd});
     self.command = cmd;
     self._command_defaulted = true;
 }
@@ -5551,6 +5540,16 @@ const Replay = struct {
         /// Note: when "-e" is used, ONLY this is present and
         /// not an additional "arg" with "-e" value.
         @"-e": cli.Location,
+
+        /// The argument text of an `arg` or `conditional_arg` step, or null
+        /// for any other step.
+        fn argText(self: Step) ?[]const u8 {
+            return switch (self) {
+                .arg => |v| v.value,
+                .conditional_arg => |v| v.arg,
+                else => null,
+            };
+        }
 
         fn clone(
             self: Step,

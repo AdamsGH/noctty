@@ -258,9 +258,7 @@ fn canCacheProbe(probe: []const []const u8) bool {
 /// A local drive path only. Screen it before any file operation, including
 /// executable lookup; GetDriveType reads the local drive table.
 fn isLocalAbsolute(path: []const u8) bool {
-    if (os_path.isNetworkOrDevicePath(path) or path.len < 3 or
-        !std.ascii.isAlphabetic(path[0]) or path[1] != ':' or
-        (path[2] != '/' and path[2] != '\\')) return false;
+    if (os_path.isNetworkOrDevicePath(path) or !windows_shell.isDriveAbsolutePath(path)) return false;
     return switch (os_windows.driveTypeForLetter(path[0])) {
         os_windows.DRIVE_FIXED, os_windows.DRIVE_REMOVABLE, os_windows.DRIVE_RAMDISK => true,
         else => false,
@@ -274,37 +272,9 @@ const LocalPath = enum { safe, missing, unsafe };
 fn localPathState(path: []const u8) LocalPath {
     if (comptime builtin.os.tag != .windows) return .unsafe;
     if (!isLocalAbsolute(path)) return .unsafe;
-    var wide = windows.sliceToPrefixedFileW(null, path) catch return .unsafe;
-    if (!os_windows.directVolumePath(&wide)) return .unsafe;
-    const span = wide.span();
-    var name: windows.UNICODE_STRING = .{
-        .Length = @intCast(span.len * 2),
-        .MaximumLength = @intCast(span.len * 2),
-        .Buffer = @constCast(span.ptr),
-    };
-    var attrs: windows.OBJECT_ATTRIBUTES = .{
-        .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
-        .RootDirectory = null,
-        .ObjectName = &name,
-        .Attributes = 0x1000, // OBJ_DONT_REPARSE
-        .SecurityDescriptor = null,
-        .SecurityQualityOfService = null,
-    };
-    var io: windows.IO_STATUS_BLOCK = undefined;
     var handle: windows.HANDLE = undefined;
-    const status = windows.ntdll.NtCreateFile(
-        &handle,
-        windows.FILE_READ_ATTRIBUTES,
-        &attrs,
-        &io,
-        null,
-        windows.FILE_ATTRIBUTE_NORMAL,
-        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
-        windows.FILE_OPEN,
-        0,
-        null,
-        0,
-    );
+    const status = windows_shell.ntOpenDontReparse(path, windows.FILE_READ_ATTRIBUTES, 0, &handle) orelse
+        return .unsafe;
     switch (status) {
         .SUCCESS => {},
         .OBJECT_NAME_NOT_FOUND, .OBJECT_PATH_NOT_FOUND => return .missing,
@@ -435,13 +405,9 @@ fn distroHasTerminfo(
     while (true) {
         const known = probe_cache.get(key) orelse break;
         switch (known) {
-            .yes => {
+            .yes, .no => {
                 probe_mutex.unlock();
-                return true;
-            },
-            .no => {
-                probe_mutex.unlock();
-                return false;
+                return known == .yes;
             },
             // Another tab is asking the same question.
             .pending => probe_done.wait(&probe_mutex),
