@@ -353,15 +353,12 @@ namespace SettingsPatterns
                 else
                 {
                     Require(expand != null, "Missing ExpandCollapse pattern");
-                    Require(value != null || selection != null, "Missing Value and Selection patterns");
-                    IValue writableValue = null;
-                    if (value != null)
-                    {
-                        int readOnly;
-                        ((IValue)value).GetCurrentIsReadOnly(out readOnly);
-                        result["valueReadOnly"] = readOnly != 0;
-                        if (readOnly == 0) writableValue = (IValue)value;
-                    }
+                    Require(value != null, "Missing Value pattern");
+                    IValue writableValue = (IValue)value;
+                    int readOnly;
+                    writableValue.GetCurrentIsReadOnly(out readOnly);
+                    result["valueReadOnly"] = readOnly != 0;
+                    Require(readOnly == 0, "Combo Value pattern is read-only");
                     string before = ReadCombo(value, selection);
                     result["before"] = before;
                     if (exercise)
@@ -462,6 +459,8 @@ namespace SettingsPatterns
                                     int budget = 256;
                                     Require(SelectOther(list, walker, 0, ref budget, useSelectionItem ? null : writableValue, result),
                                         "No enabled unselected popup SelectionItem");
+                                    Require(Object.Equals(result["operation"], useSelectionItem ? "SelectionItem.Select" : "Value.SetValue"),
+                                        "Combo operation used the wrong pattern");
                                     IntPtr save = GetDlgItem(GetAncestor((IntPtr)hwnd, 2), 301);
                                     result["saveEnabledBeforeCollapse"] = save != IntPtr.Zero && IsWindowEnabled(save);
                                     Require(Convert.ToBoolean(result["saveEnabledBeforeCollapse"]),
