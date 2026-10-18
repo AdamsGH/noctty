@@ -101,12 +101,6 @@ pub fn resolveIpcPipeNameForTarget(
     };
 }
 
-/// Connect to the single-instance IPC pipe as a client.
-///
-/// `error.FileNotFound` and `error.PipeUnreachable` both mean "there is no
-/// instance we can talk to"; callers must treat them the same and fall back
-/// to running locally. They are kept distinct only so the unreachable case
-/// can be logged differently.
 /// Backing store for a copied SID. `SECURITY_MAX_SID_SIZE` is 68 bytes, so
 /// 256 is ample. The alignment is required, not cosmetic: a `SID` ends in an
 /// array of `DWORD` sub-authorities, and `EqualSid` reads them as such.
@@ -149,28 +143,11 @@ fn tokenUserSidBytes(
     return buf[0..sid_len];
 }
 
-/// Mandatory integrity level of a token, as an `S-1-16-<rid>` RID.
-///
-/// Unlike `allocIpcPipeIntegritySid` this reports EVERY level including
-/// medium and below, because the comparison below needs the actual value
-/// rather than "is it above medium".
+/// Mandatory integrity level of a token, as an `S-1-16-<rid>` RID: the
+/// numeric value, which the comparison below needs.
 fn tokenIntegrityRid(token: windows.HANDLE) ?u32 {
-    var label_buf: [256]u8 align(@alignOf(sys.TOKEN_MANDATORY_LABEL)) = undefined;
-    var label_len: u32 = 0;
-    if (sys.GetTokenInformation(
-        token,
-        c.TokenIntegrityLevel,
-        &label_buf,
-        label_buf.len,
-        &label_len,
-    ) == 0) return null;
-    const label: *const sys.TOKEN_MANDATORY_LABEL = @ptrCast(&label_buf);
-
-    var sid_string: ?[*:0]u16 = null;
-    if (sys.ConvertSidToStringSidW(label.Label.Sid, &sid_string) == 0) return null;
-    const sid = sid_string orelse return null;
+    const sid = allocIpcPipeIntegritySid(token) catch return null;
     defer _ = sys.LocalFree(@ptrCast(sid));
-
     return integrityRidFromSidString(std.mem.span(sid));
 }
 
@@ -293,12 +270,15 @@ fn descriptorIntegrityRidFromSddl(sddl: []const u16) error{InvalidSecurityDescri
     // The producer always emits an explicit label. Missing or unknown labels
     // must fail closed; otherwise a low-integrity same-user squatter can rely
     // on Windows' implicit-medium interpretation and impersonate our server.
-    if (std.mem.indexOf(u16, sddl, std.unicode.utf8ToUtf16LeStringLiteral("(ML;")) != null) {
-        return error.InvalidSecurityDescriptor;
-    }
     return error.InvalidSecurityDescriptor;
 }
 
+/// Connect to the single-instance IPC pipe as a client.
+///
+/// `error.FileNotFound` and `error.PipeUnreachable` both mean "there is no
+/// instance we can talk to"; callers must treat them the same and fall back
+/// to running locally. They are kept distinct only so the unreachable case
+/// can be logged differently.
 fn connectToIpcPipe(
     alloc: Allocator,
     pipe_name: [:0]const u16,
@@ -843,20 +823,7 @@ pub fn sendLaunchLayoutIpc(
         0,
     );
     defer alloc.free(request);
-
-    const pipe = connectToIpcPipe(alloc, pipe_name, elevated) catch |err| switch (err) {
-        error.FileNotFound, error.PipeUnreachable, error.UntrustedIpcServer => return false,
-        error.PipeBusy => return error.IPCFailed,
-        else => return err,
-    };
-    defer _ = windows.CloseHandle(pipe);
-
-    try win32_ipc.setAutomationRequestDeadline(
-        request,
-        automationRequestDeadline(response_timeout_ms),
-    );
-    try win32_ipc.writeAll(.{ .handle = pipe }, request);
-    return try win32_ipc.readAckWithTimeout(pipe, std.math.maxInt(u64));
+    return sendAutomationAckRequest(alloc, pipe_name, elevated, request, response_timeout_ms);
 }
 
 fn trySendStartupLaunchLayoutIpc(
@@ -903,15 +870,6 @@ pub fn scanLaunchLayoutIpcArgument(
     return .none;
 }
 
-/// Apply a forwarded `new_window` argv to `config`.
-///
-/// Returns `error.ForbiddenForwardedArgument` for the whole request if any
-/// argument is rejected. Dropping individual keys silently would leave the
-/// caller with a window that does not match what was asked for, and would
-/// make an attacker's probe indistinguishable from a normal launch.
-///
-/// This function does not log, so that it stays a pure predicate over argv
-/// and can be unit tested; every caller logs the rejection it handles.
 fn automationWorkingDirectoryValue(value: []const u8) []const u8 {
     var result = std.mem.trim(u8, value, &std.ascii.whitespace);
     if (result.len >= 2 and result[0] == '"' and result[result.len - 1] == '"') {
@@ -951,6 +909,15 @@ pub fn applyAutomationWorkingDirectory(config: *configpkg.Config, value: []const
     config.@"working-directory" = working_directory;
 }
 
+/// Apply a forwarded `new_window` argv to `config`.
+///
+/// Returns `error.ForbiddenForwardedArgument` for the whole request if any
+/// argument is rejected. Dropping individual keys silently would leave the
+/// caller with a window that does not match what was asked for, and would
+/// make an attacker's probe indistinguishable from a normal launch.
+///
+/// This function does not log, so that it stays a pure predicate over argv
+/// and can be unit tested; every caller logs the rejection it handles.
 pub fn applyNewWindowArguments(
     alloc_gpa: Allocator,
     config: *configpkg.Config,
@@ -1329,13 +1296,13 @@ fn ipcServerMain(
     while (true) {
         if (connectIpcClient(pipe, io_event, stop_event)) |connected| {
             if (!connected) return;
-            if (handleIpcClient(app, .{
+            handleIpcClient(app, .{
                 .handle = pipe,
                 .event = io_event,
                 .stop_event = stop_event,
-            })) |_| {} else |err| if (err != error.IpcStopped) {
+            }) catch |err| if (err != error.IpcStopped) {
                 log.warn("failed to process win32 IPC client err={}", .{err});
-            }
+            };
         } else |err| {
             // Includes a client that connected and left before this instance
             // was picked up; the instance cannot serve anyone else, so it is
@@ -1400,7 +1367,7 @@ fn createIpcServerEvent() ?windows.HANDLE {
     };
 }
 
-fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !win32_ipc.RequestKind {
+fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
     const kind = win32_ipc.decodeRequestKind(pipe) catch |err| {
         win32_ipc.writeAck(pipe, false) catch {};
         return err;
@@ -1468,7 +1435,6 @@ fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !win32_ipc.RequestKind {
             try win32_ipc.writeAck(pipe, false);
         },
     }
-    return kind;
 }
 
 fn handleNewWindowIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
@@ -1485,13 +1451,7 @@ fn handleNewWindowIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
         return;
     }
 
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .new_window = .{
-        .arguments = arguments,
-    } }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .new_window = .{ .arguments = arguments } })) {
         return error.IPCFailed;
     }
 
@@ -1527,13 +1487,19 @@ fn handlePerformActionIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !v
         else => return err,
     };
     defer app.core_app.alloc.free(payload.action_text);
+    try ackAutomationAction(app, pipe, payload.target, payload.action_text, payload.deadline_ms);
+}
 
-    requestAutomationAction(
-        app,
-        payload.target,
-        payload.action_text,
-        payload.deadline_ms,
-    ) catch |err| {
+/// Run an automation action and answer the client: success, the status for
+/// a refusal it can act on, or the error for `handleIpcClient` to report.
+fn ackAutomationAction(
+    app: *App,
+    pipe: win32_ipc.Pipe,
+    target: apprt.ipc.AutomationActionTarget,
+    action_text: []const u8,
+    deadline_ms: u64,
+) !void {
+    requestAutomationAction(app, target, action_text, deadline_ms) catch |err| {
         const status: u8 = switch (err) {
             error.InvalidAutomationAction => win32_ipc.ack_invalid_automation_action,
             error.UnsafeAutomationAction => win32_ipc.ack_unsafe_automation_action,
@@ -1541,8 +1507,7 @@ fn handlePerformActionIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !v
             error.NoAutomationTarget => win32_ipc.ack_no_automation_target,
             else => return err,
         };
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
+        return win32_ipc.writeAckStatus(pipe, status);
     };
     try win32_ipc.writeAck(pipe, true);
 }
@@ -1562,24 +1527,7 @@ fn handleLaunchLayoutIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !vo
         .{payload.name},
     );
     defer app.core_app.alloc.free(action_text);
-
-    requestAutomationAction(
-        app,
-        .focused,
-        action_text,
-        payload.deadline_ms,
-    ) catch |err| {
-        const status: u8 = switch (err) {
-            error.InvalidAutomationAction => win32_ipc.ack_invalid_automation_action,
-            error.UnsafeAutomationAction => win32_ipc.ack_unsafe_automation_action,
-            error.InvalidAutomationTarget => win32_ipc.ack_invalid_automation_target,
-            error.NoAutomationTarget => win32_ipc.ack_no_automation_target,
-            else => return err,
-        };
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
-    };
-    try win32_ipc.writeAck(pipe, true);
+    try ackAutomationAction(app, pipe, .focused, action_text, payload.deadline_ms);
 }
 
 fn handleFocusIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
@@ -1590,16 +1538,7 @@ fn handleFocusIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         },
         else => return err,
     };
-    requestAutomationCommand(
-        app,
-        .{ .focus = payload.target },
-        payload.deadline_ms,
-    ) catch |err| {
-        const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
-    };
-    try win32_ipc.writeAck(pipe, true);
+    try ackAutomationCommand(app, pipe, .{ .focus = payload.target }, payload.deadline_ms);
 }
 
 fn handleSendTextIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
@@ -1615,17 +1554,23 @@ fn handleSendTextIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         else => return err,
     };
     defer payload.deinit(app.core_app.alloc);
-    requestAutomationCommand(
-        app,
-        .{ .send_text = .{
-            .target = payload.target,
-            .text = payload.text,
-        } },
-        payload.deadline_ms,
-    ) catch |err| {
+    try ackAutomationCommand(app, pipe, .{ .send_text = .{
+        .target = payload.target,
+        .text = payload.text,
+    } }, payload.deadline_ms);
+}
+
+/// Run an automation command and answer the client: success, the status
+/// for a refusal it can act on, or the error for `handleIpcClient` to report.
+fn ackAutomationCommand(
+    app: *App,
+    pipe: win32_ipc.Pipe,
+    command: apprt.ipc.AutomationCommand,
+    deadline_ms: u64,
+) !void {
+    requestAutomationCommand(app, command, deadline_ms) catch |err| {
         const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
+        return win32_ipc.writeAckStatus(pipe, status);
     };
     try win32_ipc.writeAck(pipe, true);
 }
@@ -1650,19 +1595,10 @@ fn handleNewTabIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_automation_policy_refused);
         return;
     };
-    requestAutomationCommand(
-        app,
-        .{ .new_tab = .{
-            .target = payload.target,
-            .working_directory = payload.working_directory,
-        } },
-        payload.deadline_ms,
-    ) catch |err| {
-        const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
-    };
-    try win32_ipc.writeAck(pipe, true);
+    try ackAutomationCommand(app, pipe, .{ .new_tab = .{
+        .target = payload.target,
+        .working_directory = payload.working_directory,
+    } }, payload.deadline_ms);
 }
 
 fn handleNewSplitIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
@@ -1676,20 +1612,20 @@ fn handleNewSplitIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_automation_policy_refused);
         return;
     };
-    requestAutomationCommand(
-        app,
-        .{ .new_split = .{
-            .target = payload.target,
-            .direction = payload.direction,
-            .working_directory = payload.working_directory,
-        } },
-        payload.deadline_ms,
-    ) catch |err| {
-        const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
+    try ackAutomationCommand(app, pipe, .{ .new_split = .{
+        .target = payload.target,
+        .direction = payload.direction,
+        .working_directory = payload.working_directory,
+    } }, payload.deadline_ms);
+}
+
+/// Hand `message` to the App's mailbox, giving up after the IPC I/O timeout.
+fn pushIpcMailboxMessage(app: *App, message: CoreApp.Message) bool {
+    const mailbox: CoreApp.Mailbox = .{
+        .rt_app = app,
+        .mailbox = &app.core_app.mailbox,
     };
-    try win32_ipc.writeAck(pipe, true);
+    return mailbox.push(message, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) != 0;
 }
 
 fn requestAutomationWindowListJson(
@@ -1704,11 +1640,7 @@ fn requestAutomationWindowListJson(
     );
     defer request.release();
     request.retain(); // Mailbox-consumer ownership.
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .automation_window_list = request }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .automation_window_list = request })) {
         request.release();
         return error.IPCFailed;
     }
@@ -1737,11 +1669,7 @@ fn requestAutomationAction(
     );
     defer request.release();
     request.retain(); // Mailbox-consumer ownership.
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .automation_action = request }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .automation_action = request })) {
         request.release();
         return error.IPCFailed;
     }
@@ -1763,11 +1691,7 @@ fn requestAutomationCommand(
     );
     defer request.release();
     request.retain(); // Mailbox-consumer ownership.
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .automation_command = request }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .automation_command = request })) {
         request.release();
         return error.IPCFailed;
     }
@@ -2184,34 +2108,23 @@ test "win32 SDDL auto-inherit normalization keeps every access-bearing field" {
     }
 }
 
-test "win32 IPC pipe descriptor attaches the expected owner DACL and label" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+/// A pipe name no other test uses: `\\.\pipe\noctty-ipc-<tag>-<tick>`.
+fn testUniquePipeName(alloc: Allocator, comptime tag: []const u8) ![:0]u16 {
+    const name = try std.fmt.allocPrint(alloc, "\\\\.\\pipe\\noctty-ipc-" ++ tag ++ "-{d}", .{sys.GetTickCount64()});
+    defer alloc.free(name);
+    return std.unicode.utf8ToUtf16LeAllocZ(alloc, name);
+}
 
-    const alloc = std.testing.allocator;
-    const requested = try allocIpcPipeSecurityDescriptor();
-    defer _ = sys.LocalFree(requested);
-
+/// A non-blocking byte pipe that rejects remote clients, with `descriptor`
+/// attached.
+fn testCreateSecuredPipe(name: [:0]const u16, descriptor: *anyopaque) windows.HANDLE {
     var security_attributes: windows.SECURITY_ATTRIBUTES = .{
         .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = requested,
+        .lpSecurityDescriptor = descriptor,
         .bInheritHandle = windows.FALSE,
     };
-
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        alloc,
-        "\\\\.\\pipe\\noctty-ipc-sddl-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer alloc.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pipe_name_utf8);
-    defer alloc.free(pipe_name);
-
-    // Assert against the descriptor Windows ACTUALLY ATTACHED, not against the
-    // string we handed in. Only the live object shows the generic-rights
-    // mapping, and only the live object proves the label survived creation.
-    const pipe = sys.CreateNamedPipeW(
-        pipe_name.ptr,
+    return sys.CreateNamedPipeW(
+        name.ptr,
         c.PIPE_ACCESS_DUPLEX,
         windows.PIPE_TYPE_BYTE |
             c.PIPE_READMODE_BYTE |
@@ -2223,6 +2136,22 @@ test "win32 IPC pipe descriptor attaches the expected owner DACL and label" {
         0,
         &security_attributes,
     );
+}
+
+test "win32 IPC pipe descriptor attaches the expected owner DACL and label" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const requested = try allocIpcPipeSecurityDescriptor();
+    defer _ = sys.LocalFree(requested);
+
+    const pipe_name = try testUniquePipeName(alloc, "sddl");
+    defer alloc.free(pipe_name);
+
+    // Assert against the descriptor Windows ACTUALLY ATTACHED, not against the
+    // string we handed in. Only the live object shows the generic-rights
+    // mapping, and only the live object proves the label survived creation.
+    const pipe = testCreateSecuredPipe(pipe_name, requested);
     try std.testing.expect(pipe != windows.INVALID_HANDLE_VALUE);
     defer _ = windows.CloseHandle(pipe);
 
@@ -2355,38 +2284,10 @@ test "win32 IPC pipe DACL still admits a same-user client" {
     const descriptor = try allocIpcPipeSecurityDescriptor();
     defer _ = sys.LocalFree(descriptor);
 
-    var security_attributes: windows.SECURITY_ATTRIBUTES = .{
-        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = descriptor,
-        .bInheritHandle = windows.FALSE,
-    };
-
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        std.testing.allocator,
-        "\\\\.\\pipe\\noctty-ipc-dacl-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer std.testing.allocator.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(
-        std.testing.allocator,
-        pipe_name_utf8,
-    );
+    const pipe_name = try testUniquePipeName(std.testing.allocator, "dacl");
     defer std.testing.allocator.free(pipe_name);
 
-    const server = sys.CreateNamedPipeW(
-        pipe_name.ptr,
-        c.PIPE_ACCESS_DUPLEX,
-        windows.PIPE_TYPE_BYTE |
-            c.PIPE_READMODE_BYTE |
-            win32_ipc.pipe_nowait |
-            c.PIPE_REJECT_REMOTE_CLIENTS,
-        1,
-        1024,
-        1024,
-        0,
-        &security_attributes,
-    );
+    const server = testCreateSecuredPipe(pipe_name, descriptor);
     try std.testing.expect(server != windows.INVALID_HANDLE_VALUE);
     defer _ = windows.CloseHandle(server);
 
@@ -2661,37 +2562,13 @@ test "win32 IPC client authenticates the connected pipe descriptor" {
 
     const alloc = std.testing.allocator;
 
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        alloc,
-        "\\\\.\\pipe\\noctty-ipc-serverauth-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer alloc.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pipe_name_utf8);
+    const pipe_name = try testUniquePipeName(alloc, "serverauth");
     defer alloc.free(pipe_name);
 
     const descriptor = try allocIpcPipeSecurityDescriptor();
     defer _ = sys.LocalFree(descriptor);
-    var security_attributes: windows.SECURITY_ATTRIBUTES = .{
-        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = descriptor,
-        .bInheritHandle = windows.FALSE,
-    };
 
-    const server = sys.CreateNamedPipeW(
-        pipe_name.ptr,
-        c.PIPE_ACCESS_DUPLEX,
-        windows.PIPE_TYPE_BYTE |
-            c.PIPE_READMODE_BYTE |
-            win32_ipc.pipe_nowait |
-            c.PIPE_REJECT_REMOTE_CLIENTS,
-        1,
-        1024,
-        1024,
-        0,
-        &security_attributes,
-    );
+    const server = testCreateSecuredPipe(pipe_name, descriptor);
     try std.testing.expect(server != windows.INVALID_HANDLE_VALUE);
     defer _ = windows.CloseHandle(server);
 
@@ -2748,17 +2625,7 @@ test "automation working directory receiver policy mirrors forwarded syntax" {
 test "win32 IPC silent synchronous client read is bounded" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        std.testing.allocator,
-        "\\\\.\\pipe\\noctty-ipc-timeout-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer std.testing.allocator.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(
-        std.testing.allocator,
-        pipe_name_utf8,
-    );
+    const pipe_name = try testUniquePipeName(std.testing.allocator, "timeout");
     defer std.testing.allocator.free(pipe_name);
 
     const server = sys.CreateNamedPipeW(

@@ -206,10 +206,9 @@ pub fn tabButtonKeyAction(vk: WPARAM, mods: KeyMods) ?TabButtonKeyAction {
         c.VK_DELETE => .close,
         // The overview is a palette action; the menu key opens the tab's
         // context menu, as it does on every other Windows control.
-        c.VK_APPS => .context_menu,
         // Shift+F10 is the same request. F10 is a system key, so it arrives
         // as WM_SYSKEYDOWN, and plain F10 stays with the window.
-        c.VK_F10 => if (mods.shift and !mods.ctrl) .context_menu else null,
+        c.VK_APPS, c.VK_F10 => if (tabContextMenuKey(vk, mods)) .context_menu else null,
         c.VK_TAB => switch (tabFocusStep(vk, mods) orelse return null) {
             .next => .focus_next,
             .previous => .focus_previous,
@@ -238,6 +237,11 @@ pub fn chromeButtonKeyAction(vk: WPARAM, mods: KeyMods) ?ChromeButtonKeyAction {
 /// the menu key's release (and Shift+F10's) into a second WM_CONTEXTMENU after
 /// the key-down already opened the menu.
 pub fn tabButtonSwallowsKeyUp(vk: WPARAM, mods: KeyMods) bool {
+    return tabContextMenuKey(vk, mods);
+}
+
+/// The menu key, or Shift+F10 without Ctrl or Alt.
+fn tabContextMenuKey(vk: WPARAM, mods: KeyMods) bool {
     return vk == c.VK_APPS or (vk == c.VK_F10 and mods.shift and !mods.ctrl and !mods.alt);
 }
 
