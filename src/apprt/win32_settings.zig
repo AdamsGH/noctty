@@ -1097,6 +1097,7 @@ const settings_clipped_control_count = settings_control_count - settings_header_
 
 comptime {
     for (settings_control_specs, 0..) |spec, i| {
+        if (spec.id <= 1) @compileError("Settings control ID is reserved for static/default dialog controls");
         for (settings_control_specs[0..i]) |other| {
             if (spec.id == other.id) @compileError("Duplicate Settings control ID");
             if (spec.section != null and spec.section == other.section and spec.order == other.order)
@@ -2781,6 +2782,7 @@ pub const SettingsWindow = struct {
     /// The viewport and the state the layout and the field frames keep about
     /// it, for a window that is gone.
     fn forgetFormWindows(self: *SettingsWindow) void {
+        self.fields = .{};
         self.viewport = null;
         self.framed_invalid_field = null;
         self.help_shown = false;
@@ -3148,17 +3150,13 @@ pub const SettingsWindow = struct {
     /// the arrow-key group of the rail would run on into the fields and Save:
     /// each section's first field and the action bar start their own.
     fn applyTabOrder(self: *SettingsWindow) void {
+        var previous_text = false;
         for (std.enums.values(Section)) |section| for (formItemsForSection(section), 0..) |item, index| {
             const control = self.controlHwnd(item.control_index) orelse continue;
-            if (item.label_index) |label_index| if (self.field_labels[label_index]) |label| {
-                sendToBottom(label);
-                // Dialog arrow navigation includes STATICs. Isolate the label
-                // from both adjacent control groups while retaining adjacency.
-                startGroup(label);
-                startGroup(control);
-            };
-            sendToBottom(control);
-            if (index == 0) startGroup(control);
+            const label = if (item.label_index) |label_index| self.field_labels[label_index] else null;
+            const text = settings_control_specs[item.control_index].role == .text;
+            orderFormControl(control, label, index == 0 or previous_text or text);
+            previous_text = text;
         };
         // Conflict choices and Discard sit left of Save (never together); the
         // close prompt replaces them all.
@@ -7122,7 +7120,11 @@ fn settingsFormItemRects(items: []const FormItem, pane_width: i32, dpi: u32, out
     var start: usize = 0;
     while (start < items.len) {
         var end = start + 1;
-        while (end < items.len and items[end].checkbox == items[start].checkbox) : (end += 1) {}
+        // A later labeled checkbox starts a new run so its label has its own
+        // space above the control, rather than sharing the first row's label.
+        while (end < items.len and items[end].checkbox == items[start].checkbox and
+            !(items[end].checkbox and items[end].label_index != null)) : (end += 1)
+        {}
         if (items[start].checkbox) {
             const lane = settingsFieldRects(0, pane_width, dpi);
             const control_top = top + if (items[start].label_index != null) scaleForDpi(settings_field_label_offset, dpi) else 0;
@@ -8416,7 +8418,7 @@ test "settings Tab visits the fields in form order and Save last" {
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
 
-            // A pending change enables Save, which is created before every field.
+            // A pending change makes Save eligible for dialog traversal.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
             settings.syncCursorStyleFromCombo();
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
@@ -8485,6 +8487,26 @@ test "settings arrow-key groups stop at the rail and the action bar" {
     }.body);
 }
 
+test "settings later labeled checkbox starts a layout run" {
+    const items = [_]FormItem{
+        .{ .control_index = 0, .checkbox = true },
+        .{ .control_index = 1, .checkbox = true, .label_index = 0 },
+        .{ .control_index = 2, .checkbox = true },
+    };
+    var rects: [items.len]SettingsFieldRects = undefined;
+    settingsFormItemRects(&items, 700, 96, &rects);
+    try std.testing.expect(rects[1].label.top >= rects[0].control.bottom);
+    try std.testing.expect(rects[1].control.top > rects[1].label.bottom);
+    try std.testing.expect(rects[2].control.top > rects[1].control.bottom);
+}
+
+test "settings forgetting form clears every generated HWND" {
+    var settings: SettingsWindow = undefined;
+    inline for (std.meta.fields(FieldWindows)) |field| @field(settings.fields, field.name) = @ptrFromInt(1);
+    settings.forgetFormWindows();
+    inline for (std.meta.fields(FieldWindows)) |field| try std.testing.expect(@field(settings.fields, field.name) == null);
+}
+
 test "settings labeled checkbox arrow group never visits its static label" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
@@ -8518,6 +8540,20 @@ test "settings display-only text row needs no persistence adapter" {
             comptime std.debug.assert(!@hasField(@TypeOf(field_adapters), spec.binding));
             const control = makeDisplayControl(fixture.settings.viewport.?, fixture.settings.handle.hinstance, spec).?;
             defer _ = sys.DestroyWindow(control);
+            // Insert the descriptor-only row in a real checkbox run and use
+            // the same grouping helper as generated rows on either side.
+            fixture.settings.setActiveSection(.privacy);
+            const before = fixture.settings.fields.chk_desktop_notifications.?;
+            const after = fixture.settings.fields.chk_app_notify_clipboard.?;
+            orderFormControl(before, null, true);
+            orderFormControl(control, null, true);
+            orderFormControl(after, null, true);
+            _ = sys.ShowWindow(control, SW_SHOWNORMAL);
+            for ([_]HWND{ before, after }) |checkbox| {
+                for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                    try std.testing.expect(dialog_test.GetNextDlgGroupItem(fixture.hwnd(), checkbox, previous).? != control);
+                }
+            }
             var text: [64]u8 = undefined;
             try std.testing.expectEqualStrings(spec.name, readEditUtf8(control, &text).?);
             try std.testing.expectEqual(@as(LONG_PTR, 499), sys.GetWindowLongPtrW(control, -12));
@@ -10195,6 +10231,17 @@ fn wheelScrollPixels(remainder: *i32, delta: i32, notch_px: i32) i32 {
     const pixels: i64 = @divTrunc(total, WHEEL_DELTA);
     remainder.* = @intCast(total - pixels * WHEEL_DELTA);
     return @intCast(std.math.clamp(pixels, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+/// Keep labels adjacent while excluding STATIC rows from neighboring arrow groups.
+fn orderFormControl(control: HWND, label: ?HWND, boundary: bool) void {
+    if (label) |text| {
+        sendToBottom(text);
+        startGroup(text);
+        startGroup(control);
+    }
+    sendToBottom(control);
+    if (boundary) startGroup(control);
 }
 
 fn startGroup(control: HWND) void {

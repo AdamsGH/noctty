@@ -13,6 +13,11 @@
     stage and SHA-256. OutputDirectory must be NEW and inside wt-setform-run.
     Native GetNextDlgTabItem/GetNextDlgGroupItem check traversal without focusing
     or injecting keys, including both arrow directions at the labeled checkbox.
+    Tab traversal starts at the active rail button and covers the entire Settings
+    dialog cycle, including enabled footer actions, before filtering form rows.
+    Bounded traces retain ordered native steps and root/viewport/anchor state,
+    window ownership and NULL-return error codes, without window titles. This
+    checks native dialog order; it does not inject Tab or call app accelerators.
     Labeled rows require immediate native STATIC predecessor; other checkboxes
     label themselves through their existing caption. Existing labels/names/IDs
     and section order are deliberately independent of product descriptors.
@@ -58,7 +63,8 @@ namespace SetForm
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
         [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLong(IntPtr hwnd, int index);
-        [DllImport("user32.dll")] static extern IntPtr GetNextDlgTabItem(IntPtr dialog, IntPtr control, bool previous);
+        [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetNextDlgTabItem(IntPtr dialog, IntPtr control, bool previous);
+        [DllImport("user32.dll", SetLastError=true)] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
         [DllImport("user32.dll")] static extern IntPtr GetNextDlgGroupItem(IntPtr dialog, IntPtr control, bool previous);
         [DllImport("user32.dll", CharSet=CharSet.Unicode)]
         static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int length);
@@ -98,20 +104,83 @@ namespace SetForm
             }
             return result.ToArray();
         }
-        public static int[] TabOrder(IntPtr dialog, IntPtr viewport, bool reverse)
+        public sealed class TabStep
         {
-            var result = new List<int>(); var visited = new HashSet<IntPtr>();
-            IntPtr child = GetNextDlgTabItem(dialog, IntPtr.Zero, reverse);
-            for (int i = 0; child != IntPtr.Zero && i < 256; i++) {
-                if (!visited.Add(child)) return result.ToArray();
-                if (GetParent(child) == viewport) {
-                    if (!IsWindowVisible(child) || !IsWindowEnabled(child))
-                        throw new InvalidOperationException("Tab visits hidden or disabled form control");
-                    result.Add(GetDlgCtrlID(child));
+            public long Hwnd, Parent, NextHwnd;
+            public int Id;
+            public uint ThreadId, ProcessId;
+            public int? OwnerError, NextError;
+            public bool Form, Visible, Enabled, TabStop, NextQueried;
+        }
+        public sealed class TabTrace
+        {
+            public TabStep Root, Viewport, Anchor;
+            public List<TabStep> Steps = new List<TabStep>();
+            public bool Complete, Reverse;
+            public int Calls;
+            public long ClosureHwnd;
+            public string Error;
+        }
+        static TabStep TabState(IntPtr hwnd, IntPtr viewport)
+        {
+            var step = new TabStep { Hwnd = hwnd.ToInt64() };
+            if (hwnd == IntPtr.Zero) return step;
+            uint processId;
+            step.ThreadId = GetWindowThreadProcessId(hwnd, out processId);
+            if (step.ThreadId == 0) step.OwnerError = Marshal.GetLastWin32Error();
+            step.ProcessId = processId;
+            IntPtr parent = GetParent(hwnd);
+            step.Parent = parent.ToInt64(); step.Form = parent == viewport;
+            step.Id = GetDlgCtrlID(hwnd);
+            step.Visible = IsWindowVisible(hwnd); step.Enabled = IsWindowEnabled(hwnd);
+            step.TabStop = (GetWindowLong(hwnd, -16) & 0x10000) != 0;
+            return step;
+        }
+        public static TabTrace TabOrder(IntPtr dialog, IntPtr viewport, IntPtr start, bool reverse)
+        {
+            var trace = new TabTrace { Reverse = reverse }; var visited = new HashSet<IntPtr>();
+            try {
+                // State-only diagnostics: no titles, focus changes or input.
+                trace.Root = TabState(dialog, viewport);
+                trace.Viewport = TabState(viewport, viewport);
+                trace.Anchor = TabState(start, viewport);
+                if (dialog == IntPtr.Zero || viewport == IntPtr.Zero || start == IntPtr.Zero ||
+                    trace.Viewport.Parent != dialog.ToInt64() || trace.Anchor.Parent != dialog.ToInt64())
+                    throw new InvalidOperationException("Tab traversal requires the Settings root, its viewport and a nonzero rail anchor");
+                if (!trace.Root.Visible || !trace.Root.Enabled || !trace.Viewport.Visible || !trace.Viewport.Enabled ||
+                    trace.Root.ThreadId == 0 || trace.Viewport.ThreadId != trace.Root.ThreadId || trace.Anchor.ThreadId != trace.Root.ThreadId)
+                    throw new InvalidOperationException("Tab root/viewport/anchor is unavailable or belongs to a different window thread");
+                // GetNextDlgTabItem documents NULL hCtl as failure, not a request
+                // for the first control. Keep hDlg at Settings: the control-parent
+                // viewport participates in its parent's rail/form/footer cycle.
+                IntPtr child = start;
+                for (int i = 0; i < 256; i++) {
+                    if (child == IntPtr.Zero)
+                        throw new InvalidOperationException("GetNextDlgTabItem returned NULL before returning to the rail anchor");
+                    if (!visited.Add(child)) {
+                        trace.ClosureHwnd = child.ToInt64();
+                        if (child != start)
+                            throw new InvalidOperationException("Dialog tab traversal cycled without returning to the rail anchor");
+                        trace.Complete = true;
+                        return trace;
+                    }
+                    var step = TabState(child, viewport);
+                    trace.Steps.Add(step);
+                    if ((step.Parent != dialog.ToInt64() && step.Parent != viewport.ToInt64()) ||
+                        step.ThreadId != trace.Root.ThreadId || step.ProcessId != trace.Root.ProcessId)
+                        throw new InvalidOperationException("Dialog tab traversal escaped the Settings rail/form/footer");
+                    if (!step.Visible || !step.Enabled || !step.TabStop)
+                        throw new InvalidOperationException("Tab visits a hidden, disabled or non-tab-stop control");
+                    child = GetNextDlgTabItem(dialog, child, reverse);
+                    step.NextQueried = true; step.NextHwnd = child.ToInt64(); trace.Calls++;
+                    if (child == IntPtr.Zero) step.NextError = Marshal.GetLastWin32Error();
                 }
-                child = GetNextDlgTabItem(dialog, child, reverse);
+                throw new InvalidOperationException("Dialog tab traversal failed to cycle within 256 steps");
+            } catch (Exception failure) {
+                // Preserve every partial observation for the caller's receipt.
+                trace.Error = failure.Message;
+                return trace;
             }
-            throw new InvalidOperationException("Dialog tab traversal failed to cycle within bound");
         }
         public static long Prose(IntPtr viewport, string marker)
         {
@@ -295,12 +364,43 @@ try {
             Assert-Contract (($visual.Id -join ',') -ceq (($sectionCases | ForEach-Object { $_[1] }) -join ',')) `
                 "Visible controls differ from the frozen section order: $section"
             $enabledIds = @($visual | Where-Object Enabled | ForEach-Object Id)
-            $forward = @([SetForm.Layout]::TabOrder($settings, $viewport, $false))
-            $reverse = @([SetForm.Layout]::TabOrder($settings, $viewport, $true))
+            $rootRows = @([SetForm.Layout]::Rows($settings))
+            Write-Json (Join-Path $OutputDirectory "section-$section-dialog-native.json") $rootRows
+            $rootTabRows = @($rootRows | Where-Object { $_.Visible -and $_.Enabled -and $_.TabStop })
+            $railIds = @($rootTabRows | Where-Object { $_.Id -in 201..207 } | ForEach-Object Id)
+            # Fixed footer IDs/order, filtered by current native eligibility.
+            # Inspection keeps Save disabled; hidden/disabled actions must never
+            # be visited. Including eligible actions preserves the real cycle.
+            $footerOrder = @(303, 304, 307, 301, 305, 306, 2)
+            $footerIds = @($rootTabRows | Where-Object { $_.Id -in $footerOrder } | Sort-Object Top, Left | ForEach-Object Id)
+            $expectedFooterIds = @($footerOrder | Where-Object { $_ -in $footerIds })
+            $anchor = Ctl $settings $section
+            $forwardTrace = [SetForm.Layout]::TabOrder($settings, $viewport, $anchor, $false)
+            Write-Json (Join-Path $OutputDirectory "section-$section-tab-forward.json") $forwardTrace
+            $record.forwardGlobalTabIds = @($forwardTrace.Steps | ForEach-Object Id)
+            $reverseTrace = [SetForm.Layout]::TabOrder($settings, $viewport, $anchor, $true)
+            Write-Json (Join-Path $OutputDirectory "section-$section-tab-reverse.json") $reverseTrace
+            $record.reverseGlobalTabIds = @($reverseTrace.Steps | ForEach-Object Id)
+            # Retain both directions before rejecting either one; failures are
+            # diagnostics, never accepted as empty or partial successful walks.
+            Assert-Contract $forwardTrace.Complete "Forward tab traversal failed: $($forwardTrace.Error)"
+            Assert-Contract $reverseTrace.Complete "Reverse tab traversal failed: $($reverseTrace.Error)"
+            Assert-Contract (($railIds -join ',') -ceq [string]$section) "Active section must be the rail's only tab stop: $section"
+            Assert-Contract (($footerIds -join ',') -ceq ($expectedFooterIds -join ',')) "Footer visual order changed: $section"
+            $forward = @($forwardTrace.Steps | Where-Object Form | ForEach-Object Id)
+            $reverse = @($reverseTrace.Steps | Where-Object Form | ForEach-Object Id)
             $reversedIds = @($enabledIds); [array]::Reverse($reversedIds)
             $record.forwardTabIds = $forward; $record.reverseTabIds = $reverse
             Assert-Contract (($forward -join ',') -ceq ($enabledIds -join ',')) "Tab order differs from visual order: $section"
             Assert-Contract (($reverse -join ',') -ceq ($reversedIds -join ',')) "Reverse Tab order differs from visual order: $section"
+            $tailIds = @($enabledIds) + @($footerIds)
+            $expectedGlobal = @($section) + $tailIds
+            [array]::Reverse($tailIds)
+            $expectedReverseGlobal = @($section) + $tailIds
+            Assert-Contract (($record.forwardGlobalTabIds -join ',') -ceq ($expectedGlobal -join ',')) `
+                "Forward tab traversal differs from rail/form/footer order: $section"
+            Assert-Contract (($record.reverseGlobalTabIds -join ',') -ceq ($expectedReverseGlobal -join ',')) `
+                "Reverse tab traversal differs from rail/footer/form order: $section"
             if ($section -eq 206) {
                 # ID 417 has an immediately preceding STATIC Notifications label.
                 # The native dialog-manager query catches a label being eligible
