@@ -39850,8 +39850,8 @@ pub const Surface = struct {
                 // WINDOWPLACEMENT uses workspace coordinates for a normal
                 // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
                 // before the work-area translation, and back afterwards.
-                const normal = workspaceToScreenRect(placement.rcNormalPosition, source.info);
-                placement.rcNormalPosition = screenToWorkspaceRect(
+                const normal = workspaceRectToScreen(placement.rcNormalPosition, source.info);
+                placement.rcNormalPosition = screenRectToWorkspace(
                     fullscreenRestoreRect(normal, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi),
                     target.info,
                 );
@@ -39900,19 +39900,16 @@ pub const Surface = struct {
         return .{ .monitor = monitor, .info = info, .dpi = sys.GetDpiForWindow(hwnd) };
     }
 
-    /// `rect` in the workspace coordinates of `info`'s monitor (relative to
-    /// its work area) moved to screen coordinates.
-    fn workspaceToScreenRect(rect: RECT, info: MONITORINFO) RECT {
+    /// The inverse of `workspaceRectToScreen`.
+    fn screenRectToWorkspace(rect: RECT, info: MONITORINFO) RECT {
         const dx = info.rcWork.left - info.rcMonitor.left;
         const dy = info.rcWork.top - info.rcMonitor.top;
-        return .{ .left = rect.left + dx, .top = rect.top + dy, .right = rect.right + dx, .bottom = rect.bottom + dy };
-    }
-
-    /// The inverse of `workspaceToScreenRect`.
-    fn screenToWorkspaceRect(rect: RECT, info: MONITORINFO) RECT {
-        const dx = info.rcWork.left - info.rcMonitor.left;
-        const dy = info.rcWork.top - info.rcMonitor.top;
-        return .{ .left = rect.left - dx, .top = rect.top - dy, .right = rect.right - dx, .bottom = rect.bottom - dy };
+        return .{
+            .left = rect.left - dx,
+            .top = rect.top - dy,
+            .right = rect.right - dx,
+            .bottom = rect.bottom - dy,
+        };
     }
 
     fn setDecorationsVisible(self: *Surface, visible: bool) !void {
