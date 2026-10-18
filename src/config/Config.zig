@@ -4054,7 +4054,7 @@ test "a UTF-16 config file on disk is read through loadFile" {
     try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
 }
 
-/// `len` bytes of comment lines, each at most 64 bytes, for placing the next
+/// `len` bytes of comment lines, each at most 65 bytes, for placing the next
 /// line at a chosen offset in a test config file. `len` must be at least 2.
 fn testCommentLines(alloc: Allocator, len: usize) ![]u8 {
     assert(len >= 2);
@@ -4087,8 +4087,9 @@ test "loadFile reads lines after an ignored line that ends at the read buffer bo
         /// Bytes before `setting`: comment lines, then `blank` blank lines.
         before: usize,
         blank: usize = 0,
-        /// Comment bytes after `setting`.
+        /// Comment bytes after `setting`, then `tail`.
         after: usize = 0,
+        tail: []const u8 = "",
     };
     const cases = [_]Case{
         // A comment line ends exactly at the end of the buffer. Before the
@@ -4103,8 +4104,15 @@ test "loadFile reads lines after an ignored line that ends at the read buffer bo
         .{ .name = "setting ends the file at the boundary", .before = boundary - setting.len },
         // ...and on a comment after it.
         .{ .name = "comment ends the file at the boundary", .before = 100, .after = boundary - 100 - setting.len },
-        // Past the first refill, with more comments after the setting.
-        .{ .name = "comment run then more comments", .before = boundary, .after = 3 * boundary },
+        // The next call after the setting refills the buffer from just past
+        // the setting, so a comment run of exactly one buffer after it ends
+        // on the next boundary, before a second setting.
+        .{
+            .name = "comment runs end at two boundaries",
+            .before = boundary,
+            .after = boundary,
+            .tail = "cursor-style = underline\n",
+        },
     };
 
     for (cases, 0..) |case, i| {
@@ -4123,6 +4131,7 @@ test "loadFile reads lines after an ignored line that ends at the read buffer bo
             defer alloc.free(comments_after);
             try data.appendSlice(alloc, comments_after);
         }
+        try data.appendSlice(alloc, case.tail);
 
         const name = try std.fmt.allocPrint(alloc, "case{d}.ghostty", .{i});
         defer alloc.free(name);
@@ -4135,6 +4144,7 @@ test "loadFile reads lines after an ignored line that ends at the read buffer bo
         try cfg.loadFile(alloc, path);
         try testing.expect(cfg._diagnostics.empty());
         try testing.expectEqual(@as(f32, 77), cfg.@"font-size");
+        if (case.tail.len > 0) try testing.expect(cfg.@"cursor-style" == .underline);
     }
 }
 
