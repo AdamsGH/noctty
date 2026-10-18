@@ -1256,10 +1256,6 @@ pub const SettingsControlProvider = struct {
         return self.role == .text or self.role == .live_text;
     }
 
-    fn keyboardFocusable(self: *const SettingsControlProvider) bool {
-        return !self.isText() and self.role != .layout_pane;
-    }
-
     pub fn disconnect(self: *SettingsControlProvider) com.HRESULT {
         self.detach();
         if (self.disconnected.load(.acquire)) return com.S_OK;
@@ -1403,9 +1399,11 @@ pub const SettingsControlProvider = struct {
             constants.UIA_IsContentElementPropertyId,
             => out.* = com.VARIANT.fromBool(self.role != .layout_pane),
             constants.UIA_IsEnabledPropertyId => out.* = com.VARIANT.fromBool(IsWindowEnabled(self.hwnd) != 0),
-            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(self.keyboardFocusable()),
+            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(
+                !self.isText() and self.role != .layout_pane,
+            ),
             constants.UIA_HasKeyboardFocusPropertyId => out.* = com.VARIANT.fromBool(
-                self.keyboardFocusable() and hwndHasKeyboardFocus(self.hwnd),
+                !self.isText() and self.role != .layout_pane and hwndHasKeyboardFocus(self.hwnd),
             ),
             constants.UIA_IsOffscreenPropertyId => out.* = com.VARIANT.fromBool(settingsControlIsOffscreen(
                 IsWindowVisible(self.hwnd),
