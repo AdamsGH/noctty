@@ -14,6 +14,7 @@ param(
     [Parameter(Mandatory)] [string] $Bin,
     [Parameter(Mandatory)] [string] $Run,
     [switch] $Driver,
+    [string] $DesktopName,
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 300,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
@@ -154,6 +155,21 @@ public static class DpiGeometry {
         if(!PostMessageW(h,0x100,new IntPtr(key),new IntPtr(1))) throw new Exception("Key-down post failed");
         if(!PostMessageW(h,0x101,new IntPtr(key),new IntPtr(0xC0000001L))) throw new Exception("Key-up post failed");
     }
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint tid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformationW(IntPtr h,int index,StringBuilder value,int length,out int needed);
+    // The name of the desktop of the thread that owns `h`.
+    public static string WindowDesktop(IntPtr h) {
+        int pid; int tid=GetWindowThreadProcessId(h,out pid); var name=new StringBuilder(256); int needed;
+        if(tid==0 || !GetUserObjectInformationW(GetThreadDesktop((uint)tid),2,name,512,out needed)) throw new Exception("Window desktop query failed");
+        return name.ToString();
+    }
+    // Starts a process on the named desktop, with no console window.
+    public static ProcessInfo Spawn(string app,string command,string cwd,string desktop) {
+        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
+        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000000,IntPtr.Zero,cwd,ref si,out pi))
+            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
+        return pi;
+    }
     public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job) {
         var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
         // Assign the suspended driver before it can spawn children. The job
@@ -199,7 +215,7 @@ if (-not $Driver) {
         $job=[DpiGeometry]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName
         $pi=[DpiGeometry]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -256,11 +272,17 @@ function Launch-Case([string]$Name,[string]$Extra='') {
     $config=Join-Path $dir 'geometry.ghostty'
     @('command = cmd.exe /d /k','shell-integration = none','single-instance = false','window-save-state = never','confirm-close-surface = false','keybind = f11=toggle_fullscreen','keybind = f10=toggle_quick_terminal','quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-size = 25%', $Extra) | Set-Content -LiteralPath $config
     $exe=Join-Path $dir 'noctty.exe'
-    $p=Start-Process -FilePath $exe -ArgumentList @("--config-file=`"$config`"") -WorkingDirectory $dir -WindowStyle Hidden -PassThru
+    # An explicit lpDesktop: a child that a private-desktop driver starts with a null desktop can
+    # land on the interactive desktop. The Process object holds its own handle before the launch
+    # handles close, so it stays this launch's process.
+    $pi=[DpiGeometry]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$config),$dir,"WinSta0\$DesktopName")
+    try { $p=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$p.Handle }
+    finally { [void][DpiGeometry]::CloseHandle($pi.thread); [void][DpiGeometry]::CloseHandle($pi.process) }
     $script:processes.Add(@{Case=$Name;Pid=$p.Id;StartTime=$p.StartTime.ToUniversalTime().ToString('o');Executable=$p.ProcessName})
     $deadline=[datetime]::UtcNow.AddSeconds(15)
     do {
         $hosts=@([DpiGeometry]::Hosts($p.Id))
+        if($hosts.Count -and [DpiGeometry]::WindowDesktop($hosts[0]) -ne $DesktopName) { Close-Case @{Process=$p}; throw "Case $Name window is not on the private desktop." }
         $ready=$false
         $ledger=Join-Path $dir 'startup-attempts.json'
         if(Test-Path -LiteralPath $ledger) {
