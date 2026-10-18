@@ -3246,6 +3246,22 @@ pub const App = struct {
         }
     }
 
+    /// Whether the WM_TIMER `msg` is the tick of thread timer `timer_id`;
+    /// call it only for WM_TIMER. A thread timer (`SetTimer(null, ...)`)
+    /// posts with a null hwnd. Checking that keeps a window timer whose
+    /// numeric id happens to collide from being taken.
+    fn threadTimerFired(msg: *const MSG, timer_id: ?UINT_PTR) bool {
+        const id = timer_id orelse return false;
+        return @intFromPtr(msg.hwnd) == 0 and msg.wParam == id;
+    }
+
+    /// Kill the thread timer in `timer_id`, if one is armed, and forget it.
+    fn killThreadTimer(timer_id: *?UINT_PTR) void {
+        const id = timer_id.* orelse return;
+        _ = sys.KillTimer(null, id);
+        timer_id.* = null;
+    }
+
     pub fn run(self: *App) !void {
         try self.sanitizeCurrentDirectory();
         const cwd = std.process.getCwdAlloc(self.core_app.alloc) catch null;
@@ -3396,13 +3412,10 @@ pub const App = struct {
 
         if (!self.embedding_mode) self.initializeJumpList();
         if (!self.embedding_mode) self.scheduleGlobalHotkeySync();
-        if (!self.embedding_mode and self.global_hotkeys_dirty and self.windows.items.len == 0) {
-            self.global_hotkeys_dirty = false;
-            self.syncGlobalHotkeys() catch |err| {
-                log.err("failed to sync win32 global hotkeys err={}", .{err});
-            };
+        if (!self.embedding_mode and self.windows.items.len == 0) {
+            self.syncDirtyGlobalHotkeys();
+            self.startQuitTimer();
         }
-        if (!self.embedding_mode and self.windows.items.len == 0) self.startQuitTimer();
 
         // Initial window creation must not start a check until the swapped
         // build is healthy and authoritative. Later windows retain the usual
@@ -3517,31 +3530,23 @@ pub const App = struct {
                         continue;
                     }
                 }
-                if (self.program_status_notify_timer_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.flushProgramStatusNotifications();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.program_status_notify_timer_id)) {
+                    self.flushProgramStatusNotifications();
+                    continue;
                 }
-                if (self.session_checkpoint_timer_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.onSessionCheckpointTimer();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.session_checkpoint_timer_id)) {
+                    self.onSessionCheckpointTimer();
+                    continue;
                 }
-                if (self.update_recheck_timer_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.onUpdateRecheckTimer();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.update_recheck_timer_id)) {
+                    self.onUpdateRecheckTimer();
+                    continue;
                 }
-                if (self.profile_discovery_watchdog_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.stopProfileDiscoveryWatchdog();
-                        const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
-                        if ((pending or self.anyHostRequestedProfiles()) and self.hosts.items.len > 0) self.startProfileDiscovery();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.profile_discovery_watchdog_id)) {
+                    self.stopProfileDiscoveryWatchdog();
+                    const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
+                    if ((pending or self.anyHostRequestedProfiles()) and self.hosts.items.len > 0) self.startProfileDiscovery();
+                    continue;
                 }
             }
 
@@ -3575,11 +3580,17 @@ pub const App = struct {
             _ = sys.TranslateMessage(&msg);
             _ = sys.DispatchMessageW(&msg);
 
-            self.syncDirtyGlobalHotkeys();
-            try self.tickCoreApp();
-
-            if (!self.running and self.windows.items.len == 0) break;
+            if (try self.finishLoopStep()) break;
         }
+    }
+
+    /// What the message loop does after it dispatched a message: sync the
+    /// global hotkeys if they changed, then tick the core. Returns whether
+    /// the loop should exit.
+    fn finishLoopStep(self: *App) !bool {
+        self.syncDirtyGlobalHotkeys();
+        try self.tickCoreApp();
+        return !self.running and self.windows.items.len == 0;
     }
 
     pub fn terminate(self: *App) void {
@@ -3716,6 +3727,12 @@ pub const App = struct {
         return self.localAppDataPath("session-state.json");
     }
 
+    /// Resolve `%LOCALAPPDATA%\noctty\startup-attempts.json`, the recovery
+    /// ledger. Caller frees with `core_app.alloc`.
+    fn recoveryLedgerPath(self: *const App) ?[]u8 {
+        return self.localAppDataPath("startup-attempts.json");
+    }
+
     fn namedLayoutPath(self: *const App, name: []const u8) ![]u8 {
         const relative = try win32_layouts.relativePathAlloc(self.core_app.alloc, name);
         defer self.core_app.alloc.free(relative);
@@ -3814,10 +3831,7 @@ pub const App = struct {
     }
 
     fn stopSessionCheckpointTimer(self: *App) void {
-        if (self.session_checkpoint_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.session_checkpoint_timer_id = null;
-        }
+        killThreadTimer(&self.session_checkpoint_timer_id);
     }
 
     fn onSessionCheckpointTimer(self: *App) void {
@@ -4143,7 +4157,7 @@ pub const App = struct {
         } orelse return false;
         defer parsed.deinit();
 
-        const ledger_path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json");
+        const ledger_path = self.recoveryLedgerPath();
         defer if (ledger_path) |value| self.core_app.alloc.free(value);
         if (ledger_path) |value| {
             markRecoveryAttemptAtPath(self.core_app.alloc, value, &self.recovery_startup, .{ .session_restore = unixMillis() });
@@ -4306,6 +4320,15 @@ pub const App = struct {
         );
     }
 
+    /// The `render` action for one surface: request a repaint, drain the
+    /// terminal output its accessibility session waits for, and tell that
+    /// session the renderer updated.
+    fn renderSurface(self: *App, surface: *Surface) !void {
+        try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
+        surface.drainTerminalAccessibilityOutput();
+        if (surface.terminal_accessibility) |session| session.rendererUpdated();
+    }
+
     test "a failed new window request leaves the app running and the mailbox draining" {
         if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -4420,7 +4443,7 @@ pub const App = struct {
     /// restore markers. A crash, inside any renderer, never gets here.
     fn markRecoveryOpenGLUnavailable(self: *App) void {
         if (!gl_startup.openGLStartupFailed()) return;
-        const path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json") orelse return;
+        const path = self.recoveryLedgerPath() orelse return;
         defer self.core_app.alloc.free(path);
         markRecoveryAttemptAtPath(self.core_app.alloc, path, &self.recovery_startup, .{ .opengl_unavailable = unixMillis() });
     }
@@ -4433,7 +4456,7 @@ pub const App = struct {
         const memory_attempts = self.recovery_startup.attempts[0..self.recovery_startup.count];
         const target_started_at = memory_attempts[memory_attempts.len - 1].started_at_unix_ms;
         if (memory_attempts[memory_attempts.len - 1].ready_at_unix_ms != null) return;
-        const path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json") orelse return;
+        const path = self.recoveryLedgerPath() orelse return;
         defer self.core_app.alloc.free(path);
 
         // The disk read and the replace below are one transaction against
@@ -5436,10 +5459,7 @@ pub const App = struct {
     }
 
     fn stopUpdateRecheckTimer(self: *App) void {
-        if (self.update_recheck_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.update_recheck_timer_id = null;
-        }
+        killThreadTimer(&self.update_recheck_timer_id);
     }
 
     /// Applying a staged update sets `running = false` first; nothing is left
@@ -5677,10 +5697,7 @@ pub const App = struct {
     }
 
     fn stopProfileDiscoveryWatchdog(self: *App) void {
-        if (self.profile_discovery_watchdog_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.profile_discovery_watchdog_id = null;
-        }
+        killThreadTimer(&self.profile_discovery_watchdog_id);
     }
 
     fn applyPendingProfileDiscovery(self: *App) void {
@@ -5781,14 +5798,7 @@ pub const App = struct {
             self.setUpdateNotice(release.version_text, release.release_url, completion.staged) catch |err| {
                 log.warn("failed to surface update notice err={}", .{err});
             };
-            if (completion.manual_message) |message| {
-                self.showUpdateInfo(.info, message) catch |err| {
-                    log.warn("failed to show updater status message err={}", .{err});
-                };
-            }
-            return;
         }
-
         if (completion.manual_message) |message| {
             self.showUpdateInfo(.info, message) catch |err| {
                 log.warn("failed to show updater status message err={}", .{err});
@@ -5932,39 +5942,28 @@ pub const App = struct {
             release_feed_url,
             expected_kind,
         ) catch |err| {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(err);
             return err;
         };
         defer staged.deinit(self.core_app.alloc);
 
         const install_dir = currentInstallDir(self.core_app.alloc) catch |err| {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(err);
             return err;
         };
         defer self.core_app.alloc.free(install_dir);
 
         if (staged.kind == .portable) {
             updatepkg.recordPortableApplyPending(self.core_app.alloc, state_path, 0) catch |err| {
-                self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
-                    log.warn("failed to show updater apply failure err={}", .{banner_err});
-                };
+                self.showUpdateApplyFailure(err);
                 return err;
             };
-            self.stopQuitTimer();
-            self.running = false;
-            self.destroyAllWindows();
-            if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+            self.quitConfirmed();
             return;
         }
 
         if (!internal_os.windows.isInstallerManagedInstallDir(install_dir)) {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(error.InvalidInstallPath)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(error.InvalidInstallPath);
             return error.InvalidInstallPath;
         }
 
@@ -5993,9 +5992,7 @@ pub const App = struct {
             c.SW_SHOW,
         );
         if (@intFromPtr(result) <= 32) {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(error.UpdateApplyLaunchFailed)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(error.UpdateApplyLaunchFailed);
             return error.UpdateApplyLaunchFailed;
         }
 
@@ -6003,10 +6000,14 @@ pub const App = struct {
             log.warn("failed to record updater apply request after launch err={}", .{err});
         };
 
-        self.stopQuitTimer();
-        self.running = false;
-        self.destroyAllWindows();
-        if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+        self.quitConfirmed();
+    }
+
+    /// Say in the banner why Install or Apply could not go ahead.
+    fn showUpdateApplyFailure(self: *App, err: anyerror) void {
+        self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
+            log.warn("failed to show updater apply failure err={}", .{banner_err});
+        };
     }
 
     /// Install quits the app and nothing watches Setup, so the next start is
@@ -6154,10 +6155,7 @@ pub const App = struct {
     }
 
     fn stopQuitTimer(self: *App) void {
-        if (self.quit_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.quit_timer_id = null;
-        }
+        killThreadTimer(&self.quit_timer_id);
     }
 
     fn startTerminalHandoffIdleTimer(self: *App) void {
@@ -6171,10 +6169,7 @@ pub const App = struct {
     }
 
     fn stopTerminalHandoffIdleTimer(self: *App) void {
-        if (self.terminal_handoff_idle_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.terminal_handoff_idle_timer_id = null;
-        }
+        killThreadTimer(&self.terminal_handoff_idle_timer_id);
     }
 
     /// Decide whether the embedding-mode server may exit, and close the race
@@ -6237,10 +6232,7 @@ pub const App = struct {
     }
 
     fn stopRecoveryRetryTimer(self: *App) void {
-        if (self.recovery_retry_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.recovery_retry_timer_id = null;
-        }
+        killThreadTimer(&self.recovery_retry_timer_id);
     }
 
     /// The retry timer fired: this is the tick the deadline was holding out
@@ -6254,10 +6246,7 @@ pub const App = struct {
     }
 
     fn stopUndoPruneTimer(self: *App) void {
-        if (self.undo_prune_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.undo_prune_timer_id = null;
-        }
+        killThreadTimer(&self.undo_prune_timer_id);
     }
 
     fn undoTimeoutMs(self: *const App) u64 {
@@ -6904,17 +6893,11 @@ pub const App = struct {
             .render => {
                 return switch (target) {
                     .app => blk: {
-                        for (self.windows.items) |surface| {
-                            try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
-                            surface.drainTerminalAccessibilityOutput();
-                            if (surface.terminal_accessibility) |session| session.rendererUpdated();
-                        }
+                        for (self.windows.items) |surface| try self.renderSurface(surface);
                         break :blk true;
                     },
                     .surface => if (self.findSurfaceForTarget(target)) |surface| blk: {
-                        try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
-                        surface.drainTerminalAccessibilityOutput();
-                        if (surface.terminal_accessibility) |session| session.rendererUpdated();
+                        try self.renderSurface(surface);
                         break :blk true;
                     } else false,
                 };
@@ -8824,15 +8807,9 @@ pub const App = struct {
         return null;
     }
 
-    fn activeTab(host: *Host) ?*Tab {
-        if (host.tabs.items.len == 0 or host.active_tab >= host.tabs.items.len) return null;
-        return &host.tabs.items[host.active_tab];
-    }
-
     fn activeSurfaceForHost(self: *App, host_id: u32) ?*Surface {
         const host = self.findHostById(host_id) orelse return null;
-        const tab = activeTab(host) orelse return null;
-        return tab.focusedSurface();
+        return host.activeSurface();
     }
 
     fn findSurfaceById(self: *App, surface_id: u64) ?*Surface {
@@ -9312,11 +9289,7 @@ pub const App = struct {
                         return surface;
                     }
                 }
-                if (activeTab(host)) |tab| {
-                    if (tab.focusedSurface()) |surface| {
-                        return surface;
-                    }
-                }
+                if (host.activeSurface()) |surface| return surface;
             }
         }
 
@@ -9526,7 +9499,7 @@ pub const App = struct {
                 // A close never restores, raises or takes focus from a
                 // window the user is not looking at, and moves focus only
                 // when the pane that had it closed.
-                if (activeTab(host)) |tab| if (tab.focusedSurface()) |replacement| {
+                if (host.activeTab()) |tab| if (tab.focusedSurface()) |replacement| {
                     if (was_active_surface and tabSeenByUser(host, host.active_tab))
                         self.activateSurface(replacement)
                     else
@@ -10169,10 +10142,7 @@ pub const App = struct {
     fn requestQuit(self: *App, near: ?*Surface) void {
         if (!self.session_ending) {
             if (self.settings_window.holdQuitForUnsavedChanges()) return;
-            if (self.pendingCloseAsk(&appQuitConfirmAccept, if (near) |surface| surface.host else null)) |ask| {
-                ask.host.askBeforeClosing(.app, ask.count, &appQuitConfirmAccept, self);
-                return;
-            }
+            if (self.askBeforeAppClose(.app, &appQuitConfirmAccept, if (near) |surface| surface.host else null)) return;
         }
         self.quitConfirmed();
     }
@@ -10184,10 +10154,7 @@ pub const App = struct {
         // install that then declines.
         if (self.settingsHoldInstall()) return;
         if (!self.session_ending) {
-            if (self.pendingCloseAsk(&updateApplyConfirmAccept, self.update_action_host)) |ask| {
-                ask.host.askBeforeClosing(.update, ask.count, &updateApplyConfirmAccept, self);
-                return;
-            }
+            if (self.askBeforeAppClose(.update, &updateApplyConfirmAccept, self.update_action_host)) return;
         }
         try self.queueApplyStagedUpdate();
     }
@@ -10242,6 +10209,19 @@ pub const App = struct {
             if (host.tabs.items.len > 0) prompt_host = host;
         };
         return .{ .count = count, .host = prompt_host };
+    }
+
+    /// Raise the prompt `pendingCloseAsk` finds for an app-wide close that
+    /// `on_accept` resumes. False when no terminal needs asking about.
+    fn askBeforeAppClose(
+        self: *App,
+        scope: CloseScope,
+        on_accept: *const fn (userdata: ?*anyopaque) void,
+        near_host: ?*Host,
+    ) bool {
+        const ask = self.pendingCloseAsk(on_accept, near_host) orelse return false;
+        ask.host.askBeforeClosing(scope, ask.count, on_accept, self);
+        return true;
     }
 
     fn quitConfirmed(self: *App) void {
@@ -10379,11 +10359,7 @@ pub const App = struct {
                 }
                 break :loaded @import("win32/wgl.zig").ensureLoaded();
             };
-            if (!loaded) {
-                const err = windows.kernel32.GetLastError();
-                recordOpenGLStartupWin32Failure(.load_opengl32, err);
-                return windows.unexpectedError(err);
-            }
+            if (!loaded) return windows.unexpectedError(recordOpenGLStartupLastError(.load_opengl32));
         }
 
         const hdc = sys.GetDC(hwnd) orelse {
@@ -10415,11 +10391,8 @@ pub const App = struct {
                     },
                 );
 
-                if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    recordOpenGLStartupWin32Failure(.set_pixel_format, err);
-                    return windows.unexpectedError(err);
-                }
+                if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0)
+                    return windows.unexpectedError(recordOpenGLStartupLastError(.set_pixel_format));
                 pixel_format.validatePixelFormatSetTransition(
                     format_before,
                     selection.pixel_format,
@@ -10434,24 +10407,28 @@ pub const App = struct {
             },
         };
 
-        const hglrc = sys.wglCreateContext(hdc) orelse {
-            const err = windows.kernel32.GetLastError();
-            recordOpenGLStartupWin32Failure(.create_context, err);
-            return windows.unexpectedError(err);
-        };
+        const hglrc = sys.wglCreateContext(hdc) orelse
+            return windows.unexpectedError(recordOpenGLStartupLastError(.create_context));
         errdefer _ = sys.wglDeleteContext(hglrc);
 
-        if (sys.wglMakeCurrent(hdc, hglrc) == 0) {
-            const err = windows.kernel32.GetLastError();
-            recordOpenGLStartupWin32Failure(.initial_make_current, err);
-            return windows.unexpectedError(err);
-        }
+        if (sys.wglMakeCurrent(hdc, hglrc) == 0)
+            return windows.unexpectedError(recordOpenGLStartupLastError(.initial_make_current));
 
         return .{
             .hdc = hdc,
             .hglrc = hglrc,
             .provenance = provenance,
         };
+    }
+
+    /// Record that OpenGL startup failed at `step` with the thread's last
+    /// Win32 error, and return that error code. The caller turns it into
+    /// `error.Unexpected` with `windows.unexpectedError`, so a Debug build's
+    /// stack dump still starts at the failing call.
+    fn recordOpenGLStartupLastError(step: OpenGLStartupStep) windows.Win32Error {
+        const err = windows.kernel32.GetLastError();
+        recordOpenGLStartupWin32Failure(step, err);
+        return err;
     }
 
     /// Checks the target now, so a refused one still fails at the caller,
@@ -10536,9 +10513,7 @@ pub const App = struct {
     /// whether the loop should exit.
     fn drainDeferredOpens(self: *App) !bool {
         while (self.runDeferredOpens()) {
-            self.syncDirtyGlobalHotkeys();
-            try self.tickCoreApp();
-            if (!self.running and self.windows.items.len == 0) return true;
+            if (try self.finishLoopStep()) return true;
         }
         return false;
     }
@@ -11693,31 +11668,16 @@ pub const App = struct {
         var waiting = false;
         for (self.windows.items) |surface| {
             if (!surface.program_status_notify_pending) continue;
-            // Notifications may have been turned off while it waited.
-            if (!surface.core().config.desktop_notifications) {
-                surface.program_status_notify_pending = false;
-                continue;
-            }
-            const found = self.findTabForSurface(surface) orelse {
+            const owed = self.owedProgramStatus(surface) orelse {
                 surface.program_status_notify_pending = false;
                 continue;
             };
-            const record = surface.program_status.headline() orelse {
-                surface.program_status_notify_pending = false;
-                continue;
-            };
-            if (tabSeenByUser(found.host, found.index) or
-                !win32_program_status.Indicator.of(record).needsUser())
-            {
-                surface.program_status_notify_pending = false;
-                continue;
-            }
             if (!self.program_status_notify.allow(&surface.program_status_notified_ms, sys.GetTickCount64())) {
                 waiting = true;
                 continue;
             }
             surface.program_status_notify_pending = false;
-            self.showProgramStatusToast(surface, found.host, found.index, record) catch |err| {
+            self.showProgramStatusToast(surface, owed.host, owed.index, owed.record) catch |err| {
                 log.warn("deferred program status notification failed err={}", .{err});
             };
             // The toast may have pumped messages that closed windows, so
@@ -11726,6 +11686,23 @@ pub const App = struct {
             break;
         }
         if (!waiting) self.stopProgramStatusNotifyTimer();
+    }
+
+    /// What `surface`'s held-back notification would say now, and about
+    /// which tab, or null when it is no longer owed: notifications were
+    /// turned off while it waited, the pane left its tab, it shows nothing
+    /// that needs the user, or its tab is in sight.
+    fn owedProgramStatus(self: *App, surface: *Surface) ?struct {
+        host: *Host,
+        index: usize,
+        record: *const win32_program_status.Record,
+    } {
+        if (!surface.core().config.desktop_notifications) return null;
+        const found = self.findTabForSurface(surface) orelse return null;
+        const record = surface.program_status.headline() orelse return null;
+        if (tabSeenByUser(found.host, found.index) or
+            !win32_program_status.Indicator.of(record).needsUser()) return null;
+        return .{ .host = found.host, .index = found.index, .record = record };
     }
 
     fn startProgramStatusNotifyTimer(self: *App) void {
@@ -11739,10 +11716,7 @@ pub const App = struct {
     }
 
     fn stopProgramStatusNotifyTimer(self: *App) void {
-        if (self.program_status_notify_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.program_status_notify_timer_id = null;
-        }
+        killThreadTimer(&self.program_status_notify_timer_id);
     }
 
     /// Focus the next tab whose programs need the user; see
