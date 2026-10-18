@@ -215,13 +215,13 @@ line is read. The one prompt drawn before that, by the user's own function,
 gets its marks from the line reader instead, all after its text: the D for the
 command that replaced the prompt, OSC 7, and `133;P;k=i;redraw=0` in place of
 its missing A (P does not fresh-line, so the cursor stays where the prompt
-ended), then B. A venv is the exception: its prompt writes `(venv) ` and calls
-the saved copy of our wrapper, which writes D, OSC 7 and A itself, so they land
-after `(venv) ` instead of before it, and the line reader adds only B. A prompt
-that cannot be wrapped, because it is `ReadOnly` or was deleted, gets OSC 7, P
-and B on every line, but no D (see below). Only the host's own read of a prompt
-line gets these marks: not a script that calls `PSConsoleHostReadLine` itself,
-whose command they would cut short, and not a remote prompt under
+ended), then B. A venv's one prompt is the exception: it writes `(venv) ` and
+calls the saved copy of our wrapper, which writes D, OSC 7 and A itself, so they
+land after `(venv) ` instead of before it, and the line reader adds only B. A
+prompt that cannot be wrapped, because it is `ReadOnly` or was deleted, gets
+OSC 7, P and B on every line, but no D (see below). Only the host's own read of
+a prompt line gets these marks: not a script that calls `PSConsoleHostReadLine`
+itself, whose command they would cut short, and not a remote prompt under
 `Enter-PSSession`.
 
 That D is worked out by the wrapper's rules (below), from the `$?` the host
