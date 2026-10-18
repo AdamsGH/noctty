@@ -572,6 +572,41 @@ Run with:
 powershell.exe -ExecutionPolicy Bypass -File ..\..\scripts\interactive-win11.ps1 -ResetState
 ```
 
+## interactive-win11-stale-modes.ps1
+
+Checks that cmd and PowerShell recover Enter and Ctrl+C after a program leaves
+Kitty keyboard or modifyOtherKeys modes enabled, on normal exit and exact-PID
+termination. `-Scenario Modes` uses hidden desktops and never accesses the
+clipboard. Use a measurement-AUMID build on a shared machine; the harness copies
+it into fresh portable directories, redirects AppData, and uses a unique class.
+
+```powershell
+pwsh -NoProfile -File test/windows/interactive-win11-stale-modes.ps1 `
+    -ExePath <measurement-build>/zig-out/bin/noctty.exe -Scenario Modes `
+    -Shells cmd -ExerciseInheritedCtrlCIgnore
+```
+
+`-ExerciseInheritedCtrlCIgnore` starts the hidden worker with
+`CREATE_NEW_PROCESS_GROUP`, which disables Ctrl+C through an inheritable Windows
+process attribute. The hidden controller explicitly enables Ctrl+C with
+`SetConsoleCtrlHandler(NULL, FALSE)` before launching noctty. Registering the
+fixture's `Console.CancelKeyPress` handler alone does not clear that attribute.
+Without the controller reset, the cmd regression times out at
+`31-exit.ctrl.interrupted`; a native input observer confirmed that the Ctrl+C
+record still reaches ConPTY's input in this condition.
+Removing the controller reset must fail this invocation. The fixture itself
+never clears the attribute, so it can still detect an ignore flag introduced by
+the product's own launch path.
+
+See Microsoft's [SetConsoleCtrlHandler documentation](https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler)
+for the inherited attribute and [start command reference](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/start)
+for `/b`'s corresponding Ctrl+C behavior.
+
+The inherited-ignore exercise requires `Modes` or `All`; `Paste` alone is rejected.
+The ordinary invocation omits the regression switch. `-Shells cmd` restricts it
+to cmd; the default tests both shells. `-Scenario Paste` and `All` additionally
+use a private window station because desktops on WinSta0 share the clipboard.
+
 ## Style
 
 - Define reusable helpers as `function Verb-Noun { ... }` with a `param(...)`
