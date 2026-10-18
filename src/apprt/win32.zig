@@ -6668,33 +6668,18 @@ pub const App = struct {
                 // silently swapping the config source on every manual
                 // reload. Scoped to this path — non-reload code keeps
                 // seeing the sanitized cwd.
-                const cwd_before: ?[]u8 = std.process.getCwdAlloc(self.core_app.alloc) catch null;
-                defer if (cwd_before) |p| self.core_app.alloc.free(p);
-
-                // `defer` + flag so the restore fires even when
+                //
+                // The restore is deferred so it fires even when
                 // `Config.load` returns an error — otherwise a
                 // broken include leaves the process pinned to
                 // `startup_cwd` (same class of bug as the one
                 // fixed in `settingsSaveAndReload`). Relative-path
                 // lookups + child processes spawned after a failed
-                // reload would inherit the wrong cwd.
-                var did_chdir_to_startup: bool = false;
-                if (self.startup_cwd) |cwd| {
-                    if (std.process.changeCurDir(cwd)) |_| {
-                        did_chdir_to_startup = true;
-                    } else |err| {
-                        std.log.warn("reload_config: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
-                    }
-                }
-                defer {
-                    if (did_chdir_to_startup) {
-                        if (cwd_before) |cwd| {
-                            std.process.changeCurDir(cwd) catch |err| {
-                                std.log.warn("reload_config: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                            };
-                        }
-                    }
-                }
+                // reload would inherit the wrong cwd. It runs at the
+                // end of this arm, after the config is applied, as it
+                // always has here.
+                var startup_cwd = self.enterStartupCwd();
+                defer startup_cwd.restore();
 
                 var config = try configpkg.Config.load(self.core_app.alloc);
                 defer config.deinit();
@@ -11064,30 +11049,150 @@ pub const App = struct {
     /// return short-circuited the restore, leaving the process pinned to
     /// `startup_cwd` whenever a reload hit a broken config file.
     fn loadConfigAtStartupCwd(self: *App) !configpkg.Config {
-        const alloc = self.core_app.alloc;
-        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
-        defer if (cwd_before) |p| alloc.free(p);
+        var startup_cwd = self.enterStartupCwd();
+        defer startup_cwd.restore();
+        return configpkg.Config.load(self.core_app.alloc);
+    }
 
-        var did_chdir_to_startup: bool = false;
+    /// The process cwd moved to `startup_cwd` until `restore` puts the
+    /// sanitized cwd back, so a `Config.load` in between resolves relative
+    /// `--config-file` entries as the launch did. Shared by
+    /// `loadConfigAtStartupCwd` (Settings saves) and the `reload_config`
+    /// action, which keeps it until the reloaded config is applied.
+    ///
+    /// A startup directory that no longer exists is not created again: the
+    /// files under it went with it, so an empty directory in its place
+    /// brings none of them back. The load then runs in the current
+    /// directory, and the warning says the move failed.
+    const StartupCwd = struct {
+        alloc: Allocator,
+        /// The cwd to go back to; null when it could not be read.
+        before: ?[]u8,
+        moved: bool,
+
+        fn restore(self: *StartupCwd) void {
+            defer if (self.before) |path| self.alloc.free(path);
+            if (!self.moved) return;
+            const cwd = self.before orelse return;
+            std.process.changeCurDir(cwd) catch |err| {
+                std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
+            };
+        }
+    };
+
+    fn enterStartupCwd(self: *const App) StartupCwd {
+        var scope: StartupCwd = .{
+            .alloc = self.core_app.alloc,
+            .before = std.process.getCwdAlloc(self.core_app.alloc) catch null,
+            .moved = false,
+        };
         if (self.startup_cwd) |cwd| {
-            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
             if (std.process.changeCurDir(cwd)) |_| {
-                did_chdir_to_startup = true;
+                scope.moved = true;
             } else |err| {
                 std.log.warn("config load: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
             }
         }
-        defer {
-            if (did_chdir_to_startup) {
-                if (cwd_before) |cwd| {
-                    std.process.changeCurDir(cwd) catch |err| {
-                        std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                    };
-                }
-            }
-        }
+        return scope;
+    }
 
-        return configpkg.Config.load(alloc);
+    test "StartupCwd resolves a relative config-file in the startup directory and never creates a missing one" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.makeDir("launch");
+        try tmp.dir.makeDir("sanitized");
+        try tmp.dir.writeFile(.{ .sub_path = "launch/custom.conf", .data = "font-size = 17\n" });
+        const launch = try tmp.dir.realpathAlloc(alloc, "launch");
+        defer alloc.free(launch);
+        const sanitized = try tmp.dir.realpathAlloc(alloc, "sanitized");
+        defer alloc.free(sanitized);
+        const missing = try std.fs.path.join(alloc, &.{ launch, "deleted" });
+        defer alloc.free(missing);
+
+        // The test borrows the process cwd. It goes back before the
+        // temporary directory, which Windows cannot delete while it is the
+        // cwd, is cleaned up.
+        const original_cwd = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(original_cwd);
+        defer std.process.changeCurDir(original_cwd) catch |err| {
+            std.debug.panic("could not restore the test's cwd err={}", .{err});
+        };
+        try std.process.changeCurDir(sanitized);
+        defer app.startup_cwd = null;
+
+        const Cases = struct {
+            /// What `Config.load` does with `--config-file=custom.conf` on the
+            /// command line, run inside the scope: `loadCliArgs` parses the
+            /// argument, then expands it against `realpath(".")` (its private
+            /// `expandPaths` calls the same `RepeatablePath.expand`), and
+            /// `loadRecursiveFiles` reads the file.
+            fn loadRelativeConfigFile(test_app: *App, load_alloc: Allocator, expected_cwd: []const u8) !configpkg.Config {
+                var startup_cwd = test_app.enterStartupCwd();
+                defer startup_cwd.restore();
+                var config = try configpkg.Config.default(load_alloc);
+                errdefer config.deinit();
+                var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+                    .iterator = cli_args.sliceIterator(&.{"--config-file=custom.conf"}),
+                };
+                try config.loadIter(load_alloc, &args);
+                var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const base = try std.fs.cwd().realpath(".", &base_buf);
+                try std.testing.expectEqualStrings(expected_cwd, base);
+                try config.@"config-file".expand(config._arena.?.allocator(), base, &config._diagnostics);
+                try config.loadRecursiveFiles(load_alloc);
+                try config.finalize();
+                return config;
+            }
+
+            /// An error injected inside the scope, as a load that fails.
+            fn failInside(test_app: *App) !void {
+                var startup_cwd = test_app.enterStartupCwd();
+                defer startup_cwd.restore();
+                return error.TestInjectedLoadFailure;
+            }
+        };
+
+        // A relative config-file resolves in the startup directory, and the
+        // sanitized cwd is back afterwards.
+        app.startup_cwd = launch;
+        {
+            var config = try Cases.loadRelativeConfigFile(&app, alloc, launch);
+            defer config.deinit();
+            try std.testing.expectEqual(@as(f32, 17), config.@"font-size");
+        }
+        const after = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(after);
+        try std.testing.expectEqualStrings(sanitized, after);
+
+        // A startup directory that is gone stays gone: the scope stays in the
+        // current directory, so the relative file is not found there, and the
+        // current directory is as it was afterwards.
+        app.startup_cwd = missing;
+        {
+            var config = try Cases.loadRelativeConfigFile(&app, alloc, sanitized);
+            defer config.deinit();
+            try std.testing.expectEqual(@as(f32, 12), config.@"font-size");
+        }
+        try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(missing, .{}));
+        const after_missing = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(after_missing);
+        try std.testing.expectEqualStrings(sanitized, after_missing);
+
+        // A failure inside the scope still puts the sanitized cwd back.
+        app.startup_cwd = launch;
+        try std.testing.expectError(error.TestInjectedLoadFailure, Cases.failInside(&app));
+        const after_failure = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(after_failure);
+        try std.testing.expectEqualStrings(sanitized, after_failure);
     }
 
     /// Before a Settings save: has the config file been edited since the
