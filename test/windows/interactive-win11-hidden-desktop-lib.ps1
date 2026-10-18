@@ -22,6 +22,10 @@ public static class HiddenDesktopNative {
         public short show, cbReserved; public IntPtr reserved2, stdin, stdout, stderr;
     }
     [StructLayout(LayoutKind.Sequential)] public struct PI { public IntPtr process, thread; public int pid, tid; }
+    [StructLayout(LayoutKind.Sequential)] public struct SA {
+        public int size; public IntPtr descriptor; [MarshalAs(UnmanagedType.Bool)] public bool inherit;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateFileW(string path, uint access, uint share, ref SA security, uint creation, uint flags, IntPtr template);
     public delegate bool EnumProc(IntPtr hwnd, IntPtr arg);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string name, IntPtr device, IntPtr mode, int flags, uint access, IntPtr security);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
@@ -33,7 +37,7 @@ public static class HiddenDesktopNative {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member);
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr process, uint code);
-    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
     public static int[] JobPids(IntPtr job) {
         // This harness has few children. MORE_DATA fails closed rather than
         // truncating an unexpectedly large process list.
@@ -48,7 +52,10 @@ public static class HiddenDesktopNative {
     }
     public static int[] ReapOwnedJob(IntPtr job) {
         var stopped=new List<int>();
-        for(int round=0;round<8;round++) {
+        // A signaled process can remain in the job list briefly after exit.
+        // Keep the empty-job oracle, but give accounting time to catch up.
+        DateTime deadline=DateTime.UtcNow.AddSeconds(10);
+        while(DateTime.UtcNow<deadline) {
             int[] ids=JobPids(job); if(ids.Length==0) return stopped.ToArray();
             foreach(int id in ids) {
                 // Hold the exact process handle and freshly verify membership
@@ -68,6 +75,7 @@ public static class HiddenDesktopNative {
                     if(WaitForSingleObject(handle,10000)!=0) throw new Exception("Owned process did not exit");
                 } finally { CloseHandle(handle); }
             }
+            System.Threading.Thread.Sleep(10);
         }
         if(JobPids(job).Length!=0) throw new Exception("Owned job still has processes after cleanup");
         return stopped.ToArray();
@@ -102,15 +110,38 @@ public static class HiddenDesktopNative {
 '@
 }
 
-function Start-Hidden([string] $Application, [string] $Command, [string] $Directory, [string] $Desktop, [IntPtr] $OwnerJob = [IntPtr]::Zero) {
+function Start-Hidden([string] $Application, [string] $Command, [string] $Directory, [string] $Desktop, [IntPtr] $OwnerJob = [IntPtr]::Zero, [switch] $NewProcessGroup, [string] $LogPath) {
     $si = [HiddenDesktopNative+SI]::new()
     $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][HiddenDesktopNative+SI])
     $si.desktop = $Desktop
     $pi = [HiddenDesktopNative+PI]::new()
     $flags = if ($OwnerJob -ne [IntPtr]::Zero) { 0x08004004 } else { 0x08004000 }
-    if (-not [HiddenDesktopNative]::CreateProcessW($Application, [Text.StringBuilder]::new($Command),
-            [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, [IntPtr]::Zero, $Directory, [ref]$si, [ref]$pi)) {
-        throw "CreateProcessW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    # CREATE_NEW_PROCESS_GROUP deliberately seeds the inheritable Ctrl+C-ignore
+    # attribute for the regression case. It does not bypass the owned job.
+    if ($NewProcessGroup) { $flags = $flags -bor 0x200 }
+    $logHandle = [IntPtr]::Zero
+    $inputHandle = [IntPtr]::Zero
+    try {
+        if ($LogPath) {
+            $security = [HiddenDesktopNative+SA]::new()
+            $security.size = [Runtime.InteropServices.Marshal]::SizeOf($security)
+            $security.inherit = $true
+            $logHandle = [HiddenDesktopNative]::CreateFileW($LogPath, 0x40000000, 1, [ref]$security, 1, 0x80, [IntPtr]::Zero)
+            if ($logHandle -eq [IntPtr](-1)) { throw 'Opening compiler log failed.' }
+            $inputHandle = [HiddenDesktopNative]::CreateFileW('NUL', 2147483648, 3, [ref]$security, 3, 0x80, [IntPtr]::Zero)
+            if ($inputHandle -eq [IntPtr](-1)) { throw 'Opening compiler input failed.' }
+            $si.flags = 0x100 # STARTF_USESTDHANDLES
+            $si.stdin = $inputHandle; $si.stdout = $logHandle; $si.stderr = $logHandle
+        }
+        if (-not [HiddenDesktopNative]::CreateProcessW($Application, [Text.StringBuilder]::new($Command),
+                [IntPtr]::Zero, [IntPtr]::Zero, [bool]$LogPath, $flags, [IntPtr]::Zero, $Directory, [ref]$si, [ref]$pi)) {
+            throw "CreateProcessW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+    }
+    finally {
+        foreach ($handle in @($logHandle, $inputHandle)) {
+            if ($handle -ne [IntPtr]::Zero -and $handle -ne [IntPtr](-1)) { [void][HiddenDesktopNative]::CloseHandle($handle) }
+        }
     }
     try {
         # Assign the suspended driver before its first instruction: every
@@ -124,6 +155,24 @@ function Start-Hidden([string] $Application, [string] $Command, [string] $Direct
                 [void][HiddenDesktopNative]::TerminateProcess($pi.process, 1)
                 throw 'Resuming contained driver failed.'
             }
+        }
+        if ($LogPath) {
+            # Retain the exact native handle through exit: even an immediate
+            # compiler failure must produce its real exit code and log path.
+            $wait = [HiddenDesktopNative]::WaitForSingleObject($pi.process, 60000)
+            if ($wait -eq 258) {
+                if (-not [HiddenDesktopNative]::TerminateProcess($pi.process, 1) -or
+                    [HiddenDesktopNative]::WaitForSingleObject($pi.process, 10000) -ne 0) {
+                    throw 'Terminating timed-out compiler failed.'
+                }
+                throw 'Console fixture compilation timed out.'
+            }
+            if ($wait -ne 0) { throw 'Waiting for compiler failed.' }
+            $exitCode = [uint32]259
+            if (-not [HiddenDesktopNative]::GetExitCodeProcess($pi.process, [ref]$exitCode)) {
+                throw 'Reading compiler exit code failed.'
+            }
+            return $exitCode
         }
     }
     finally {

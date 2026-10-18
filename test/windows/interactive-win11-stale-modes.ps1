@@ -7,6 +7,7 @@ param(
     [int] $TimeoutSeconds = 30,
     [switch] $RequireAdoptedStartupBaseline,
     [switch] $ExerciseParentTimeout,
+    [switch] $ExerciseInheritedCtrlCIgnore,
     [switch] $Worker
 )
 
@@ -27,6 +28,7 @@ if ($TimeoutSeconds -lt 1) { throw 'TimeoutSeconds must be positive.' }
 if ($Scenario -eq 'Paste' -and $Shells -contains 'pwsh') { throw 'Paste supports cmd only; use -Shells cmd.' }
 if (-not $Worker -and $Scenario -eq 'All' -and $Shells -notcontains 'cmd') { throw 'All requires cmd for its paste check; use -Shells cmd,pwsh.' }
 if ($ExerciseParentTimeout -and $Scenario -ne 'Modes') { throw 'Timeout exercise requires -Scenario Modes.' }
+if ($ExerciseInheritedCtrlCIgnore -and $Scenario -eq 'Paste') { throw 'Inherited Ctrl+C exercise requires -Scenario Modes or All.' }
 
 . (Join-Path $PSScriptRoot 'interactive-win11-hidden-desktop-lib.ps1')
 
@@ -37,6 +39,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class StaleModesNative {
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateWindowStationW(string name, uint flags, uint access, IntPtr security);
     [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation();
     [DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessWindowStation(IntPtr station);
@@ -177,8 +180,19 @@ class Fixture {
     $sourcePath = Join-Path $RunRoot 'mode-fixture.cs'
     [IO.File]::WriteAllText($sourcePath, $fixtureSource)
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    & $compiler /nologo /target:exe "/out:$fixturePath" $sourcePath
-    if ($LASTEXITCODE -ne 0) { throw 'Console fixture compilation failed.' }
+    $compilerDesktopName = 'noctty-stale-compile-' + [guid]::NewGuid().ToString('N')
+    $compilerDesktop = [HiddenDesktopNative]::CreateDesktopW($compilerDesktopName,
+        [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
+    if ($compilerDesktop -eq [IntPtr]::Zero) { throw 'Creating compiler desktop failed.' }
+    try {
+        $compilerLog = Join-Path $RunRoot 'compile.log'
+        $compilerCommand = '"{0}" /nologo /target:exe /out:"{1}" "{2}"' -f $compiler, $fixturePath, $sourcePath
+        $compilerExit = Start-Hidden $compiler $compilerCommand $RunRoot "WinSta0\$compilerDesktopName" -LogPath $compilerLog
+        if ($compilerExit -ne 0 -or -not (Test-Path -LiteralPath $fixturePath)) {
+            throw "Console fixture compilation failed (exit $compilerExit); see $compilerLog"
+        }
+    }
+    finally { [void][HiddenDesktopNative]::CloseDesktop($compilerDesktop) }
     $allResults = @()
     try {
         foreach ($shell in $Shells) {
@@ -226,7 +240,7 @@ class Fixture {
                 $pwsh = (Get-Command pwsh.exe).Source
                 $command = '"{0}" -NoProfile -NonInteractive -File "{1}" -Worker -RunRoot "{2}" -Shells {3} -TimeoutSeconds {4} -Scenario {5}' -f $pwsh, $PSCommandPath, $caseRoot, $shell, $TimeoutSeconds, $Scenario
                 if ($ExerciseParentTimeout) { $command += ' -ExerciseParentTimeout' }
-                $driver = Start-Hidden $pwsh $command $caseRoot $deskName $ownerJob
+                $driver = Start-Hidden $pwsh $command $caseRoot $deskName $ownerJob -NewProcessGroup:$ExerciseInheritedCtrlCIgnore
                 $started = $driver.StartTime
                 $driverHandle = [HiddenDesktopNative]::OpenProcess(0x00101000, $false, $driver.Id)
                 if ($driverHandle -eq [IntPtr]::Zero) { throw 'Opening driver wait/query handle failed.' }
@@ -271,7 +285,7 @@ class Fixture {
         }
     }
     finally {
-        [pscustomobject]@{ source = $sourceEvidence; scenario = $Scenario; results = $allResults; startup = Get-Fingerprint $realStartup; historyUnchanged = (@($realHistories | Where-Object { (Get-Fingerprint $_) -ne $historyBefore[$_] }).Count -eq 0) } |
+        [pscustomobject]@{ source = $sourceEvidence; scenario = $Scenario; inheritedCtrlCIgnore = [bool]$ExerciseInheritedCtrlCIgnore; results = $allResults; startup = Get-Fingerprint $realStartup; historyUnchanged = (@($realHistories | Where-Object { (Get-Fingerprint $_) -ne $historyBefore[$_] }).Count -eq 0) } |
             ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $RunRoot 'summary.json')
     }
     Write-Host "stale modes: PASS; evidence=$RunRoot; real startup and history unchanged"
@@ -338,7 +352,7 @@ function Wait-Prompt {
 $script:PromptSequence = 0
 try {
     $config = Join-Path $RunRoot 'config.ghostty'
-    $configText = "auto-update = off`nconfirm-close-surface = false`nwindow-save-state = never`nsingle-instance = false`nclipboard-paste-protection = false`nkeybind = ctrl+v=paste_from_clipboard`n"
+    $configText = "auto-update = off`nconfirm-close-surface = false`nwindow-save-state = never`nsingle-instance = false`nclass = noctty-test-stale-$([guid]::NewGuid().ToString('N'))`nclipboard-paste-protection = false`nkeybind = ctrl+v=paste_from_clipboard`n"
     if ($shell -eq 'pwsh') {
         $integration = Join-Path $RunRoot 'share\ghostty\shell-integration\powershell\integration.ps1'
         if (-not (Test-Path -LiteralPath $integration)) { throw 'Copied PowerShell integration missing.' }
@@ -349,6 +363,12 @@ try {
     else { $configText += "command = direct:cmd.exe /d /q`n" }
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
     $desktopName = [IO.File]::ReadAllText((Join-Path $RunRoot 'desktop.txt'))
+    # start /b and CREATE_NEW_PROCESS_GROUP can make this controller ignore
+    # Ctrl+C. Normalize only our boundary: the fixture must still detect an
+    # ignore flag introduced by noctty or its child-launch path.
+    if (-not [StaleModesNative]::SetConsoleCtrlHandler([IntPtr]::Zero, $false)) {
+        throw "Enabling controller Ctrl+C failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
     $app = Start-Hidden $runExe ('"' + $runExe + '" --config-file="' + $config + '"') $RunRoot $desktopName
     $appStart = $app.StartTime
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
