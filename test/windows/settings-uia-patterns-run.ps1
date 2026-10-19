@@ -996,12 +996,19 @@ function Probe-Control($Case, [IntPtr] $Hwnd, [string] $Phase, [bool] $ExerciseC
         $observed = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
         if ($Case[2] -eq 'ComboBox' -and $ExerciseControl) {
             $nativePath = Join-Path $OutputDirectory $script:attempt.comboTraceFile
-            $messages = @(if (Test-Path -LiteralPath $nativePath) {
-                Get-Content -LiteralPath $nativePath | ForEach-Object { $_ | ConvertFrom-Json } |
-                    Where-Object { $_.control_id -eq $Case[1] }
-            })
+            $messages = [Collections.Generic.List[object]]::new()
+            $malformedLines = 0
+            if (Test-Path -LiteralPath $nativePath) {
+                foreach ($line in [IO.File]::ReadAllLines($nativePath)) {
+                    try {
+                        $entry = $line | ConvertFrom-Json -ErrorAction Stop
+                        if ($entry.control_id -eq $Case[1]) { $messages.Add($entry) }
+                    } catch { $malformedLines++ }
+                }
+            }
             $observed | Add-Member -NotePropertyName nativeTraceFile -NotePropertyValue $script:attempt.comboTraceFile
-            $observed | Add-Member -NotePropertyName nativeDropdownMessages -NotePropertyValue $messages
+            $observed | Add-Member -NotePropertyName nativeDropdownMessages -NotePropertyValue @($messages.ToArray())
+            $observed | Add-Member -NotePropertyName nativeTraceMalformedLines -NotePropertyValue $malformedLines
             Write-Json $path $observed
             Assert-Contract (-not $RequireComboTrace -or (Test-Path -LiteralPath $nativePath)) 'Required native combo trace is missing.'
             if ($RequireComboTrace -and $observed.pass -and $observed.enabled) {

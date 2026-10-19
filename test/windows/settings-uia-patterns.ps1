@@ -487,13 +487,14 @@ namespace SettingsPatterns
                                 long returned = (long)expansion["returnTimestamp"];
                                 double sinceReturn = (System.Diagnostics.Stopwatch.GetTimestamp() - returned) *
                                     1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                                // Preserve the original return + 100 ms observation deadline;
-                                // diagnostic work consumes this wait rather than extending it.
+                                // Observe no earlier than return + 100 ms. Diagnostic work
+                                // consumes the wait, but can overrun it; retain the actual offset.
                                 if (sinceReturn < 100) Thread.Sleep((int)Math.Ceiling(100 - sinceReturn));
                                 double observedAfter = (System.Diagnostics.Stopwatch.GetTimestamp() - returned) *
                                     1000.0 / System.Diagnostics.Stopwatch.Frequency;
                                 var snapshot = ExpansionSnapshot((IntPtr)hwnd, (IExpandCollapse)expand);
                                 snapshot["millisecondsSinceExpandReturn"] = observedAfter;
+                                snapshot["returnedSnapshotOverran100ms"] = sinceReturn > 100;
                                 expansion["after100ms"] = snapshot;
                                 Require(Object.Equals(snapshot["stateHresult"], "0x00000000"), "Cannot read expanded state");
                                 int state = Convert.ToInt32(snapshot["state"]);
