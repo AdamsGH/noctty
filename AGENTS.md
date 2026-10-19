@@ -152,14 +152,17 @@ that govern each symbol you change, or that none does.
   `src/shell-integration/` (PowerShell `integration.ps1`, cmd/Clink, Git
   Bash's `ghostty.bash`) and their injection (`termio/shell_integration.zig`
   argv analysis, `win32_powershell_install.zig`): the OSC 133 and OSC 7 marks
-  a shell emits, PSReadLine hooks, execution policy.
+  a shell emits, PSReadLine hooks, execution policy, keyboard-mode recovery at
+  the prompt after a TUI leaves Kitty or modifyOtherKeys flags set
+  (`CSI <99u`, `CSI >4;0m`).
 - [terminal-core.md](docs/agents/log/terminal-core.md): `src/terminal/` (VT
   parser limits, `PageList`, OSC parsers, OSC 133 exit codes, prompt typeahead
   in `semantic_command.zig`, the scrollback search thread,
   `TerminalFormatter`/`ScreenFormatter` output for undo snapshots and Copy as
   HTML), OSC 7 and OSC 9;9 cwd reports (`termio/stream_handler.zig`,
   `os.hostname.isLocal`, `windows_shell.conemuPathToLocal`),
-  `src/Surface.zig` locking around links.
+  `src/Surface.zig` locking around links, and `ShellExecute*` calls queued for
+  the message loop (`App.deferShellRequest`, `drainDeferredOpens`).
 - [renderer.md](docs/agents/log/renderer.md): `src/renderer/` (OpenGL/WGL,
   the D3D11 beta and GL-to-D3D11 fallback, `Thread.zig` pacing and follow-up
   timers, synchronized output, vsync, `RenderPass` viewport, cursor sprites,
@@ -224,7 +227,8 @@ that govern each symbol you change, or that none does.
   text (`win32_terminal_accessibility.zig`, TextPattern, ScrollIntoView, the
   echo queue), palette and tab-list UIA.
 - [config.md](docs/agents/log/config.md): config loading and reload outside
-  the Settings window: `--config-file` and `startup_cwd` on reload,
+  the Settings window: the config file reader (`cli/args.zig` `LineIterator`,
+  `Config.file_read_buffer_len`), `--config-file` and `startup_cwd` on reload,
   diagnostics shown in the GUI, conditional replay, `newConfig` shallow
   clones, `+edit-config` and opening the config file, adding config keys.
 - [app-lifecycle.md](docs/agents/log/app-lifecycle.md): `App.init` and
@@ -246,8 +250,11 @@ that govern each symbol you change, or that none does.
   claims about behaviour.
 - [test-harnesses.md](docs/agents/log/test-harnesses.md): writing or running
   `test/windows/` harnesses (hidden desktops, the foreground, sandboxes, the
-  interactive composite, the flagship contracts), CI test steps, and a test
-  count or result that contradicts the code.
+  interactive composite, the flagship contracts), CI test steps, the Zig test
+  runner's probe children and thread tests (`src/pty_transport_probe.zig`,
+  `std.Progress.lockStdErr`, the search-thread tests in
+  `src/terminal/search/Thread.zig`), and a test count or result that
+  contradicts the code.
 - [tooling.md](docs/agents/log/tooling.md): declaring `extern` functions or
   structs, casting Win32 handles and `LPARAM`/`LRESULT` (`@intCast`,
   `@bitCast`, `@ptrFromInt`), passing `[:0]u16` to text APIs, renaming Zig
@@ -280,8 +287,9 @@ symbols). The entry is done when:
   file's "See also" names the entry by date, subject (and ID, if any) and
   file;
 - a path or symbol the entry governs that its area's trigger does not name is
-  added to that trigger (and to the file's `scope`); a pointer to another
-  file's entry goes in a header "See also", never in the index;
+  added to that trigger; the corresponding source paths are covered by the
+  file's `scope` globs; a pointer to another file's entry goes in a header
+  "See also", never in the index;
 - a new area file (only when no trigger fits) has the heading
   `# Self-Correction Log: <area>`, a blank line, the pointer line every area
   file has, a blank line, then any `Corrected in other files:` or

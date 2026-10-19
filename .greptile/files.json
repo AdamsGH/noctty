@@ -35,7 +35,9 @@
         "src/Surface.zig",
         "src/termio/stream_handler.zig",
         "src/os/hostname.zig",
-        "src/config/windows_shell.zig"
+        "src/config/windows_shell.zig",
+        "src/apprt/win32.zig",
+        "src/apprt/win32_elevation.zig"
       ]
     },
     {
@@ -225,7 +227,9 @@
         "test/**",
         "scripts/dev-windows.cmd",
         "scripts/interactive-win11*",
-        ".github/workflows/**"
+        ".github/workflows/**",
+        "src/pty_transport_probe.zig",
+        "src/terminal/search/Thread.zig"
       ]
     },
     {
