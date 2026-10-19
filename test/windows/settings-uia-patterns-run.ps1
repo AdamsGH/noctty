@@ -998,19 +998,45 @@ function Probe-Control($Case, [IntPtr] $Hwnd, [string] $Phase, [bool] $ExerciseC
             $nativePath = Join-Path $OutputDirectory $script:attempt.comboTraceFile
             $messages = [Collections.Generic.List[object]]::new()
             $malformedLines = 0
+            $pendingFinalLine = $false
+            $readError = $null
             if (Test-Path -LiteralPath $nativePath) {
-                foreach ($line in [IO.File]::ReadAllLines($nativePath)) {
+                try {
+                    # Match the open-trace reader: the product retains a writer.
+                    # Snapshot only the bounded length seen at open, not future appends.
+                    $stream = [IO.FileStream]::new($nativePath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
                     try {
-                        $entry = $line | ConvertFrom-Json -ErrorAction Stop
-                        if ($entry.control_id -eq $Case[1]) { $messages.Add($entry) }
-                    } catch { $malformedLines++ }
-                }
+                        Assert-Contract ($stream.Length -le 192KB) 'Combo trace exceeds its record bound.'
+                        $buffer = [byte[]]::new([int]$stream.Length)
+                        $read = 0
+                        while ($read -lt $buffer.Length) {
+                            $count = $stream.Read($buffer, $read, $buffer.Length - $read)
+                            if ($count -eq 0) { break }
+                            $read += $count
+                        }
+                        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                    } finally { $stream.Dispose() }
+                    $pendingFinalLine = $text.Length -gt 0 -and -not $text.EndsWith("`n")
+                    $lines = $text.Split("`n")
+                    for ($i = 0; $i -lt $lines.Length - 1; $i++) {
+                        try {
+                            $entry = $lines[$i] | ConvertFrom-Json -ErrorAction Stop
+                            if ($entry.control_id -eq $Case[1]) { $messages.Add($entry) }
+                        } catch { $malformedLines++ }
+                    }
+                } catch { $readError = '{0}:0x{1:X8}' -f $_.Exception.GetType().Name, $_.Exception.HResult }
             }
             $observed | Add-Member -NotePropertyName nativeTraceFile -NotePropertyValue $script:attempt.comboTraceFile
             $observed | Add-Member -NotePropertyName nativeDropdownMessages -NotePropertyValue @($messages.ToArray())
             $observed | Add-Member -NotePropertyName nativeTraceMalformedLines -NotePropertyValue $malformedLines
+            $observed | Add-Member -NotePropertyName nativeTracePendingFinalLine -NotePropertyValue $pendingFinalLine
+            $observed | Add-Member -NotePropertyName nativeTraceReadError -NotePropertyValue $readError
             Write-Json $path $observed
-            Assert-Contract (-not $RequireComboTrace -or (Test-Path -LiteralPath $nativePath)) 'Required native combo trace is missing.'
+            if ($RequireComboTrace -and $observed.pass) {
+                Assert-Contract (Test-Path -LiteralPath $nativePath) 'Required native combo trace is missing.'
+                Assert-Contract ($null -eq $readError) 'Required native combo trace is unreadable.'
+            }
             if ($RequireComboTrace -and $observed.pass -and $observed.enabled) {
                 $received = @($messages | Where-Object { $_.stage -eq 'show_received' -and $_.show })
                 $returned = @($messages | Where-Object { $_.stage -eq 'show_returned' -and $_.show })
