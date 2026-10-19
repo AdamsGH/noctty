@@ -78,6 +78,9 @@ function Start-InteractiveWin11StateGuard {
     $paths = [ordered]@{
         Startup = Join-Path $LocalAppDataRoot 'noctty\startup-attempts.json'
         ProductJumpList = Join-Path $destinations 'c2214d6ebc43ff3f.customDestinations-ms'
+        # Observed for io.github.amanthanvi.noctty.measure in PR #393's
+        # private-desktop batches (PR body, Validation). This exact file was
+        # created and removed after those batches; never glob this directory.
         MeasureJumpList = Join-Path $destinations '251fcb42973017e3.customDestinations-ms'
     }
     $before = [ordered]@{}
@@ -110,7 +113,7 @@ function Assert-InteractiveWin11StateGuard {
     $clipboardAfter = $null
     try {
         $clipboardAfter = [uint32](& $Guard.ClipboardSequenceReader)
-        if ($Guard.ClipboardBefore -ne $clipboardAfter) { $failures.Add('Clipboard sequence changed; stop launches and report it.') }
+        if ($Guard.ClipboardBefore -ne $clipboardAfter) { $failures.Add('Clipboard sequence changed during the batch; report before further launches.') }
     } catch { $failures.Add("Clipboard sequence inspection failed: $($_.Exception.Message)") }
     $finished = [DateTimeOffset]::UtcNow
     foreach ($name in @('Startup', 'ProductJumpList')) {
@@ -118,16 +121,18 @@ function Assert-InteractiveWin11StateGuard {
         $old = $Guard.Before[$name]
         $new = $after[$name]
         if ($old.Exists -ne $new.Exists -or $old.Length -ne $new.Length -or $old.LastWriteTimeUtc -cne $new.LastWriteTimeUtc) {
-            $failures.Add("$name metadata changed; stop launches and report it.")
+            $failures.Add("$name metadata changed during the batch; report before further launches.")
         }
     }
     $cleanup = if ($after.Contains('MeasureJumpList')) { 'not-present' } else { 'preserved-metadata-unavailable' }
     if ($Guard.Before.MeasureJumpList.Exists) { $cleanup = 'preserved-preexisting' }
     elseif ($after.Contains('MeasureJumpList') -and $after.MeasureJumpList.Exists) {
         $cleanup = 'preserved-uncertain-timestamps'
-        $created = [DateTimeOffset]::Parse($after.MeasureJumpList.CreationTimeUtc)
-        $written = [DateTimeOffset]::Parse($after.MeasureJumpList.LastWriteTimeUtc)
-        $started = [DateTimeOffset]::Parse($Guard.StartedAtUtc)
+        $culture = [Globalization.CultureInfo]::InvariantCulture
+        $styles = [Globalization.DateTimeStyles]::None
+        $created = [DateTimeOffset]::ParseExact($after.MeasureJumpList.CreationTimeUtc, 'o', $culture, $styles)
+        $written = [DateTimeOffset]::ParseExact($after.MeasureJumpList.LastWriteTimeUtc, 'o', $culture, $styles)
+        $started = [DateTimeOffset]::ParseExact($Guard.StartedAtUtc, 'o', $culture, $styles)
         # NTFS tunnelling may retain an old creation time for this exact name.
         # Record it and preserve that uncertain file rather than relax deletion.
         if ($created -ge $started -and $created -le $finished -and $written -ge $started -and $written -le $finished) {

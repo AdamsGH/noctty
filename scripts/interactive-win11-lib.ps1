@@ -1153,11 +1153,12 @@ function Get-InteractiveWin11LaunchAction {
     }
 
     if (Test-InteractiveWin11MeasureMode) {
-        $measureRepo = Get-InteractiveWin11MeasureRepoForExe $resolvedExePath
+        [void] (Get-InteractiveWin11MeasureRepoForExe $resolvedExePath)
         if ([IO.File]::Exists($resolvedExePath)) {
-            # HEAD and hashes are the authority here, rather than timestamps.
-            # A stale or damaged receipt must fail, including with -NoBuild.
-            Assert-InteractiveWin11MeasureBuild -RepoRoot $measureRepo -ExePath $resolvedExePath
+            # This selects build versus reuse only. Every caller then runs
+            # Assert-InteractiveWin11ExeExists at admission, which validates
+            # HEAD/source/binary receipts once, including with -NoBuild.
+            # Do not duplicate that full source walk inside leaf budgets.
             return 'launch'
         }
         if ($NoBuild) { throw "Missing measurement noctty.exe at $resolvedExePath (-NoBuild)." }

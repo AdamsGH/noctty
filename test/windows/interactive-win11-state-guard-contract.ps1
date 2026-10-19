@@ -87,6 +87,17 @@ try {
     Assert-Control ($receipt.MeasureCleanup -eq 'removed-batch-created' -and $receipt.After.MeasureJumpList.CreationTimeUtc) 'Cleanup receipt lacks creation UTC.'
     $passed++
 
+    $case = New-Control 'invariant-time'
+    $guard = Start-Control $case
+    [IO.File]::WriteAllText($case.Measure, 'synthetic-measure')
+    $originalCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('ar-SA')
+        Assert-InteractiveWin11StateGuard $guard
+        Assert-Control (-not (Test-Path -LiteralPath $case.Measure)) 'Invariant timestamp cleanup failed under ar-SA.'
+    } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $originalCulture }
+    $passed++
+
     $case = New-Control 'preexisting'
     [IO.File]::WriteAllText($case.Measure, 'preexisting')
     $guard = Start-Control $case
@@ -152,15 +163,19 @@ try {
     function Invoke-FinalizerControl {
         $windowsHarnessStateGuard = [pscustomobject]@{}
         $windowsHarnessHistoryGuard = [pscustomobject]@{}
-        $savedMeasureAumid = $env:NOCTTY_INTERACTIVE_MEASURE_AUMID
+        $originalMeasureAumid = $env:NOCTTY_INTERACTIVE_MEASURE_AUMID
+        $savedMeasureAumid = 'state-control-original'
+        $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = '1'
         $called = [Collections.Generic.List[string]]::new()
         function Assert-InteractiveWin11StateGuard { param($Guard) $called.Add('state'); throw 'state-control-failure' }
         function Assert-WindowsHarnessHistoryGuard { param($Guard) $called.Add('history'); throw 'history-control-failure' }
         $message = ''
-        try { & $finalizer } catch { $message = $_.Exception.Message }
-        Assert-Control (($called -join ',') -eq 'state,history') 'Composite skipped a guard after a failure.'
-        Assert-Control ($message -like '*state-control-failure*history-control-failure*') 'Composite lost a guard failure.'
-        Assert-Control ($env:NOCTTY_INTERACTIVE_MEASURE_AUMID -ceq $savedMeasureAumid) 'Composite did not restore measure environment.'
+        try {
+            try { & $finalizer } catch { $message = $_.Exception.Message }
+            Assert-Control (($called -join ',') -eq 'state,history') 'Composite skipped a guard after a failure.'
+            Assert-Control ($message -like '*state-control-failure*history-control-failure*') 'Composite lost a guard failure.'
+            Assert-Control ($env:NOCTTY_INTERACTIVE_MEASURE_AUMID -ceq $savedMeasureAumid) 'Composite did not restore measure environment.'
+        } finally { $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $originalMeasureAumid }
     }
     Invoke-FinalizerControl
     $passed++

@@ -97,6 +97,18 @@ jobs:
         shell: powershell
         run: ./test/windows/powershell-shell-integration.ps1
 
+      - name: Harness provenance and state controls (PowerShell 7)
+        shell: pwsh
+        run: |
+          ./test/windows/interactive-win11-measure-contract.ps1
+          ./test/windows/interactive-win11-state-guard-contract.ps1
+
+      - name: Harness provenance and state controls (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          ./test/windows/interactive-win11-measure-contract.ps1
+          ./test/windows/interactive-win11-state-guard-contract.ps1
+
       - name: Cmd and Clink integration tests (portable)
         shell: pwsh
         run: |

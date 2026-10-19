@@ -303,12 +303,12 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $measureRoutingExe
 Set-Content -LiteralPath $measureRoutingExe -Value 'synthetic executable'
 $script:measureRoutingRejectReceipt = $false
 Assert-Equal (Get-InteractiveWin11LaunchAction -ExePath $measureRoutingExe -NoBuild) 'launch' 'valid measurement receipt should permit reuse'
-Assert-Equal $script:measureRoutingAssertCount 1 'measurement reuse must validate the receipt'
+Assert-Equal $script:measureRoutingAssertCount 0 'action selection must defer full validation to admission'
 Assert-InteractiveWin11ExeExists -ExePath $measureRoutingExe -AllowInboxConPty
-Assert-Equal $script:measureRoutingAssertCount 2 'the final executable preflight must validate the receipt'
+Assert-Equal $script:measureRoutingAssertCount 1 'the final executable preflight must validate the receipt exactly once'
 $script:measureRoutingRejectReceipt = $true
 $rejected = $false
-try { Get-InteractiveWin11LaunchAction -ExePath $measureRoutingExe | Out-Null } catch { $rejected = $true }
+try { Assert-InteractiveWin11ExeExists -ExePath $measureRoutingExe -AllowInboxConPty } catch { $rejected = $true }
 Assert-True $rejected 'an invalid measurement receipt must fail rather than fall back to timestamps or a product build'
 $foreignRejected = $false
 try { Get-InteractiveWin11LaunchAction -ExePath $existingExe | Out-Null } catch { $foreignRejected = $true }
