@@ -85,6 +85,16 @@ if ($releaseWindowsJob -match 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24') {
 $windowsArmWorkflow = Join-Path $repoRoot '.github\workflows\windows-arm64.yml'
 $windowsArmWorkflowText = Get-Content -LiteralPath $windowsArmWorkflow -Raw
 $checksJob = Get-YamlJobText -Content $testWorkflowText -Name 'checks' -Source $testWorkflow
+foreach ($controlCase in @(
+        @{ Name = 'Harness provenance and state controls (PowerShell 7)'; Shell = 'pwsh' },
+        @{ Name = 'Harness provenance and state controls (Windows PowerShell 5.1)'; Shell = 'powershell' }
+    )) {
+    $step = Get-YamlStepBlock -Content $checksJob -Name $controlCase.Name -Source $testWorkflow
+    if ($step -notmatch ('(?m)^ {8}shell: ' + $controlCase.Shell + '\s*$') -or
+        $step -notmatch '(?m)^ {8}run: \|\r?\n {10}\./test/windows/interactive-win11-measure-contract\.ps1\r?\n {10}\./test/windows/interactive-win11-state-guard-contract\.ps1\s*$') {
+        throw "Missing executable provenance and state controls: $($controlCase.Name)"
+    }
+}
 foreach ($shellCase in @(
         @{ Name = 'PowerShell shell integration tests (PowerShell 7)'; Shell = 'pwsh'; Script = 'powershell-shell-integration' },
         @{ Name = 'PowerShell shell integration tests (Windows PowerShell 5.1)'; Shell = 'powershell'; Script = 'powershell-shell-integration' },
@@ -132,6 +142,8 @@ foreach ($coverage in @(
                 'Flagship verification contract checks',
                 'PowerShell shell integration tests (PowerShell 7)',
                 'PowerShell shell integration tests (Windows PowerShell 5.1)',
+                'Harness provenance and state controls (PowerShell 7)',
+                'Harness provenance and state controls (Windows PowerShell 5.1)',
                 'Bash shell integration tests (Git Bash)',
                 'Cmd and Clink integration tests (portable)',
                 'Interactive hints contract checks',

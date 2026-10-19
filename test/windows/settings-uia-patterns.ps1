@@ -17,6 +17,11 @@ param(
     [switch] $UseSelectionItem,
     [switch] $CompileOnly
 )
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'settings-uia-patterns.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 if (-not ('SettingsPatterns.Probe' -as [type])) {
     Add-Type -TypeDefinition @"
@@ -632,3 +637,7 @@ if (-not $Hwnd -or -not $Desktop -or -not $OutputPath -or -not $Kind) {
 $result = [SettingsPatterns.Probe]::Run($Hwnd, $Desktop, $Kind, $ExpectedName, $Exercise.IsPresent, $UseSelectionItem.IsPresent)
 $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding utf8
 if (-not $result['pass']) { exit 1 }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

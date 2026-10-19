@@ -15,6 +15,11 @@ param(
     [string] $ExpectedName,
     [switch] $CompileOnly
 )
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'settings-generated-form.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 
 if (-not ('SettingsPatterns.FormProbe' -as [type])) {
@@ -127,3 +132,7 @@ if ($Kind -in 'CheckBox', 'ComboBox') {
 }
 $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding utf8
 if (-not $result['pass']) { exit 1 }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

@@ -41,6 +41,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# The reused #455 guard controller starts and checks this history guard under this runner's name.
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 $client = Join-Path $PSScriptRoot 'settings-generated-form.ps1'
 $SetFormRunner = $PSCommandPath
 $existingRunner = Join-Path $PSScriptRoot 'settings-uia-patterns-run.ps1'

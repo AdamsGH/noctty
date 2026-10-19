@@ -537,8 +537,42 @@ its own. It holds the private desktop, the owned kill-on-close job, the two
 explicit-desktop launches (`Launch` for the driver, `Spawn` for a case),
 `Invoke-LocalHiddenDriver` (the outer half: run the harness again as its driver
 on a new private desktop with LOCALAPPDATA and APPDATA redirected into the run
-directory, then check the real `startup-attempts.json` and, where the harness asks,
-the clipboard sequence number), and the small helpers those harnesses had copied.
+directory, then check the real `startup-attempts.json`, PowerShell history
+metadata, and, where the harness asks, the clipboard sequence number), and the
+small helpers those harnesses had copied.
+
+## PowerShell history isolation
+
+`scripts/windows-harness-history.ps1` resolves the real history paths through
+Windows known folders and compares only existence, size and UTC mtime. Interactive
+entry points start the guard before launching and assert it in `finally`; the
+composite also guards the whole batch. A change fails with the harness name,
+including when another check already failed. The guard never opens or hashes
+history. Maintainer activity during a run can also trip it and must be attributed
+before another launch.
+
+Shell-independent panes use `--command=cmd.exe`. An explicit `-e` selects only
+the first pane, so additional tabs and splits still need the cmd default.
+Only fixtures that test a configured `command` opt out of the shared pin.
+Tests that need interactive
+PowerShell configure PSReadLine before the first read, using a run-local
+`HistorySavePath` and/or `HistorySaveStyle SaveNothing`. Redirecting `APPDATA`
+alone does not isolate PSReadLine. Seeded prediction tests retain their scratch
+history with `SaveAtExit`. `harness-history-guard.ps1` checks the guard against
+scratch metadata changes and real PSReadLine writes on a private desktop;
+the negative control must reject the scratch write and the isolated control
+must leave its scratch history unchanged.
+
+The interactive composite builds exact clean `HEAD` in a generation under
+`.sandbox/interactive-measure/<HEAD>`, with only the recorded measurement AUMID
+patch applied to extracted source. It suppresses product registration writes and
+uses `.measure` for process and jump-list identity. The explicit product toast
+notifier and command-finish policy stay unchanged. Source/build receipts bind
+the source archive, patch and both executable hashes; the composite retains and
+rechecks them. This is measurement-build evidence, with registration repair and
+installed cold-start activation outside its coverage. Each child retains its
+own redirected config directories. See [history-inventory.md](history-inventory.md)
+for the shell and guard used by each harness.
 
 ## ..\..\scripts\check-test-skips.ps1
 

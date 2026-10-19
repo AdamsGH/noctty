@@ -13,9 +13,12 @@
 #   * Invoke-LocalHiddenDriver: the outer half of a harness. It runs the harness
 #     again as its driver on a new private desktop, inside that job, with
 #     LOCALAPPDATA and APPDATA redirected into the run directory, and checks
-#     that the real startup-attempts.json (and, with -GuardClipboard, the
-#     clipboard sequence number) did not change.
+#     that the real startup-attempts.json, the real PSReadLine history files'
+#     size and time (scripts/windows-harness-history.ps1) and, with
+#     -GuardClipboard, the clipboard sequence number did not change.
 #   * Small helpers the harnesses had each copied.
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 
 if (-not ('HiddenLocal' -as [type])) {
 Add-Type @'
@@ -136,14 +139,6 @@ function Startup-Fingerprint {
     return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
 }
 
-# Size and time only; the contents of a shell history are never read.
-function History-Metadata {
-    $path = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
-    if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
-    $item = Get-Item -LiteralPath $path
-    return @{ Exists=$true; Length=$item.Length; Modified=$item.LastWriteTimeUtc.ToString('o') }
-}
-
 function Jump-List-Files {
     $dir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\Recent\CustomDestinations'
     if (-not (Test-Path -LiteralPath $dir)) { return @() }
@@ -194,6 +189,7 @@ function Invoke-LocalHiddenDriver {
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Source Bin must contain noctty.exe.' }
     $before = Startup-Fingerprint
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness (Split-Path -Leaf $Script)
     if ($GuardClipboard) { $clipBefore = [HiddenLocal]::GetClipboardSequenceNumber() }
     if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
     [void](New-Item -ItemType Directory -Path $Run)
@@ -229,11 +225,14 @@ function Invoke-LocalHiddenDriver {
         $after=Startup-Fingerprint
         if ($GuardClipboard) { $clipAfter=[HiddenLocal]::GetClipboardSequenceNumber() }
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        $state=@{ Before=$before; After=$after; Unchanged=$unchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount }
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        $state=@{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=($null -eq $historyFailure); OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount }
         if ($GuardClipboard) {
             $state.ClipboardSequenceBefore=$clipBefore; $state.ClipboardSequenceAfter=$clipAfter; $state.ClipboardUnchanged=($clipBefore -eq $clipAfter)
         }
         $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if ($historyFailure) { throw $historyFailure }
         if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if ($GuardClipboard -and $clipBefore -ne $clipAfter) { throw "Clipboard sequence number moved ($clipBefore -> $clipAfter); stop launches and report it." }
         if($cleanupError) { throw $cleanupError }

@@ -4,6 +4,8 @@ Portable integration smoke for App HWND delivery on a private desktop.
 Run with -Bin <built bin directory> -Run <new evidence directory>.
 No builds, desktop switching, foreground activation, injected input, clipboard,
 PowerShell profiles, or real shell history. All child processes belong to a job.
+The terminal runs cmd.exe, and the real PSReadLine history files' size and time are
+checked before and after (metadata only).
 The adopted real startup-state hash is checked before and after the run; supply
 ExpectedStartupModified to pin its exact UTC timestamp as well.
 #>
@@ -207,6 +209,7 @@ if(-not $Driver) {
     if(Test-Path -LiteralPath $Run){throw 'Run directory must be new.'}
     if(-not(Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))){throw 'Bin must contain noctty.exe.'}
     $before=Startup-Fingerprint
+    $historyGuard=Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-app-delivery.ps1'
     if(($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)){throw 'Real startup state differs from adopted baseline; no launches performed.'}
     [void](New-Item -ItemType Directory -Path $Run)
     $portableBin=Join-Path $Run 'portable\bin'
@@ -247,7 +250,10 @@ if(-not $Driver) {
         [void][AppDeliverySmoke]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{Before=$before;After=$after;Unchanged=$unchanged;DriverIdentityVerified=($null -eq $identityError);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$ownedProcesses;Driver=$driverObservation} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        $historyFailure=$null
+        try{Assert-WindowsHarnessHistoryGuard -Guard $historyGuard}catch{$historyFailure=$_}
+        @{Before=$before;After=$after;Unchanged=$unchanged;HistoryUnchanged=($null -eq $historyFailure);DriverIdentityVerified=($null -eq $identityError);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$ownedProcesses;Driver=$driverObservation} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if($historyFailure){throw $historyFailure}
         if(-not $unchanged){throw 'Real startup state changed; stop launches.'}
         if($cleanupError){throw $cleanupError}
         if($identityError){throw $identityError}

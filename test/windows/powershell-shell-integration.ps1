@@ -3,6 +3,11 @@ param(
     [string]$UncPath = ''
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'powershell-shell-integration.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $script:AssertionCount = 0
 
@@ -1192,4 +1197,8 @@ public sealed class NocttyInjectedChildOutput {
         $env:GHOSTTY_SHELL_FEATURES = $script:OriginalFeatures
     }
     Remove-Item -LiteralPath $script:TempDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

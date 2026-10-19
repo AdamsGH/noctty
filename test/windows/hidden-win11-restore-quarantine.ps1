@@ -99,7 +99,7 @@ if (-not $Driver) {
     $source = (Resolve-Path -LiteralPath $Bin).Path
     if (-not (Test-Path -LiteralPath (Join-Path $source 'noctty.exe'))) { throw "No noctty.exe in $source." }
     $before = Startup-Fingerprint
-    $historyBefore = History-Metadata
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-restore-quarantine.ps1'
     $clipboardBefore = [HiddenLocal]::GetClipboardSequenceNumber()
     if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
     $jumpBefore = @(Jump-List-Files | ForEach-Object { $_.Path })
@@ -145,15 +145,15 @@ if (-not $Driver) {
             } else { $otherNew += (Split-Path -Leaf $f.Path) }
         }
         $after=Startup-Fingerprint
-        $historyAfter = History-Metadata
         $clipboardAfter=[HiddenLocal]::GetClipboardSequenceNumber()
         Write-Host "Clipboard sequence after: $clipboardAfter"
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        $historyUnchanged=$historyBefore.Exists -eq $historyAfter.Exists -and $historyBefore.Length -eq $historyAfter.Length -and $historyBefore.Modified -eq $historyAfter.Modified
-        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=$historyUnchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter; JumpListFilesRemoved=$removed; OtherNewJumpListFiles=$otherNew; BatchStartUtc=$batchStart.ToString('o'); BatchEndUtc=$batchEnd.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=($null -eq $historyFailure); OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter; JumpListFilesRemoved=$removed; OtherNewJumpListFiles=$otherNew; BatchStartUtc=$batchStart.ToString('o'); BatchEndUtc=$batchEnd.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
         if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if ($clipboardBefore -ne $clipboardAfter) { throw "Clipboard sequence number changed ($clipboardBefore -> $clipboardAfter); stop launches and report it." }
-        if (-not $historyUnchanged) { throw 'Real PowerShell history metadata changed; stop launches and report it.' }
+        if ($historyFailure) { throw $historyFailure }
         if($cleanupError) { throw $cleanupError }
     }
     if($code -ne 0) { throw "Hidden driver failed with exit $code; inspect sanitized results in $Run." }

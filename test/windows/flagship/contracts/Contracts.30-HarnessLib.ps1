@@ -194,7 +194,9 @@ $resolutionSourceAsts = foreach ($source in @(
 foreach ($source in $resolutionSourceAsts) {
     $expectedDotSources = if ($source.Path -eq $statefulWin11Lib) {
         @(". (Join-Path (Split-Path -Parent (Split-Path -Parent `$PSScriptRoot)) 'scripts\interactive-win11-window-lib.ps1')")
-    } else { @() }
+    } else {
+        @(". (Join-Path `$PSScriptRoot 'interactive-win11-measure-lib.ps1')")
+    }
     $expectedAmpersands = if ($source.Path -eq $interactiveWin11Lib) {
         @(
             '& $bootstrapCmd powershell.exe -ExecutionPolicy Bypass -File $LauncherPath @ArgumentList',
@@ -739,7 +741,7 @@ try {
     )
     if ($script:containmentForwardCalls -ne 1 -or
         ($launchArguments -join '|') -ne
-            '--contract-containment-probe|--single-instance=false|--class=noctty-interactive-contract-sandbox') {
+            '--contract-containment-probe|--single-instance=false|--class=noctty-interactive-contract-sandbox|--command=cmd.exe') {
         throw 'Interactive launch composition did not invoke containment policy once and append isolation arguments.'
     }
 }

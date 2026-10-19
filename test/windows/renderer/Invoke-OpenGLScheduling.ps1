@@ -7,6 +7,11 @@ param(
     [string]$DesktopName,
     [string]$RealProfile
 )
+
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Invoke-OpenGLScheduling.ps1'
+try {
+
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Native.ps1')
 $DefaultBinary=[IO.Path]::GetFullPath($DefaultBinary)
@@ -112,3 +117,7 @@ function Case([string]$Name,[string]$Binary){
 try{$result.runs+=Case 'default' $DefaultBinary;$result.runs+=Case 'opengl-only' $OpenGLOnlyBinary;$result.status='pass'}catch{$result.failure=$_.Exception.Message}
 finally{CheckProfile;$result.profileAfter=Receipt;$result|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json')}
 if($result.status -ne 'pass'){exit 1}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

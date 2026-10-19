@@ -39,6 +39,7 @@ param(
     [switch] $DetachedOnly
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'cli-com-native.cs')
 
 function Get-StateMetadata([string] $Path, [switch] $MetadataOnly) {
@@ -103,9 +104,8 @@ if (-not $Driver) {
         'command = C:\Windows\System32\cmd.exe /d /q'
     ) | Set-Content -LiteralPath (Join-Path $portable 'config.ghostty') -Encoding utf8NoBOM
     $startupPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty/startup-attempts.json'
-    $historyPath = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt'
     $startupBefore = Get-StateMetadata $startupPath
-    $historyBefore = Get-StateMetadata $historyPath -MetadataOnly
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness 'cli-com-forwarder.ps1'
     $clipboardBefore = [ComCliNative]::GetClipboardSequenceNumber()
     $batchStarted = [datetime]::UtcNow
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -144,18 +144,19 @@ if (-not $Driver) {
         if ($desktopHandle) { [void][ComCliNative]::CloseDesktop($desktopHandle) }
         $clock.Stop()
         $startupAfter = Get-StateMetadata $startupPath
-        $historyAfter = Get-StateMetadata $historyPath -MetadataOnly
+        $historyFailure = $null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure = $_ }
         $clipboardAfter = [ComCliNative]::GetClipboardSequenceNumber()
         $receipt = [ordered]@{
             StartedUtc = $batchStarted.ToString('o'); FinishedUtc = [datetime]::UtcNow.ToString('o'); ElapsedMs = $clock.Elapsed.TotalMilliseconds
             Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
             Desktop = "WinSta0\$DesktopName"
             StartupBefore = $startupBefore; StartupAfter = $startupAfter
-            HistoryBefore = $historyBefore; HistoryAfter = $historyAfter
+            HistoryPaths = $historyGuard.Paths; HistoryBefore = $historyGuard.Before
             ClipboardBefore = $clipboardBefore; ClipboardAfter = $clipboardAfter
             ClipboardUnchanged = $clipboardBefore -eq $clipboardAfter
             StartupUnchanged = ($startupBefore | ConvertTo-Json -Compress) -ceq ($startupAfter | ConvertTo-Json -Compress)
-            HistoryUnchanged = ($historyBefore | ConvertTo-Json -Compress) -ceq ($historyAfter | ConvertTo-Json -Compress)
+            HistoryUnchanged = $null -eq $historyFailure
             ComBytes = (Get-Item -LiteralPath (Join-Path $portable 'noctty.com')).Length
             ComSha256 = (Get-FileHash -LiteralPath (Join-Path $portable 'noctty.com')).Hash
             Status = if ($failure) { 'Failed' } else { 'Passed' }
@@ -164,7 +165,8 @@ if (-not $Driver) {
             Coverage = if ($ProveDesktopOnly) { 'Windowless fixture setup gate only; product coverage owed' } elseif ($ThinForwarder) { 'Full + thin forwarder fixture cases' } else { 'Full' }
         }
         $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDir 'isolation.json') -Encoding utf8NoBOM
-        Assert-Condition ($receipt.StartupUnchanged -and $receipt.HistoryUnchanged) 'Real state metadata changed; stop launches and report.'
+        if ($historyFailure) { throw $historyFailure }
+        Assert-Condition $receipt.StartupUnchanged 'Real state metadata changed; stop launches and report.'
         Assert-Condition $receipt.ClipboardUnchanged 'WinSta0 clipboard sequence changed; stop launches and report.'
     }
     if ($failure) { throw $failure }

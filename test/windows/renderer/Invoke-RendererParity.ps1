@@ -11,6 +11,11 @@ param(
     [string]$RealProfile = '',
     [string]$DesktopName = ''
 )
+
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Invoke-RendererParity.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Native.ps1')
 $repoRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot))
@@ -441,3 +446,7 @@ finally {
     $result | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8
 }
 if ($result.status -ne 'pass') { exit 1 }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}
