@@ -3471,6 +3471,11 @@ pub const SettingsWindow = struct {
     /// font and High Contrast changes arrive under several names.
     pub fn themeChanged(self: *SettingsWindow) void {
         const hwnd = self.hwnd orelse return;
+        // SetWindowTheme synchronously sends WM_THEMECHANGED while the adapter
+        // is still applying. Its caller already follows that work with fonts
+        // and layout; reentering here creates both a second time on each open,
+        // before the initial font can satisfy themeInputsApplied.
+        if (self.theme_adapter.applying) return;
         const colors = self.resolveThemeColors();
         if (self.themeInputsApplied(colors)) return;
         self.theme_applications +%= 1;
@@ -5574,6 +5579,28 @@ test "settings theme change with unchanged inputs rebuilds nothing" {
     settings.themeChanged();
     try std.testing.expectEqual(@as(u32, 4), settings.theme_applications);
     try std.testing.expect(settings.theme_adapter.button_brush != null);
+}
+
+test "settings initial native theme does not reenter font and layout work" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            // SetWindowTheme sends WM_THEMECHANGED synchronously. The open
+            // path already follows the adapter with fonts and layout; handling
+            // that notification again would build both while apply is active.
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+            try std.testing.expect(settings.themeInputsApplied(settings.resolveThemeColors()));
+            // Once open completes, a notification with the same inputs also
+            // keeps the fonts and layout already applied.
+            const fonts = .{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font };
+            _ = sys.SendMessageW(fixture.hwnd(), WM_THEMECHANGED, 0, 0);
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+            try std.testing.expectEqualDeep(fonts, .{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font });
+        }
+    }.body);
 }
 
 test "settings Ctrl+S is the only save shortcut" {
