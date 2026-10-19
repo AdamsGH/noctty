@@ -1038,9 +1038,20 @@ function Probe-Control($Case, [IntPtr] $Hwnd, [string] $Phase, [bool] $ExerciseC
                 Assert-Contract ($null -eq $readError) 'Required native combo trace is unreadable.'
             }
             if ($RequireComboTrace -and $observed.pass -and $observed.enabled) {
-                $received = @($messages | Where-Object { $_.stage -eq 'show_received' -and $_.show })
-                $returned = @($messages | Where-Object { $_.stage -eq 'show_returned' -and $_.show })
-                Assert-Contract ($received.Count -gt 0 -and $received.Count -eq $returned.Count) 'Successful combo operation has no complete native dropdown trace.'
+                $expansions = @($observed.expansions)
+                Assert-Contract ($expansions.Count -eq 2) 'Successful combo operation must record both expansions.'
+                foreach ($expansion in $expansions) {
+                    # Each Expand has its own clock interval; a complete first
+                    # pair cannot stand in for a missing second expansion.
+                    $inAttempt = @($messages | Where-Object {
+                        $_.tick_ms -ge $expansion.before.tick_ms -and $_.tick_ms -le $expansion.returnTickMs
+                    })
+                    $received = @($inAttempt | Where-Object { $_.stage -eq 'show_received' -and $_.show })
+                    $returned = @($inAttempt | Where-Object { $_.stage -eq 'show_returned' -and $_.show })
+                    Assert-Contract ($received.Count -eq 1 -and $returned.Count -eq 1 -and
+                        $received[0].tick_ms -le $returned[0].tick_ms -and
+                        [Array]::IndexOf($inAttempt, $received[0]) -lt [Array]::IndexOf($inAttempt, $returned[0])) 'Successful combo expansion has no complete native dropdown trace in its interval.'
+                }
             }
         }
         Assert-Contract (($probe.ExitCode() -eq 0) -eq [bool]$observed.pass) 'Client exit/result mismatch.'
