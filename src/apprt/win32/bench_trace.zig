@@ -55,8 +55,12 @@ pub const SettingsOpenTrace = struct {
     /// Read the opt-in once per App lifetime. An inherited environment must
     /// not make unit tests write files; tests exercise initPath explicitly.
     pub fn init(alloc: Allocator) SettingsOpenTrace {
+        return initEnv(alloc, "NOCTTY_SETTINGS_OPEN_TRACE");
+    }
+
+    fn initEnv(alloc: Allocator, name: []const u8) SettingsOpenTrace {
         if (builtin.is_test) return .{};
-        const path = std.process.getEnvVarOwned(alloc, "NOCTTY_SETTINGS_OPEN_TRACE") catch return .{};
+        const path = std.process.getEnvVarOwned(alloc, name) catch return .{};
         defer alloc.free(path);
         return initPath(path) catch .{};
     }
@@ -90,6 +94,10 @@ pub const SettingsOpenTrace = struct {
             self.deinit();
             return;
         };
+        self.writeRecord(file, line);
+    }
+
+    fn writeRecord(self: *SettingsOpenTrace, file: std.fs.File, line: []const u8) void {
         file.writeAll(line) catch {
             self.deinit();
             return;
@@ -102,6 +110,55 @@ pub const SettingsOpenTrace = struct {
         return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\"}}\n", .{ tick_ms, @tagName(stage) });
     }
 };
+
+/// Opt-in receipts from the Settings HWND thread, immediately around the
+/// subclass's call into the native CB_SHOWDROPDOWN handler. This distinguishes
+/// a UIA request from a message actually delivered to the control. No text,
+/// configuration values, process arguments or input state is recorded.
+pub const SettingsComboTrace = struct {
+    const max_record_bytes = 192;
+    inner: SettingsOpenTrace = .{},
+
+    pub fn init(alloc: Allocator) SettingsComboTrace {
+        return .{ .inner = SettingsOpenTrace.initEnv(alloc, "NOCTTY_SETTINGS_COMBO_TRACE") };
+    }
+
+    pub fn deinit(self: *SettingsComboTrace) void {
+        self.inner.deinit();
+    }
+
+    pub fn enabled(self: *const SettingsComboTrace) bool {
+        return self.inner.enabled();
+    }
+
+    pub fn note(self: *SettingsComboTrace, control_id: i32, show: bool, dropped: bool, result: ?isize) void {
+        const file = self.inner.file orelse return;
+        var buf: [max_record_bytes]u8 = undefined;
+        const line = formatRecord(&buf, GetTickCount64(), control_id, show, dropped, result) catch {
+            self.deinit();
+            return;
+        };
+        self.inner.writeRecord(file, line);
+    }
+
+    fn formatRecord(buf: []u8, tick_ms: u64, control_id: i32, show: bool, dropped: bool, result: ?isize) ![]const u8 {
+        if (result) |value| return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"show_returned\",\"control_id\":{d},\"show\":{},\"dropped\":{},\"result\":{d}}}\n", .{ tick_ms, control_id, show, dropped, value });
+        return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"show_received\",\"control_id\":{d},\"show\":{},\"dropped\":{}}}\n", .{ tick_ms, control_id, show, dropped });
+    }
+};
+
+test "Settings combo trace records native dropdown delivery without control text" {
+    var buf: [SettingsComboTrace.max_record_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":99,\"stage\":\"show_received\",\"control_id\":405,\"show\":true,\"dropped\":false}\n",
+        try SettingsComboTrace.formatRecord(&buf, 99, 405, true, false, null),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":100,\"stage\":\"show_returned\",\"control_id\":405,\"show\":false,\"dropped\":true,\"result\":0}\n",
+        try SettingsComboTrace.formatRecord(&buf, 100, 405, false, true, 0),
+    );
+    _ = try SettingsComboTrace.formatRecord(&buf, std.math.maxInt(u64), std.math.minInt(i32), false, false, std.math.minInt(isize));
+}
 
 test "Settings open trace formatter emits only stage and timestamp" {
     var buf: [SettingsOpenTrace.max_record_bytes]u8 = undefined;

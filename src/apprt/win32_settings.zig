@@ -31,6 +31,7 @@ const settings_transaction = @import("win32_settings_transaction.zig");
 const sys = @import("win32/sys.zig");
 const config_problems = @import("win32/config_problems.zig");
 const field_model = @import("win32_settings_fields.zig");
+const bench_trace = @import("win32/bench_trace.zig");
 const SetFocus = sys.SetFocus;
 
 /// Minimal set of Win32 aliases + externs we need here. Shared ABI structs
@@ -1517,6 +1518,7 @@ pub const AppHandle = struct {
 
 pub const SettingsWindow = struct {
     handle: AppHandle,
+    combo_trace: bench_trace.SettingsComboTrace = .{},
     hwnd: ?HWND = null,
     /// The form's own window (`viewport_class_name`): every field, its label
     /// and the help text are its children, so its client area is what clips
@@ -1693,7 +1695,7 @@ pub const SettingsWindow = struct {
     wheel_lines_override: ?u32 = null,
 
     pub fn init(handle: AppHandle) SettingsWindow {
-        return .{ .handle = handle };
+        return .{ .handle = handle, .combo_trace = bench_trace.SettingsComboTrace.init(handle.alloc) };
     }
 
     fn canInitializeCustomUiaProviders(self: *const SettingsWindow) bool {
@@ -1768,6 +1770,7 @@ pub const SettingsWindow = struct {
     }
 
     pub fn deinit(self: *SettingsWindow) void {
+        defer self.combo_trace.deinit();
         self.freeNoteText();
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) _ = sys.DestroyWindow(h);
@@ -9665,7 +9668,11 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
                 }
             }
             if (previous) |proc| {
+                if (msg == 0x014F and settings.combo_trace.enabled())
+                    settings.combo_trace.note(sys.GetDlgCtrlID(hwnd), wParam != 0, sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0, null);
                 const result = sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+                if (msg == 0x014F and settings.combo_trace.enabled())
+                    settings.combo_trace.note(sys.GetDlgCtrlID(hwnd), wParam != 0, sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0, result);
                 if (msg == WM_SETFOCUS) {
                     if (settings.control_uia_providers[index]) |provider| provider.raiseFocusChanged();
                 }

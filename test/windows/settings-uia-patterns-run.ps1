@@ -10,7 +10,7 @@
     Every child has explicit lpDesktop and CREATE_NO_WINDOW. A kill-on-close job
     owns the worker tree; retained process handles bound each UIA client. No
     desktop switch, global input, Narrator, history contents or clipboard content.
-    Real startup hash, history metadata and clipboard counter bracket the batch.
+    Real startup/history metadata and clipboard counter bracket the batch.
 
     Runtime requires -Run. With both cohort counts zero, the original 30 UIA
     cases run. Otherwise ColdOpenCount independent cold opens and ReloadCount
@@ -25,6 +25,10 @@
     summarize stage tags only and retain the original trace without printing it.
     -RequireTrace asserts a valid route-specific trace and successful Settings dispatch;
     leave it unset for a build without the optional product instrumentation.
+    NOCTTY_SETTINGS_COMBO_TRACE separately records native CB_SHOWDROPDOWN
+    delivery and return, keyed by control ID. Exercise receipts attach those
+    records to the HRESULT and before/returned/100 ms popup observations.
+    -RequireComboTrace rejects a missing diagnostic trace on instrumented builds.
     Any clipboard sequence change stops launches without attribution.
 
     Results: summary.json, cases.json, per-control probe JSON, guard snapshots,
@@ -53,6 +57,7 @@ param(
     [ValidateRange(0,10000)][int] $ColdOpenCount = 0,
     [ValidateRange(0,10000)][int] $ReloadCount = 0,
     [switch] $RequireTrace,
+    [switch] $RequireComboTrace,
     [switch] $RawPostedF9,
     [ValidateSet('d3d11','opengl')][string] $Renderer = 'd3d11',
     [switch] $CompileOnly,
@@ -527,7 +532,7 @@ function Click([IntPtr] $Hwnd) {
     [void][Set91.Native]::Send($Hwnd, 0xF5, 0, 0)
 }
 function Get-GuardSnapshot {
-    # Hash only startup; history guards use metadata without opening contents.
+    # Metadata only: never open the maintainer's profile or history contents.
     $roam = [Environment]::GetFolderPath('ApplicationData')
     $local = [Environment]::GetFolderPath('LocalApplicationData')
     $docs = [Environment]::GetFolderPath('MyDocuments')
@@ -540,7 +545,7 @@ function Get-GuardSnapshot {
         $item = Get-Item -LiteralPath $paths[$label] -ErrorAction SilentlyContinue
         if ($item) {
             [ordered]@{ label = $label; exists = $true; bytes = $item.Length
-                mtime = $item.LastWriteTimeUtc.Ticks; sha256 = $(if ($label -eq 'startup') { (Get-FileHash -LiteralPath $item.FullName).Hash } else { $null }) }
+                mtime = $item.LastWriteTimeUtc.Ticks }
         } else { [ordered]@{ label = $label; exists = $false } }
     }
     $destinations = @(Get-ChildItem -LiteralPath (Join-Path $roam 'Microsoft/Windows/Recent/CustomDestinations') `
@@ -615,6 +620,7 @@ if (-not $WorkerDesktop) {
             '-OutputDirectory', $OutputDirectory, '-WorkerDesktop', $desktopName,
             '-ColdOpenCount', "$ColdOpenCount", '-ReloadCount', "$ReloadCount", '-Renderer', $Renderer)
         if ($RequireTrace) { $workerArgs += '-RequireTrace' }
+        if ($RequireComboTrace) { $workerArgs += '-RequireComboTrace' }
         if ($RawPostedF9) { $workerArgs += '-RawPostedF9' }
         Assert-ClipboardGuard
         $worker = [Set91.Native]::Launch((Join-Path $PSHOME 'pwsh.exe'), $workerArgs, $desktopName, $OutputDirectory, $job)
@@ -754,9 +760,11 @@ function Start-Fixture {
     $script:openClock = $null
     $class = 'noctty-test-set91-' + [guid]::NewGuid().ToString('N')
     $tracePath = Join-Path $OutputDirectory ('settings-open-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+    $comboTracePath = Join-Path $OutputDirectory ('settings-combo-' + [guid]::NewGuid().ToString('N') + '.jsonl')
     $script:attemptClock.Restart()
     $script:attempt = [ordered]@{ index = $attempts.Count + 1; pid = 0
-        desktop = $WorkerDesktop; traceFile = [IO.Path]::GetFileName($tracePath); previousStartedAt = $null
+        desktop = $WorkerDesktop; traceFile = [IO.Path]::GetFileName($tracePath)
+        comboTraceFile = [IO.Path]::GetFileName($comboTracePath); previousStartedAt = $null
         stage = 'baseline'; stages = [Collections.Generic.List[object]]::new(); f9 = @()
         elapsedMilliseconds = 0; trace = $null; cleanup = $null; startup = $null }
     $attempts.Add($script:attempt)
@@ -771,13 +779,18 @@ function Start-Fixture {
     Assert-Contract (-not [IO.File]::Exists($tracePath)) 'Trace path must be NEW.'
     Assert-ClipboardGuard
     $savedTrace = [Environment]::GetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', 'Process')
+    $savedComboTrace = [Environment]::GetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', 'Process')
     try {
         [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', $tracePath, 'Process')
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', $comboTracePath, 'Process')
         Add-Stage 'launch-requested' $null
         $script:process = [Set91.Native]::Launch($PortableExe,
             @('--single-instance=false', "--class=$class", '--command=cmd.exe /d /q'),
             $WorkerDesktop, $fixture, [IntPtr]::Zero)
-    } finally { [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', $savedTrace, 'Process') }
+    } finally {
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', $savedTrace, 'Process')
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', $savedComboTrace, 'Process')
+    }
     $script:attempt.pid = $process.Pid
     Add-Stage 'launched' ([ordered]@{ pid = $process.Pid; priorityClass = 'BelowNormal'; exitCode = $process.ExitCode()
         waitResult = [Set91.Native]::WaitForSingleObject($process.Handle, 0) })
@@ -978,6 +991,17 @@ function Probe-Control($Case, [IntPtr] $Hwnd, [string] $Phase, [bool] $ExerciseC
         }
         Assert-Contract (Test-Path -LiteralPath $path) 'UIA client produced no result.'
         $observed = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        if ($Case[2] -eq 'ComboBox' -and $ExerciseControl) {
+            $nativePath = Join-Path $OutputDirectory $script:attempt.comboTraceFile
+            $messages = @(if (Test-Path -LiteralPath $nativePath) {
+                Get-Content -LiteralPath $nativePath | ForEach-Object { $_ | ConvertFrom-Json } |
+                    Where-Object { $_.control_id -eq $Case[1] }
+            })
+            $observed | Add-Member -NotePropertyName nativeTraceFile -NotePropertyValue $script:attempt.comboTraceFile
+            $observed | Add-Member -NotePropertyName nativeDropdownMessages -NotePropertyValue $messages
+            Write-Json $path $observed
+            Assert-Contract (-not $RequireComboTrace -or (Test-Path -LiteralPath $nativePath)) 'Required native combo trace is missing.'
+        }
         Assert-Contract (($probe.ExitCode() -eq 0) -eq [bool]$observed.pass) 'Client exit/result mismatch.'
         return $observed
     }

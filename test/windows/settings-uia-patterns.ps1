@@ -93,9 +93,9 @@ namespace SettingsPatterns
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IExpandCollapse
     {
-        void Expand();                           // 3
+        [PreserveSig] int Expand();               // 3
         void Collapse();                         // 4
-        void GetCurrentExpandCollapseState(out int state); // 5
+        [PreserveSig] int GetCurrentExpandCollapseState(out int state); // 5
     }
 
     [ComImport, Guid("a94cd8b1-0844-4cd6-9d2d-640537ab39e9")]
@@ -145,6 +145,15 @@ namespace SettingsPatterns
             public uint State;
             public IntPtr Combo, Edit, List;
         }
+        [StructLayout(LayoutKind.Sequential)]
+        struct GuiThreadInfo
+        {
+            public uint Size, Flags;
+            public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+            public Rect CaretRect;
+        }
+        [DllImport("user32.dll")]
+        static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
         [DllImport("user32.dll")]
         static extern bool GetComboBoxInfo(IntPtr hwnd, ref ComboInfo info);
         [DllImport("user32.dll")]
@@ -157,6 +166,12 @@ namespace SettingsPatterns
         static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
         [DllImport("user32.dll")]
         static extern bool IsWindowEnabled(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
         [DllImport("user32.dll")]
         static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [DllImport("user32.dll")]
@@ -196,6 +211,81 @@ namespace SettingsPatterns
         static void Require(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
+        }
+        // Keep observations separate from assertions: a failed expansion must
+        // retain its HRESULT and native popup state before Collapse cleans up.
+        static Dictionary<string, object> ExpansionSnapshot(IntPtr hwnd, IExpandCollapse expand)
+        {
+            var snapshot = new Dictionary<string, object>();
+            snapshot["utc"] = DateTimeOffset.UtcNow.ToString("o");
+            uint pid;
+            uint thread = GetWindowThreadProcessId(hwnd, out pid);
+            var gui = new GuiThreadInfo();
+            gui.Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
+            if (thread != 0 && GetGUIThreadInfo(thread, ref gui))
+            {
+                snapshot["activeHwnd"] = gui.Active.ToInt64();
+                snapshot["focusHwnd"] = gui.Focus.ToInt64();
+                snapshot["captureHwnd"] = gui.Capture.ToInt64();
+                snapshot["guiFlags"] = gui.Flags;
+            }
+            try
+            {
+                int state;
+                int hr = expand.GetCurrentExpandCollapseState(out state);
+                snapshot["stateHresult"] = String.Format("0x{0:X8}", hr);
+                if (hr >= 0) snapshot["state"] = state;
+            }
+            catch (COMException error)
+            {
+                snapshot["stateHresult"] = String.Format("0x{0:X8}", error.HResult);
+            }
+            IntPtr dropped;
+            bool replied = ReadComboMessage(hwnd, 0x0157, IntPtr.Zero, IntPtr.Zero, 2, 2000, out dropped) != IntPtr.Zero;
+            snapshot["droppedStateReplied"] = replied;
+            snapshot["droppedState"] = replied ? (object)dropped.ToInt64() : null;
+            var info = new ComboInfo();
+            info.Size = (uint)Marshal.SizeOf(typeof(ComboInfo));
+            bool hasInfo = GetComboBoxInfo(hwnd, ref info);
+            snapshot["comboInfoAvailable"] = hasInfo;
+            snapshot["listHwnd"] = hasInfo ? info.List.ToInt64() : 0;
+            snapshot["listExists"] = hasInfo && IsWindow(info.List);
+            snapshot["listVisible"] = hasInfo && IsWindowVisible(info.List);
+            if (hasInfo && info.List != IntPtr.Zero)
+            {
+                uint listPid;
+                snapshot["listThreadId"] = GetWindowThreadProcessId(info.List, out listPid);
+                snapshot["listProcessId"] = listPid;
+            }
+            Rect rect;
+            if (hasInfo && GetWindowRect(info.List, out rect))
+                snapshot["listRect"] = new int[] { rect.Left, rect.Top, rect.Right, rect.Bottom };
+            return snapshot;
+        }
+        static Dictionary<string, object> ExpandObserved(IntPtr hwnd, IExpandCollapse expand,
+            List<object> attempts)
+        {
+            var receipt = new Dictionary<string, object>();
+            attempts.Add(receipt);
+            receipt["before"] = ExpansionSnapshot(hwnd, expand);
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                int hr = expand.Expand();
+                receipt["hresult"] = String.Format("0x{0:X8}", hr);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+            }
+            catch (COMException error)
+            {
+                receipt["hresult"] = String.Format("0x{0:X8}", error.HResult);
+                throw;
+            }
+            finally
+            {
+                receipt["elapsedMilliseconds"] = timer.Elapsed.TotalMilliseconds;
+                receipt["returned"] = ExpansionSnapshot(hwnd, expand);
+            }
+            return receipt;
         }
         static string ReadCombo(object value, object selection)
         {
@@ -312,6 +402,7 @@ namespace SettingsPatterns
                 automation.ElementFromHandle((IntPtr)hwnd, out element);
                 // Collect observations before contract assertions, including on red baselines.
                 result["name"] = Property(element, 30005);
+                result["frameworkId"] = Property(element, 30024);
                 result["helpText"] = Property(element, 30013);
                 result["enabled"] = Property(element, 30010);
                 result["offscreen"] = Property(element, 30022);
@@ -364,11 +455,13 @@ namespace SettingsPatterns
                     if (exercise)
                     {
                         bool expanded = false;
+                        var expansions = new List<object>();
+                        result["expansions"] = expansions;
                         try
                         {
                             try
                             {
-                                ((IExpandCollapse)expand).Expand();
+                                ExpandObserved((IntPtr)hwnd, (IExpandCollapse)expand, expansions);
                                 expanded = true;
                                 Require(enabled, "Disabled Expand unexpectedly succeeded");
                             }
@@ -395,10 +488,16 @@ namespace SettingsPatterns
                             if (enabled)
                             {
                                 Thread.Sleep(100);
-                                int state;
-                                ((IExpandCollapse)expand).GetCurrentExpandCollapseState(out state);
+                                var snapshot = ExpansionSnapshot((IntPtr)hwnd, (IExpandCollapse)expand);
+                                ((Dictionary<string, object>)expansions[0])["after100ms"] = snapshot;
+                                Require(Object.Equals(snapshot["stateHresult"], "0x00000000"), "Cannot read expanded state");
+                                int state = Convert.ToInt32(snapshot["state"]);
                                 result["expandedState"] = state;
                                 Require(state == 1, "Combo did not expand");
+                                Require(Object.Equals(snapshot["droppedStateReplied"], true) &&
+                                    Convert.ToInt64(snapshot["droppedState"]) != 0 &&
+                                    Object.Equals(snapshot["listExists"], true) && Object.Equals(snapshot["listVisible"], true),
+                                    "Expanded combo has no visible native popup");
                                 var info = new ComboInfo();
                                 info.Size = (uint)Marshal.SizeOf(typeof(ComboInfo));
                                 Require(GetComboBoxInfo((IntPtr)hwnd, ref info) && info.List != IntPtr.Zero,
@@ -450,7 +549,7 @@ namespace SettingsPatterns
                                 result["cancelSaveEnabled"] = IsWindowEnabled(hoverSave);
                                 Require(!Convert.ToBoolean(result["cancelSaveEnabled"]), "Cancelled hover dirtied pending config");
                                 Require(Object.Equals(before, result["cancelValue"]), "Cancel changed the combo value");
-                                ((IExpandCollapse)expand).Expand();
+                                ExpandObserved((IntPtr)hwnd, (IExpandCollapse)expand, expansions);
                                 IElement list = null;
                                 try
                                 {
