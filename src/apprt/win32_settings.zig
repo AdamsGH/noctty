@@ -206,30 +206,9 @@ fn displayFieldId(comptime binding: []const u8) usize {
 }
 const EDIT_SCROLLBACK: usize = nativeFieldId("edit_scrollback");
 const EDIT_FONT_SIZE: usize = nativeFieldId("edit_font_size");
-const COMBO_CONFIRM_CLOSE: usize = nativeFieldId("combo_confirm_close");
-const COMBO_COPY_ON_SELECT: usize = nativeFieldId("combo_copy_on_select");
-const COMBO_WINDOW_THEME: usize = nativeFieldId("combo_window_theme");
-const COMBO_SHELL_INTEG: usize = nativeFieldId("combo_shell_integ");
-const CHK_TRIM_TRAIL: usize = nativeFieldId("chk_trim_trail");
 const EDIT_BG_OPACITY: usize = nativeFieldId("edit_bg_opacity");
-const COMBO_CURSOR_STYLE: usize = nativeFieldId("combo_cursor_style");
-const CHK_BG_BLUR: usize = nativeFieldId("chk_bg_blur");
-const COMBO_PAD_BALANCE: usize = nativeFieldId("combo_pad_balance");
-const EDIT_FONT_FAMILY: usize = nativeFieldId("edit_font_family");
-const EDIT_THEME: usize = nativeFieldId("edit_theme");
-const EDIT_COMMAND: usize = nativeFieldId("edit_command");
 const EDIT_PAD_X: usize = nativeFieldId("edit_pad_x");
 const EDIT_PAD_Y: usize = nativeFieldId("edit_pad_y");
-const CHK_DESKTOP_NOTIFICATIONS: usize = nativeFieldId("chk_desktop_notifications");
-const CHK_APP_NOTIFY_CLIPBOARD: usize = nativeFieldId("chk_app_notify_clipboard");
-const CHK_APP_NOTIFY_CONFIG: usize = nativeFieldId("chk_app_notify_config");
-const COMBO_AUTO_UPDATE: usize = nativeFieldId("combo_auto_update");
-const COMBO_AUTO_UPDATE_CHANNEL: usize = nativeFieldId("combo_auto_update_channel");
-const COMBO_CLIPBOARD_READ: usize = nativeFieldId("combo_clipboard_read");
-const COMBO_CLIPBOARD_WRITE: usize = nativeFieldId("combo_clipboard_write");
-const COMBO_LINK_URL: usize = nativeFieldId("combo_link_url");
-const COMBO_LINK_PREVIEWS: usize = nativeFieldId("combo_link_previews");
-const CHK_ACCENT_FOLLOW: usize = nativeFieldId("chk_accent_follow");
 const ES_NUMBER: u32 = 0x2000;
 const ES_AUTOHSCROLL: u32 = 0x80;
 const EN_CHANGE: u16 = 0x0300;
@@ -391,9 +370,6 @@ fn backgroundBlurFromCheckbox(
     };
 }
 
-const PaddingAxis = enum { x, y };
-const AppNotificationField = enum { clipboard, config };
-
 /// Ownership-safe native settings tracked by the transaction model. The three
 /// arena-backed edit fields use a parallel tracker below because transaction
 /// values must not borrow slices from replaceable Config snapshots.
@@ -487,32 +463,14 @@ const FieldAdapter = struct {
     display: *const fn (*SettingsWindow) void,
     changed: *const fn (*SettingsWindow) void,
     left: ?*const fn (*SettingsWindow) void = null,
+    /// The typed field a generic adapter edits through its own descriptor's
+    /// control; checked against the row the adapter is keyed by.
+    field: ?SettingField = null,
 };
 fn ownedEditChanged(comptime field: OwnedSettingField, comptime binding: []const u8) *const fn (*SettingsWindow) void {
     return struct {
         fn changed(self: *SettingsWindow) void {
             if (@field(self.fields, binding)) |edit| self.markOwnedTextChanged(field, edit);
-        }
-    }.changed;
-}
-fn paddingEditChanged(comptime axis: PaddingAxis) *const fn (*SettingsWindow) void {
-    return struct {
-        fn changed(self: *SettingsWindow) void {
-            self.syncPaddingFromEdit(axis);
-        }
-    }.changed;
-}
-fn notificationChanged(comptime field: AppNotificationField) *const fn (*SettingsWindow) void {
-    return struct {
-        fn changed(self: *SettingsWindow) void {
-            self.syncAppNotificationsFromCheckbox(field);
-        }
-    }.changed;
-}
-fn clipboardAccessChanged(comptime key: []const u8, comptime binding: []const u8) *const fn (*SettingsWindow) void {
-    return struct {
-        fn changed(self: *SettingsWindow) void {
-            self.syncClipboardAccessFromCombo(key, @field(self.fields, binding));
         }
     }.changed;
 }
@@ -525,51 +483,81 @@ fn display_edit_theme(self: *SettingsWindow) void {
 fn display_edit_command(self: *SettingsWindow) void {
     if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.command)]) self.displayCommandInEdit();
 }
-fn display_edit_pad_x(self: *SettingsWindow) void {
-    self.displayPaddingInEdit(.x);
+/// A dropdown whose items are the field's curated `Combo` options.
+fn comboAdapter(comptime field: SettingField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayCombo(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncCombo(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field };
 }
-fn display_edit_pad_y(self: *SettingsWindow) void {
-    self.displayPaddingInEdit(.y);
+/// A checkbox for a plain bool field or a bool projection.
+fn checkboxAdapter(comptime field: SettingField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayCheckbox(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncCheckbox(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field };
 }
-fn display_chk_app_notify_clipboard(self: *SettingsWindow) void {
-    self.displayAppNotificationsInCheckbox(.clipboard);
+/// A number text field (scrollback, font size, opacity).
+fn numberAdapter(comptime field: RawScalarField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayNumberInEdit(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncNumberFromEdit(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field.setting() };
 }
-fn display_chk_app_notify_config(self: *SettingsWindow) void {
-    self.displayAppNotificationsInCheckbox(.config);
-}
-fn display_combo_clipboard_read(self: *SettingsWindow) void {
-    self.displayClipboardAccessInCombo("clipboard-read", self.fields.combo_clipboard_read);
-}
-fn display_combo_clipboard_write(self: *SettingsWindow) void {
-    self.displayClipboardAccessInCombo("clipboard-write", self.fields.combo_clipboard_write);
+/// A window padding text field: one value or a comma-separated pair.
+fn paddingAdapter(comptime field: RawScalarField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayPaddingInEdit(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncPaddingFromEdit(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field.setting() };
 }
 const field_adapters = .{
-    .edit_scrollback = FieldAdapter{ .display = SettingsWindow.displayScrollbackInEdit, .changed = SettingsWindow.syncScrollbackFromEdit },
-    .edit_font_size = FieldAdapter{ .display = SettingsWindow.displayFontSizeInEdit, .changed = SettingsWindow.syncFontSizeFromEdit },
-    .edit_bg_opacity = FieldAdapter{ .display = SettingsWindow.displayBgOpacityInEdit, .changed = SettingsWindow.syncBgOpacityFromEdit },
-    .chk_trim_trail = FieldAdapter{ .display = SettingsWindow.displayTrimTrailInCheckbox, .changed = SettingsWindow.syncTrimTrailFromCheckbox },
-    .chk_desktop_notifications = FieldAdapter{ .display = SettingsWindow.displayDesktopNotificationsInCheckbox, .changed = SettingsWindow.syncDesktopNotificationsFromCheckbox },
-    .combo_confirm_close = FieldAdapter{ .display = SettingsWindow.displayConfirmCloseInCombo, .changed = SettingsWindow.syncConfirmCloseFromCombo },
-    .combo_copy_on_select = FieldAdapter{ .display = SettingsWindow.displayCopyOnSelectInCombo, .changed = SettingsWindow.syncCopyOnSelectFromCombo },
-    .combo_link_url = FieldAdapter{ .display = SettingsWindow.displayLinkUrlInCombo, .changed = SettingsWindow.syncLinkUrlFromCombo },
-    .combo_link_previews = FieldAdapter{ .display = SettingsWindow.displayLinkPreviewsInCombo, .changed = SettingsWindow.syncLinkPreviewsFromCombo },
-    .combo_window_theme = FieldAdapter{ .display = SettingsWindow.displayWindowThemeInCombo, .changed = SettingsWindow.syncWindowThemeFromCombo },
-    .combo_shell_integ = FieldAdapter{ .display = SettingsWindow.displayShellIntegInCombo, .changed = SettingsWindow.syncShellIntegFromCombo },
-    .combo_cursor_style = FieldAdapter{ .display = SettingsWindow.displayCursorStyleInCombo, .changed = SettingsWindow.syncCursorStyleFromCombo },
-    .chk_accent_follow = FieldAdapter{ .display = SettingsWindow.displayAccentFollowInCheckbox, .changed = SettingsWindow.syncAccentFollowFromCheckbox },
+    .edit_scrollback = numberAdapter(.scrollback_limit),
+    .edit_font_size = numberAdapter(.font_size),
+    .edit_bg_opacity = numberAdapter(.background_opacity),
+    .chk_trim_trail = checkboxAdapter(.trim_trailing_spaces),
+    .chk_desktop_notifications = checkboxAdapter(.desktop_notifications),
+    .combo_confirm_close = comboAdapter(.confirm_close),
+    .combo_copy_on_select = comboAdapter(.copy_on_select),
+    .combo_link_url = comboAdapter(.link_url),
+    .combo_link_previews = comboAdapter(.link_previews),
+    .combo_window_theme = comboAdapter(.window_theme),
+    .combo_shell_integ = comboAdapter(.shell_integration),
+    .combo_cursor_style = comboAdapter(.cursor_style),
+    .chk_accent_follow = checkboxAdapter(.accent_follow_system),
     .chk_bg_blur = FieldAdapter{ .display = SettingsWindow.displayBgBlurInCheckbox, .changed = SettingsWindow.syncBgBlurFromCheckbox },
-    .combo_pad_balance = FieldAdapter{ .display = SettingsWindow.displayPadBalanceInCombo, .changed = SettingsWindow.syncPadBalanceFromCombo },
-    .combo_auto_update = FieldAdapter{ .display = SettingsWindow.displayAutoUpdateInCombo, .changed = SettingsWindow.syncAutoUpdateFromCombo },
-    .combo_auto_update_channel = FieldAdapter{ .display = SettingsWindow.displayAutoUpdateChannelInCombo, .changed = SettingsWindow.syncAutoUpdateChannelFromCombo },
+    .combo_pad_balance = comboAdapter(.padding_balance),
+    .combo_auto_update = comboAdapter(.auto_update),
+    .combo_auto_update_channel = comboAdapter(.auto_update_channel),
     .edit_font_family = FieldAdapter{ .display = display_edit_font_family, .changed = ownedEditChanged(.font_family, "edit_font_family"), .left = SettingsWindow.syncFontFamilyFromEdit },
     .edit_theme = FieldAdapter{ .display = display_edit_theme, .changed = ownedEditChanged(.theme, "edit_theme"), .left = SettingsWindow.syncThemeFromEdit },
     .edit_command = FieldAdapter{ .display = display_edit_command, .changed = ownedEditChanged(.command, "edit_command"), .left = SettingsWindow.syncCommandFromEdit },
-    .edit_pad_x = FieldAdapter{ .display = display_edit_pad_x, .changed = paddingEditChanged(.x) },
-    .edit_pad_y = FieldAdapter{ .display = display_edit_pad_y, .changed = paddingEditChanged(.y) },
-    .chk_app_notify_clipboard = FieldAdapter{ .display = display_chk_app_notify_clipboard, .changed = notificationChanged(.clipboard) },
-    .chk_app_notify_config = FieldAdapter{ .display = display_chk_app_notify_config, .changed = notificationChanged(.config) },
-    .combo_clipboard_read = FieldAdapter{ .display = display_combo_clipboard_read, .changed = clipboardAccessChanged("clipboard-read", "combo_clipboard_read") },
-    .combo_clipboard_write = FieldAdapter{ .display = display_combo_clipboard_write, .changed = clipboardAccessChanged("clipboard-write", "combo_clipboard_write") },
+    .edit_pad_x = paddingAdapter(.window_padding_x),
+    .edit_pad_y = paddingAdapter(.window_padding_y),
+    .chk_app_notify_clipboard = checkboxAdapter(.app_notify_clipboard),
+    .chk_app_notify_config = checkboxAdapter(.app_notify_config),
+    .combo_clipboard_read = comboAdapter(.clipboard_read),
+    .combo_clipboard_write = comboAdapter(.clipboard_write),
 };
 
 comptime {
@@ -577,6 +565,10 @@ comptime {
     for (field_model.form_fields) |row| {
         if (!@hasField(@TypeOf(field_adapters), row.native.binding))
             @compileError("Editable Settings descriptor has no native adapter: " ++ row.native.binding);
+        if (@field(field_adapters, row.native.binding).field) |field| {
+            if (row.field == null or row.field.? != field)
+                @compileError("Settings adapter edits another field than its row: " ++ row.native.binding);
+        }
         // A scalar/projection uses the value-safe transaction; an owned field
         // must have the matching explicit arena-owned adapter.
         if (row.field == null) {
@@ -626,10 +618,15 @@ const RawScalarField = enum {
     window_padding_x,
     window_padding_y,
 
-    fn section(self: RawScalarField) Section {
+    /// The typed field the text parses into once it is valid.
+    fn setting(self: RawScalarField) SettingField {
         return switch (self) {
-            inline else => |field| nativeSection(field_model.descriptor(@field(SettingField, @tagName(field))).section),
+            inline else => |field| @field(SettingField, @tagName(field)),
         };
+    }
+
+    fn section(self: RawScalarField) Section {
+        return nativeSection(field_model.descriptor(self.setting()).section);
     }
 };
 
@@ -800,6 +797,11 @@ pub const ApplyId = SettingsTransaction.ApplyId;
 
 const settingValue = field_model.settingValue;
 pub const setSettingValue = field_model.setSettingValue;
+
+/// `field`'s value in `config`, unwrapped from the transaction's union.
+fn fieldValue(config: *const Config, comptime field: SettingField) @FieldType(SettingValue, @tagName(field)) {
+    return @field(settingValue(config, field), @tagName(field));
+}
 
 /// `text` without its backticks. The CLI help is written for Markdown; the
 /// Settings window shows plain text, where a backtick is just noise.
@@ -1142,9 +1144,14 @@ const checkbox_captions = captions: {
     };
     break :captions result;
 };
-const settings_text_count = 5 + settings_label_specs.len;
+/// Indices of the text providers: the header texts, then the field labels.
+const text_header_index = 0;
+const text_summary_index = 1;
 const text_status_index = 2;
 const text_close_prompt_index = 3;
+const text_help_index = 4;
+const text_first_label_index = 5;
+const settings_text_count = text_first_label_index + settings_label_specs.len;
 const background_blur_label = field_model.descriptor(.background_blur).nativeNames().?.caption.?;
 
 const FormItem = struct {
@@ -1920,9 +1927,8 @@ pub const SettingsWindow = struct {
         if (self.transaction) |transaction| for (transaction.entries) |entry| {
             fields[@intFromEnum(entry.field)] = entry.dirty or entry.conflict;
         };
-        inline for (comptime std.enums.values(RawScalarField)) |field| {
-            if (self.raw_scalar_dirty[@intFromEnum(field)])
-                fields[@intFromEnum(@field(SettingField, @tagName(field)))] = true;
+        for (std.enums.values(RawScalarField)) |field| {
+            if (self.raw_scalar_dirty[@intFromEnum(field)]) fields[@intFromEnum(field.setting())] = true;
         }
         var count: usize = 0;
         for (fields) |changed| count += @intFromBool(changed);
@@ -2157,12 +2163,16 @@ pub const SettingsWindow = struct {
 
     fn rawScalarEdit(self: *const SettingsWindow, field: RawScalarField) ?HWND {
         return switch (field) {
-            .scrollback_limit => self.fields.edit_scrollback,
-            .font_size => self.fields.edit_font_size,
-            .background_opacity => self.fields.edit_bg_opacity,
-            .window_padding_x => self.fields.edit_pad_x,
-            .window_padding_y => self.fields.edit_pad_y,
+            inline else => |raw| self.fieldControl(raw.setting()),
         };
+    }
+
+    /// The native control of `field`, by the binding its descriptor names.
+    fn fieldControl(self: *const SettingsWindow, comptime field: SettingField) ?HWND {
+        inline for (field_model.form_fields) |row| if (comptime row.field == field) {
+            return @field(self.fields, row.native.binding);
+        };
+        @compileError("No Settings control edits " ++ @tagName(field));
     }
 
     fn rawScalarDestination(self: *const SettingsWindow, field: RawScalarField) struct { section: Section, hwnd: ?HWND } {
@@ -2171,9 +2181,7 @@ pub const SettingsWindow = struct {
 
     fn ownedEdit(self: *const SettingsWindow, field: OwnedSettingField) ?HWND {
         return switch (field) {
-            .font_family => self.fields.edit_font_family,
-            .theme => self.fields.edit_theme,
-            .command => self.fields.edit_command,
+            inline else => |owned| @field(self.fields, owned.descriptor().native.?.binding),
         };
     }
 
@@ -2271,13 +2279,7 @@ pub const SettingsWindow = struct {
                     _ = SetFocus(control);
                 }
             },
-            .conflict => |field| {
-                self.active_raw_validation = null;
-                self.validation_control = null;
-                var buf: [256]u8 = undefined;
-                self.setStatus(conflictStatusText(&buf, field.label()));
-            },
-            .owned_conflict => |field| {
+            inline .conflict, .owned_conflict => |field| {
                 self.active_raw_validation = null;
                 self.validation_control = null;
                 var buf: [256]u8 = undefined;
@@ -2691,12 +2693,12 @@ pub const SettingsWindow = struct {
 
     fn textHwnd(self: *const SettingsWindow, index: usize) ?HWND {
         return switch (index) {
-            0 => self.text_header,
-            1 => self.text_summary,
+            text_header_index => self.text_header,
+            text_summary_index => self.text_summary,
             text_status_index => self.text_status,
             text_close_prompt_index => self.text_close_prompt,
-            4 => self.text_help,
-            else => if (index - 5 < self.field_labels.len) self.field_labels[index - 5] else null,
+            text_help_index => self.text_help,
+            else => if (index - text_first_label_index < self.field_labels.len) self.field_labels[index - text_first_label_index] else null,
         };
     }
 
@@ -2824,6 +2826,21 @@ pub const SettingsWindow = struct {
 
     fn formItems(self: *const SettingsWindow) []const FormItem {
         return formItemsForSection(self.active_section);
+    }
+
+    const ActiveFormRows = struct {
+        controls: [settings_clipped_control_count]bool = @splat(false),
+        labels: [settings_label_specs.len]bool = @splat(false),
+    };
+
+    /// Which controls and labels belong to the section on show.
+    fn activeFormRows(self: *const SettingsWindow) ActiveFormRows {
+        var rows: ActiveFormRows = .{};
+        for (self.formItems()) |item| {
+            rows.controls[item.control_index] = true;
+            if (item.label_index) |index| rows.labels[index] = true;
+        }
+        return rows;
     }
 
     fn controlSection(self: *const SettingsWindow, control_index: usize) ?Section {
@@ -3035,21 +3052,16 @@ pub const SettingsWindow = struct {
         const viewport = self.viewport orelse return;
         var client: RECT = undefined;
         if (GetClientRect(viewport, &client) == 0) return;
-        var active_controls = [_]bool{false} ** settings_clipped_control_count;
-        var active_labels = [_]bool{false} ** settings_label_specs.len;
-        for (self.formItems()) |item| {
-            active_controls[item.control_index] = true;
-            if (item.label_index) |index| active_labels[index] = true;
-        }
+        const active = self.activeFormRows();
         for (0..settings_clipped_control_count) |index| if (self.control_uia_providers[index]) |provider| {
-            provider.setViewportFullyClipped(!active_controls[index] or
+            provider.setViewportFullyClipped(!active.controls[index] or
                 viewportHidesChild(viewport, self.controlHwnd(index), client.bottom));
         };
-        if (self.text_uia_providers[4]) |provider| {
+        if (self.text_uia_providers[text_help_index]) |provider| {
             provider.setViewportFullyClipped(!self.help_shown or viewportHidesChild(viewport, self.text_help, client.bottom));
         }
-        for (self.field_labels, 0..) |label, index| if (self.text_uia_providers[index + 5]) |provider| {
-            provider.setViewportFullyClipped(!active_labels[index] or viewportHidesChild(viewport, label, client.bottom));
+        for (self.field_labels, 0..) |label, index| if (self.text_uia_providers[text_first_label_index + index]) |provider| {
+            provider.setViewportFullyClipped(!active.labels[index] or viewportHidesChild(viewport, label, client.bottom));
         };
     }
 
@@ -3545,57 +3557,51 @@ pub const SettingsWindow = struct {
                 if (next_style != style) _ = sys.SetWindowLongPtrW(button, GWL_STYLE, @intCast(next_style));
             }
         }
-        var active_controls = [_]bool{false} ** settings_clipped_control_count;
-        var active_labels = [_]bool{false} ** settings_label_specs.len;
-        for (self.formItems()) |item| {
-            active_controls[item.control_index] = true;
-            if (item.label_index) |index| active_labels[index] = true;
-        }
+        const active = self.activeFormRows();
         for (0..settings_clipped_control_count) |index| if (self.controlHwnd(index)) |control| {
-            setChildShown(control, active_controls[index]);
+            setChildShown(control, active.controls[index]);
         };
         for (self.field_labels, 0..) |label, index| if (label) |control| {
-            setChildShown(control, active_labels[index]);
+            setChildShown(control, active.labels[index]);
         };
     }
 
-    /// Read the current EDIT text and write the parsed integer into
-    /// the pending draft. Called from EN_CHANGE. Swallows parse
-    /// errors silently — ES_NUMBER style means the text is already
-    /// digits-only, but the empty-string case needs to map to 0 (or
-    /// be ignored).
-    fn syncScrollbackFromEdit(self: *SettingsWindow) void {
+    /// Parse a number field's text (scrollback, font size, opacity) into the
+    /// draft. Called from EN_CHANGE. Text that does not parse keeps the field
+    /// raw (`markRawScalarEdit`) and records its message; the draft keeps the
+    /// last valid value.
+    fn syncNumberFromEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        const setting = comptime field.setting();
+        const label = comptime field_model.descriptor(setting).label;
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const edit = self.fields.edit_scrollback orelse return;
-        self.markRawScalarEdit(.scrollback_limit);
-
+        const edit = self.rawScalarEdit(field) orelse return;
+        self.markRawScalarEdit(field);
         var buf_w: [32]u16 = undefined;
         const n = sys.GetWindowTextW(edit, &buf_w, @intCast(buf_w.len));
-        if (n <= 0) return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit is required.");
+        if (n <= 0) return self.setRawScalarValidationError(field, edit, label ++ " is required.");
         var utf8_buf: [64]u8 = undefined;
         const utf8 = std.unicode.utf16LeToUtf8(&utf8_buf, buf_w[0..@intCast(n)]) catch
-            return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit contains invalid text.");
+            return self.setRawScalarValidationError(field, edit, label ++ " contains invalid text.");
         const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
-        if (trimmed.len == 0) return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit is required.");
-        const parsed = field_model.parseScalar(.scrollback_limit, trimmed) catch
-            return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit must be a non-negative whole number.");
-        self.finishRawScalarEdit(.scrollback_limit);
-        p.*.@"scrollback-limit" = parsed;
-        self.trackFieldEdit(.scrollback_limit);
+        if (trimmed.len == 0) return self.setRawScalarValidationError(field, edit, label ++ " is required.");
+        const parsed = field_model.parseScalar(setting, trimmed) catch |err|
+            return self.setRawScalarValidationError(field, edit, switch (comptime field_model.descriptor(setting).validation) {
+                .unsigned_integer => label ++ " must be a non-negative whole number.",
+                else => field_model.scalarValidationMessage(setting, err == error.OutOfRange),
+            });
+        self.finishRawScalarEdit(field);
+        setSettingValue(p, @unionInit(SettingValue, @tagName(setting), parsed));
+        self.trackFieldEdit(setting);
     }
 
-    fn displayScrollbackInEdit(self: *SettingsWindow) void {
-        if (!self.shouldRefreshRawScalar(.scrollback_limit)) return;
-        const edit = self.fields.edit_scrollback orelse return;
+    fn displayNumberInEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        if (!self.shouldRefreshRawScalar(field)) return;
+        const edit = self.rawScalarEdit(field) orelse return;
         const p = self.pending orelse return;
         var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "{d}", .{p.@"scrollback-limit"}) catch return;
-        var buf_w: [32]u16 = undefined;
-        const w = utf8ToW(&buf_w, text);
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(edit, WM_SETTEXT, 0, @bitCast(@intFromPtr(w)));
-        self.suppress_edit_events = false;
+        const text = std.fmt.bufPrintZ(&buf, "{d}", .{fieldValue(&p, field.setting())}) catch return;
+        setEditText(edit, text, &self.suppress_edit_events);
     }
 
     fn syncFontFamilyFromEdit(self: *SettingsWindow) void {
@@ -3622,39 +3628,6 @@ pub const SettingsWindow = struct {
             writer.writeAll(family) catch break;
         }
         setEditText(edit, writer.buffered(), &self.suppress_edit_events);
-    }
-
-    fn syncFontSizeFromEdit(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const edit = self.fields.edit_font_size orelse return;
-        self.markRawScalarEdit(.font_size);
-        var buf_w: [32]u16 = undefined;
-        const n = sys.GetWindowTextW(edit, &buf_w, @intCast(buf_w.len));
-        if (n <= 0) return self.setRawScalarValidationError(.font_size, edit, "Font size is required.");
-        var utf8_buf: [64]u8 = undefined;
-        const utf8 = std.unicode.utf16LeToUtf8(&utf8_buf, buf_w[0..@intCast(n)]) catch
-            return self.setRawScalarValidationError(.font_size, edit, "Font size contains invalid text.");
-        const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
-        if (trimmed.len == 0) return self.setRawScalarValidationError(.font_size, edit, "Font size is required.");
-        const parsed = field_model.parseScalar(.font_size, trimmed) catch |err|
-            return self.setRawScalarValidationError(.font_size, edit, field_model.scalarValidationMessage(.font_size, err == error.OutOfRange));
-        self.finishRawScalarEdit(.font_size);
-        p.*.@"font-size" = parsed;
-        self.trackFieldEdit(.font_size);
-    }
-
-    fn displayFontSizeInEdit(self: *SettingsWindow) void {
-        if (!self.shouldRefreshRawScalar(.font_size)) return;
-        const edit = self.fields.edit_font_size orelse return;
-        const p = self.pending orelse return;
-        var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "{d}", .{p.@"font-size"}) catch return;
-        var buf_w: [32]u16 = undefined;
-        const w = utf8ToW(&buf_w, text);
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(edit, WM_SETTEXT, 0, @bitCast(@intFromPtr(w)));
-        self.suppress_edit_events = false;
     }
 
     fn syncThemeFromEdit(self: *SettingsWindow) void {
@@ -3690,39 +3663,6 @@ pub const SettingsWindow = struct {
         setEditText(edit, writer.buffered(), &self.suppress_edit_events);
     }
 
-    fn syncBgOpacityFromEdit(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const edit = self.fields.edit_bg_opacity orelse return;
-        self.markRawScalarEdit(.background_opacity);
-        var buf_w: [32]u16 = undefined;
-        const n = sys.GetWindowTextW(edit, &buf_w, @intCast(buf_w.len));
-        if (n <= 0) return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity is required.");
-        var utf8_buf: [64]u8 = undefined;
-        const utf8 = std.unicode.utf16LeToUtf8(&utf8_buf, buf_w[0..@intCast(n)]) catch
-            return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity contains invalid text.");
-        const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
-        if (trimmed.len == 0) return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity is required.");
-        const parsed = field_model.parseScalar(.background_opacity, trimmed) catch |err|
-            return self.setRawScalarValidationError(.background_opacity, edit, field_model.scalarValidationMessage(.background_opacity, err == error.OutOfRange));
-        self.finishRawScalarEdit(.background_opacity);
-        p.*.@"background-opacity" = parsed;
-        self.trackFieldEdit(.background_opacity);
-    }
-
-    fn displayBgOpacityInEdit(self: *SettingsWindow) void {
-        if (!self.shouldRefreshRawScalar(.background_opacity)) return;
-        const edit = self.fields.edit_bg_opacity orelse return;
-        const p = self.pending orelse return;
-        var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "{d}", .{p.@"background-opacity"}) catch return;
-        var buf_w: [32]u16 = undefined;
-        const w = utf8ToW(&buf_w, text);
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(edit, WM_SETTEXT, 0, @bitCast(@intFromPtr(w)));
-        self.suppress_edit_events = false;
-    }
-
     fn syncCommandFromEdit(self: *SettingsWindow) void {
         if (self.suppress_edit_events or !self.owned_text_changed[@intFromEnum(OwnedSettingField.command)]) return;
         const p = &(self.pending orelse return);
@@ -3755,59 +3695,27 @@ pub const SettingsWindow = struct {
         setEditText(edit, writer.buffered(), &self.suppress_edit_events);
     }
 
-    fn syncPaddingFromEdit(self: *SettingsWindow, axis: PaddingAxis) void {
+    fn syncPaddingFromEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        const setting = comptime field.setting();
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const raw_field: RawScalarField = switch (axis) {
-            .x => .window_padding_x,
-            .y => .window_padding_y,
-        };
-        const edit = switch (axis) {
-            .x => self.fields.edit_pad_x,
-            .y => self.fields.edit_pad_y,
-        } orelse return;
-        self.markRawScalarEdit(raw_field);
+        const edit = self.rawScalarEdit(field) orelse return;
+        self.markRawScalarEdit(field);
         var text_buf: [64]u8 = undefined;
         const text = readEditUtf8(edit, &text_buf) orelse
-            return self.setRawScalarValidationError(raw_field, edit, switch (axis) {
-                .x => "Window padding X could not be read.",
-                .y => "Window padding Y could not be read.",
-            });
-        const parsed = (switch (axis) {
-            .x => field_model.parseScalar(.window_padding_x, text),
-            .y => field_model.parseScalar(.window_padding_y, text),
-        }) catch |err| return self.setRawScalarValidationError(raw_field, edit, switch (axis) {
-            .x => field_model.scalarValidationMessage(.window_padding_x, err == error.OutOfRange),
-            .y => field_model.scalarValidationMessage(.window_padding_y, err == error.OutOfRange),
-        });
-        self.finishRawScalarEdit(raw_field);
-        switch (axis) {
-            .x => {
-                p.*.@"window-padding-x" = parsed;
-                self.trackFieldEdit(.window_padding_x);
-            },
-            .y => {
-                p.*.@"window-padding-y" = parsed;
-                self.trackFieldEdit(.window_padding_y);
-            },
-        }
+            return self.setRawScalarValidationError(field, edit, comptime field_model.descriptor(setting).label ++ " could not be read.");
+        const parsed = field_model.parseScalar(setting, text) catch |err|
+            return self.setRawScalarValidationError(field, edit, field_model.scalarValidationMessage(setting, err == error.OutOfRange));
+        self.finishRawScalarEdit(field);
+        setSettingValue(p, @unionInit(SettingValue, @tagName(setting), parsed));
+        self.trackFieldEdit(setting);
     }
 
-    fn displayPaddingInEdit(self: *SettingsWindow, axis: PaddingAxis) void {
-        const raw_field: RawScalarField = switch (axis) {
-            .x => .window_padding_x,
-            .y => .window_padding_y,
-        };
-        if (!self.shouldRefreshRawScalar(raw_field)) return;
-        const edit = switch (axis) {
-            .x => self.fields.edit_pad_x,
-            .y => self.fields.edit_pad_y,
-        } orelse return;
+    fn displayPaddingInEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        if (!self.shouldRefreshRawScalar(field)) return;
+        const edit = self.rawScalarEdit(field) orelse return;
         const p = self.pending orelse return;
-        const padding = switch (axis) {
-            .x => p.@"window-padding-x",
-            .y => p.@"window-padding-y",
-        };
+        const padding = fieldValue(&p, field.setting());
         var buf: [64]u8 = undefined;
         const text = if (padding.top_left == padding.bottom_right)
             std.fmt.bufPrint(&buf, "{d}", .{padding.top_left}) catch return
@@ -3816,235 +3724,48 @@ pub const SettingsWindow = struct {
         setEditText(edit, text, &self.suppress_edit_events);
     }
 
-    fn syncTrimTrailFromCheckbox(self: *SettingsWindow) void {
+    /// A checkbox for a bool field, or for one of `app-notifications`' bool
+    /// projections, which writes only its own member.
+    fn syncCheckbox(self: *SettingsWindow, comptime field: SettingField) void {
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const chk = self.fields.chk_trim_trail orelse return;
-        const state = sys.SendMessageW(chk, BM_GETCHECK, 0, 0);
-        p.*.@"clipboard-trim-trailing-spaces" = (state == BST_CHECKED);
-        self.trackFieldEdit(.trim_trailing_spaces);
+        const chk = self.fieldControl(field) orelse return;
+        const checked = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        setSettingValue(p, @unionInit(SettingValue, @tagName(field), checked));
+        self.trackFieldEdit(field);
     }
 
-    fn displayTrimTrailInCheckbox(self: *SettingsWindow) void {
-        const chk = self.fields.chk_trim_trail orelse return;
+    fn displayCheckbox(self: *SettingsWindow, comptime field: SettingField) void {
+        const chk = self.fieldControl(field) orelse return;
         const p = self.pending orelse return;
+        self.showChecked(chk, fieldValue(&p, field));
+    }
+
+    fn showChecked(self: *SettingsWindow, chk: HWND, checked: bool) void {
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(
-            chk,
-            BM_SETCHECK,
-            if (p.@"clipboard-trim-trailing-spaces") BST_CHECKED else BST_UNCHECKED,
-            0,
-        );
+        _ = sys.SendMessageW(chk, BM_SETCHECK, if (checked) BST_CHECKED else BST_UNCHECKED, 0);
         self.suppress_edit_events = false;
     }
 
-    fn syncDesktopNotificationsFromCheckbox(self: *SettingsWindow) void {
+    /// A dropdown. Its item positions are the field's `Combo` options, which
+    /// map an index to the config value and back.
+    fn syncCombo(self: *SettingsWindow, comptime field: SettingField) void {
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const chk = self.fields.chk_desktop_notifications orelse return;
-        p.*.@"desktop-notifications" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        self.trackFieldEdit(.desktop_notifications);
-    }
-
-    fn displayDesktopNotificationsInCheckbox(self: *SettingsWindow) void {
-        const chk = self.fields.chk_desktop_notifications orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(
-            chk,
-            BM_SETCHECK,
-            if (p.@"desktop-notifications") BST_CHECKED else BST_UNCHECKED,
-            0,
-        );
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAppNotificationsFromCheckbox(self: *SettingsWindow, field: AppNotificationField) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const chk = switch (field) {
-            .clipboard => self.fields.chk_app_notify_clipboard,
-            .config => self.fields.chk_app_notify_config,
-        } orelse return;
-        const enabled = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        switch (field) {
-            .clipboard => {
-                p.*.@"app-notifications".@"clipboard-copy" = enabled;
-                self.trackFieldEdit(.app_notify_clipboard);
-            },
-            .config => {
-                p.*.@"app-notifications".@"config-reload" = enabled;
-                self.trackFieldEdit(.app_notify_config);
-            },
-        }
-    }
-
-    fn displayAppNotificationsInCheckbox(self: *SettingsWindow, field: AppNotificationField) void {
-        const chk = switch (field) {
-            .clipboard => self.fields.chk_app_notify_clipboard,
-            .config => self.fields.chk_app_notify_config,
-        } orelse return;
-        const p = self.pending orelse return;
-        const enabled = switch (field) {
-            .clipboard => p.@"app-notifications".@"clipboard-copy",
-            .config => p.@"app-notifications".@"config-reload",
-        };
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(chk, BM_SETCHECK, if (enabled) BST_CHECKED else BST_UNCHECKED, 0);
-        self.suppress_edit_events = false;
-    }
-
-    /// Enum combo helpers. `fromIndex` maps combobox selection to
-    /// config enum value; `toIndex` goes the other direction for
-    /// initial display.
-    fn syncConfirmCloseFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_confirm_close orelse return;
+        const combo = self.fieldControl(field) orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"confirm-close-surface" = confirmCloseFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.confirm_close);
+        const value = field_model.Combo(field).fromIndex(idx) orelse return;
+        setSettingValue(p, @unionInit(SettingValue, @tagName(field), value));
+        self.trackFieldEdit(field);
     }
 
-    fn displayConfirmCloseInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_confirm_close orelse return;
+    fn displayCombo(self: *SettingsWindow, comptime field: SettingField) void {
+        const combo = self.fieldControl(field) orelse return;
         const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromConfirmClose(p.@"confirm-close-surface"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncCopyOnSelectFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_copy_on_select orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"copy-on-select" = copyOnSelectFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.copy_on_select);
-    }
-
-    fn displayCopyOnSelectInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_copy_on_select orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromCopyOnSelect(p.@"copy-on-select"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncClipboardAccessFromCombo(self: *SettingsWindow, comptime field_name: []const u8, combo_opt: ?HWND) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = combo_opt orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        @field(p.*, field_name) = clipboardAccessFromComboIndex(idx) orelse return;
-        if (comptime std.mem.eql(u8, field_name, "clipboard-read")) {
-            self.trackFieldEdit(.clipboard_read);
-        } else if (comptime std.mem.eql(u8, field_name, "clipboard-write")) {
-            self.trackFieldEdit(.clipboard_write);
-        }
-    }
-
-    fn displayClipboardAccessInCombo(self: *SettingsWindow, comptime field_name: []const u8, combo_opt: ?HWND) void {
-        const combo = combo_opt orelse return;
-        const p = self.pending orelse return;
-        const idx = comboIndexFromClipboardAccess(@field(p, field_name));
+        const idx = field_model.Combo(field).toIndex(fieldValue(&p, field));
         self.suppress_edit_events = true;
         _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncLinkUrlFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_link_url orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"link-url" = linkUrlFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.link_url);
-    }
-
-    fn displayLinkUrlInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_link_url orelse return;
-        const p = self.pending orelse return;
-        const idx = comboIndexFromLinkUrl(p.@"link-url");
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncLinkPreviewsFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_link_previews orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"link-previews" = linkPreviewsFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.link_previews);
-    }
-
-    fn displayLinkPreviewsInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_link_previews orelse return;
-        const p = self.pending orelse return;
-        const idx = comboIndexFromLinkPreviews(p.@"link-previews");
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncWindowThemeFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_window_theme orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"window-theme" = windowThemeFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.window_theme);
-    }
-
-    fn displayWindowThemeInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_window_theme orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromWindowTheme(p.@"window-theme"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncShellIntegFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_shell_integ orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"shell-integration" = shellIntegrationFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.shell_integration);
-    }
-
-    fn displayShellIntegInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_shell_integ orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromShellIntegration(p.@"shell-integration"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncCursorStyleFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_cursor_style orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"cursor-style" = cursorStyleFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.cursor_style);
-    }
-
-    fn displayCursorStyleInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_cursor_style orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromCursorStyle(p.@"cursor-style"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -4066,85 +3787,7 @@ pub const SettingsWindow = struct {
     fn displayBgBlurInCheckbox(self: *SettingsWindow) void {
         const chk = self.fields.chk_bg_blur orelse return;
         const p = self.pending orelse return;
-        const enabled = p.@"background-blur".win32BlurRequested();
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(
-            chk,
-            BM_SETCHECK,
-            if (enabled) BST_CHECKED else BST_UNCHECKED,
-            0,
-        );
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAccentFollowFromCheckbox(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const chk = self.fields.chk_accent_follow orelse return;
-        p.*.@"accent-follow-system" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        self.trackFieldEdit(.accent_follow_system);
-    }
-
-    fn displayAccentFollowInCheckbox(self: *SettingsWindow) void {
-        const chk = self.fields.chk_accent_follow orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(chk, BM_SETCHECK, if (p.@"accent-follow-system") BST_CHECKED else BST_UNCHECKED, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncPadBalanceFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_pad_balance orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"window-padding-balance" = paddingBalanceFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.padding_balance);
-    }
-
-    fn displayPadBalanceInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_pad_balance orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromPaddingBalance(p.@"window-padding-balance"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAutoUpdateFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_auto_update orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"auto-update" = autoUpdateFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.auto_update);
-    }
-
-    fn displayAutoUpdateInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_auto_update orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromAutoUpdate(p.@"auto-update"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAutoUpdateChannelFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.fields.combo_auto_update_channel orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"auto-update-channel" = autoUpdateChannelFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.auto_update_channel);
-    }
-
-    fn displayAutoUpdateChannelInCombo(self: *SettingsWindow) void {
-        const combo = self.fields.combo_auto_update_channel orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromAutoUpdateChannel(p.@"auto-update-channel"), 0);
-        self.suppress_edit_events = false;
+        self.showChecked(chk, p.@"background-blur".win32BlurRequested());
     }
 
     /// Refresh every control from the pending draft. Called after
@@ -4928,8 +4571,8 @@ pub const SettingsWindow = struct {
         annotateAccessibleControls(self);
         // Before the UIA providers: they subclass the same HWNDs and call
         // down to whatever procedure is installed when they arrive.
-        for (self.comboControls()) |combo| if (combo) |control| subclassCombo(control);
-        for (self.editControls()) |edit| if (edit) |control| subclassEdit(control);
+        for (self.comboControls()) |combo| if (combo) |control| subclassKeepingPrevious(control, &settingsComboProc);
+        for (self.editControls()) |edit| if (edit) |control| subclassKeepingPrevious(control, &settingsEditProc);
         self.applyTabOrder();
         // Establish native values before providers cache their initial state.
         self.refreshAllControls();
@@ -5615,8 +5258,8 @@ test "settings save preserves untouched scalar precision and legacy ranges" {
             .pending = pending,
             .fields = .{ .edit_font_size = font_edit, .edit_bg_opacity = opacity_edit },
         };
-        settings.displayFontSizeInEdit();
-        settings.displayBgOpacityInEdit();
+        settings.displayNumberInEdit(.font_size);
+        settings.displayNumberInEdit(.background_opacity);
         settings.save();
         try std.testing.expect(capture.saved);
         try std.testing.expectEqual(font_size, capture.font_size);
@@ -5644,13 +5287,13 @@ test "settings numeric edits reject nonfinite floats and excessive padding" {
     var pending = try Config.default(std.testing.allocator);
     defer pending.deinit();
     var settings: SettingsWindow = .{ .handle = undefined, .pending = pending, .fields = .{ .edit_font_size = edit, .edit_bg_opacity = edit, .edit_pad_x = edit } };
-    settings.syncFontSizeFromEdit();
+    settings.syncNumberFromEdit(.font_size);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.font_size)] != null);
     try std.testing.expectEqual(@as(f32, 12), settings.pending.?.@"font-size");
-    settings.syncBgOpacityFromEdit();
+    settings.syncNumberFromEdit(.background_opacity);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.background_opacity)] != null);
     _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("4294967295"));
-    settings.syncPaddingFromEdit(.x);
+    settings.syncPaddingFromEdit(.window_padding_x);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.window_padding_x)] != null);
 }
 
@@ -5687,7 +5330,7 @@ test "settings opacity preview is floored while the draft keeps the typed value"
 
         // Typing 0.85: the intermediate 0 must not turn the window invisible.
         _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0"));
-        settings.syncBgOpacityFromEdit();
+        settings.syncNumberFromEdit(.background_opacity);
         try std.testing.expectEqual(@as(f64, 0), settings.pending.?.@"background-opacity");
         try std.testing.expectEqual(@as(usize, 1), capture.count);
         try std.testing.expectEqual(case.floor, capture.previews[0]);
@@ -5702,13 +5345,13 @@ test "settings opacity preview is floored while the draft keeps the typed value"
         try std.testing.expectEqual(case.floor, capture.previews[1]);
 
         _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0.85"));
-        settings.syncBgOpacityFromEdit();
+        settings.syncNumberFromEdit(.background_opacity);
         try std.testing.expectEqual(@as(f64, 0.85), settings.pending.?.@"background-opacity");
         try std.testing.expectEqual(@as(f64, 0.85), capture.previews[2]);
 
         // A rollback restores the saved value exactly, floor or not.
         _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0"));
-        settings.syncBgOpacityFromEdit();
+        settings.syncNumberFromEdit(.background_opacity);
         settings.clearPending();
         try std.testing.expectEqual(case.saved, capture.previews[capture.count - 1]);
     }
@@ -5760,7 +5403,7 @@ test "settings save checks the file for edits first, and a conflict stops it" {
 
     // The draft: font size 14, from a session that started at the default 12.
     _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("14"));
-    settings.syncFontSizeFromEdit();
+    settings.syncNumberFromEdit(.font_size);
     try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
 
     // The file is as the session left it: the save goes ahead.
@@ -6266,7 +5909,7 @@ test "settings an invalid field marks its rail section, the title and UIA" {
 
             // An unsaved edit marks its own section and the title, not the others.
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.terminal).?.markerState());
             try std.testing.expectEqual(Marker.none, settings.sectionProvider(.appearance).?.markerState());
             try std.testing.expectEqualStrings("noctty settings (unsaved changes)", try titleOf(hwnd));
@@ -6369,7 +6012,7 @@ test "settings status and close prompt are live regions" {
             // A half-typed number and the hint that follows an edit: silent.
             typeInto(settings.fields.edit_font_size.?, "1");
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqual(@as(usize, 0), events.testing_live_regions);
             // The error, once it is shown: spoken, once, and not again for the
             // same words.
@@ -6399,7 +6042,7 @@ test "settings a failed Save and close is spoken when the prompt goes away" {
             const events = win32_uia.events;
 
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            settings.syncCombo(.confirm_close);
             settings.showClosePrompt();
             // The status line is hidden behind the prompt: nothing to speak yet.
             events.testing_live_regions = 0;
@@ -6494,7 +6137,7 @@ test "settings offers accent-follow-system as a checkbox that previews the theme
 
             fixture.live_previews = true;
             _ = sys.SendMessageW(chk, BM_SETCHECK, BST_UNCHECKED, 0);
-            settings.syncAccentFollowFromCheckbox();
+            settings.syncCheckbox(.accent_follow_system);
             try std.testing.expect(!settings.pending.?.@"accent-follow-system");
             try std.testing.expect(!fixture.config.@"accent-follow-system");
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
@@ -6751,7 +6394,7 @@ test "settings Discard changes throws the draft away and keeps the window" {
             fixture.live_previews = true;
             const original_cursor = settings.original.?.@"cursor-style";
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             typeInto(settings.fields.edit_font_size.?, "16");
             try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
             try std.testing.expect(fixture.config.@"cursor-style" != original_cursor);
@@ -6790,7 +6433,7 @@ test "settings Discard changes throws the draft away and keeps the window" {
 
             // The next edit replaces the note, as any outcome is replaced.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
         }
     }.body);
@@ -6805,7 +6448,7 @@ test "settings Discard changes gives way to the conflict choices and to the clos
             const discard = settings.btn_discard_changes.?;
 
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             try std.testing.expect(sys.IsWindowVisible(discard) != 0);
 
             // The close prompt hides it with Save and brings it back with Save.
@@ -8233,7 +7876,7 @@ test "settings Enter presses the focused push button and does nothing in a field
             // saves nor closes the window.
             settings.setActiveSection(.appearance);
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
             _ = sys.SetFocus(settings.fields.edit_font_size.?);
             _ = fixture.pumpKey(0x0D);
@@ -8257,7 +7900,7 @@ test "settings Ctrl+S reaches Save through the accelerator hook" {
             defer fixture.finish();
             const settings = &fixture.settings;
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             _ = sys.SetFocus(settings.fields.edit_font_size.?);
 
             // The thread's key table starts as a copy of what the real keyboard
@@ -8300,14 +7943,14 @@ test "settings Ctrl+S gate follows the Save button and a held Escape does not fl
             settings.saveIfAllowed();
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             settings.saveIfAllowed();
             try std.testing.expectEqual(@as(u32, 1), fixture.saved);
 
             // Dirty again: Escape opens the prompt, its auto-repeats do not
             // toggle it, and nothing closes while a close is already posted.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 3, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             _ = sys.SetFocus(settings.fields.edit_font_size.?);
             try std.testing.expect(fixture.pumpKey(0x1B));
             try std.testing.expect(settings.close_prompt_visible);
@@ -8420,7 +8063,7 @@ test "settings Tab visits the fields in form order and Save last" {
 
             // A pending change makes Save eligible for dialog traversal.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
 
             for (std.enums.values(Section)) |section| {
@@ -8965,7 +8608,7 @@ test "settings rail marks draw for unsaved and invalid sections at 100% and 150%
 
                 // Unsaved: the dot, in the accent (a text colour in High Contrast).
                 _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-                settings.syncCursorStyleFromCombo();
+                settings.syncCombo(.cursor_style);
                 dialog_test.flushPaint(hwnd);
                 const unsaved = try dialog_test.Capture.take(hwnd);
                 defer unsaved.deinit();
@@ -9675,7 +9318,7 @@ test "CHROME unsupported link previews retain their config value and palette foc
             defer fixture.finish();
             const settings = &fixture.settings;
             settings.pending.?.@"link-previews" = .osc8;
-            settings.displayLinkPreviewsInCombo();
+            settings.displayCombo(.link_previews);
             try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(settings.fields.combo_link_previews.?, CB_GETCURSEL, 0, 0));
             try settings.openField(.link_previews);
             try std.testing.expectEqual(Section.privacy, settings.active_section);
@@ -9706,37 +9349,37 @@ test "settings status line says whether an edit previews or waits for a save" {
 
             // An edit that shows in the open terminals now.
             _ = sys.SendMessageW(settings.fields.combo_window_theme.?, CB_SETCURSEL, 3, 0);
-            settings.syncWindowThemeFromCombo();
+            settings.syncCombo(.window_theme);
             try std.testing.expectEqualStrings("Previewing now. Save to keep it.", try statusTextOf(settings, &buf));
 
             // Cursor style is previewed into the config, but no open terminal
             // reads it until the save, so it must not claim a preview.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
 
             // A setting that is only read at save says so too.
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
 
             // Putting everything back leaves nothing to save.
             _ = sys.SendMessageW(settings.fields.combo_window_theme.?, CB_SETCURSEL, 0, 0);
-            settings.syncWindowThemeFromCombo();
+            settings.syncCombo(.window_theme);
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, @as(usize, comboIndexFromCursorStyle(settings.original.?.@"cursor-style")), 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, @as(usize, comboIndexFromConfirmClose(settings.original.?.@"confirm-close-surface")), 0);
-            settings.syncConfirmCloseFromCombo();
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqualStrings(nothing_to_save_text, try statusTextOf(settings, &buf));
 
             // A saved edit is reported, and the next edit replaces that.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             settings.save();
             try std.testing.expectEqual(@as(u32, 1), fixture.saved);
             try std.testing.expectEqualStrings("Settings saved.", try statusTextOf(settings, &buf));
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
         }
     }.body);
@@ -9761,7 +9404,7 @@ test "settings outcome messages show over a conflict and do not outlive their ed
             var buf: [256]u8 = undefined;
 
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             var disk = try Config.default(std.testing.allocator);
             defer disk.deinit();
             disk.@"cursor-style" = .bar;
@@ -9781,7 +9424,7 @@ test "settings outcome messages show over a conflict and do not outlive their ed
             settings.status_note = .save_failed;
             try std.testing.expectEqualStrings(nothing_to_save_text, settings.idleStatusText());
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            settings.syncCombo(.confirm_close);
             // The edit replaced the note.
             try std.testing.expectEqualStrings("Applies when you save.", settings.idleStatusText());
         }
@@ -9797,7 +9440,7 @@ test "settings typing in a text field replaces the saved message" {
             var buf: [256]u8 = undefined;
 
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             settings.save();
             try std.testing.expectEqualStrings("Settings saved.", try statusTextOf(settings, &buf));
 
@@ -9864,7 +9507,7 @@ test "settings conflict message uses the field's name and fits its own row" {
 
             // The same field edited here and, differently, on disk.
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             var disk = try Config.default(std.testing.allocator);
             defer disk.deinit();
             disk.@"cursor-style" = .bar;
@@ -9920,7 +9563,7 @@ test "settings stacked action bar keeps a wide status row above the buttons" {
             const settings = &fixture.settings;
 
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            settings.syncCombo(.cursor_style);
             var disk = try Config.default(std.testing.allocator);
             defer disk.deinit();
             disk.@"cursor-style" = .bar;
@@ -10104,16 +9747,18 @@ fn settingsComboProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) call
     return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
 }
 
-fn subclassCombo(combo: HWND) void {
+/// Install `proc` on a stock control and keep the procedure it replaces in
+/// the control's `GWLP_USERDATA`, which the stock classes leave unused.
+fn subclassKeepingPrevious(control: HWND, proc: win32_types.WNDPROC) void {
     // Already ours (the prior procedure is recorded): nothing to do.
-    if (sys.GetWindowLongPtrW(combo, GWLP_USERDATA) != 0) return;
+    if (sys.GetWindowLongPtrW(control, GWLP_USERDATA) != 0) return;
     const previous = sys.SetWindowLongPtrW(
-        combo,
+        control,
         GWLP_WNDPROC,
-        @as(LONG_PTR, @intCast(@intFromPtr(&settingsComboProc))),
+        @as(LONG_PTR, @intCast(@intFromPtr(proc))),
     );
     if (previous == 0) return;
-    _ = sys.SetWindowLongPtrW(combo, GWLP_USERDATA, previous);
+    _ = sys.SetWindowLongPtrW(control, GWLP_USERDATA, previous);
 }
 
 /// Subclass for the text fields, which draw their own frame (`fieldFrameInsets`,
@@ -10166,17 +9811,6 @@ fn settingsEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callc
         else => {},
     }
     return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
-}
-
-fn subclassEdit(edit: HWND) void {
-    if (sys.GetWindowLongPtrW(edit, GWLP_USERDATA) != 0) return;
-    const previous = sys.SetWindowLongPtrW(
-        edit,
-        GWLP_WNDPROC,
-        @as(LONG_PTR, @intCast(@intFromPtr(&settingsEditProc))),
-    );
-    if (previous == 0) return;
-    _ = sys.SetWindowLongPtrW(edit, GWLP_USERDATA, previous);
 }
 
 const FieldFrameInsets = struct { x: i32, y: i32 };
@@ -10649,7 +10283,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                             if (controlIndexIsCheckbox(index)) colors.secondary_text else colors.button_text
                         else
                             colors.button_text
-                    else if (control == o.text_summary or (o.textIndex(control) orelse 0) >= 5)
+                    else if (control == o.text_summary or (o.textIndex(control) orelse 0) >= text_first_label_index)
                         colors.secondary_text
                     else
                         colors.text
@@ -10776,11 +10410,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (lParam != 0 and (notify == EN_SETFOCUS or notify == CBN_SETFOCUS or notify == BN_SETFOCUS)) {
                 if (owner) |o| if (!o.restoring_focus) o.ensureControlVisible(@ptrFromInt(@as(usize, @bitCast(lParam))));
             }
-            if (clickedButton(id, notify, BTN_OPEN_EDITOR)) {
-                if (owner) |o| o.handle.openInEditor(o.handle.ctx);
-                return 0;
-            }
-            if (clickedButton(id, notify, BTN_KEYBINDINGS_EDITOR)) {
+            if (clickedButton(id, notify, BTN_OPEN_EDITOR) or clickedButton(id, notify, BTN_KEYBINDINGS_EDITOR)) {
                 if (owner) |o| o.handle.openInEditor(o.handle.ctx);
                 return 0;
             }
@@ -11119,9 +10749,7 @@ fn copyOwnedSetting(target: *Config, source: *const Config, field: OwnedSettingF
 
 fn writeOwnedSettingValue(writer: *std.Io.Writer, config: *const Config, field: OwnedSettingField) !void {
     switch (field) {
-        .font_family => try field_model.writeOwnedSettingValue(.@"font-family", writer, config),
-        .theme => try field_model.writeOwnedSettingValue(.theme, writer, config),
-        .command => try field_model.writeOwnedSettingValue(.command, writer, config),
+        inline else => |owned| try field_model.writeOwnedSettingValue(owned.descriptor().key, writer, config),
     }
 }
 
