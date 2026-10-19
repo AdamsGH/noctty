@@ -117,6 +117,7 @@ pub const SettingsOpenTrace = struct {
 /// configuration values, process arguments or input state is recorded.
 pub const SettingsComboTrace = struct {
     const max_record_bytes = 192;
+    pub const Event = enum { action_received, action_returned, focus_lost, capture_changed, closeup };
     inner: SettingsOpenTrace = .{},
 
     pub fn init(alloc: Allocator) SettingsComboTrace {
@@ -135,6 +136,16 @@ pub const SettingsComboTrace = struct {
         const file = self.inner.file orelse return;
         var buf: [max_record_bytes]u8 = undefined;
         const line = formatRecord(&buf, GetTickCount64(), control_id, show, dropped, result) catch {
+            self.deinit();
+            return;
+        };
+        self.inner.writeRecord(file, line);
+    }
+
+    pub fn noteEvent(self: *SettingsComboTrace, event: Event, control_id: i32, dropped: bool) void {
+        const file = self.inner.file orelse return;
+        var buf: [max_record_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\",\"control_id\":{d},\"dropped\":{}}}\n", .{ GetTickCount64(), @tagName(event), control_id, dropped }) catch {
             self.deinit();
             return;
         };

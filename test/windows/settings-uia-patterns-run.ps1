@@ -28,7 +28,8 @@
     NOCTTY_SETTINGS_COMBO_TRACE separately records native CB_SHOWDROPDOWN
     delivery and return, keyed by control ID. Exercise receipts attach those
     records to the HRESULT and before/returned/100 ms popup observations.
-    -RequireComboTrace rejects a missing diagnostic trace on instrumented builds.
+    -RequireComboTrace rejects a missing diagnostic trace and successful enabled
+    operations without a native show/return pair for their control.
     Any clipboard sequence change stops launches without attribution.
 
     Results: summary.json, cases.json, per-control probe JSON, guard snapshots,
@@ -532,7 +533,8 @@ function Click([IntPtr] $Hwnd) {
     [void][Set91.Native]::Send($Hwnd, 0xF5, 0, 0)
 }
 function Get-GuardSnapshot {
-    # Metadata only: never open the maintainer's profile or history contents.
+    # Metadata only for the maintainer's noctty profile and history files.
+    # Shell jump-list hashes below remain a separate guard.
     $roam = [Environment]::GetFolderPath('ApplicationData')
     $local = [Environment]::GetFolderPath('LocalApplicationData')
     $docs = [Environment]::GetFolderPath('MyDocuments')
@@ -777,6 +779,7 @@ function Start-Fixture {
     if ($baseline.latest) { $script:attempt.previousStartedAt = $baseline.latest.started_at_unix_ms }
     Add-Stage 'baseline-captured' $baseline
     Assert-Contract (-not [IO.File]::Exists($tracePath)) 'Trace path must be NEW.'
+    Assert-Contract (-not [IO.File]::Exists($comboTracePath)) 'Combo trace path must be NEW.'
     Assert-ClipboardGuard
     $savedTrace = [Environment]::GetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', 'Process')
     $savedComboTrace = [Environment]::GetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', 'Process')
@@ -1001,6 +1004,11 @@ function Probe-Control($Case, [IntPtr] $Hwnd, [string] $Phase, [bool] $ExerciseC
             $observed | Add-Member -NotePropertyName nativeDropdownMessages -NotePropertyValue $messages
             Write-Json $path $observed
             Assert-Contract (-not $RequireComboTrace -or (Test-Path -LiteralPath $nativePath)) 'Required native combo trace is missing.'
+            if ($RequireComboTrace -and $observed.pass -and $observed.enabled) {
+                $received = @($messages | Where-Object { $_.stage -eq 'show_received' -and $_.show })
+                $returned = @($messages | Where-Object { $_.stage -eq 'show_returned' -and $_.show })
+                Assert-Contract ($received.Count -gt 0 -and $received.Count -eq $returned.Count) 'Successful combo operation has no complete native dropdown trace.'
+            }
         }
         Assert-Contract (($probe.ExitCode() -eq 0) -eq [bool]$observed.pass) 'Client exit/result mismatch.'
         return $observed

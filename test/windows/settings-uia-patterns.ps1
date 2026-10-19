@@ -218,6 +218,7 @@ namespace SettingsPatterns
         {
             var snapshot = new Dictionary<string, object>();
             snapshot["utc"] = DateTimeOffset.UtcNow.ToString("o");
+            snapshot["tick_ms"] = Environment.TickCount64;
             uint pid;
             uint thread = GetWindowThreadProcessId(hwnd, out pid);
             var gui = new GuiThreadInfo();
@@ -229,17 +230,10 @@ namespace SettingsPatterns
                 snapshot["captureHwnd"] = gui.Capture.ToInt64();
                 snapshot["guiFlags"] = gui.Flags;
             }
-            try
-            {
-                int state;
-                int hr = expand.GetCurrentExpandCollapseState(out state);
-                snapshot["stateHresult"] = String.Format("0x{0:X8}", hr);
-                if (hr >= 0) snapshot["state"] = state;
-            }
-            catch (COMException error)
-            {
-                snapshot["stateHresult"] = String.Format("0x{0:X8}", error.HResult);
-            }
+            int state;
+            int hr = expand.GetCurrentExpandCollapseState(out state);
+            snapshot["stateHresult"] = String.Format("0x{0:X8}", hr);
+            if (hr >= 0) snapshot["state"] = state;
             IntPtr dropped;
             bool replied = ReadComboMessage(hwnd, 0x0157, IntPtr.Zero, IntPtr.Zero, 2, 2000, out dropped) != IntPtr.Zero;
             snapshot["droppedStateReplied"] = replied;
@@ -282,6 +276,8 @@ namespace SettingsPatterns
             }
             finally
             {
+                receipt["returnTimestamp"] = System.Diagnostics.Stopwatch.GetTimestamp();
+                receipt["returnTickMs"] = Environment.TickCount64;
                 receipt["elapsedMilliseconds"] = timer.Elapsed.TotalMilliseconds;
                 receipt["returned"] = ExpansionSnapshot(hwnd, expand);
             }
@@ -487,15 +483,25 @@ namespace SettingsPatterns
                             }
                             if (enabled)
                             {
-                                Thread.Sleep(100);
+                                var expansion = (Dictionary<string, object>)expansions[0];
+                                long returned = (long)expansion["returnTimestamp"];
+                                double sinceReturn = (System.Diagnostics.Stopwatch.GetTimestamp() - returned) *
+                                    1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                                // Preserve the original return + 100 ms observation deadline;
+                                // diagnostic work consumes this wait rather than extending it.
+                                if (sinceReturn < 100) Thread.Sleep((int)Math.Ceiling(100 - sinceReturn));
+                                double observedAfter = (System.Diagnostics.Stopwatch.GetTimestamp() - returned) *
+                                    1000.0 / System.Diagnostics.Stopwatch.Frequency;
                                 var snapshot = ExpansionSnapshot((IntPtr)hwnd, (IExpandCollapse)expand);
-                                ((Dictionary<string, object>)expansions[0])["after100ms"] = snapshot;
+                                snapshot["millisecondsSinceExpandReturn"] = observedAfter;
+                                expansion["after100ms"] = snapshot;
                                 Require(Object.Equals(snapshot["stateHresult"], "0x00000000"), "Cannot read expanded state");
                                 int state = Convert.ToInt32(snapshot["state"]);
                                 result["expandedState"] = state;
                                 Require(state == 1, "Combo did not expand");
-                                Require(Object.Equals(snapshot["droppedStateReplied"], true) &&
-                                    Convert.ToInt64(snapshot["droppedState"]) != 0 &&
+                                Require(Object.Equals(snapshot["droppedStateReplied"], true),
+                                    "Native dropped-state read timed out");
+                                Require(Convert.ToInt64(snapshot["droppedState"]) != 0 &&
                                     Object.Equals(snapshot["listExists"], true) && Object.Equals(snapshot["listVisible"], true),
                                     "Expanded combo has no visible native popup");
                                 var info = new ComboInfo();
