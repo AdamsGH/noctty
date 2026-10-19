@@ -446,6 +446,15 @@ lands incrementally.
 - Alt+Space still sends ESC SPACE to the program as well as opening the
   window menu (#381). Once conhost has seen a Win32 input record it holds a
   lone ESC back until more input arrives, as under Windows Terminal (#335).
+- Since 1.3.132 (#335) noctty sends keys to ConPTY as Win32 input records
+  (unless the program asked for the Kitty keyboard protocol). A record's text
+  is Windows' translation of the key against the keyboard state at key-down,
+  not a `WM_CHAR` that follows it. So a tool that types into noctty by sending
+  `WM_KEYDOWN` and then `WM_CHAR` to its window (`SendMessage`) without setting
+  that keyboard state (for example with `AttachThreadInput` and
+  `SetKeyboardState`) gets a Shift chord's unshifted character: Shift+.
+  arrives as `.`, and the tool's `WM_CHAR` is dropped. Real keys, `SendInput`
+  and IME commits are unaffected.
 - A Japanese IME commit of 【】 freezes input in a `wslc exec -it` session
   (#395); reading wslc's source points at `wslc.exe` itself, not noctty (not
   reproduced with a real IME or container).
