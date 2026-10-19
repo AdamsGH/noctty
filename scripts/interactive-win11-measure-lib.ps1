@@ -66,7 +66,7 @@ function Invoke-InteractiveWin11MeasureGit {
         '"' + ([regex]::Replace([regex]::Replace($arg, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1')) + '"'
     }
     $info = New-Object Diagnostics.ProcessStartInfo
-    $info.FileName = (Get-Command git.exe -CommandType Application -ErrorAction Stop).Source
+    $info.FileName = (Get-Command git.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $info.Arguments = $quoted -join ' '
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true

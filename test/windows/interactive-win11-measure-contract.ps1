@@ -10,6 +10,23 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 # Exercise the real binary-safe git boundary before replacing it for fixtures.
 $libraryRepo = Split-Path -Parent (Split-Path -Parent ([IO.Path]::GetFullPath($LibraryPath)))
+function Test-MultipleGitCandidates {
+    # Hosted Windows exposes several git.exe applications on PATH. Keep the
+    # real first candidate and an invalid second one: concatenating Source
+    # values cannot start, while selecting the first runs real git safely.
+    $gitCandidates = @(
+        (Microsoft.PowerShell.Core\Get-Command git.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1),
+        [pscustomobject]@{ Source = (Join-Path $libraryRepo 'not-a-git-executable.exe') }
+    )
+    function Get-Command {
+        param([string] $Name, [string] $CommandType, [string] $ErrorAction)
+        if ($Name -cne 'git.exe' -or $CommandType -cne 'Application') { throw 'Unexpected command lookup in git candidate control.' }
+        return $gitCandidates
+    }
+    $head = Get-InteractiveWin11MeasureHead $libraryRepo
+    if ($head -notmatch '^[0-9a-f]{40,64}$') { throw 'Multiple git candidate control failed.' }
+}
+Test-MultipleGitCandidates
 $liveHead = Get-InteractiveWin11MeasureHead $libraryRepo
 $liveOriginal = Invoke-InteractiveWin11MeasureGit $libraryRepo @('show', "${liveHead}:src/apprt/win32_aumid.zig")
 [void] (Get-InteractiveWin11MeasurePatchedBytes $liveOriginal)
@@ -118,7 +135,8 @@ function Invoke-InteractiveWin11MeasureGit {
     }
 }
 
-$script:measureContractChecks = 0
+# The real-process multiple-candidate control above passed before fixtures.
+$script:measureContractChecks = 1
 function Assert-MeasureContractRejected {
     param([string] $Name, [scriptblock] $Action)
     $rejected = $false
