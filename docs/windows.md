@@ -593,7 +593,8 @@ console sets another one, so cmd's `title`, PowerShell and full-screen
 programs name the window as they do anywhere else. When the client set
 `STARTF_USESHOWWINDOW`, `start /min` and `Start-Process -WindowStyle
 Minimized` open the window minimized without taking focus, `SW_SHOWNOACTIVATE`
-opens it without taking focus, and a maximized start opens it maximized.
+opens it without taking focus, and a maximized start opens it maximized. The
+`maximize` and `fullscreen` settings do not apply to an adopted console.
 `powershell.exe -WindowStyle Hidden` hides its own console window after it
 starts. For an adopted console, noctty follows OpenConsole's show/hide
 notifications as Windows Terminal does: hide minimizes the window, and show
@@ -974,6 +975,24 @@ Windows 10 the window is frameless: no border, shadow, or resize edges, no
 Alt+Space menu, and no tab-strip drag, and maximizing it covers the taskbar.
 The quick terminal is frameless on both, so it sits flush with its screen edge.
 
+`maximize = true` and `fullscreen = true` apply to every new window: the
+first one, `new_window`, a profile opened in a new window, a window forwarded
+from another launch (`noctty --maximize`, `noctty +new-window
+--fullscreen=true`), a launched layout, and a window restored from the saved
+session (see [Session restore and recovery](#session-restore-and-recovery)).
+They do not apply to new tabs or splits, to the quick terminal, or to a
+console handed off as the default terminal, which starts in the show state
+its program asked for. Changing them with a config reload does not
+change windows that are already open. A window with no other window to copy
+(the first one, or one opened when none is open) is shown in that state from
+the start. A window opened from another one (`new_window`, a forwarded
+launch) is shown first and then maximized or made fullscreen, as a window
+opened from a maximized one already was. A window that starts fullscreen
+leaves fullscreen to the window it would otherwise have been: its normal size
+and place, or maximized when `maximize` is also set. The settings win over a
+minimized launch (`start /min`, a shortcut set to Run: Minimized): such a
+window starts maximized or fullscreen, not minimized.
+
 The universal palette puts actions, live tabs, panes, Windows profiles,
 named layouts, and native settings in one fuzzy-ranked, keyboard-driven
 list. Type a prefix to filter one category: `>` actions, `@` tabs, `/`
@@ -1133,6 +1152,15 @@ the window moves to the nearest monitor's
 work area, its size capped to it. A window with a caption's worth of title bar
 (48 px wide) on some monitor stays where it was, even if the rest
 of it hangs off the screen.
+
+`maximize = true` and `fullscreen = true` (or `--maximize` and
+`--fullscreen=true` on the command line) apply to restored windows too: each
+is placed at its saved rect first and then maximized or made fullscreen, so
+the saved rect is the one it returns to. Without them a window comes back in
+its saved state. The saved session does not record fullscreen: a window that
+was fullscreen when the session was saved is saved at its monitor's rect as a
+normal window, and comes back that way (with `fullscreen = true`, fullscreen
+again, leaving fullscreen to that monitor-sized rect).
 
 A snapshot that merely exceeds the limits above (too many lines, a line over
 16 KiB, or the shared budget) is dropped on load and the window's layout still
@@ -1507,7 +1535,7 @@ layout without prompting, and only for the focused target.
 `+new-window` forwards command-line arguments to the running instance, which
 honors only allowlisted window-scoped presentation settings: window geometry
 and decoration (`--window-width`, `--window-height`, `--window-position-*`,
-`--window-padding-*`, `--window-decoration`, `--maximize`, `--fullscreen`),
+`--window-padding-*`, `--window-decoration`, `--maximize`, `--fullscreen=true`),
 `--title`, non-name font settings (`--font-size`, `--font-thicken`), and
 colors (`--background`, `--foreground`, `--palette`, `--cursor-color`,
 `--background-opacity`).
