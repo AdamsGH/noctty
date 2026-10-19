@@ -252,8 +252,9 @@ that govern each symbol you change, or that none does.
   `test/windows/` harnesses (hidden desktops, the foreground, sandboxes, the
   interactive composite, the flagship contracts), CI test steps, the Zig test
   runner's probe children and thread tests (`src/pty_transport_probe.zig`,
-  `std.Progress.lockStdErr`), and a test count or result that contradicts the
-  code.
+  `std.Progress.lockStdErr`, the search-thread tests in
+  `src/terminal/search/Thread.zig`), and a test count or result that
+  contradicts the code.
 - [tooling.md](docs/agents/log/tooling.md): declaring `extern` functions or
   structs, casting Win32 handles and `LPARAM`/`LRESULT` (`@intCast`,
   `@bitCast`, `@ptrFromInt`), passing `[:0]u16` to text APIs, renaming Zig
