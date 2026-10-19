@@ -9,6 +9,13 @@ function Get-Fingerprint([string] $Path) {
     return "$($item.LastWriteTimeUtc.Ticks):$($item.Length):$((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash)"
 }
 
+# Real shell histories are private. Guard only their metadata; never open or hash them.
+function Get-HistoryMetadata([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
+    $item = Get-Item -LiteralPath $Path
+    return "$($item.LastWriteTimeUtc.Ticks):$($item.Length)"
+}
+
 if (-not ('HiddenDesktopNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -52,10 +59,10 @@ public static class HiddenDesktopNative {
     }
     public static int[] ReapOwnedJob(IntPtr job) {
         var stopped=new List<int>();
-        // A signaled process can remain in the job list briefly after exit.
-        // Keep the empty-job oracle, but give accounting time to catch up.
-        DateTime deadline=DateTime.UtcNow.AddSeconds(10);
-        while(DateTime.UtcNow<deadline) {
+        // Exited processes can remain in job accounting briefly. Poll for
+        // up to ten seconds while retaining the strict empty-job oracle.
+        var timer=System.Diagnostics.Stopwatch.StartNew();
+        while(timer.ElapsedMilliseconds<10000) {
             int[] ids=JobPids(job); if(ids.Length==0) return stopped.ToArray();
             foreach(int id in ids) {
                 // Hold the exact process handle and freshly verify membership
@@ -72,7 +79,11 @@ public static class HiddenDesktopNative {
                     if(!TerminateProcess(handle,1)) {
                         if(!GetExitCodeProcess(handle,out code) || code==259) throw new Exception("Owned process termination failed");
                     } else stopped.Add(id);
-                    if(WaitForSingleObject(handle,10000)!=0) throw new Exception("Owned process did not exit");
+                    uint remaining=(uint)Math.Max(0,10000-timer.ElapsedMilliseconds);
+                    uint waited=WaitForSingleObject(handle,remaining);
+                    // At the deadline, let the final job-accounting query
+                    // decide whether all processes have exited.
+                    if(waited!=0 && waited!=258) throw new Exception("Waiting for owned process failed");
                 } finally { CloseHandle(handle); }
             }
             System.Threading.Thread.Sleep(10);
@@ -110,18 +121,31 @@ public static class HiddenDesktopNative {
 '@
 }
 
-function Start-Hidden([string] $Application, [string] $Command, [string] $Directory, [string] $Desktop, [IntPtr] $OwnerJob = [IntPtr]::Zero, [switch] $NewProcessGroup, [string] $LogPath) {
+function Start-Hidden([string] $Application, [string] $Command, [string] $Directory, [string] $Desktop, [IntPtr] $OwnerJob = [IntPtr]::Zero, [switch] $NewProcessGroup, [string] $LogPath, [hashtable] $EnvironmentOverrides = @{}) {
+    if (-not $Desktop -or $Desktop -notmatch '^[^\\]+\\[^\\]+$' -or $Desktop -match '\\Default$') { throw 'Explicit private desktop required.' }
     $si = [HiddenDesktopNative+SI]::new()
     $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][HiddenDesktopNative+SI])
     $si.desktop = $Desktop
     $pi = [HiddenDesktopNative+PI]::new()
+    # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS; suspend owned drivers
+    # until their job assignment is complete. A new process group is opt-in
+    # for the Modes/All controller normalization exercise, never the matrix.
     $flags = if ($OwnerJob -ne [IntPtr]::Zero) { 0x08004004 } else { 0x08004000 }
-    # CREATE_NEW_PROCESS_GROUP deliberately seeds the inheritable Ctrl+C-ignore
-    # attribute for the regression case. It does not bypass the owned job.
-    if ($NewProcessGroup) { $flags = $flags -bor 0x200 }
+    if ($NewProcessGroup) { $flags = $flags -bor 0x200 } # CREATE_NEW_PROCESS_GROUP
+    $environmentBlock = [IntPtr]::Zero
     $logHandle = [IntPtr]::Zero
     $inputHandle = [IntPtr]::Zero
     try {
+        if ($EnvironmentOverrides.Count -ne 0) {
+            # Redirect the driver from its first instruction, including
+            # PowerShell startup and Add-Type, without changing this parent.
+            $entries = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $entries[$entry.Key] = $entry.Value }
+            foreach ($name in $EnvironmentOverrides.Keys) { $entries[$name] = $EnvironmentOverrides[$name] }
+            $lines = foreach ($entry in $entries.GetEnumerator()) { $entry.Key + '=' + $entry.Value }
+            $environmentBlock = [Runtime.InteropServices.Marshal]::StringToHGlobalUni(($lines -join "`0") + "`0`0")
+            $flags = $flags -bor 0x400 # CREATE_UNICODE_ENVIRONMENT
+        }
         if ($LogPath) {
             $security = [HiddenDesktopNative+SA]::new()
             $security.size = [Runtime.InteropServices.Marshal]::SizeOf($security)
@@ -134,11 +158,12 @@ function Start-Hidden([string] $Application, [string] $Command, [string] $Direct
             $si.stdin = $inputHandle; $si.stdout = $logHandle; $si.stderr = $logHandle
         }
         if (-not [HiddenDesktopNative]::CreateProcessW($Application, [Text.StringBuilder]::new($Command),
-                [IntPtr]::Zero, [IntPtr]::Zero, [bool]$LogPath, $flags, [IntPtr]::Zero, $Directory, [ref]$si, [ref]$pi)) {
+                [IntPtr]::Zero, [IntPtr]::Zero, [bool]$LogPath, $flags, $environmentBlock, $Directory, [ref]$si, [ref]$pi)) {
             throw "CreateProcessW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         }
     }
     finally {
+        if ($environmentBlock -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($environmentBlock) }
         foreach ($handle in @($logHandle, $inputHandle)) {
             if ($handle -ne [IntPtr]::Zero -and $handle -ne [IntPtr](-1)) { [void][HiddenDesktopNative]::CloseHandle($handle) }
         }
@@ -157,21 +182,19 @@ function Start-Hidden([string] $Application, [string] $Command, [string] $Direct
             }
         }
         if ($LogPath) {
-            # Retain the exact native handle through exit: even an immediate
-            # compiler failure must produce its real exit code and log path.
+            # #477: wait through the original PI handle. A fast compiler
+            # failure must retain its exit code and log, even after PID exit.
             $wait = [HiddenDesktopNative]::WaitForSingleObject($pi.process, 60000)
             if ($wait -eq 258) {
                 if (-not [HiddenDesktopNative]::TerminateProcess($pi.process, 1) -or
                     [HiddenDesktopNative]::WaitForSingleObject($pi.process, 10000) -ne 0) {
-                    throw 'Terminating timed-out compiler failed.'
+                    throw "Terminating timed-out compiler failed; see $LogPath"
                 }
-                throw 'Console fixture compilation timed out.'
+                throw "Console fixture compilation timed out; see $LogPath"
             }
-            if ($wait -ne 0) { throw 'Waiting for compiler failed.' }
+            if ($wait -ne 0) { throw "Waiting for compiler failed; see $LogPath" }
             $exitCode = [uint32]259
-            if (-not [HiddenDesktopNative]::GetExitCodeProcess($pi.process, [ref]$exitCode)) {
-                throw 'Reading compiler exit code failed.'
-            }
+            if (-not [HiddenDesktopNative]::GetExitCodeProcess($pi.process, [ref]$exitCode)) { throw "Reading compiler exit code failed; see $LogPath" }
             return $exitCode
         }
     }
