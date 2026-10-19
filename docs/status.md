@@ -173,7 +173,10 @@ Win32-validated VT protocol coverage is tracked in
 - Session restore via `window-save-state`: windows, tabs, splits, profiles,
   working directories, and explicit titles come back; child processes do
   not. The opt-in `window-save-state-scrollback` line count also restores
-  bounded, clearly marked plain-text pane snapshots. Only one noctty process
+  bounded, clearly marked plain-text pane snapshots. The next launch restores
+  what the last window held when it went, however it went: its close, its
+  last tab or pane, its last shell exiting, or a quit. Undo history is not
+  saved. Only one noctty process
   owns `session-state.json`; a second instance, a forwarded launch, `-e` and
   `--working-directory` launches neither restore nor save it.
 - Named layouts (C17): save the focused window's tabs, splits, profiles,

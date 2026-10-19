@@ -2306,11 +2306,15 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `default`.
 ///
-/// On Windows the session's owning process saves on exit, at sign-out or
-/// shutdown, when the display configuration changes, and one second after
-/// a burst of window, tab or pane structural changes settles. Checkpoints
-/// use the same ownership and privacy rules as the exit save and never run
-/// during startup restore. The practical window/session shape includes:
+/// On Windows the session's owning process saves as the session's last
+/// window goes (however it goes: its close, its last tab or pane, its last
+/// shell exiting, a quit), at sign-out or shutdown, when the display
+/// configuration changes, and one second after a burst of window, tab or
+/// pane structural changes settles. The next launch restores what that last
+/// window held; undo history is not saved, and no save deletes the file.
+/// Checkpoints use the same ownership and privacy rules as the save when the
+/// last window goes and never run during startup restore. The practical
+/// window/session shape includes:
 /// host window rectangle/state plus tab, split, profile, working-directory,
 /// and explicit title metadata. Child process state is not restored. The
 /// opt-in `window-save-state-scrollback` setting can additionally restore a

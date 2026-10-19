@@ -1115,14 +1115,26 @@ the indicator is later turned off.
 
 One noctty process owns the saved session: the first one started normally,
 which restores it (or opens its first window when there is nothing to
-restore). Only that process saves it, on exit, at sign-out, shutdown or
-reboot, when the display configuration changes, and one second after a burst
-of window, tab or pane structural changes settles. These checkpoints use the
-same ownership, scrollback opt-in and sensitive-input exclusions as the exit
-save; startup restoration completes before checkpointing is enabled. The save at sign-out,
-shutdown or reboot is the last one and never deletes the file, even with no
-windows left: the sign-out also ends the shells, so an empty window list
-then says nothing about what was closed on purpose. A launch that forwards
+restore). Only that process saves it: as the session's last window goes, at
+sign-out, shutdown or reboot, when the display configuration changes, and one
+second after a burst of window, tab or pane structural changes settles. These
+checkpoints use the same ownership, scrollback opt-in and sensitive-input
+exclusions as the save when the last window goes; startup restoration
+completes before checkpointing is enabled.
+
+The saved session is what the last window held just before it went, however
+it went: its close button, Alt+F4 or the taskbar, `close_window`, the X of its
+only tab, `close_tab:this` on its last tab (saved as the tab closes, not when
+its undo time runs out), `close_surface` on its last pane, its last shell
+exiting, `quit`, `close_all_windows`, or an update install. The quick terminal
+is never a session window, and neither is a window left empty after its last
+tab closed, which stays only for undo. Undo history is never saved: a tab or
+pane closed while other tabs or windows stayed open does not come back on the
+next launch, even if noctty quits before its undo time runs out. Undoing the
+close of the last tab, or opening a new tab or window, continues the session.
+No save deletes the file: with no window to record, a save writes nothing.
+The save at sign-out, shutdown or reboot is the last one: the sign-out also
+ends the shells, and the panes they leave are not saved over it. A launch that forwards
 to a running noctty, a window opened with `--working-directory` (Explorer's
 "Open noctty here" and the jump list's recent folders) or with `-e` or
 `initial-command`, the startup profile picker, a `--launch-layout` or
