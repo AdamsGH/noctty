@@ -77,10 +77,10 @@ if (Test-Path -LiteralPath (Join-Path $repoRoot 'src\build\docker\debian')) {
 }
 
 # The Release workflow's Chocolatey push runs for every stable release unless
-# the repository variable CHOCOLATEY_PUBLISH is 'off', the switch for the
-# months chocolatey.org refuses the push (docs/chocolatey-publishing.md). An
-# unset variable still pushes, a prerelease never does, the key stays mapped,
-# and nothing else may skip the step or hide its failure.
+# the repository variable CHOCOLATEY_PUBLISH is 'off', the switch for while
+# chocolatey.org refuses the push (docs/chocolatey-publishing.md). An unset
+# variable still pushes, a prerelease never does, the key stays mapped, and
+# nothing else may skip the step or hide its failure.
 $releaseChocolateyCondition = 'if: steps.meta.outputs.prerelease != ''true'' && vars.CHOCOLATEY_PUBLISH != ''off'''
 function Test-ReleaseChocolateyStep {
     param([Parameter(Mandatory)] [string] $Text)
