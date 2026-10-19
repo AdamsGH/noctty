@@ -31,6 +31,7 @@ const settings_transaction = @import("win32_settings_transaction.zig");
 const sys = @import("win32/sys.zig");
 const config_problems = @import("win32/config_problems.zig");
 const field_model = @import("win32_settings_fields.zig");
+const bench_trace = @import("win32/bench_trace.zig");
 const SetFocus = sys.SetFocus;
 
 /// Minimal set of Win32 aliases + externs we need here. Shared ABI structs
@@ -1517,6 +1518,7 @@ pub const AppHandle = struct {
 
 pub const SettingsWindow = struct {
     handle: AppHandle,
+    combo_trace: bench_trace.SettingsComboTrace = .{},
     hwnd: ?HWND = null,
     /// The form's own window (`viewport_class_name`): every field, its label
     /// and the help text are its children, so its client area is what clips
@@ -1693,7 +1695,7 @@ pub const SettingsWindow = struct {
     wheel_lines_override: ?u32 = null,
 
     pub fn init(handle: AppHandle) SettingsWindow {
-        return .{ .handle = handle };
+        return .{ .handle = handle, .combo_trace = bench_trace.SettingsComboTrace.init(handle.alloc) };
     }
 
     fn canInitializeCustomUiaProviders(self: *const SettingsWindow) bool {
@@ -1768,6 +1770,7 @@ pub const SettingsWindow = struct {
     }
 
     pub fn deinit(self: *SettingsWindow) void {
+        defer self.combo_trace.deinit();
         self.freeNoteText();
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) _ = sys.DestroyWindow(h);
@@ -9645,9 +9648,16 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
             const previous = settings.control_uia_prev_procs[index];
             if (msg == win32_uia.SettingsControlProvider.action_message) {
                 if (settings.control_uia_providers[index]) |provider| {
+                    const trace_action = settings.combo_trace.enabled() and
+                        (wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.expand) or
+                            wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.collapse));
+                    if (trace_action)
+                        settings.combo_trace.noteEvent(.action_received, sys.GetDlgCtrlID(hwnd), sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
                     if (wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.expand) and sys.IsWindowEnabled(hwnd) != 0)
                         settings.ensureControlVisible(hwnd);
                     const hr = provider.handleAction(wParam, lParam);
+                    if (trace_action)
+                        settings.combo_trace.noteEvent(.action_returned, sys.GetDlgCtrlID(hwnd), sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
                     return if (hr == @import("win32_uia/com.zig").S_OK) win32_uia.SettingsControlProvider.action_success else hr;
                 }
                 return @import("win32_uia/com.zig").UIA_E_ELEMENTNOTAVAILABLE;
@@ -9665,7 +9675,20 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
                 }
             }
             if (previous) |proc| {
+                if (settings.combo_trace.enabled() and settings_control_specs[index].role == .combo_box) {
+                    const event: ?bench_trace.SettingsComboTrace.Event = switch (msg) {
+                        WM_KILLFOCUS => .focus_lost,
+                        0x0215 => .capture_changed, // WM_CAPTURECHANGED
+                        else => null,
+                    };
+                    if (event) |tag|
+                        settings.combo_trace.noteEvent(tag, sys.GetDlgCtrlID(hwnd), sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+                }
+                if (msg == 0x014F and settings.combo_trace.enabled())
+                    settings.combo_trace.note(sys.GetDlgCtrlID(hwnd), wParam != 0, sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0, null);
                 const result = sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+                if (msg == 0x014F and settings.combo_trace.enabled())
+                    settings.combo_trace.note(sys.GetDlgCtrlID(hwnd), wParam != 0, sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0, result);
                 if (msg == WM_SETFOCUS) {
                     if (settings.control_uia_providers[index]) |provider| provider.raiseFocusChanged();
                 }
@@ -10387,6 +10410,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_COMMAND => {
             const id: usize = wParam & 0xFFFF;
             const notify: u16 = @intCast((wParam >> 16) & 0xFFFF);
+            if (notify == 8 and lParam != 0) { // CBN_CLOSEUP
+                if (owner) |o| if (o.combo_trace.enabled()) {
+                    const control: HWND = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                    if (o.controlIndex(control)) |index| {
+                        if (settings_control_specs[index].role == .combo_box)
+                            o.combo_trace.noteEvent(.closeup, sys.GetDlgCtrlID(control), sys.SendMessageW(control, CB_GETDROPPEDSTATE, 0, 0) != 0);
+                    }
+                };
+            }
             // Popup mouse input is delivered to its list HWND. Native combo
             // notifications are the reliable point to announce the resulting
             // expansion / selection state, after draft handlers have run.
