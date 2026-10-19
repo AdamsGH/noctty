@@ -292,27 +292,29 @@ class Fixture {
         string action=a[0], marker=a[1]; uint output;
         if(GetConsoleMode(GetStdHandle(-11),out output)) SetConsoleMode(GetStdHandle(-11),output|4);
         if(action=="interrupt") {
-            // Registering a handler does NOT reset the inherited ignore bit.
-            // Never call SetConsoleCtrlHandler(NULL,FALSE) in this fixture.
-            Console.CancelKeyPress+=(s,e)=> { File.WriteAllText(marker+".interrupted","yes"); Environment.Exit(0); };
-            uint input;
-            if(!GetConsoleMode(GetStdHandle(-10),out input)) return Fail(marker,14);
-            File.WriteAllText(marker+".input-mode",input.ToString());
-            File.WriteAllText(marker+".desktop",ObjectName(GetProcessWindowStation())+"\\"+ObjectName(GetThreadDesktop(GetCurrentThreadId())));
-            // ProcessConsoleHostProcess (49) returns the actual console server,
-            // with low flag bits. GetConsoleWindow's owner can masquerade as
-            // the root client and DLL presence does not rule out fallback.
-            UIntPtr server; uint returned;
-            if(NtQueryInformationProcess(new IntPtr(-1),49,out server,(uint)UIntPtr.Size,out returned)<0 || returned!=(uint)UIntPtr.Size) return Fail(marker,15);
-            int hostPid=checked((int)(server.ToUInt64()&~3UL));
-            if(hostPid==0) return Fail(marker,16);
-            File.WriteAllText(marker+".host-pid",hostPid.ToString());
-            using(var host=Process.GetProcessById(hostPid)) File.WriteAllText(marker+".host-image",host.MainModule.FileName);
-            var peb=(PebHeader)Marshal.PtrToStructure(RtlGetCurrentPeb(),typeof(PebHeader));
-            var parameters=(ParametersHeader)Marshal.PtrToStructure(peb.parameters,typeof(ParametersHeader));
-            File.WriteAllText(marker+".ignore",(parameters.consoleFlags&1).ToString());
-            File.WriteAllText(marker+".ready.tmp",Process.GetCurrentProcess().Id.ToString());
-            File.Move(marker+".ready.tmp",marker+".ready");
+            try {
+                // Registering a handler does NOT reset the inherited ignore bit.
+                // Never call SetConsoleCtrlHandler(NULL,FALSE) in this fixture.
+                Console.CancelKeyPress+=(s,e)=> { File.WriteAllText(marker+".interrupted","yes"); Environment.Exit(0); };
+                uint input;
+                if(!GetConsoleMode(GetStdHandle(-10),out input)) return Fail(marker,14);
+                File.WriteAllText(marker+".input-mode",input.ToString());
+                File.WriteAllText(marker+".desktop",ObjectName(GetProcessWindowStation())+"\\"+ObjectName(GetThreadDesktop(GetCurrentThreadId())));
+                // ProcessConsoleHostProcess (49) returns the actual console server,
+                // with low flag bits. GetConsoleWindow's owner can masquerade as
+                // the root client and DLL presence does not rule out fallback.
+                UIntPtr server; uint returned;
+                if(NtQueryInformationProcess(new IntPtr(-1),49,out server,(uint)UIntPtr.Size,out returned)<0 || returned!=(uint)UIntPtr.Size) return Fail(marker,15);
+                int hostPid=checked((int)(server.ToUInt64()&~3UL));
+                if(hostPid==0) return Fail(marker,16);
+                File.WriteAllText(marker+".host-pid",hostPid.ToString());
+                using(var host=Process.GetProcessById(hostPid)) File.WriteAllText(marker+".host-image",host.MainModule.FileName);
+                var peb=(PebHeader)Marshal.PtrToStructure(RtlGetCurrentPeb(),typeof(PebHeader));
+                var parameters=(ParametersHeader)Marshal.PtrToStructure(peb.parameters,typeof(ParametersHeader));
+                File.WriteAllText(marker+".ignore",(parameters.consoleFlags&1).ToString());
+                File.WriteAllText(marker+".ready.tmp",Process.GetCurrentProcess().Id.ToString());
+                File.Move(marker+".ready.tmp",marker+".ready");
+            } catch(Exception) { return Fail(marker,17); }
             Thread.Sleep(Timeout.Infinite); return 0;
         }
         if(action=="paste") {
