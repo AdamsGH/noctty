@@ -9921,10 +9921,46 @@ pub const RepeatableCommand = struct {
             item.* = try item.clone(alloc);
         }
 
+        // Cloning value_c directly would copy Command.C structs
+        // whose string pointers still reference the source config's
+        // memory — the clone must stay valid after the source is
+        // freed.
+        var value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty;
+        try value_c.ensureTotalCapacityPrecise(alloc, value.items.len);
+        for (value.items) |item| {
+            value_c.appendAssumeCapacity(try item.cval(alloc));
+        }
+
         return .{
             .value = value,
-            .value_c = try self.value_c.clone(alloc),
+            .value_c = value_c,
         };
+    }
+
+    test "RepeatableCommand clone owns C command strings" {
+        const testing = std.testing;
+        var copy_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer copy_arena.deinit();
+        const copy = copy: {
+            var source_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer source_arena.deinit();
+            var source: Self = .{};
+            try source.parseCLI(source_arena.allocator(), "title:Custom,description:Description,action:text:payload");
+            const result = try source.clone(copy_arena.allocator());
+            const original_c = source.value_c.items[0];
+            const copied_c = result.value_c.items[0];
+            // Check ownership before releasing the source, so the regression
+            // fails without reading freed memory on the broken clone.
+            try testing.expect(copied_c.action != original_c.action);
+            try testing.expect(copied_c.title == result.value.items[0].title.ptr);
+            try testing.expect(copied_c.description == result.value.items[0].description.ptr);
+            break :copy result;
+        };
+        const command_c = copy.cval().commands[0];
+        try testing.expectEqualStrings("text:payload", std.mem.span(command_c.action));
+        try testing.expectEqualStrings("Custom", std.mem.span(command_c.title));
+        try testing.expectEqualStrings("Description", std.mem.span(command_c.description));
+        try testing.expectEqualStrings("text", std.mem.span(command_c.action_key));
     }
 
     /// Compare if two of our value are equal. Required by Config.
@@ -11518,6 +11554,43 @@ test "clone default" {
 
     // I want to do this but this doesn't work (the API doesn't work)
     // try testing.expectEqualDeep(dest, source);
+}
+
+test "clone command C view survives source config deinit" {
+    const testing = std.testing;
+    var copy = copy: {
+        var source = try Config.default(testing.allocator);
+        defer source.deinit();
+        const alloc = source._arena.?.allocator();
+        try source.@"command-palette-entry".parseCLI(alloc, "title:Custom,action:open_config");
+        var result = try source.clone(testing.allocator);
+        errdefer result.deinit();
+        const original = source.@"command-palette-entry".cval();
+        const cloned = result.@"command-palette-entry".cval();
+        try testing.expectEqual(original.len, cloned.len);
+        // Assert ownership before deinit so broken clones fail without UAF.
+        const custom = cloned.len - 1;
+        try testing.expect(original.commands[custom].action != cloned.commands[custom].action);
+        try testing.expect(original.commands[custom].title != cloned.commands[custom].title);
+        break :copy result;
+    };
+    defer copy.deinit();
+    const commands = copy.@"command-palette-entry".cval();
+    try testing.expectEqual(inputpkg.command.defaults.len + 1, commands.len);
+    for (inputpkg.command.defaultsC, 0..) |expected, i| {
+        try testing.expectEqualStrings(std.mem.span(expected.action), std.mem.span(commands.commands[i].action));
+        try testing.expectEqualStrings(std.mem.span(expected.title), std.mem.span(commands.commands[i].title));
+    }
+    const custom = commands.commands[commands.len - 1];
+    try testing.expectEqualStrings("open_config", std.mem.span(custom.action));
+    try testing.expectEqualStrings("Custom", std.mem.span(custom.title));
+    try testing.expectEqualStrings("", std.mem.span(custom.description));
+
+    // Clearing the palette must stay empty through another complete clone.
+    try copy.@"command-palette-entry".parseCLI(copy._arena.?.allocator(), "");
+    var empty = try copy.clone(testing.allocator);
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.@"command-palette-entry".cval().len);
 }
 
 test "default quit-after-last-window-closed is enabled in the Windows fork" {
