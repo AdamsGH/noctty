@@ -43,6 +43,48 @@ pub const SettingsOpenStage = enum {
     settings_open_error,
 };
 
+/// The steps `SettingsWindow.open` takes to build the window. A stamp is taken
+/// as a step ends, so the time since the stamp before it is that step's.
+pub const SettingsCreationStage = enum {
+    create_begin,
+    create_config,
+    create_frame,
+    create_theme,
+    create_fonts,
+    create_rail,
+    create_form,
+    create_actions,
+    create_annotate,
+    create_refresh,
+    create_layout,
+    create_show,
+    create_end,
+};
+
+/// Stamps `SettingsWindow.open` takes while it builds the window, kept in
+/// memory and written by the App after the open returns: one file write per
+/// open instead of one per stage, and none inside the work being timed.
+/// Disabled, `mark` reads one flag: no clock, syscall or allocation.
+pub const SettingsCreationStamps = struct {
+    pub const capacity = 32;
+
+    enabled: bool = false,
+    len: usize = 0,
+    stages: [capacity]SettingsCreationStage = undefined,
+    ticks: [capacity]u64 = undefined,
+    counters: [capacity]i64 = undefined,
+
+    pub fn mark(self: *SettingsCreationStamps, stage: SettingsCreationStage) void {
+        if (!self.enabled or self.len == capacity) return;
+        var counter: i64 = 0;
+        _ = QueryPerformanceCounter(&counter);
+        self.stages[self.len] = stage;
+        self.ticks[self.len] = GetTickCount64();
+        self.counters[self.len] = counter;
+        self.len += 1;
+    }
+};
+
 /// Ordered App/UI-thread diagnostics, separate from per-surface memory metrics.
 /// Only static stages and timestamps are accepted; no keys, config, or text.
 pub const SettingsOpenTrace = struct {
@@ -97,6 +139,35 @@ pub const SettingsOpenTrace = struct {
         self.writeRecord(file, line);
     }
 
+    /// Write the creation stamps one open took, in one write, and empty them.
+    /// Each record keeps its own tick and adds the performance counter in
+    /// microseconds, which resolves what the 15.6 ms tick cannot.
+    pub fn noteCreation(self: *SettingsOpenTrace, stamps: *SettingsCreationStamps) void {
+        defer stamps.len = 0;
+        const file = self.file orelse return;
+        var frequency: i64 = 0;
+        if (QueryPerformanceFrequency(&frequency) == 0 or frequency <= 0) return;
+        var buf: [SettingsCreationStamps.capacity * max_record_bytes]u8 = undefined;
+        var used: usize = 0;
+        var count: u16 = 0;
+        for (stamps.stages[0..stamps.len], stamps.ticks[0..stamps.len], stamps.counters[0..stamps.len]) |stage, tick, counter| {
+            if (self.records + count == max_records) break;
+            const line = formatCreationRecord(buf[used..][0..max_record_bytes], tick, stage, counterMicroseconds(counter, frequency)) catch {
+                self.deinit();
+                return;
+            };
+            used += line.len;
+            count += 1;
+        }
+        if (count == 0) return;
+        file.writeAll(buf[0..used]) catch {
+            self.deinit();
+            return;
+        };
+        self.records += count;
+        if (self.records == max_records) self.deinit();
+    }
+
     fn writeRecord(self: *SettingsOpenTrace, file: std.fs.File, line: []const u8) void {
         file.writeAll(line) catch {
             self.deinit();
@@ -108,6 +179,15 @@ pub const SettingsOpenTrace = struct {
 
     fn formatRecord(buf: []u8, tick_ms: u64, stage: SettingsOpenStage) ![]const u8 {
         return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\"}}\n", .{ tick_ms, @tagName(stage) });
+    }
+
+    fn formatCreationRecord(buf: []u8, tick_ms: u64, stage: SettingsCreationStage, qpc_us: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\",\"qpc_us\":{d}}}\n", .{ tick_ms, @tagName(stage), qpc_us });
+    }
+
+    fn counterMicroseconds(counter: i64, frequency: i64) u64 {
+        if (counter <= 0) return 0;
+        return @intCast(@divTrunc(@as(i128, counter) * std.time.us_per_s, @as(i128, frequency)));
     }
 };
 
@@ -229,6 +309,65 @@ test "Settings open trace caps output and closes its owned handle" {
     try std.testing.expectEqual(@as(usize, SettingsOpenTrace.max_records), std.mem.count(u8, data, "\"stage\":\"open_config_action\""));
     trace.deinit();
     trace.note(.settings_open_enter);
+}
+
+test "Settings creation stamps cost one flag check while disabled" {
+    var stamps: SettingsCreationStamps = .{};
+    stamps.mark(.create_begin);
+    try std.testing.expectEqual(@as(usize, 0), stamps.len);
+    stamps.enabled = true;
+    for (0..SettingsCreationStamps.capacity + 3) |_| stamps.mark(.create_form);
+    try std.testing.expectEqual(@as(usize, SettingsCreationStamps.capacity), stamps.len);
+    try std.testing.expect(stamps.counters[0] <= stamps.counters[stamps.len - 1]);
+}
+
+test "Settings creation records carry the stage and both clocks" {
+    var buf: [SettingsOpenTrace.max_record_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":99,\"stage\":\"create_form\",\"qpc_us\":1234567}\n",
+        try SettingsOpenTrace.formatCreationRecord(&buf, 99, .create_form, 1234567),
+    );
+    inline for (std.meta.tags(SettingsCreationStage)) |stage| {
+        const line = try SettingsOpenTrace.formatCreationRecord(&buf, std.math.maxInt(u64), stage, std.math.maxInt(u64));
+        try std.testing.expect(line.len < SettingsOpenTrace.max_record_bytes);
+    }
+    // A 10 MHz counter at 25 s, and a counter that read nothing.
+    try std.testing.expectEqual(@as(u64, 25_000_000), SettingsOpenTrace.counterMicroseconds(250_000_000, 10_000_000));
+    try std.testing.expectEqual(@as(u64, 0), SettingsOpenTrace.counterMicroseconds(0, 10_000_000));
+}
+
+test "Settings creation stamps are written once, in order, within the record cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "trace.jsonl" });
+    defer alloc.free(path);
+    var trace = try SettingsOpenTrace.initPath(path);
+    defer trace.deinit();
+
+    var stamps: SettingsCreationStamps = .{ .enabled = true };
+    stamps.mark(.create_begin);
+    stamps.mark(.create_end);
+    trace.noteCreation(&stamps);
+    try std.testing.expectEqual(@as(usize, 0), stamps.len);
+    try std.testing.expectEqual(@as(u16, 2), trace.records);
+    const data = try tmp.dir.readFileAlloc(alloc, "trace.jsonl", 4096);
+    defer alloc.free(data);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data, "\n"));
+    const begin = std.mem.indexOf(u8, data, "\"stage\":\"create_begin\"").?;
+    const end = std.mem.indexOf(u8, data, "\"stage\":\"create_end\"").?;
+    try std.testing.expect(begin < end);
+
+    // The file closes at the cap, part way through a batch.
+    trace.records = SettingsOpenTrace.max_records - 1;
+    stamps.mark(.create_begin);
+    stamps.mark(.create_end);
+    trace.noteCreation(&stamps);
+    try std.testing.expect(!trace.enabled());
+    try std.testing.expectEqual(@as(usize, 0), stamps.len);
+    trace.noteCreation(&stamps);
 }
 
 /// Resolve a trace output path against the current working directory.

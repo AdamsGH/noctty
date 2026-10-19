@@ -10966,6 +10966,10 @@ pub const App = struct {
         // Skipping the fallback would regress CI / sandboxed flows
         // that previously worked.
         self.settings_open_trace.note(.settings_open_enter);
+        // The window's own steps, timed in memory and written after the
+        // outcome so no file write lands inside the work being timed.
+        self.settings_window.creation_stamps.enabled = self.settings_open_trace.enabled();
+        defer self.settings_open_trace.noteCreation(&self.settings_window.creation_stamps);
         self.settings_window.open() catch |err| {
             self.settings_open_trace.note(.settings_open_error);
             std.log.warn("settings window unavailable (err={}); falling back to editor", .{err});

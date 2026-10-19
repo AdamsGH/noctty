@@ -1519,6 +1519,9 @@ pub const AppHandle = struct {
 pub const SettingsWindow = struct {
     handle: AppHandle,
     combo_trace: bench_trace.SettingsComboTrace = .{},
+    /// How long each step of the last `open` took, when the App's
+    /// `NOCTTY_SETTINGS_OPEN_TRACE` is on; the App writes and empties it.
+    creation_stamps: bench_trace.SettingsCreationStamps = .{},
     hwnd: ?HWND = null,
     /// The form's own window (`viewport_class_name`): every field, its label
     /// and the help text are its children, so its client area is what clips
@@ -4278,6 +4281,9 @@ pub const SettingsWindow = struct {
             }
             self.hwnd = null;
         }
+        const stamps = &self.creation_stamps;
+        stamps.len = 0;
+        stamps.mark(.create_begin);
         self.resetClosePromptState();
         self.close_notified = false;
         self.focus_before_deactivate = null;
@@ -4287,6 +4293,7 @@ pub const SettingsWindow = struct {
         // or atomically refreshed after a successful save.
         self.status_note = .none;
         try self.adoptCurrentConfig();
+        stamps.mark(.create_config);
 
         if (self.class_atom == 0) {
             const wc: WNDCLASSEXW = .{
@@ -4396,6 +4403,7 @@ pub const SettingsWindow = struct {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        stamps.mark(.create_frame);
 
         const btn_class = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
         self.text_header = makeStatic(hwnd, self.handle.hinstance, "Appearance");
@@ -4416,6 +4424,7 @@ pub const SettingsWindow = struct {
         self.btn_section_advanced = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.advanced);
         self.subclassSectionButtons();
         self.initializeSectionUiaProviders();
+        stamps.mark(.create_rail);
 
         // The form: every field, its label and the help text live in the
         // viewport, after the rail in z-order so Tab goes rail, fields, action
@@ -4468,6 +4477,7 @@ pub const SettingsWindow = struct {
             }
         }
         self.initializeTextUiaProviders();
+        stamps.mark(.create_form);
 
         // "Save" button — always visible; writes `pending` to disk
         // and fires a hard reload. Save errors are logged and the draft
@@ -4571,6 +4581,7 @@ pub const SettingsWindow = struct {
             self.handle.hinstance,
             null,
         );
+        stamps.mark(.create_actions);
 
         // Painted field labels keep the native dark visual treatment, while
         // MSAA annotations give the existing EDIT/COMBO HWNDs stable names
@@ -4582,18 +4593,25 @@ pub const SettingsWindow = struct {
         for (self.comboControls()) |combo| if (combo) |control| subclassKeepingPrevious(control, &settingsComboProc);
         for (self.editControls()) |edit| if (edit) |control| subclassKeepingPrevious(control, &settingsEditProc);
         self.applyTabOrder();
+        stamps.mark(.create_annotate);
         // Establish native values before providers cache their initial state.
         self.refreshAllControls();
         self.initializeControlUiaProviders();
         self.refreshNativeSectionText();
+        stamps.mark(.create_refresh);
         self.theme_adapter.apply(hwnd, self.resolveThemeColors());
+        stamps.mark(.create_theme);
         self.recreateUiFont();
+        stamps.mark(.create_fonts);
 
         layoutChildren(self);
         self.applySectionVisibility();
+        stamps.mark(.create_layout);
         _ = sys.ShowWindow(hwnd, SW_SHOWNORMAL);
+        stamps.mark(.create_show);
         _ = sys.SetForegroundWindow(hwnd);
         if (self.sectionButton(self.active_section)) |button| _ = sys.SetFocus(button);
+        stamps.mark(.create_end);
     }
 };
 
@@ -5599,6 +5617,34 @@ test "settings initial native theme does not reenter font and layout work" {
             _ = sys.SendMessageW(fixture.hwnd(), WM_THEMECHANGED, 0, 0);
             try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
             try std.testing.expectEqualDeep(fonts, .{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font });
+        }
+    }.body);
+}
+
+test "settings open stamps each creation step once when traced" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const stamps = &settings.creation_stamps;
+            stamps.enabled = true;
+            try settings.open();
+            const all = comptime std.meta.tags(bench_trace.SettingsCreationStage);
+            try std.testing.expectEqual(all.len, stamps.len);
+            try std.testing.expectEqual(bench_trace.SettingsCreationStage.create_begin, stamps.stages[0]);
+            try std.testing.expectEqual(bench_trace.SettingsCreationStage.create_end, stamps.stages[stamps.len - 1]);
+            for (all) |stage| try std.testing.expectEqual(@as(usize, 1), std.mem.count(bench_trace.SettingsCreationStage, stamps.stages[0..stamps.len], &.{stage}));
+            for (stamps.counters[1..stamps.len], stamps.counters[0 .. stamps.len - 1]) |later, earlier| try std.testing.expect(later >= earlier);
+
+            // Raising the open window is not a creation; a disabled trace takes nothing.
+            stamps.len = 0;
+            try settings.open();
+            try std.testing.expectEqual(@as(usize, 0), stamps.len);
+            settings.closeNow(fixture.hwnd());
+            stamps.enabled = false;
+            try settings.open();
+            try std.testing.expectEqual(@as(usize, 0), stamps.len);
         }
     }.body);
 }
@@ -7700,6 +7746,14 @@ const dialog_test = struct {
         }
 
         fn startWith(custom_uia: bool) !*Fixture {
+            const self = try prepare(custom_uia);
+            errdefer self.finish();
+            try self.settings.open();
+            return self;
+        }
+
+        /// The fixture with its window not opened yet.
+        fn prepare(custom_uia: bool) !*Fixture {
             const self = try std.testing.allocator.create(Fixture);
             errdefer std.testing.allocator.destroy(self);
             self.* = .{
@@ -7725,7 +7779,6 @@ const dialog_test = struct {
                 .onClosed = &onClosed,
             });
             self.settings.wheel_lines_override = 3;
-            try self.settings.open();
             return self;
         }
 
