@@ -147,7 +147,8 @@ that govern each symbol you change, or that none does.
   write pool in `termio/Exec.zig`, `ResizePseudoConsole`, in-box conhost
   versus the bundled `conpty.dll`/`OpenConsole.exe`
   (`scripts/stage-conpty-redist.ps1`), what ConPTY's buffer holds after a
-  resize, minimize, clear or undo.
+  resize, minimize, clear or undo, the Ctrl+C-ignore attribute hosted shells
+  inherit (`process_shared.enableGuiChildCtrlC` in `src/main_ghostty.zig`).
 - [shell-integration.md](docs/agents/log/shell-integration.md): scripts under
   `src/shell-integration/` (PowerShell `integration.ps1`, cmd/Clink, Git
   Bash's `ghostty.bash`) and their injection (`termio/shell_integration.zig`
@@ -218,7 +219,9 @@ that govern each symbol you change, or that none does.
   (`win32_surface_drop*.zig`), pending clipboard confirmations.
 - [settings.md](docs/agents/log/settings.md): the Settings window
   (`win32_settings.zig`, `win32_settings_fields.zig`): its controls, dialog
-  manager, viewport, live preview, its own UIA patterns, and the save path
+  manager, viewport, live preview, theming (`SettingsThemeAdapter`,
+  `themeChanged`), its own UIA patterns and combo trace
+  (`NOCTTY_SETTINGS_COMBO_TRACE`, `win32/bench_trace.zig`), and the save path
   (`settingsSaveAndReload`, `patchOrAppendEdits`, save target, masked values).
 - [accessibility.md](docs/agents/log/accessibility.md): new widgets and UI
   events (adding a native widget, or changing its focus, children or
@@ -230,7 +233,9 @@ that govern each symbol you change, or that none does.
   the Settings window: the config file reader (`cli/args.zig` `LineIterator`,
   `Config.file_read_buffer_len`), `--config-file` and `startup_cwd` on reload,
   diagnostics shown in the GUI, conditional replay, `newConfig` shallow
-  clones, `+edit-config` and opening the config file, adding config keys.
+  clones, `RepeatableCommand.clone` and its C mirror (`value_c`,
+  `Command.cval`), `+edit-config` and opening the config file, adding config
+  keys.
 - [app-lifecycle.md](docs/agents/log/app-lifecycle.md): `App.init` and
   startup stalls, startup attempts and safe mode, session state and
   state-file schemas, IPC and single instance (`win32/ipc_server.zig`), AUMID
@@ -253,8 +258,9 @@ that govern each symbol you change, or that none does.
   interactive composite, the flagship contracts), CI test steps, the Zig test
   runner's probe children and thread tests (`src/pty_transport_probe.zig`,
   `std.Progress.lockStdErr`, the search-thread tests in
-  `src/terminal/search/Thread.zig`), and a test count or result that
-  contradicts the code.
+  `src/terminal/search/Thread.zig`), PSReadLine history isolation
+  (`scripts/windows-harness-history.ps1`, `--command=cmd.exe` pins), and a
+  test count or result that contradicts the code.
 - [tooling.md](docs/agents/log/tooling.md): declaring `extern` functions or
   structs, casting Win32 handles and `LPARAM`/`LRESULT` (`@intCast`,
   `@bitCast`, `@ptrFromInt`), passing `[:0]u16` to text APIs, renaming Zig

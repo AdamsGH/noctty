@@ -13,7 +13,9 @@
         "src/termio/**",
         "src/build/ConptyRedist.zig",
         "scripts/stage-conpty-redist.ps1",
-        "src/apprt/win32.zig"
+        "src/apprt/win32.zig",
+        "src/process_shared.zig",
+        "src/main_ghostty.zig"
       ]
     },
     {
@@ -154,7 +156,8 @@
         "src/apprt/win32_settings*.zig",
         "src/apprt/win32/save_target.zig",
         "test/windows/settings-uia-*.ps1",
-        "src/apprt/win32.zig"
+        "src/apprt/win32.zig",
+        "src/apprt/win32/bench_trace.zig"
       ]
     },
     {
@@ -173,7 +176,8 @@
         "src/config/**",
         "src/cli/**",
         "src/apprt/win32/config_problems.zig",
-        "src/apprt/win32.zig"
+        "src/apprt/win32.zig",
+        "src/input/command.zig"
       ]
     },
     {
@@ -229,7 +233,8 @@
         "scripts/interactive-win11*",
         ".github/workflows/**",
         "src/pty_transport_probe.zig",
-        "src/terminal/search/Thread.zig"
+        "src/terminal/search/Thread.zig",
+        "scripts/windows-harness-history.ps1"
       ]
     },
     {
