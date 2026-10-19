@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 20
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-shaders.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Settling delay before shader-output validation.
 $script:SHADER_SETTLE_MS = 750
@@ -182,3 +187,7 @@ finally {
 }
 
 Write-Host "interactive Win11 shader validation: PASS (RGB=$($color.R),$($color.G),$($color.B), screenshot=$screenshotPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

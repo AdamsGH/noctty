@@ -62,6 +62,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot 'settings-open-readiness.psm1') -Force
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 if ($TestTraceParser) { Test-SettingsOpenTraceParser; return }
 
 if (-not ('Set91.Native' -as [type])) {
@@ -583,6 +584,8 @@ if (-not $WorkerDesktop) {
         'OutputDirectory must be outside the source stage.'
     [void](New-Item -ItemType Directory -Path $OutputDirectory)
     $before = Get-GuardSnapshot
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness (Split-Path -Leaf $PSCommandPath)
+    $historyFailure = $null
     $script:clipboardBase = $before.clipboard
     Write-Json (Join-Path $OutputDirectory 'guard-before.json') $before
     $savedLocal = $env:LOCALAPPDATA
@@ -682,6 +685,7 @@ if (-not $WorkerDesktop) {
             ($before.files | ConvertTo-Json -Depth 8 -Compress) -ceq ($after.files | ConvertTo-Json -Depth 8 -Compress) -and
             ($realBefore | ConvertTo-Json -Depth 8 -Compress) -ceq ($realAfter | ConvertTo-Json -Depth 8 -Compress)
         } catch { $cleanupErrors.Add('Final guard snapshot: ' + $_.Exception.Message) }
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure = $_; $cleanupErrors.Add($_.Exception.Message) }
         Write-Json (Join-Path $OutputDirectory 'summary.json') ([ordered]@{
             pass = ($null -eq $failure -and $workerCode -eq 0 -and $guardPass -and $cleanupErrors.Count -eq 0)
             workerExit = $workerCode; guardPass = $guardPass; error = $failure
@@ -692,6 +696,7 @@ if (-not $WorkerDesktop) {
             newDestinations = $newDestinations; coldRequested = $ColdOpenCount; reloadRequested = $ReloadCount
         })
     }
+    if ($historyFailure) { throw $historyFailure }
     Assert-Contract ($cleanupErrors.Count -eq 0) 'Cleanup or final guard receipt failed; inspect summary.json. Stop launches.'
     Assert-Contract $guardPass 'Real startup/history, shell destination metadata or clipboard sequence changed; stop launches and inspect guard artifacts.'
     Assert-Contract ($null -eq $failure) "Runner failed: $failure"

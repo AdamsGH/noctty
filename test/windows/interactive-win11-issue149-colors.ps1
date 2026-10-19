@@ -7,6 +7,11 @@ param(
     [ValidateRange(10, 300)] [int]$TimeoutSeconds = 60
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-issue149-colors.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $launcher = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -314,7 +319,7 @@ Assert-Issue149PublicConfig $cli 'default' '282c34' 'ffffff' 'cc6666' $repoRoot
 $run = $null
 $primaryError = $null
 try {
-    $run = Start-StatefulApp $layout $exe $repoRoot 'issue149-colors'
+    $run = Start-StatefulApp $layout $exe $repoRoot 'issue149-colors' -UseConfiguredCommand
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $hostHwnd = Wait-StatefulHost $run $deadline
     Wait-InteractiveWin11Until -Deadline $deadline -Description 'initial issue149 payload marker' -Process $run.Process -Condition {
@@ -387,3 +392,7 @@ finally {
 
 if ($null -ne $primaryError) { throw $primaryError }
 Write-Host 'PASS: issue #149 default/theme/explicit colors reached the presented WGL framebuffer across reload, new tab, and new split.'
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

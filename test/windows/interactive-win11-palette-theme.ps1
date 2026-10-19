@@ -1,5 +1,10 @@
 [CmdletBinding()]
 param([switch]$Rebuild, [switch]$ResetState, [switch]$ExerciseHighContrast, [int]$TimeoutSeconds = 60)
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-palette-theme.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 # Settling delay after restoring palette-theme presentation state.
 $script:PALETTE_THEME_SETTLE_MS = 750
@@ -332,3 +337,7 @@ finally {
 }
 if ($null -ne $primaryError) { throw $primaryError }
 Write-Host "interactive-win11 palette-theme validation: PASS (config=$configPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

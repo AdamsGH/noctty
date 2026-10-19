@@ -16,6 +16,11 @@ param(
     [switch] $Worker
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-stale-modes.ps1'
+try {
+
+
 # PKG-16 runtime checks. Never launches the supplied executable in place.
 # Each case owns a portable copy, redirected AppData, and a hidden desktop.
 # Paste additionally requires its own windowstation: clipboard is shared
@@ -662,7 +667,7 @@ try {
         $integration = Join-Path $RunRoot 'share\ghostty\shell-integration\powershell\integration.ps1'
         if (-not (Test-Path -LiteralPath $integration)) { throw 'Copied PowerShell integration missing.' }
         $bootstrap = Join-Path $RunRoot 'bootstrap.ps1'
-        [IO.File]::WriteAllText($bootstrap, "Import-Module PSReadLine`nSet-PSReadLineOption -HistorySavePath '$RunRoot\history.txt' -HistorySaveStyle SaveNothing`n`$Global:__pkg16_prompt_sequence = 0`nfunction global:prompt { `$Global:__pkg16_prompt_sequence++; [IO.File]::WriteAllText('$RunRoot\prompt.sequence', [string]`$Global:__pkg16_prompt_sequence); 'PKG16> ' }`n. '$integration'`n[IO.File]::WriteAllText('$RunRoot\boot.ready','yes')`n")
+        [IO.File]::WriteAllText($bootstrap, "try {`nImport-Module PSReadLine -ErrorAction Stop`nSet-PSReadLineOption -HistorySavePath '$RunRoot\history.txt' -HistorySaveStyle SaveNothing -ErrorAction Stop`nif ((Get-PSReadLineOption).HistorySavePath -cne '$RunRoot\history.txt' -or (Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing') { exit 1 }`n} catch { exit 1 }`n`$Global:__pkg16_prompt_sequence = 0`nfunction global:prompt { `$Global:__pkg16_prompt_sequence++; [IO.File]::WriteAllText('$RunRoot\prompt.sequence', [string]`$Global:__pkg16_prompt_sequence); 'PKG16> ' }`n. '$integration'`n[IO.File]::WriteAllText('$RunRoot\boot.ready','yes')`n")
         $configText += 'command = direct:"' + (Get-Command pwsh.exe).Source + '" -NoProfile -NoLogo -NoExit -ExecutionPolicy Bypass -File "' + $bootstrap + '"' + "`n"
     }
     else { $configText += "command = direct:cmd.exe /d /q`n" }
@@ -797,3 +802,7 @@ finally {
     $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $RunRoot 'result.json')
 }
 if ($result.status -ne 'PASS') { exit 1 }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

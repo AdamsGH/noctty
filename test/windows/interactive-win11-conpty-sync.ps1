@@ -13,6 +13,11 @@ param(
     [string] $ResultPath
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-conpty-sync.ps1'
+try {
+
+
 # Differential harness: does noctty's screen agree with ConPTY's?
 #
 # ConPTY keeps its own copy of the screen. Console-API programs (cmd's line
@@ -507,7 +512,7 @@ if ($Inner) {
         $historyPath = Join-Path $script:Work "$Name-psreadline-history.txt"
         [IO.File]::WriteAllLines($historyPath, [string[]]@($History), (New-Object System.Text.UTF8Encoding $false))
         $integration = Join-Path $RunRoot 'tools\integration.ps1'
-        return ('{0} -NoLogo -NoProfile -NoExit -Command "Set-PSReadLineOption -HistorySavePath ''{1}'' -HistorySaveStyle SaveAtExit {2}; & {{ $__ghostty_utf8_console = $false; . ([scriptblock]::Create([IO.File]::ReadAllText(''{3}''))) }}"' -f
+        return ('{0} -NoLogo -NoProfile -NoExit -Command "try {{ Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -HistorySavePath ''{1}'' -HistorySaveStyle SaveAtExit {2} -ErrorAction Stop; if ((Get-PSReadLineOption).HistorySavePath -cne ''{1}'' -or (Get-PSReadLineOption).HistorySaveStyle -ne ''SaveAtExit'') {{ exit 1 }} }} catch {{ exit 1 }}; & {{ $__ghostty_utf8_console = $false; . ([scriptblock]::Create([IO.File]::ReadAllText(''{3}''))) }}"' -f
             $Exe, $historyPath, $ExtraOptions, $integration)
     }
 
@@ -539,7 +544,7 @@ if ($Inner) {
         [IO.File]::WriteAllLines($configPath, [string[]]$config, (New-Object System.Text.UTF8Encoding $false))
         # The shared composer adds the Job Object containment, a private
         # single-instance class per scenario, and nothing else.
-        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" })) +
+        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" }) -UseConfiguredCommand) +
             @("`"--config-file=$configPath`"")
         $process = [NocttyConptySyncNative]::StartOnDesktop($script:Exe, ($arguments -join ' '), $script:Work, $DesktopName)
         $ctx = [pscustomobject]@{
@@ -1194,3 +1199,7 @@ $passCount = @($results | Where-Object Status -eq 'PASS').Count
 $xfailCount = @($results | Where-Object Status -eq 'XFAIL').Count
 $skipCount = @($results | Where-Object Status -eq 'SKIP').Count
 Write-Host ("interactive-win11 conpty-sync validation: PASS (scenarios={0}, in-sync={1}, known-desync={2}, skipped={3}, evidence={4})" -f $results.Count, $passCount, $xfailCount, $skipCount, (Join-Path $runRoot 'evidence'))
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

@@ -27,6 +27,7 @@ param(
     [ValidateRange(60,900)] [int] $DriverTimeoutSeconds = 600
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -213,6 +214,7 @@ if(-not $Driver) {
         Compile-Helper (Join-Path $PSScriptRoot 'console-attach-info.c') (Join-Path $Run 'console-attach-info.exe') $compileJob $root
     } finally { [void][HerdrMouse]::StopOwnedJob($compileJob) }
     $before=Startup-Fingerprint
+    $historyGuard=Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-herdr-mouse.ps1'
     if($BaselineHash -and $before.Hash -ne $BaselineHash.ToLowerInvariant()) { throw 'Real startup state differs from the adopted baseline; stop launches.' }
     $portable=Join-Path $Run 'source\bin'; [void](New-Item -ItemType Directory -Path $portable)
     Get-ChildItem -LiteralPath $Bin -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $portable }
@@ -247,8 +249,11 @@ if(-not $Driver) {
         [void][HerdrMouse]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{Before=$before;After=$after;Unchanged=$unchanged;OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$owned} |
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        @{Before=$before;After=$after;Unchanged=$unchanged;HistoryUnchanged=($null -eq $historyFailure);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$owned} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if($historyFailure) { throw $historyFailure }
         if(-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if($cleanupError) { throw $cleanupError }
     }

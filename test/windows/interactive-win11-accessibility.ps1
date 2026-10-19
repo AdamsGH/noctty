@@ -8,6 +8,11 @@ param(
     [int] $IdleSoakSeconds = 60
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-accessibility.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Recurring cadence for accessibility, focus, and window-state polls.
 $script:ACCESSIBILITY_POLL_MS = 100
@@ -3474,7 +3479,7 @@ $layout = $harness.Layout
 # The commands this harness types are cmd syntax (`%TEMP%\wgh*.cmd`), so the terminal must run cmd.exe.
 # Since #443 the default shell is pwsh when installed, where `%TEMP%` is not expanded and the launcher
 # never runs ("Timed out waiting for terminal marker launcher output" in release evidence 39164175922).
-$accessibilityLaunchArguments = @(Get-InteractiveWin11LaunchArguments -Layout $layout) + @('--command=cmd.exe')
+$accessibilityLaunchArguments = @(Get-InteractiveWin11LaunchArguments -Layout $layout)
 $exe = Get-InteractiveWin11ExePath -RepoRoot $repoRoot
 if ((Get-InteractiveWin11LaunchAction -ExePath $exe -Rebuild:$Rebuild -BuildInputs (Get-InteractiveWin11DefaultBuildInputs -RepoRoot $repoRoot)) -eq 'build') {
     Invoke-InteractiveWin11Build -RepoRoot $repoRoot
@@ -6207,6 +6212,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$ownerProbeClass"
+        '--command=cmd.exe'
     )
     $ownerProbeProcess = Start-Process -FilePath $exe -ArgumentList $ownerProbeArguments `
         -WorkingDirectory $repoRoot -RedirectStandardOutput $ownerProbeStdout -RedirectStandardError $ownerProbeStderr -PassThru
@@ -6524,6 +6530,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$saveProbeClass"
+        '--command=cmd.exe'
     )
     $saveProbeProcess = Start-AccessibilityProcessWithEnvironment `
         -FilePath $exe `
@@ -6599,6 +6606,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$saveVerifyClass"
+        '--command=cmd.exe'
     )
     $saveVerifyProcess = Start-AccessibilityProcessWithEnvironment `
         -FilePath $exe `
@@ -7388,3 +7396,7 @@ if ($failureMessages.Count -gt 0) {
 }
 
 Write-Host "interactive Win11 accessibility: PASS ($artifact)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

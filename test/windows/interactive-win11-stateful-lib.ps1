@@ -127,10 +127,10 @@ function Get-StatefulPixel([IntPtr] $Hwnd) {
     }
 }
 
-function Start-StatefulApp($Layout, [string] $Exe, [string] $RepoRoot, [string] $Name, [string[]] $ExtraArguments = @()) {
+function Start-StatefulApp($Layout, [string] $Exe, [string] $RepoRoot, [string] $Name, [string[]] $ExtraArguments = @(), [switch] $UseConfiguredCommand) {
     $stdout = Join-Path $Layout.Logs "$Name-stdout.log"
     $stderr = Join-Path $Layout.Logs "$Name-stderr.log"
-    $arguments = @((Get-InteractiveWin11LaunchArguments -Layout $Layout)) + @($ExtraArguments)
+    $arguments = @((Get-InteractiveWin11LaunchArguments -Layout $Layout -UseConfiguredCommand:$UseConfiguredCommand)) + @($ExtraArguments)
     $process = Start-Process -FilePath $Exe -ArgumentList $arguments `
         -WorkingDirectory $RepoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     return [pscustomobject]@{ Process = $process; Stdout = $stdout; Stderr = $stderr }

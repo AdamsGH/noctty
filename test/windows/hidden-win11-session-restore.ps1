@@ -87,6 +87,7 @@ if (-not $Driver) {
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Source Bin must contain noctty.exe.' }
     $before = Startup-Fingerprint
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-session-restore.ps1'
     $clipboardBefore = [HiddenLocal]::GetClipboardSequenceNumber()
     if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
     [void](New-Item -ItemType Directory -Path $Run)
@@ -118,7 +119,10 @@ if (-not $Driver) {
         $after=Startup-Fingerprint
         $clipboardAfter=[HiddenLocal]::GetClipboardSequenceNumber()
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{ Before=$before; After=$after; Unchanged=$unchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=($null -eq $historyFailure); OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if ($historyFailure) { throw $historyFailure }
         if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if ($clipboardBefore -ne $clipboardAfter) { throw "Clipboard sequence number changed ($clipboardBefore -> $clipboardAfter); stop launches and report it." }
         if($cleanupError) { throw $cleanupError }

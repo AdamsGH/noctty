@@ -3,6 +3,11 @@
 param([string] $ExePath, [string] $RunRoot, [switch] $Worker,
       [ValidateSet('context-menu','ignore','copy')] [string] $RightClickAction = 'context-menu',
       [switch] $ObserveBaseline)
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-mouse-input.ps1'
+try {
+
 # No clipboard access, SendInput, cursor movement, or foreground changes.
 # All messages target a portable instance on a newly created hidden desktop.
 $ErrorActionPreference = 'Stop'
@@ -223,3 +228,7 @@ finally {
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $RunRoot 'result.json')
 }
 if ($result.status -ne 'PASS') { exit 1 }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}
