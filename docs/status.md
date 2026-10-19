@@ -265,13 +265,15 @@ Win32-validated VT protocol coverage is tracked in
 ### Windows package managers
 
 - WinGet package id: `AmanThanvi.noctty` (published; `winget install --id AmanThanvi.noctty -e`).
-- Chocolatey package id: `noctty` (the release workflow builds it and its
-  last step runs after WinGet, but the publish script skips the push while no
-  `CHOCO_API_KEY` secret is configured, as in 1.3.132; community.chocolatey.org
-  had no `noctty` package on 2026-10-16). The first submission then waits in
-  moderation for weeks, and later pushes get `403` until a version is
-  approved; see [chocolatey-publishing.md](chocolatey-publishing.md). A
-  released version is pushed with the manual Chocolatey Publish workflow.
+- Chocolatey package id: `noctty`, with no approved version on
+  community.chocolatey.org. The release workflow builds the package and its
+  last step, after WinGet, pushes it, but another community account submitted
+  `noctty` 1.3.131 on 2026-10-16 and owns the id, so chocolatey.org refused
+  this repository's pushes of 1.3.132 and 1.3.133 with `403`; a handover was
+  requested on 2026-10-19. The repository variable `CHOCOLATEY_PUBLISH = off`
+  skips that step until a push can succeed; see
+  [chocolatey-publishing.md](chocolatey-publishing.md). A released version is
+  pushed with the manual Chocolatey Publish workflow.
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
 
 ### Crash reports
