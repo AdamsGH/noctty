@@ -6,6 +6,7 @@ param(
 . (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 $windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-validate.ps1'
 $savedMeasureAumid = $env:NOCTTY_INTERACTIVE_MEASURE_AUMID
+$windowsHarnessStateGuard = $null
 try {
 
 
@@ -17,6 +18,8 @@ $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = '1'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $suiteLogDir = Join-Path $env:TEMP ("noctty-interactive-win11-suite-{0}" -f $PID)
 New-Item -ItemType Directory -Force -Path $suiteLogDir | Out-Null
+. (Join-Path $repoRoot 'scripts\interactive-win11-state-guard.ps1')
+$windowsHarnessStateGuard = Start-InteractiveWin11StateGuard -Harness 'interactive-win11-validate.ps1' -ReceiptDirectory $suiteLogDir
 $libPath = Join-Path $repoRoot 'scripts\interactive-win11-lib.ps1'
 . $libPath
 
@@ -350,9 +353,15 @@ if ($finalProvenance.Head -cne $suiteProvenance.Head -or $finalProvenance.ExeSHA
     (Get-InteractiveWin11MeasureHash ([IO.File]::ReadAllBytes($buildEvidence))) -cne $buildEvidenceHash) {
     throw 'Measurement HEAD, binaries, or provenance evidence changed during the composite suite.'
 }
-Write-Host "interactive-win11 validate suite: PASS ($suiteLogDir)"
-
 } finally {
     $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $savedMeasureAumid
-    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+    # Run both even if either fails, and retain both failure messages.
+    $guardFailures = [Collections.Generic.List[string]]::new()
+    try {
+        if ($null -ne $windowsHarnessStateGuard) { Assert-InteractiveWin11StateGuard -Guard $windowsHarnessStateGuard }
+    } catch { $guardFailures.Add($_.Exception.Message) }
+    try { Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard }
+    catch { $guardFailures.Add($_.Exception.Message) }
+    if ($guardFailures.Count) { throw ($guardFailures -join [Environment]::NewLine) }
 }
+Write-Host "interactive-win11 validate suite: PASS ($suiteLogDir)"

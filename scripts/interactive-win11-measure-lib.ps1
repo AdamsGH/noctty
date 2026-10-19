@@ -149,12 +149,15 @@ function Get-InteractiveWin11MeasurePatchedBytes {
 function Get-InteractiveWin11MeasureFiles {
     param([Parameter(Mandatory)] [string] $Root)
 
+    # The caller checks Root and its ancestors. Enumerate each directory only
+    # after checking its attributes; recursive enumeration could follow a link.
     $pending = New-Object 'Collections.Generic.Stack[string]'
     $pending.Push($Root)
     while ($pending.Count -gt 0) {
-        foreach ($item in (Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop)) {
+        $directory = [IO.DirectoryInfo]::new($pending.Pop())
+        foreach ($item in $directory.EnumerateFileSystemInfos()) {
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Measurement tree contains a reparse point.' }
-            if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+            if ($item.Attributes -band [IO.FileAttributes]::Directory) { $pending.Push($item.FullName) }
             else { $item.FullName }
         }
     }
@@ -184,48 +187,62 @@ function Assert-InteractiveWin11MeasureSource {
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
     $stream = New-Object IO.MemoryStream(,$archiveBytes)
     $zip = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Read)
+    # Validate every source descendant before opening any source file. The
+    # complete set also detects missing and unexpected files without repeating
+    # the provider/ancestor walk for each of several thousand archived files.
+    $remaining = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $expected = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $sha = [Security.Cryptography.SHA256]::Create()
     $sourcePrefix = $Layout.Source + [IO.Path]::DirectorySeparatorChar
     $originalHash = $null
     $patchedHash = $null
     $originalNotifierHash = $null
     $measuredNotifierHash = $null
     try {
+        foreach ($file in (Get-InteractiveWin11MeasureFiles $Layout.Source)) { [void] $remaining.Add($file) }
         foreach ($entry in $zip.Entries) {
             if ($entry.FullName.EndsWith('/')) { continue }
-            $path = [IO.Path]::GetFullPath((Join-Path $Layout.Source $entry.FullName))
+            $path = [IO.Path]::GetFullPath([IO.Path]::Combine($Layout.Source, $entry.FullName))
             if (-not $path.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase) -or -not $expected.Add($path)) {
                 throw 'Invalid or duplicate measurement archive path.'
             }
+            if (-not $remaining.Remove($path)) { throw "Missing measurement source file: $($entry.FullName)" }
             $entryStream = $entry.Open()
-            $bytes = New-Object IO.MemoryStream
-            try { $entryStream.CopyTo($bytes); $wanted = $bytes.ToArray() }
-            finally { $entryStream.Dispose(); $bytes.Dispose() }
-            if ($entry.FullName -ceq 'src/apprt/win32_aumid.zig') {
-                $originalHash = Get-InteractiveWin11MeasureHash $wanted
-                $wanted = Get-InteractiveWin11MeasurePatchedBytes $wanted
-                $patchedHash = Get-InteractiveWin11MeasureHash $wanted
+            try {
+                if ($entry.FullName -ceq 'src/apprt/win32_aumid.zig' -or $entry.FullName -ceq 'src/apprt/win32.zig') {
+                    $bytes = [IO.MemoryStream]::new()
+                    try { $entryStream.CopyTo($bytes); $wanted = $bytes.ToArray() }
+                    finally { $bytes.Dispose() }
+                    if ($entry.FullName -ceq 'src/apprt/win32_aumid.zig') {
+                        $originalHash = Get-InteractiveWin11MeasureHash $wanted
+                        $wanted = Get-InteractiveWin11MeasurePatchedBytes $wanted
+                        $patchedHash = Get-InteractiveWin11MeasureHash $wanted
+                    }
+                    else {
+                        $originalNotifierHash = Get-InteractiveWin11MeasureHash $wanted
+                        Assert-InteractiveWin11MeasureProductNotifierSource $wanted
+                        $measuredNotifierHash = $originalNotifierHash
+                    }
+                    $wantedHash = [Convert]::ToBase64String($sha.ComputeHash($wanted))
+                }
+                else { $wantedHash = [Convert]::ToBase64String($sha.ComputeHash($entryStream)) }
             }
-            elseif ($entry.FullName -ceq 'src/apprt/win32.zig') {
-                $originalNotifierHash = Get-InteractiveWin11MeasureHash $wanted
-                Assert-InteractiveWin11MeasureProductNotifierSource $wanted
-                $measuredNotifierHash = $originalNotifierHash
-            }
-            Assert-InteractiveWin11MeasurePlainPath $path
-            if ((Get-InteractiveWin11MeasureHash ([IO.File]::ReadAllBytes($path))) -cne (Get-InteractiveWin11MeasureHash $wanted)) {
+            finally { $entryStream.Dispose() }
+            $actualStream = [IO.File]::OpenRead($path)
+            try { $actualHash = [Convert]::ToBase64String($sha.ComputeHash($actualStream)) }
+            finally { $actualStream.Dispose() }
+            if ($actualHash -cne $wantedHash) {
                 throw "Measurement source differs from the expected HEAD plus AUMID patch: $($entry.FullName)"
             }
         }
-        foreach ($file in (Get-InteractiveWin11MeasureFiles $Layout.Source)) {
-            if (-not $expected.Contains($file)) { throw 'Unexpected file in measurement source tree.' }
-        }
+        if ($remaining.Count -ne 0) { throw 'Unexpected file in measurement source tree.' }
         if (-not $originalHash -or -not $originalNotifierHash -or
             $sourceReceipt.OriginalAumidSHA256 -cne $originalHash -or $sourceReceipt.PatchedAumidSHA256 -cne $patchedHash -or
             $sourceReceipt.OriginalNotifierSHA256 -cne $originalNotifierHash -or $sourceReceipt.MeasuredNotifierSHA256 -cne $measuredNotifierHash) {
             throw 'Measurement source patch hashes do not match HEAD.'
         }
     }
-    finally { $zip.Dispose(); $stream.Dispose() }
+    finally { $sha.Dispose(); $zip.Dispose(); $stream.Dispose() }
     return $sourceReceipt
 }
 
@@ -267,8 +284,10 @@ function Assert-InteractiveWin11MeasureBuild {
     $layout = Get-InteractiveWin11MeasureLayout $RepoRoot
     Assert-InteractiveWin11MeasurePlainPath $layout.Root
     Assert-InteractiveWin11MeasurePlainPath (Join-Path $layout.Root 'build.lock')
-    # A build holds this file open exclusively until the final receipt is valid.
-    $lock = [IO.File]::Open((Join-Path $layout.Root 'build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    # Readers may validate the same generation concurrently. A builder holds
+    # this file exclusively until the final receipt is valid, excluding both
+    # readers and other builders in either acquisition order.
+    $lock = [IO.File]::Open((Join-Path $layout.Root 'build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try { Assert-InteractiveWin11MeasureBuildCore $layout $ExePath }
     finally { $lock.Dispose() }
 }

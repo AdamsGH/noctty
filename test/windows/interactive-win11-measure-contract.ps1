@@ -169,10 +169,32 @@ $buildInputBytes = [IO.File]::ReadAllBytes($buildInput)
 [IO.File]::AppendAllText($buildInput, 'tampered')
 Assert-MeasureContractRejected 'changed other source' { Assert-MeasureFixture }
 [IO.File]::WriteAllBytes($buildInput, $buildInputBytes)
+[IO.File]::Delete($buildInput)
+Assert-MeasureContractRejected 'missing archived source file' { Assert-MeasureFixture }
+[IO.File]::WriteAllBytes($buildInput, $buildInputBytes)
 $unexpected = Join-Path $layout.Source 'injected.zig'
 [IO.File]::WriteAllText($unexpected, '// unexpected source')
 Assert-MeasureContractRejected 'added source file' { Assert-MeasureFixture }
 [IO.File]::Delete($unexpected)
+$unexpectedDirectory = Join-Path $layout.Source 'hidden-extra'
+[void] [IO.Directory]::CreateDirectory($unexpectedDirectory)
+[IO.File]::SetAttributes($unexpectedDirectory, [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::Hidden)
+$unexpectedNested = Join-Path $unexpectedDirectory 'injected.zig'
+[IO.File]::WriteAllText($unexpectedNested, '// unexpected nested source')
+Assert-MeasureContractRejected 'added file in hidden directory' { Assert-MeasureFixture }
+[IO.File]::Delete($unexpectedNested)
+[IO.Directory]::Delete($unexpectedDirectory)
+# A directory junction has the same ReparsePoint gate as a symbolic link. Put
+# it on an expected ancestor so accepting its target's matching bytes fails.
+$plainDirectory = Join-Path $layout.Source 'src\apprt'
+$savedDirectory = Join-Path $fixtureRoot 'saved-apprt'
+[IO.Directory]::Move($plainDirectory, $savedDirectory)
+try {
+    [void] (New-Item -ItemType Junction -Path $plainDirectory -Target $savedDirectory -ErrorAction Stop)
+    try { Assert-MeasureContractRejected 'reparse ancestor with matching source bytes' { Assert-MeasureFixture } }
+    finally { [IO.Directory]::Delete($plainDirectory) }
+}
+finally { [IO.Directory]::Move($savedDirectory, $plainDirectory) }
 [IO.File]::AppendAllText($originalPath, 'tampered')
 Assert-MeasureContractRejected 'changed original AUMID bytes' { Assert-MeasureFixture }
 [IO.File]::WriteAllBytes($originalPath, $script:measureContractOriginal)
@@ -203,6 +225,68 @@ $buildReceipt.Aumid = 'io.github.amanthanvi.noctty.measure'
 $heldLock = [IO.File]::Open((Join-Path $layout.Root 'build.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 try { Assert-MeasureContractRejected 'in-progress build lock' { Assert-MeasureFixture } }
 finally { $heldLock.Dispose() }
+# Run the actual build validator in two runspaces. Pause both only after their
+# complete source checks, while their reader locks are still held, so overlap
+# and the reverse-order builder exclusion are observed rather than inferred.
+$ready = [Threading.CountdownEvent]::new(2)
+$release = [Threading.ManualResetEventSlim]::new($false)
+$context = [pscustomobject]@{
+    LibraryPath = [IO.Path]::GetFullPath($LibraryPath); Root = $fixtureRoot; Exe = $layout.Exe
+    Head = $script:measureContractHead; Original = $script:measureContractOriginal
+    Notifier = $script:measureContractNotifier; Archive = $script:measureContractArchive
+    GitBody = ${function:Invoke-InteractiveWin11MeasureGit}.ToString()
+}
+$readerScript = @'
+param($Context, $Ready, $Release)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. $Context.LibraryPath
+$script:measureContractHead = $Context.Head
+$script:measureContractOriginal = $Context.Original
+$script:measureContractNotifier = $Context.Notifier
+$script:measureContractArchive = $Context.Archive
+$script:measureContractDirty = $false
+Set-Item Function:Invoke-InteractiveWin11MeasureGit ([scriptblock]::Create($Context.GitBody))
+$validateSource = ${function:Assert-InteractiveWin11MeasureSource}
+function Assert-InteractiveWin11MeasureSource {
+    param($Layout, [string] $Head)
+    $receipt = & $validateSource $Layout $Head
+    [void] $Ready.Signal()
+    if (-not $Release.Wait(15000)) { throw 'Concurrent validator release timed out.' }
+    return $receipt
+}
+Assert-InteractiveWin11MeasureBuild -RepoRoot $Context.Root -ExePath $Context.Exe
+'@
+$readers = @()
+try {
+    foreach ($readerIndex in 1..2) {
+        $pipeline = [PowerShell]::Create()
+        [void] $pipeline.AddScript($readerScript).AddArgument($context).AddArgument($ready).AddArgument($release)
+        $readers += [pscustomobject]@{ Pipeline = $pipeline; Pending = $pipeline.BeginInvoke() }
+    }
+    if (-not $ready.Wait(15000)) { throw 'Two measurement validators did not hold reader locks concurrently.' }
+    $script:measureContractChecks++
+    Assert-MeasureContractRejected 'builder while concurrent validators hold reader locks' {
+        $writer = [IO.File]::Open((Join-Path $layout.Root 'build.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $writer.Dispose()
+    }
+}
+finally {
+    $release.Set()
+    try {
+        $readerFailed = $false
+        foreach ($reader in $readers) {
+            try {
+                [void] $reader.Pipeline.EndInvoke($reader.Pending)
+                if ($reader.Pipeline.HadErrors) { $readerFailed = $true }
+            }
+            catch { $readerFailed = $true }
+            finally { $reader.Pipeline.Dispose() }
+        }
+        if ($readerFailed) { throw 'Concurrent measurement validator failed.' }
+    }
+    finally { $ready.Dispose(); $release.Dispose() }
+}
 Assert-MeasureFixture
 $script:measureContractChecks++
 Write-Output "PASS: $script:measureContractChecks measurement provenance checks (synthetic fixtures; no build or runtime)."
