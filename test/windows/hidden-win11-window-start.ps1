@@ -277,8 +277,10 @@ try {
     # Forwarded window keys: a new window copies the running window's size
     # (cascaded), decorations and opacity, and what the forwarded argv sets
     # wins over that copy. The reference is a first window whose config has
-    # the forwarded size. Caption buttons tell a decorated window: an
-    # undecorated one keeps its frame on Windows 11, so its style is the same.
+    # the forwarded size. The hit test where the close button is tells a
+    # decorated window (HTCLOSE) from an undecorated one, whose tab strip is
+    # there (HTCAPTION): on Windows 11 both keep the frame, so their style is
+    # the same.
     $case=Start-Case (New-Case 'keys-reference' @('window-save-state = never','window-width = 60','window-height = 20'))
     try { $reference=Sample 'keys-reference' $case.Host } finally { Stop-Case $case }
     function Close-Button($h,$s) { return [Ws]::HitTest($h,$s.Rect.Right-30,$s.Rect.Top+20) }
@@ -325,10 +327,18 @@ try {
             Check 'forwarded --window-width/height: the size it asked for' (((Size $s.Client) -join 'x') -eq ((Size $reference.Client) -join 'x')) (Size $reference.Client) (Size $s.Client)
             Close-Window $h
         }
+        # Placed and sized by the arguments, it is where they say at the size
+        # they ask for: core init sized it there, and the copy takes neither.
+        $h=Forward 'keys-position-size' '--window-position-x=400 --window-position-y=300 --window-width=60 --window-height=20'
+        if($h) {
+            $s=Sample 'keys-position-size' $h
+            Check 'forwarded position and size: placed there, at the size it asked for' ($s.Rect.Left -eq 400 -and $s.Rect.Top -eq 300 -and ((Size $s.Client) -join 'x') -eq ((Size $reference.Client) -join 'x')) @{Left=400; Top=300; Client=(Size $reference.Client)} @{Left=$s.Rect.Left; Top=$s.Rect.Top; Client=(Size $s.Client)}
+            Close-Window $h
+        }
         $h=Forward 'keys-decoration' '--window-decoration=none'
         if($h) {
             $s=Sample 'keys-decoration' $h; $hit=Close-Button $h $s
-            Check 'forwarded --window-decoration=none: no caption buttons' ($hit -ne 20) 'not HTCLOSE' $hit
+            Check 'forwarded --window-decoration=none: no caption buttons, the tab strip is there' ($hit -eq 2) 'HTCAPTION' $hit
             Close-Window $h
         }
         $h=Forward 'keys-opacity' '--background-opacity=0.6'
@@ -343,7 +353,7 @@ try {
         $h=Forward 'keys-none-open' '--window-position-x=400 --window-position-y=300 --window-width=60 --window-height=20 --window-decoration=none'
         if($h) {
             $s=Sample 'keys-none-open' $h; $hit=Close-Button $h $s
-            Check 'no window open: the forwarded place, size and decorations' ($s.Rect.Left -eq 400 -and $s.Rect.Top -eq 300 -and ((Size $s.Client) -join 'x') -eq ((Size $reference.Client) -join 'x') -and $hit -ne 20) @{Left=400; Top=300; Client=(Size $reference.Client); HitTest='not HTCLOSE'} @{Left=$s.Rect.Left; Top=$s.Rect.Top; Client=(Size $s.Client); HitTest=$hit}
+            Check 'no window open: the forwarded place, size and decorations' ($s.Rect.Left -eq 400 -and $s.Rect.Top -eq 300 -and ((Size $s.Client) -join 'x') -eq ((Size $reference.Client) -join 'x') -and $hit -eq 2) @{Left=400; Top=300; Client=(Size $reference.Client); HitTest='HTCAPTION'} @{Left=$s.Rect.Left; Top=$s.Rect.Top; Client=(Size $s.Client); HitTest=$hit}
         }
     } finally { Stop-Case $primary }
 
