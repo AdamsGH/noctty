@@ -2306,11 +2306,23 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `default`.
 ///
-/// On Windows the session's owning process saves on exit, at sign-out or
-/// shutdown, when the display configuration changes, and one second after
-/// a burst of window, tab or pane structural changes settles. Checkpoints
-/// use the same ownership and privacy rules as the exit save and never run
-/// during startup restore. The practical window/session shape includes:
+/// On Windows the session's owning process saves as the session ends (the
+/// last window going, however it goes: its close, its last tab or pane, its
+/// last shell exiting; or a quit, which saves every window it closes), at
+/// sign-out or shutdown, when the display configuration changes, and one
+/// second after a burst of window, tab or pane structural changes settles.
+/// The next launch restores what was open when the session ended; undo
+/// history is not saved, and no save deletes the file. One exception: a
+/// session restored at startup that nothing used (no input reached a running
+/// program, and no tab, pane, window or quick terminal was opened) and
+/// whose programs all ended by themselves is not saved back, since it would
+/// open and close again at every launch. Its saved file is renamed to
+/// `session-state.json.restore-ended` instead (up to five copies), and the
+/// next launch starts fresh. With all five names taken, the file is left in
+/// place and the next launch restores it again.
+/// Checkpoints use the same ownership and privacy rules as the save when the
+/// last window goes and never run during startup restore. The practical
+/// window/session shape includes:
 /// host window rectangle/state plus tab, split, profile, working-directory,
 /// and explicit title metadata. Child process state is not restored. The
 /// opt-in `window-save-state-scrollback` setting can additionally restore a

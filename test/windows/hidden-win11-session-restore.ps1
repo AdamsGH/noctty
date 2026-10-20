@@ -1,12 +1,16 @@
 #requires -Version 7.0
 <#
 Portable, hidden-desktop integration regression for session-file compatibility
-and restore placement (PKG-44). Run with -Bin <source bin directory> -Run <new
+and restore placement (PKG-44), and for what the saved session holds once its
+last window has gone (#497): -Scenario restore, last-window, or all (the
+default). Run with -Bin <source bin directory> -Run <new
 evidence directory>. The run directory must not already exist. Every file the
 app reads or writes is a sample this script creates beside a portable copy of
 the app: the real %LOCALAPPDATA%\noctty is never written or deleted, and only
 the hash and time of its startup state file are read, before and after. Never switches desktops,
-injects real input or registers a global hotkey, and nothing it does can copy (the
+injects real input or registers a global hotkey (the last-window cases press
+in-app keybinds with key messages sent to the pane, one case sends an arrow, one only Shift, and one clicks
+the pane), and nothing it does can copy (the
 clipboard belongs to the window station, not the desktop); the clipboard sequence number is logged
 before and after and a change fails the run. Optional
 ExpectedStartupHash/ExpectedStartupModified pin an adopted baseline.
@@ -21,7 +25,10 @@ param(
     [Parameter(Mandatory)] [string] $Run,
     [switch] $Driver,
     [string] $DesktopName,
-    [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 420,
+    [ValidateSet('all','restore','last-window')] [string] $Scenario = 'all',
+    # Last-window cases to run, comma-separated (all of them when empty).
+    [string] $Cases = '',
+    [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 600,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
 )
@@ -79,6 +86,50 @@ public static class Sr {
         try { if(!SetWindowPos(h,IntPtr.Zero,x,y,w,ht,0x14)) throw new Exception("SetWindowPos failed"); }
         finally { SetThreadDpiAwarenessContext(old); }
     }
+    [StructLayout(LayoutKind.Sequential)] struct Msg { public IntPtr h; public uint m; public IntPtr w,l; public uint t; public int x,y; }
+    [DllImport("user32.dll")] static extern bool PeekMessageW(out Msg m,IntPtr h,uint min,uint max,uint remove);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from,uint to,bool attach);
+    [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] state);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint flags,uint ms,out IntPtr result);
+    static void Send(IntPtr h,uint m,int key,long l) {
+        IntPtr result;
+        if(SendMessageTimeoutW(h,m,new IntPtr(key),new IntPtr(l),0,20000,out result)==IntPtr.Zero && Marshal.GetLastWin32Error()==1460)
+            throw new Exception("Key not handled within 20 s");
+    }
+    // A key-down and key-up for a pane (or a host with no tab), which runs the
+    // in-app keybind for that key. A keybind is not a global hotkey, so nothing
+    // is registered, and an F-key types no text. noctty reads the modifiers
+    // from its thread's keyboard state, which a private desktop never updates,
+    // so they are cleared there: this thread joins that input queue, and the
+    // key is sent rather than posted so noctty handles it before the queues
+    // part. The user's keyboard is another queue and is not touched.
+    public static void Key(IntPtr h,int key) {
+        uint pid; uint target=GetWindowThreadProcessId(h,out pid); uint me=GetCurrentThreadId();
+        Msg queue; PeekMessageW(out queue,IntPtr.Zero,0,0,0); // Give this thread an input queue.
+        if(target==0 || !AttachThreadInput(me,target,true)) throw new Exception("AttachThreadInput failed");
+        try {
+            if(!SetKeyboardState(new byte[256])) throw new Exception("SetKeyboardState failed");
+            Send(h,0x100,key,1);
+            // The keybind may have closed the window the key went to.
+            if(IsWindow(h)) Send(h,0x101,key,0xC0000001L);
+        } finally { AttachThreadInput(me,target,false); }
+    }
+    // A left click at (8,8) in a pane, sent as the keys are, with the
+    // modifiers cleared. Copy-on-select is off in the case that uses it, and
+    // a click that does not move selects nothing.
+    public static void Click(IntPtr h) {
+        uint pid; uint target=GetWindowThreadProcessId(h,out pid); uint me=GetCurrentThreadId();
+        Msg queue; PeekMessageW(out queue,IntPtr.Zero,0,0,0);
+        if(target==0 || !AttachThreadInput(me,target,true)) throw new Exception("AttachThreadInput failed");
+        try {
+            if(!SetKeyboardState(new byte[256])) throw new Exception("SetKeyboardState failed");
+            long at=(8<<16)|8;
+            Send(h,0x201,1,at);
+            if(IsWindow(h)) Send(h,0x202,0,at);
+        } finally { AttachThreadInput(me,target,false); }
+    }
 }
 '@
 if (-not $Driver) {
@@ -102,7 +153,7 @@ if (-not $Driver) {
         $job=[HiddenLocal]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Scenario {5} -Cases "{6}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName,$Scenario,$Cases
         $pi=[HiddenLocal]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -137,6 +188,9 @@ if (-not $Driver) {
 $script:checks=[Collections.Generic.List[object]]::new()
 $script:samples=[Collections.Generic.List[object]]::new()
 $script:processes=[Collections.Generic.List[object]]::new()
+# Every case runs with single instance off and a class of its own, so no copy
+# can reach a noctty already running on this machine.
+$runClass='noctty-test-sr-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 function Inside-AWork($r,$works) {
     foreach($w in $works) { if($r.Left -ge $w.Left -and $r.Top -ge $w.Top -and $r.Right -le $w.Right -and $r.Bottom -le $w.Bottom) { return $true } }
     return $false
@@ -161,7 +215,7 @@ function Session-Json($x,$y,$w,$h,[string]$State,[string]$Cwd,[bool]$Extra) {
     return ($doc | ConvertTo-Json -Depth 12 -Compress)
 }
 
-function New-Case([string]$Name,[hashtable]$Files,[string]$Extra='') {
+function New-Case([string]$Name,[hashtable]$Files,[string[]]$Extra=@()) {
     $dir=Join-Path $Run "$Name\bin"; Copy-Portable $Bin $dir
     foreach($relative in $Files.Keys) {
         $target=Join-Path $dir $relative
@@ -169,7 +223,7 @@ function New-Case([string]$Name,[hashtable]$Files,[string]$Extra='') {
         Set-Content -LiteralPath $target -Value $Files[$relative] -NoNewline -Encoding utf8NoBOM
     }
     $config=Join-Path $dir 'session.ghostty'
-    @('command = cmd.exe /d /k','shell-integration = none','single-instance = false','window-save-state = always','confirm-close-surface = false',$Extra) | Set-Content -LiteralPath $config
+    @('command = cmd.exe /d /k','shell-integration = none','single-instance = false','window-save-state = always','confirm-close-surface = false') + $Extra | Set-Content -LiteralPath $config
     return @{ Name=$Name; Dir=$dir; Config=$config }
 }
 function Start-Case($case,[switch]$NoLedgerWait) {
@@ -177,7 +231,7 @@ function Start-Case($case,[switch]$NoLedgerWait) {
     # An explicit lpDesktop: a child that a private-desktop driver starts with a null desktop can
     # land on the interactive desktop. The Process object holds its own handle before the launch
     # handles close, so it stays this launch's process.
-    $pi=[HiddenLocal]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$case.Config),$case.Dir,"WinSta0\$DesktopName")
+    $pi=[HiddenLocal]::Spawn($exe,('"{0}" --config-file="{1}" --single-instance=false --class={2}' -f $exe,$case.Config,$runClass),$case.Dir,"WinSta0\$DesktopName")
     try { $p=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$p.Handle }
     finally { [void][HiddenLocal]::CloseHandle($pi.thread); [void][HiddenLocal]::CloseHandle($pi.process) }
     $script:processes.Add(@{Case=$case.Name;Pid=$p.Id;StartTime=$p.StartTime.ToUniversalTime().ToString('o');Executable=$p.ProcessName})
@@ -215,11 +269,197 @@ function Stop-Case($case) {
         else { throw 'Exact process identity changed during cleanup.' }
     }
 }
+
+# #497 (last-window): every way the session's last window can go. Keys are
+# F-keys bound to the actions, sent to a pane with the modifiers cleared
+# ([Sr]::Key), so no chord is needed.
+$lastWindowConfig=@('keybind = f2=new_window','keybind = f3=close_all_windows','keybind = f4=new_tab','keybind = f5=close_tab:this',
+    'keybind = f6=close_surface','keybind = f7=quit','keybind = f8=toggle_quick_terminal','keybind = f9=undo',
+    'quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%')
+$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78; Down=0x28; Shift=0x10 }
+# The pane that is on screen in `$h`, or any pane when none is.
+function Pane($h) {
+    $all=@([HiddenLocal]::Surfaces($h)); $shown=@($all|Where-Object {([Sr]::Read($_)).Visible})
+    if($shown.Count) { return $shown[0] }
+    if($all.Count) { return $all[0] }
+    throw 'Host has no pane.'
+}
+function Press($h,[int]$Key,[int]$SettleMs=700) { [Sr]::Key($h,$Key); if($SettleMs) { Start-Sleep -Milliseconds $SettleMs } }
+function New-Hosts($case,$known) { return @([HiddenLocal]::Hosts($case.Process.Id)|Where-Object {$known -notcontains $_ -and @([HiddenLocal]::Surfaces($_)).Count -gt 0}) }
+function Post-Close($h) { if(-not [Sr]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero)) { throw 'WM_CLOSE post failed.' } }
+# Seeds a one-window session at a known rect, restores it, moves the window
+# whose state the file must end up holding, ends the session the way `$End`
+# names, and reads the file once the process has exited by itself. The move
+# comes after the last structural change has had its one-second checkpoint,
+# and a move saves nothing by itself, so the moved rect can only reach the
+# file through the save as the session ends. The process is never closed by
+# the harness before the file is read: a harness WM_CLOSE would save it.
+# -SetAside: the restored pane's program ends before any key reached it, so
+# the restore failed and the saved session must be moved aside, not saved
+# back (it would open and close again at every launch).
+function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(),[switch]$SetAside) {
+    $seedX=$work.Left+180; $seedY=$work.Top+140
+    $case=New-Case $Name @{ 'session-state.json'=(Session-Json $seedX $seedY 900 600 'normal' (Join-Path $Run "$Name\bin") $false) } ($lastWindowConfig + $Extra)
+    $path=Join-Path $case.Dir 'session-state.json'
+    $case=Start-Case $case
+    $exited=$false; $moved=$null
+    try {
+        $main=$case.Host; $target=$main; $qt=$null
+        switch($End) {
+            { $_ -in 'quick-terminal-quit','quick-terminal-close' } {
+                Press (Pane $main) $Vk.QuickTerminal 1500
+                $found=@(New-Hosts $case @($main))
+                if($found.Count -ne 1) { throw "$($Name): quick terminal absent." }
+                $qt=$found[0]
+            }
+            'first-of-two-windows' {
+                Press (Pane $main) $Vk.NewWindow 2500
+                $found=@(New-Hosts $case @($main))
+                if($found.Count -ne 1) { throw "$($Name): new window absent." }
+                $target=$found[0]
+            }
+            'undo-host-close' {
+                Press (Pane $main) $Vk.NewWindow 2500
+                $found=@(New-Hosts $case @($main))
+                if($found.Count -ne 1) { throw "$($Name): new window absent." }
+                $target=$found[0]
+                # The first window's only tab goes into undo history: an
+                # empty window kept for undo, which is not a session window.
+                Press (Pane $main) $Vk.CloseTab 1500
+            }
+            'close-window-two-tabs' { Press (Pane $main) $Vk.NewTab 1500 }
+            'undo-then-close' {
+                Press (Pane $main) $Vk.CloseTab 800
+                Press $main $Vk.Undo 0    # sent to the empty host, which routes it
+                if(-not (Wait-Until { @([HiddenLocal]::Surfaces($main)|Where-Object {([Sr]::Read($_)).Visible}).Count -eq 1 } 5)) { throw "$($Name): undo did not bring the tab back." }
+                Start-Sleep -Milliseconds 1500
+            }
+        }
+        [Sr]::Move($target,$work.Left+260,$work.Top+210,820,580); Start-Sleep -Milliseconds 500
+        $moved=Sample "$Name-moved" $target
+        switch($End) {
+            'close-tab' { Press (Pane $main) $Vk.CloseTab 0 }
+            'close-surface' { Press (Pane $main) $Vk.CloseSurface 0 }
+            'quit' { Press (Pane $main) $Vk.Quit 0 }
+            'close-all-windows' { Press (Pane $main) $Vk.CloseAll 0 }
+            'shell-exit' {
+                # The configured command exits by itself. A key while it runs
+                # uses the restored session.
+                if(-not $SetAside) { Press (Pane $main) $Vk.Down 0 }
+            }
+            'shell-exit-clicked' {
+                # The same with a click instead of a key.
+                [Sr]::Click((Pane $main))
+            }
+            'shell-exit-modifier' {
+                # Only Shift, pressed and released while the program runs:
+                # a modifier alone is not input for it.
+                Press (Pane $main) $Vk.Shift 0
+            }
+            'quick-terminal-quit' {
+                Post-Close $main
+                if(-not (Wait-Until { -not [Sr]::Alive($main) } 8)) { throw "$($Name): window did not close." }
+                Press (Pane $qt) $Vk.Quit 0
+            }
+            'first-of-two-windows' {
+                Post-Close $main
+                if(-not (Wait-Until { -not [Sr]::Alive($main) } 8)) { throw "$($Name): the first window did not close." }
+                Post-Close $target
+            }
+            'quick-terminal-close' {
+                Post-Close $main
+                if(-not (Wait-Until { -not [Sr]::Alive($main) } 8)) { throw "$($Name): window did not close." }
+                Post-Close $qt
+            }
+            { $_ -in 'undo-host-close','undo-then-close','close-window-two-tabs' } { Post-Close $target }
+            default { throw "Unknown ending $End." }
+        }
+        $exited=$case.Process.WaitForExit(30000)
+    } finally {
+        # Only this launch's own process, through the handle its Process
+        # object holds; never by name. Killing saves nothing.
+        if(-not $case.Process.HasExited) { $case.Process.Kill(); [void]$case.Process.WaitForExit(5000) }
+    }
+    Check "${Name}: the process ended by itself" $exited $true $exited
+    if($SetAside) {
+        $aside="$path.restore-ended"
+        $left=Test-Path -LiteralPath $path; $moved_aside=Test-Path -LiteralPath $aside
+        $breaker=@(Get-ChildItem -LiteralPath $case.Dir -Filter 'session-state.json.restore-failed*' -File).Count
+        Check "${Name}: nothing is saved back" (-not $left) 'absent' $(if($left){'present'}else{'absent'})
+        Check "${Name}: the saved session was moved aside" $moved_aside 'present' $(if($moved_aside){'present'}else{'absent'})
+        Check "${Name}: the crash breaker's slots are left free" ($breaker -eq 0) 0 $breaker
+        if($moved_aside) {
+            $held=@((Get-Content -LiteralPath $aside -Raw | ConvertFrom-Json).windows)
+            Check "${Name}: the moved session still holds its window" ($held.Count -eq 1) 1 $held.Count
+        }
+        return
+    }
+    $kept=Test-Path -LiteralPath $path
+    Check "${Name}: the saved session is still there" $kept 'present' $(if($kept){'present'}else{'deleted'})
+    if(-not $kept -or -not $moved) { return }
+    $saved=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $windows=@($saved.windows)
+    Check "${Name}: it holds one window" ($windows.Count -eq 1) 1 $windows.Count
+    if($windows.Count -ne 1) { return }
+    $w=$windows[0]
+    Check "${Name}: with the tabs it had as it went" (@($w.tabs).Count -eq $Tabs) $Tabs @($w.tabs).Count
+    $savedRect=[pscustomobject]@{Left=$w.x;Top=$w.y;Right=$w.x+$w.width;Bottom=$w.y+$w.height}
+    Check "${Name}: at the rect it had as it went" ($null -ne $w.x -and (Rect-Same $savedRect $moved.Rect)) (Rect-Array $moved.Rect) (Rect-Array $savedRect)
+}
+
 try {
     $work=[Sr]::PrimaryWork()
     $works=@([Sr]::Works())
     $script:samples.Add(@{Name='work-areas'; State=@($works | ForEach-Object { ,(Rect-Array $_) })})
 
+    if($Scenario -in 'all','last-window') {
+        $endings=@(
+            # The reporter's case first: close_tab:this on the last tab, with
+            # the default undo-timeout (the window and process go when it runs out).
+            @{ Name='close-tab' },
+            @{ Name='close-surface' },
+            # The restored pane's shell exits by itself after a key: saved.
+            @{ Name='shell-exit'; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
+            # The same with a click: saved.
+            @{ Name='shell-exit-clicked'; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul','copy-on-select = false') },
+            # The same with no key: that restore failed, and is moved aside.
+            @{ Name='shell-exit-untouched'; End='shell-exit'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
+            # The same with only Shift pressed and released: still unused.
+            @{ Name='shell-exit-modifier'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
+            @{ Name='quit' },
+            @{ Name='close-all-windows' },
+            # A quick terminal is never a session window: the last real window
+            # closes while one is open, then a quit from it, or its own close.
+            @{ Name='quick-terminal-quit' },
+            @{ Name='quick-terminal-close' },
+            # The first of two windows closes (its tab is not the shell model's
+            # last), then the other one, which the session keeps.
+            @{ Name='first-of-two-windows' },
+            # Nor is a window kept empty for undo after its last tab closed.
+            @{ Name='undo-host-close' },
+            # An undo brings the session back, so the next close saves it again.
+            @{ Name='undo-then-close' },
+            # The window's own close saves both tabs; closing its panes one by
+            # one after that must not save the last one alone over it.
+            @{ Name='close-window-two-tabs'; Tabs=2 }
+        )
+        $only=@($Cases -split ',' | Where-Object { $_ })
+        # A name no case has fails the run: a typo must not pass by running nothing.
+        $known=@($endings | ForEach-Object { $_.Name })
+        foreach($name in $only) {
+            if($known -notcontains $name) { $script:checks.Add(@{Name="${name}: a last-window case by that name"; Passed=$false; Error="No last-window case is named '$name'."}) }
+        }
+        foreach($ending in $endings) {
+            if($only.Count -and $only -notcontains $ending.Name) { continue }
+            # One case failing to run is that case's failure, not the others'.
+            $tabs=if($ending.Tabs){$ending.Tabs}else{1}
+            $end=if($ending.End){$ending.End}else{$ending.Name}
+            try { Last-Window $ending.Name $end $tabs @($ending.Extra | Where-Object { $_ }) -SetAside:([bool]$ending.SetAside) }
+            catch { $script:checks.Add(@{Name="$($ending.Name): case ran"; Passed=$false; Error=$_.Exception.Message}) }
+        }
+    }
+
+    if($Scenario -in 'all','restore') {
     # G037: a session a newer build wrote is left exactly as it was.
     $newerSession='{"schema_version":2,"windows":[{"layout_v2":{"zones":[1,2]}}],"future":true}'
     $case=New-Case 'newer-session' @{ 'session-state.json'=$newerSession }
@@ -323,12 +563,13 @@ try {
     $case=Start-Case $case
     try { } finally { Stop-Case $case }
     Check 'integration.ps1 from an older build replaced' ((Get-Item -LiteralPath $script).Length -gt 1000) 'embedded script' (Get-Item -LiteralPath $script).Length
+    }
 } catch {
     $script:checks.Add(@{Name='Harness execution'; Passed=$false; Error=$_.Exception.Message})
 } finally {
     $remaining=@($script:processes | Where-Object {Get-Process -Id $_.Pid -ErrorAction SilentlyContinue})
     Check 'owned runtime processes exited' ($remaining.Count -eq 0) 0 $remaining.Count
-    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script; real pointer, shell input, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
+    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, in-app keybinds, one arrow and one Shift pressed with key messages sent to the pane, and one click sent to a pane; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
-if($failed.Count){exit 1}
+if($failed.Count){ $failed | ForEach-Object { Write-Host ("FAIL: " + $_.Name) }; exit 1 }
