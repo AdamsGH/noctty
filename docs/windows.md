@@ -1151,7 +1151,9 @@ unplugged or the layout changed, or Windows capped an extreme size or position),
 the window moves to the nearest monitor's
 work area, its size capped to it. A window with a caption's worth of title bar
 (48 px wide) on some monitor stays where it was, even if the rest
-of it hangs off the screen.
+of it hangs off the screen. A launch that asked for a minimized window
+(`start /min`, a shortcut set to Run: Minimized) restores windows the same
+way: they come back at their saved rect, not minimized.
 
 `maximize = true` and `fullscreen = true` (or `--maximize` and
 `--fullscreen=true` on the command line) apply to restored windows too: each
