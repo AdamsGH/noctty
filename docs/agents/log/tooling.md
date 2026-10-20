@@ -4,6 +4,7 @@ Dates descend; entries that share a date are not always newest first. A newer-da
 
 See also:
 - PowerShell traps filed where they were found: a one-element array from `if`/`switch` unrolls to a scalar (item 6 of the 2026-10-17 "The manual Chocolatey Publish workflow" entry in build-release-ci.md); `@($a + 1, $b)` parses as `$a + (1, $b)` (the 2026-10-16 "The real-input check of #285" entry in window-frame.md, harness traps).
+- A struct argument or a `const` copy of an aggregate can alias a list element: the 2026-10-19 `closeWindow` aliasing entry in tabs-panes.md.
 
 - 2026-05-02: Lowercasing Zig type aliases to satisfy naming review can collide with same-named declarations or locals in Zig's shared declaration namespace; check for helper/local name conflicts before committing mechanical renames.
 - 2026-05-01: In this fork, with both `origin` and `upstream` remotes configured, bare `gh pr view <n>` can resolve the upstream Ghostty PR number; use `-R amanthanvi/noctty` for fork-local PR review/checks.
