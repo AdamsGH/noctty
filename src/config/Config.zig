@@ -1501,11 +1501,12 @@ link: RepeatableLink = .{},
 /// will apply to all new windows, not just the first one.
 ///
 /// On Windows this includes a window restored from the saved session (see
-/// `window-save-state`), which is maximized over the rect it was saved at, so
-/// that rect is the one it returns to, and a named layout. It does not apply
-/// to the quick terminal or to a console handed off as the default terminal,
-/// which starts in the show state its program asked for. Changing it does not
-/// change windows that are already open.
+/// `window-save-state`) and a window opened from a named layout. A restored
+/// window is maximized over the rect it was saved at, and that rect is the
+/// one it returns to. It does not apply to the quick terminal or to a console
+/// handed off as the default terminal, which starts in the show state its
+/// program asked for. Changing it does not change windows that are already
+/// open.
 ///
 /// Available since: 1.1.0
 maximize: bool = false,
