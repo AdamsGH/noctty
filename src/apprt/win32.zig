@@ -48903,8 +48903,9 @@ test "win32 a forwarded window position places a new window" {
 
             // A forwarded position places it, at the source's size, over the
             // config's as well. Before the fix it went where the config said,
-            // or one cascade step off the source.
-            for ([_]bool{ false, true }) |configured| {
+            // or one cascade step off the source. The first pass runs with the
+            // config's position still set.
+            for ([_]bool{ true, false }) |configured| {
                 if (!configured) {
                     app.config.@"window-position-x" = null;
                     app.config.@"window-position-y" = null;
