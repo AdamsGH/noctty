@@ -419,7 +419,9 @@ screenshots, and verifies default colors, bundled `Cobalt2`, explicit overrides
 after the theme, live config reload, new-tab and new-split inheritance. The
 configured payload paints independent bands for the default foreground and
 palette index 1. `-MinimumDpi 144` makes a high-DPI run mandatory when that
-desktop is available.
+desktop is available. Its config sets `unfocused-split-opacity = 1`: the
+new-split phase reads both panes for the exact colors, and the pane that loses
+focus to the new split would otherwise be dimmed.
 
 Run with:
 

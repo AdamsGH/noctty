@@ -949,6 +949,15 @@ a DWM dark caption; high-contrast palette switching; IME support;
 drag-and-drop of files, plain text, URLs, and HTML into a pane; and native
 right-click context menus.
 
+In a tab with two or more panes, the renderer dims every pane but the one the
+tab has selected (`unfocused-split-opacity`, toward `unfocused-split-fill`,
+which defaults to the configured `background`), and `split-divider-color`
+colors the gap between them. The selected pane of a window that is not in
+front stays undimmed, and a zoomed pane is never dimmed. The dim covers the
+terminal content, after any custom shader, but not the overlay scrollbar or a
+docked search bar; High Contrast turns it off and keeps the system colors for
+the gap.
+
 The dark caption is chosen at runtime, not by build number:
 `DWMWA_USE_IMMERSIVE_DARK_MODE` (20) is tried first and the legacy attribute
 (19) is used when DWM rejects it. Windows 11 additionally gets an integrated

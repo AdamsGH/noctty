@@ -1108,6 +1108,14 @@ palette: Palette = .{},
 /// is 0.15. This value still looks weird but you can at least see what's going
 /// on. A value outside of the range 0.15 to 1 will be clamped to the nearest
 /// valid value.
+///
+/// On Windows the renderer draws the dim over the split's terminal content,
+/// after any `custom-shader` (so a shader that dims an unfocused terminal
+/// itself, for example through `iFocus`, dims it twice). The overlay
+/// scrollbar and a docked search bar are not dimmed. The dim follows the
+/// split each tab has selected, not keyboard focus, so the selected split of
+/// a window that is not in front stays undimmed, and a zoomed split is never
+/// dimmed. High Contrast turns it off.
 @"unfocused-split-opacity": f64 = 0.7,
 
 /// The color to dim the unfocused split. Unfocused splits are dimmed by
@@ -1116,11 +1124,18 @@ palette: Palette = .{},
 ///
 /// This will default to the background color.
 ///
+/// On Windows that is the configured `background`, not a color a program
+/// sets with OSC 11.
+///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"unfocused-split-fill": ?Color = null,
 
 /// The color of the split divider. If this is not set, a default will be chosen.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+///
+/// On Windows this colors the gap between split panes, but not the accent line
+/// around the focused split. If it is not set, the window theme's divider color
+/// is used. High Contrast uses the system colors instead.
 ///
 /// Available since: 1.1.0
 @"split-divider-color": ?Color = null,

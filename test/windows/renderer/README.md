@@ -32,6 +32,23 @@ DPI only where the scaled host fits the monitor's work area: a host that cannot
 grow shrinks the grid, and since PKG-14 a Windows pty does not pull the rows it
 pushed into history back when the grid grows again, so that round trip cannot
 be exact (a 1024x768 hosted runner records why it skipped the upscale).
+The split-dim cases (`unfocused-split-opacity`, #408; `-SplitDimOnly` runs
+just them) split the window so both panes show the fixture and check that
+each dimmed capture equals its undimmed capture blended toward the fill at
+`1 - opacity` in sRGB space, every pixel within two levels (the fixture hides
+the cursor for them, because its shape follows keyboard focus). They move
+focus with `goto_split`, zoom and unzoom, recreate the D3D11 device, reload with a
+custom shader (the dim lands after it; D3D11 moves to OpenGL and keeps it)
+and with opacity 1, close a pane, and compare the dimmed frame across
+backends with the parity tolerances above. `-WarpOnly` runs the WARP case
+without the shader reload. The held case keeps synchronized output open in
+the fixture and captures without a redraw, so only what the renderer presents
+itself is read; it runs on OpenGL, because a D3D11 pane on a hidden desktop is
+always occluded and its paced present retry carries any change through a hold.
+Readback is the render target before DWM: the production OpenGL path that
+draws straight into the window's sRGB framebuffer (off in test-tools builds)
+and D3D11 after composition need a visible check.
+
 The fault hooks exercise production HRESULT handling, without resetting the
 system graphics driver. Every local case must close gracefully; the exact-PID
 fallback exists only for cleanup after a failure.

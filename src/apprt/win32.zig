@@ -8259,6 +8259,8 @@ pub const App = struct {
         for (self.hosts.items) |host| {
             host.rebuildThemeBrushes();
             host.recreateChromeFont();
+            // High Contrast turns the split dim off and back on.
+            host.syncSplitDim();
             if (frame_mode_changed) {
                 // A stock<->integrated frame flip can cancel the old
                 // NC hover tracking without delivering
@@ -9139,6 +9141,7 @@ pub const App = struct {
                 surface.window_focused,
             );
             if (found.tab.focused != handle) found.tab.focused = handle;
+            found.host.syncSplitDim();
             if (!needs_host_sync) {
                 surface.presentWindow();
                 self.commitShellSurfaceFocus(surface);
@@ -9226,6 +9229,7 @@ pub const App = struct {
                 if (window.active_tab) |active| if (active.eql(tab_id)) {
                     host.active_tab = index;
                 };
+                host.syncSplitDim();
                 return;
             }
             return;
@@ -9319,6 +9323,7 @@ pub const App = struct {
                 surface.window_visible,
             );
             if (found.tab.focused != handle) found.tab.focused = handle;
+            found.host.syncSplitDim();
             if (!needs_host_sync) {
                 surface.setVisible(true);
                 self.commitShellSurfaceActivation(surface);
@@ -9348,6 +9353,7 @@ pub const App = struct {
         found.host.active_tab = found.index;
         found.host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
         found.tab.focused = handle;
+        found.host.syncSplitDim();
         self.commitShellSurfaceFocus(surface);
         runUiActionOrLog("input mode focus sync failed", found.host.refreshModeIndicator());
         return changed;
@@ -24924,7 +24930,105 @@ const Host = struct {
         return changed or pane_rect_changed;
     }
 
+    /// Tell every pane whether the renderer dims it as an unfocused split
+    /// (`win32_chrome_state.splitDimmed`), in every tab, so a background
+    /// tab is right when it shows. It follows `tab.focused`, the split the
+    /// tab has selected, not keyboard focus: an inactive window keeps its
+    /// focused split undimmed, as upstream does. Called wherever
+    /// `tab.focused` or the split tree changes (`layout`, the activation
+    /// and focus funnels, `App.followShellFocus`) and from
+    /// `App.reconfigureTheme` for High Contrast.
+    fn syncSplitDim(self: *Host) void {
+        const high_contrast = isHighContrastActive();
+        for (self.tabs.items) |*tab| {
+            const pane_count = tab.leafCount();
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                const selected = entry.handle == tab.focused or
+                    (if (tab.tree.zoomed) |zoomed| entry.handle == zoomed else false);
+                entry.view.setSplitDimmed(win32_chrome_state.splitDimmed(pane_count, selected, high_contrast));
+            }
+        }
+    }
+
+    test "only unfocused splits of a two-pane tab are dimmed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        if (isHighContrastActive()) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var surface_c: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host },
+                .{ .storage = &surface_c, .host = &host, .register = true },
+            },
+            .tabs = &.{.{ .host = &host, .surface = &surface_a, .id = 1 }},
+        });
+        defer session.deinit();
+
+        // Tab 1 is [A | B] with A selected; tab 2 holds C alone.
+        const inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+        defer {
+            var cleanup = inserted;
+            cleanup.deinit();
+        }
+        const next_tree = try host.tabs.items[0].tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+        host.tabs.items[0].tree.deinit();
+        host.tabs.items[0].tree = next_tree;
+        host.tabs.items[0].focused = host.tabs.items[0].findHandle(&surface_a).?;
+        try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &surface_c));
+
+        host.syncSplitDim();
+        try std.testing.expect(!surface_a.split_dimmed);
+        try std.testing.expect(surface_b.split_dimmed);
+        try std.testing.expect(!surface_c.split_dimmed);
+
+        // Focus moving to B within the tab swaps them.
+        _ = app.noteSurfaceFocused(&surface_b);
+        try std.testing.expect(surface_a.split_dimmed);
+        try std.testing.expect(!surface_b.split_dimmed);
+
+        // The keyboard leaving (an inactive window) keeps B, the split the
+        // tab has selected, undimmed.
+        surface_b.focusChanged(false);
+        try std.testing.expect(!surface_b.split_dimmed);
+
+        // A no-focus activation, as a docked search edit taking focus does.
+        app.activateSurfaceNoFocus(&surface_a);
+        try std.testing.expect(!surface_a.split_dimmed);
+        try std.testing.expect(surface_b.split_dimmed);
+
+        // A zoomed pane shows alone and is never dimmed.
+        host.tabs.items[0].tree.zoom(host.tabs.items[0].findHandle(&surface_b).?);
+        host.syncSplitDim();
+        try std.testing.expect(!surface_b.split_dimmed);
+        host.tabs.items[0].tree.zoom(null);
+
+        // One pane left: nothing to compare it with.
+        const alone = try host.tabs.items[0].tree.remove(std.testing.allocator, host.tabs.items[0].findHandle(&surface_b).?);
+        host.tabs.items[0].tree.deinit();
+        host.tabs.items[0].tree = alone;
+        host.tabs.items[0].focused = host.tabs.items[0].findHandle(&surface_a).?;
+        surface_a.split_dimmed = true;
+        host.syncSplitDim();
+        try std.testing.expect(!surface_a.split_dimmed);
+        // A surface without a started core tells no renderer yet.
+        try std.testing.expect(!surface_b.split_dimmed_sent);
+    }
+
     fn layout(self: *Host) !void {
+        // Every structural change ends in a layout, including the ones that
+        // fail or return before placing panes.
+        defer self.syncSplitDim();
         const rect = (try self.layoutClientRect()) orelse return;
         var chrome_layout_changed = false;
         if (!self.layoutChromeForRect(rect, &chrome_layout_changed)) return;
@@ -27432,7 +27536,38 @@ fn resolveTheme(config: *const configpkg.Config) ThemeColors {
         .ghostty => darkTheme(),
     };
     const follow = config.@"accent-follow-system";
-    return withSystemTabAccent(theme, follow, if (follow) resolveSystemAccentColor() else null);
+    return withSplitDividerColor(
+        withSystemTabAccent(theme, follow, if (follow) resolveSystemAccentColor() else null),
+        config.@"split-divider-color",
+    );
+}
+
+/// `split-divider-color` recolors the gap between split panes; unset, the
+/// theme's divider stays. The focused pane's accent is not this color. High
+/// Contrast never gets here (`resolveTheme`), so it keeps system colors.
+fn withSplitDividerColor(theme: ThemeColors, color: ?configpkg.Config.Color) ThemeColors {
+    var result = theme;
+    if (color) |value| result.pane_divider = rgb(value.r, value.g, value.b);
+    return result;
+}
+
+test "split-divider-color recolors the pane gap" {
+    const dark = darkTheme();
+    const recolored = withSplitDividerColor(dark, .{ .r = 0x12, .g = 0x34, .b = 0x56 });
+    try std.testing.expectEqual(rgb(0x12, 0x34, 0x56), recolored.pane_divider);
+    try std.testing.expectEqual(dark.pane_divider_focused, recolored.pane_divider_focused);
+    try std.testing.expectEqual(dark.pane_divider, withSplitDividerColor(dark, null).pane_divider);
+    try std.testing.expectEqual(lightTheme().pane_divider, withSplitDividerColor(lightTheme(), null).pane_divider);
+
+    // Through the config, as a reload resolves it.
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    config.@"window-theme" = .dark;
+    config.@"accent-follow-system" = false;
+    config.@"split-divider-color" = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    if (!isHighContrastActive()) {
+        try std.testing.expectEqual(rgb(0x12, 0x34, 0x56), resolveTheme(&config).pane_divider);
+    }
 }
 
 /// DESIGN.md's floor for essential non-text indicators against the surface
@@ -35194,6 +35329,8 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
                         5 => .next_tab,
                         6 => .close_surface,
                         7 => .reload_config,
+                        8 => .{ .goto_split = .previous },
+                        9 => .toggle_split_zoom,
                         else => return 0,
                     };
                     return @intFromBool(v.core_surface.performBindingAction(action) catch false);
@@ -35609,6 +35746,11 @@ pub const Surface = struct {
     mouse_visible: bool = true,
     hovered_link: ?[:0]const u8 = null,
     window_focused: bool = false,
+    /// This pane is an unfocused split, which the renderer dims
+    /// (`Host.syncSplitDim`), and what the renderer was last told; the
+    /// renderer starts undimmed.
+    split_dimmed: bool = false,
+    split_dimmed_sent: bool = false,
     /// The bell rang here while the user was not looking; the tab label and
     /// the window caption carry the glyph until `clearBell`.
     bell_ringing: bool = false,
@@ -36139,6 +36281,9 @@ pub const Surface = struct {
             // The core's `set_title` may have relabelled a host that stays
             // for the tabs it had; `windowDestroyed` would refresh them.
             if (!created_host) runUiActionOrLog("failed surface chrome refresh failed", host.refreshChrome());
+            // A layout during init may have dimmed the pane this split
+            // came from, which is alone in its tab again.
+            if (!created_host) host.syncSplitDim();
         }
 
         // The core opens the pty at the size read below. Give a new split its
@@ -36186,6 +36331,9 @@ pub const Surface = struct {
             );
             self.core_initialized = true;
             log.debug("surface.init core surface initialized", .{});
+            // A pane made behind its tab's focus (a restored layout) was
+            // marked dimmed before it had a renderer to tell.
+            self.flushSplitDimmed();
             // The core read the child's size when its init began, and the
             // core's own init-time actions can lay the host out again before
             // it ends. `syncCoreSizeFromClientRect` recorded any such move in
@@ -40600,6 +40748,19 @@ pub const Surface = struct {
         self.requestRepaintWithMode(repaint_mode) catch |err| {
             log.err("win32 size-change repaint request failed err={}", .{err});
         };
+    }
+
+    fn setSplitDimmed(self: *Surface, dimmed: bool) void {
+        self.split_dimmed = dimmed;
+        self.flushSplitDimmed();
+    }
+
+    /// Tell the renderer about a change of `split_dimmed`. A surface whose
+    /// core has not started has no renderer yet; `init` flushes once it has.
+    fn flushSplitDimmed(self: *Surface) void {
+        if (!self.core_initialized or self.split_dimmed_sent == self.split_dimmed) return;
+        self.split_dimmed_sent = self.split_dimmed;
+        self.core_surface.renderer_thread.send(.{ .split_dimmed = self.split_dimmed });
     }
 
     fn focusChanged(self: *Surface, focused: bool) void {
