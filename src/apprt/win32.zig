@@ -9057,7 +9057,7 @@ pub const App = struct {
             placed.rect.top,
             placed.rect.right - placed.rect.left,
             placed.rect.bottom - placed.rect.top,
-            newWindowSetPosFlags(positioned, placed),
+            newWindowSetPosFlags(positioned, false, placed),
         ) == 0) {
             return lastError();
         }
@@ -29802,12 +29802,31 @@ fn setMinimizedNormalRect(hwnd: HWND, rect: RECT) !void {
 /// `SetWindowPos` flags for a window placed like the one it was opened from.
 /// `window-position-x/y` says where every new window goes, so when its config
 /// sets them (`positioned`, `WindowKeeps.position`) the window keeps that
-/// place and takes only the size. A fullscreen window covers its monitor
-/// wherever the config would put it.
-fn newWindowSetPosFlags(positioned: bool, placed: NewWindowPlacement) UINT {
+/// place and takes only the size. With a size of its own as well (`sized`,
+/// `WindowKeeps.size`) it takes neither: core init already gave it that size
+/// where it is, which can be another monitor than the source's, whose work
+/// area `newWindowPlacement` fits the rect to. A fullscreen window covers its
+/// monitor wherever the config would put it.
+fn newWindowSetPosFlags(positioned: bool, sized: bool, placed: NewWindowPlacement) UINT {
     var flags: UINT = c.SWP_NOACTIVATE;
-    if (!placed.copied and positioned) flags |= c.SWP_NOMOVE;
+    if (!placed.copied and positioned) {
+        flags |= c.SWP_NOMOVE;
+        if (sized) flags |= c.SWP_NOSIZE;
+    }
     return flags;
+}
+
+test "win32 a new window placed and sized by its own config takes neither from the window it copies" {
+    const cascaded: NewWindowPlacement = .{ .rect = std.mem.zeroes(RECT), .maximize = null };
+    const fullscreen: NewWindowPlacement = .{ .rect = std.mem.zeroes(RECT), .maximize = null, .copied = true };
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE), newWindowSetPosFlags(false, false, cascaded));
+    // A size alone is still moved one cascade step off the source and
+    // fitted to its monitor, where the window goes.
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE), newWindowSetPosFlags(false, true, cascaded));
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE | c.SWP_NOMOVE), newWindowSetPosFlags(true, false, cascaded));
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE | c.SWP_NOMOVE | c.SWP_NOSIZE), newWindowSetPosFlags(true, true, cascaded));
+    // A fullscreen window covers the source's monitor all the same.
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE), newWindowSetPosFlags(true, true, fullscreen));
 }
 
 /// A window's outer size, in physical pixels.
@@ -41083,10 +41102,26 @@ pub const Surface = struct {
             own_size = .{ .width = rect.right - rect.left, .height = rect.bottom - rect.top };
         };
         self.copySharedWindowStateFrom(source, keeps);
-        if (own_size) |size| if (self.fullscreen) {
-            // It leaves fullscreen to that size, where the source would.
-            self.restore_rect = rectWithSize(self.restore_rect, size);
-            self.restore_placement.rcNormalPosition = rectWithSize(self.restore_placement.rcNormalPosition, size);
+        if (own_size) |size| if (self.fullscreen) if (self.windowHwnd()) |hwnd| {
+            // It leaves fullscreen to that size, where the source would, and
+            // inside the work area there, as a window opened from a normal
+            // or maximized source is. The source's return is in the pixels
+            // of the monitor it entered fullscreen on, which leaving scales
+            // from, and `size` is in this window's, on the monitor the
+            // source covers now. So the return is first taken as leaving
+            // fullscreen here gives it, then sized and fitted here, and
+            // leaving does not scale `size` too.
+            const back = try self.fullscreenReturn(hwnd);
+            const here = try windowMonitor(hwnd);
+            const work = here.info.rcWork;
+            self.restore_monitor = here;
+            self.restore_rect = fitRectInWork(back.rect.left, back.rect.top, size.width, size.height, work);
+            self.restore_placement = back.placement;
+            const normal = workspaceRectToScreen(back.placement.rcNormalPosition, here.info);
+            self.restore_placement.rcNormalPosition = screenRectToWorkspace(
+                fitRectInWork(normal.left, normal.top, size.width, size.height, work),
+                here.info,
+            );
         };
 
         try self.applyWindowStyle();
@@ -41096,7 +41131,7 @@ pub const Surface = struct {
         const hwnd = self.windowHwnd() orelse return;
         const source_hwnd = source.windowHwnd() orelse return;
         const placed = try newWindowPlacement(self.app, source_hwnd, source.fullscreen, hwnd, own_size);
-        var flags = newWindowSetPosFlags(keeps.position, placed) | c.SWP_FRAMECHANGED;
+        var flags = newWindowSetPosFlags(keeps.position, own_size != null, placed) | c.SWP_FRAMECHANGED;
         // Another tab of the source's own window is already where it goes.
         if (hwnd == source_hwnd) flags |= c.SWP_NOMOVE | c.SWP_NOSIZE;
         if (sys.SetWindowPos(
@@ -49562,6 +49597,43 @@ const ForwardedKeysTest = struct {
     fn undecoratedStyle(surface: *const Surface) u32 {
         return effectiveHostWindowStyle(surface.keepsFrameUndecorated(), false, true) & ~@as(u32, c.WS_VISIBLE);
     }
+
+    /// The monitors of the desktop, at most `buf.len`. A CI runner has one,
+    /// so the legs that need two run only on a machine with more.
+    fn monitors(buf: *[8]MONITORINFO) ![]const MONITORINFO {
+        const Collect = struct {
+            infos: *[8]MONITORINFO,
+            count: usize = 0,
+            failed: bool = false,
+
+            fn add(monitor: sys.HMONITOR, _: HDC, _: *RECT, data: LPARAM) callconv(.winapi) BOOL {
+                const self: *@This() = @ptrFromInt(@as(usize, @bitCast(data)));
+                if (self.count == self.infos.len) return 0;
+                var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+                info.cbSize = @sizeOf(MONITORINFO);
+                if (sys.GetMonitorInfoW(monitor, &info) == 0) {
+                    self.failed = true;
+                    return 0;
+                }
+                self.infos[self.count] = info;
+                self.count += 1;
+                return 1;
+            }
+        };
+        var collect: Collect = .{ .infos = buf };
+        _ = sys.EnumDisplayMonitors(null, null, Collect.add, @bitCast(@intFromPtr(&collect)));
+        if (collect.failed) return lastError();
+        return buf[0..collect.count];
+    }
+
+    /// Moves the source, a normal window, to (100, 100) in `work`, asking
+    /// for 800x600 (onto a monitor of another DPI it takes the size its DPI
+    /// change scales that to), and returns its DPI there.
+    fn moveSource(self: *ForwardedKeysTest, work: RECT) !u32 {
+        const hwnd = self.source.windowHwnd().?;
+        if (sys.SetWindowPos(hwnd, null, work.left + 100, work.top + 100, 800, 600, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+        return sys.GetDpiForWindow(hwnd);
+    }
 };
 
 test "win32 a forwarded window position places a new window" {
@@ -49673,6 +49745,201 @@ test "win32 a forwarded window size sizes a new window, also one opened from a m
     }.body);
 }
 
+test "win32 a forwarded size from a fullscreen window is in the pixels of the monitor the new window is on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        /// Moves the source, a normal window, near the far corner of `work`,
+        /// where its rect fits and a new window of the forwarded size does
+        /// not, also on a 1024x768 runner at 96 DPI.
+        fn toCorner(hwnd: HWND, work: RECT) !void {
+            if (sys.SetWindowPos(hwnd, null, work.right - 300, work.bottom - 200, 280, 180, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+        }
+
+        /// The new window leaves fullscreen, maximized if the source was
+        /// before it went fullscreen, and is then restored: it has the client
+        /// its forwarded size gives it, inside `work`. Returns its rect.
+        fn leaveInside(clone: *Surface, maximized: bool, work: RECT) !RECT {
+            const hwnd = clone.windowHwnd().?;
+            try std.testing.expect(clone.fullscreen);
+            try clone.toggleFullscreen(.native);
+            try std.testing.expect(!clone.fullscreen);
+            try std.testing.expectEqual(maximized, sys.IsZoomed(hwnd) != 0);
+            if (maximized) _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+            const rect = try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expect(rect.left >= work.left and rect.top >= work.top);
+            try std.testing.expect(rect.right <= work.right and rect.bottom <= work.bottom);
+            return rect;
+        }
+
+        /// The source leaves fullscreen too. `rect`, the new window's, is
+        /// where the source comes back to, moved only as far as its own
+        /// size needs to stay inside `work`.
+        fn expectAtSource(t: *ForwardedKeysTest, maximized: bool, rect: RECT, work: RECT) !void {
+            const hwnd = t.source.windowHwnd().?;
+            try t.source.toggleFullscreen(.native);
+            const back = if (maximized) try ForwardedKeysTest.Fixture.normalRect(hwnd) else try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expectEqualDeep(fitRectInWork(back.left, back.top, rect.right - rect.left, rect.bottom - rect.top, work), rect);
+            if (maximized) _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+        }
+
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const Fixture = ForwardedKeysTest.Fixture;
+            const source_hwnd = t.source.windowHwnd().?;
+
+            // The source entered fullscreen while its monitor's scale was
+            // twice what it is now, so leaving gives it its rect at half the
+            // size. The new window's forwarded size is its own, in pixels of
+            // the scale it has now. Before the fix it was halved too.
+            try t.source.toggleFullscreen(.native);
+            const dpi = t.source.restore_monitor.?.dpi;
+            t.source.restore_monitor.?.dpi = dpi * 2;
+            {
+                const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                t.source.restore_monitor.?.dpi = dpi;
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expect(clone.fullscreen);
+                try clone.toggleFullscreen(.native);
+                try std.testing.expect(!clone.fullscreen and sys.IsZoomed(hwnd) == 0);
+                try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+                const rect = try Fixture.screenRect(hwnd);
+                try std.testing.expectEqual(t.source_rect.left, rect.left);
+                try std.testing.expectEqual(t.source_rect.top, rect.top);
+                t.fixture.closeWindow(clone);
+            }
+            try t.source.toggleFullscreen(.native);
+
+            // Near the far corner of the work area the source fits and the
+            // new window does not, so it comes back moved inside, as one
+            // opened from a normal or maximized source is. Also from a source
+            // maximized before it went fullscreen, which leaves to its
+            // placement, and at the doubled scale above. Before the fix it
+            // reached past the work area at either scale, and from the
+            // maximized source at the doubled scale its client was halved.
+            const work = (try Surface.windowMonitor(source_hwnd)).info.rcWork;
+            for ([_]bool{ false, true }) |maximized| {
+                for ([_]u32{ 1, 2 }) |scale| {
+                    try toCorner(source_hwnd, work);
+                    if (maximized) _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+                    try t.source.toggleFullscreen(.native);
+                    t.source.restore_monitor.?.dpi = dpi * scale;
+                    const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                    t.source.restore_monitor.?.dpi = dpi;
+                    const rect = try leaveInside(clone, maximized, work);
+                    t.fixture.closeWindow(clone);
+                    try expectAtSource(&t, maximized, rect, work);
+                }
+            }
+
+            // The same with real monitors: the source entered fullscreen on
+            // one and was moved to another while fullscreen. Measured on
+            // main with a 144 DPI and two 96 DPI monitors: the new window
+            // left fullscreen with a 261x187 client on a 96 DPI monitor and
+            // 911x703 on the 144 DPI one, where 400x300 and 600x450 were
+            // asked for. Monitors of the same DPI were right before the fix.
+            // The maximized source pins the placement's half of the fix.
+            var buf: [8]MONITORINFO = undefined;
+            const monitors = try ForwardedKeysTest.monitors(&buf);
+            for (monitors) |entered| {
+                for (monitors) |now| {
+                    if (std.meta.eql(entered.rcMonitor, now.rcMonitor)) continue;
+                    for ([_]bool{ false, true }) |maximized| {
+                        _ = try t.moveSource(entered.rcWork);
+                        try toCorner(source_hwnd, entered.rcWork);
+                        if (maximized) _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+                        try t.source.toggleFullscreen(.native);
+                        const screen = now.rcMonitor;
+                        if (sys.SetWindowPos(source_hwnd, null, screen.left, screen.top, screen.right - screen.left, screen.bottom - screen.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+                        const now_dpi = sys.GetDpiForWindow(source_hwnd);
+                        const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                        const hwnd = clone.windowHwnd().?;
+                        try std.testing.expectEqualDeep(screen, try Fixture.screenRect(hwnd));
+                        const rect = try leaveInside(clone, maximized, now.rcWork);
+                        try std.testing.expectEqualDeep(screen, try Fixture.monitorRect(hwnd));
+                        try std.testing.expectEqual(now_dpi, sys.GetDpiForWindow(hwnd));
+                        t.fixture.closeWindow(clone);
+                        try expectAtSource(&t, maximized, rect, now.rcWork);
+                    }
+                }
+            }
+        }
+    }.body);
+}
+
+test "win32 a new window placed and sized by forwarded arguments keeps that size on any monitor" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn forwardAt(t: *ForwardedKeysTest, x: i32, y: i32, size: apprt.action.InitialSize) !void {
+            var buf: [2][32]u8 = undefined;
+            const placed = try ForwardedKeysTest.placedAt(&buf, x, y);
+            const clone = try t.forward(&.{ placed[0], placed[1], ForwardedKeysTest.sized[0], ForwardedKeysTest.sized[1] }, size);
+            const hwnd = clone.windowHwnd().?;
+            const rect = try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expectEqual(x, rect.left);
+            try std.testing.expectEqual(y, rect.top);
+            try std.testing.expectEqualDeep(
+                scaleInitialClientSize(.{ .width = size.width, .height = size.height }, clone.content_scale),
+                try ForwardedKeysTest.clientSize(hwnd),
+            );
+            t.fixture.closeWindow(clone);
+        }
+
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const source_hwnd = t.source.windowHwnd().?;
+
+            // Placed where the arguments say, a window keeps the size they
+            // give it, as a first window would, even where it does not fit
+            // the source's work area: the cascade that fits a new window to
+            // that area does not place this one. Before the fix it was cut
+            // to that area. On the source's monitor, that is a window taller
+            // than the work area, up to the tallest a window can be.
+            {
+                const monitor = try Surface.windowMonitor(source_hwnd);
+                const work = monitor.info.rcWork;
+                const scale: apprt.ContentScale = .{
+                    .x = @as(f32, @floatFromInt(monitor.dpi)) / 96.0,
+                    .y = @as(f32, @floatFromInt(monitor.dpi)) / 96.0,
+                };
+                const frame_height = (t.source_rect.bottom - t.source_rect.top) -
+                    @as(i32, @intCast((try ForwardedKeysTest.clientSize(source_hwnd)).height));
+                const height: u32 = @intFromFloat(@ceil(@as(f32, @floatFromInt(work.bottom - work.top - frame_height + 1)) / scale.y));
+                const client = scaleInitialClientSize(.{ .width = ForwardedKeysTest.own.width, .height = height }, scale);
+                // SM_CYMAXTRACK.
+                const tallest = sys.GetSystemMetricsForDpi(60, monitor.dpi);
+                if (@as(i32, @intCast(client.height)) + frame_height <= tallest) {
+                    try forwardAt(&t, work.left + 40, work.top, .{ .width = ForwardedKeysTest.own.width, .height = height });
+                }
+            }
+
+            // Placed on another monitor, larger than the source's work area
+            // and inside its own. Measured on main with 3840x2088,
+            // 1920x1032 and 1080x1872 work areas: every window larger than
+            // the source's work area was cut to it, at the right place.
+            var buf: [8]MONITORINFO = undefined;
+            const monitors = try ForwardedKeysTest.monitors(&buf);
+            for (monitors) |source| {
+                for (monitors) |target| {
+                    if (std.meta.eql(source.rcMonitor, target.rcMonitor)) continue;
+                    const target_dpi: i32 = @intCast(try t.moveSource(target.rcWork));
+                    _ = try t.moveSource(source.rcWork);
+                    const width = @min(target.rcWork.right - target.rcWork.left - 120, @max(source.rcWork.right - source.rcWork.left + 60, 600));
+                    const height = @min(target.rcWork.bottom - target.rcWork.top - 120, @max(source.rcWork.bottom - source.rcWork.top + 40, 400));
+                    try forwardAt(&t, target.rcWork.left + 40, target.rcWork.top + 30, .{
+                        .width = @intCast(@divTrunc(width * 96, target_dpi)),
+                        .height = @intCast(@divTrunc(height * 96, target_dpi)),
+                    });
+                }
+            }
+        }
+    }.body);
+}
+
 test "win32 forwarded window decorations win over the ones a new window copies" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     try runOnHiddenDesktop(struct {
@@ -49682,30 +49949,41 @@ test "win32 forwarded window decorations win over the ones a new window copies" 
             defer t.deinit();
             const style = ForwardedKeysTest.style;
             const undecorated = ForwardedKeysTest.undecoratedStyle;
+            const framed = effectiveHostWindowStyle(true, false, true) & ~@as(u32, c.WS_VISIBLE);
 
-            // Before the fix a new window always took the source's.
-            {
-                const clone = try t.forward(&.{"--window-decoration=none"}, null);
-                try std.testing.expect(!clone.decorations_visible and !clone.host.?.cached_decorations_visible);
-                try std.testing.expectEqual(undecorated(clone), style(clone.windowHwnd().?));
-                t.fixture.closeWindow(clone);
-            }
-            try t.source.toggleDecorations();
-            // The control: without them it copies the source's.
-            {
-                const clone = try t.forward(null, null);
-                try std.testing.expect(!clone.decorations_visible);
-                try std.testing.expectEqual(undecorated(clone), style(clone.windowHwnd().?));
-                t.fixture.closeWindow(clone);
-            }
-            {
-                const clone = try t.forward(&.{"--window-decoration=auto"}, null);
-                try std.testing.expect(clone.decorations_visible and clone.host.?.cached_decorations_visible);
-                try std.testing.expect(style(clone.windowHwnd().?) != undecorated(clone));
-                // A config reload gives it the config's decorations again, as
-                // it does a window that took them from the config.
-                try std.testing.expect(!clone.decorations_visible_overridden);
-                t.fixture.closeWindow(clone);
+            // Windows 10's frameless undecorated window, and Windows 11's,
+            // which keeps the frame (`undecoratedKeepsFrame`), so there only
+            // the decoration state tells the two apart: a style check passes
+            // either way.
+            for ([_]u32{ 19045, c.OS_BUILD_WIN11_21H2 }) |os_build| {
+                t.fixture.app.os_build = os_build;
+                // Before the fix a new window always took the source's.
+                {
+                    const clone = try t.forward(&.{"--window-decoration=none"}, null);
+                    try std.testing.expect(!clone.decorations_visible and !clone.host.?.cached_decorations_visible);
+                    try std.testing.expectEqual(undecorated(clone), style(clone.windowHwnd().?));
+                    try std.testing.expectEqual(clone.keepsFrameUndecorated(), undecorated(clone) == framed);
+                    t.fixture.closeWindow(clone);
+                }
+                try t.source.toggleDecorations();
+                // The control: without them it copies the source's.
+                {
+                    const clone = try t.forward(null, null);
+                    try std.testing.expect(!clone.decorations_visible);
+                    try std.testing.expectEqual(undecorated(clone), style(clone.windowHwnd().?));
+                    t.fixture.closeWindow(clone);
+                }
+                {
+                    const clone = try t.forward(&.{"--window-decoration=auto"}, null);
+                    try std.testing.expect(clone.decorations_visible and clone.host.?.cached_decorations_visible);
+                    try std.testing.expectEqual(framed, style(clone.windowHwnd().?));
+                    // A config reload gives it the config's decorations
+                    // again, as it does a window that took them from the
+                    // config.
+                    try std.testing.expect(!clone.decorations_visible_overridden);
+                    t.fixture.closeWindow(clone);
+                }
+                try t.source.toggleDecorations();
             }
         }
     }.body);
