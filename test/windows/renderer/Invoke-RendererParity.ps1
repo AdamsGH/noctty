@@ -134,7 +134,7 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
         $clock = [Diagnostics.Stopwatch]::StartNew(); $hostWindow = [IntPtr]::Zero; $surfaceWindow = [IntPtr]::Zero
         # What the banner reads said, kept for a timeout: a read that blocks
         # points at a busy UI thread, a different name at another banner.
-        if ($OpenGLStartupFallback) { $case.bannerWait = [ordered]@{ reads = 0; lastName = $null; lastReadMs = $null; longestReadMs = 0; foundMs = $null; waitMs = $null } }
+        if ($OpenGLStartupFallback) { $case.bannerWait = [ordered]@{ shownMs = $null; reads = 0; lastName = $null; lastReadMs = $null; longestReadMs = 0; foundMs = $null; waitMs = $null } }
         while ($clock.Elapsed.TotalSeconds -lt 40) {
             if ([RendererNative]::WaitForSingleObject($nativeProcess.process,0) -eq 0) {
                 $exitCode=0; [void][RendererNative]::GetExitCodeProcess($nativeProcess.process,[ref]$exitCode)
@@ -146,14 +146,18 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
                 if (![RendererNative]::IsWindowVisible($hostWindow)) { [void][RendererNative]::ShowWindow($hostWindow, 4) }
                 $surfaceWindow = [RendererNative]::Surface($hostWindow)
                 if ($OpenGLStartupFallback -and !$case.fallbackBanner) {
+                    # The banner child exists, hidden, long before a banner
+                    # is set. Read it only once it is shown, which is when an
+                    # info countdown starts, so the reads time only that wait.
                     $banner=[RendererNative]::ChildOfId($hostWindow,1913)
-                    if ($banner -ne [IntPtr]::Zero) {
+                    if ($banner -ne [IntPtr]::Zero -and [RendererNative]::IsWindowVisible($banner)) {
+                        $bannerWait = $case.bannerWait
+                        if ($null -eq $bannerWait.shownMs) { $bannerWait.shownMs = $clock.ElapsedMilliseconds }
                         $readStart = $clock.ElapsedMilliseconds
                         # A read that throws is recorded; the next poll
                         # reads again.
                         try { $name=[Windows.Automation.AutomationElement]::FromHandle($banner).Current.Name }
                         catch { $name = '<' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message + '>' }
-                        $bannerWait = $case.bannerWait
                         $bannerWait.reads++; $bannerWait.lastName = $name; $bannerWait.lastReadMs = $clock.ElapsedMilliseconds
                         $bannerWait.longestReadMs = [Math]::Max($bannerWait.longestReadMs, $bannerWait.lastReadMs - $readStart)
                         if ($name -match 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { $case.fallbackBanner=$name; $bannerWait.foundMs = $bannerWait.lastReadMs }
@@ -186,7 +190,8 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             if ($case.initial.status.backend -ne 'd3d11' -or !$case.initial.status.opengl_unavailable -or $case.initial.status.opengl_context) { throw 'Unavailable OpenGL did not fall back, cache its failure, and release WGL.' }
             if ($case.fallbackBanner -notmatch 'OpenGL could not start.*Custom shaders and images are not available.*renderer') {
                 $bannerWait = $case.bannerWait
-                throw "OpenGL startup fallback banner is incomplete: after $($bannerWait.waitMs) ms and $($bannerWait.reads) reads (longest $($bannerWait.longestReadMs) ms), the last UIA name, read at $($bannerWait.lastReadMs) ms, was '$($bannerWait.lastName)'."
+                $shown = if ($null -eq $bannerWait.shownMs) { 'never shown' } else { "shown at $($bannerWait.shownMs) ms" }
+                throw "OpenGL startup fallback banner is incomplete: after $($bannerWait.waitMs) ms the banner was $shown, and after $($bannerWait.reads) reads (longest $($bannerWait.longestReadMs) ms) the last UIA name, read at $($bannerWait.lastReadMs) ms, was '$($bannerWait.lastName)'."
             }
             Remove-Item -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH
             if (![RendererNative]::Action($surfaceWindow,1)) { throw 'New tab action rejected.' }
