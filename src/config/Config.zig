@@ -1517,8 +1517,8 @@ maximize: bool = false,
 /// On Windows it applies to the same windows as `maximize`. A window that
 /// starts fullscreen leaves fullscreen to the window it would otherwise have
 /// been, maximized when `maximize` is also set. The saved session does not
-/// record fullscreen. On the command line it needs a value:
-/// `--fullscreen=true`.
+/// record fullscreen: a fullscreen window is saved as the window it leaves
+/// fullscreen to. On the command line it needs a value: `--fullscreen=true`.
 ///
 /// Allowable values are:
 ///

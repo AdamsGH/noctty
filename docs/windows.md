@@ -991,7 +991,8 @@ opened from a maximized one already was. A window that starts fullscreen
 leaves fullscreen to the window it would otherwise have been: its normal size
 and place, or maximized when `maximize` is also set. The settings win over a
 minimized launch (`start /min`, a shortcut set to Run: Minimized): such a
-window starts maximized or fullscreen, not minimized.
+window starts maximized or fullscreen, not minimized, and the windows opened
+after it (Settings, a new window) are not minimized either.
 
 The universal palette puts actions, live tabs, panes, Windows profiles,
 named layouts, and native settings in one fuzzy-ranked, keyboard-driven
@@ -1160,9 +1161,10 @@ way: they come back at their saved rect, not minimized.
 is placed at its saved rect first and then maximized or made fullscreen, so
 the saved rect is the one it returns to. Without them a window comes back in
 its saved state. The saved session does not record fullscreen: a window that
-was fullscreen when the session was saved is saved at its monitor's rect as a
-normal window, and comes back that way (with `fullscreen = true`, fullscreen
-again, leaving fullscreen to that monitor-sized rect).
+was fullscreen when the session was saved is saved as the window it leaves
+fullscreen to, at the rect it had before fullscreen and maximized if it was
+maximized then, and comes back as that window (fullscreen again with
+`fullscreen = true`).
 
 A snapshot that merely exceeds the limits above (too many lines, a line over
 16 KiB, or the shared budget) is dropped on load and the window's layout still

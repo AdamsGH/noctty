@@ -7,8 +7,9 @@ exist. Every file the app reads or writes is a sample this script creates
 beside a portable copy of the app: the real %LOCALAPPDATA%\noctty is never
 written, and only the hash and time of its startup state file are read,
 before and after. Never switches desktops, injects real input or registers a
-global hotkey: the only keys are posted F11 (`toggle_fullscreen`) and F12
-(`toggle_quick_terminal`, bound in the case's config) messages, and nothing it
+global hotkey: the only keys are posted F11 (`toggle_fullscreen`), F12
+(`toggle_quick_terminal`) and F8 (`open_config`, which opens Settings and saves
+nothing) messages, the last two bound in the case's config, and nothing it
 does can copy. The clipboard sequence number is logged before and after and a
 change fails the run. Every launch uses `--single-instance=false` and a class
 of its own, except the forwarding case, whose two copies share a class no
@@ -61,6 +62,17 @@ public static class Ws {
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int show);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
+    delegate bool EnumProc(IntPtr h,IntPtr p);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f,IntPtr p);
+    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h,out int pid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h,StringBuilder s,int n);
+    // The top-level windows of class `cls` that process `pid` has on this desktop.
+    public static IntPtr[] TopLevel(int pid,string cls) {
+        var list=new System.Collections.Generic.List<IntPtr>();
+        EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id); var s=new StringBuilder(128); GetClassNameW(h,s,128);
+            if(id==pid && s.ToString()==cls) list.Add(h); return true; },IntPtr.Zero);
+        return list.ToArray();
+    }
     public static bool Alive(IntPtr h) { return IsWindow(h); }
     public static State Read(IntPtr h) {
         var old=SetThreadDpiAwarenessContext(new IntPtr(-4));
@@ -258,15 +270,45 @@ try {
     try { $s=Sample 'restore-normal-maximize' $case.Host } finally { Stop-Case $case }
     Check 'restore with maximize: maximized over the saved rect' ($s.Zoomed -and (Rect-Same $s.Normal $saved)) (Rect-Array $saved) @{Zoomed=$s.Zoomed; Normal=(Rect-Array $s.Normal)}
 
-    # A fullscreen window is saved as a normal window at its monitor's rect
-    # (the session has no fullscreen state). Recorded, not asserted.
+    # The session has no fullscreen state, so a fullscreen window is saved as
+    # the window leaving fullscreen gives back. It was saved as a normal
+    # window over its whole monitor, and with `fullscreen = true` every later
+    # launch then left fullscreen to that.
+    function Saved-Window($case) {
+        $file=Join-Path $case.Dir 'session-state.json'
+        if(-not (Test-Path -LiteralPath $file)) { return $null }
+        $w=(Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).windows[0]
+        $script:samples.Add(@{Name="saved-$($case.Name)"; State=@{x=$w.x;y=$w.y;width=$w.width;height=$w.height;state=$w.state}})
+        return $w
+    }
+    function Saved-Rect($w) { return [pscustomobject]@{ Left=$w.x; Top=$w.y; Right=($w.x+$w.width); Bottom=($w.y+$w.height) } }
     $case=Start-Case (New-Case 'save-fullscreen' @('window-save-state = always','fullscreen = true'))
     try { [void](Sample 'save-fullscreen' $case.Host) } finally { Stop-Case $case }
-    $file=Join-Path $case.Dir 'session-state.json'
-    if(Test-Path -LiteralPath $file) {
-        $w=(Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).windows[0]
-        $script:samples.Add(@{Name='saved-fullscreen-window'; State=@{x=$w.x;y=$w.y;width=$w.width;height=$w.height;state=$w.state}})
+    $w=Saved-Window $case
+    $actual=if($w){@{State=$w.state; Rect=(Rect-Array (Saved-Rect $w))}}else{'no saved window'}
+    Check 'save, fullscreen = true: saved as the configured window' ($w -and $w.state -eq 'normal' -and (Rect-Same (Saved-Rect $w) $normal.Rect)) (Rect-Array $normal.Rect) $actual
+    if($w) {
+        $json=Get-Content -LiteralPath (Join-Path $case.Dir 'session-state.json') -Raw
+        $case=Start-Case (New-Case 'save-fullscreen-again' @('window-save-state = always','fullscreen = true') @{ 'session-state.json'=$json })
+        try {
+            $s=Sample 'save-fullscreen-again' $case.Host
+            Check 'save, fullscreen = true, next launch: fullscreen' ($s.Popup -and (Rect-Same $s.Rect $s.Monitor 0)) (Rect-Array $s.Monitor) @{Popup=$s.Popup; Rect=(Rect-Array $s.Rect)}
+            Press (Pane $case.Host) 0x7A 1200      # F11: toggle_fullscreen
+            $r=Sample 'save-fullscreen-again-left' $case.Host
+            Check 'save, fullscreen = true, next launch: leaves it to the configured window' (-not $r.Popup -and -not $r.Zoomed -and (Rect-Same $r.Rect $normal.Rect)) (Rect-Array $normal.Rect) @{Popup=$r.Popup; Zoomed=$r.Zoomed; Rect=(Rect-Array $r.Rect)}
+        } finally { Stop-Case $case }
     }
+    # F11 on a maximized window: saved maximized over its normal rect.
+    $case=Start-Case (New-Case 'save-f11-maximized' @('window-save-state = always'))
+    try {
+        [void][Ws]::ShowWindow($case.Host,3); Start-Sleep -Milliseconds 800   # SW_MAXIMIZE
+        Press (Pane $case.Host) 0x7A 1200      # F11: toggle_fullscreen
+        $s=Sample 'save-f11-maximized' $case.Host
+        Check 'save, F11 from maximized: the window is fullscreen' ($s.Popup -and (Rect-Same $s.Rect $s.Monitor 0)) (Rect-Array $s.Monitor) @{Popup=$s.Popup; Rect=(Rect-Array $s.Rect)}
+    } finally { Stop-Case $case }
+    $w=Saved-Window $case
+    $actual=if($w){@{State=$w.state; Rect=(Rect-Array (Saved-Rect $w))}}else{'no saved window'}
+    Check 'save, F11 from maximized: saved maximized over its normal rect' ($w -and $w.state -eq 'maximized' -and (Rect-Same (Saved-Rect $w) $normal.Rect)) (Rect-Array $normal.Rect) $actual
 
     # Not the quick terminal: with `maximize = true` it keeps its strip.
     $case=Start-Case (New-Case 'quick-terminal' @('window-save-state = never','maximize = true','keybind = f12=toggle_quick_terminal','quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%'))
@@ -288,13 +330,37 @@ try {
     try { $s=Sample 'startupinfo-normal' $case.Host } finally { Stop-Case $case }
     Check 'maximize, launched with SW_SHOWNORMAL in STARTUPINFO: maximized' $s.Zoomed $true @{Zoomed=$s.Zoomed; Visible=$s.Visible; Iconic=$s.Iconic}
     # Recorded, not asserted: a minimized launch (SW_SHOWMINNOACTIVE) with
-    # each setting, and a maximized shortcut with neither setting.
+    # `maximize`, and a maximized shortcut with neither setting.
     foreach($show in @(
         @{N='startupinfo-minimized-maximize'; V=7; Lines=@('window-save-state = never','maximize = true')},
-        @{N='startupinfo-minimized-fullscreen'; V=7; Lines=@('window-save-state = never','fullscreen = true')},
         @{N='startupinfo-maximized-shortcut'; V=3; Lines=@('window-save-state = never')})) {
         $case=Start-Case (New-Case $show.N $show.Lines) -Show $show.V
         try { [void](Sample $show.N $case.Host) } finally { Stop-Case $case }
+    }
+
+    # The launcher's show command goes to the first framed window the app
+    # shows, and a window that starts fullscreen is a popup by then. It has
+    # to take the command before that, or the next framed window takes it:
+    # Settings opened minimized, or maximized from a maximized shortcut.
+    foreach($show in @(
+        @{N='startupinfo-minimized-fullscreen'; V=7},
+        @{N='startupinfo-maximized-fullscreen'; V=3})) {
+        $case=Start-Case (New-Case $show.N @('window-save-state = never','fullscreen = true','keybind = f8=open_config')) -Show $show.V
+        try {
+            $s=Sample $show.N $case.Host
+            Check "$($show.N): the first window starts fullscreen" ($s.Popup -and -not $s.Iconic -and (Rect-Same $s.Rect $s.Monitor 0)) (Rect-Array $s.Monitor) @{Popup=$s.Popup; Iconic=$s.Iconic; Rect=(Rect-Array $s.Rect)}
+            Press (Pane $case.Host) 0x77 300       # F8: open_config
+            $ok=Wait-Until { @([Ws]::TopLevel($case.Process.Id,'noctty.win32.settings')|Where-Object {[Ws]::Read($_).Visible}).Count -gt 0 } 15
+            Check "$($show.N): Settings opened" $ok $true $ok
+            $settings=@([Ws]::TopLevel($case.Process.Id,'noctty.win32.settings'))
+            if($settings.Count) {
+                Start-Sleep -Milliseconds 600
+                $t=Sample "$($show.N)-settings" $settings[0]
+                Check "$($show.N): Settings opens as a normal window" ($t.Visible -and -not $t.Iconic -and -not $t.Zoomed) 'visible, not minimized, not maximized' @{Visible=$t.Visible; Iconic=$t.Iconic; Zoomed=$t.Zoomed}
+                foreach($h in $settings) { [void][Ws]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
+                Start-Sleep -Milliseconds 600
+            }
+        } finally { Stop-Case $case }
     }
 
     # A minimized launch that restores a session: Windows minimizes the

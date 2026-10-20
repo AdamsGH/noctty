@@ -5272,6 +5272,25 @@ pub const App = struct {
     /// the taskbar this machine lacks.
     fn sessionWindowPlacementOn(host: *Host, monitor: ?MONITORINFO) ?SessionWindowPlacement {
         const hwnd = host.hwnd orelse return null;
+        // The session does not record fullscreen, so a fullscreen window is
+        // saved as the window leaving fullscreen gives back. Read as it is,
+        // it is a normal window over its whole monitor (its style drops
+        // WS_MAXIMIZE), and that is what it came back as, every time with
+        // `fullscreen = true`.
+        if (host.activeSurface()) |surface| if (surface.fullscreen) {
+            if (surface.fullscreenReturn(hwnd)) |back| {
+                const maximized = back.placement.showCmd == c.SW_MAXIMIZE;
+                var rect = back.rect;
+                if (maximized) {
+                    rect = back.placement.rcNormalPosition;
+                    if (monitor orelse back.monitor) |info| rect = workspaceRectToScreen(rect, info);
+                }
+                if (rect.right <= rect.left or rect.bottom <= rect.top) return .{ .rect = null, .maximized = maximized };
+                return .{ .rect = rect, .maximized = maximized };
+            } else |err| {
+                log.warn("win32 session save: fullscreen window placement failed err={}", .{err});
+            }
+        };
         var maximized = sys.IsZoomed(hwnd) != 0;
         var rect: RECT = undefined;
         if (maximized or sys.IsIconic(hwnd) != 0) {
@@ -40196,6 +40215,14 @@ pub const Surface = struct {
     fn applyWindowStart(self: *Surface, start: WindowStart) void {
         const hwnd = self.windowHwnd() orelse return;
         if (start.fullscreen and !self.fullscreen) {
+            // A launcher's show command (`start /min`, a shortcut set to Run:
+            // Minimized or Maximized) goes to the first framed top-level
+            // window the process calls ShowWindow on. A popup's show does not
+            // take it, so the next framed window would: Settings, or a window
+            // opened from this one after it left fullscreen, would open
+            // minimized. SW_HIDE takes it while this window is still framed,
+            // and shows nothing.
+            if (sys.IsWindowVisible(hwnd) == 0) _ = sys.ShowWindow(hwnd, c.SW_HIDE);
             self.enterFullscreen() catch |err| {
                 log.warn("win32 configured fullscreen failed err={}", .{err});
             };
@@ -40243,24 +40270,42 @@ pub const Surface = struct {
         }
     }
 
+    /// The window leaving fullscreen gives back: the one it was when it
+    /// entered fullscreen, moved to the monitor it is on now.
+    const FullscreenReturn = struct {
+        /// Its rect, in screen coordinates.
+        rect: RECT,
+        /// Its placement. `rcNormalPosition` is in the workspace coordinates
+        /// of `monitor`.
+        placement: WINDOWPLACEMENT,
+        /// The monitor it is on now, if entering fullscreen recorded one.
+        monitor: ?MONITORINFO,
+    };
+
+    fn fullscreenReturn(self: *const Surface, hwnd: HWND) !FullscreenReturn {
+        var back: FullscreenReturn = .{ .rect = self.restore_rect, .placement = self.restore_placement, .monitor = null };
+        const source = self.restore_monitor orelse return back;
+        const target = try windowMonitor(hwnd);
+        back.monitor = target.info;
+        if (target.monitor != source.monitor or target.dpi != source.dpi) {
+            back.rect = fullscreenRestoreRect(back.rect, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi);
+            // WINDOWPLACEMENT uses workspace coordinates for a normal
+            // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
+            // before the work-area translation, and back afterwards.
+            const normal = workspaceRectToScreen(back.placement.rcNormalPosition, source.info);
+            back.placement.rcNormalPosition = screenRectToWorkspace(
+                fullscreenRestoreRect(normal, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi),
+                target.info,
+            );
+        }
+        return back;
+    }
+
     fn leaveFullscreen(self: *Surface) !void {
         const hwnd = self.windowHwnd() orelse return;
-        var rect = self.restore_rect;
-        var placement = self.restore_placement;
-        if (self.restore_monitor) |source| {
-            const target = try windowMonitor(hwnd);
-            if (target.monitor != source.monitor or target.dpi != source.dpi) {
-                rect = fullscreenRestoreRect(rect, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi);
-                // WINDOWPLACEMENT uses workspace coordinates for a normal
-                // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
-                // before the work-area translation, and back afterwards.
-                const normal = workspaceRectToScreen(placement.rcNormalPosition, source.info);
-                placement.rcNormalPosition = screenRectToWorkspace(
-                    fullscreenRestoreRect(normal, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi),
-                    target.info,
-                );
-            }
-        }
+        const back = try self.fullscreenReturn(hwnd);
+        const rect = back.rect;
+        const placement = back.placement;
         self.fullscreen = false;
         try self.applyWindowStyle();
 
@@ -53034,6 +53079,64 @@ test "win32 session placement saves the normal rect in screen coordinates for ev
             placed = App.sessionWindowPlacement(&host).?;
             try std.testing.expectEqualDeep(normal, placed.rect.?);
             try std.testing.expect(!placed.maximized);
+        }
+    }.body);
+}
+
+test "win32 session placement saves a fullscreen window as the window it leaves fullscreen to" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+
+            const Case = struct {
+                maximize: bool = false,
+                fullscreen: bool = false,
+                /// Maximized by the user before it enters fullscreen.
+                zoomed: bool = false,
+            };
+            // Entered from a normal window and from a maximized one, and
+            // started fullscreen by the settings, alone and with `maximize`.
+            for ([_]Case{ .{}, .{ .zoomed = true }, .{ .fullscreen = true }, .{ .maximize = true, .fullscreen = true } }) |case| {
+                app.config.maximize = case.maximize;
+                app.config.fullscreen = if (case.fullscreen) .true else .false;
+                try app.createWindow(default_title);
+                const surface = fixture.newest();
+                const hwnd = surface.windowHwnd().?;
+                const host = surface.host.?;
+                const created = Fixture.hidden_rect;
+                const maximized = case.zoomed or case.maximize;
+                if (case.zoomed) _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+                if (!case.fullscreen) try surface.toggleFullscreen(.native);
+                try std.testing.expect(surface.fullscreen);
+                try std.testing.expectEqualDeep(try Fixture.monitorRect(hwnd), try Fixture.screenRect(hwnd));
+
+                // Not a normal window over the whole monitor, which it was
+                // saved as before, and came back as.
+                var placed = App.sessionWindowPlacement(host).?;
+                try std.testing.expectEqualDeep(created, placed.rect.?);
+                try std.testing.expectEqual(maximized, placed.maximized);
+                // Minimized while fullscreen, the same.
+                _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+                placed = App.sessionWindowPlacement(host).?;
+                try std.testing.expectEqualDeep(created, placed.rect.?);
+                try std.testing.expectEqual(maximized, placed.maximized);
+                _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+
+                // It is the window leaving fullscreen gives back.
+                try surface.toggleFullscreen(.native);
+                try std.testing.expectEqual(maximized, sys.IsZoomed(hwnd) != 0);
+                try std.testing.expectEqualDeep(created, try Fixture.normalRect(hwnd));
+                placed = App.sessionWindowPlacement(host).?;
+                try std.testing.expectEqualDeep(created, placed.rect.?);
+                try std.testing.expectEqual(maximized, placed.maximized);
+                fixture.closeWindows();
+            }
         }
     }.body);
 }
