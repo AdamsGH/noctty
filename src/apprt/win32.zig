@@ -19341,6 +19341,7 @@ const Host = struct {
             !self.banner_focused;
         if (!run) return self.stopBannerExpiry();
         if (self.banner_expires_at != null) return;
+        if (!infoBannersExpire()) return;
         const duration_ms = bannerMessageDurationMs();
         self.banner_expires_at = sys.GetTickCount64() + duration_ms;
         _ = sys.SetTimer(hwnd, c.BANNER_TIMER_ID, duration_ms, null);
@@ -20004,6 +20005,43 @@ const Host = struct {
         try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
         try host.setBanner(.info, "Layout saved.");
         try std.testing.expect(host.banner_expires_at != null);
+    }
+
+    test "NOCTTY_RENDERER_KEEP_NOTICES keeps info banners up in test-tools builds only" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(bannerKeepNoticesTestBody);
+    }
+
+    fn bannerKeepNoticesTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        host.layoutBanner(window.content, window.content.top);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        host.refreshSurfaceVisibility();
+
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_RENDERER_KEEP_NOTICES");
+        if (windows.kernel32.SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) == 0) return lastError();
+        defer _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+        try host.setBanner(.info, "OpenGL could not start.");
+        if (build_config.renderer_test_tools) {
+            // No countdown, so nothing clears it, however long the UI
+            // thread is busy before a harness reads it.
+            try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+            try std.testing.expectEqualStrings("OpenGL could not start.", host.banner_text.?);
+        } else {
+            // Shipped builds never read the switch.
+            try std.testing.expect(host.banner_expires_at != null);
+        }
     }
 
     fn setOverlayDefaultBanner(self: *Host, mode: HostOverlayMode) !void {
@@ -33252,6 +33290,35 @@ fn bannerMessageDurationMs() UINT {
     var seconds: u32 = 0;
     if (sys.SystemParametersInfoW(c.SPI_GETMESSAGEDURATION, 0, @ptrCast(&seconds), 0) == 0) seconds = 0;
     return std.math.clamp(seconds, 5, 300) * std.time.ms_per_s;
+}
+
+/// False only in a `-Drenderer-test-tools` build started with
+/// `NOCTTY_RENDERER_KEEP_NOTICES`. A countdown starts when the banner is
+/// set, so a UI thread busy past it (a slow cold start) clears the banner
+/// before a harness can read it through UIA; the renderer harness's OpenGL
+/// startup fallback case sets this switch so it can read the banner.
+fn infoBannersExpire() bool {
+    return infoBannersExpireIn(build_config.renderer_test_tools);
+}
+
+/// `infoBannersExpire` for a build with or without test tools, so that the
+/// default test build, which is what CI runs, checks both.
+fn infoBannersExpireIn(comptime test_tools: bool) bool {
+    if (!test_tools) return true;
+    return !std.process.hasEnvVarConstant("NOCTTY_RENDERER_KEEP_NOTICES");
+}
+
+test "infoBannersExpire reads NOCTTY_RENDERER_KEEP_NOTICES only with test tools" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_RENDERER_KEEP_NOTICES");
+    defer _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+    _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+    try std.testing.expect(infoBannersExpireIn(true));
+    try std.testing.expect(infoBannersExpireIn(false));
+    if (windows.kernel32.SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) == 0) return lastError();
+    try std.testing.expect(!infoBannersExpireIn(true));
+    try std.testing.expect(infoBannersExpireIn(false));
+    try std.testing.expectEqual(infoBannersExpireIn(build_config.renderer_test_tools), infoBannersExpire());
 }
 
 /// Mouse on a banner button, or null for a message it leaves alone. The

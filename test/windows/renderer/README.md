@@ -75,7 +75,22 @@ while a reload enables a shader/background image. Text frames must keep advancin
 Resize now checks actual swapchain dimensions and a new ResizeBuffers receipt,
 in addition to offscreen readback. Host notices are suppressed only in this
 test-tools parity run to keep reference geometry identical; production and the
-visible check retain them.
+visible check retain them. The OpenGL startup fallback case reads its banner
+through UIA instead, and sets `NOCTTY_RENDERER_KEEP_NOTICES` (also honoured only
+by test-tools builds) so the banner stays up: an info banner's countdown starts
+when it is shown, and a slow cold launch can keep the UI thread busy until it has
+expired. Before the launch the case makes one UIA read of its own desktop's root,
+which needs nothing from the app (`warmupMs`), so the UIA client's first-call cost
+comes before the banner wait. It reads the banner only once it is shown, and
+times a `WM_NULL` round trip to the host just before each read (`longestPingMs`);
+a slow one means the app's UI thread was not pumping messages, or the machine was
+too busy to run either process. The `bannerWait` receipt also records the first poll that saw the banner shown
+(`shownMs`), the reads, the longest one, when the read that found the name
+started and ended (`foundReadStartMs`, `foundMs`), and the last name read. The
+app reads the name at some point during that read, so
+`foundReadStartMs - shownMs` is a lower bound on how long the banner had to stay
+up. `foundMs - shownMs` is not a bound, because the read's own time can be spent
+in the UIA client.
 
 Build two production binaries with custom shaders, one default and one with
 `-Dd3d11=false`. Run `Invoke-OpenGLScheduling.ps1 -DefaultBinary <exe>
