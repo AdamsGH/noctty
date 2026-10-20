@@ -121,7 +121,17 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
     if (!(Test-Path -LiteralPath (Join-Path $bin 'noctty.portable'))) { throw 'Portable marker missing; app launch blocked.' }
     $proc = $null
     $nativeProcess = New-Object RendererNative+PI
-    if ($OpenGLStartupFallback) { Add-Type -AssemblyName UIAutomationClient }
+    if ($OpenGLStartupFallback) {
+        Add-Type -AssemblyName UIAutomationClient
+        # A process's first UIA call may be slow on a cold runner. Make it
+        # before the launch, on this desktop's root, which needs nothing from
+        # the app, so it neither falls in the banner wait nor blocks the poll
+        # that sees the banner shown.
+        $warmup = [Diagnostics.Stopwatch]::StartNew(); $warmupError = $null
+        try { [void][Windows.Automation.AutomationElement]::RootElement.Current.Name }
+        catch { $warmupError = $_.Exception.GetType().Name + ': ' + $_.Exception.Message }
+        $warmupMs = $warmup.ElapsedMilliseconds
+    }
     $case = [ordered]@{ label = $Label; requested = $Backend; portable = $true; appDataRedirected = $true }
     try {
         $nativeProcess = [RendererNative]::Launch((Join-Path $bin 'noctty.exe'), $bin, $DesktopName, $environment, (Join-Path $run 'stderr.txt'))
@@ -132,9 +142,10 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
         $identity = $proc.StartTime
         $case.pid = $proc.Id; $case.startTime = $identity
         $clock = [Diagnostics.Stopwatch]::StartNew(); $hostWindow = [IntPtr]::Zero; $surfaceWindow = [IntPtr]::Zero
-        # What the banner reads said, kept for a timeout: a read that blocks
-        # points at a busy UI thread, a different name at another banner.
-        if ($OpenGLStartupFallback) { $case.bannerWait = [ordered]@{ shownMs = $null; reads = 0; lastName = $null; lastReadMs = $null; longestReadMs = 0; foundMs = $null; waitMs = $null } }
+        # What the banner reads said, kept on a pass and for a timeout: a slow
+        # WM_NULL points at a busy UI thread, a different name at another
+        # banner.
+        if ($OpenGLStartupFallback) { $case.bannerWait = [ordered]@{ warmupMs = $warmupMs; warmupError = $warmupError; shownMs = $null; reads = 0; longestPingMs = 0; longestReadMs = 0; lastName = $null; lastReadMs = $null; foundReadStartMs = $null; foundMs = $null; waitMs = $null } }
         while ($clock.Elapsed.TotalSeconds -lt 40) {
             if ([RendererNative]::WaitForSingleObject($nativeProcess.process,0) -eq 0) {
                 $exitCode=0; [void][RendererNative]::GetExitCodeProcess($nativeProcess.process,[ref]$exitCode)
@@ -146,24 +157,32 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
                 if (![RendererNative]::IsWindowVisible($hostWindow)) { [void][RendererNative]::ShowWindow($hostWindow, 4) }
                 $surfaceWindow = [RendererNative]::Surface($hostWindow)
                 if ($OpenGLStartupFallback -and !$case.fallbackBanner) {
+                    $bannerWait = $case.bannerWait
                     # The banner child exists, hidden, long before a banner
                     # is set. Read it only once it is shown, which is when an
-                    # info countdown starts, so the reads time only that wait.
-                    # shownMs is the first poll that sees it shown, so
-                    # foundMs - shownMs is a lower bound on how long it had
-                    # to stay up.
+                    # info countdown starts.
                     $banner=[RendererNative]::ChildOfId($hostWindow,1913)
                     if ($banner -ne [IntPtr]::Zero -and [RendererNative]::IsWindowVisible($banner)) {
-                        $bannerWait = $case.bannerWait
                         if ($null -eq $bannerWait.shownMs) { $bannerWait.shownMs = $clock.ElapsedMilliseconds }
+                        # WM_NULL comes back once the app's UI thread pumps
+                        # messages, so a slow one means that thread (or the
+                        # whole machine) was busy. The read starts after it.
+                        $pingStart = $clock.ElapsedMilliseconds; $reply = [IntPtr]::Zero
+                        [void][RendererNative]::SendMessageTimeoutW($hostWindow, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0, 10000, [ref]$reply)
                         $readStart = $clock.ElapsedMilliseconds
+                        $bannerWait.longestPingMs = [Math]::Max($bannerWait.longestPingMs, $readStart - $pingStart)
                         # A read that throws is recorded; the next poll
                         # reads again.
                         try { $name=[Windows.Automation.AutomationElement]::FromHandle($banner).Current.Name }
                         catch { $name = '<' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message + '>' }
                         $bannerWait.reads++; $bannerWait.lastName = $name; $bannerWait.lastReadMs = $clock.ElapsedMilliseconds
                         $bannerWait.longestReadMs = [Math]::Max($bannerWait.longestReadMs, $bannerWait.lastReadMs - $readStart)
-                        if ($name -match 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { $case.fallbackBanner=$name; $bannerWait.foundMs = $bannerWait.lastReadMs }
+                        # The banner was shown by shownMs, and the app read
+                        # the name no earlier than the read's start, so
+                        # foundReadStartMs - shownMs is a lower bound on how
+                        # long the banner had to stay up. foundMs - shownMs
+                        # is not one: the read's own time can be the client's.
+                        if ($name -match 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { $case.fallbackBanner=$name; $bannerWait.foundReadStartMs = $readStart; $bannerWait.foundMs = $bannerWait.lastReadMs }
                     }
                 }
             }
@@ -194,7 +213,7 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             if ($case.fallbackBanner -notmatch 'OpenGL could not start.*Custom shaders and images are not available.*renderer') {
                 $bannerWait = $case.bannerWait
                 $shown = if ($null -eq $bannerWait.shownMs) { 'never shown' } else { "shown at $($bannerWait.shownMs) ms" }
-                throw "OpenGL startup fallback banner is incomplete: after $($bannerWait.waitMs) ms the banner was $shown, and after $($bannerWait.reads) reads (longest $($bannerWait.longestReadMs) ms) the last UIA name, read at $($bannerWait.lastReadMs) ms, was '$($bannerWait.lastName)'."
+                throw "OpenGL startup fallback banner is incomplete: after $($bannerWait.waitMs) ms the banner was $shown, and after $($bannerWait.reads) reads (longest WM_NULL wait $($bannerWait.longestPingMs) ms, longest read $($bannerWait.longestReadMs) ms) the last UIA name, read at $($bannerWait.lastReadMs) ms, was '$($bannerWait.lastName)'."
             }
             Remove-Item -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH
             if (![RendererNative]::Action($surfaceWindow,1)) { throw 'New tab action rejected.' }
