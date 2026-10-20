@@ -13477,6 +13477,37 @@ test "Terminal: fullReset status display" {
     try testing.expect(t.status_display == .main);
 }
 
+test "Terminal: fullReset preserves kitty graphics limits" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    // Zero is `image-storage-limit = 0`, which disables the protocol.
+    for ([_]usize{ 1234, 0 }) |total_limit| {
+        try t.screens.active.kitty_images.setLimit(
+            alloc,
+            t.screens.active,
+            total_limit,
+        );
+        t.fullReset();
+        try testing.expectEqual(
+            total_limit,
+            t.screens.active.kitty_images.total_limit,
+        );
+
+        // An alternate screen created after the reset inherits the
+        // primary screen's limit.
+        _ = try t.switchScreen(.alternate);
+        try testing.expectEqual(
+            total_limit,
+            t.screens.active.kitty_images.total_limit,
+        );
+        _ = try t.switchScreen(.primary);
+    }
+}
+
 // https://github.com/mitchellh/ghostty/issues/1607
 test "Terminal: fullReset clears alt screen kitty keyboard state" {
     var t = try init(testing.allocator, .{ .cols = 10, .rows = 10 });
