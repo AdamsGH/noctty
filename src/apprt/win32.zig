@@ -39311,7 +39311,8 @@ pub const Surface = struct {
             return;
         }
 
-        const action = win32_hints.resolveAction(payload, ctrl, alt);
+        // Outside WSL, `/c/x` opens as `C:\x`, as a Ctrl+click on it does.
+        const action = win32_hints.resolveAction(payload, ctrl, alt, !self.core().launchesWsl());
 
         self.closeQuickSelect(true);
         if (action == .open) {
@@ -51569,6 +51570,50 @@ test "security regression win32 link opener allows local junctions without PATHE
         }
     }
     try std.testing.expect(try App.isAllowedWin32OpenTarget(alloc, junction));
+}
+
+test "win32 link opener opens the Windows path of an MSYS2 link, never the text as written (#514)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("conf.d");
+    try tmp.dir.writeFile(.{ .sub_path = "conf.d/config.fish", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "conf.d/run.cmd", .data = "@exit /b 0\r\n" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    if (!windows_shell.isDriveAbsolutePath(root)) return error.SkipZigTest;
+
+    for ([_]struct { name: []const u8, allowed: bool }{
+        .{ .name = "conf.d", .allowed = true },
+        .{ .name = "conf.d\\config.fish", .allowed = true },
+        // The opener's every other refusal holds for the Windows path.
+        .{ .name = "conf.d\\run.cmd", .allowed = false },
+        .{ .name = "conf.d\\missing.txt", .allowed = false },
+    }) |case| {
+        const windows_path = try std.fs.path.join(alloc, &.{ root, case.name });
+        defer alloc.free(windows_path);
+        for ([_][]const u8{ "", "/cygdrive" }) |prefix| {
+            const text = try std.fmt.allocPrint(alloc, "{s}/{c}{s}", .{ prefix, std.ascii.toLower(windows_path[0]), windows_path[2..] });
+            defer alloc.free(text);
+            std.mem.replaceScalar(u8, text, '\\', '/');
+            const mapped = try windows_shell.msysDrivePathToWindows(alloc, text) orelse return error.TestUnexpectedResult;
+            defer alloc.free(mapped);
+            try std.testing.expectEqual(case.allowed, try App.isAllowedWin32OpenTarget(alloc, mapped));
+            // What a Ctrl+click handed the opener before #514.
+            try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, text));
+        }
+    }
+
+    // A letter that is no drive here is refused without a lookup.
+    for ("BHJKMNOPQRSTUVWY") |letter| {
+        if (internal_os.windows.driveTypeForLetter(letter) != internal_os.windows.DRIVE_NO_ROOT_DIR) continue;
+        const text = [_]u8{ '/', std.ascii.toLower(letter), '/', 'x' };
+        const mapped = try windows_shell.msysDrivePathToWindows(alloc, &text) orelse return error.TestUnexpectedResult;
+        defer alloc.free(mapped);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, mapped));
+        break;
+    }
 }
 
 test "security regression win32 link opener allows local symlinks" {

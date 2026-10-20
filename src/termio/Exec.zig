@@ -196,6 +196,13 @@ pub fn deinit(self: *Exec) void {
     self.subprocess.deinit();
 }
 
+/// Whether this pane runs WSL, decided from the launch command line as
+/// `Subprocess.wsl_launch` says. A WSL started from another shell inside the
+/// pane, and a session adopted from a default-terminal handoff, do not count.
+pub fn launchesWsl(self: *const Exec) bool {
+    return self.subprocess.wsl_launch;
+}
+
 /// Call to initialize the terminal state as necessary for this backend.
 /// This is called before any termio begins. This should not be called
 /// after termio begins because it may put the internal terminal state
@@ -841,6 +848,12 @@ const Subprocess = struct {
     /// the distribution has said it knows the entry. See `wsl_env`.
     wsl_probe: ?wsl_env.Probe = null,
 
+    /// Whether this is a WSL launch (`wsl_env.launchArgv`), the same test that
+    /// lists the terminal's identity in `WSLENV`: a POSIX path such a pane
+    /// prints is a Linux path. Set by `init` and never changed, so the
+    /// surface may read it on its own thread (`Exec.launchesWsl`).
+    wsl_launch: bool = false,
+
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
     windows_job_object_plan: WindowsJobObjectPlan,
@@ -1192,12 +1205,12 @@ const Subprocess = struct {
         // terminal's identity has to be listed there. Do it after every
         // override, to merge the user's own WSLENV instead of replacing it.
         // TERM waits for `start`, which can ask the distribution.
+        const wsl_argv: ?[]const [:0]const u8 = if (comptime builtin.os.tag == .windows)
+            try wsl_env.launchArgv(alloc, exec_command.args, exec_command.windows_cmd_shell)
+        else
+            null;
         const wsl_probe: ?wsl_env.Probe = if (comptime builtin.os.tag == .windows) wsl: {
-            const argv = try wsl_env.launchArgv(
-                alloc,
-                exec_command.args,
-                exec_command.windows_cmd_shell,
-            ) orelse break :wsl null;
+            const argv = wsl_argv orelse break :wsl null;
             try wsl_env.forwardIdentity(&env, term_overridden);
             if (term_overridden or std.mem.eql(u8, cfg.term, "xterm-256color")) break :wsl null;
             const can_probe = if (exec_command.windows_cmd_shell)
@@ -1220,6 +1233,7 @@ const Subprocess = struct {
             .rt_post_fork_info = cfg.rt_post_fork_info,
             .windows_job_object_plan = cfg.windows_job_object_plan,
             .wsl_probe = wsl_probe,
+            .wsl_launch = wsl_argv != null,
 
             // Should be initialized with initTerminal call.
             .grid_size = .{},
@@ -2915,6 +2929,40 @@ test "a WSL launch lists the terminal's identity in WSLENV" {
             "COLORTERM/u:TERM_PROGRAM/u:TERM_PROGRAM_VERSION/u",
             subprocess.env.?.get("WSLENV").?,
         );
+    }
+}
+
+test "a pane knows it runs WSL from its launch command, probe or not" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // A TERM set through `env` is never probed, but the pane is still WSL.
+    var term_set: configpkg.RepeatableStringMap = .{};
+    try term_set.parseCLI(arena.allocator(), "TERM=xterm-kitty");
+
+    for ([_]struct { command: configpkg.Command, env: configpkg.RepeatableStringMap = .{}, wsl: bool }{
+        .{ .command = .{ .direct = &.{ "C:\\Windows\\System32\\wsl.exe", "-d", "Ubuntu" } }, .wsl = true },
+        .{ .command = .{ .direct = &.{"wsl"} }, .wsl = true },
+        .{ .command = .{ .direct = &.{"wsl.exe"} }, .env = term_set, .wsl = true },
+        .{ .command = .{ .shell = "wsl.exe -d Ubuntu" }, .wsl = true },
+        .{ .command = .{ .direct = &.{"C:\\Windows\\System32\\cmd.exe"} }, .wsl = false },
+        .{ .command = .{ .direct = &.{ "C:\\msys64\\usr\\bin\\fish.exe", "-l" } }, .wsl = false },
+        .{ .command = .{ .shell = "C:\\msys64\\usr\\bin\\fish.exe -l" }, .wsl = false },
+        .{ .command = .{ .direct = &.{"C:\\Program Files\\Git\\bin\\bash.exe"} }, .wsl = false },
+    }) |case| {
+        var exec = try Exec.init(testing.allocator, .{
+            .command = case.command,
+            .env = EnvMap.init(testing.allocator),
+            .env_override = case.env,
+            .resources_dir = null,
+            .term = "xterm-ghostty",
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        });
+        defer exec.deinit();
+        try testing.expectEqual(case.wsl, exec.launchesWsl());
     }
 }
 

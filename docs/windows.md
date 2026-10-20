@@ -1404,7 +1404,8 @@ on resize, on a click, and when the surface loses focus.
 Completing a label copies the matched text to the clipboard. Hold Ctrl while
 completing to open a target that begins with an allowed URL scheme or names a
 file or folder on this machine (`C:\dir\file.txt`, `.\src\main.zig:12:5`,
-`src\a.cs(3,4)`); other targets, network shares included, are copied. A path
+`src\a.cs(3,4)`, and outside WSL `/c/dir/file.txt`, as described below);
+other targets, network shares included, are copied. A path
 opens through the same checks as a Ctrl+click on it, with a trailing
 `:line:col` or `(line,col)` left off: it must exist and must not be a program
 or script. When it is refused, a banner says it was not opened. Hold Alt to
@@ -1431,6 +1432,17 @@ its own link. So `C:\a.txt copied` ends at `.txt` and
 has no dot still takes the words after it (`C:\Users\amant and then` is one
 match), because that cannot be told from a folder with a space in its name.
 A path inside single or double quotes ends at its closing quote.
+
+In a pane that does not run WSL, an absolute drive path as MSYS2, Git Bash
+and Cygwin print it opens as the Windows path it names: `/c/Users/me` and
+`/cygdrive/c/Users/me` open `C:\Users\me`, and a relative link resolves
+against a pane directory reported in that form. The Windows path then goes
+through the same checks as one written `C:\Users\me`, so a letter that is not
+a local drive, a network drive or a missing file is refused. A pane counts as
+WSL when its command is `wsl.exe`, directly or as `command = wsl.exe ...`;
+there `/c/...` is a Linux path and is not opened. A WSL started from another
+shell inside a pane, or handed to noctty as the default terminal, is not
+recognized as one.
 
 A quick select with nothing to label, or with too many targets to label
 without overlap, says so in the banner.

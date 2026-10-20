@@ -2049,6 +2049,35 @@ pub fn conemuPathToLocal(alloc: Allocator, value: []const u8) !?[]const u8 {
     return null;
 }
 
+/// The Windows path an MSYS2 or Cygwin program means by an absolute drive
+/// path: MSYS2 (Git Bash included) prints `C:\Users\me` as `/c/Users/me`, and
+/// Cygwin as `/cygdrive/c/Users/me`. `/c` alone is `C:\`. Returns null for
+/// anything else: a first segment of more than one letter (`/cd/x`), a rooted
+/// path that is not a drive (`/home/me`, `/usr/bin`), and every network or
+/// device shape, since `//server/share` and `/\server` never start with a
+/// letter.
+///
+/// Only for a pane that is not WSL: there `/c/x` is a Linux path. The drive is
+/// not checked; whatever opens the result must refuse a letter that is not a
+/// local drive, as it does for the same text written `C:\x`.
+pub fn msysDrivePathToWindows(alloc: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
+    const rooted = msysDriveRoot(path) orelse return null;
+    return try drivePathToWindows(alloc, std.ascii.toUpper(rooted[1]), rooted[2..]);
+}
+
+/// Whether `msysDrivePathToWindows` reads `path` as a drive path.
+pub fn isMsysDrivePath(path: []const u8) bool {
+    return msysDriveRoot(path) != null;
+}
+
+/// `path` from its `/<letter>` on, without the `/cygdrive` prefix.
+fn msysDriveRoot(path: []const u8) ?[]const u8 {
+    const rooted = if (std.mem.startsWith(u8, path, "/cygdrive/")) path["/cygdrive".len..] else path;
+    if (rooted.len < 2 or rooted[0] != '/' or !std.ascii.isAlphabetic(rooted[1])) return null;
+    if (rooted.len > 2 and rooted[2] != '/') return null;
+    return rooted;
+}
+
 fn appendNormalizedPath(
     buf: *std.ArrayList(u8),
     alloc: Allocator,
@@ -3100,6 +3129,60 @@ test "conemuPathToLocal leaves everything but a drive-absolute path to the calle
         "C:\\Users\"",
     }) |value| {
         try testing.expect(try conemuPathToLocal(alloc, value) == null);
+    }
+}
+
+test "msysDrivePathToWindows reads the drive paths MSYS2 and Cygwin print" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        // The reporter's `pwd` in an MSYS2 fish (#514).
+        .{ "/c/Users/FengYu/.config/fish/conf.d", "C:\\Users\\FengYu\\.config\\fish\\conf.d" },
+        .{ "/cygdrive/c/Users/me", "C:\\Users\\me" },
+        .{ "/D/work", "D:\\work" },
+        .{ "/c", "C:\\" },
+        .{ "/c/", "C:\\" },
+        .{ "/cygdrive/c", "C:\\" },
+        // A location stays on for the resolver to take off.
+        .{ "/c/src/main.zig:12:5", "C:\\src\\main.zig:12:5" },
+        // A doubled separator never makes a share out of the rest.
+        .{ "/c//server/share", "C:\\server\\share" },
+    };
+    for (cases) |case| {
+        const result = try msysDrivePathToWindows(alloc, case[0]) orelse return error.TestUnexpectedResult;
+        defer alloc.free(result);
+        try testing.expectEqualStrings(case[1], result);
+        try testing.expect(isMsysDrivePath(case[0]));
+    }
+
+    for ([_][]const u8{
+        "",
+        "/",
+        "c/Users",
+        "C:\\Users",
+        "C:/Users",
+        // noctty's Git Bash integration sends this form, a Windows path.
+        "/C:/Users",
+        "/cd/x",
+        "/home/me",
+        "/usr/bin",
+        "/cygdrive",
+        "/cygdrive/",
+        "/cygdrive/cd/x",
+        "/1/x",
+        "/_/x",
+        "\\c\\Users",
+        // Shares and devices are never drives.
+        "//server/share",
+        "//c/share",
+        "/\\server\\share",
+        "\\\\server\\share",
+        "//?/UNC/server/share",
+        "\\\\.\\pipe\\x",
+    }) |path| {
+        try testing.expect(try msysDrivePathToWindows(alloc, path) == null);
+        try testing.expect(!isMsysDrivePath(path));
     }
 }
 

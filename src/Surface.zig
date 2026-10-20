@@ -2997,7 +2997,8 @@ pub fn openLinkText(self: *Surface, text: []const u8) !void {
 }
 
 /// The path to open for link text, when that is not the text itself: see
-/// `resolveOpenPath`. Takes the terminal's pwd for a relative path.
+/// `resolveOpenPath`, and `resolveMsysOpenPath` in a pane that is not WSL.
+/// Takes the terminal's pwd for a relative path.
 ///
 /// Must be called without the renderer state mutex held: it takes the mutex
 /// to copy the pwd, then checks the filesystem without it.
@@ -3010,7 +3011,48 @@ fn resolvePathForOpening(
     else
         try self.pwd(self.alloc) orelse return null;
     defer if (terminal_pwd) |p| self.alloc.free(p);
+    if (builtin.os.tag == .windows and !self.launchesWsl())
+        return resolveMsysOpenPath(self.alloc, terminal_pwd, path);
     return resolveOpenPath(self.alloc, terminal_pwd, path);
+}
+
+/// Whether this pane runs WSL, as its launch command says
+/// (`termio.Exec.launchesWsl`).
+pub fn launchesWsl(self: *const Surface) bool {
+    return switch (self.io.backend) {
+        .exec => |*exec| exec.launchesWsl(),
+    };
+}
+
+/// `resolveOpenPath` for a pane that is not WSL, where an absolute MSYS2 or
+/// Cygwin drive path is a Windows path (`windows_shell.msysDrivePathToWindows`):
+/// `/c/Users/me` is `C:\Users\me`. Link text of that form is read as the
+/// Windows path, and so is a pane directory of that form (fish under MSYS2
+/// reports `/c/...` in its OSC 7) for a relative link.
+///
+/// Such text is never left to the opener as written, which cannot read it:
+/// the result is the Windows path even when nothing is there, and the opener
+/// then refuses it as it refuses that path typed with a drive letter (a
+/// missing file, a letter that is no local drive, a share behind a link).
+fn resolveMsysOpenPath(
+    alloc: Allocator,
+    dir: ?[]const u8,
+    text: []const u8,
+) Allocator.Error!?[]const u8 {
+    const windows_shell = configpkg.windows_shell;
+    if (try windows_shell.msysDrivePathToWindows(alloc, text)) |path| {
+        const found = resolveOpenPath(alloc, null, path) catch |err| {
+            alloc.free(path);
+            return err;
+        };
+        if (found == null) return path;
+        alloc.free(path);
+        return found;
+    }
+    const base = dir orelse return resolveOpenPath(alloc, null, text);
+    const windows_base = try windows_shell.msysDrivePathToWindows(alloc, base);
+    defer if (windows_base) |p| alloc.free(p);
+    return resolveOpenPath(alloc, windows_base orelse base, text);
 }
 
 /// What link text names on disk, as an owned path. Null leaves the text to
@@ -3436,6 +3478,152 @@ test "link text resolves to the file it names, without its line and column" {
         "\\\\?\\UNC\\server\\share\\a.txt(1,2)",
         "\\\\.\\pipe\\x:3",
     }) |text| try std.testing.expect(try resolveOpenPath(alloc, null, text) == null);
+}
+
+/// `windows_path` as MSYS2 prints it (`/c/x/y`), after `prefix` (`/cygdrive`
+/// for Cygwin's form).
+fn testMsysPath(alloc: Allocator, prefix: []const u8, windows_path: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{c}{s}", .{
+        prefix,
+        std.ascii.toLower(windows_path[0]),
+        windows_path[2..],
+    });
+    std.mem.replaceScalar(u8, path, '\\', '/');
+    return path;
+}
+
+test "an MSYS2 or Cygwin drive path in link text is the Windows path it names (#514)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "" });
+    try tmp.dir.makePath("conf.d");
+    try tmp.dir.writeFile(.{ .sub_path = "conf.d/b.zig", .data = "" });
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    if (!configpkg.windows_shell.isDriveAbsolutePath(dir)) return error.SkipZigTest;
+
+    const Case = struct { prefix: []const u8 = "", text: []const u8, expect: []const u8 };
+    for ([_]Case{
+        // The reporter's case: `pwd` printed a folder.
+        .{ .text = "conf.d", .expect = "conf.d" },
+        .{ .text = "a.txt", .expect = "a.txt" },
+        .{ .prefix = "/cygdrive", .text = "a.txt", .expect = "a.txt" },
+        // A location comes off, as for the same path with a drive letter.
+        .{ .text = "conf.d\\b.zig:12:5", .expect = "conf.d\\b.zig" },
+        .{ .prefix = "/cygdrive", .text = "conf.d\\b.zig(3,4)", .expect = "conf.d\\b.zig" },
+        // A missing file is still the Windows path, for the opener to refuse
+        // as it refuses that path typed with a drive letter.
+        .{ .text = "missing.txt", .expect = "missing.txt" },
+        .{ .text = "missing.txt:12", .expect = "missing.txt:12" },
+    }) |case| {
+        const windows_text = try std.fs.path.join(alloc, &.{ dir, case.text });
+        defer alloc.free(windows_text);
+        const text = try testMsysPath(alloc, case.prefix, windows_text);
+        defer alloc.free(text);
+        const want = try std.fs.path.join(alloc, &.{ dir, case.expect });
+        defer alloc.free(want);
+        want[0] = std.ascii.toUpper(want[0]);
+
+        const got = try resolveMsysOpenPath(alloc, null, text);
+        defer if (got) |p| alloc.free(p);
+        std.testing.expectEqualStrings(want, got orelse "(null)") catch |err| {
+            std.debug.print("text {s}\n", .{text});
+            return err;
+        };
+
+        // Before #514 (and still in a WSL pane, where `/c/x` is a Linux path)
+        // the text went to the opener as written, which refuses it.
+        try std.testing.expect(try resolveOpenPath(alloc, null, text) == null);
+    }
+
+    // A relative link in a pane whose directory is an MSYS2 path (fish under
+    // MSYS2 reports `/c/...` in its OSC 7) resolves against the Windows path.
+    {
+        const msys_dir = try testMsysPath(alloc, "", dir);
+        defer alloc.free(msys_dir);
+        const want = try std.fs.path.join(alloc, &.{ dir, "conf.d\\b.zig" });
+        defer alloc.free(want);
+        want[0] = std.ascii.toUpper(want[0]);
+        const got = try resolveMsysOpenPath(alloc, msys_dir, "conf.d/b.zig:7");
+        defer if (got) |p| alloc.free(p);
+        try std.testing.expectEqualStrings(want, got orelse "(null)");
+        try std.testing.expect(try resolveOpenPath(alloc, msys_dir, "conf.d/b.zig:7") == null);
+        // A Windows directory still works.
+        const plain = try resolveMsysOpenPath(alloc, dir, "a.txt");
+        defer if (plain) |p| alloc.free(p);
+        try std.testing.expect(plain != null);
+    }
+
+    // A letter that is no drive here is the Windows path too, which the opener
+    // refuses (`localRoot`); nothing is looked up for it.
+    var free_letter: ?u8 = null;
+    for ("BHJKMNOPQRSTUVWY") |letter| {
+        if (internal_os.windows.driveTypeForLetter(letter) == internal_os.windows.DRIVE_NO_ROOT_DIR) {
+            free_letter = letter;
+            break;
+        }
+    }
+    if (free_letter) |letter| {
+        const text = try std.fmt.allocPrint(alloc, "/{c}/file.txt:3", .{std.ascii.toLower(letter)});
+        defer alloc.free(text);
+        const want = try std.fmt.allocPrint(alloc, "{c}:\\file.txt:3", .{letter});
+        defer alloc.free(want);
+        const got = try resolveMsysOpenPath(alloc, null, text);
+        defer if (got) |p| alloc.free(p);
+        try std.testing.expectEqualStrings(want, got orelse "(null)");
+    }
+
+    // Shares, devices and rooted paths that are not drives stay as they are:
+    // the resolver leaves them to the opener, which refuses them.
+    for ([_][]const u8{
+        "//server/share/a.txt",
+        "//server/share/a.txt:1",
+        "//c/share/a.txt",
+        "/\\server\\share\\a.txt",
+        "//?/UNC/server/share/a.txt",
+        "//./pipe/x",
+        "/home/me/a.txt",
+        "/cd/a.txt:1",
+        "/cygdrive/cd/a.txt",
+    }) |text| try std.testing.expect(try resolveMsysOpenPath(alloc, null, text) == null);
+    // And a share as the pane's directory never resolves a relative link.
+    for ([_][]const u8{ "//server/share", "/\\server\\share", "//c/share" }) |share| {
+        try std.testing.expect(try resolveMsysOpenPath(alloc, share, "a.txt") == null);
+    }
+}
+
+test "only a pane that is not WSL reads /c/x as C:\\x (#514)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "" });
+    const file = try tmp.dir.realpathAlloc(alloc, "a.txt");
+    defer alloc.free(file);
+    if (!configpkg.windows_shell.isDriveAbsolutePath(file)) return error.SkipZigTest;
+    const text = try testMsysPath(alloc, "", file);
+    defer alloc.free(text);
+
+    // An absolute path never reads the pwd, so the surface needs only its
+    // allocator and its launch.
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.alloc = alloc;
+    surface.io.backend = .{ .exec = undefined };
+
+    surface.io.backend.exec.subprocess.wsl_launch = false;
+    const got = try surface.resolvePathForOpening(text);
+    defer if (got) |p| alloc.free(p);
+    try std.testing.expect(got != null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(file, got.?));
+
+    // In WSL `/c/x` is a Linux path: left to the opener as written, as before.
+    surface.io.backend.exec.subprocess.wsl_launch = true;
+    try std.testing.expect(try surface.resolvePathForOpening(text) == null);
 }
 
 test "a link through a symlink to a share is never stat-ed" {
