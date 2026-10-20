@@ -236,7 +236,8 @@ function Invoke-SiteWorkflowStep {
         foreach ($name in $Environment.Keys) {
             [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name])
         }
-        $stepOutput = & ([Environment]::ProcessPath) -NoProfile -NonInteractive -Command ". '$stepFile'" 2>&1 | Out-String
+        $stepCommand = ". '$($stepFile.Replace("'", "''"))'"
+        $stepOutput = & ([Environment]::ProcessPath) -NoProfile -NonInteractive -Command $stepCommand 2>&1 | Out-String
         [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $stepOutput }
     }
     finally {
@@ -274,9 +275,11 @@ if ($releaseCopyStep -notmatch '(?m)^        id: published[ \t]*\r?$') {
 }
 $releaseCopyScript = Get-SiteWorkflowStepScript -Step $releaseCopyStep -Source "$siteDeployWorkflow :: release-copy"
 
+# The apostrophe in the name stands for a TEMP under a profile such as
+# C:\Users\O'Brien, so every run exercises the step command's quoting.
 $siteStepFixtureRoot = [IO.Path]::GetFullPath((Join-Path (
     [IO.Path]::GetTempPath()
-) "noctty-site-steps-contract-$PID-$([Guid]::NewGuid().ToString('N'))"))
+) "noctty-site-step's-contract-$PID-$([Guid]::NewGuid().ToString('N'))"))
 if (-not $siteStepFixtureRoot.StartsWith(
         [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar,
         [StringComparison]::OrdinalIgnoreCase
