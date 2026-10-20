@@ -10449,6 +10449,14 @@ pub const App = struct {
         if (self.windows.items.len == 0) sys.PostQuitMessage(0);
     }
 
+    /// Each window goes a pane at a time, as closing it does: the last pane's
+    /// teardown destroys and removes its host. Not through the host's own
+    /// DestroyWindow while it has panes: a pane's teardown can destroy the
+    /// window right below it (its tab's button, made after the pane), and
+    /// Windows then sends WM_DESTROY to none of the host's other children.
+    /// Those panes never ran `destroy`, kept their cores' threads and stayed
+    /// in `windows`, so a quit with two tabs left the process running with
+    /// no window.
     fn destroyAllWindows(self: *App) void {
         self.quitting = true;
         defer self.quitting = false;
@@ -10459,8 +10467,21 @@ pub const App = struct {
                 continue;
             };
             host.clearStructuralHistory(.normal);
+            // Its last one may have taken the host with it.
+            if (self.destroyPaneOf(host)) continue;
             _ = sys.DestroyWindow(hwnd);
         }
+    }
+
+    /// Destroys one of `host`'s panes through its own window. False when
+    /// none is left that could be.
+    fn destroyPaneOf(self: *App, host: *const Host) bool {
+        for (self.windows.items) |surface| {
+            if (surface.host != host) continue;
+            const pane = surface.hwnd orelse continue;
+            if (sys.DestroyWindow(pane) != 0) return true;
+        }
+        return false;
     }
 
     fn rollbackSessionRestoreHost(self: *App, host: *Host) void {
@@ -50098,6 +50119,55 @@ test "win32 a config reload of maximize and fullscreen leaves the windows alread
                 try std.testing.expect(try app.performAction(.{ .surface = surface.core() }, .config_change, .{ .config = config }));
             }
             try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = config }));
+        }
+    }.body);
+}
+
+test "win32 a quit tears down every pane of every tab, hidden tabs and splits too, and ends the app" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+
+            // A window whose second and third tabs, the third split in two,
+            // are behind its first, and a window with two tabs. Each new tab
+            // is brought to the front as `new_tab` does, so its button is
+            // made right after its pane, as in the app. Before the fix,
+            // destroying a host stopped at the first tab's button, which
+            // that tab's teardown destroys: the quit left 4 of these 6 panes
+            // and posted no WM_QUIT.
+            try app.createWindow(default_title);
+            const front = fixture.newest();
+            const host = front.host.?;
+            const behind = try app.createWindowSurface(&app.config, default_title, .{ .host_id = front.host_id });
+            try std.testing.expect(host.activateTabIndex(1));
+            const split = try app.createWindowSurface(&app.config, default_title, .{ .host_id = front.host_id });
+            try std.testing.expect(host.activateTabIndex(2));
+            _ = try app.createWindowSurface(&app.config, default_title, .{
+                .host_id = front.host_id,
+                .tab_id = app.findTabForSurface(split).?.tab.id,
+                .clone_state_from = split,
+            });
+            try std.testing.expect(host.activateTabIndex(0));
+            try std.testing.expect(front.window_visible and !behind.window_visible and !split.window_visible);
+            try app.createWindow(default_title);
+            const other = fixture.newest();
+            _ = try app.createWindowSurface(&app.config, default_title, .{ .host_id = other.host_id });
+            try std.testing.expect(other.host.?.activateTabIndex(1));
+            try std.testing.expectEqual(@as(usize, 6), app.windows.items.len);
+            try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+
+            // The stand-in cores never started, so `destroy` leaves them
+            // registered (`deinitCore`); the core's own teardown would not.
+            for (app.windows.items) |surface| fixture.core_app.deleteSurface(surface);
+            app.quitConfirmed();
+            try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
+            try std.testing.expectEqual(@as(usize, 0), app.hosts.items.len);
+            var msg: MSG = undefined;
+            try std.testing.expect(sys.PeekMessageW(&msg, null, c.WM_QUIT, c.WM_QUIT, c.PM_REMOVE) != 0);
         }
     }.body);
 }

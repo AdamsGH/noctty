@@ -275,8 +275,9 @@ function Stop-Case($case) {
 # ([Sr]::Key), so no chord is needed.
 $lastWindowConfig=@('keybind = f2=new_window','keybind = f3=close_all_windows','keybind = f4=new_tab','keybind = f5=close_tab:this',
     'keybind = f6=close_surface','keybind = f7=quit','keybind = f8=toggle_quick_terminal','keybind = f9=undo',
+    'keybind = f11=new_split:right','keybind = f12=previous_tab',
     'quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%')
-$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78; Down=0x28; Shift=0x10 }
+$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78; NewSplit=0x7A; PreviousTab=0x7B; Down=0x28; Shift=0x10 }
 # The pane that is on screen in `$h`, or any pane when none is.
 function Pane($h) {
     $all=@([HiddenLocal]::Surfaces($h)); $shown=@($all|Where-Object {([Sr]::Read($_)).Visible})
@@ -327,7 +328,19 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
                 # empty window kept for undo, which is not a session window.
                 Press (Pane $main) $Vk.CloseTab 1500
             }
-            'close-window-two-tabs' { Press (Pane $main) $Vk.NewTab 1500 }
+            { $_ -in 'close-window-two-tabs','quit-two-tabs','close-all-windows-two-tabs' } { Press (Pane $main) $Vk.NewTab 1500 }
+            'quit-split-in-hidden-tab' {
+                Press (Pane $main) $Vk.NewTab 1500
+                Press (Pane $main) $Vk.NewSplit 1500
+                Press (Pane $main) $Vk.PreviousTab 1500
+                # Three panes with one on screen: the first tab is in front
+                # and the split tab is behind it. If a key did nothing, this
+                # would be the plain two-tab case, which fails on main too.
+                $panes=@([HiddenLocal]::Surfaces($main)); $shown=@($panes|Where-Object {([Sr]::Read($_)).Visible})
+                $reached=$panes.Count -eq 3 -and $shown.Count -eq 1
+                Check "${Name}: a split tab behind the one on screen before the quit" $reached '3 panes, 1 on screen' "$($panes.Count) panes, $($shown.Count) on screen"
+                if(-not $reached) { return }
+            }
             'undo-then-close' {
                 Press (Pane $main) $Vk.CloseTab 800
                 Press $main $Vk.Undo 0    # sent to the empty host, which routes it
@@ -340,8 +353,8 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
         switch($End) {
             'close-tab' { Press (Pane $main) $Vk.CloseTab 0 }
             'close-surface' { Press (Pane $main) $Vk.CloseSurface 0 }
-            'quit' { Press (Pane $main) $Vk.Quit 0 }
-            'close-all-windows' { Press (Pane $main) $Vk.CloseAll 0 }
+            { $_ -in 'quit','quit-two-tabs','quit-split-in-hidden-tab' } { Press (Pane $main) $Vk.Quit 0 }
+            { $_ -in 'close-all-windows','close-all-windows-two-tabs' } { Press (Pane $main) $Vk.CloseAll 0 }
             'shell-exit' {
                 # The configured command exits by itself. A key while it runs
                 # uses the restored session.
@@ -403,6 +416,11 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
     if($windows.Count -ne 1) { return }
     $w=$windows[0]
     Check "${Name}: with the tabs it had as it went" (@($w.tabs).Count -eq $Tabs) $Tabs @($w.tabs).Count
+    if($End -eq 'quit-split-in-hidden-tab' -and @($w.tabs).Count -eq 2) {
+        $splitPanes=@($w.tabs[1].layout.nodes | Where-Object { $_.PSObject.Properties.Name -contains 'pane' }).Count
+        Check "${Name}: with the first tab in front" ($w.selected_tab -eq 0) 0 $w.selected_tab
+        Check "${Name}: and both panes of the split tab behind it" ($splitPanes -eq 2) 2 $splitPanes
+    }
     $savedRect=[pscustomobject]@{Left=$w.x;Top=$w.y;Right=$w.x+$w.width;Bottom=$w.y+$w.height}
     Check "${Name}: at the rect it had as it went" ($null -ne $w.x -and (Rect-Same $savedRect $moved.Rect)) (Rect-Array $moved.Rect) (Rect-Array $savedRect)
 }
@@ -428,6 +446,12 @@ try {
             @{ Name='shell-exit-modifier'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
             @{ Name='quit' },
             @{ Name='close-all-windows' },
+            # With a second tab, and with a split in a tab behind the front
+            # one: a quit used to tear down only the panes up to the first
+            # tab's button and leave the process running with no window.
+            @{ Name='quit-two-tabs'; Tabs=2 },
+            @{ Name='close-all-windows-two-tabs'; Tabs=2 },
+            @{ Name='quit-split-in-hidden-tab'; Tabs=2 },
             # A quick terminal is never a session window: the last real window
             # closes while one is open, then a quit from it, or its own close.
             @{ Name='quick-terminal-quit' },
