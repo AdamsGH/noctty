@@ -288,16 +288,43 @@ try {
     try { $s=Sample 'startupinfo-normal' $case.Host } finally { Stop-Case $case }
     Check 'maximize, launched with SW_SHOWNORMAL in STARTUPINFO: maximized' $s.Zoomed $true @{Zoomed=$s.Zoomed; Visible=$s.Visible; Iconic=$s.Iconic}
     # Recorded, not asserted: a minimized launch (SW_SHOWMINNOACTIVE) with
-    # each setting, a saved maximized session launched minimized, and a
-    # maximized shortcut with neither setting.
+    # each setting, and a maximized shortcut with neither setting.
     foreach($show in @(
         @{N='startupinfo-minimized-maximize'; V=7; Lines=@('window-save-state = never','maximize = true')},
         @{N='startupinfo-minimized-fullscreen'; V=7; Lines=@('window-save-state = never','fullscreen = true')},
-        @{N='startupinfo-minimized-restore-maximized'; V=7; Lines=@('window-save-state = always'); Files=@{ 'session-state.json'=(Session-Json $saved 'maximized') }},
         @{N='startupinfo-maximized-shortcut'; V=3; Lines=@('window-save-state = never')})) {
-        $files=if($show.Files){$show.Files}else{@{}}
-        $case=Start-Case (New-Case $show.N $show.Lines $files) -Show $show.V
+        $case=Start-Case (New-Case $show.N $show.Lines) -Show $show.V
         try { [void](Sample $show.N $case.Host) } finally { Stop-Case $case }
+    }
+
+    # A minimized launch that restores a session: Windows minimizes the
+    # restored window's first show, before it has its saved rect. Restore
+    # activates it, and it has to come back at that rect, maximized or
+    # fullscreen as the session and the settings say.
+    foreach($show in @(
+        @{N='startupinfo-minimized-restore-normal'; State='normal'; Lines=@()},
+        @{N='startupinfo-minimized-restore-maximized'; State='maximized'; Lines=@()},
+        @{N='startupinfo-minimized-restore-maximize'; State='normal'; Lines=@('maximize = true')},
+        @{N='startupinfo-minimized-restore-fullscreen'; State='normal'; Lines=@('fullscreen = true')})) {
+        $case=Start-Case (New-Case $show.N (@('window-save-state = always') + $show.Lines) @{ 'session-state.json'=(Session-Json $saved $show.State) }) -Show 7
+        try {
+            $s=Sample $show.N $case.Host
+            $actual=@{Iconic=$s.Iconic; Zoomed=$s.Zoomed; Popup=$s.Popup; Rect=(Rect-Array $s.Rect); Normal=(Rect-Array $s.Normal)}
+            switch($show.N) {
+                'startupinfo-minimized-restore-normal' {
+                    Check 'minimized launch, saved normal: back at its saved rect' (-not $s.Iconic -and -not $s.Zoomed -and (Rect-Same $s.Rect $saved)) (Rect-Array $saved) $actual
+                }
+                'startupinfo-minimized-restore-fullscreen' {
+                    Check 'minimized launch, saved normal, fullscreen: fullscreen on its monitor' (-not $s.Iconic -and $s.Popup -and (Rect-Same $s.Rect $s.Monitor 0)) (Rect-Array $s.Monitor) $actual
+                    Press (Pane $case.Host) 0x7A 1200      # F11: toggle_fullscreen
+                    $r=Sample "$($show.N)-left" $case.Host
+                    Check 'minimized launch, saved normal, fullscreen: leaves it to the saved rect' (-not $r.Popup -and $r.Caption -and -not $r.Zoomed -and (Rect-Same $r.Rect $saved)) (Rect-Array $saved) @{Popup=$r.Popup; Zoomed=$r.Zoomed; Rect=(Rect-Array $r.Rect)}
+                }
+                default {
+                    Check "minimized launch, $($show.N -replace '^startupinfo-minimized-restore-',''): maximized over the saved rect" (-not $s.Iconic -and $s.Zoomed -and (Rect-Same $s.Normal $saved)) (Rect-Array $saved) $actual
+                }
+            }
+        } finally { Stop-Case $case }
     }
 } catch {
     $script:checks.Add(@{Name='Harness execution'; Passed=$false; Error=$_.Exception.Message})

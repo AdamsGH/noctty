@@ -4539,8 +4539,9 @@ pub const App = struct {
         const selected = active_tab.focusedSurface() orelse window_surface orelse return error.EmptyTabs;
         // `maximize` and `fullscreen` apply to a restored window too (#496),
         // and a launched layout, which has no saved state, takes them as any
-        // new window does. The window is at its saved rect by now, so that
-        // is the normal rect it returns to.
+        // new window does. The window has its saved rect by now (as the rect
+        // it returns to, if a minimized launch minimized it), so that is the
+        // normal rect it returns to.
         const start = WindowStart.fromConfig(&self.config);
         selected.applyWindowStart(start);
         // Fullscreen is kept per surface, and every tab shares the window's.
@@ -4841,38 +4842,47 @@ pub const App = struct {
             const works = WorkAreas.collect();
             const dpi_before = sys.GetDpiForWindow(hwnd);
             var target = restoredRectOnScreen(saved, works.slice(), restore_grab);
-            // The rect is in the pixels of the monitor it was saved on, and is
-            // where the window goes: a crossing from the monitor the host was
-            // created on must not swap in the DPI suggestion's rescaled size.
-            host.restore_placing = true;
-            defer host.restore_placing = false;
-            for (0..3) |attempt| {
-                if (sys.SetWindowPos(
-                    hwnd,
-                    null,
-                    target.left,
-                    target.top,
-                    target.right - target.left,
-                    target.bottom - target.top,
-                    c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-                ) == 0) return lastError();
-                // Windows caps what it is given (a left edge to 16 bits, a
-                // width to the largest window), so whether the title bar can
-                // be reached is judged on the rect the window ended up with.
-                var actual: RECT = undefined;
-                if (sys.GetWindowRect(hwnd, &actual) == 0) return lastError();
-                const moved = restoredRectOnScreen(actual, works.slice(), restore_grab);
-                if (!rectEqual(moved, actual)) {
-                    if (attempt == 2) {
-                        log.warn("win32 session restore: window stayed off every monitor", .{});
-                        break;
+            if (sys.IsIconic(hwnd) != 0) {
+                // A launch that asked for a minimized window (`start /min`,
+                // a shortcut set to Run: Minimized) has Windows minimize the
+                // first window's first show. SetWindowPos on a minimized
+                // window moves its icon, and it would come back from the
+                // taskbar where it was created: give it the rect to return to.
+                try setMinimizedNormalRect(hwnd, target);
+            } else {
+                // The rect is in the pixels of the monitor it was saved on, and is
+                // where the window goes: a crossing from the monitor the host was
+                // created on must not swap in the DPI suggestion's rescaled size.
+                host.restore_placing = true;
+                defer host.restore_placing = false;
+                for (0..3) |attempt| {
+                    if (sys.SetWindowPos(
+                        hwnd,
+                        null,
+                        target.left,
+                        target.top,
+                        target.right - target.left,
+                        target.bottom - target.top,
+                        c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+                    ) == 0) return lastError();
+                    // Windows caps what it is given (a left edge to 16 bits, a
+                    // width to the largest window), so whether the title bar can
+                    // be reached is judged on the rect the window ended up with.
+                    var actual: RECT = undefined;
+                    if (sys.GetWindowRect(hwnd, &actual) == 0) return lastError();
+                    const moved = restoredRectOnScreen(actual, works.slice(), restore_grab);
+                    if (!rectEqual(moved, actual)) {
+                        if (attempt == 2) {
+                            log.warn("win32 session restore: window stayed off every monitor", .{});
+                            break;
+                        }
+                        target = moved;
+                        continue;
                     }
-                    target = moved;
-                    continue;
+                    // The layout that follows a DPI change can resize it once
+                    // more: apply the same rect again once.
+                    if (sys.GetDpiForWindow(hwnd) == dpi_before or rectEqual(actual, target)) break;
                 }
-                // The layout that follows a DPI change can resize it once
-                // more: apply the same rect again once.
-                if (sys.GetDpiForWindow(hwnd) == dpi_before or rectEqual(actual, target)) break;
             }
         }
         if ((window.state orelse .normal) == .maximized) {
@@ -29281,6 +29291,27 @@ fn workspaceRectToScreen(rect: RECT, monitor: MONITORINFO) RECT {
     };
 }
 
+/// Makes `rect` (screen coordinates) the rect the minimized `hwnd` returns
+/// to, and leaves it minimized.
+fn setMinimizedNormalRect(hwnd: HWND, rect: RECT) !void {
+    var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+    placement.length = @sizeOf(WINDOWPLACEMENT);
+    if (sys.GetWindowPlacement(hwnd, &placement) == 0) return lastError();
+    // Workspace coordinates of the monitor the rect is on, as
+    // `sessionWindowPlacementOn` reads them.
+    const center: POINT = .{
+        .x = @divTrunc(rect.left, 2) + @divTrunc(rect.right, 2),
+        .y = @divTrunc(rect.top, 2) + @divTrunc(rect.bottom, 2),
+    };
+    const monitor = sys.MonitorFromPoint(center, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+    var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+    info.cbSize = @sizeOf(MONITORINFO);
+    if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+    placement.rcNormalPosition = Surface.screenRectToWorkspace(rect, info);
+    placement.showCmd = c.SW_SHOWMINNOACTIVE;
+    if (sys.SetWindowPlacement(hwnd, &placement) == 0) return lastError();
+}
+
 /// `SetWindowPos` flags for a window placed like the one it was opened from.
 /// `window-position-x/y` says where every new window goes, so with it set the
 /// window keeps that place and takes only the source's size. A fullscreen
@@ -40182,6 +40213,11 @@ pub const Surface = struct {
 
     fn enterFullscreen(self: *Surface) !void {
         const hwnd = self.windowHwnd() orelse return;
+        // A minimized window comes back first. SetWindowPos would move only
+        // its icon, and it would return from the taskbar as a popup at its
+        // normal rect. A restored session's first window is minimized here
+        // under a minimized launch (`applyRestoredWindowPlacement`).
+        if (sys.IsIconic(hwnd) != 0) _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
         // Captured before the style write below, which drops WS_MAXIMIZE:
         // the monitor-sized SetWindowPos after it would otherwise land on a
         // normal window and overwrite its normal rect.
@@ -48150,6 +48186,11 @@ const WindowStartTestApp = struct {
     var hidden_rect: RECT = undefined;
     var first_show: ?FirstShow = null;
     var previous_proc: ?*const anyopaque = null;
+    /// Minimizes the watched window as it first shows, as Windows does to a
+    /// process's first show when its launcher asked for a minimized window
+    /// (`STARTUPINFO` `SW_SHOWMINNOACTIVE`: `start /min`, a shortcut set to
+    /// Run: Minimized).
+    var minimize_first_show = false;
 
     const FirstShow = struct { rect: RECT, zoomed: bool, style: u32 };
     const swp_showwindow: UINT = 0x0040;
@@ -48167,6 +48208,7 @@ const WindowStartTestApp = struct {
         self.app.test_surface_init_stage = &stage;
         watched = null;
         first_show = null;
+        minimize_first_show = false;
     }
 
     fn deinit(self: *WindowStartTestApp) void {
@@ -48238,6 +48280,7 @@ const WindowStartTestApp = struct {
     }
 
     fn proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+        var shown = false;
         if (msg == c.WM_WINDOWPOSCHANGED and hwnd == watched and first_show == null) {
             const pos: *const WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lp)));
             if (pos.flags & swp_showwindow != 0) {
@@ -48248,9 +48291,12 @@ const WindowStartTestApp = struct {
                     .zoomed = sys.IsZoomed(hwnd) != 0,
                     .style = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE)))),
                 };
+                shown = true;
             }
         }
-        return sys.CallWindowProcW(previous_proc, hwnd, msg, wp, lp);
+        const result = sys.CallWindowProcW(previous_proc, hwnd, msg, wp, lp);
+        if (shown and minimize_first_show) _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+        return result;
     }
 
     fn screenRect(hwnd: HWND) !RECT {
@@ -48402,6 +48448,65 @@ test "win32 a new window from a normal one takes maximize, and a forwarded --max
                 try std.testing.expectEqualDeep(source_rect, try Fixture.screenRect(source_hwnd));
                 fixture.closeWindow(clone);
             }
+        }
+    }.body);
+}
+
+test "win32 a config reload of maximize and fullscreen leaves the windows already open alone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+
+            try app.createWindow(default_title);
+            const plain = fixture.newest();
+            const plain_hwnd = plain.windowHwnd().?;
+            const plain_rect = try Fixture.screenRect(plain_hwnd);
+
+            // Turned on: the window that is open stays as it is.
+            var both = try app.config.clone(std.testing.allocator);
+            defer both.deinit();
+            both.maximize = true;
+            both.fullscreen = .true;
+            try reload(app, &both);
+            try std.testing.expect(app.config.maximize and app.config.fullscreen == .true);
+            try std.testing.expect(sys.IsZoomed(plain_hwnd) == 0 and !plain.fullscreen);
+            try std.testing.expectEqualDeep(plain_rect, try Fixture.screenRect(plain_hwnd));
+
+            // A window opened after the reload takes them.
+            try app.createWindow(default_title);
+            const started = fixture.newest();
+            const started_hwnd = started.windowHwnd().?;
+            try std.testing.expect(started.fullscreen);
+            const started_rect = try Fixture.screenRect(started_hwnd);
+
+            // Turned off: neither window changes, and the second still
+            // leaves fullscreen to a maximized window, as it started.
+            var neither = try app.config.clone(std.testing.allocator);
+            defer neither.deinit();
+            neither.maximize = false;
+            neither.fullscreen = .false;
+            try reload(app, &neither);
+            try std.testing.expect(started.fullscreen and sys.IsZoomed(started_hwnd) == 0);
+            try std.testing.expectEqualDeep(started_rect, try Fixture.screenRect(started_hwnd));
+            try std.testing.expect(sys.IsZoomed(plain_hwnd) == 0 and !plain.fullscreen);
+            try std.testing.expectEqualDeep(plain_rect, try Fixture.screenRect(plain_hwnd));
+            try started.toggleFullscreen(.native);
+            try std.testing.expect(sys.IsZoomed(started_hwnd) != 0);
+        }
+
+        /// What a reload does once the file is read (`CoreApp.updateConfig`):
+        /// each pane's config change, then the app's.
+        fn reload(app: *App, config: *const configpkg.Config) !void {
+            for (app.windows.items) |surface| {
+                try std.testing.expect(try app.performAction(.{ .surface = surface.core() }, .config_change, .{ .config = config }));
+            }
+            try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = config }));
         }
     }.body);
 }
@@ -53028,6 +53133,8 @@ test "win32 a restored window and a launched layout take maximize and fullscreen
                 /// A saved session's window; null is a launched layout's,
                 /// whose geometry and state are stripped.
                 state: ?win32_session_state.WindowState = null,
+                /// Launched minimized: the first show is a minimize.
+                minimized: bool = false,
                 maximized: bool,
             };
             for ([_]Case{
@@ -53043,9 +53150,21 @@ test "win32 a restored window and a launched layout take maximize and fullscreen
                 .{ .maximize = true, .maximized = true },
                 .{ .fullscreen = true, .state = .normal, .maximized = false },
                 .{ .maximize = true, .fullscreen = true, .state = .normal, .maximized = true },
+                // A minimized launch minimizes the first show, before the
+                // window has its saved rect. It still returns to that rect
+                // (it came back where it was created before), and a
+                // minimized window is not made fullscreen in place (it
+                // stayed a minimized popup).
+                .{ .minimized = true, .state = .normal, .maximized = false },
+                .{ .minimized = true, .state = .maximized, .maximized = true },
+                .{ .minimized = true, .maximize = true, .state = .normal, .maximized = true },
+                .{ .minimized = true, .fullscreen = true, .state = .normal, .maximized = false },
+                .{ .minimized = true, .maximize = true, .fullscreen = true, .state = .normal, .maximized = true },
+                .{ .minimized = true, .fullscreen = true, .maximized = false },
             }) |case| {
                 app.config.maximize = case.maximize;
                 app.config.fullscreen = if (case.fullscreen) .true else .false;
+                Fixture.minimize_first_show = case.minimized;
                 // Two tabs, the second selected: every tab shares the
                 // window's fullscreen.
                 const tabs = [_]win32_session_state.Tab{ tab, tab };
@@ -53065,6 +53184,14 @@ test "win32 a restored window and a launched layout take maximize and fullscreen
                 // A layout has no rect of its own: it keeps where it was
                 // created.
                 const normal = if (case.state != null) saved else Fixture.hidden_rect;
+                if (case.minimized and !case.maximize and !case.fullscreen and case.state == .normal) {
+                    // Nothing else un-minimizes it before activation.
+                    try std.testing.expect(sys.IsIconic(hwnd) != 0);
+                    try std.testing.expectEqualDeep(normal, try Fixture.normalRect(hwnd));
+                }
+                // As `restoreSessionState` does next.
+                app.activateSurface(surface);
+                try std.testing.expect(sys.IsIconic(hwnd) == 0);
                 for (host.tabs.items) |*each| {
                     try std.testing.expectEqual(case.fullscreen, each.focusedSurface().?.fullscreen);
                 }
