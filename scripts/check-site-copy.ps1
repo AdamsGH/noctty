@@ -54,7 +54,7 @@ $forbiddenRules = @(
 
 $requiredRules = @(
     @{ Path = Join-Path $siteRoot "index.html"; Pattern = "https://github.com/amanthanvi/noctty/releases/latest"; Reason = "Primary download CTA should point to latest release." },
-    @{ Path = Join-Path $siteRoot "terminal.js"; Pattern = "%LOCALAPPDATA%\\noctty\\config.ghostty"; Reason = "Landing page should mention the real Windows config path." },
+    @{ Path = Join-Path $siteRoot "index.html"; Pattern = "%LOCALAPPDATA%\noctty\config.ghostty"; Reason = "Landing page should mention the real Windows config path." },
     @{ Path = Join-Path $siteRoot "index.html"; Pattern = "https://github.com/amanthanvi/noctty"; Reason = "Landing page should keep a repo link." },
     @{ Path = Join-Path $siteRoot "index.html"; Pattern = "winget install --id AmanThanvi.noctty -e"; Reason = "The hero install command should be the published WinGet command (WinGet is the default install path)." },
     @{ Path = Join-Path $siteRoot "install.js"; Pattern = "winget install --id AmanThanvi.noctty -e"; Reason = "Copied install text should match the hero's WinGet command." },

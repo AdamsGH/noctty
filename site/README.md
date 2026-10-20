@@ -4,19 +4,19 @@ Static site for `noctty.com`, deployed to Cloudflare Pages. Hand-written
 HTML, one stylesheet, four small ES modules, no framework and no npm
 dependencies.
 
-| File              | Purpose                                                 |
-| ----------------- | ------------------------------------------------------- |
-| `index.html`      | Landing page                                            |
-| `why-noctty.html` | Trust page: identity, measurements, verification        |
-| `404.html`        | Not-found page                                          |
-| `styles.css`      | Whole stylesheet, `nc-` prefixed classes                |
-| `app.js`          | Theme toggle                                            |
-| `version.js`      | Latest-release fetch for the version text               |
-| `install.js`      | Clipboard copy for the install command                  |
-| `terminal.js`     | Scripted terminal demo (also imported by the tests)     |
-| `assets/`         | Favicon, self-hosted fonts, hero image, capture, social |
-| `tests/`          | `node --test` units                                     |
-| `_headers`        | Cloudflare Pages cache and security headers             |
+| File              | Purpose                                               |
+| ----------------- | ----------------------------------------------------- |
+| `index.html`      | Landing page                                          |
+| `why-noctty.html` | About page: identity, measurements, verification      |
+| `404.html`        | Not-found page                                        |
+| `styles.css`      | Whole stylesheet, `nc-` prefixed classes              |
+| `app.js`          | Theme toggle; the 404 page's requested-path text      |
+| `version.js`      | Latest-release fetch for the version text             |
+| `install.js`      | Clipboard copy for the install commands               |
+| `terminal.js`     | Scripted hero demo (also imported by the tests)       |
+| `assets/`         | Favicon, self-hosted fonts, app captures, social card |
+| `tests/`          | `node --test` units                                   |
+| `_headers`        | Cloudflare Pages cache and security headers           |
 
 ## Editing
 
@@ -41,22 +41,42 @@ copy is checked against `README.md`, `docs/status.md`,
 `docs/getting-started.md`, `docs/verify-release.md`, and the two migration
 guides; when they disagree, tighten the site until the claim holds.
 
-The CSP allows no inline event handlers and no third-party origins. Fonts
-are self-hosted. The only outbound request is the GitHub Releases version
-fetch.
+The CSP allows no inline event handlers, and its only third-party origin is
+`https://api.github.com` for the GitHub Releases version fetch, which is the
+only outbound request. Fonts and images are self-hosted.
 
 ## Design
 
-Dark by default, because the use scene is a terminal at night; light is a
-first-class state. Ink-indigo surfaces, moonlight-cream text, one periwinkle
-accent, aurora green reserved for verified states. Space Grotesk for display,
-Segoe UI Variable for body, JetBrains Mono for commands and keys. Both web
-fonts are OFL-licensed, subsetted to Latin, and ship with their licenses.
+The page is chrome and the terminal is the content. Everything outside a
+terminal window uses the shadcn zinc scale: the tokens at the top of
+`styles.css` carry a light and a dark value through `light-dark()`. The only
+color on the site is inside terminal windows, taken from noctty's default
+colors (dark) and the GitHub Light Default theme (light). Light and dark
+follow the visitor's system until they press the toggle, which then sticks.
 
-Motion is limited to the terminal demo and one entrance on the trust page
-hero; both stop under `prefers-reduced-motion`. `hero-sky.webp` and the
-social card are generated images, cropped and darkened locally.
-`app-window.webp` is a real capture of the app.
+Geist sets all text and JetBrains Mono sets commands and terminals. Both are
+self-hosted, OFL-licensed, and ship with their licenses. `geist.woff2` is
+`Geist-Variable` from the `geist` npm package 1.8.1, instanced to weights
+400 to 600 and subset to Latin with fontTools.
+
+Only the hero demo moves. It pauses off-screen and in hidden tabs, and under
+`prefers-reduced-motion` it shows still frames that the step buttons switch
+between. Its palette rows, their order and the status line copy what the app
+showed for "split" in the captures. `tests/terminal.test.mjs` checks each
+row's title, description, action and shown shortcut, the status format, and
+every key chip on the landing page against `src/input/command.zig`,
+`src/cli/testdata/default_keybinds_windows.txt` and
+`src/apprt/win32/labels.zig`; `tests/install.test.mjs` checks that each copy
+button copies the command shown beside it.
+
+The `shot-*.webp` files are real captures of the app, one per theme, from a
+build with renderer test tools on a private desktop: the panes come from the
+app's own readback and the chrome from `PrintWindow`. The restored-session
+shots come from a real restart of that copy with
+`window-save-state-scrollback` set, each pane scrolled to the top. The
+terminal content is staged (a demo repository with a placeholder author), and
+the terminal shots are cropped to their top 600 rows. The social card,
+`noctty-social.jpg`, is rendered from HTML around one of the captures.
 
 ## Deployment
 
