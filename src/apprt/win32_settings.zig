@@ -8108,6 +8108,9 @@ const dialog_test = struct {
     /// reaches it: the state `open` decides at creation and a section switch
     /// or a DPI change decides again (`setActiveSection`, `recreateUiFont`).
     /// A font is recorded by its role, since a rebuild makes new handles.
+    /// Neither path writes `WS_GROUP` or `WS_DISABLED`, so for those bits
+    /// the comparison shows only that nothing changed them; "settings
+    /// arrow-key groups stop at the rail and the action bar" pins the groups.
     const OpenState = struct {
         const WS_DISABLED: u32 = 0x08000000;
         const kept_styles = WS_VISIBLE | WS_TABSTOP | WS_GROUP | WS_DISABLED | WS_VSCROLL;
@@ -8495,13 +8498,67 @@ test "settings arrow-key groups stop at the rail and the action bar" {
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
+            const viewport = settings.viewport.?;
+            const VK_UP: u32 = 0x26;
+            const VK_DOWN: u32 = 0x28;
+            const DLGC_WANTARROWS: LRESULT = 0x0001;
+            const rail = struct {
+                fn has(window: *const SettingsWindow, control: HWND) bool {
+                    for (std.enums.values(Section)) |section| {
+                        if (window.sectionButton(section).? == control) return true;
+                    }
+                    return false;
+                }
+            }.has;
 
             // Down from the last rail button wraps to the first, rather than
-            // running on into the fields.
+            // running on into the fields, and no rail button's group reaches
+            // past the rail. (The dialog manager clicks the rail's radio
+            // buttons as it moves, so the rail is read rather than walked.)
             try std.testing.expectEqual(
                 settings.btn_section_appearance.?,
                 dialog_test.GetNextDlgGroupItem(hwnd, settings.btn_section_advanced.?, 0).?,
             );
+            for (std.enums.values(Section)) |section| for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                try std.testing.expect(rail(settings, dialog_test.GetNextDlgGroupItem(hwnd, settings.sectionButton(section).?, previous).?));
+            };
+
+            // A pending change shows and enables Discard changes and Save.
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
+            const actions = [_]HWND{ settings.btn_discard_changes.?, settings.btn_save.? };
+            for (actions) |button| try std.testing.expect(sys.IsWindowVisible(button) != 0 and sys.IsWindowEnabled(button) != 0);
+
+            // Down and Up as the App pump hands them to the dialog manager:
+            // from a form control that leaves the arrows to it (a check box,
+            // a push button) focus stays in the form, and from the action bar
+            // it never reaches the form or the rail. Both sides rest on the
+            // group the bar's first button starts at creation; the last
+            // control on Advanced is a push button that is a group of its own.
+            for (std.enums.values(Section)) |section| {
+                settings.setActiveSection(section);
+                errdefer std.debug.print("settings arrows on {s}\n", .{@tagName(section)});
+                // The pump moves focus at all: Down goes from Discard to Save.
+                _ = sys.SetFocus(actions[0]);
+                try std.testing.expect(fixture.pumpKey(VK_DOWN));
+                try std.testing.expectEqual(actions[1], sys.GetFocus().?);
+                for (settings.formItems()) |item| {
+                    const control = settings.controlHwnd(item.control_index).?;
+                    if (sys.IsWindowVisible(control) == 0 or sys.IsWindowEnabled(control) == 0) continue;
+                    if (SendMessageW(control, WM_GETDLGCODE, 0, 0) & DLGC_WANTARROWS != 0) continue;
+                    for ([_]u32{ VK_DOWN, VK_UP }) |key| {
+                        _ = sys.SetFocus(control);
+                        try std.testing.expect(fixture.pumpKey(key));
+                        try std.testing.expect(IsChild(viewport, sys.GetFocus().?) != 0);
+                    }
+                }
+                for (actions) |button| for ([_]u32{ VK_DOWN, VK_UP }) |key| {
+                    _ = sys.SetFocus(button);
+                    try std.testing.expect(fixture.pumpKey(key));
+                    const focus = sys.GetFocus().?;
+                    try std.testing.expect(IsChild(viewport, focus) == 0 and !rail(settings, focus));
+                };
+            }
         }
     }.body);
 }
