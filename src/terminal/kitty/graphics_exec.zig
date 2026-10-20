@@ -569,3 +569,37 @@ test "kittygfx no response with no image ID or number load and display" {
         try testing.expect(resp == null);
     }
 }
+
+test "kittygfx placement at the cursor after a full reset is drawn and kept" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // RIS: the page reset marks every tracked pin garbage, the cursor's
+    // included, and display() tracks a copy of the cursor pin.
+    t.fullReset();
+
+    const storage = &t.screens.active.kitty_images;
+    const cmds = [_][]const u8{
+        // Transmit and display at the home position. C=1 keeps the cursor
+        // there, so the second placement copies the same cursor pin.
+        "a=T,f=24,t=d,i=1,p=1,s=1,v=2,c=1,r=1,C=1,q=2;////////",
+        "a=p,i=1,p=2,c=1,r=1,C=1,q=2",
+    };
+    for (cmds, 1..) |str, expected| {
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+
+        // Every placement so far must have a rect (be drawn) and survive
+        // the garbage sweep in the next addPlacement.
+        try testing.expectEqual(expected, storage.placements.count());
+        const img = storage.imageById(1).?;
+        var it = storage.placements.iterator();
+        while (it.next()) |entry| {
+            try testing.expect(entry.value_ptr.rect(img, &t) != null);
+        }
+    }
+}

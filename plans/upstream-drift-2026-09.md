@@ -249,7 +249,7 @@ row above.
 | `2b32b5b75cfe` retained temp directory handles    | Ported to Zig 0.15 `std.fs`. Without `TMP` the parent is the current directory opened again, never `std.fs.cwd()`.                                                     |
 | `73ac36fa5679` search state of a destroyed screen | As upstream, in the fork's search thread (query options, match-row cache); the select reconcile also covers the fork's refresh timer, which stops while unfocused.     |
 
-On 2026-10-19 the KITTYPIN item ported three Kitty placement pin fixes, after
+On 2026-10-19 the KITTYPIN item ported four Kitty placement pin fixes, after
 the report in #482. This takes `d0c516f8f384` and `b5e86a42844e` out of the
 "Kitty placement lifecycle" row above; `6760c6482be2` (pending image payloads)
 and `b8222f4a8403` (clear placements on image retransmit) stay deferred, as
@@ -260,6 +260,7 @@ does the "Kitty graphics security series" row.
 | `d0c516f8f384` release replaced placement pins | `addPlacement` takes the screen and deinitializes the placement it replaces, without upstream's `std.Io` argument and generation stamps.                          |
 | `b5e86a42844e` release evicted placement pins  | `addImage` and `evictImage` take the screen, and eviction deinitializes each placement it removes.                                                                |
 | `402b9227de1e` reclaim pruned placements       | `addPlacement` sweeps placements whose pin is garbage, and `Placement.rect` returns null for one, which the renderer reads. The fork has no Kitty C API to adapt. |
+| `d30a9c424d3e` cursor pin garbage after RIS    | As upstream. Needed with `402b9227de1e`: `PageList.reset` marks the cursor pin garbage, and a placement copies it.                                                |
 
 ## Validation gates
 

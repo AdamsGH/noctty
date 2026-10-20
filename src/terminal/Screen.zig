@@ -386,11 +386,16 @@ pub fn reset(self: *Screen) void {
     self.pages.reset();
 
     // The above reset preserves tracked pins so we can still use
-    // our cursor pin, which should be at the top-left already.
+    // our cursor pin, which should be at the top-left already. The
+    // reset marks every tracked pin as garbage, but we keep using
+    // this one at its new valid position, so clear the flag: copies
+    // of the cursor pin (e.g. for Kitty image placements) must not
+    // be born garbage.
     const cursor_pin: *PageList.Pin = self.cursor.page_pin;
     assert(cursor_pin.node == self.pages.pages.first.?);
     assert(cursor_pin.x == 0);
     assert(cursor_pin.y == 0);
+    cursor_pin.garbage = false;
     const cursor_rac = cursor_pin.rowAndCell();
     self.cursor.deinit(self.alloc);
     self.cursor = .{
@@ -3694,6 +3699,22 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             self.cursor.pending_wrap = true;
         }
     }
+}
+
+test "Screen reset cursor pin is not garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+    try s.testWriteString("hello, world");
+
+    // The page reset marks every tracked pin garbage but the screen
+    // keeps using the cursor pin, so it must come back clean: anything
+    // that copies it (e.g. Kitty image placements) would otherwise be
+    // born garbage and reaped.
+    s.reset();
+    try testing.expect(!s.cursor.page_pin.garbage);
 }
 
 test "Screen read and write" {
