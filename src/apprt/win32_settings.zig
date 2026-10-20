@@ -4280,6 +4280,10 @@ pub const SettingsWindow = struct {
     /// with a live HWND brings the existing window to the foreground
     /// instead of duplicating it.
     pub fn open(self: *SettingsWindow) !void {
+        // The stamps describe this call alone: a raise leaves none, so an
+        // earlier creation's stamps never read as this one's.
+        const stamps = &self.creation_stamps;
+        stamps.len = 0;
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) {
                 switch (pendingCloseReopenAction(self.close_posted, self.close_after_save)) {
@@ -4305,8 +4309,6 @@ pub const SettingsWindow = struct {
             }
             self.hwnd = null;
         }
-        const stamps = &self.creation_stamps;
-        stamps.len = 0;
         stamps.mark(.create_begin);
         self.resetClosePromptState();
         self.close_notified = false;
@@ -5639,8 +5641,8 @@ test "settings open stamps each creation step once when traced" {
             for (all) |stage| try std.testing.expectEqual(@as(usize, 1), std.mem.count(bench_trace.SettingsCreationStage, stamps.stages[0..stamps.len], &.{stage}));
             for (stamps.counters[1..stamps.len], stamps.counters[0 .. stamps.len - 1]) |later, earlier| try std.testing.expect(later >= earlier);
 
-            // Raising the open window is not a creation; a disabled trace takes nothing.
-            stamps.len = 0;
+            // Raising the open window is not a creation, and keeps none of the
+            // creation's stamps; a disabled trace takes nothing.
             try settings.open();
             try std.testing.expectEqual(@as(usize, 0), stamps.len);
             settings.closeNow(fixture.hwnd());
@@ -5671,7 +5673,8 @@ test "settings open creates each window once in its final form" {
                 std.debug.print("settings open: {d} windows, {d} messages to them\n", .{ tree.len, totals.messages });
                 Work.print(&tree);
             }
-            // The frame, 20 windows on it, the form viewport and its 51.
+            // The frame, its 19 children (one is the viewport) and the
+            // viewport's 52.
             try std.testing.expectEqual(@as(usize, 72), tree.len);
             for (tree.slice()) |hwnd| {
                 const counts = Work.of(hwnd);
@@ -5694,6 +5697,40 @@ test "settings open creates each window once in its final form" {
             // notifications the children send back rebuild nothing.
             try std.testing.expectEqual(@as(u32, 1), settings.font_builds);
             try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+        }
+    }.body);
+}
+
+test "settings open on any section ends as a switch to it would leave it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            // The section survives a close, so Settings can open on any of
+            // them, and `open` alone decides each window's visibility, tab
+            // stop, check, text and font there. The paths a switch and a DPI
+            // change take must find nothing to change.
+            for (std.enums.values(Section)) |section| {
+                settings.active_section = section;
+                try settings.open();
+                const opened = State.of(settings);
+                const help = section == .keybindings or section == .advanced;
+                try std.testing.expectEqual(help, settings.help_shown);
+                try std.testing.expectEqual(help, State.styleOf(settings.text_help.?) & WS_VISIBLE != 0);
+                try std.testing.expectEqual(help, sys.GetWindowTextLengthW(settings.text_help.?) > 0);
+                settings.setActiveSection(section);
+                settings.recreateUiFont();
+                const switched = State.of(settings);
+                errdefer std.debug.print("settings opened on {s}\n", .{@tagName(section)});
+                try std.testing.expectEqual(opened.len, switched.len);
+                for (opened.slice(), switched.slice()) |at_open, after_switch| {
+                    errdefer State.print(at_open, after_switch);
+                    try std.testing.expectEqualDeep(at_open, after_switch);
+                }
+                settings.closeNow(fixture.hwnd());
+            }
         }
     }.body);
 }
@@ -8064,6 +8101,68 @@ const dialog_test = struct {
                     counts.messages,
                 });
             }
+        }
+    };
+
+    /// What each window of an open Settings window shows and how the keyboard
+    /// reaches it: the state `open` decides at creation and a section switch
+    /// or a DPI change decides again (`setActiveSection`, `recreateUiFont`).
+    /// A font is recorded by its role, since a rebuild makes new handles.
+    const OpenState = struct {
+        const WS_DISABLED: u32 = 0x08000000;
+        const kept_styles = WS_VISIBLE | WS_TABSTOP | WS_GROUP | WS_DISABLED | WS_VSCROLL;
+        const Font = enum { none, ui, secondary, emphasis, header, other };
+
+        const Window = struct {
+            hwnd: HWND,
+            id: c_int,
+            style: u32,
+            rect: RECT,
+            check: usize,
+            text: u64,
+            font: Font,
+        };
+
+        windows: [128]Window = undefined,
+        len: usize = 0,
+
+        fn styleOf(hwnd: HWND) u32 {
+            return @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, GWL_STYLE))));
+        }
+
+        fn of(settings: *const SettingsWindow) OpenState {
+            const tree = OpenWork.Tree.of(settings.hwnd.?);
+            var state: OpenState = .{};
+            for (tree.slice()) |hwnd| {
+                var rect: RECT = undefined;
+                _ = GetWindowRect(hwnd, &rect);
+                var class_w: [16]u16 = undefined;
+                const class_len = GetClassNameW(hwnd, &class_w, class_w.len);
+                const button = std.mem.eql(u16, class_w[0..@intCast(@max(0, class_len))], std.unicode.utf8ToUtf16LeStringLiteral("Button"));
+                var text_w: [2048]u16 = undefined;
+                const text_len = sys.GetWindowTextW(hwnd, &text_w, text_w.len);
+                const font: HGDIOBJ = @ptrFromInt(@as(usize, @bitCast(sys.SendMessageW(hwnd, WM_GETFONT, 0, 0))));
+                state.windows[state.len] = .{
+                    .hwnd = hwnd,
+                    .id = sys.GetDlgCtrlID(hwnd),
+                    .style = styleOf(hwnd) & kept_styles,
+                    .rect = rect,
+                    .check = if (button) @bitCast(sys.SendMessageW(hwnd, BM_GETCHECK, 0, 0)) else 0,
+                    .text = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(text_w[0..@intCast(@max(0, text_len))])),
+                    .font = if (font == null) .none else if (font == settings.ui_font) .ui else if (font == settings.secondary_font) .secondary else if (font == settings.emphasis_font) .emphasis else if (font == settings.header_font) .header else .other,
+                };
+                state.len += 1;
+            }
+            return state;
+        }
+
+        fn slice(self: *const OpenState) []const Window {
+            return self.windows[0..self.len];
+        }
+
+        fn print(at_open: Window, after_switch: Window) void {
+            std.debug.print("  id={d} at open: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) text={x}\n", .{ at_open.id, at_open.style, at_open.check, @tagName(at_open.font), at_open.rect.left, at_open.rect.top, at_open.rect.right, at_open.rect.bottom, at_open.text });
+            std.debug.print("  id={d} switched: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) text={x}\n", .{ after_switch.id, after_switch.style, after_switch.check, @tagName(after_switch.font), after_switch.rect.left, after_switch.rect.top, after_switch.rect.right, after_switch.rect.bottom, after_switch.text });
         }
     };
 };
