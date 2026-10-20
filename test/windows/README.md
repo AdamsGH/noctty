@@ -596,12 +596,18 @@ fails it, and its receipts go to `flagship/artifacts/interactive-win11/job-state
 When a screen-pixel wait (`Get-StatefulPixel` inside `Wait-InteractiveWin11Until`)
 times out, the harness writes `pixel-diagnostic-*.json` to its sandbox `logs`
 folder, which the job uploads: the window under each of the 16 sample points
-(handle, class, process name; never a title), the foreground window, whether
-noctty's window was hung, cloaked or minimized, the input idle time, the windows
-of other processes above it, and a screenshot of the sampled rect. The
-screenshot is withheld when another process's window overlaps that rect, so no
-other application's screen content reaches the artifacts; the report still
-names that window.
+(handle, class, process name; never a title) and the color read there, the
+foreground window, whether noctty's window was hung, cloaked, minimized, hidden
+or see-through, the input idle time, the windows above it that overlap the
+rect, and a screenshot of the sampled rect. The screenshot is taken only while
+noctty's window is shown, uncloaked, not minimized and opaque, every sample
+point lies on a noctty window, and no window of another process above it
+overlaps the rect (unless DWM says that window is cloaked); it is clipped to
+noctty's client area inset by the corner radius, and deleted if the same check
+fails right after the capture (`Get-StatefulScreenshotDecision`). Otherwise the
+report says why it was withheld. The 16 single-pixel colors are recorded
+either way, so a sample point on another application's window records that
+window's color at that point.
 
 ## ..\..\scripts\check-test-skips.ps1
 

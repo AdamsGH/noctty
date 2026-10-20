@@ -255,6 +255,38 @@ try {
     $result = Invoke-JobControl 'job-rebuilt' @($writeGeneration, { param($Control, $ReceiptPath) [IO.File]::WriteAllText($ReceiptPath, (@{ Head = 'h'; ExeSHA256 = 'other'; CliSHA256 = 'c'; SourceReceiptSHA256 = 's'; BuildArguments = 'b' } | ConvertTo-Json)) })
     Assert-Control ($result.Message -like '*measurement build changed after the composite (ExeSHA256)*') 'A rebuilt measurement generation was accepted.'
     $passed++
+
+    # The real step runner against scratch leaves. A leaf reports failure the way
+    # Invoke-InteractiveWin11HarnessMain does, with `exit` from a function of a
+    # dot-sourced library: that sets $LASTEXITCODE and throws nothing, so the
+    # step must turn it into a failure, and must not inherit an earlier code.
+    $stepDefinitions = @($jobAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-InteractiveWin11JobStep'
+    }, $true))
+    Assert-Control ($stepDefinitions.Count -eq 1) 'Job driver must define Invoke-InteractiveWin11JobStep once.'
+    $leafRoot = Join-Path $scratch 'job-step'
+    New-Item -ItemType Directory -Path $leafRoot | Out-Null
+    [IO.File]::WriteAllText((Join-Path $leafRoot 'leaf-lib.ps1'), 'function Invoke-LeafMain([int] $Code) { if ($Code -ne 0) { exit $Code } }')
+    [IO.File]::WriteAllText((Join-Path $leafRoot 'leaf.ps1'), "param([int] `$Code = 0)`n. (Join-Path `$PSScriptRoot 'leaf-lib.ps1')`nInvoke-LeafMain `$Code`n")
+    & {
+        . ([scriptblock]::Create($stepDefinitions[0].Extent.Text))
+        $outcomes = foreach ($stepCase in @(
+                @{ Arguments = @{ Code = 3 }; Before = 0 }
+                @{ Arguments = @{ Code = 0 }; Before = 7 }
+                @{ Arguments = @{}; Before = 5 }
+            )) {
+            $global:LASTEXITCODE = $stepCase.Before
+            try {
+                Invoke-InteractiveWin11JobStep -RepoRoot $leafRoot -Step ([pscustomobject]@{ Script = 'leaf.ps1'; Arguments = $stepCase.Arguments })
+                'pass'
+            }
+            catch { $_.Exception.Message }
+        }
+        $global:LASTEXITCODE = 0
+        Assert-Control (($outcomes -join '|') -ceq 'leaf.ps1 failed with exit code 3.|pass|pass') "The job step runner lost a leaf's exit code: $($outcomes -join ' | ')"
+    }
+    $passed++
     Write-Host "interactive-win11 state guard contracts: PASS ($passed controls; scratch-only)"
 } finally {
     $resolved = [IO.Path]::GetFullPath($scratch)
