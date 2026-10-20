@@ -63,9 +63,21 @@ social card are generated images, cropped and darkened locally.
 The Pages project is a Direct Upload project: there is no `wrangler.toml`
 and no Git-integrated build. `.github/workflows/deploy-site.yml` owns
 production. It runs on every push to `main`, on published stable releases,
-and on manual dispatch; pull requests do not deploy. The workflow:
+when a Release run completes, and on manual dispatch; pull requests do not
+deploy.
 
-1. Runs the copy checks and the asset determinism check.
+Production takes a release copy only once GitHub has published that release,
+because the site links the release's downloads. While `README.md` names a
+version newer than the latest GitHub release (the release-copy merge, before
+its Release run publishes), the run holds the deploy and says so in a notice
+and in the job summary; the Release run's completion then deploys it. The
+Release workflow publishes with `GITHUB_TOKEN`, and an event made with
+`GITHUB_TOKEN` starts no workflow run, so `release: published` fires only for
+a release a person publishes. The workflow:
+
+1. Runs the site copy checks, the asset determinism check, the header
+   contract, and the release copy check against the latest GitHub release,
+   each in its own step.
 2. Builds the payload twice from an exact file allowlist
    (`scripts/build-site-payload.ps1`) and requires identical SHA-256
    manifests.
