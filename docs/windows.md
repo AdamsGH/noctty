@@ -1437,9 +1437,12 @@ In a pane that does not run WSL, an absolute drive path as MSYS2, Git Bash
 and Cygwin print it opens as the Windows path it names: `/c/Users/me` and
 `/cygdrive/c/Users/me` open `C:\Users\me`, and a relative link resolves
 against a pane directory reported in that form (`/c` included). The Windows
-path then goes through the same checks as one written `C:\Users\me`, so a
-letter that is not a local drive, a network drive or a missing file is
-refused. A drive's root is never opened from text, just as `C:\` is not a
+path then goes through the same checks as one written `C:\Users\me`: it
+opens only if it exists on a local drive and is not a program or a file
+Windows would run or install when opened (`.cmd`, `.ps1`, `.msi`, `.lnk` and
+the like). So a letter that is not a local drive, a network drive, a missing
+file and `/c/x/run.cmd` are refused, while `/c/x/config.fish` opens like any
+document. A drive's root is never opened from text, just as `C:\` is not a
 link: `/c` alone is a switch in `cmd /c` far more often than a drive.
 
 A pane counts as WSL when its command starts `wsl.exe` or WSL's `bash.exe`
