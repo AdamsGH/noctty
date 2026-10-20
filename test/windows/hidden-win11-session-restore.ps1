@@ -9,7 +9,7 @@ app reads or writes is a sample this script creates beside a portable copy of
 the app: the real %LOCALAPPDATA%\noctty is never written or deleted, and only
 the hash and time of its startup state file are read, before and after. Never switches desktops,
 injects real input or registers a global hotkey (the last-window cases press
-in-app keybinds with posted key messages), and nothing it does can copy (the
+in-app keybinds with key messages sent to the pane), and nothing it does can copy (the
 clipboard belongs to the window station, not the desktop); the clipboard sequence number is logged
 before and after and a change fails the run. Optional
 ExpectedStartupHash/ExpectedStartupModified pin an adopted baseline.
@@ -83,12 +83,35 @@ public static class Sr {
         try { if(!SetWindowPos(h,IntPtr.Zero,x,y,w,ht,0x14)) throw new Exception("SetWindowPos failed"); }
         finally { SetThreadDpiAwarenessContext(old); }
     }
-    // A key-down and key-up posted to a pane (or to a host with no tab), which
-    // runs the in-app keybind for that key. A keybind is not a global hotkey,
-    // so nothing is registered, and an F-key types no text.
+    [StructLayout(LayoutKind.Sequential)] struct Msg { public IntPtr h; public uint m; public IntPtr w,l; public uint t; public int x,y; }
+    [DllImport("user32.dll")] static extern bool PeekMessageW(out Msg m,IntPtr h,uint min,uint max,uint remove);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from,uint to,bool attach);
+    [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] state);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint flags,uint ms,out IntPtr result);
+    static void Send(IntPtr h,uint m,int key,long l) {
+        IntPtr result;
+        if(SendMessageTimeoutW(h,m,new IntPtr(key),new IntPtr(l),0,20000,out result)==IntPtr.Zero && Marshal.GetLastWin32Error()==1460)
+            throw new Exception("Key not handled within 20 s");
+    }
+    // A key-down and key-up for a pane (or a host with no tab), which runs the
+    // in-app keybind for that key. A keybind is not a global hotkey, so nothing
+    // is registered, and an F-key types no text. noctty reads the modifiers
+    // from its thread's keyboard state, which a private desktop never updates,
+    // so they are cleared there: this thread joins that input queue, and the
+    // key is sent rather than posted so noctty handles it before the queues
+    // part. The user's keyboard is another queue and is not touched.
     public static void Key(IntPtr h,int key) {
-        if(!PostMessageW(h,0x100,new IntPtr(key),new IntPtr(1))) throw new Exception("Key-down post failed");
-        if(!PostMessageW(h,0x101,new IntPtr(key),new IntPtr(0xC0000001L))) throw new Exception("Key-up post failed");
+        uint pid; uint target=GetWindowThreadProcessId(h,out pid); uint me=GetCurrentThreadId();
+        Msg queue; PeekMessageW(out queue,IntPtr.Zero,0,0,0); // Give this thread an input queue.
+        if(target==0 || !AttachThreadInput(me,target,true)) throw new Exception("AttachThreadInput failed");
+        try {
+            if(!SetKeyboardState(new byte[256])) throw new Exception("SetKeyboardState failed");
+            Send(h,0x100,key,1);
+            // The keybind may have closed the window the key went to.
+            if(IsWindow(h)) Send(h,0x101,key,0xC0000001L);
+        } finally { AttachThreadInput(me,target,false); }
     }
 }
 '@
@@ -231,8 +254,8 @@ function Stop-Case($case) {
 }
 
 # #497 (last-window): every way the session's last window can go. Keys are
-# F-keys bound to the actions, posted to a pane (a posted Ctrl never reaches
-# GetKeyboardState, so the default chords cannot be used).
+# F-keys bound to the actions, sent to a pane with the modifiers cleared
+# ([Sr]::Key), so no chord is needed.
 $lastWindowConfig=@('keybind = f2=new_window','keybind = f3=close_all_windows','keybind = f4=new_tab','keybind = f5=close_tab:this',
     'keybind = f6=close_surface','keybind = f7=quit','keybind = f8=toggle_quick_terminal','keybind = f9=undo',
     'quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%')
@@ -507,7 +530,7 @@ try {
 } finally {
     $remaining=@($script:processes | Where-Object {Get-Process -Id $_.Pid -ErrorAction SilentlyContinue})
     Check 'owned runtime processes exited' ($remaining.Count -eq 0) 0 $remaining.Count
-    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, and in-app keybinds pressed with posted key messages; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
+    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, and in-app keybinds pressed with key messages sent to the pane; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
 if($failed.Count){ $failed | ForEach-Object { Write-Host ("FAIL: " + $_.Name) }; exit 1 }
