@@ -1481,6 +1481,9 @@ pub inline fn eraseHistory(
         .{ .history = .{} },
         bl,
     );
+    if (comptime build_options.kitty_graphics) {
+        self.kitty_images.deleteInErasedRows(self, .{ .history = .{} }, bl);
+    }
     self.pages.eraseHistory(bl);
     self.cursorReload();
 }
@@ -1972,11 +1975,24 @@ pub inline fn resize(
         .pull_scrollback = opts.pull_scrollback,
     });
 
+    // Without pulling scrollback, a resize that would push the cursor's row
+    // into history erases the rows below the new bottom instead, and marks
+    // the tracked pins in them garbage (PageList.keepRowActive). Delete the
+    // images anchored there now rather than at the next placement.
+    if (comptime build_options.kitty_graphics) {
+        if (!opts.pull_scrollback and self.kitty_images.removeGarbagePlacements(self)) {
+            self.kitty_images.dirty = true;
+        }
+    }
+
     // If we have no scrollback and we shrunk our rows, we must explicitly
     // erase our history. This is because PageList always keeps at least
     // a page size of history.
     if (self.no_scrollback) {
         self.semantic_command.invalidateRange(&self.pages, .{ .history = .{} }, null);
+        if (comptime build_options.kitty_graphics) {
+            self.kitty_images.deleteInErasedRows(self, .{ .history = .{} }, null);
+        }
         self.pages.eraseHistory(null);
     }
 
