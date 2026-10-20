@@ -5922,9 +5922,12 @@ test "settings sections shown in any order leave the window as one made whole at
                 const fixture = try dialog_test.Fixture.startWith(true);
                 defer fixture.finish();
                 const settings = &fixture.settings;
-                // Every section made at open, in order, as before sections
-                // were made when first shown.
-                if (whole) dialog_test.makeAllSections(settings);
+                // Every section made at open, in order, and every value shown
+                // there, as before sections were made when first shown.
+                if (whole) {
+                    dialog_test.makeAllSections(settings);
+                    settings.refreshAllControls();
+                }
                 for (order) |section| settings.setActiveSection(section);
                 states[index] = State.of(settings);
                 for (0..settings_control_count) |control| providers[index][control] = settings.control_uia_providers[control] != null;
@@ -5955,7 +5958,12 @@ test "settings a section first shown after a DPI or High Contrast change looks a
                     const fixture = try dialog_test.Fixture.start();
                     defer fixture.finish();
                     const settings = &fixture.settings;
-                    if (whole) dialog_test.makeAllSections(settings);
+                    // Every section made and shown its values at open, so the
+                    // change reaches it the way it reaches a window's controls.
+                    if (whole) {
+                        dialog_test.makeAllSections(settings);
+                        settings.refreshAllControls();
+                    }
                     switch (change) {
                         .dpi => dialog_test.simulateDpi(fixture.hwnd(), 144),
                         .high_contrast => {
