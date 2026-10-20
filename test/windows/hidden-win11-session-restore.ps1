@@ -333,6 +333,13 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
                 Press (Pane $main) $Vk.NewTab 1500
                 Press (Pane $main) $Vk.NewSplit 1500
                 Press (Pane $main) $Vk.PreviousTab 1500
+                # Three panes with one on screen: the first tab is in front
+                # and the split tab is behind it. If a key did nothing, this
+                # would be the plain two-tab case, which fails on main too.
+                $panes=@([HiddenLocal]::Surfaces($main)); $shown=@($panes|Where-Object {([Sr]::Read($_)).Visible})
+                $reached=$panes.Count -eq 3 -and $shown.Count -eq 1
+                Check "${Name}: a split tab behind the one on screen before the quit" $reached '3 panes, 1 on screen' "$($panes.Count) panes, $($shown.Count) on screen"
+                if(-not $reached) { return }
             }
             'undo-then-close' {
                 Press (Pane $main) $Vk.CloseTab 800
@@ -409,6 +416,11 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
     if($windows.Count -ne 1) { return }
     $w=$windows[0]
     Check "${Name}: with the tabs it had as it went" (@($w.tabs).Count -eq $Tabs) $Tabs @($w.tabs).Count
+    if($End -eq 'quit-split-in-hidden-tab' -and @($w.tabs).Count -eq 2) {
+        $splitPanes=@($w.tabs[1].layout.nodes | Where-Object { $_.PSObject.Properties.Name -contains 'pane' }).Count
+        Check "${Name}: with the first tab in front" ($w.selected_tab -eq 0) 0 $w.selected_tab
+        Check "${Name}: and both panes of the split tab behind it" ($splitPanes -eq 2) 2 $splitPanes
+    }
     $savedRect=[pscustomobject]@{Left=$w.x;Top=$w.y;Right=$w.x+$w.width;Bottom=$w.y+$w.height}
     Check "${Name}: at the rect it had as it went" ($null -ne $w.x -and (Rect-Same $savedRect $moved.Rect)) (Rect-Array $moved.Rect) (Rect-Array $savedRect)
 }
