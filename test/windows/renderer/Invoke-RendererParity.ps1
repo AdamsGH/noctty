@@ -7,6 +7,7 @@ param(
     [switch]$RequireHardware,
     [switch]$WarpOnly,
     [switch]$OpenGLStartupOnly,
+    [switch]$SplitDimOnly,
     [switch]$Driver,
     [string]$RealProfile = '',
     [string]$DesktopName = ''
@@ -61,6 +62,7 @@ if (!$Driver) {
         if ($RequireHardware) { $command += ' -RequireHardware' }
         if ($WarpOnly) { $command += ' -WarpOnly' }
         if ($OpenGLStartupOnly) { $command += ' -OpenGLStartupOnly' }
+        if ($SplitDimOnly) { $command += ' -SplitDimOnly' }
         if (![RendererNative]::CreateProcessW($exe, [Text.StringBuilder]::new($command), [IntPtr]::Zero, [IntPtr]::Zero, $false, 0x08004000, [IntPtr]::Zero, $PSScriptRoot, [ref]$si, [ref]$pi)) { throw 'Hidden driver CreateProcess failed.' }
         Write-Output "Hidden renderer driver PID=$($pi.pid) desktop=$DesktopName"
         $wait = [Diagnostics.Stopwatch]::StartNew()
@@ -84,7 +86,7 @@ if (!$Driver) {
 if ([RendererNative]::DesktopName() -ne $DesktopName -or !$DesktopName.StartsWith('renderer-test-')) { throw 'Driver is not on its verified hidden desktop.' }
 [void][RendererNative]::SetThreadDpiAwarenessContext([IntPtr]-4)
 $result = [ordered]@{ status = 'error'; hiddenDesktop = $DesktopName; profileBefore = $before; binarySHA256 = (Get-FileHash -LiteralPath $Binary).Hash; runs = @(); comparisons = @() }
-function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironment = @{}, [string[]]$ExtraConfig = @(), [switch]$Lifecycle, [switch]$MultiPane, [switch]$Streaming, [int]$FailureAction = 0, [switch]$ReloadUnsupported, [switch]$ReloadImages, [switch]$RetryHardware, [switch]$OpenGLStartupFallback) {
+function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironment = @{}, [string[]]$ExtraConfig = @(), [switch]$Lifecycle, [switch]$MultiPane, [switch]$Streaming, [int]$FailureAction = 0, [switch]$ReloadUnsupported, [switch]$ReloadImages, [switch]$RetryHardware, [switch]$OpenGLStartupFallback, [switch]$SplitDim, [switch]$HoldSync, [switch]$NoShaderReload, [string]$SplitFill = '', [double]$SplitOpacity = 0.7) {
     [void](Assert-Profile $before)
     $run = Join-Path $OutputDirectory $Label
     $bin = Join-Path $run 'bin'
@@ -100,6 +102,11 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
     $config = @('auto-update=off', 'window-save-state=never', 'confirm-close-surface=false', 'window-width=96', 'window-height=28', 'font-size=14', 'font-family=JetBrains Mono', 'cursor-style=block', 'cursor-style-blink=false', 'background=#101010', 'foreground=#eeeeee', 'minimum-contrast=4.5', 'window-vsync=false', 'shell-integration=none', 'single-instance=false', 'windows-job-object-kill-on-close=true', ('renderer=' + $Backend))
     $config += 'command=direct:"' + (Get-Command pwsh).Source + '" -NoProfile -File "' + (Join-Path $bin 'Fixture.ps1') + '"'
     if ($Streaming) { $config[-1] += ' -Stream' }
+    if ($HoldSync) { $config[-1] += ' -HoldSync' }
+    if ($SplitDim) {
+        $config += 'unfocused-split-opacity=' + $SplitOpacity.ToString([Globalization.CultureInfo]::InvariantCulture)
+        if ($SplitFill) { $config += 'unfocused-split-fill=#' + $SplitFill }
+    }
     $config += $ExtraConfig
     $config += 'class=noctty-test-renderer-' + [guid]::NewGuid().ToString('N')
     Set-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value ($config -join "`n") -Encoding utf8
@@ -324,6 +331,117 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             $case.afterReload = & $capture 'after-unsupported-reload'
             if ($case.afterReload.status.frames -le $case.reloaded.status.frames) { throw 'D3D11 stopped rendering after rejected GL fallback.' }
         }
+        if ($SplitDim) {
+            # Both panes run the fixture; the split's new pane, on the right,
+            # takes focus. The dim is the fill blended at 1 - opacity in sRGB
+            # space, so each dimmed capture must equal its undimmed capture
+            # blended that way, except in the cursor cell, whose shape follows
+            # keyboard focus.
+            $fillHex = if ($SplitFill) { $SplitFill } else { '101010' } # the fixture's background
+            $fill = @(0, 2, 4 | ForEach-Object { [Convert]::ToInt32($fillHex.Substring($_, 2), 16) })
+            $alpha = [int][Math]::Round((1 - $SplitOpacity) * 255, [MidpointRounding]::AwayFromZero)
+            $case.splitAlpha = $alpha
+            $blend = {
+                param($Dimmed, $Undimmed, $What, [int]$Alpha = $alpha)
+                $check = [RendererNative]::BlendCheck($Dimmed.path, $Undimmed.path, $fill[0], $fill[1], $fill[2], $Alpha, 2) | ConvertFrom-Json
+                if ($Alpha -gt 0 -and $check.changed -lt 1000) { throw "${What}: the dim changed only $($check.changed) pixels." }
+                if ($check.mismatches -gt 0 -and ($check.bboxWidth -gt 64 -or $check.bboxHeight -gt 64)) { throw "${What}: $($check.mismatches) pixels in a $($check.bboxWidth)x$($check.bboxHeight) box are not the fill blended in sRGB space." }
+                return $check
+            }
+            # The dim state reaches the renderer through its mailbox; poll
+            # until a capture reports the expected state.
+            $paneCapture = {
+                param($Pane, $Name, [bool]$Dimmed, [switch]$NoReplay)
+                $surfaceWindow = $Pane
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                while ($true) {
+                    $frame = & $capture $Name -NoReplay:$NoReplay
+                    if ([bool]$frame.status.split_dimmed -eq $Dimmed) { return $frame }
+                    if ($clock.Elapsed.TotalSeconds -gt 5) { throw "$Name reports split_dimmed=$($frame.status.split_dimmed), expected $Dimmed." }
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+            Remove-Item -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH
+            if (![RendererNative]::Action($surfaceWindow, 2)) { throw 'Split action rejected.' }
+            $splitClock = [Diagnostics.Stopwatch]::StartNew()
+            while (!(Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH) -and $splitClock.Elapsed.TotalSeconds -lt 40) { Start-Sleep -Milliseconds 25 }
+            if (!(Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH)) { throw 'Split fixture did not become ready.' }
+            # A held fixture starts its hold 1.5 s after it is ready.
+            Start-Sleep -Milliseconds $(if ($HoldSync) { 2500 } else { 800 })
+            $panes = @([RendererNative]::Surfaces($hostWindow, $true) | Sort-Object { [RendererNative]::Left($_) })
+            if ($panes.Count -ne 2) { throw 'Expected two visible split panes.' }
+            $left = $panes[0]; $right = $panes[1]
+            if ($HoldSync) {
+                # Under a synchronized-output hold only what the renderer
+                # presents itself reaches a capture without a redraw: the dim
+                # of the pane focus leaves must be presented for it. Run on
+                # OpenGL: an occluded D3D11 pane (any hidden desktop) presents
+                # through its paced retry whatever the hold.
+                $case.heldFocused = & $paneCapture $right 'held-right-focused' $false -NoReplay
+                if (![RendererNative]::Action($right, 8)) { throw 'goto_split rejected.' }
+                $heldClock = [Diagnostics.Stopwatch]::StartNew()
+                while ($true) {
+                    Start-Sleep -Milliseconds 250
+                    $case.heldUnfocused = & $paneCapture $right 'held-right-unfocused' $true -NoReplay
+                    try { $case.heldBlend = & $blend $case.heldUnfocused $case.heldFocused 'Held right pane'; break }
+                    catch { if ($heldClock.Elapsed.TotalSeconds -gt 5) { throw "The dim was not presented under a synchronized-output hold: $($_.Exception.Message)" } }
+                }
+                $case.heldWaitMs = $heldClock.ElapsedMilliseconds
+            } else {
+                $case.splitLeft = & $paneCapture $left 'split-left-dimmed' $true
+                $case.splitRight = & $paneCapture $right 'split-right-focused' $false
+                if (![RendererNative]::Action($right, 8)) { throw 'goto_split rejected.' }
+                $case.gotoLeft = & $paneCapture $left 'goto-left-focused' $false
+                $case.gotoRight = & $paneCapture $right 'goto-right-dimmed' $true
+                $case.leftBlend = & $blend $case.splitLeft $case.gotoLeft 'Left pane'
+                $case.rightBlend = & $blend $case.gotoRight $case.splitRight 'Right pane'
+                # A zoomed pane shows alone, undimmed; leaving the zoom dims the
+                # other pane again.
+                if (![RendererNative]::Action($left, 9)) { throw 'Zoom rejected.' }
+                Start-Sleep -Milliseconds 400
+                if ([RendererNative]::Surfaces($hostWindow, $true).Count -ne 1) { throw 'Zoom left more than one pane visible.' }
+                $case.zoomedLeft = & $paneCapture $left 'zoomed-left' $false
+                if (![RendererNative]::Action($left, 9)) { throw 'Unzoom rejected.' }
+                Start-Sleep -Milliseconds 400
+                $case.unzoomedRight = & $paneCapture $right 'unzoomed-right' $true
+                $case.unzoomedBlend = & $blend $case.unzoomedRight $case.splitRight 'Right pane after the zoom'
+                if ($case.initial.status.backend -eq 'd3d11') {
+                    if (![RendererNative]::LoseDevice($right)) { throw 'Device-loss action failed.' }
+                    Start-Sleep -Milliseconds 200
+                    $case.recreatedRight = & $paneCapture $right 'recreated-right' $true
+                    $case.recreatedDiff = [RendererNative]::Diff($case.unzoomedRight.path, $case.recreatedRight.path, (Join-Path $run 'recreated-right-diff.png')) | ConvertFrom-Json
+                    if ($case.recreatedDiff.different -ne 0) { throw 'Device recreation changed the dimmed pane.' }
+                }
+                if (!$NoShaderReload) {
+                    # The dim lands after a custom shader; a D3D11 pane moves to
+                    # OpenGL for it and keeps its dim.
+                    $shaderPath = Join-Path $run 'split-dim.glsl'
+                    Set-Content -LiteralPath $shaderPath -Value 'void mainImage(out vec4 c, in vec2 p) { c = texture(iChannel0, p / iResolution.xy); }'
+                    Add-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value @(('custom-shader=' + $shaderPath), 'custom-shader-animation=false')
+                    if (![RendererNative]::Action($left, 7)) { throw 'Config reload action rejected.' }
+                    Start-Sleep -Milliseconds 1000
+                    $case.shaderRight = & $paneCapture $right 'shader-right-dimmed' $true
+                    if ($case.shaderRight.status.backend -ne 'opengl') { throw 'A custom shader did not move the pane to OpenGL.' }
+                    $case.shaderBlend = & $blend $case.shaderRight $case.splitRight 'Right pane under a custom shader'
+                }
+                # Opacity 1 turns the dim off: the unfocused pane matches its
+                # undimmed frame.
+                Add-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value 'unfocused-split-opacity=1'
+                if (![RendererNative]::Action($left, 7)) { throw 'Config reload action rejected.' }
+                Start-Sleep -Milliseconds 1000
+                $surfaceWindow = $right
+                $case.opaqueRight = & $capture 'opaque-right'
+                $case.opaqueBlend = & $blend $case.opaqueRight $case.splitRight 'Right pane at opacity 1' -Alpha 0
+                # One pane left: nothing to dim.
+                Add-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value ('unfocused-split-opacity=' + $SplitOpacity.ToString([Globalization.CultureInfo]::InvariantCulture))
+                if (![RendererNative]::Action($left, 7)) { throw 'Config reload action rejected.' }
+                Start-Sleep -Milliseconds 800
+                if (![RendererNative]::Action($left, 6)) { throw 'Close split action rejected.' }
+                Start-Sleep -Milliseconds 600
+                if ([RendererNative]::Surfaces($hostWindow, $true).Count -ne 1) { throw 'Closing a split left more than one pane.' }
+                $case.alone = & $paneCapture $right 'alone-right' $false
+            }
+        }
         if ($MultiPane) {
             if (![RendererNative]::Action($surfaceWindow, 2)) { throw 'Split action rejected.' }
             Start-Sleep -Milliseconds 1500
@@ -386,6 +504,23 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
 }
 try {
     # These cases need no GL driver and run on x64 and native ARM64 CI too.
+    if ($SplitDimOnly) {
+        $splitGL = Invoke-Case 'split-dim-opengl' 'opengl' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitGL
+        $splitHardware = Invoke-Case 'split-dim-hardware' 'd3d11' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitHardware
+        $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
+        $splitDefault = Invoke-Case 'split-dim-default-fill' 'd3d11' -SplitDim -NoShaderReload; $result.runs += $splitDefault
+        # OpenGL only: D3D11 on a hidden desktop is always occluded, and its
+        # paced present retry would carry the dim through a hold anyway.
+        $splitHeldGL = Invoke-Case 'split-dim-held-opengl' 'opengl' -SplitDim -HoldSync; $result.runs += $splitHeldGL
+        # Same dim on every backend: hardware exactly, WARP within its edge tolerance.
+        foreach ($candidate in @($splitHardware, $splitWarp)) {
+            $diff = [RendererNative]::Diff($splitGL.splitLeft.path, $candidate.splitLeft.path, (Join-Path $OutputDirectory ($candidate.label + '-dimmed-diff.png'))) | ConvertFrom-Json
+            $result.comparisons += @{ label = $candidate.label + '-dimmed'; diff = $diff }
+            if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware dims differently from OpenGL.' }
+            if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP dim exceeds documented edge quantization tolerance.' }
+        }
+        $result.status = 'pass'; return
+    }
     $startupFallback = Invoke-Case 'opengl-startup-fallback' 'opengl' @{NOCTTY_RENDERER_FAIL_OPENGL_VERSION='1'} -OpenGLStartupFallback
     $result.runs += $startupFallback
     if ($OpenGLStartupOnly) { $result.status = 'pass'; return }
@@ -399,6 +534,7 @@ try {
         $warp = Invoke-Case 'warp' 'd3d11-warp' -Lifecycle
         $result.runs += $warp
         if (!$warp.initial.status.warp) { throw 'Forced WARP selected hardware.' }
+        $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
         $result.status = 'pass'
         return
     }
@@ -413,6 +549,20 @@ try {
         $result.comparisons += @{ label = $candidate.label; diff = $diff }
         if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware differs from OpenGL.' }
         if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP exceeds documented edge quantization tolerance.' }
+    }
+    $splitGL = Invoke-Case 'split-dim-opengl' 'opengl' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitGL
+    $splitHardware = Invoke-Case 'split-dim-hardware' 'd3d11' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitHardware
+    $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
+    $splitDefault = Invoke-Case 'split-dim-default-fill' 'd3d11' -SplitDim -NoShaderReload; $result.runs += $splitDefault
+    # OpenGL only: D3D11 on a hidden desktop is always occluded, and its
+    # paced present retry would carry the dim through a hold anyway.
+    $splitHeldGL = Invoke-Case 'split-dim-held-opengl' 'opengl' -SplitDim -HoldSync; $result.runs += $splitHeldGL
+    # Same dim on every backend: hardware exactly, WARP within its edge tolerance.
+    foreach ($candidate in @($splitHardware, $splitWarp)) {
+        $diff = [RendererNative]::Diff($splitGL.splitLeft.path, $candidate.splitLeft.path, (Join-Path $OutputDirectory ($candidate.label + '-dimmed-diff.png'))) | ConvertFrom-Json
+        $result.comparisons += @{ label = $candidate.label + '-dimmed'; diff = $diff }
+        if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware dims differently from OpenGL.' }
+        if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP dim exceeds documented edge quantization tolerance.' }
     }
     $noDevice = Invoke-Case 'no-device' 'd3d11' @{ NOCTTY_RENDERER_FAIL_DEVICE = '1' }; $result.runs += $noDevice
     if ($noDevice.initial.status.backend -ne 'opengl') { throw 'Unavailable D3D11 did not select OpenGL.' }

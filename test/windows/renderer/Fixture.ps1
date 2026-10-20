@@ -1,4 +1,4 @@
-param([switch]$Stream, [int]$IntervalMs=10)
+param([switch]$Stream, [switch]$HoldSync, [int]$IntervalMs=10)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $e=[char]27
@@ -43,5 +43,14 @@ if ($env:NOCTTY_RENDERER_TEST_KITTY -eq '1') { [Console]::Write("$e`_Ga=T,f=24,s
   }
   Start-Sleep -Milliseconds $IntervalMs
  }
+}
+# Hold synchronized output (mode 2026) open: termio ends a hold after 1 s,
+# and each new BSU restarts that clock. Only what the renderer presents on its
+# own reaches a capture that asks for no redraw.
+if ($HoldSync) {
+ # Let the frame with the whole fixture reach the screen first.
+ Start-Sleep -Milliseconds 1500
+ $clock=[Diagnostics.Stopwatch]::StartNew()
+ while($clock.Elapsed.TotalSeconds -lt 85) { [Console]::Write("$e[?2026h"); Start-Sleep -Milliseconds 300 }
 }
 Start-Sleep -Seconds 90

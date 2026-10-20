@@ -353,7 +353,7 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
     const file = try std.fs.cwd().createFile(status_path, .{});
     defer file.close();
     const json = switch (self.active) {
-        .opengl => try std.json.Stringify.valueAlloc(self.alloc, .{ .backend = "opengl" }, .{}),
+        .opengl => |v| try std.json.Stringify.valueAlloc(self.alloc, .{ .backend = "opengl", .split_dimmed = v.split_dimmed }, .{}),
         .d3d11 => |v| report: {
             const receipt = v.api.stats();
             var max_image_id: u32 = 0;
@@ -363,6 +363,7 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
             }
             break :report try std.json.Stringify.valueAlloc(self.alloc, .{
                 .backend = "d3d11",
+                .split_dimmed = v.split_dimmed,
                 .warp = receipt.warp != 0,
                 .adapter = std.mem.sliceTo(&receipt.adapter_name, 0),
                 .feature_level = receipt.feature_level,
@@ -500,6 +501,15 @@ pub fn setFocus(self: *Windows, focus: bool) !void {
     defer self.mutex.unlock();
     switch (self.active) {
         inline else => |v| try v.setFocus(focus),
+    }
+}
+
+pub fn setSplitDimmed(self: *Windows, dimmed: bool) void {
+    if (self.opengl.load(.acquire)) |v| return v.setSplitDimmed(dimmed);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    switch (self.active) {
+        inline else => |v| v.setSplitDimmed(dimmed),
     }
 }
 

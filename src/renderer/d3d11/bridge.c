@@ -43,8 +43,14 @@ struct NocttyD3DTarget {
     struct NocttyD3DTarget *next;
     ID3D11Texture2D *gpu;
     ID3D11RenderTargetView *rtv;
+    /* A UNORM view of a linear (sRGB) target's texture, for a step that
+     * blends with the stored bytes, in gamma space: the split dim. Null for
+     * a target whose rtv is already UNORM. */
+    ID3D11RenderTargetView *gamma_rtv;
     uint32_t width, height, linear, rendered;
 };
+/* noctty_d3d11_draw pipeline numbers (d3d11/Pipeline.zig Kind). */
+enum { PIPELINE_BG = 0, PIPELINE_CELL_BG = 1, PIPELINE_TEXT = 2, PIPELINE_SPLIT_DIM = 5 };
 struct NocttyD3D {
     HWND hwnd;
     HMODULE library;
@@ -203,7 +209,7 @@ static HRESULT target_gpu(NocttyD3DTarget *t) {
     if (!t->owner->device) return E_FAIL;
     if (!t->width || !t->height) return S_OK;
     ID3D11Texture2D *gpu = NULL;
-    ID3D11RenderTargetView *rtv = NULL;
+    ID3D11RenderTargetView *rtv = NULL, *gamma_rtv = NULL;
     D3D11_TEXTURE2D_DESC desc;
     D3D11_RENDER_TARGET_VIEW_DESC view;
     memset(&desc, 0, sizeof(desc));
@@ -219,15 +225,20 @@ static HRESULT target_gpu(NocttyD3DTarget *t) {
     view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
     hr = ID3D11Device_CreateRenderTargetView(t->owner->device, (ID3D11Resource *)gpu, &view, &rtv);
     if (FAILED(hr)) { RELEASE(gpu); return hr; }
-    RELEASE(t->rtv); RELEASE(t->gpu);
-    t->gpu = gpu; t->rtv = rtv; t->rendered = 0;
+    if (t->linear) {
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        hr = ID3D11Device_CreateRenderTargetView(t->owner->device, (ID3D11Resource *)gpu, &view, &gamma_rtv);
+        if (FAILED(hr)) { RELEASE(rtv); RELEASE(gpu); return hr; }
+    }
+    RELEASE(t->gamma_rtv); RELEASE(t->rtv); RELEASE(t->gpu);
+    t->gpu = gpu; t->rtv = rtv; t->gamma_rtv = gamma_rtv; t->rendered = 0;
     return S_OK;
 }
 static void release_device(NocttyD3D *d) {
     if (d->context) ID3D11DeviceContext_ClearState(d->context);
     for (NocttyD3DBuffer *b = d->buffers; b; b = b->next) { RELEASE(b->srv); RELEASE(b->gpu); }
     for (NocttyD3DTexture *t = d->textures; t; t = t->next) { RELEASE(t->srv); RELEASE(t->gpu); }
-    for (NocttyD3DTarget *t = d->targets; t; t = t->next) { RELEASE(t->rtv); RELEASE(t->gpu); t->rendered = 0; }
+    for (NocttyD3DTarget *t = d->targets; t; t = t->next) { RELEASE(t->gamma_rtv); RELEASE(t->rtv); RELEASE(t->gpu); t->rendered = 0; }
     d->last_rendered = NULL;
     noctty_composition_destroy(d->composition);
     d->composition = NULL;
@@ -753,7 +764,7 @@ NocttyD3DTarget *noctty_d3d11_target_create(NocttyD3D *d, uint32_t width, uint32
     t->owner = d; t->width = width; t->height = height; t->linear = linear;
     HRESULT hr = device_status(d);
     if (SUCCEEDED(hr)) hr = record_result(d, target_gpu(t));
-    if (FAILED(hr) && !recovery_will_rebuild(d)) { RELEASE(t->rtv); RELEASE(t->gpu); free(t); return NULL; }
+    if (FAILED(hr) && !recovery_will_rebuild(d)) { RELEASE(t->gamma_rtv); RELEASE(t->rtv); RELEASE(t->gpu); free(t); return NULL; }
     t->next = d->targets; d->targets = t;
     return t;
 }
@@ -762,7 +773,7 @@ void noctty_d3d11_target_destroy(NocttyD3DTarget *t) {
     while (*link && *link != t) link = &(*link)->next;
     if (*link) *link = t->next;
     if (t->owner->last_rendered == t) t->owner->last_rendered = NULL;
-    RELEASE(t->rtv); RELEASE(t->gpu); free(t);
+    RELEASE(t->gamma_rtv); RELEASE(t->rtv); RELEASE(t->gpu); free(t);
 }
 int32_t noctty_d3d11_clear(NocttyD3DTarget *t, const float *color) {
     HRESULT hr = device_status(t->owner);
@@ -779,20 +790,25 @@ int32_t noctty_d3d11_draw(NocttyD3DTarget *target, uint32_t pipeline, NocttyD3DB
     NocttyD3D *d = target->owner;
     HRESULT hr = device_status(d);
     if (FAILED(hr)) return hr;
-    if (pipeline > 2 || !target->rtv || !uniforms || uniforms->owner != d || !uniforms->gpu) return record_result(d, E_INVALIDARG);
-    if ((pipeline != 0 && (!backgrounds || !backgrounds->srv)) ||
-        (pipeline == 2 && (!text || !text->srv || !gray || !gray->srv || !color || !color->srv))) return record_result(d, E_INVALIDARG);
+    if ((pipeline > PIPELINE_TEXT && pipeline != PIPELINE_SPLIT_DIM) || !target->rtv || !uniforms || uniforms->owner != d || !uniforms->gpu) return record_result(d, E_INVALIDARG);
+    if (((pipeline == PIPELINE_CELL_BG || pipeline == PIPELINE_TEXT) && (!backgrounds || !backgrounds->srv)) ||
+        (pipeline == PIPELINE_TEXT && (!text || !text->srv || !gray || !gray->srv || !color || !color->srv))) return record_result(d, E_INVALIDARG);
     if ((text && text->owner != d) || (backgrounds && backgrounds->owner != d) ||
         (gray && gray->owner != d) || (color && color->owner != d)) return record_result(d, E_INVALIDARG);
+    /* The split dim is the background shader fed the fill (bg_ps does not
+     * linearize it), blended over the finished frame through a UNORM view,
+     * so on the stored sRGB bytes, as upstream's overlay blends. */
+    const int split_dim = pipeline == PIPELINE_SPLIT_DIM;
+    ID3D11RenderTargetView *rtv = split_dim && target->gamma_rtv ? target->gamma_rtv : target->rtv;
     D3D11_VIEWPORT viewport = { 0, 0, (float)target->width, (float)target->height, 0, 1 };
     ID3D11DeviceContext_RSSetViewports(d->context, 1, &viewport);
     ID3D11DeviceContext_RSSetState(d->context, d->rasterizer);
-    ID3D11DeviceContext_OMSetRenderTargets(d->context, 1, &target->rtv, NULL);
-    ID3D11DeviceContext_OMSetBlendState(d->context, pipeline == 0 ? d->opaque : d->blend, NULL, UINT_MAX);
+    ID3D11DeviceContext_OMSetRenderTargets(d->context, 1, &rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(d->context, pipeline == PIPELINE_BG ? d->opaque : d->blend, NULL, UINT_MAX);
     ID3D11DeviceContext_IASetInputLayout(d->context, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(d->context, pipeline == 2 ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(d->context, pipeline == 2 ? d->text_vs : d->bg_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(d->context, d->ps[pipeline], NULL, 0);
+    ID3D11DeviceContext_IASetPrimitiveTopology(d->context, pipeline == PIPELINE_TEXT ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(d->context, pipeline == PIPELINE_TEXT ? d->text_vs : d->bg_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(d->context, d->ps[split_dim ? PIPELINE_BG : pipeline], NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(d->context, 0, 1, &uniforms->gpu);
     ID3D11DeviceContext_PSSetConstantBuffers(d->context, 0, 1, &uniforms->gpu);
     ID3D11ShaderResourceView *resources[4] = {

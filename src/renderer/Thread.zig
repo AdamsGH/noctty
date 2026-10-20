@@ -553,6 +553,11 @@ fn drainMailbox(self: *Thread) !bool {
                 }
             },
 
+            .split_dimmed => |v| {
+                self.renderer.setSplitDimmed(v);
+                self.held_frame.notePixelsChanged();
+            },
+
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
                 if (self.flags.focused and self.cursorShouldBlink()) {
@@ -1208,6 +1213,12 @@ const HeldFrame = struct {
         }
     }
 
+    /// The renderer itself changed what the frame shows (a split's dim),
+    /// which the terminal holding its output does not hold back.
+    fn notePixelsChanged(self: *HeldFrame) void {
+        self.repaint_owed = true;
+    }
+
     fn presents(self: HeldFrame, pass: RenderPass, draw_active: bool) bool {
         return self.repaint_owed or (pass == .animation and draw_active);
     }
@@ -1263,6 +1274,23 @@ test "a frame synchronized output holds is presented only for animation and owed
     held.noteWake(.{ .wake = Source.apprt_paint_retry.bit() });
     try testing.expect(held.presents(.followup, false));
     held.noteWake(.followup);
+    try testing.expect(held.presents(.followup, false));
+    held.notePresent();
+    try testing.expect(!held.presents(.followup, false));
+}
+
+test "a split dim change presents a frame synchronized output holds" {
+    const testing = std.testing;
+    const Source = rendererpkg.State.WakeSource;
+
+    // The change arrives as a mailbox message, whose wake alone does not
+    // present a held frame; the message makes the pass present it.
+    var held: HeldFrame = .{};
+    held.noteWake(.{ .wake = Source.mailbox.bit() });
+    try testing.expect(!held.presents(.{ .wake = Source.mailbox.bit() }, false));
+    held.notePixelsChanged();
+    try testing.expect(held.presents(.{ .wake = Source.mailbox.bit() }, false));
+    // Pacing put the pass off: the follow-up that runs it presents.
     try testing.expect(held.presents(.followup, false));
     held.notePresent();
     try testing.expect(!held.presents(.followup, false));
