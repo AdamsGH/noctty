@@ -80,9 +80,10 @@ through UIA instead, and sets `NOCTTY_RENDERER_KEEP_NOTICES` (also honoured only
 by test-tools builds) so the banner stays up: an info banner's countdown starts
 when it is shown, and a slow cold launch can keep the UI thread busy until it has
 expired. The case reads the banner only once it is shown. Its `bannerWait`
-receipt records when that was (`shownMs`), the reads, the longest one, when the
-name was found and the last name read, so `foundMs - shownMs` is how long the
-banner had to stay up.
+receipt records the first poll that saw it shown (`shownMs`), the reads, the
+longest one, when the name was found and the last name read. `foundMs - shownMs`
+is a lower bound on how long the banner had to stay up: the harness polls every
+25 ms and can itself be late to see it.
 
 Build two production binaries with custom shaders, one default and one with
 `-Dd3d11=false`. Run `Invoke-OpenGLScheduling.ps1 -DefaultBinary <exe>

@@ -149,6 +149,9 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
                     # The banner child exists, hidden, long before a banner
                     # is set. Read it only once it is shown, which is when an
                     # info countdown starts, so the reads time only that wait.
+                    # shownMs is the first poll that sees it shown, so
+                    # foundMs - shownMs is a lower bound on how long it had
+                    # to stay up.
                     $banner=[RendererNative]::ChildOfId($hostWindow,1913)
                     if ($banner -ne [IntPtr]::Zero -and [RendererNative]::IsWindowVisible($banner)) {
                         $bannerWait = $case.bannerWait
