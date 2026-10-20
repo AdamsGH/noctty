@@ -1515,12 +1515,26 @@ link: RepeatableLink = .{},
 /// to new windows and does not apply to tabs, splits, etc. However, this setting
 /// will apply to all new windows, not just the first one.
 ///
+/// On Windows this includes a window restored from the saved session (see
+/// `window-save-state`) and a window opened from a named layout. A restored
+/// window is maximized over the rect it was saved at, and that rect is the
+/// one it returns to. It does not apply to the quick terminal or to a console
+/// handed off as the default terminal, which starts in the show state its
+/// program asked for. Changing it does not change windows that are already
+/// open.
+///
 /// Available since: 1.1.0
 maximize: bool = false,
 
 /// Start new windows in fullscreen. This setting applies to new windows and
 /// does not apply to tabs, splits, etc. However, this setting will apply to all
 /// new windows, not just the first one.
+///
+/// On Windows it applies to the same windows as `maximize`. A window that
+/// starts fullscreen leaves fullscreen to the window it would otherwise have
+/// been, maximized when `maximize` is also set. The saved session does not
+/// record fullscreen: a fullscreen window is saved as the window it leaves
+/// fullscreen to. On the command line it needs a value: `--fullscreen=true`.
 ///
 /// Allowable values are:
 ///
