@@ -1037,6 +1037,13 @@ test "hints: local path shapes are openable and everything else is not" {
             "\\\\?\\C:\\x",
             "/Users/x",
             "/cd/x",
+            // A drive's root never is, like `C:\` (#520 review): these are
+            // switches far more often (`cmd /c`, `xcopy /s /e`).
+            "/c",
+            "/c/",
+            "/cygdrive/c",
+            "/c/..",
+            "/c/x/..",
             "C:\\a\\b.txt:stream",
             "/c/a/b.txt:stream",
             "https://example.com/a",
@@ -1049,9 +1056,53 @@ test "hints: local path shapes are openable and everything else is not" {
     }
 
     // An MSYS2 or Cygwin drive path is local only outside WSL (#514).
-    for ([_][]const u8{ "/c/work/notes.txt", "/c/work/notes.txt:3:4", "/cygdrive/c/work", "/c" }) |text| {
+    for ([_][]const u8{ "/c/work/notes.txt", "/c/work/notes.txt:3:4", "/cygdrive/c/work", "/c/w" }) |text| {
         try std.testing.expect(isLocalPath(text, true));
         try std.testing.expect(!isLocalPath(text, false));
+    }
+}
+
+// Windows command lines are full of single-letter switches, and `url.regex`
+// matches each as a rooted path (`/c` in `cmd /c "dir"`). Ctrl copies them in
+// every pane; only a path below a drive's root opens outside WSL (#514, #520
+// review).
+test "hints: a single-letter switch is never a drive's root" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+
+    var state = try renderFixture(
+        alloc,
+        100,
+        8,
+        "cmd /c \"dir\"\r\n" ++
+            "findstr /c:\"x\" a.txt\r\n" ++
+            "C:\\Windows\\system32\\cmd.exe /d /c \"x\"\r\n" ++
+            "xcopy /s /e a b\r\n" ++
+            "/c/Users/me/conf.d\r\n" ++
+            "END",
+    );
+    defer state.deinit(alloc);
+
+    var scan = try scanRenderState(alloc, &state, &default_patterns);
+    defer scan.deinit(alloc);
+
+    // Text, then what Ctrl does outside WSL and in a WSL pane.
+    const expected = [_]struct { []const u8, Action, Action }{
+        .{ "/c", .copy, .copy },
+        .{ "/c", .copy, .copy },
+        .{ "C:\\Windows\\system32\\cmd.exe", .open, .open },
+        .{ "/d", .copy, .copy },
+        .{ "/c", .copy, .copy },
+        .{ "/s", .copy, .copy },
+        .{ "/e a b", .copy, .copy },
+        .{ "/c/Users/me/conf.d", .open, .copy },
+    };
+    try testing.expectEqual(expected.len, scan.matches.len);
+    for (expected, 0..) |want, index| {
+        try testing.expectEqualStrings(want[0], scan.matchText(index));
+        try testing.expectEqual(want[1], resolveAction(want[0], true, false, true));
+        try testing.expectEqual(want[2], resolveAction(want[0], true, false, false));
     }
 }
 

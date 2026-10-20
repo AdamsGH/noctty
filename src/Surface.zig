@@ -3028,7 +3028,9 @@ pub fn launchesWsl(self: *const Surface) bool {
 /// Cygwin drive path is a Windows path (`windows_shell.msysDrivePathToWindows`):
 /// `/c/Users/me` is `C:\Users\me`. Link text of that form is read as the
 /// Windows path, and so is a pane directory of that form (fish under MSYS2
-/// reports `/c/...` in its OSC 7) for a relative link.
+/// reports `/c/...` in its OSC 7, and `/c` for the drive's root) for a
+/// relative link. A drive's root as link text (`/c`, as in `cmd /c`) is not
+/// read: it is left to the opener as written, which refuses it.
 ///
 /// Such text is never left to the opener as written, which cannot read it:
 /// the result is the Windows path even when nothing is there, and the opener
@@ -3050,7 +3052,7 @@ fn resolveMsysOpenPath(
         return found;
     }
     const base = dir orelse return resolveOpenPath(alloc, null, text);
-    const windows_base = try windows_shell.msysDrivePathToWindows(alloc, base);
+    const windows_base = try windows_shell.msysDriveDirToWindows(alloc, base);
     defer if (windows_base) |p| alloc.free(p);
     return resolveOpenPath(alloc, windows_base orelse base, text);
 }
@@ -3555,6 +3557,22 @@ test "an MSYS2 or Cygwin drive path in link text is the Windows path it names (#
         const plain = try resolveMsysOpenPath(alloc, dir, "a.txt");
         defer if (plain) |p| alloc.free(p);
         try std.testing.expect(plain != null);
+        // So does a drive's root as the pane directory (`cd /c` in fish).
+        const root = [_]u8{ '/', std.ascii.toLower(dir[0]) };
+        const below_root = try std.fs.path.join(alloc, &.{ dir[3..], "a.txt" });
+        defer alloc.free(below_root);
+        const from_root = try resolveMsysOpenPath(alloc, &root, below_root);
+        defer if (from_root) |p| alloc.free(p);
+        try std.testing.expect(from_root != null);
+        try std.testing.expect(std.ascii.eqlIgnoreCase(from_root.?[3..], below_root));
+    }
+
+    // A drive's root is not read from link text: a lone `/c` is nearly always
+    // a switch (`cmd /c "x"`, `findstr /c:x`, `xcopy /s /e`), and a `..` above
+    // the drive is MSYS2's own root. The opener gets the text as written and
+    // refuses it, as on main (#520 review).
+    for ([_][]const u8{ "/c", "/C", "/d", "/s", "/e", "/c/", "/cygdrive/c", "/c/x/..", "/c/..", "/c/..." }) |text| {
+        try std.testing.expect(try resolveMsysOpenPath(alloc, null, text) == null);
     }
 
     // A letter that is no drive here is the Windows path too, which the opener

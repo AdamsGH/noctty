@@ -62,6 +62,37 @@ pub fn launchArgv(
     return words;
 }
 
+/// Whether `args` start WSL through its `bash.exe` launcher, the one in the
+/// Windows directory or the WindowsApps alias
+/// (`windows_shell.isWslBashLauncherPath`), directly or as the program of a
+/// `command = bash ...` line. A bare `bash` is the first one on the child's
+/// `PATH`, as shell integration finds it before it leaves this launcher
+/// alone (and otherwise launches its match by full path). Not exact for a
+/// direct bare `bash` with integration off: `CreateProcessW` tries the
+/// system directory before `PATH`. `alloc` should be an arena.
+pub fn launchesBashLauncher(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    windows_cmd_shell: bool,
+    env: *const EnvMap,
+) !bool {
+    const argv = if (!windows_cmd_shell)
+        args
+    else if (args.len == 3)
+        try splitWords(alloc, args[2])
+    else
+        return false;
+    if (argv.len == 0) return false;
+    const exe = argv[0];
+    const name = std.fs.path.basename(exe);
+    if (!std.ascii.eqlIgnoreCase(name, "bash") and !std.ascii.eqlIgnoreCase(name, "bash.exe")) return false;
+    const program = if (std.mem.indexOfAny(u8, exe, "\\/:") == null)
+        try windows_shell.lookupChildExecutable(alloc, exe, env) orelse return false
+    else
+        exe;
+    return try windows_shell.isWslBashLauncherPath(alloc, program);
+}
+
 /// An automatic TERM belongs to one verified WSL child, not an entire cmd
 /// pipeline. Shell expansion also prevents reproducing its selector/cwd.
 pub fn canProbeShell(line: []const u8) bool {

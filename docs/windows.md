@@ -1436,13 +1436,21 @@ A path inside single or double quotes ends at its closing quote.
 In a pane that does not run WSL, an absolute drive path as MSYS2, Git Bash
 and Cygwin print it opens as the Windows path it names: `/c/Users/me` and
 `/cygdrive/c/Users/me` open `C:\Users\me`, and a relative link resolves
-against a pane directory reported in that form. The Windows path then goes
-through the same checks as one written `C:\Users\me`, so a letter that is not
-a local drive, a network drive or a missing file is refused. A pane counts as
-WSL when its command is `wsl.exe`, directly or as `command = wsl.exe ...`;
-there `/c/...` is a Linux path and is not opened. A WSL started from another
-shell inside a pane, or handed to noctty as the default terminal, is not
-recognized as one.
+against a pane directory reported in that form (`/c` included). The Windows
+path then goes through the same checks as one written `C:\Users\me`, so a
+letter that is not a local drive, a network drive or a missing file is
+refused. A drive's root is never opened from text, just as `C:\` is not a
+link: `/c` alone is a switch in `cmd /c` far more often than a drive.
+
+A pane counts as WSL when its command starts `wsl.exe` or WSL's `bash.exe`
+launcher (the one in the Windows folder, or the WindowsApps alias), directly
+or as `command = wsl.exe ...`; a bare `bash` counts when the first `bash` on
+the pane's `PATH` is that launcher. There `/c/...` is a Linux path and is
+not opened. Some WSL sessions are not recognized, so a `/c/x` printed in
+them opens `C:\x` when that exists: WSL started by another program in the
+pane (`cmd /c wsl`, `wsl` typed at a prompt), a distribution's own launcher
+such as `ubuntu.exe`, and a session handed to noctty as the default
+terminal.
 
 A quick select with nothing to label, or with too many targets to label
 without overlap, says so in the banner.
