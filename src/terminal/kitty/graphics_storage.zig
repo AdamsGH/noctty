@@ -449,7 +449,7 @@ pub const ImageStorage = struct {
 
                 var it = self.placements.iterator();
                 while (it.next()) |entry| {
-                    if (entry.key_ptr.image_id >= v.first or entry.key_ptr.image_id <= v.last) {
+                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
                         const image_id = entry.key_ptr.image_id;
                         entry.value_ptr.deinit(t.screens.active);
                         self.placements.removeByPtr(entry.key_ptr);
@@ -705,6 +705,24 @@ pub const ImageStorage = struct {
             }
         }
 
+        /// Multiply two protocol-controlled values without allowing them to
+        /// wrap. Placement geometry is exposed as u32, so values larger than
+        /// that are represented by the largest possible value.
+        fn saturatingMul(lhs: u32, rhs: u32) u32 {
+            return std.math.mul(u32, lhs, rhs) catch std.math.maxInt(u32);
+        }
+
+        /// Scale a dimension by an aspect ratio and round to the nearest
+        /// integer. The u64 intermediate can hold the product of two u32s as
+        /// well as the rounding adjustment.
+        fn scaleDimension(value: u32, numerator: u32, denominator: u32) u32 {
+            if (denominator == 0) return 0;
+
+            const rounded = (@as(u64, value) * @as(u64, numerator) +
+                @as(u64, denominator) / 2) / @as(u64, denominator);
+            return std.math.cast(u32, rounded) orelse std.math.maxInt(u32);
+        }
+
         /// Calculates the size of this placement's image in pixels,
         /// taking in to account the specified rows and columns.
         pub fn calculatedSize(
@@ -735,15 +753,12 @@ pub const ImageStorage = struct {
             const cell_width: u32 = t.width_px / t.cols;
             const cell_height: u32 = t.height_px / t.rows;
 
-            const width_f64: f64 = @floatFromInt(width);
-            const height_f64: f64 = @floatFromInt(height);
-
             // If we have a specified cols AND rows then we calculate
             // the width and height from them directly, we don't need
             // to adjust for aspect ratio.
             if (self.columns > 0 and self.rows > 0) {
-                const calc_width = cell_width * self.columns;
-                const calc_height = cell_height * self.rows;
+                const calc_width = saturatingMul(cell_width, self.columns);
+                const calc_height = saturatingMul(cell_height, self.rows);
 
                 return .{
                     .width = calc_width,
@@ -757,11 +772,8 @@ pub const ImageStorage = struct {
             // If only the columns were specified, we determine
             // the height of the image based on the aspect ratio.
             if (self.columns > 0) {
-                const aspect = height_f64 / width_f64;
-                const calc_width: u32 = cell_width * self.columns;
-                const calc_height: u32 = @intFromFloat(@round(
-                    @as(f64, @floatFromInt(calc_width)) * aspect,
-                ));
+                const calc_width = saturatingMul(cell_width, self.columns);
+                const calc_height = scaleDimension(calc_width, height, width);
 
                 return .{
                     .width = calc_width,
@@ -772,11 +784,8 @@ pub const ImageStorage = struct {
             // Otherwise, only the rows were specified, so we
             // determine the width based on the aspect ratio.
             {
-                const aspect = width_f64 / height_f64;
-                const calc_height: u32 = cell_height * self.rows;
-                const calc_width: u32 = @intFromFloat(@round(
-                    @as(f64, @floatFromInt(calc_height)) * aspect,
-                ));
+                const calc_height = saturatingMul(cell_height, self.rows);
+                const calc_width = scaleDimension(calc_height, width, height);
 
                 return .{
                     .width = calc_width,
@@ -806,12 +815,12 @@ pub const ImageStorage = struct {
             return .{
                 .cols = std.math.divCeil(
                     u32,
-                    calc_size.width + self.x_offset,
+                    calc_size.width +| self.x_offset,
                     t.width_px / t.cols,
                 ) catch 0,
                 .rows = std.math.divCeil(
                     u32,
-                    calc_size.height + self.y_offset,
+                    calc_size.height +| self.y_offset,
                     t.height_px / t.rows,
                 ) catch 0,
             };
@@ -821,8 +830,10 @@ pub const ImageStorage = struct {
 
         /// Returns a selection of the entire rectangle this placement
         /// occupies within the screen. This can return null if the placement
-        /// doesn't have an associated rect (i.e. a virtual placement, or one
-        /// whose tracked content has been pruned from the scrollback).
+        /// doesn't have an associated rect: a virtual placement, one whose
+        /// tracked content has been pruned from the scrollback, or one whose
+        /// computed grid is empty (missing pixel metrics, or an aspect ratio
+        /// that rounds one dimension down to zero).
         pub fn rect(
             self: Placement,
             image: Image,
@@ -840,17 +851,21 @@ pub const ImageStorage = struct {
             // addPlacement reclaims it.
             if (pin.garbage) return null;
 
+            // An empty grid occupies no rectangle, and subtracting one from
+            // a zero count below would underflow.
+            if (grid_size.cols == 0 or grid_size.rows == 0) return null;
+
             var br = switch (pin.downOverflow(grid_size.rows - 1)) {
                 .offset => |v| v,
                 .overflow => |v| v.end,
             };
-            br.x = @min(
+            br.x = @intCast(@min(
                 // We need to sub one here because the x value is
                 // one width already. So if the image is width "1"
                 // then we add zero to X because X itself is width 1.
-                pin.x + (grid_size.cols - 1),
-                t.cols - 1,
-            );
+                @as(u32, pin.x) +| (grid_size.cols - 1),
+                @as(u32, t.cols) - 1,
+            ));
 
             return .{
                 .top_left = pin.*,
@@ -1519,15 +1534,26 @@ test "storage: delete images by range 3" {
     try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+    try s.addPlacement(alloc, t.screens.active, 3, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try testing.expectEqual(@as(usize, 3), s.images.count());
-    try testing.expectEqual(@as(usize, 2), s.placements.count());
+    try testing.expectEqual(@as(usize, 3), s.placements.count());
 
     s.dirty = false;
-    s.delete(alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 1 } });
+    // Only image 2 is inside the range: the placements below and above it
+    // stay, and so do their pins.
+    s.delete(alloc, &t, .{ .range = .{ .delete = false, .first = 2, .last = 2 } });
     try testing.expect(s.dirty);
     try testing.expectEqual(@as(usize, 3), s.images.count());
-    try testing.expectEqual(@as(usize, 0), s.placements.count());
-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expectEqual(@as(usize, 2), s.placements.count());
+    try testing.expect(s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }) != null);
+    try testing.expect(s.placements.get(.{
+        .image_id = 3,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }) != null);
+    try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
 }
 
 test "storage: delete images by range 4" {
@@ -1544,15 +1570,26 @@ test "storage: delete images by range 4" {
     try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+    try s.addPlacement(alloc, t.screens.active, 3, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try testing.expectEqual(@as(usize, 3), s.images.count());
-    try testing.expectEqual(@as(usize, 2), s.placements.count());
+    try testing.expectEqual(@as(usize, 3), s.placements.count());
 
     s.dirty = false;
-    s.delete(alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 1 } });
+    // Only image 2 is inside the range: the placements below and above it
+    // stay, and so do their pins.
+    s.delete(alloc, &t, .{ .range = .{ .delete = true, .first = 2, .last = 2 } });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 1), s.images.count());
-    try testing.expectEqual(@as(usize, 0), s.placements.count());
-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expectEqual(@as(usize, 2), s.images.count());
+    try testing.expectEqual(@as(usize, 2), s.placements.count());
+    try testing.expect(s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }) != null);
+    try testing.expect(s.placements.get(.{
+        .image_id = 3,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }) != null);
+    try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
 }
 
 test "storage: aspect ratio calculation when only columns or rows specified" {
@@ -1598,5 +1635,187 @@ test "storage: aspect ratio calculation when only columns or rows specified" {
         const calc_size = placement.calculatedSize(image, &t);
         try testing.expectEqual(@as(u32, 178), calc_size.width);
         try testing.expectEqual(@as(u32, 100), calc_size.height);
+    }
+}
+
+test "storage: placement geometry handles untrusted dimensions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const max = std.math.maxInt(u32);
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(alloc);
+    t.width_px = max;
+    t.height_px = max;
+
+    // Cell dimensions multiplied by protocol-controlled row and column
+    // counts saturate instead of panicking or wrapping.
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .virtual = {} },
+            .columns = 3,
+            .rows = 3,
+        };
+        const actual = placement.calculatedSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(max, actual.width);
+        try testing.expectEqual(max, actual.height);
+    }
+
+    // Aspect-ratio scaling also saturates when the derived dimension does
+    // not fit in the u32 geometry type.
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .virtual = {} },
+            .columns = 3,
+            .source_height = max,
+        };
+        const actual = placement.calculatedSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(max, actual.width);
+        try testing.expectEqual(max, actual.height);
+    }
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .virtual = {} },
+            .rows = 3,
+            .source_width = max,
+        };
+        const actual = placement.calculatedSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(max, actual.width);
+        try testing.expectEqual(max, actual.height);
+    }
+
+    // Pixel offsets are protocol-controlled too. Include them without
+    // allowing the grid-size numerator to wrap.
+    t.width_px = 2;
+    t.height_px = 2;
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .virtual = {} },
+            .x_offset = max,
+            .y_offset = max,
+        };
+        const actual = placement.gridSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(max, actual.cols);
+        try testing.expectEqual(max, actual.rows);
+    }
+
+    const pin = try trackPin(&t, .{ .x = 0, .y = 0 });
+    defer t.screens.active.pages.untrackPin(pin);
+
+    // Explicit maximum dimensions must clamp the rectangle to the terminal
+    // without overflowing its horizontal extent.
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .pin = pin },
+            .columns = max,
+            .rows = 1,
+        };
+        const rect = placement.rect(.{ .width = 1, .height = 1 }, &t).?;
+        try testing.expectEqual(@as(size.CellCountInt, 1), rect.bottom_right.x);
+    }
+
+    // Terminals can temporarily have no pixel geometry. A placement whose
+    // computed grid is empty has no rectangle, so rect must not subtract one
+    // from a zero row count.
+    t.width_px = 0;
+    t.height_px = 0;
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .pin = pin },
+            .columns = 1,
+        };
+        const actual = placement.gridSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(@as(u32, 0), actual.cols);
+        try testing.expectEqual(@as(u32, 0), actual.rows);
+        try testing.expect(placement.rect(.{ .width = 1, .height = 1 }, &t) == null);
+    }
+}
+
+test "storage: aspect scaling of an untrusted source size with ordinary cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const max = std.math.maxInt(u32);
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(alloc);
+    t.width_px = 20; // 10 px per col
+    t.height_px = 40; // 20 px per row
+
+    // The cell size times one column or row fits, but the side scaled by
+    // the aspect ratio of a 4294967295 px source dimension does not.
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .virtual = {} },
+            .columns = 1,
+            .source_height = max,
+        };
+        const actual = placement.calculatedSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(@as(u32, 10), actual.width);
+        try testing.expectEqual(max, actual.height);
+    }
+    {
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .virtual = {} },
+            .rows = 1,
+            .source_width = max,
+        };
+        const actual = placement.calculatedSize(.{ .width = 1, .height = 1 }, &t);
+        try testing.expectEqual(max, actual.width);
+        try testing.expectEqual(@as(u32, 20), actual.height);
+    }
+}
+
+test "storage: placement rect with an empty or maximum grid" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100; // 10 px per col
+    t.height_px = 200; // 20 px per row
+
+    const pin = try trackPin(&t, .{ .x = 5, .y = 0 });
+    defer t.screens.active.pages.untrackPin(pin);
+
+    // With ordinary cell metrics, scaling a very wide, one-pixel-tall
+    // image to one column rounds its height to zero pixels: no row.
+    {
+        const image: Image = .{ .id = 1, .width = 10000, .height = 1 };
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .pin = pin },
+            .columns = 1,
+        };
+        const grid = placement.gridSize(image, &t);
+        try testing.expectEqual(@as(u32, 1), grid.cols);
+        try testing.expectEqual(@as(u32, 0), grid.rows);
+        try testing.expect(placement.rect(image, &t) == null);
+    }
+
+    // The same for a very tall, one-pixel-wide image scaled to one row:
+    // no column.
+    {
+        const image: Image = .{ .id = 1, .width = 1, .height = 10000 };
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .pin = pin },
+            .rows = 1,
+        };
+        const grid = placement.gridSize(image, &t);
+        try testing.expectEqual(@as(u32, 0), grid.cols);
+        try testing.expectEqual(@as(u32, 1), grid.rows);
+        try testing.expect(placement.rect(image, &t) == null);
+    }
+
+    // The maximum column count from a pin past the second column clamps to
+    // the last column instead of overflowing.
+    {
+        const image: Image = .{ .id = 1, .width = 1, .height = 1 };
+        const placement: ImageStorage.Placement = .{
+            .location = .{ .pin = pin },
+            .columns = std.math.maxInt(u32),
+            .rows = 1,
+        };
+        const rect = placement.rect(image, &t).?;
+        try testing.expectEqual(@as(size.CellCountInt, 5), rect.top_left.x);
+        try testing.expectEqual(@as(size.CellCountInt, 9), rect.bottom_right.x);
     }
 }

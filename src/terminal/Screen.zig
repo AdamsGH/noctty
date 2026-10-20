@@ -405,9 +405,15 @@ pub fn reset(self: *Screen) void {
     };
 
     if (comptime build_options.kitty_graphics) {
-        // Reset kitty graphics storage
+        // Reset kitty graphics storage, keeping the configured limit: a
+        // limit of zero (`image-storage-limit = 0`) disables the protocol,
+        // and a program must not turn it back on with RIS.
+        const total_limit = self.kitty_images.total_limit;
         self.kitty_images.deinit(self.alloc, self);
-        self.kitty_images = .{ .dirty = true };
+        self.kitty_images = .{
+            .dirty = true,
+            .total_limit = total_limit,
+        };
     }
 
     // Reset our basic state
