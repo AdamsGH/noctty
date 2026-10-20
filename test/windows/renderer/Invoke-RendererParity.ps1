@@ -113,7 +113,10 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
     Set-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value ($config -join "`n") -Encoding utf8
     $environment = @{ LOCALAPPDATA = (Join-Path $run 'LocalAppData'); APPDATA = (Join-Path $run 'AppData'); NOCTTY_RENDERER_CAPTURE_PATH = (Join-Path $run 'frame.bmp'); NOCTTY_RENDERER_STATUS_PATH = (Join-Path $run 'renderer.json'); NOCTTY_RENDERER_READY_PATH = (Join-Path $run 'ready.txt'); NOCTTY_RENDERER_HIDE_NOTICES = '1' }
     foreach ($key in $ExtraEnvironment.Keys) { $environment[$key] = $ExtraEnvironment[$key] }
-    if ($OpenGLStartupFallback) { [void]$environment.Remove('NOCTTY_RENDERER_HIDE_NOTICES') }
+    # The fallback case reads its banner through UIA. An info banner's
+    # countdown starts when it is set, so on a slow cold launch it could be
+    # gone before the first read; this test-tools switch keeps it up.
+    if ($OpenGLStartupFallback) { [void]$environment.Remove('NOCTTY_RENDERER_HIDE_NOTICES'); $environment.NOCTTY_RENDERER_KEEP_NOTICES = '1' }
     [void](New-Item -ItemType Directory -Path $environment.LOCALAPPDATA, $environment.APPDATA)
     if (!(Test-Path -LiteralPath (Join-Path $bin 'noctty.portable'))) { throw 'Portable marker missing; app launch blocked.' }
     $proc = $null
@@ -129,6 +132,9 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
         $identity = $proc.StartTime
         $case.pid = $proc.Id; $case.startTime = $identity
         $clock = [Diagnostics.Stopwatch]::StartNew(); $hostWindow = [IntPtr]::Zero; $surfaceWindow = [IntPtr]::Zero
+        # What the banner reads said, kept for a timeout: a read that blocks
+        # points at a busy UI thread, a different name at another banner.
+        if ($OpenGLStartupFallback) { $case.bannerWait = [ordered]@{ reads = 0; lastName = $null; lastReadMs = $null; longestReadMs = 0; foundMs = $null; waitMs = $null } }
         while ($clock.Elapsed.TotalSeconds -lt 40) {
             if ([RendererNative]::WaitForSingleObject($nativeProcess.process,0) -eq 0) {
                 $exitCode=0; [void][RendererNative]::GetExitCodeProcess($nativeProcess.process,[ref]$exitCode)
@@ -142,14 +148,22 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
                 if ($OpenGLStartupFallback -and !$case.fallbackBanner) {
                     $banner=[RendererNative]::ChildOfId($hostWindow,1913)
                     if ($banner -ne [IntPtr]::Zero) {
-                        $name=[Windows.Automation.AutomationElement]::FromHandle($banner).Current.Name
-                        if ($name -match 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { $case.fallbackBanner=$name }
+                        $readStart = $clock.ElapsedMilliseconds
+                        # A read that throws is recorded; the next poll
+                        # reads again.
+                        try { $name=[Windows.Automation.AutomationElement]::FromHandle($banner).Current.Name }
+                        catch { $name = '<' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message + '>' }
+                        $bannerWait = $case.bannerWait
+                        $bannerWait.reads++; $bannerWait.lastName = $name; $bannerWait.lastReadMs = $clock.ElapsedMilliseconds
+                        $bannerWait.longestReadMs = [Math]::Max($bannerWait.longestReadMs, $bannerWait.lastReadMs - $readStart)
+                        if ($name -match 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { $case.fallbackBanner=$name; $bannerWait.foundMs = $bannerWait.lastReadMs }
                     }
                 }
             }
             if ($surfaceWindow -ne [IntPtr]::Zero -and (Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH) -and (!$OpenGLStartupFallback -or $case.fallbackBanner)) { break }
             Start-Sleep -Milliseconds 25
         }
+        if ($OpenGLStartupFallback) { $case.bannerWait.waitMs = $clock.ElapsedMilliseconds }
         if ($surfaceWindow -eq [IntPtr]::Zero -or !(Test-Path -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH)) { throw 'Fixture did not become ready.' }
         Start-Sleep -Milliseconds 500
         $capture = {
@@ -170,7 +184,10 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
         $case.initial = & $capture 'initial'
         if ($OpenGLStartupFallback) {
             if ($case.initial.status.backend -ne 'd3d11' -or !$case.initial.status.opengl_unavailable -or $case.initial.status.opengl_context) { throw 'Unavailable OpenGL did not fall back, cache its failure, and release WGL.' }
-            if ($case.fallbackBanner -notmatch 'OpenGL could not start.*Custom shaders and images are not available.*renderer') { throw 'OpenGL startup fallback banner is incomplete.' }
+            if ($case.fallbackBanner -notmatch 'OpenGL could not start.*Custom shaders and images are not available.*renderer') {
+                $bannerWait = $case.bannerWait
+                throw "OpenGL startup fallback banner is incomplete: after $($bannerWait.waitMs) ms and $($bannerWait.reads) reads (longest $($bannerWait.longestReadMs) ms), the last UIA name, read at $($bannerWait.lastReadMs) ms, was '$($bannerWait.lastName)'."
+            }
             Remove-Item -LiteralPath $environment.NOCTTY_RENDERER_READY_PATH
             if (![RendererNative]::Action($surfaceWindow,1)) { throw 'New tab action rejected.' }
             $tabClock=[Diagnostics.Stopwatch]::StartNew()

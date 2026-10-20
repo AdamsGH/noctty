@@ -75,7 +75,12 @@ while a reload enables a shader/background image. Text frames must keep advancin
 Resize now checks actual swapchain dimensions and a new ResizeBuffers receipt,
 in addition to offscreen readback. Host notices are suppressed only in this
 test-tools parity run to keep reference geometry identical; production and the
-visible check retain them.
+visible check retain them. The OpenGL startup fallback case reads its banner
+through UIA instead, and sets `NOCTTY_RENDERER_KEEP_NOTICES` (also honoured only
+by test-tools builds) so the banner stays up: an info banner's countdown starts
+when it is set, and a slow cold launch can keep the UI thread busy until it has
+expired. Its `bannerWait` receipt records the reads, the longest one, and the
+last name read.
 
 Build two production binaries with custom shaders, one default and one with
 `-Dd3d11=false`. Run `Invoke-OpenGLScheduling.ps1 -DefaultBinary <exe>
