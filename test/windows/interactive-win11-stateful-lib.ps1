@@ -95,7 +95,20 @@ function Show-StatefulHost([IntPtr] $HostHwnd) {
     Start-Sleep -Milliseconds $script:STATEFUL_HOST_SETTLE_MS
 }
 
+function Get-StatefulPixelSamplePoints([InteractiveWin11WindowNative+RECT] $Rect) {
+    $width = $Rect.Right - $Rect.Left
+    $height = $Rect.Bottom - $Rect.Top
+    foreach ($column in 1..4) {
+        foreach ($row in 1..4) {
+            [Drawing.Point]::new($Rect.Left + [int](($width * $column) / 5), $Rect.Top + [int](($height * $row) / 5))
+        }
+    }
+}
+
 function Get-StatefulPixel([IntPtr] $Hwnd) {
+    # Names the window a screen-pixel wait reads, so Wait-InteractiveWin11Until
+    # can record what was on screen there if the wait times out.
+    $script:InteractiveWin11PixelWindow = $Hwnd
     $rect = [InteractiveWin11WindowNative+RECT]::new()
     if (-not [InteractiveWin11WindowNative]::GetWindowRect($Hwnd, [ref]$rect)) {
         throw "GetWindowRect failed for hwnd=$Hwnd"
@@ -106,18 +119,12 @@ function Get-StatefulPixel([IntPtr] $Hwnd) {
         $counts = @{}
         $bestColor = 0
         $bestCount = 0
-        $width = $rect.Right - $rect.Left
-        $height = $rect.Bottom - $rect.Top
-        foreach ($column in 1..4) {
-            foreach ($row in 1..4) {
-                $sampleX = $rect.Left + [int](($width * $column) / 5)
-                $sampleY = $rect.Top + [int](($height * $row) / 5)
-                $graphics.CopyFromScreen($sampleX, $sampleY, 0, 0, [Drawing.Size]::new(1, 1))
-                $color = $bitmap.GetPixel(0, 0).ToArgb()
-                $count = 1 + [int]($counts[$color])
-                $counts[$color] = $count
-                if ($count -gt $bestCount) { $bestColor = $color; $bestCount = $count }
-            }
+        foreach ($point in Get-StatefulPixelSamplePoints $rect) {
+            $graphics.CopyFromScreen($point.X, $point.Y, 0, 0, [Drawing.Size]::new(1, 1))
+            $color = $bitmap.GetPixel(0, 0).ToArgb()
+            $count = 1 + [int]($counts[$color])
+            $counts[$color] = $count
+            if ($count -gt $bestCount) { $bestColor = $color; $bestCount = $count }
         }
         return $bestColor
     }
@@ -127,9 +134,167 @@ function Get-StatefulPixel([IntPtr] $Hwnd) {
     }
 }
 
+if (-not ('StatefulPixelDiagnosticNative' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class StatefulPixelDiagnosticNative {
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)] private struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out uint value, int size);
+    // DWMWA_CLOAKED: 0 when shown; -1 when DWM could not say.
+    public static long Cloaked(IntPtr hwnd) {
+        uint value;
+        return DwmGetWindowAttribute(hwnd, 14, out value, 4) == 0 ? (long)value : -1L;
+    }
+    public static long InputAgeMilliseconds() {
+        LASTINPUTINFO info = new LASTINPUTINFO();
+        info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref info)) return -1;
+        return unchecked((uint)Environment.TickCount - info.dwTime);
+    }
+}
+'@
+}
+
+# Pixel diagnostics go to the harness's logs, which the interactive job uploads.
+$script:StatefulDiagnosticDirectory = $null
+
+function Get-StatefulWindowFacts([IntPtr] $Hwnd) {
+    # Handle, class and process only: never a window title or its contents.
+    if ($Hwnd -eq [IntPtr]::Zero) { return $null }
+    $processId = [uint32]0
+    [void][InteractiveWin11WindowNative]::GetWindowThreadProcessId($Hwnd, [ref]$processId)
+    $processName = $null
+    try { $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName } catch { $processName = $null }
+    return [pscustomobject][ordered]@{
+        Handle = '0x{0:X}' -f $Hwnd.ToInt64()
+        Class = Get-StatefulClassName $Hwnd
+        ProcessId = $processId
+        ProcessName = $processName
+    }
+}
+
+# Records what was on screen where a screen-pixel assertion looked: the window
+# under each sample point, the foreground window, whether noctty's window was
+# hung, cloaked or minimized, which other processes' windows lay above it, and
+# a screenshot of the sampled rect. The screenshot is withheld when another
+# process's window overlaps the rect, so the artifacts never carry another
+# application's screen content; the metadata still names that window.
+function Save-StatefulPixelDiagnostic([IntPtr] $Hwnd, [string] $Description, [string] $Directory = $script:StatefulDiagnosticDirectory) {
+    if ([string]::IsNullOrWhiteSpace($Directory)) { $Directory = [IO.Path]::GetTempPath() }
+    [void][IO.Directory]::CreateDirectory($Directory)
+    $slug = ($Description.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+    if ($slug.Length -gt 48) { $slug = $slug.Substring(0, 48).TrimEnd('-') }
+    $base = Join-Path $Directory ('pixel-diagnostic-{0}-{1}' -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff'), $slug)
+    $root = [StatefulPixelDiagnosticNative]::GetAncestor($Hwnd, 2)
+    $rootFacts = Get-StatefulWindowFacts $root
+    $rect = Get-StatefulWindowRect $Hwnd
+    $samples = [Collections.Generic.List[object]]::new()
+    $occluders = [Collections.Generic.List[object]]::new()
+    if ($null -ne $rect) {
+        $bitmap = [Drawing.Bitmap]::new(1, 1)
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            foreach ($point in Get-StatefulPixelSamplePoints $rect) {
+                $rgb = $null
+                try {
+                    $graphics.CopyFromScreen($point.X, $point.Y, 0, 0, [Drawing.Size]::new(1, 1))
+                    $rgb = '{0:x6}' -f ($bitmap.GetPixel(0, 0).ToArgb() -band 0xFFFFFF)
+                }
+                catch { $rgb = "capture failed: $($_.Exception.Message)" }
+                $nativePoint = [StatefulPixelDiagnosticNative+POINT]::new()
+                $nativePoint.X = $point.X
+                $nativePoint.Y = $point.Y
+                $under = [StatefulPixelDiagnosticNative]::WindowFromPoint($nativePoint)
+                $samples.Add([pscustomobject][ordered]@{
+                    X = $point.X; Y = $point.Y; Rgb = $rgb
+                    Window = Get-StatefulWindowFacts $under
+                    Root = Get-StatefulWindowFacts ([StatefulPixelDiagnosticNative]::GetAncestor($under, 2))
+                })
+            }
+        }
+        finally {
+            $graphics.Dispose()
+            $bitmap.Dispose()
+        }
+        # GW_HWNDPREV walks up the z-order from noctty's top-level window. Only a
+        # window DWM says is cloaked is left out; one it cannot answer for counts.
+        $above = [StatefulPixelDiagnosticNative]::GetWindow($root, 3)
+        for ($guard = 0; $above -ne [IntPtr]::Zero -and $guard -lt 4096; $guard++) {
+            $aboveRect = Get-StatefulWindowRect $above
+            if ([InteractiveWin11WindowNative]::IsWindowVisible($above) -and
+                [StatefulPixelDiagnosticNative]::Cloaked($above) -le 0 -and $null -ne $aboveRect -and
+                $aboveRect.Left -lt $rect.Right -and $aboveRect.Right -gt $rect.Left -and
+                $aboveRect.Top -lt $rect.Bottom -and $aboveRect.Bottom -gt $rect.Top) {
+                $facts = Get-StatefulWindowFacts $above
+                if ($null -eq $rootFacts -or $facts.ProcessId -ne $rootFacts.ProcessId) { $occluders.Add($facts) }
+            }
+            $above = [StatefulPixelDiagnosticNative]::GetWindow($above, 3)
+        }
+    }
+    $screenshot = $null
+    $screenshotNote = $null
+    if ($null -eq $rect) {
+        $screenshotNote = 'not taken: the window rect could not be read'
+    }
+    elseif ($occluders.Count -ne 0) {
+        $screenshotNote = "withheld: $($occluders.Count) window(s) of other processes overlap the sampled rect"
+    }
+    else {
+        $width = [Math]::Max(1, $rect.Right - $rect.Left)
+        $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
+        $capture = [Drawing.Bitmap]::new($width, $height)
+        try {
+            $captureGraphics = [Drawing.Graphics]::FromImage($capture)
+            try {
+                $captureGraphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $capture.Size)
+                $screenshot = "$base.png"
+                $capture.Save($screenshot, [Drawing.Imaging.ImageFormat]::Png)
+            }
+            catch { $screenshot = $null; $screenshotNote = "capture failed: $($_.Exception.Message)" }
+            finally { $captureGraphics.Dispose() }
+        }
+        finally { $capture.Dispose() }
+    }
+    $foreground = Get-StatefulWindowFacts ([InteractiveWin11WindowNative]::GetForegroundWindow())
+    $report = [ordered]@{
+        Description = $Description
+        TimeUtc = [DateTime]::UtcNow.ToString('o')
+        Window = Get-StatefulWindowFacts $Hwnd
+        Rect = if ($null -eq $rect) { $null } else { [ordered]@{ Left = $rect.Left; Top = $rect.Top; Right = $rect.Right; Bottom = $rect.Bottom } }
+        Root = $rootFacts
+        RootHung = [StatefulPixelDiagnosticNative]::IsHungAppWindow($root)
+        RootCloaked = [StatefulPixelDiagnosticNative]::Cloaked($root)
+        RootMinimized = [StatefulPixelDiagnosticNative]::IsIconic($root)
+        RootVisible = [InteractiveWin11WindowNative]::IsWindowVisible($root)
+        Foreground = $foreground
+        InputAgeMilliseconds = [StatefulPixelDiagnosticNative]::InputAgeMilliseconds()
+        Samples = @($samples)
+        OtherProcessWindowsAbove = @($occluders)
+        Screenshot = $screenshot
+        ScreenshotNote = $screenshotNote
+    }
+    [IO.File]::WriteAllText("$base.json", ($report | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    $underCounts = @($samples | ForEach-Object {
+            if ($null -eq $_.Root) { '<none>' } else { "$($_.Root.ProcessName)/$($_.Root.Class)" }
+        } | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Name) x$($_.Count)" })
+    $foregroundText = if ($null -eq $foreground) { '<none>' } else { "$($foreground.ProcessName)/$($foreground.Class)" }
+    $screenshotText = if ($null -ne $screenshot) { $screenshot } else { $screenshotNote }
+    return ("pixel diagnostic: foreground={0}; under the samples: {1}; hung={2}; cloaked={3}; other-process windows above={4}; screenshot={5}; report={6}.json" -f `
+            $foregroundText, ($underCounts -join ', '), $report.RootHung, $report.RootCloaked, $occluders.Count, $screenshotText, $base)
+}
+
 function Start-StatefulApp($Layout, [string] $Exe, [string] $RepoRoot, [string] $Name, [string[]] $ExtraArguments = @(), [switch] $UseConfiguredCommand) {
     $stdout = Join-Path $Layout.Logs "$Name-stdout.log"
     $stderr = Join-Path $Layout.Logs "$Name-stderr.log"
+    $script:StatefulDiagnosticDirectory = $Layout.Logs
     $arguments = @((Get-InteractiveWin11LaunchArguments -Layout $Layout -UseConfiguredCommand:$UseConfiguredCommand)) + @($ExtraArguments)
     $process = Start-Process -FilePath $Exe -ArgumentList $arguments `
         -WorkingDirectory $RepoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru

@@ -251,6 +251,48 @@ finally {
     $waitUntilCurrentProcess.Dispose()
     Remove-Item -LiteralPath Function:\Wait-InteractiveWin11Until -ErrorAction SilentlyContinue
 }
+
+# A wait whose condition read screen pixels records what was on screen when it
+# times out; any other wait, including the next one, does not
+# (EVIDENCE-PIXEL-DIAG-01). Get-StatefulPixel is what names the window.
+$statefulLibAst = @($resolutionSourceAsts | Where-Object { $_.Path -eq $statefulWin11Lib })[0].Ast
+$pixelReaders = @($statefulLibAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-StatefulPixel'
+}, $true))
+if ($pixelReaders.Count -ne 1 -or
+    $pixelReaders[0].Body.EndBlock.Statements[0].Extent.Text -cne '$script:InteractiveWin11PixelWindow = $Hwnd') {
+    throw 'Get-StatefulPixel must first name the window it reads for the pixel-timeout diagnostic.'
+}
+. ([scriptblock]::Create($waitUntilFunctions[0].Extent.Text))
+$script:pixelDiagnosticCalls = [Collections.Generic.List[string]]::new()
+function script:Save-StatefulPixelDiagnostic {
+    param([IntPtr] $Hwnd, [string] $Description)
+    $script:pixelDiagnosticCalls.Add("$($Hwnd.ToInt64()):$Description")
+    'pixel diagnostic: contract'
+}
+try {
+    $pixelTimeoutMessages = foreach ($case in @(
+            @{ Description = 'contract pixel wait'; Condition = { $script:InteractiveWin11PixelWindow = [IntPtr]77; $false } },
+            @{ Description = 'contract plain wait'; Condition = { $false } }
+        )) {
+        try {
+            # ConditionFirst: the condition runs at least once however late.
+            Wait-InteractiveWin11Until -Condition $case.Condition -Description $case.Description `
+                -Deadline ([DateTime]::UtcNow.AddMilliseconds(50)) -PollMilliseconds 5 -ConditionFirst
+            'no timeout'
+        }
+        catch { $_.Exception.Message }
+    }
+    if (($pixelTimeoutMessages -join '|') -cne 'Timed out waiting for contract pixel wait; pixel diagnostic: contract|Timed out waiting for contract plain wait' -or
+        ($script:pixelDiagnosticCalls -join '|') -cne '77:contract pixel wait') {
+        throw "Pixel-wait timeouts must carry the diagnostic and other timeouts must not: $($pixelTimeoutMessages -join ' | ')"
+    }
+}
+finally {
+    Remove-Item -LiteralPath Function:\Wait-InteractiveWin11Until, Function:\Save-StatefulPixelDiagnostic -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Script -Name pixelDiagnosticCalls, InteractiveWin11PixelWindow -ErrorAction SilentlyContinue
+}
 $harnessMainFunctions = @($interactiveWin11LibAst.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

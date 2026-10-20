@@ -179,6 +179,82 @@ try {
     }
     Invoke-FinalizerControl
     $passed++
+
+    # The release job's driver: define its functions from the parsed file and
+    # run them with every step replaced by a stub. Its main statement, the
+    # composite and the leaves never run here: nothing is built or launched.
+    $jobDriver = Join-Path $PSScriptRoot 'interactive-win11-job.ps1'
+    $jobAst = [Management.Automation.Language.Parser]::ParseFile($jobDriver, [ref]$tokens, [ref]$parseErrors)
+    Assert-Control ($parseErrors.Count -eq 0) 'Job driver parser errors.'
+    foreach ($jobFunction in @('Get-InteractiveWin11JobPlan', 'Invoke-InteractiveWin11Job')) {
+        $definitions = @($jobAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $jobFunction
+        }, $true))
+        Assert-Control ($definitions.Count -eq 1) "Job driver must define $jobFunction once."
+        . ([scriptblock]::Create($definitions[0].Extent.Text))
+    }
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $plan = @(Get-InteractiveWin11JobPlan)
+    Assert-Control ($plan.Count -ge 2 -and $plan[0].Script -ceq 'test\windows\flagship\Invoke-InteractiveWin11.ps1' -and
+        $plan[0].Arguments.Rebuild -eq $true) 'The composite must build the measurement generation first.'
+    foreach ($step in $plan) {
+        Assert-Control (Test-Path -LiteralPath (Join-Path $repo $step.Script) -PathType Leaf) "Job step is missing: $($step.Script)"
+        Assert-Control ([object]::ReferenceEquals($step, $plan[0]) -or -not $step.Arguments.ContainsKey('Rebuild')) "A leaf must reuse the composite's measurement build: $($step.Script)"
+    }
+    $passed++
+
+    function Invoke-JobControl {
+        param([string] $Name, [scriptblock[]] $Steps, [scriptblock] $Reader = { [uint32] 17 })
+        $control = New-Control $Name $Reader
+        $receiptPath = Join-Path $control.Root 'build.json'
+        $seen = [Collections.Generic.List[string]]::new()
+        function Get-InteractiveWin11MeasureLayout { param($RepoRoot) [pscustomobject]@{ Receipt = $receiptPath; Exe = (Join-Path $control.Root 'noctty.exe') } }
+        function Assert-InteractiveWin11MeasureBuild { param($RepoRoot, $ExePath) }
+        function Invoke-InteractiveWin11JobStep {
+            param($RepoRoot, $Step)
+            $seen.Add([string] $env:NOCTTY_INTERACTIVE_MEASURE_AUMID)
+            & $Step.Action $control $receiptPath
+        }
+        $stepObjects = @($Steps | ForEach-Object { [pscustomobject]@{ Script = 'synthetic'; Arguments = @{}; Action = $_ } })
+        $originalMeasureAumid = $env:NOCTTY_INTERACTIVE_MEASURE_AUMID
+        $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = 'job-control-original'
+        $message = ''
+        try {
+            try {
+                Invoke-InteractiveWin11Job -RepoRoot $control.Root -Plan $stepObjects -ReceiptDirectory $control.Logs -StateGuardArguments @{
+                    LocalAppDataRoot = $control.Local; RoamingAppDataRoot = $control.Roaming; ClipboardSequenceReader = $control.Reader
+                } | Out-Null
+            } catch { $message = $_.Exception.Message }
+            Assert-Control ($env:NOCTTY_INTERACTIVE_MEASURE_AUMID -ceq 'job-control-original') "Job $Name did not restore the measure environment."
+        } finally { $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $originalMeasureAumid }
+        Assert-Control (@($seen | Where-Object { $_ -cne '1' }).Count -eq 0) "Job $Name ran a step outside measurement mode."
+        Assert-Control (Test-Path -LiteralPath (Join-Path $control.Logs 'state-after.json')) "Job $Name skipped its state guard."
+        return [pscustomobject]@{ Message = $message; Steps = $seen.Count }
+    }
+    $writeGeneration = {
+        param($Control, $ReceiptPath)
+        [IO.File]::WriteAllText($ReceiptPath, (@{ Head = 'h'; ExeSHA256 = 'e'; CliSHA256 = 'c'; SourceReceiptSHA256 = 's'; BuildArguments = 'b' } | ConvertTo-Json))
+    }
+    $leaf = { param($Control, $ReceiptPath) }
+    $result = Invoke-JobControl 'job-pass' @($writeGeneration, $leaf, $leaf)
+    Assert-Control ($result.Message -eq '' -and $result.Steps -eq 3) "A clean job failed: $($result.Message)"
+    $passed++
+
+    # A leaf on a product-AUMID build rewrites the product jump list: the job fails.
+    $result = Invoke-JobControl 'job-product-jump-list' @($writeGeneration, { param($Control, $ReceiptPath) [IO.File]::AppendAllText($Control.Product, '-leaf') }, $leaf)
+    Assert-Control ($result.Message -like '*ProductJumpList metadata changed*' -and $result.Steps -eq 3) 'A product jump-list change did not fail the job.'
+    $passed++
+
+    # A failing leaf still runs the guard, and both failures are reported.
+    $result = Invoke-JobControl 'job-leaf-failure' @($writeGeneration, { param($Control, $ReceiptPath) [IO.File]::AppendAllText($Control.Product, '-leaf'); throw 'leaf-control-failure' }, $leaf)
+    Assert-Control ($result.Message -like '*leaf-control-failure*ProductJumpList metadata changed*' -and $result.Steps -eq 2) 'A failing leaf skipped the job guard or lost a failure.'
+    $passed++
+
+    # A leaf that rebuilt the measurement generation is not the composite's build.
+    $result = Invoke-JobControl 'job-rebuilt' @($writeGeneration, { param($Control, $ReceiptPath) [IO.File]::WriteAllText($ReceiptPath, (@{ Head = 'h'; ExeSHA256 = 'other'; CliSHA256 = 'c'; SourceReceiptSHA256 = 's'; BuildArguments = 'b' } | ConvertTo-Json)) })
+    Assert-Control ($result.Message -like '*measurement build changed after the composite (ExeSHA256)*') 'A rebuilt measurement generation was accepted.'
+    $passed++
     Write-Host "interactive-win11 state guard contracts: PASS ($passed controls; scratch-only)"
 } finally {
     $resolved = [IO.Path]::GetFullPath($scratch)

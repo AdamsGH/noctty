@@ -74,12 +74,18 @@ Invoke-InteractiveWin11HarnessMain `
     -ArgumentList $forwardedArgs
 
 if ($Rebuild) {
-    Push-Location $repoRoot
-    try {
-        zig build -Demit-exe=true -Dcustom-shaders=true
-        if ($LASTEXITCODE -ne 0) { throw "shader-enabled build failed with exit code $LASTEXITCODE" }
+    if (Test-InteractiveWin11MeasureMode) {
+        # The measurement generation always carries custom shader support.
+        Invoke-InteractiveWin11Build -RepoRoot $repoRoot
     }
-    finally { Pop-Location }
+    else {
+        Push-Location $repoRoot
+        try {
+            zig build -Demit-exe=true -Dcustom-shaders=true
+            if ($LASTEXITCODE -ne 0) { throw "shader-enabled build failed with exit code $LASTEXITCODE" }
+        }
+        finally { Pop-Location }
+    }
 }
 
 $realStartupPath = Join-Path $env:LOCALAPPDATA 'noctty\startup-attempts.json'

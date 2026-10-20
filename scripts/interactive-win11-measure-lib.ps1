@@ -31,6 +31,14 @@ function Get-InteractiveWin11MeasureExePath {
     return (Get-InteractiveWin11MeasureLayout -RepoRoot $RepoRoot).Exe
 }
 
+function Get-InteractiveWin11MeasureBuildArguments {
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Optimize)
+
+    # Custom shaders, as every release ships: the job's shader leaves run this
+    # build too, so they never fall back to a product-AUMID build of their own.
+    return @('-Demit-exe=true', '-Dcustom-shaders=true', "-Doptimize=$Optimize")
+}
+
 function Assert-InteractiveWin11MeasurePlainPath {
     param([Parameter(Mandatory)] [string] $Path)
 
@@ -260,7 +268,8 @@ function Assert-InteractiveWin11MeasureBuildCore {
     Assert-InteractiveWin11MeasurePlainPath $Layout.Exe
     Assert-InteractiveWin11MeasurePlainPath $Layout.Cli
     $receipt = Get-Content -LiteralPath $Layout.Receipt -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    if ($receipt.Schema -ne 2 -or $receipt.State -cne 'complete' -or $receipt.Head -cne $head -or
+    if ($receipt.Schema -ne 3 -or $receipt.State -cne 'complete' -or $receipt.Head -cne $head -or
+        $receipt.BuildArguments -cne ((Get-InteractiveWin11MeasureBuildArguments ([string] $receipt.Optimize)) -join ' ') -or
         $receipt.Aumid -cne 'io.github.amanthanvi.noctty.measure' -or $receipt.Patch -cne $source.Patch -or
         $receipt.NotifierAumid -cne $source.NotifierAumid -or
         $receipt.ArchiveSHA256 -cne $source.ArchiveSHA256 -or
@@ -339,15 +348,16 @@ function Invoke-InteractiveWin11MeasureBuild {
         }
         $source = Assert-InteractiveWin11MeasureSource $layout $head
         # Invalidate a prior success before a rebuild can fail or be interrupted.
-        [IO.File]::WriteAllText($layout.Receipt, '{"Schema":2,"State":"building"}')
+        [IO.File]::WriteAllText($layout.Receipt, '{"Schema":3,"State":"building"}')
         $runPath = Join-Path $layout.Root 'run-build.cmd'
         $launchPath = Join-Path $layout.Root 'launch-build.cmd'
         $logPath = Join-Path $layout.Root 'build.log'
         foreach ($path in @($layout.Prefix, $layout.Cache, $runPath, $launchPath, $logPath)) { Assert-InteractiveWin11MeasurePlainPath $path }
+        $buildArguments = (Get-InteractiveWin11MeasureBuildArguments $Optimize) -join ' '
         $run = @"
 @echo off
 cd /d "$($layout.Source)" || exit /b 1
-call "$($layout.Source)\scripts\dev-windows.cmd" zig build -Demit-exe=true -Doptimize=$Optimize --prefix "$($layout.Prefix)" <NUL
+call "$($layout.Source)\scripts\dev-windows.cmd" zig build $buildArguments --prefix "$($layout.Prefix)" <NUL
 exit /b %errorlevel%
 "@
         $launch = @"
@@ -382,7 +392,8 @@ exit /b %errorlevel%
         Assert-InteractiveWin11MeasurePlainPath $layout.Exe
         Assert-InteractiveWin11MeasurePlainPath $layout.Cli
         $receipt = [ordered]@{
-            Schema = 2; State = 'complete'; Head = $head; RepoRoot = $layout.Repo
+            Schema = 3; State = 'complete'; Head = $head; RepoRoot = $layout.Repo
+            BuildArguments = $buildArguments
             Aumid = 'io.github.amanthanvi.noctty.measure'; Patch = $source.Patch
             NotifierAumid = $source.NotifierAumid
             ArchiveSHA256 = $source.ArchiveSHA256

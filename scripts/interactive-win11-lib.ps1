@@ -719,6 +719,9 @@ function Wait-InteractiveWin11Until {
         [switch] $ConditionFirst
     )
 
+    # A condition that reads screen pixels (Get-StatefulPixel) names its window
+    # here, so a timeout can say what was on screen instead of only a color.
+    $script:InteractiveWin11PixelWindow = [IntPtr]::Zero
     if ($ConditionFirst) {
         while ($true) {
             if ($null -ne $WatchProcess -and $WatchProcess.HasExited) {
@@ -753,10 +756,12 @@ function Wait-InteractiveWin11Until {
     }
     }
 
-    if ([string]::IsNullOrEmpty($TimeoutMessage)) {
-        throw "Timed out waiting for $Description"
+    $message = if ([string]::IsNullOrEmpty($TimeoutMessage)) { "Timed out waiting for $Description" } else { $TimeoutMessage }
+    if ($script:InteractiveWin11PixelWindow -ne [IntPtr]::Zero) {
+        try { $message += "; $(Save-StatefulPixelDiagnostic -Hwnd $script:InteractiveWin11PixelWindow -Description $Description)" }
+        catch { $message += "; pixel diagnostic failed: $($_.Exception.Message)" }
     }
-    throw $TimeoutMessage
+    throw $message
 }
 
 function Get-InteractiveWin11ProcessTreeSnapshot {
