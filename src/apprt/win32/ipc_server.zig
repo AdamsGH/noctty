@@ -686,6 +686,15 @@ fn forwardedArgumentKey(arg: []const u8) ?[]const u8 {
     return if (std.mem.indexOfScalar(u8, body, '=')) |idx| body[0..idx] else body;
 }
 
+/// True when a forwarded argv sets config `key`, whatever its value.
+pub fn forwardedArgvSetsKey(argv: []const [:0]const u8, key: []const u8) bool {
+    for (argv) |arg| {
+        const set = forwardedArgumentKey(arg) orelse continue;
+        if (std.mem.eql(u8, set, key)) return true;
+    }
+    return false;
+}
+
 /// True when a forwarded config key is on the allowlist. `working-directory`
 /// is included here; its value is checked separately.
 pub fn forwardedKeyAllowed(key: []const u8) bool {
@@ -2388,6 +2397,15 @@ test "win32 forwarded argv key extraction matches the config loader" {
     try expect(forwardedArgumentKey("-e") == null);
     try expect(forwardedArgumentKey("powershell") == null);
     try expect(forwardedArgumentKey("-") == null);
+
+    // The keys a new window keeps over the state it copies: the exact key,
+    // never a prefix or a value that happens to contain it.
+    const argv: []const [:0]const u8 = &.{ "--window-width=80", "--title=--window-height=3", "--maximize" };
+    try expect(forwardedArgvSetsKey(argv, "window-width"));
+    try expect(forwardedArgvSetsKey(argv, "maximize"));
+    try expect(!forwardedArgvSetsKey(argv, "window-height"));
+    try expect(!forwardedArgvSetsKey(argv, "window"));
+    try expect(!forwardedArgvSetsKey(&.{}, "window-width"));
 }
 
 test "win32 forwarded rejection reasons are classified and safe to log" {
