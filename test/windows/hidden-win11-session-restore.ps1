@@ -9,7 +9,7 @@ app reads or writes is a sample this script creates beside a portable copy of
 the app: the real %LOCALAPPDATA%\noctty is never written or deleted, and only
 the hash and time of its startup state file are read, before and after. Never switches desktops,
 injects real input or registers a global hotkey (the last-window cases press
-in-app keybinds with key messages sent to the pane), and nothing it does can copy (the
+in-app keybinds with key messages sent to the pane, and one case clicks it), and nothing it does can copy (the
 clipboard belongs to the window station, not the desktop); the clipboard sequence number is logged
 before and after and a change fails the run. Optional
 ExpectedStartupHash/ExpectedStartupModified pin an adopted baseline.
@@ -25,6 +25,8 @@ param(
     [switch] $Driver,
     [string] $DesktopName,
     [ValidateSet('all','restore','last-window')] [string] $Scenario = 'all',
+    # Last-window cases to run, comma-separated (all of them when empty).
+    [string] $Cases = '',
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 600,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
@@ -113,6 +115,20 @@ public static class Sr {
             if(IsWindow(h)) Send(h,0x101,key,0xC0000001L);
         } finally { AttachThreadInput(me,target,false); }
     }
+    // A left click at (8,8) in a pane, sent as the keys are, with the
+    // modifiers cleared. Copy-on-select is off in the case that uses it, and
+    // a click that does not move selects nothing.
+    public static void Click(IntPtr h) {
+        uint pid; uint target=GetWindowThreadProcessId(h,out pid); uint me=GetCurrentThreadId();
+        Msg queue; PeekMessageW(out queue,IntPtr.Zero,0,0,0);
+        if(target==0 || !AttachThreadInput(me,target,true)) throw new Exception("AttachThreadInput failed");
+        try {
+            if(!SetKeyboardState(new byte[256])) throw new Exception("SetKeyboardState failed");
+            long at=(8<<16)|8;
+            Send(h,0x201,1,at);
+            if(IsWindow(h)) Send(h,0x202,0,at);
+        } finally { AttachThreadInput(me,target,false); }
+    }
 }
 '@
 if (-not $Driver) {
@@ -136,7 +152,7 @@ if (-not $Driver) {
         $job=[HiddenLocal]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Scenario {5} -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName,$Scenario
+        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Scenario {5} -Cases "{6}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName,$Scenario,$Cases
         $pi=[HiddenLocal]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
@@ -327,8 +343,12 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
             'close-all-windows' { Press (Pane $main) $Vk.CloseAll 0 }
             'shell-exit' {
                 # The configured command exits by itself. A key while it runs
-                # makes the restored pane one the user has used.
+                # uses the restored session.
                 if(-not $SetAside) { Press (Pane $main) $Vk.Down 0 }
+            }
+            'shell-exit-clicked' {
+                # The same with a click instead of a key.
+                [Sr]::Click((Pane $main))
             }
             'quick-terminal-quit' {
                 Post-Close $main
@@ -356,10 +376,12 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
     }
     Check "${Name}: the process ended by itself" $exited $true $exited
     if($SetAside) {
-        $aside="$path.restore-failed"
+        $aside="$path.restore-ended"
         $left=Test-Path -LiteralPath $path; $moved_aside=Test-Path -LiteralPath $aside
+        $breaker=@(Get-ChildItem -LiteralPath $case.Dir -Filter 'session-state.json.restore-failed*' -File).Count
         Check "${Name}: nothing is saved back" (-not $left) 'absent' $(if($left){'present'}else{'absent'})
         Check "${Name}: the saved session was moved aside" $moved_aside 'present' $(if($moved_aside){'present'}else{'absent'})
+        Check "${Name}: the crash breaker's slots are left free" ($breaker -eq 0) 0 $breaker
         if($moved_aside) {
             $held=@((Get-Content -LiteralPath $aside -Raw | ConvertFrom-Json).windows)
             Check "${Name}: the moved session still holds its window" ($held.Count -eq 1) 1 $held.Count
@@ -392,6 +414,8 @@ try {
             @{ Name='close-surface' },
             # The restored pane's shell exits by itself after a key: saved.
             @{ Name='shell-exit'; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
+            # The same with a click: saved.
+            @{ Name='shell-exit-clicked'; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul','copy-on-select = false') },
             # The same with no key: that restore failed, and is moved aside.
             @{ Name='shell-exit-untouched'; End='shell-exit'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
             @{ Name='quit' },
@@ -411,7 +435,9 @@ try {
             # one after that must not save the last one alone over it.
             @{ Name='close-window-two-tabs'; Tabs=2 }
         )
+        $only=@($Cases -split ',' | Where-Object { $_ })
         foreach($ending in $endings) {
+            if($only.Count -and $only -notcontains $ending.Name) { continue }
             # One case failing to run is that case's failure, not the others'.
             $tabs=if($ending.Tabs){$ending.Tabs}else{1}
             $end=if($ending.End){$ending.End}else{$ending.Name}
@@ -530,7 +556,7 @@ try {
 } finally {
     $remaining=@($script:processes | Where-Object {Get-Process -Id $_.Pid -ErrorAction SilentlyContinue})
     Check 'owned runtime processes exited' ($remaining.Count -eq 0) 0 $remaining.Count
-    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, and in-app keybinds pressed with key messages sent to the pane; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
+    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, in-app keybinds pressed with key messages sent to the pane, and one click sent to a pane; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
 if($failed.Count){ $failed | ForEach-Object { Write-Host ("FAIL: " + $_.Name) }; exit 1 }

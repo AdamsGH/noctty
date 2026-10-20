@@ -1339,6 +1339,10 @@ const recovery_session_set_aside_banner_w = blk: {
 };
 /// Suffix for a saved session that the last launches died restoring.
 const recovery_set_aside_suffix = ".restore-failed";
+/// Suffix for a saved session that was restored and then ended by itself
+/// before it was used (`App.setAsideFailedRestore`). Its own slots: these
+/// copies must never take the ones the crash-loop breaker needs.
+const restore_ended_suffix = ".restore-ended";
 const recovery_safe_mode_caption_w = std.unicode.utf8ToUtf16LeStringLiteral("noctty safe mode");
 
 test "win32 safe mode reload keeps recovery without loading config" {
@@ -1746,17 +1750,23 @@ fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
     return true;
 }
 
-/// Move the saved session at `path` aside, as a restore that failed: renamed
-/// into a free `.restore-failed` slot, never deleted or replaced, and left
-/// where it is once every slot is taken. Returns whether it moved.
+/// Move the saved session at `path` aside, as a restore that ended by itself
+/// before it was used: renamed into a free `.restore-ended` slot, never
+/// deleted or replaced. With every slot taken it stays where it is, and the
+/// next launch restores it again: a session the user can see beats one this
+/// would have to delete or overwrite a copy to move. Returns whether it moved.
 fn setAsideSessionStateAt(alloc: Allocator, path: []const u8) bool {
     const destination = win32_session_persistence.quarantineFileAlloc(
         alloc,
         path,
-        recovery_set_aside_suffix,
+        restore_ended_suffix,
         .keep_source,
     ) catch |err| {
-        if (err != error.FileNotFound) log.warn("win32 session: failed restore not set aside err={}", .{err});
+        switch (err) {
+            error.FileNotFound => {},
+            error.QuarantineFull => log.warn("win32 session: the restored session ended by itself before any input; left in place, every {s} name is taken", .{restore_ended_suffix}),
+            else => log.warn("win32 session: the restored session ended by itself before any input; not moved aside err={}", .{err}),
+        }
         return false;
     };
     defer alloc.free(destination);
@@ -1764,23 +1774,52 @@ fn setAsideSessionStateAt(alloc: Allocator, path: []const u8) bool {
     return true;
 }
 
-test "win32 a restore that failed is moved aside, never deleted" {
+test "win32 a restore that ended by itself is moved aside, never deleted or replaced" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const saved = "{\"schema_version\":1,\"windows\":[]}";
-    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
     defer std.testing.allocator.free(path);
 
-    try std.testing.expect(setAsideSessionStateAt(std.testing.allocator, path));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
-    const moved = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ recovery_set_aside_suffix, 64);
-    defer std.testing.allocator.free(moved);
-    try std.testing.expectEqualStrings(saved, moved);
+    // Every restore that ends this way is kept, each in a slot of its own.
+    var name_buf: [64]u8 = undefined;
+    for (0..win32_session_persistence.max_quarantined_copies) |index| {
+        var content_buf: [64]u8 = undefined;
+        const content = try std.fmt.bufPrint(&content_buf, "{{\"schema_version\":1,\"windows\":[],\"n\":{d}}}", .{index});
+        try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = content });
+        try std.testing.expect(setAsideSessionStateAt(std.testing.allocator, path));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
+        const name = if (index == 0)
+            "session-state.json" ++ restore_ended_suffix
+        else
+            try std.fmt.bufPrint(&name_buf, "session-state.json{s}.{d}", .{ restore_ended_suffix, index });
+        const moved = try tmp.dir.readFileAlloc(std.testing.allocator, name, 64);
+        defer std.testing.allocator.free(moved);
+        try std.testing.expectEqualStrings(content, moved);
+    }
     // Nothing left to move.
     try std.testing.expect(!setAsideSessionStateAt(std.testing.allocator, path));
+
+    // Every slot taken: the session stays, and no copy is replaced.
+    const latest = "{\"schema_version\":1,\"windows\":[],\"n\":5}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = latest });
+    try std.testing.expect(!setAsideSessionStateAt(std.testing.allocator, path));
+    const stayed = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 64);
+    defer std.testing.allocator.free(stayed);
+    try std.testing.expectEqualStrings(latest, stayed);
+    const first = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ restore_ended_suffix, 64);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("{\"schema_version\":1,\"windows\":[],\"n\":0}", first);
+
+    // These copies never take the crash-loop breaker's slots: with all of
+    // them taken, a session the last launches died restoring still moves.
+    try std.testing.expect(setAsideCrashedSessionState(std.testing.allocator, path));
+    const crashed = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ recovery_set_aside_suffix, 64);
+    defer std.testing.allocator.free(crashed);
+    try std.testing.expectEqualStrings(latest, crashed);
 }
 
 /// Create the directory `path` sits in when it is missing. Only that one
@@ -2824,10 +2863,20 @@ pub const App = struct {
     /// the write failed (the file then keeps the previous snapshot), and when
     /// a restore that failed was moved aside instead (`setAsideFailedRestore`).
     session_state_saved_before_last_host_close: bool = false,
+    /// The startup restore brought the saved session back, and nothing has
+    /// used it since: no input reached a running program
+    /// (`Surface.noteProgramInput`) and no terminal opened after it
+    /// (`Surface.init`). While this holds and every program the session
+    /// shows has ended by itself, the session is a restore that failed
+    /// (`sessionIsFailedRestore`) and is never saved back.
+    restored_session_untouched: bool = false,
     /// Tests only: how many times `saveSessionAsItEnds` saved. Under test no
     /// save reaches the disk, and the flag above cannot tell a save from a
     /// close that left an earlier one standing.
     test_session_saves_as_it_ends: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
+    /// Tests only: how many times a restore that failed was to be moved
+    /// aside (`setAsideFailedRestore`, past its sign-out check).
+    test_failed_restores_set_aside: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     /// Set only in the process that restored the saved session, or was
     /// eligible to and started with its first window instead. Only that
     /// process saves or deletes `session-state.json`: a launch that forwarded
@@ -3645,7 +3694,7 @@ pub const App = struct {
         ipc_server.stopIpcServer(self);
         // Windows still open at exit. After a quit or the last window's own
         // close there are none: they saved as they went.
-        if (self.hasSessionWindows()) _ = self.saveSessionState(.final);
+        if (self.hasSessionWindows()) self.saveSessionAsItEnds();
         self.releaseSessionOwnership();
         self.destroyAllWindows();
         if (self.shell_runtime_initialized) {
@@ -4219,8 +4268,9 @@ pub const App = struct {
                 gl_startup.clearOpenGLStartupFailure();
             }
         }
-        // Startup: every terminal open now came from the saved session.
-        for (self.windows.items) |surface| surface.restored_untouched = true;
+        // From here on, input that reaches a running program, or a terminal
+        // opening, uses the session.
+        self.restored_session_untouched = restored;
 
         return restored;
     }
@@ -4958,27 +5008,31 @@ pub const App = struct {
         _ = self.saveSessionState(.final);
     }
 
-    /// Whether every pane the session holds is one the saved session put
-    /// there whose program ended before any key or click reached it.
+    /// Whether the session is a restore that failed: the startup restore
+    /// brought it back, nothing has used it since, and every program it
+    /// shows has ended by itself. Saving it back would restore the same dead
+    /// panes at every launch.
     fn sessionIsFailedRestore(self: *const App) bool {
+        if (!self.restored_session_untouched) return false;
         var panes: usize = 0;
         for (self.hosts.items) |host| for (hostSessionTabs(host)) |tab| {
             var it = tab.tree.iterator();
             while (it.next()) |entry| : (panes += 1) {
-                if (!entry.view.restoreFailedUntouched()) return false;
+                if (!entry.view.programEnded()) return false;
             }
         };
         return panes > 0;
     }
 
-    /// The session ends holding only a restore that failed. Saving it back
-    /// would open and close it again at every launch, so the saved session
-    /// is moved aside instead, as one that keeps ending the process while it
-    /// is restored is, and the next launch starts fresh. A rename, never a
-    /// delete or a replace.
+    /// The session ends as a restore that failed. Saving it back would open
+    /// and close it again at every launch, so the saved session is moved
+    /// aside instead (`setAsideSessionStateAt`) and the next launch starts
+    /// fresh. A rename, never a delete or a replace. Not at a sign-out,
+    /// which ends the programs itself.
     fn setAsideFailedRestore(self: *App) void {
-        if (self.session_state_excluded_for_elevation or !self.sessionStateEnabled()) return;
         if (self.session_ending) return;
+        if (builtin.is_test) self.test_failed_restores_set_aside += 1;
+        if (self.session_state_excluded_for_elevation or !self.sessionStateEnabled()) return;
         const path = self.sessionStatePath() orelse return;
         defer self.core_app.alloc.free(path);
         _ = setAsideSessionStateAt(self.core_app.alloc, path);
@@ -5000,8 +5054,13 @@ pub const App = struct {
     /// Write the session's windows to `path`. With none to write, writes
     /// nothing and leaves the file as it is: every way the last window goes
     /// saves it first, so an empty snapshot says only that nothing is open,
-    /// not what to restore, and a delete could not be taken back.
+    /// not what to restore, and a delete could not be taken back. Nor does
+    /// it write a restore that failed (`sessionIsFailedRestore`): the file
+    /// holds that session already, or held it until `setAsideFailedRestore`
+    /// moved it, and writing it again (a checkpoint after an undo) would
+    /// bring it back for the next launch, or fill another set-aside slot.
     fn writeSessionStateAt(self: *const App, path: []const u8) bool {
+        if (self.sessionIsFailedRestore()) return false;
         const scrollback_lines: usize = self.config.@"window-save-state-scrollback";
         for ([_]usize{ scrollback_lines, 0 }, 0..) |attempt_lines, attempt_index| {
             if (attempt_index == 1) {
@@ -7565,6 +7624,7 @@ pub const App = struct {
                     .focused, .window_id => return error.InvalidAutomationTarget,
                 } orelse return error.AutomationTargetNotFound;
                 if (!automationTextAllowed(value.text)) return error.AutomationPolicyRefused;
+                surface.noteProgramInput();
 
                 const text_z = try self.core_app.alloc.dupeZ(u8, value.text);
                 defer self.core_app.alloc.free(text_z);
@@ -16203,6 +16263,8 @@ const Host = struct {
             self.postDeferredNewTab();
             return;
         }
+        // A command the user runs on the pane, as a key would.
+        surface.noteProgramInput();
         const performed = surface.core_surface.performBindingAction(action) catch |err| {
             if (outcome_provider) |provider| {
                 win32_uia.events.raiseNotification(
@@ -23382,6 +23444,7 @@ const Host = struct {
                     self.postDeferredNewTab();
                     return true;
                 }
+                surface.noteProgramInput();
                 _ = try surface.core_surface.performBindingAction(action);
                 return true;
             },
@@ -29111,6 +29174,7 @@ fn surfaceConfirmWriteCancel(userdata: ?*anyopaque, _: ConfirmCancelReason) void
 fn surfaceDropPayloadCallback(ctx: *anyopaque, payload: []const u8) void {
     const surface: *Surface = @ptrCast(@alignCast(ctx));
     if (payload.len == 0) return;
+    surface.noteProgramInput();
     const alloc = surface.app.core_app.alloc;
     const payload_z = alloc.dupeZ(u8, payload) catch |err| {
         std.log.warn("drop payload dupe failed err={}", .{err});
@@ -36138,12 +36202,6 @@ pub const Surface = struct {
     /// Recorded from the resolved profile kind at launch, so nothing downstream
     /// has to re-derive "is this SSH?" from the key text.
     launched_ssh: bool = false,
-    /// Restored from the saved session at startup, and no key or click has
-    /// reached it while its program ran. A session that ends holding only
-    /// such panes, their programs ended, is a restore that failed: saving it
-    /// back would restore the same dead panes at every launch
-    /// (`App.setAsideFailedRestore`).
-    restored_untouched: bool = false,
     launch_command: ?configpkg.Command = null,
     mouse_shape: terminal.MouseShape = .text,
     mouse_visible: bool = true,
@@ -36847,6 +36905,10 @@ pub const Surface = struct {
         // snapshot must still stand. Nor for the quick terminal, which is
         // never part of the session.
         if (!host.quick_terminal) app.session_state_saved_before_last_host_close = false;
+        // Any terminal the user opens after the startup restore, quick
+        // terminal included, uses the session; the restore's own panes all
+        // commit before `restoreSessionState` sets this.
+        app.restored_session_untouched = false;
     }
 
     test "Surface.init that fails after the core starts is unwound once, by init" {
@@ -36930,6 +36992,8 @@ pub const Surface = struct {
         try std.testing.expect(app.quit_timer_id != null);
         // The owner's last window already took the session's final snapshot.
         app.session_state_saved_before_last_host_close = true;
+        // And the startup restore brought the session back, untouched since.
+        app.restored_session_untouched = true;
 
         // A reader was told about the new tab's button, so it hears that the
         // button is gone again when init fails.
@@ -36957,8 +37021,10 @@ pub const Surface = struct {
         try std.testing.expectEqual(@as(usize, 0), core_app.surfaces.items.len);
         try std.testing.expect(app.quit_timer_id != null);
         // No terminal opened, so `terminate` must still keep that snapshot
-        // rather than save the empty app over it.
+        // rather than save the empty app over it, and nothing used the
+        // restored session.
         try std.testing.expect(app.session_state_saved_before_last_host_close);
+        try std.testing.expect(app.restored_session_untouched);
 
         // A tab the quick terminal opens is never part of the session, so the
         // snapshot stands (#497). Before, any committed init cleared it.
@@ -36971,6 +37037,8 @@ pub const Surface = struct {
         try std.testing.expect(sys.DestroyWindow(in_quick_terminal.hwnd.?) != 0);
         try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
         try std.testing.expect(snapshot_stood);
+        // But the user opened a terminal, so the restored session is used.
+        try std.testing.expect(!app.restored_session_untouched);
 
         // Once init returns, the window owns the Surface: destroying it frees
         // the Surface once, and its tab and button with it.
@@ -37611,6 +37679,8 @@ pub const Surface = struct {
         state: apprt.ClipboardRequest,
     ) !bool {
         if (clipboard_type != .standard) return false;
+        // A paste, from any key, menu or palette; a program's own read is not.
+        if (state == .paste) self.noteProgramInput();
         // A program's read that would only be declined does not read the
         // clipboard first.
         if (state == .osc_52_read and self.core_surface.config.clipboard_read == .ask) {
@@ -39208,6 +39278,7 @@ pub const Surface = struct {
             return;
         }
         if (action == .paste) {
+            self.noteProgramInput();
             // Defense-in-depth classifier pass, same as the drop path.
             //
             // Core's `isSafe` only flags newlines and bracketed-paste-end
@@ -41370,16 +41441,35 @@ pub const Surface = struct {
         );
     }
 
-    /// A key or click reached this terminal. While its program still runs,
-    /// that makes a restored pane one the user has used.
+    /// Input for this terminal's program arrived: a key, a click, the wheel,
+    /// a paste or drop, palette or automation text. While the program still
+    /// runs, that uses the session (`App.restored_session_untouched`). Into
+    /// a program that has already ended it does not: there it only closes
+    /// the pane, and a restore that failed must not count as used for that.
     fn noteProgramInput(self: *Surface) void {
-        if (self.core_initialized and !self.core_surface.child_exited) self.restored_untouched = false;
+        if (self.core_initialized and !self.core_surface.child_exited) self.app.restored_session_untouched = false;
     }
 
-    /// Restored from the saved session, and its program ended before anyone
-    /// used it.
-    fn restoreFailedUntouched(self: *const Surface) bool {
-        return self.restored_untouched and self.core_initialized and self.core_surface.child_exited;
+    /// This terminal's program has ended, by itself or killed.
+    fn programEnded(self: *const Surface) bool {
+        return self.core_initialized and self.core_surface.child_exited;
+    }
+
+    /// Whether a key event is input meant for the program: not a release,
+    /// whose press already counted, and not a modifier on its own (Alt as
+    /// the user Alt+Tabs away, Shift for a screenshot).
+    fn isProgramKeyInput(event: input.KeyEvent) bool {
+        return event.action != .release and !event.key.modifier();
+    }
+
+    test "a key release or a modifier alone is not input for the program" {
+        try std.testing.expect(isProgramKeyInput(.{ .action = .press, .key = .key_a }));
+        try std.testing.expect(isProgramKeyInput(.{ .action = .repeat, .key = .arrow_down }));
+        // An IME or character commit has no physical key.
+        try std.testing.expect(isProgramKeyInput(.{ .action = .press, .key = .unidentified, .utf8 = "x" }));
+        try std.testing.expect(!isProgramKeyInput(.{ .action = .release, .key = .key_a }));
+        try std.testing.expect(!isProgramKeyInput(.{ .action = .press, .key = .alt_left }));
+        try std.testing.expect(!isProgramKeyInput(.{ .action = .press, .key = .shift_right }));
     }
 
     /// What the keyboard and IME dispatch in `win32_input` needs from the
@@ -41388,7 +41478,7 @@ pub const Surface = struct {
         surface: *Surface,
 
         pub fn keyCallback(self: KeyTarget, event: input.KeyEvent) !CoreSurface.InputEffect {
-            self.surface.noteProgramInput();
+            if (isProgramKeyInput(event)) self.surface.noteProgramInput();
             return self.surface.core_surface.keyCallback(event);
         }
 
@@ -41648,6 +41738,7 @@ pub const Surface = struct {
 
         self.cursor_pos = cursorPosFromLParam(lParam);
         if (state == .press) {
+            self.noteProgramInput();
             if (self.hwnd) |h| {
                 _ = sys.SetFocus(h);
                 _ = sys.SetCapture(h);
@@ -41674,6 +41765,7 @@ pub const Surface = struct {
 
     fn handleMouseWheel(self: *Surface, scroll: NormalizedWheelScroll) void {
         if (!self.core_initialized) return;
+        self.noteProgramInput();
         if (self.scrollbarScrollable()) {
             const now_ms = sys.GetTickCount64();
             self.noteScrollbarActivity(now_ms);
@@ -45207,11 +45299,11 @@ test "win32 closing the session's last pane saves the session as it goes" {
     try std.testing.expect(!app.session_state_saved_before_last_host_close);
     try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
 
-    // A pane the saved session put here whose program ended before anyone
-    // typed in it or clicked it: that restore failed, and saving it back
-    // would open and close it again at every launch. Nothing saves it; the
-    // saved session is moved aside instead (`setAsideSessionStateAt`).
-    surface_b.restored_untouched = true;
+    // The startup restore brought this pane back, and its program ended
+    // before anything used the session: that restore failed, and saving it
+    // back would open and close it again at every launch. Nothing saves it;
+    // the saved session is moved aside instead (`setAsideSessionStateAt`).
+    app.restored_session_untouched = true;
     surface_b.core_surface.child_exited = true;
     try Stand.in(&surface_b);
     surface_b.core_initialized = true;
@@ -45220,17 +45312,35 @@ test "win32 closing the session's last pane saves the session as it goes" {
     try std.testing.expect(closed_untouched);
     try std.testing.expect(app.session_state_saved_before_last_host_close);
     try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
-    // Not while the session holds anything else.
+    try std.testing.expectEqual(@as(u32, 1), app.test_failed_restores_set_aside);
+    // Not at a sign-out, which ends the programs itself: its snapshot stands.
+    app.session_state_saved_before_last_host_close = false;
+    app.session_ending = true;
+    try Stand.in(&surface_b);
+    surface_b.core_initialized = true;
+    const closed_signing_out = surface_b.requestClose();
+    surface_b.core_initialized = false;
+    app.session_ending = false;
+    try std.testing.expect(closed_signing_out);
+    try std.testing.expectEqual(@as(u32, 1), app.test_failed_restores_set_aside);
+    try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
+    // Not while the session holds a program still running.
     surface_b.core_initialized = true;
     try app.hosts.append(std.testing.allocator, &other);
     const with_other = app.sessionIsFailedRestore();
     _ = detachHostReference(&app.hosts, &other);
     const alone = app.sessionIsFailedRestore();
+    // A key into a pane whose program has ended only closes the pane: it
+    // does not use the session, or the restore that failed would be saved
+    // back by the very key that closes it.
+    surface_b.noteProgramInput();
+    const after_key_into_ended = app.sessionIsFailedRestore();
     surface_b.core_initialized = false;
     try std.testing.expect(!with_other);
     try std.testing.expect(alone);
+    try std.testing.expect(after_key_into_ended);
 
-    // Used once while its program ran, it is a pane like any other.
+    // Used once while its program ran, it is a session like any other.
     app.session_state_saved_before_last_host_close = false;
     surface_b.core_surface.child_exited = false;
     surface_b.core_initialized = true;
@@ -45239,10 +45349,81 @@ test "win32 closing the session's last pane saves the session as it goes" {
     try Stand.in(&surface_b);
     const closed_used = surface_b.requestClose();
     surface_b.core_initialized = false;
-    try std.testing.expect(!surface_b.restored_untouched);
+    try std.testing.expect(!app.restored_session_untouched);
     try std.testing.expect(closed_used);
     try std.testing.expect(app.session_state_saved_before_last_host_close);
     try std.testing.expectEqual(@as(u32, 4), app.test_session_saves_as_it_ends);
+    try std.testing.expectEqual(@as(u32, 1), app.test_failed_restores_set_aside);
+}
+
+test "win32 a restored session is used once any pane takes input, whichever pane goes last" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const saved = "{\"schema_version\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
+    defer std.testing.allocator.free(path);
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .id = 1, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    // Two restored tabs whose programs have both ended by themselves.
+    app.restored_session_untouched = true;
+    surface_a.core_surface.child_exited = true;
+    surface_b.core_surface.child_exited = true;
+    surface_a.core_initialized = true;
+    surface_b.core_initialized = true;
+    const failed = app.sessionIsFailedRestore();
+    // A checkpoint (an undo of the last tab's close arms one) writes nothing
+    // for it: the file keeps the session as it was restored, and the next
+    // close finds nothing more to move aside.
+    const written_failed = app.writeSessionStateAt(path);
+    surface_a.core_initialized = false;
+    surface_b.core_initialized = false;
+    try std.testing.expect(failed);
+    try std.testing.expect(!written_failed);
+    {
+        const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 4096);
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqualStrings(saved, kept);
+    }
+
+    // Used in A while A's program ran: the whole session is used, even once
+    // A's tab has gone and only B, never touched, is left.
+    surface_a.core_surface.child_exited = false;
+    surface_a.core_initialized = true;
+    surface_a.noteProgramInput();
+    surface_a.core_initialized = false;
+    var removed = host.tabs.orderedRemove(0);
+    removed.deinit();
+    surface_b.core_initialized = true;
+    const used = app.sessionIsFailedRestore();
+    const written_used = app.writeSessionStateAt(path);
+    surface_b.core_initialized = false;
+    try std.testing.expect(!used);
+    try std.testing.expect(written_used);
+    const rewritten = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 64 * 1024);
+    defer std.testing.allocator.free(rewritten);
+    try std.testing.expect(!std.mem.eql(u8, saved, rewritten));
 }
 
 test "win32 close_tab this asks first once undo is off" {

@@ -293,8 +293,9 @@ Win32-validated VT protocol coverage is tracked in
   startup failures fall back to safe mode (a launch that ends only because
   OpenGL cannot start is not counted). A saved session that keeps ending
   the process during restore is renamed to `session-state.json.restore-failed`
-  instead of being restored again, and so is one that ends holding only
-  restored panes whose programs ended by themselves before any input.
+  instead of being restored again. A restored session that ends before anyone
+  used it, its programs all ended by themselves, is renamed to
+  `session-state.json.restore-ended` instead of being saved back.
   Details in
   [windows.md](windows.md#session-restore-and-recovery).
 - `+diagnostic-bundle` exports are explicit and redact terminal content,

@@ -1136,15 +1136,23 @@ undo time runs out. Undoing the close of the last tab, or opening a new tab or
 window, continues the session. No save deletes the file: with no window to
 record, a save writes nothing.
 
-One exception: when everything the session holds as it ends is panes the saved
-session put there whose programs ended by themselves before any key or click
-reached them (a WSL distribution that fails to start, say), that restore
-failed, and saving it back would open and close it again at every launch.
-noctty then renames the saved session to `session-state.json.restore-failed`
-(or `.1` up to `.4`) instead, as it does for a session that keeps ending the
-process while it is restored, and the next launch opens a fresh window. Rename
-the file back to try that session again. With all five names taken, the file is
-left where it is.
+One exception: a restore that ended by itself before anyone used it. If
+nothing has used the session since startup restored it, and every program in
+the panes it still holds has ended by itself (a WSL distribution that fails to
+start, say), saving it back would open and close it again at every launch.
+"Used" means input reached a pane while its program ran: a key, a click, the
+mouse wheel, a paste or drop, a command run from the command palette, or text
+sent by automation. Opening a tab, pane, window or the quick terminal counts
+too. A key pressed in a pane whose program has already ended only closes it,
+and does not count. When the session ends that way, noctty renames the saved
+session to `session-state.json.restore-ended` (or `.1` up to `.4`) instead of
+saving it, writes no checkpoint for it meanwhile, and the next launch opens a
+fresh window. Rename the file back to try that session again. Nothing is
+deleted or replaced: with all five names taken, the file is left where it is
+and the next launch restores it again. These names are separate from the
+`.restore-failed` names below, so they never stop a session that keeps
+ending the process from being moved aside.
+
 The save at sign-out, shutdown or reboot is the last one: the sign-out also
 ends the shells, and the panes they leave are not saved over it. A launch that forwards
 to a running noctty, a window opened with `--working-directory` (Explorer's
