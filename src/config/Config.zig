@@ -2317,8 +2317,9 @@ keybind: Keybinds = .{},
 /// program, and no tab, pane, window or quick terminal was opened) and
 /// whose programs all ended by themselves is not saved back, since it would
 /// open and close again at every launch. Its saved file is renamed to
-/// `session-state.json.restore-ended` instead (up to five copies; with all
-/// five taken it is left in place), and the next launch starts fresh.
+/// `session-state.json.restore-ended` instead (up to five copies), and the
+/// next launch starts fresh. With all five names taken, the file is left in
+/// place and the next launch restores it again.
 /// Checkpoints use the same ownership and privacy rules as the save when the
 /// last window goes and never run during startup restore. The practical
 /// window/session shape includes:
