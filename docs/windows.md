@@ -1553,6 +1553,19 @@ and decoration (`--window-width`, `--window-height`, `--window-position-*`,
 colors (`--background`, `--foreground`, `--palette`, `--cursor-color`,
 `--background-opacity`).
 
+The new window copies the running instance's oldest open window (not the
+quick terminal), as a `new_window` does: its size, one step down and right
+of it, its maximized or fullscreen state, its decorations and its background
+opacity. Forwarded arguments win over the copy: `--window-width` and
+`--window-height` give it its own size (both must be set, by the arguments
+or the config; from a maximized or fullscreen window, it is the size the new
+window returns to), `--window-decoration` its decorations and
+`--background-opacity` its opacity. `--window-position-*` places it as the
+config's `window-position-*` do, keeping the copied size, except that a
+window opened from a maximized or fullscreen one returns to that window's
+normal place. With no window open, the arguments apply as they do to a first
+window.
+
 Anything that runs code (`--command`, `--initial-command`, `-e`, `--input`,
 `--env`), loads a file (`--background-image`, `--custom-shader`,
 `--bell-audio-path`), changes the configuration source (`--config-file`,
