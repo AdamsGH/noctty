@@ -185,8 +185,9 @@ compatibility alias.
 
 A Chocolatey package (`noctty`) is built by the release workflow, but
 chocolatey.org has no approved version of it, so `choco install noctty` does
-not work today. Another community account owns the `noctty` id there and
-chocolatey.org refuses this repository's pushes until it is handed over; see
+not work today. Another community account owns the `noctty` id there, and
+chocolatey.org refuses this repository's pushes with `403` until the id is
+handed over and a version is approved; see
 [chocolatey-publishing.md](chocolatey-publishing.md).
 
 [getting-started.md](getting-started.md) covers download and install,
