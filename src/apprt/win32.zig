@@ -48157,6 +48157,12 @@ const WindowStartTestApp = struct {
     fn init(self: *WindowStartTestApp) !void {
         try self.session.init(.{ .core_app = &self.core_app, .app = &self.app });
         errdefer self.session.deinit();
+        // The apartment the app's UI thread has, on this thread. Without it
+        // the full suite (not a filtered run, where the register fails)
+        // leaked every pane's drop target: its `RevokeDragDrop` failed with
+        // RPC_E_WRONG_THREAD.
+        self.app.initComApartment();
+        errdefer if (self.app.com_initialized) sys.OleUninitialize();
         try self.app.ensureWindowClass();
         self.app.test_surface_init_stage = &stage;
         watched = null;
@@ -48165,6 +48171,7 @@ const WindowStartTestApp = struct {
 
     fn deinit(self: *WindowStartTestApp) void {
         self.closeWindows();
+        if (self.app.com_initialized) sys.OleUninitialize();
         const instance = self.app.hinstance;
         self.session.deinit();
         // `createHost` registers these and nothing unregisters them.
