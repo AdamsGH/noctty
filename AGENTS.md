@@ -166,30 +166,38 @@ that govern each symbol you change, or that none does.
   parser limits, `PageList`, OSC parsers, OSC 133 exit codes, prompt typeahead
   in `semantic_command.zig`, the scrollback search thread,
   `TerminalFormatter`/`ScreenFormatter` output for undo snapshots and Copy as
-  HTML), OSC 7 and OSC 9;9 cwd reports (`termio/stream_handler.zig`,
-  `os.hostname.isLocal`, `windows_shell.conemuPathToLocal`),
-  `src/Surface.zig` locking around links, and `ShellExecute*` calls queued for
-  the message loop (`App.deferShellRequest`, `drainDeferredOpens`).
+  HTML, Kitty graphics placements in `kitty/graphics_storage.zig` and
+  `kitty/graphics_exec.zig`), OSC 7 and OSC 9;9 cwd reports
+  (`termio/stream_handler.zig`, `os.hostname.isLocal`,
+  `windows_shell.conemuPathToLocal`), `src/Surface.zig` locking around links,
+  and `ShellExecute*` calls queued for the message loop
+  (`App.deferShellRequest`, `drainDeferredOpens`).
 - [renderer.md](docs/agents/log/renderer.md): `src/renderer/` (OpenGL/WGL,
   the D3D11 beta and GL-to-D3D11 fallback, `Thread.zig` pacing and follow-up
   timers, synchronized output, vsync, `RenderPass` viewport, cursor sprites,
-  search highlights after a resize), `win32/pixel_format.zig`, font fallback
+  search highlights after a resize), the unfocused-split dim (`split_dim`,
+  `Host.syncSplitDim`), `win32/pixel_format.zig`, font fallback
   and `font-thicken`, renderer wakeups from `termio` and typing latency,
   repaint during live resize, and which DLLs a CLI action or the D3D11
   backend loads (the OpenGL32 static import).
 - [window-frame.md](docs/agents/log/window-frame.md): the top-level window:
   `WM_NCCALCSIZE`/`WM_NCHITTEST` (`win32_nc_layout.zig`), integrated titlebar
   and caption buttons, `window-decoration = none`, resize bands, maximize,
-  fullscreen and restore placement, `WM_DPICHANGED` and mixed-DPI moves,
+  fullscreen and restore placement (the `maximize`/`fullscreen` keys at
+  window start: `Surface.applyWindowStart`), what a new window copies from
+  its source and which forwarded keys it keeps (`inheritWindowStateFrom`,
+  `WindowKeeps`), `WM_DPICHANGED` and mixed-DPI moves,
   `window-width`/`window-height`, `background-opacity` and DWM backdrop, the
   window menu, the quick terminal (`win32_quick_terminal.zig`).
 - [chrome-tabs-paint.md](docs/agents/log/chrome-tabs-paint.md): tab buttons
   (`tabButtonProc`, `drawButton`, labels, tooltips, close X, underline,
   `win32_tab_visual.zig`), `window-show-tab-bar`, chrome theme and system
   accent (`win32_theme.zig`), focus cues (`win32/focus_cue.zig`),
-  `win32_icons.zig`, chrome child z-order, host paint and invalidation scopes
-  and text caches (`paintChrome`, `invalidateChrome*`, `repaintTopChrome`,
-  `appendOwnedString`), tweens.
+  `win32_icons.zig`, titlebar and tab-row icon fonts
+  (`recreateTitlebarIconFonts`, `createIconFontWithGlyphs`,
+  `fontGlyphCoverage`, `drawTitlebarGlyph`), chrome child z-order, host paint
+  and invalidation scopes and text caches (`paintChrome`, `invalidateChrome*`,
+  `repaintTopChrome`, `appendOwnedString`), tweens.
 - [chrome-overlays.md](docs/agents/log/chrome-overlays.md): the command
   palette (`win32_palette.zig`, ranking, MRU, palette list), the confirm
   overlay (`showConfirm`, `invokeConfirmAccept`/`Cancel` lifetime), the
@@ -202,7 +210,8 @@ that govern each symbol you change, or that none does.
 - [tabs-panes.md](docs/agents/log/tabs-panes.md): tabs, splits and windows as
   a structure: `Surface.init` ordering, `activateSurface`, showing and hiding
   pane surfaces (occlusion, overlapping WGL children), `windowDestroyed`,
-  close and close-confirm flows, focus after a close, shell reducer effects,
+  close and close-confirm flows, quit teardown (`destroyAllWindows`,
+  `App.destroyPaneOf`), focus after a close, shell reducer effects,
   local and structural undo/redo (`win32_undo.zig`,
   `win32_structural_history.zig`, `undo-timeout`).
 - [input.md](docs/agents/log/input.md): `win32/input.zig` and key messages
@@ -224,11 +233,13 @@ that govern each symbol you change, or that none does.
   replies, paste protection (`win32_paste_protection.zig`), drag-and-drop
   (`win32_surface_drop*.zig`), pending clipboard confirmations.
 - [settings.md](docs/agents/log/settings.md): the Settings window
-  (`win32_settings.zig`, `win32_settings_fields.zig`): its controls, dialog
+  (`win32_settings.zig`, `win32_settings_fields.zig`): its controls and when
+  they are made (`SettingsWindow.open`, `materializeSection`), dialog
   manager, viewport, live preview, theming (`SettingsThemeAdapter`,
-  `themeChanged`), its own UIA patterns and combo trace
-  (`NOCTTY_SETTINGS_COMBO_TRACE`, `win32/bench_trace.zig`), and the save path
-  (`settingsSaveAndReload`, `patchOrAppendEdits`, save target, masked values).
+  `themeChanged`), its own UIA patterns, combo and open traces
+  (`NOCTTY_SETTINGS_COMBO_TRACE`, `NOCTTY_SETTINGS_OPEN_TRACE`,
+  `win32/bench_trace.zig`), and the save path (`settingsSaveAndReload`,
+  `patchOrAppendEdits`, save target, masked values).
 - [accessibility.md](docs/agents/log/accessibility.md): new widgets and UI
   events (adding a native widget, or changing its focus, children or
   notifiable properties); UIA providers under `src/apprt/win32_uia/` (COM
@@ -239,9 +250,9 @@ that govern each symbol you change, or that none does.
   the Settings window: the config file reader (`cli/args.zig` `LineIterator`,
   `Config.file_read_buffer_len`), `--config-file` and `startup_cwd` on reload,
   diagnostics shown in the GUI, conditional replay, `newConfig` shallow
-  clones, `RepeatableCommand.clone` and its C mirror (`value_c`,
-  `Command.cval`), `+edit-config` and opening the config file, adding config
-  keys.
+  clones, what `Surface.DerivedConfig` must own, `RepeatableCommand.clone`
+  and its C mirror (`value_c`, `Command.cval`), `+edit-config` and opening
+  the config file, adding config keys.
 - [app-lifecycle.md](docs/agents/log/app-lifecycle.md): `App.init` and
   startup stalls, startup attempts and safe mode, session state and
   state-file schemas, IPC and single instance (`win32/ipc_server.zig`), AUMID

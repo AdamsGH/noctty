@@ -177,7 +177,8 @@
         "src/cli/**",
         "src/apprt/win32/config_problems.zig",
         "src/apprt/win32.zig",
-        "src/input/command.zig"
+        "src/input/command.zig",
+        "src/Surface.zig"
       ]
     },
     {
