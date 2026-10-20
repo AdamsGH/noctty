@@ -195,13 +195,16 @@ public static class StatefulPixelDiagnosticNative {
 # Pixel diagnostics go to the harness's logs, which the interactive job uploads.
 $script:StatefulDiagnosticDirectory = $null
 
-function Get-StatefulWindowFacts([IntPtr] $Hwnd) {
+function Get-StatefulWindowFacts([IntPtr] $Hwnd, [hashtable] $ProcessNames = @{}) {
     # Handle, class and process only: never a window title or its contents.
+    # ProcessNames caches names by process id within one read of the screen.
     if ($Hwnd -eq [IntPtr]::Zero) { return $null }
     $processId = [uint32]0
     [void][InteractiveWin11WindowNative]::GetWindowThreadProcessId($Hwnd, [ref]$processId)
-    $processName = $null
-    try { $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName } catch { $processName = $null }
+    if (-not $ProcessNames.ContainsKey($processId)) {
+        $ProcessNames[$processId] = try { (Get-Process -Id $processId -ErrorAction Stop).ProcessName } catch { $null }
+    }
+    $processName = $ProcessNames[$processId]
     return [pscustomobject][ordered]@{
         Handle = '0x{0:X}' -f $Hwnd.ToInt64()
         Class = Get-StatefulClassName $Hwnd
@@ -222,7 +225,8 @@ function ConvertTo-StatefulRectData($Rect) {
 # the rect, of any process. -WithColors also reads the 16 sample colors.
 function Get-StatefulScreenFacts([IntPtr] $Hwnd, [switch] $WithColors) {
     $root = [StatefulPixelDiagnosticNative]::GetAncestor($Hwnd, 2)
-    $rootFacts = Get-StatefulWindowFacts $root
+    $names = @{}
+    $rootFacts = Get-StatefulWindowFacts $root $names
     $rect = ConvertTo-StatefulRectData (Get-StatefulWindowRect $Hwnd)
     $bounds = $null
     if ($root -ne [IntPtr]::Zero) {
@@ -258,8 +262,8 @@ function Get-StatefulScreenFacts([IntPtr] $Hwnd, [switch] $WithColors) {
                 $under = [StatefulPixelDiagnosticNative]::WindowFromPoint($nativePoint)
                 $samples.Add([pscustomobject][ordered]@{
                     X = $point.X; Y = $point.Y; Rgb = $rgb
-                    Window = Get-StatefulWindowFacts $under
-                    Root = Get-StatefulWindowFacts ([StatefulPixelDiagnosticNative]::GetAncestor($under, 2))
+                    Window = Get-StatefulWindowFacts $under $names
+                    Root = Get-StatefulWindowFacts ([StatefulPixelDiagnosticNative]::GetAncestor($under, 2)) $names
                 })
             }
         }
@@ -276,7 +280,7 @@ function Get-StatefulScreenFacts([IntPtr] $Hwnd, [switch] $WithColors) {
             if ([InteractiveWin11WindowNative]::IsWindowVisible($above) -and $null -ne $aboveRect -and
                 $aboveRect.Left -lt $rect.Right -and $aboveRect.Right -gt $rect.Left -and
                 $aboveRect.Top -lt $rect.Bottom -and $aboveRect.Bottom -gt $rect.Top) {
-                $windowsAbove.Add((Get-StatefulWindowFacts $above | Add-Member -PassThru -NotePropertyName Cloaked -NotePropertyValue ([StatefulPixelDiagnosticNative]::Cloaked($above))))
+                $windowsAbove.Add((Get-StatefulWindowFacts $above $names | Add-Member -PassThru -NotePropertyName Cloaked -NotePropertyValue ([StatefulPixelDiagnosticNative]::Cloaked($above))))
             }
             $above = [StatefulPixelDiagnosticNative]::GetWindow($above, 3)
         }
