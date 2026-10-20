@@ -444,6 +444,11 @@ try {
             @{ Name='close-window-two-tabs'; Tabs=2 }
         )
         $only=@($Cases -split ',' | Where-Object { $_ })
+        # A name no case has fails the run: a typo must not pass by running nothing.
+        $known=@($endings | ForEach-Object { $_.Name })
+        foreach($name in $only) {
+            if($known -notcontains $name) { $script:checks.Add(@{Name="${name}: a last-window case by that name"; Passed=$false; Error="No last-window case is named '$name'."}) }
+        }
         foreach($ending in $endings) {
             if($only.Count -and $only -notcontains $ending.Name) { continue }
             # One case failing to run is that case's failure, not the others'.
