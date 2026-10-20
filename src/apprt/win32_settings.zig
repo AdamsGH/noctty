@@ -250,7 +250,6 @@ const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const SWP_NOSIZE: UINT = 0x0001;
 const SWP_NOMOVE: UINT = 0x0002;
 const SWP_NOZORDER: UINT = 0x0004;
-const SWP_NOREDRAW: UINT = 0x0008;
 const SWP_NOACTIVATE: UINT = 0x0010;
 const SWP_FRAMECHANGED: UINT = 0x0020;
 const SWP_NOCOPYBITS: UINT = 0x0100;
@@ -1049,11 +1048,12 @@ fn displayRowSpec(row: field_model.DisplayRow) FormControl {
     };
 }
 
-fn makeDisplayControl(parent: HWND, hinstance: HINSTANCE, comptime spec: FormControl) ?HWND {
+/// `style` adds the window's final visibility and group (`WS_VISIBLE`, `WS_GROUP`).
+fn makeDisplayControl(parent: HWND, hinstance: HINSTANCE, comptime spec: FormControl, style: u32) ?HWND {
     return switch (comptime spec.role) {
-        .button => sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, settings_field_max_width, settings_control_height, parent, @ptrFromInt(spec.id), hinstance, null),
+        .button => sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON | style, 0, 0, settings_field_max_width, settings_control_height, parent, @ptrFromInt(spec.id), hinstance, null),
         .text => blk: {
-            const text = makeStatic(parent, hinstance, spec.caption orelse spec.name);
+            const text = makeStatic(parent, hinstance, spec.caption orelse spec.name, style);
             if (text) |control| _ = sys.SetWindowLongPtrW(control, -12, @intCast(spec.id)); // GWLP_ID
             break :blk text;
         },
@@ -1352,10 +1352,17 @@ const SettingsThemeAdapter = struct {
         self.button_brush = null;
     }
 
+    /// What `apply` reaches: the window alone (its brushes, DWM attributes
+    /// and own theme), for `open`, whose children are themed as they are
+    /// created (`SettingsWindow.finishChild`); or every child as well, for a
+    /// theme that changed under existing windows.
+    const Scope = enum { frame, window };
+
     fn apply(
         self: *SettingsThemeAdapter,
         hwnd: HWND,
         colors: win32_theme.SettingsColors,
+        scope: Scope,
     ) void {
         if (self.applying) return;
         self.applying = true;
@@ -1369,6 +1376,7 @@ const SettingsThemeAdapter = struct {
 
         win32_theme.WindowThemeAdapter.applySettings(hwnd, colors);
         applyNativeControlTheme(hwnd, colors);
+        if (scope == .frame) return;
         _ = sys.EnumChildWindows(
             hwnd,
             applyNativeControlThemeToChild,
@@ -1519,6 +1527,9 @@ pub const AppHandle = struct {
 pub const SettingsWindow = struct {
     handle: AppHandle,
     combo_trace: bench_trace.SettingsComboTrace = .{},
+    /// How long each step of the last `open` took, when the App's
+    /// `NOCTTY_SETTINGS_OPEN_TRACE` is on; the App writes and empties it.
+    creation_stamps: bench_trace.SettingsCreationStamps = .{},
     hwnd: ?HWND = null,
     /// The form's own window (`viewport_class_name`): every field, its label
     /// and the help text are its children, so its client area is what clips
@@ -1587,10 +1598,12 @@ pub const SettingsWindow = struct {
     emphasis_font: HGDIOBJ = null,
     header_font: HGDIOBJ = null,
     theme_adapter: SettingsThemeAdapter = .{},
-    /// DPI the UI fonts were last built for, and how many times `themeChanged`
-    /// has actually re-themed the window (a test reads the latter).
+    /// DPI the UI fonts were last built for, how many times `themeChanged`
+    /// has actually re-themed the window and how many times the fonts were
+    /// built (tests read the counts).
     ui_font_dpi: u32 = 0,
     theme_applications: u32 = 0,
+    font_builds: u32 = 0,
     close_prompt_measure_width: i32 = -1,
     close_prompt_measure_dpi: u32 = 0,
     close_prompt_measure_quitting: bool = false,
@@ -3155,54 +3168,24 @@ pub const SettingsWindow = struct {
         if (self.sectionButton(self.active_section)) |button| _ = SetFocus(button);
     }
 
-    /// Put the controls in the order Tab should visit them: the rail, then each
-    /// section's fields as laid out, then the action bar. Tab follows z-order,
-    /// which is creation order. Keep each label/control pair together while
-    /// arranging the sections and action bar; the resulting sibling order is
-    /// z-order (and with it the UIA sibling order) equal to the visual order.
-    ///
-    /// Only the Appearance rail button starts a dialog group, so without more
-    /// the arrow-key group of the rail would run on into the fields and Save:
-    /// each section's first field and the action bar start their own.
-    fn applyTabOrder(self: *SettingsWindow) void {
-        var previous_text = false;
-        for (std.enums.values(Section)) |section| for (formItemsForSection(section), 0..) |item, index| {
-            const control = self.controlHwnd(item.control_index) orelse continue;
-            const label = if (item.label_index) |label_index| self.field_labels[label_index] else null;
-            const text = settings_control_specs[item.control_index].role == .text;
-            orderFormControl(control, label, formGroupStarts(index, previous_text, text));
-            previous_text = text;
-        };
-        // Conflict choices and Discard sit left of Save (never together); the
-        // close prompt replaces them all.
-        var first_action = true;
-        for ([_]?HWND{
-            self.btn_conflict_keep,
-            self.btn_conflict_use_disk,
-            self.btn_discard_changes,
-            self.btn_save,
-            self.btn_close_save,
-            self.btn_close_discard,
-            self.btn_close_keep_editing,
-        }) |button| if (button) |control| {
-            sendToBottom(control);
-            if (first_action) startGroup(control);
-            first_action = false;
-        };
-    }
-
     fn refreshNativeSectionText(self: *SettingsWindow) void {
         setWindowTextUtf8(self.text_header, self.active_section.headerText());
         setWindowTextUtf8(self.text_summary, self.active_section.placeholderText());
-        // A static text holds 2047 UTF-16 units, so the page is built in as
-        // many bytes.
-        var help_buf: [2047]u8 = undefined;
-        const help = switch (self.active_section) {
+        var help_buf: [help_text_bytes]u8 = undefined;
+        setWindowTextUtf8(self.text_help, self.helpText(&help_buf));
+    }
+
+    /// A static text holds 2047 UTF-16 units, so the page is built in as many
+    /// bytes.
+    const help_text_bytes = 2047;
+
+    /// The text above the form: Keybindings and Advanced have one.
+    fn helpText(self: *const SettingsWindow, buf: *[help_text_bytes]u8) []const u8 {
+        return switch (self.active_section) {
             .keybindings => keybindingsHelpText(),
-            .advanced => self.advancedHelpText(&help_buf),
+            .advanced => self.advancedHelpText(buf),
             else => "",
         };
-        setWindowTextUtf8(self.text_help, help);
     }
 
     /// The app loaded the config again, so what the Advanced page lists as
@@ -3275,31 +3258,50 @@ pub const SettingsWindow = struct {
         return bar.status_separate != self.status_row_separate or bar.status_height != self.status_row_height;
     }
 
+    /// Build the fonts for the current DPI and give them to every child: a DPI
+    /// or theme change. A child `open` creates gets its font as it is made.
     fn recreateUiFont(self: *SettingsWindow) void {
-        const hwnd = self.hwnd orelse return;
+        const replaced = self.buildUiFonts() orelse return;
+        self.applyUiFonts();
+        replaced.delete();
+    }
+
+    const UiFonts = struct {
+        handles: [4]HGDIOBJ,
+
+        fn delete(self: UiFonts) void {
+            for (self.handles) |font| if (font) |handle| {
+                _ = DeleteObject(handle);
+            };
+        }
+    };
+
+    /// The window's four fonts for `self.dpi`, and the line height the text
+    /// fields centre on. Returns the fonts they replace, for the caller to
+    /// delete once no child draws with them; null when a font could not be
+    /// made, leaving the old ones in place.
+    fn buildUiFonts(self: *SettingsWindow) ?UiFonts {
+        const hwnd = self.hwnd orelse return null;
         const variable_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Variable Text");
         const fallback_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
         const face = if (fontFaceAvailable(hwnd, variable_face)) variable_face else fallback_face;
-        const next = createSettingsFont(self.dpi, 13, 400, face) orelse return;
+        const next = createSettingsFont(self.dpi, 13, 400, face) orelse return null;
         const next_secondary = createSettingsFont(self.dpi, 12, 400, face) orelse {
             _ = DeleteObject(next);
-            return;
+            return null;
         };
         const next_emphasis = createSettingsFont(self.dpi, 13, 600, face) orelse {
             _ = DeleteObject(next_secondary);
             _ = DeleteObject(next);
-            return;
+            return null;
         };
         const next_header = createSettingsFont(self.dpi, 16, 600, face) orelse {
             _ = DeleteObject(next_emphasis);
             _ = DeleteObject(next_secondary);
             _ = DeleteObject(next);
-            return;
+            return null;
         };
-        const previous = self.ui_font;
-        const previous_secondary = self.secondary_font;
-        const previous_emphasis = self.emphasis_font;
-        const previous_header = self.header_font;
+        const replaced: UiFonts = .{ .handles = .{ self.ui_font, self.secondary_font, self.emphasis_font, self.header_font } };
         self.ui_font_dpi = self.dpi;
         self.ui_font = next;
         self.secondary_font = next_secondary;
@@ -3308,37 +3310,62 @@ pub const SettingsWindow = struct {
         self.close_prompt_measure_width = -1;
         self.close_prompt_measure_height = 0;
         self.status_measure_width = -1;
-        _ = EnumChildWindows(hwnd, applyChildFont, @bitCast(@intFromPtr(next)));
-        if (self.text_header) |header| _ = SendMessageW(header, WM_SETFONT, @intFromPtr(next_header), 1);
-        if (self.text_summary) |text| _ = SendMessageW(text, WM_SETFONT, @intFromPtr(next_secondary), 1);
+        self.field_text_height = fontLineHeight(hwnd, next);
+        self.font_builds +%= 1;
+        return replaced;
+    }
+
+    fn applyUiFonts(self: *SettingsWindow) void {
+        const hwnd = self.hwnd orelse return;
+        _ = EnumChildWindows(hwnd, applyChildFont, @bitCast(@intFromPtr(self.ui_font)));
+        if (self.text_header) |header| _ = SendMessageW(header, WM_SETFONT, @intFromPtr(self.header_font), 1);
+        if (self.text_summary) |text| _ = SendMessageW(text, WM_SETFONT, @intFromPtr(self.secondary_font), 1);
         for (self.field_labels) |label| {
-            if (label) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(next_secondary), 1);
+            if (label) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(self.secondary_font), 1);
         }
         for (0..settings_clipped_control_count) |index| if (controlIndexIsCheckbox(index)) {
-            if (self.controlHwnd(index)) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(next_secondary), 1);
+            if (self.controlHwnd(index)) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(self.secondary_font), 1);
         };
-        if (self.text_close_prompt) |prompt| _ = SendMessageW(prompt, WM_SETFONT, @intFromPtr(next_emphasis), 1);
+        if (self.text_close_prompt) |prompt| _ = SendMessageW(prompt, WM_SETFONT, @intFromPtr(self.emphasis_font), 1);
         self.syncStatusFont();
-        if (previous) |font| _ = DeleteObject(font);
-        if (previous_secondary) |font| _ = DeleteObject(font);
-        if (previous_emphasis) |font| _ = DeleteObject(font);
-        if (previous_header) |font| _ = DeleteObject(font);
-        self.field_text_height = fontLineHeight(hwnd, next);
-        // The text fields centre on the new line height and the frame scales
-        // with the DPI: ask each one for its frame again.
+        self.refreshFieldFrames();
+        self.updateComboMetrics();
+    }
+
+    /// The text fields centre on the line height and their frame scales with
+    /// the DPI (`settingsEditProc`): ask each one for its frame again.
+    fn refreshFieldFrames(self: *SettingsWindow) void {
         for (self.editControls()) |edit| if (edit) |control| {
             _ = SetWindowPos(control, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         };
-        self.updateComboMetrics();
+    }
+
+    /// What a child made during `open` needs before it is first drawn: its
+    /// theme and its font, once each, and a dropdown's list item height after
+    /// its font. A theme or DPI change later re-applies all of them to every
+    /// window (`themeChanged`, `recreateUiFont`).
+    fn finishChild(self: *SettingsWindow, child: ?HWND, font: HGDIOBJ, kind: enum { control, combo }) ?HWND {
+        const control = child orelse return null;
+        const colors = self.theme_adapter.colors;
+        switch (kind) {
+            .control => applyNativeControlTheme(control, colors),
+            .combo => win32_theme.WindowThemeAdapter.applyNativeCombo(control, colors),
+        }
+        if (font) |value| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(value), 0);
+        if (kind == .combo) _ = SendMessageW(control, CB_SETITEMHEIGHT, 0, self.px(settings_combo_item_height));
+        return control;
+    }
+
+    fn statusFont(self: *const SettingsWindow) HGDIOBJ {
+        return switch (self.nextStatus()) {
+            .conflict, .owned_conflict => self.emphasis_font,
+            .raw_validation, .owned_validation, .none => self.secondary_font,
+        };
     }
 
     fn syncStatusFont(self: *SettingsWindow) void {
         const status = self.text_status orelse return;
-        const font = switch (self.nextStatus()) {
-            .conflict, .owned_conflict => self.emphasis_font,
-            .raw_validation, .owned_validation, .none => self.secondary_font,
-        };
-        if (font) |value| {
+        if (self.statusFont()) |value| {
             const current: LRESULT = @bitCast(@intFromPtr(value));
             if (SendMessageW(status, WM_GETFONT, 0, 0) != current) {
                 _ = SendMessageW(status, WM_SETFONT, @intFromPtr(value), 1);
@@ -3479,7 +3506,7 @@ pub const SettingsWindow = struct {
         const colors = self.resolveThemeColors();
         if (self.themeInputsApplied(colors)) return;
         self.theme_applications +%= 1;
-        self.theme_adapter.apply(hwnd, colors);
+        self.theme_adapter.apply(hwnd, colors, .window);
         self.recreateUiFont();
         layoutChildren(self);
         _ = sys.InvalidateRect(hwnd, null, 1);
@@ -4253,6 +4280,10 @@ pub const SettingsWindow = struct {
     /// with a live HWND brings the existing window to the foreground
     /// instead of duplicating it.
     pub fn open(self: *SettingsWindow) !void {
+        // The stamps describe this call alone: a raise leaves none, so an
+        // earlier creation's stamps never read as this one's.
+        const stamps = &self.creation_stamps;
+        stamps.len = 0;
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) {
                 switch (pendingCloseReopenAction(self.close_posted, self.close_after_save)) {
@@ -4278,6 +4309,7 @@ pub const SettingsWindow = struct {
             }
             self.hwnd = null;
         }
+        stamps.mark(.create_begin);
         self.resetClosePromptState();
         self.close_notified = false;
         self.focus_before_deactivate = null;
@@ -4287,6 +4319,7 @@ pub const SettingsWindow = struct {
         // or atomically refreshed after a successful save.
         self.status_note = .none;
         try self.adoptCurrentConfig();
+        stamps.mark(.create_config);
 
         if (self.class_atom == 0) {
             const wc: WNDCLASSEXW = .{
@@ -4396,66 +4429,105 @@ pub const SettingsWindow = struct {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        stamps.mark(.create_frame);
 
+        // Each window is created once, in its final form: where Tab reaches
+        // it (z-order is creation order), with its final group, tab stop and
+        // visibility, then given its theme and its font (`finishChild`).
+        // Nothing reorders, restyles, re-themes or re-fonts every window
+        // afterwards, so what the colours, brushes and fonts are comes first.
+        // A `WM_DPICHANGED` from the move above already built the fonts for
+        // the new DPI. Fonts before any child: a text field's frame centres on
+        // their line height.
+        self.theme_adapter.apply(hwnd, self.resolveThemeColors(), .frame);
+        stamps.mark(.create_theme);
+        if (self.ui_font == null or self.ui_font_dpi != self.dpi) {
+            if (self.buildUiFonts()) |replaced| replaced.delete();
+        }
+        stamps.mark(.create_fonts);
+
+        const hinstance = self.handle.hinstance;
         const btn_class = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
-        self.text_header = makeStatic(hwnd, self.handle.hinstance, "Appearance");
-        self.text_summary = makeStatic(hwnd, self.handle.hinstance, Section.appearance.placeholderText());
-        self.text_status = makeStatic(hwnd, self.handle.hinstance, "");
-        self.text_close_prompt = makeStatic(hwnd, self.handle.hinstance, "Save changes before closing?");
-        if (self.text_close_prompt) |text| _ = sys.ShowWindow(text, SW_HIDE);
+        const status_text = switch (self.nextStatus()) {
+            .none => self.idleStatusText(),
+            else => "",
+        };
+        self.text_header = self.finishChild(makeStatic(hwnd, hinstance, self.active_section.headerText(), WS_VISIBLE), self.header_font, .control);
+        self.text_summary = self.finishChild(makeStatic(hwnd, hinstance, self.active_section.placeholderText(), WS_VISIBLE), self.secondary_font, .control);
+        self.text_status = self.finishChild(makeStatic(hwnd, hinstance, status_text, WS_VISIBLE), self.statusFont(), .control);
+        self.text_close_prompt = self.finishChild(makeStatic(hwnd, hinstance, "Save changes before closing?", 0), self.emphasis_font, .control);
 
         // Left-rail section buttons. Clicks arrive via WM_COMMAND on
         // the parent; the id maps back to a `Section` via
         // `Section.fromButtonId`.
-        self.btn_section_appearance = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.appearance);
-        self.btn_section_terminal = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.terminal);
-        self.btn_section_shell = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.shell);
-        self.btn_section_privacy = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.privacy);
-        self.btn_section_updates = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.updates);
-        self.btn_section_keybindings = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.keybindings);
-        self.btn_section_advanced = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.advanced);
+        const selected = self.active_section;
+        self.btn_section_appearance = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .appearance, selected), self.ui_font, .control);
+        self.btn_section_terminal = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .terminal, selected), self.ui_font, .control);
+        self.btn_section_shell = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .shell, selected), self.ui_font, .control);
+        self.btn_section_privacy = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .privacy, selected), self.ui_font, .control);
+        self.btn_section_updates = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .updates, selected), self.ui_font, .control);
+        self.btn_section_keybindings = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .keybindings, selected), self.ui_font, .control);
+        self.btn_section_advanced = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .advanced, selected), self.ui_font, .control);
+        if (self.sectionButton(selected)) |button| _ = sys.SendMessageW(button, BM_SETCHECK, BST_CHECKED, 0);
         self.subclassSectionButtons();
         self.initializeSectionUiaProviders();
+        stamps.mark(.create_rail);
 
         // The form: every field, its label and the help text live in the
         // viewport, after the rail in z-order so Tab goes rail, fields, action
         // bar. WS_EX_CONTROLPARENT lets the dialog manager walk into it.
         // WM_COMMAND and WM_CTLCOLOR* from the fields are forwarded here.
+        // No scroll bar yet: the layout gives it one when the form overflows
+        // (`SetScrollInfo`, `ShowScrollBar`).
         const form = sys.CreateWindowExW(
             WS_EX_CONTROLPARENT,
             viewport_class_name,
             std.unicode.utf8ToUtf16LeStringLiteral(""),
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             0,
             0,
             1,
             1,
             hwnd,
             null,
-            self.handle.hinstance,
+            hinstance,
             self,
         ) orelse {
             const err = windows.kernel32.GetLastError();
             _ = sys.DestroyWindow(hwnd);
             return windows.unexpectedError(err);
         };
-        self.viewport = form;
-        self.text_help = makeStatic(form, self.handle.hinstance, "");
+        // Its scroll bar takes the theme; it draws no text.
+        self.viewport = self.finishChild(form, null, .control);
         // The arrow keys walk a group from window to window and step into the
         // viewport, ignoring a group style on the viewport itself: its first
         // child has to end the rail's group, or Down from the last section
-        // would run on into the labels.
-        if (self.text_help) |help| startGroup(help);
+        // would run on into the labels. The layout shows it on the pages that
+        // have help.
+        var help_buf: [help_text_bytes]u8 = undefined;
+        self.text_help = self.finishChild(makeStatic(form, hinstance, self.helpText(&help_buf), WS_GROUP), self.ui_font, .control);
+        // Each section's rows in the order they are laid out, a label right
+        // before its control. A section's first row, a label and its control,
+        // and a row next to text start an arrow-key group, so the arrows never
+        // run from one section into the next or onto a static row.
+        var previous_text = false;
         inline for (comptime std.enums.values(Section)) |section| {
-            inline for (comptime formItemsForSection(section)) |item| {
+            const visible: u32 = if (section == selected) WS_VISIBLE else 0;
+            inline for (comptime formItemsForSection(section), 0..) |item, index| {
                 const spec = comptime settings_control_specs[item.control_index];
-                if (item.label_index) |i| self.field_labels[i] = makeStatic(form, self.handle.hinstance, spec.label.?);
+                const text = comptime spec.role == .text;
+                var group = formGroupStarts(index, previous_text, text);
+                if (item.label_index) |i| {
+                    self.field_labels[i] = self.finishChild(makeStatic(form, hinstance, spec.label.?, visible | WS_GROUP), self.secondary_font, .control);
+                    if (self.field_labels[i] != null) group = true;
+                }
+                const style: u32 = visible | if (group) WS_GROUP else 0;
                 if (comptime item.control_index < field_model.form_fields.len) {
                     const row = comptime field_model.form_fields[item.control_index];
                     @field(self.fields, spec.binding) = switch (comptime row.kind()) {
-                        .choice => makeCombo(form, self.handle.hinstance, spec.id, settings_combo_popup_height, &field_model.Combo(row.field.?).labels),
-                        .boolean, .blur => makeCheckbox(form, self.handle.hinstance, spec.id, std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?)),
-                        else => makeEdit(form, self.handle.hinstance, spec.id, if (row.kind() == .integer) ES_NUMBER else 0),
+                        .choice => makeCombo(form, hinstance, spec.id, settings_combo_popup_height, &field_model.Combo(row.field.?).labels, style),
+                        .boolean, .blur => makeCheckbox(form, hinstance, spec.id, std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), style),
+                        else => makeEdit(form, hinstance, spec.id, style | if (row.kind() == .integer) ES_NUMBER else 0),
                     };
                     if (@field(self.fields, spec.binding)) |control| {
                         if (row.descriptor.support != .available) _ = sys.EnableWindow(control, 0);
@@ -4463,114 +4535,32 @@ pub const SettingsWindow = struct {
                             _ = sys.SendMessageW(control, 0x1501, 0, @bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(row.descriptor.placeholder)))); // EM_SETCUEBANNER
                     }
                 } else {
-                    @field(self.fields, spec.binding) = makeDisplayControl(form, self.handle.hinstance, spec);
+                    @field(self.fields, spec.binding) = makeDisplayControl(form, hinstance, spec, style);
                 }
+                const font = if (comptime spec.role == .check_box) self.secondary_font else self.ui_font;
+                if (self.finishChild(@field(self.fields, spec.binding), font, if (comptime spec.role == .combo_box) .combo else .control) != null)
+                    previous_text = text;
             }
         }
         self.initializeTextUiaProviders();
+        stamps.mark(.create_form);
 
-        // "Save" button — always visible; writes `pending` to disk
-        // and fires a hard reload. Save errors are logged and the draft
-        // remains in memory for retry.
-        const btn_save_label = std.unicode.utf8ToUtf16LeStringLiteral("Save");
-        self.btn_save = sys.CreateWindowExW(
-            0,
-            btn_class,
-            btn_save_label,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            96,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_SAVE),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_discard_changes = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Discard changes"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            128,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_DISCARD_CHANGES),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_conflict_keep = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Keep mine"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            112,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CONFLICT_KEEP),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_conflict_use_disk = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Use disk"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            112,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CONFLICT_USE_DISK),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_close_save = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Save and close"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            120,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CLOSE_SAVE),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_close_discard = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Discard changes"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            128,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CLOSE_DISCARD),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_close_keep_editing = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Keep editing"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            112,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CLOSE_KEEP_EDITING),
-            self.handle.hinstance,
-            null,
-        );
+        // The action bar, in the order Tab reaches it: the conflict choices
+        // and Discard sit left of Save (never together), and the close
+        // prompt's three replace them all. The first starts the bar's group.
+        // All seven exist from the start: Escape reaches the close path only
+        // through the enabled "Keep editing" button, which owns IDCANCEL.
+        // "Save" writes `pending` to disk and fires a hard reload; save
+        // errors are logged and the draft remains in memory for retry.
+        const discard_label = std.unicode.utf8ToUtf16LeStringLiteral("Discard changes");
+        self.btn_conflict_keep = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Keep mine"), BTN_CONFLICT_KEEP, 112, WS_GROUP), self.ui_font, .control);
+        self.btn_conflict_use_disk = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Use disk"), BTN_CONFLICT_USE_DISK, 112, 0), self.ui_font, .control);
+        self.btn_discard_changes = self.finishChild(makePushButton(hwnd, hinstance, discard_label, BTN_DISCARD_CHANGES, 128, WS_VISIBLE), self.ui_font, .control);
+        self.btn_save = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Save"), BTN_SAVE, 96, WS_VISIBLE), self.ui_font, .control);
+        self.btn_close_save = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Save and close"), BTN_CLOSE_SAVE, 120, 0), self.ui_font, .control);
+        self.btn_close_discard = self.finishChild(makePushButton(hwnd, hinstance, discard_label, BTN_CLOSE_DISCARD, 128, 0), self.ui_font, .control);
+        self.btn_close_keep_editing = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Keep editing"), BTN_CLOSE_KEEP_EDITING, 112, 0), self.ui_font, .control);
+        stamps.mark(.create_actions);
 
         // Painted field labels keep the native dark visual treatment, while
         // MSAA annotations give the existing EDIT/COMBO HWNDs stable names
@@ -4581,19 +4571,22 @@ pub const SettingsWindow = struct {
         // down to whatever procedure is installed when they arrive.
         for (self.comboControls()) |combo| if (combo) |control| subclassKeepingPrevious(control, &settingsComboProc);
         for (self.editControls()) |edit| if (edit) |control| subclassKeepingPrevious(control, &settingsEditProc);
-        self.applyTabOrder();
+        // The stock EDIT answered the frame request at creation; the
+        // subclass owns it now.
+        self.refreshFieldFrames();
+        stamps.mark(.create_annotate);
         // Establish native values before providers cache their initial state.
         self.refreshAllControls();
         self.initializeControlUiaProviders();
-        self.refreshNativeSectionText();
-        self.theme_adapter.apply(hwnd, self.resolveThemeColors());
-        self.recreateUiFont();
+        stamps.mark(.create_refresh);
 
         layoutChildren(self);
-        self.applySectionVisibility();
+        stamps.mark(.create_layout);
         _ = sys.ShowWindow(hwnd, SW_SHOWNORMAL);
+        stamps.mark(.create_show);
         _ = sys.SetForegroundWindow(hwnd);
-        if (self.sectionButton(self.active_section)) |button| _ = sys.SetFocus(button);
+        if (self.sectionButton(selected)) |button| _ = sys.SetFocus(button);
+        stamps.mark(.create_end);
     }
 };
 
@@ -4689,13 +4682,14 @@ fn populateCombo(combo_opt: ?HWND, items: []const []const u8) void {
     }
 }
 
-fn makeStatic(parent: HWND, hinstance: HINSTANCE, text: []const u8) ?HWND {
+/// `style` adds the window's final visibility and group (`WS_VISIBLE`, `WS_GROUP`).
+fn makeStatic(parent: HWND, hinstance: HINSTANCE, text: []const u8, style: u32) ?HWND {
     var text_w: [2048]u16 = undefined;
     return sys.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
         utf8ToW(&text_w, text),
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+        WS_CHILD | SS_LEFT | SS_NOPREFIX | style,
         0,
         0,
         1,
@@ -4772,11 +4766,12 @@ fn createSettingsFont(dpi: u32, logical_height: i32, weight: i32, face: [*:0]con
     );
 }
 
+/// `style` adds the edit styles and the window's final visibility and group.
 fn makeEdit(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
-    extra_style: u32,
+    style: u32,
 ) ?HWND {
     const edit_class = std.unicode.utf8ToUtf16LeStringLiteral("EDIT");
     // No border style: the field draws its own frame (`settingsEditProc`).
@@ -4787,7 +4782,7 @@ fn makeEdit(
         0,
         edit_class,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | extra_style,
+        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | style,
         0,
         0,
         settings_field_max_width,
@@ -4801,18 +4796,20 @@ fn makeEdit(
     return edit;
 }
 
+/// `style` adds the window's final visibility and group.
 fn makeCheckbox(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
     label: LPCWSTR,
+    style: u32,
 ) ?HWND {
     const btn_class = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
     return sys.CreateWindowExW(
         0,
         btn_class,
         label,
-        WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+        WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX | style,
         0,
         0,
         settings_field_max_width,
@@ -4824,19 +4821,21 @@ fn makeCheckbox(
     );
 }
 
+/// `style` adds the window's final visibility and group.
 fn makeCombo(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
     height: i32,
     items: []const []const u8,
+    style: u32,
 ) ?HWND {
     const combo_class = std.unicode.utf8ToUtf16LeStringLiteral("COMBOBOX");
     const combo = sys.CreateWindowExW(
         0,
         combo_class,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS | style,
         0,
         0,
         settings_field_max_width,
@@ -4850,11 +4849,33 @@ fn makeCombo(
     return combo;
 }
 
+/// `style` adds the window's final visibility and group.
+fn makePushButton(parent: HWND, hinstance: HINSTANCE, label: LPCWSTR, id: usize, width: i32, style: u32) ?HWND {
+    return sys.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        label,
+        WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON | style,
+        0,
+        0,
+        width,
+        32,
+        parent,
+        @ptrFromInt(id),
+        hinstance,
+        null,
+    );
+}
+
+/// The rail is one arrow-key group, which the first button starts, and the
+/// selected section's button is its tab stop (`applySectionVisibility` moves
+/// it on a switch).
 fn makeSectionButton(
     parent: HWND,
     hinstance: HINSTANCE,
     class: LPCWSTR,
     section: Section,
+    selected: Section,
 ) ?HWND {
     const id: usize = switch (section) {
         .appearance => BTN_SECTION_APPEARANCE,
@@ -4865,12 +4886,13 @@ fn makeSectionButton(
         .keybindings => BTN_SECTION_KEYBINDINGS,
         .advanced => BTN_SECTION_ADVANCED,
     };
-    const group_style: u32 = if (section == .appearance) WS_GROUP | WS_TABSTOP else 0;
+    const group_style: u32 = if (section == .appearance) WS_GROUP else 0;
+    const tab_style: u32 = if (section == selected) WS_TABSTOP else 0;
     return sys.CreateWindowExW(
         0,
         class,
         section.label(),
-        WS_CHILD | WS_VISIBLE | group_style | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
+        WS_CHILD | WS_VISIBLE | group_style | tab_style | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
         0,
         0,
         100,
@@ -5599,6 +5621,116 @@ test "settings initial native theme does not reenter font and layout work" {
             _ = sys.SendMessageW(fixture.hwnd(), WM_THEMECHANGED, 0, 0);
             try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
             try std.testing.expectEqualDeep(fonts, .{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font });
+        }
+    }.body);
+}
+
+test "settings open stamps each creation step once when traced" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const stamps = &settings.creation_stamps;
+            stamps.enabled = true;
+            try settings.open();
+            const all = comptime std.meta.tags(bench_trace.SettingsCreationStage);
+            try std.testing.expectEqual(all.len, stamps.len);
+            try std.testing.expectEqual(bench_trace.SettingsCreationStage.create_begin, stamps.stages[0]);
+            try std.testing.expectEqual(bench_trace.SettingsCreationStage.create_end, stamps.stages[stamps.len - 1]);
+            for (all) |stage| try std.testing.expectEqual(@as(usize, 1), std.mem.count(bench_trace.SettingsCreationStage, stamps.stages[0..stamps.len], &.{stage}));
+            for (stamps.counters[1..stamps.len], stamps.counters[0 .. stamps.len - 1]) |later, earlier| try std.testing.expect(later >= earlier);
+
+            // Raising the open window is not a creation, and keeps none of the
+            // creation's stamps; a disabled trace takes nothing.
+            try settings.open();
+            try std.testing.expectEqual(@as(usize, 0), stamps.len);
+            settings.closeNow(fixture.hwnd());
+            stamps.enabled = false;
+            try settings.open();
+            try std.testing.expectEqual(@as(usize, 0), stamps.len);
+        }
+    }.body);
+}
+
+test "settings open creates each window once in its final form" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const Work = dialog_test.OpenWork;
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try Work.measure(settings);
+            try std.testing.expect(!Work.overflowed);
+            const tree = Work.Tree.of(fixture.hwnd());
+            var totals: Work.Counts = .{ .hwnd = fixture.hwnd() };
+            for (tree.slice()) |hwnd| {
+                const counts = Work.of(hwnd);
+                totals.themes += counts.themes;
+                totals.messages += counts.messages;
+            }
+            errdefer {
+                std.debug.print("settings open: {d} windows, {d} messages to them\n", .{ tree.len, totals.messages });
+                Work.print(&tree);
+            }
+            // The frame, its 19 children (one is the viewport) and the
+            // viewport's 52.
+            try std.testing.expectEqual(@as(usize, 72), tree.len);
+            for (tree.slice()) |hwnd| {
+                const counts = Work.of(hwnd);
+                try std.testing.expectEqual(@as(u16, 1), counts.created);
+                if (hwnd == fixture.hwnd()) continue;
+                // Created where Tab reaches it, with its final group, tab stop
+                // and visibility: nothing is moved, restyled or hidden again.
+                try std.testing.expectEqual(@as(u16, 0), counts.z_moves);
+                try std.testing.expectEqual(@as(u16, 0), counts.style_rewrites);
+                try std.testing.expectEqual(@as(u16, 0), counts.hidden);
+                try std.testing.expect(counts.shown <= 1);
+                // One font each; the viewport draws no text.
+                try std.testing.expectEqual(@as(u16, if (hwnd == settings.viewport.?) 0 else 1), counts.fonts);
+                // One theme each, when the theme service sends anything at all.
+                if (totals.themes != 0) try std.testing.expectEqual(@as(u16, 1), counts.themes);
+                // A text field asks for its frame once, after its subclass.
+                try std.testing.expectEqual(@as(u16, @intFromBool(settings.isEditControl(hwnd))), counts.frame_changes);
+            }
+            // The fonts are built once, before any child, and the theme
+            // notifications the children send back rebuild nothing.
+            try std.testing.expectEqual(@as(u32, 1), settings.font_builds);
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+        }
+    }.body);
+}
+
+test "settings open on any section ends as a switch to it would leave it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            // The section survives a close, so Settings can open on any of
+            // them, and `open` alone decides each window's visibility, tab
+            // stop, check, text and font there. The paths a switch and a DPI
+            // change take must find nothing to change.
+            for (std.enums.values(Section)) |section| {
+                settings.active_section = section;
+                try settings.open();
+                const opened = State.of(settings);
+                const help = section == .keybindings or section == .advanced;
+                try std.testing.expectEqual(help, settings.help_shown);
+                try std.testing.expectEqual(help, State.styleOf(settings.text_help.?) & WS_VISIBLE != 0);
+                try std.testing.expectEqual(help, sys.GetWindowTextLengthW(settings.text_help.?) > 0);
+                settings.setActiveSection(section);
+                settings.recreateUiFont();
+                const switched = State.of(settings);
+                errdefer std.debug.print("settings opened on {s}\n", .{@tagName(section)});
+                try std.testing.expectEqual(opened.len, switched.len);
+                for (opened.slice(), switched.slice()) |at_open, after_switch| {
+                    errdefer State.print(at_open, after_switch);
+                    try std.testing.expectEqualDeep(at_open, after_switch);
+                }
+                settings.closeNow(fixture.hwnd());
+            }
         }
     }.body);
 }
@@ -7700,6 +7832,14 @@ const dialog_test = struct {
         }
 
         fn startWith(custom_uia: bool) !*Fixture {
+            const self = try prepare(custom_uia);
+            errdefer self.finish();
+            try self.settings.open();
+            return self;
+        }
+
+        /// The fixture with its window not opened yet.
+        fn prepare(custom_uia: bool) !*Fixture {
             const self = try std.testing.allocator.create(Fixture);
             errdefer std.testing.allocator.destroy(self);
             self.* = .{
@@ -7725,7 +7865,6 @@ const dialog_test = struct {
                 .onClosed = &onClosed,
             });
             self.settings.wheel_lines_override = 3;
-            try self.settings.open();
             return self;
         }
 
@@ -7817,6 +7956,216 @@ const dialog_test = struct {
             const height = @min(self.settings.px(520), work.bottom - work.top);
             _ = SetWindowPos(self.hwnd(), null, work.left, work.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
             try std.testing.expect(self.settings.content_scroll_max > 0);
+        }
+    };
+    /// What one `open` does to each window, counted from the messages user32
+    /// delivers on this thread (thread-local `WH_CBT` and `WH_CALLWNDPROC`
+    /// hooks): what each window was actually sent, not what the code meant to
+    /// send. `SetWindowTheme` shows as the `WM_THEMECHANGED` it sends.
+    const OpenWork = struct {
+        const WH_CALLWNDPROC: c_int = 4;
+        const WH_CBT: c_int = 5;
+        const HCBT_CREATEWND: c_int = 3;
+        const WM_SHOWWINDOW: UINT = 0x0018;
+        const WM_STYLECHANGING: UINT = 0x007C;
+        const WM_WINDOWPOSCHANGING: UINT = 0x0046;
+        const HookProc = *const fn (c_int, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+        const CWPSTRUCT = extern struct { lParam: LPARAM, wParam: WPARAM, message: UINT, hwnd: HWND };
+        extern "user32" fn SetWindowsHookExW(id: c_int, proc: HookProc, module: ?HINSTANCE, thread: u32) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn UnhookWindowsHookEx(hook: *anyopaque) callconv(.winapi) BOOL;
+        extern "user32" fn CallNextHookEx(hook: ?*anyopaque, code: c_int, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
+
+        const Counts = struct {
+            hwnd: HWND,
+            created: u16 = 0,
+            fonts: u16 = 0,
+            themes: u16 = 0,
+            shown: u16 = 0,
+            hidden: u16 = 0,
+            z_moves: u16 = 0,
+            style_rewrites: u16 = 0,
+            frame_changes: u16 = 0,
+            messages: u32 = 0,
+        };
+
+        // The hooks run on the test's own thread, one at a time.
+        var seen: [256]Counts = undefined;
+        var seen_len: usize = 0;
+        var overflowed = false;
+
+        fn at(hwnd: HWND) ?*Counts {
+            for (seen[0..seen_len]) |*counts| if (counts.hwnd == hwnd) return counts;
+            if (seen_len == seen.len) {
+                overflowed = true;
+                return null;
+            }
+            seen[seen_len] = .{ .hwnd = hwnd };
+            seen_len += 1;
+            return &seen[seen_len - 1];
+        }
+
+        fn of(hwnd: HWND) Counts {
+            for (seen[0..seen_len]) |counts| if (counts.hwnd == hwnd) return counts;
+            return .{ .hwnd = hwnd };
+        }
+
+        fn cbt(code: c_int, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+            if (code == HCBT_CREATEWND) if (at(@ptrFromInt(wParam))) |counts| {
+                counts.created += 1;
+            };
+            return CallNextHookEx(null, code, wParam, lParam);
+        }
+
+        fn sent(code: c_int, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+            if (code >= 0) {
+                const message: *const CWPSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (at(message.hwnd)) |counts| {
+                    counts.messages += 1;
+                    switch (message.message) {
+                        WM_SETFONT => counts.fonts += 1,
+                        WM_THEMECHANGED => counts.themes += 1,
+                        WM_SHOWWINDOW => if (message.wParam != 0) {
+                            counts.shown += 1;
+                        } else {
+                            counts.hidden += 1;
+                        },
+                        WM_STYLECHANGING => if (message.wParam == @as(WPARAM, @bitCast(@as(isize, GWL_STYLE)))) {
+                            counts.style_rewrites += 1;
+                        },
+                        WM_WINDOWPOSCHANGING => {
+                            const pos: *const sys.WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(message.lParam)));
+                            if (pos.flags & SWP_NOZORDER == 0) counts.z_moves += 1;
+                            if (pos.flags & SWP_FRAMECHANGED != 0) counts.frame_changes += 1;
+                        },
+                        else => {},
+                    }
+                }
+            }
+            return CallNextHookEx(null, code, wParam, lParam);
+        }
+
+        /// Open `settings` with the hooks installed.
+        fn measure(settings: *SettingsWindow) !void {
+            seen_len = 0;
+            overflowed = false;
+            const thread = sys.GetCurrentThreadId();
+            const creation_hook = SetWindowsHookExW(WH_CBT, &cbt, null, thread) orelse return error.HookUnavailable;
+            defer _ = UnhookWindowsHookEx(creation_hook);
+            const message_hook = SetWindowsHookExW(WH_CALLWNDPROC, &sent, null, thread) orelse return error.HookUnavailable;
+            defer _ = UnhookWindowsHookEx(message_hook);
+            try settings.open();
+        }
+
+        /// The window's tree: the window itself first, then its descendants.
+        const Tree = struct {
+            windows: [128]HWND = undefined,
+            len: usize = 0,
+
+            fn of(root: HWND) Tree {
+                var tree: Tree = .{};
+                tree.windows[0] = root;
+                tree.len = 1;
+                _ = sys.EnumChildWindows(root, collect, @bitCast(@intFromPtr(&tree)));
+                return tree;
+            }
+
+            fn collect(child: HWND, data: LPARAM) callconv(.winapi) BOOL {
+                const tree: *Tree = @ptrFromInt(@as(usize, @bitCast(data)));
+                if (tree.len == tree.windows.len) return 0;
+                tree.windows[tree.len] = child;
+                tree.len += 1;
+                return 1;
+            }
+
+            fn slice(self: *const Tree) []const HWND {
+                return self.windows[0..self.len];
+            }
+        };
+
+        fn print(tree: *const Tree) void {
+            for (tree.slice()) |hwnd| {
+                const counts = of(hwnd);
+                var class_w: [64]u16 = undefined;
+                const length = GetClassNameW(hwnd, &class_w, class_w.len);
+                std.debug.print("  {f} id={d} created={d} fonts={d} themes={d} shown={d} hidden={d} z={d} style={d} frame={d} messages={d}\n", .{
+                    std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
+                    sys.GetDlgCtrlID(hwnd),
+                    counts.created,
+                    counts.fonts,
+                    counts.themes,
+                    counts.shown,
+                    counts.hidden,
+                    counts.z_moves,
+                    counts.style_rewrites,
+                    counts.frame_changes,
+                    counts.messages,
+                });
+            }
+        }
+    };
+
+    /// What each window of an open Settings window shows and how the keyboard
+    /// reaches it: the state `open` decides at creation and a section switch
+    /// or a DPI change decides again (`setActiveSection`, `recreateUiFont`).
+    /// A font is recorded by its role, since a rebuild makes new handles.
+    /// Neither path writes `WS_GROUP` or `WS_DISABLED`, so for those bits
+    /// the comparison shows only that nothing changed them; "settings
+    /// arrow-key groups stop at the rail and the action bar" pins the groups.
+    const OpenState = struct {
+        const WS_DISABLED: u32 = 0x08000000;
+        const kept_styles = WS_VISIBLE | WS_TABSTOP | WS_GROUP | WS_DISABLED | WS_VSCROLL;
+        const Font = enum { none, ui, secondary, emphasis, header, other };
+
+        const Window = struct {
+            hwnd: HWND,
+            id: c_int,
+            style: u32,
+            rect: RECT,
+            check: usize,
+            text: u64,
+            font: Font,
+        };
+
+        windows: [128]Window = undefined,
+        len: usize = 0,
+
+        fn styleOf(hwnd: HWND) u32 {
+            return @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, GWL_STYLE))));
+        }
+
+        fn of(settings: *const SettingsWindow) OpenState {
+            const tree = OpenWork.Tree.of(settings.hwnd.?);
+            var state: OpenState = .{};
+            for (tree.slice()) |hwnd| {
+                var rect: RECT = undefined;
+                _ = GetWindowRect(hwnd, &rect);
+                var class_w: [16]u16 = undefined;
+                const class_len = GetClassNameW(hwnd, &class_w, class_w.len);
+                const button = std.mem.eql(u16, class_w[0..@intCast(@max(0, class_len))], std.unicode.utf8ToUtf16LeStringLiteral("Button"));
+                var text_w: [2048]u16 = undefined;
+                const text_len = sys.GetWindowTextW(hwnd, &text_w, text_w.len);
+                const font: HGDIOBJ = @ptrFromInt(@as(usize, @bitCast(sys.SendMessageW(hwnd, WM_GETFONT, 0, 0))));
+                state.windows[state.len] = .{
+                    .hwnd = hwnd,
+                    .id = sys.GetDlgCtrlID(hwnd),
+                    .style = styleOf(hwnd) & kept_styles,
+                    .rect = rect,
+                    .check = if (button) @bitCast(sys.SendMessageW(hwnd, BM_GETCHECK, 0, 0)) else 0,
+                    .text = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(text_w[0..@intCast(@max(0, text_len))])),
+                    .font = if (font == null) .none else if (font == settings.ui_font) .ui else if (font == settings.secondary_font) .secondary else if (font == settings.emphasis_font) .emphasis else if (font == settings.header_font) .header else .other,
+                };
+                state.len += 1;
+            }
+            return state;
+        }
+
+        fn slice(self: *const OpenState) []const Window {
+            return self.windows[0..self.len];
+        }
+
+        fn print(at_open: Window, after_switch: Window) void {
+            std.debug.print("  id={d} at open: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) text={x}\n", .{ at_open.id, at_open.style, at_open.check, @tagName(at_open.font), at_open.rect.left, at_open.rect.top, at_open.rect.right, at_open.rect.bottom, at_open.text });
+            std.debug.print("  id={d} switched: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) text={x}\n", .{ after_switch.id, after_switch.style, after_switch.check, @tagName(after_switch.font), after_switch.rect.left, after_switch.rect.top, after_switch.rect.right, after_switch.rect.bottom, after_switch.text });
         }
     };
 };
@@ -8149,13 +8498,67 @@ test "settings arrow-key groups stop at the rail and the action bar" {
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
+            const viewport = settings.viewport.?;
+            const VK_UP: u32 = 0x26;
+            const VK_DOWN: u32 = 0x28;
+            const DLGC_WANTARROWS: LRESULT = 0x0001;
+            const rail = struct {
+                fn has(window: *const SettingsWindow, control: HWND) bool {
+                    for (std.enums.values(Section)) |section| {
+                        if (window.sectionButton(section).? == control) return true;
+                    }
+                    return false;
+                }
+            }.has;
 
             // Down from the last rail button wraps to the first, rather than
-            // running on into the fields.
+            // running on into the fields, and no rail button's group reaches
+            // past the rail. (The dialog manager clicks the rail's radio
+            // buttons as it moves, so the rail is read rather than walked.)
             try std.testing.expectEqual(
                 settings.btn_section_appearance.?,
                 dialog_test.GetNextDlgGroupItem(hwnd, settings.btn_section_advanced.?, 0).?,
             );
+            for (std.enums.values(Section)) |section| for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                try std.testing.expect(rail(settings, dialog_test.GetNextDlgGroupItem(hwnd, settings.sectionButton(section).?, previous).?));
+            };
+
+            // A pending change shows and enables Discard changes and Save.
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
+            const actions = [_]HWND{ settings.btn_discard_changes.?, settings.btn_save.? };
+            for (actions) |button| try std.testing.expect(sys.IsWindowVisible(button) != 0 and sys.IsWindowEnabled(button) != 0);
+
+            // Down and Up as the App pump hands them to the dialog manager:
+            // from a form control that leaves the arrows to it (a check box,
+            // a push button) focus stays in the form, and from the action bar
+            // it never reaches the form or the rail. Both sides rest on the
+            // group the bar's first button starts at creation; the last
+            // control on Advanced is a push button that is a group of its own.
+            for (std.enums.values(Section)) |section| {
+                settings.setActiveSection(section);
+                errdefer std.debug.print("settings arrows on {s}\n", .{@tagName(section)});
+                // The pump moves focus at all: Down goes from Discard to Save.
+                _ = sys.SetFocus(actions[0]);
+                try std.testing.expect(fixture.pumpKey(VK_DOWN));
+                try std.testing.expectEqual(actions[1], sys.GetFocus().?);
+                for (settings.formItems()) |item| {
+                    const control = settings.controlHwnd(item.control_index).?;
+                    if (sys.IsWindowVisible(control) == 0 or sys.IsWindowEnabled(control) == 0) continue;
+                    if (SendMessageW(control, WM_GETDLGCODE, 0, 0) & DLGC_WANTARROWS != 0) continue;
+                    for ([_]u32{ VK_DOWN, VK_UP }) |key| {
+                        _ = sys.SetFocus(control);
+                        try std.testing.expect(fixture.pumpKey(key));
+                        try std.testing.expect(IsChild(viewport, sys.GetFocus().?) != 0);
+                    }
+                }
+                for (actions) |button| for ([_]u32{ VK_DOWN, VK_UP }) |key| {
+                    _ = sys.SetFocus(button);
+                    try std.testing.expect(fixture.pumpKey(key));
+                    const focus = sys.GetFocus().?;
+                    try std.testing.expect(IsChild(viewport, focus) == 0 and !rail(settings, focus));
+                };
+            }
         }
     }.body);
 }
@@ -8211,17 +8614,26 @@ test "settings display-only text row needs no persistence adapter" {
                 .accessible_name = "Read-only information",
             } });
             comptime std.debug.assert(!@hasField(@TypeOf(field_adapters), spec.binding));
-            const control = makeDisplayControl(fixture.settings.viewport.?, fixture.settings.handle.hinstance, spec).?;
-            defer _ = sys.DestroyWindow(control);
-            // Insert the descriptor-only row in a real checkbox run and use
-            // the same grouping helper as generated rows on either side.
+            // Insert the descriptor-only row in a real checkbox run, grouped
+            // by the same rule as generated rows on either side: created with
+            // the group its position gives it, and the row after it starting
+            // one because it follows text.
             fixture.settings.setActiveSection(.privacy);
             const before = fixture.settings.fields.chk_app_notify_clipboard.?;
             const after = fixture.settings.fields.chk_app_notify_config.?;
-            orderFormControl(before, null, formGroupStarts(5, false, false));
-            orderFormControl(control, null, formGroupStarts(6, false, true));
-            orderFormControl(after, null, formGroupStarts(7, true, false));
-            _ = sys.ShowWindow(control, SW_SHOWNORMAL);
+            const group = struct {
+                fn style(starts: bool) u32 {
+                    return if (starts) WS_GROUP else 0;
+                }
+            }.style;
+            try std.testing.expectEqual(@as(u32, 0), group(formGroupStarts(5, false, false)));
+            const control = makeDisplayControl(fixture.settings.viewport.?, fixture.settings.handle.hinstance, spec, WS_VISIBLE | group(formGroupStarts(6, false, true))).?;
+            defer _ = sys.DestroyWindow(control);
+            const keep_size = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            _ = SetWindowPos(control, before, 0, 0, 0, 0, keep_size);
+            _ = SetWindowPos(after, control, 0, 0, 0, 0, keep_size);
+            const after_style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(after, GWL_STYLE))));
+            _ = sys.SetWindowLongPtrW(after, GWL_STYLE, @intCast(after_style | group(formGroupStarts(7, true, false))));
             for ([_]HWND{ before, after }) |checkbox| {
                 for ([_]windows.BOOL{ 0, 1 }) |previous| {
                     try std.testing.expect(dialog_test.GetNextDlgGroupItem(fixture.hwnd(), checkbox, previous).? != control);
@@ -9922,21 +10334,6 @@ fn formGroupStarts(index: usize, previous_text: bool, text: bool) bool {
     return index == 0 or previous_text or text;
 }
 
-fn orderFormControl(control: HWND, label: ?HWND, boundary: bool) void {
-    if (label) |text| {
-        sendToBottom(text);
-        startGroup(text);
-        startGroup(control);
-    }
-    sendToBottom(control);
-    if (boundary) startGroup(control);
-}
-
-fn startGroup(control: HWND) void {
-    const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
-    if (style & WS_GROUP == 0) _ = sys.SetWindowLongPtrW(control, GWL_STYLE, @intCast(style | WS_GROUP));
-}
-
 /// Show or hide a child window, leaving one already in that state alone. The
 /// style bit is read rather than `IsWindowVisible`, which is false for every
 /// child until the window itself is shown.
@@ -9944,12 +10341,6 @@ fn setChildShown(control: HWND, shown: bool) void {
     const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
     if ((style & WS_VISIBLE != 0) == shown) return;
     _ = ShowWindow(control, if (shown) SW_SHOWNORMAL else SW_HIDE);
-}
-
-fn sendToBottom(control: HWND) void {
-    const hwnd_bottom: ?*anyopaque = @ptrFromInt(1);
-    const flags: UINT = 0x0002 | 0x0001 | SWP_NOACTIVATE | SWP_NOREDRAW; // SWP_NOMOVE | SWP_NOSIZE
-    _ = sys.SetWindowPos(control, hwnd_bottom, 0, 0, 0, 0, flags);
 }
 
 test "settings wheel carries sub-pixel movement between messages" {

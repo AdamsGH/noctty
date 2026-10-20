@@ -1,6 +1,13 @@
 # Task-file helpers for Settings harnesses. No process, window or input access.
 Set-StrictMode -Version Latest
 
+# `bench_trace.SettingsOpenStage` and `bench_trace.SettingsCreationStage`.
+$script:SettingsOutcomeStages = @('f9_keydown','f9_before_core_initialized','open_config_action',
+    'settings_open_enter','settings_open_ok','settings_open_error')
+$script:SettingsCreationStages = @('create_begin','create_config','create_frame','create_theme','create_fonts',
+    'create_rail','create_form','create_actions','create_annotate','create_refresh','create_layout',
+    'create_show','create_end')
+
 function Write-SettingsOpenReceipt {
     param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][AllowNull()] $Value)
     # The caller owns a NEW output directory and is its sole writer.
@@ -133,14 +140,24 @@ function ConvertFrom-SettingsOpenTrace {
         try {
             $row = ConvertFrom-Json -InputObject $line -ErrorAction Stop
             [uint64]$tick = 0
-            if ([Text.Encoding]::UTF8.GetByteCount($line) -gt 128 -or @($row.PSObject.Properties).Count -ne 2 -or
+            [uint64]$qpc = 0
+            $names = @($row.PSObject.Properties.Name)
+            # Outcome records carry the tick; the window's creation steps, written
+            # after the open returns, add the performance counter in microseconds.
+            $creation = $names.Count -eq 3 -and $row.stage -in $script:SettingsCreationStages
+            if ([Text.Encoding]::UTF8.GetByteCount($line) -gt 128 -or
                 -not [uint64]::TryParse([string]$row.tick_ms, [ref]$tick) -or
-                $row.stage -notin 'f9_keydown','f9_before_core_initialized','open_config_action',
-                    'settings_open_enter','settings_open_ok','settings_open_error') { throw 'trace-schema-invalid' }
+                $(if ($creation) {
+                    ($names -join ',') -cne 'tick_ms,stage,qpc_us' -or -not [uint64]::TryParse([string]$row.qpc_us, [ref]$qpc)
+                } else {
+                    $names.Count -ne 2 -or $row.stage -notin $script:SettingsOutcomeStages
+                })) { throw 'trace-schema-invalid' }
             $tag = [string]$row.stage
             if (-not $summary.tags.ContainsKey($tag)) { $summary.tags[$tag] = 0 }
             $summary.tags[$tag]++
-            $summary.records.Add([ordered]@{ stage = $tag; tick_ms = $tick })
+            $record = [ordered]@{ stage = $tag; tick_ms = $tick }
+            if ($creation) { $record.qpc_us = $qpc }
+            $summary.records.Add($record)
         } catch { $summary.invalidRows++ }
     }
     return $summary
@@ -157,6 +174,19 @@ function Test-SettingsOpenTraceParser {
         $result = ConvertFrom-SettingsOpenTrace -Text ('{"tick_ms":42,"stage":"' + $tag + '"}' + "`n")
         if ($result.invalidRows -ne 0 -or $result.records.Count -ne 1 -or
             $result.records[0].stage -cne $tag -or $result.records[0].tick_ms -ne 42) { throw "Trace tag regression: $tag" }
+        $checks++
+    }
+    foreach ($tag in $script:SettingsCreationStages) {
+        $result = ConvertFrom-SettingsOpenTrace -Text ('{"tick_ms":42,"stage":"' + $tag + '","qpc_us":1234567}' + "`n")
+        if ($result.invalidRows -ne 0 -or $result.records.Count -ne 1 -or $result.records[0].stage -cne $tag -or
+            $result.records[0].tick_ms -ne 42 -or $result.records[0].qpc_us -ne 1234567) { throw "Creation tag regression: $tag" }
+        $checks++
+    }
+    foreach ($invalid in @('{"tick_ms":1,"stage":"create_form"}', '{"tick_ms":1,"stage":"settings_open_ok","qpc_us":5}',
+        '{"tick_ms":1,"stage":"create_form","qpc_us":-5}', '{"tick_ms":1,"stage":"create_form","pid":5}',
+        '{"qpc_us":5,"tick_ms":1,"stage":"create_form"}')) {
+        $result = ConvertFrom-SettingsOpenTrace -Text ($invalid + "`n")
+        if ($result.invalidRows -ne 1 -or $result.records.Count -ne 0) { throw "Invalid creation row accepted: $invalid" }
         $checks++
     }
     $committed = '{"tick_ms":1,"stage":"open_config_action"}' + "`n"

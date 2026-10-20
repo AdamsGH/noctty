@@ -10966,6 +10966,15 @@ pub const App = struct {
         // Skipping the fallback would regress CI / sandboxed flows
         // that previously worked.
         self.settings_open_trace.note(.settings_open_enter);
+        // The window's own steps, timed in memory and written after the
+        // outcome so no file write lands inside the work being timed. They
+        // are taken only while this runs: the trace covers this route alone.
+        const stamps = &self.settings_window.creation_stamps;
+        stamps.enabled = self.settings_open_trace.enabled();
+        defer {
+            self.settings_open_trace.noteCreation(stamps);
+            stamps.enabled = false;
+        }
         self.settings_window.open() catch |err| {
             self.settings_open_trace.note(.settings_open_error);
             std.log.warn("settings window unavailable (err={}); falling back to editor", .{err});
@@ -11440,6 +11449,69 @@ pub const App = struct {
                 const actual = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, text[0..@intCast(len)]);
                 defer std.testing.allocator.free(actual);
                 try std.testing.expectEqualStrings(@import("../os/windows_text_editor.zig").failure_message, actual);
+            }
+        }.body);
+    }
+
+    test "SET open_config writes creation steps only for the window it created" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnHiddenDesktop(struct {
+            fn body() !void {
+                var core_app: CoreApp = undefined;
+                var app: App = undefined;
+                var session: TestSession = .{};
+                try session.init(.{ .core_app = &core_app, .app = &app });
+                defer session.deinit();
+                app.initComApartment();
+                if (!app.com_initialized) return error.SkipZigTest;
+                defer sys.OleUninitialize();
+                app.settings_window.handle.deferUiaDisconnect = null;
+                const settings_class = comptime std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings");
+                const viewport_class = comptime std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings.viewport");
+                defer {
+                    app.settings_window.deinit();
+                    _ = sys.UnregisterClassW(settings_class, app.settings_window.handle.hinstance);
+                    _ = sys.UnregisterClassW(viewport_class, app.settings_window.handle.hinstance);
+                }
+                var tmp = std.testing.tmpDir(.{});
+                defer tmp.cleanup();
+                try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 12\n" });
+                const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.ghostty");
+                defer std.testing.allocator.free(path);
+                app.cli_config_override_path = path;
+                defer app.cli_config_override_path = null;
+                const Hook = struct {
+                    var calls: usize = 0;
+                    fn open(_: *App, _: []const u8) !void {
+                        calls += 1;
+                    }
+                };
+                Hook.calls = 0;
+                app.test_open_target = &Hook.open;
+                const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+                defer std.testing.allocator.free(dir);
+                const trace_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "settings-open.jsonl" });
+                defer std.testing.allocator.free(trace_path);
+                app.settings_open_trace = .{ .file = try std.fs.createFileAbsolute(trace_path, .{ .exclusive = true }) };
+                defer app.settings_open_trace.deinit();
+
+                // open_config creates the window and writes its steps.
+                try app.openConfig();
+                try std.testing.expect(!app.settings_window.creation_stamps.enabled);
+                _ = sys.DestroyWindow(app.settings_window.hwnd.?);
+                // The palette's Settings rows create it without the trace.
+                try app.settings_window.openField(.font_size);
+                try std.testing.expectEqual(@as(usize, 0), app.settings_window.creation_stamps.len);
+                // open_config only raises it now: no creation steps follow.
+                try app.openConfig();
+                try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+
+                const data = try tmp.dir.readFileAlloc(std.testing.allocator, "settings-open.jsonl", 64 * 1024);
+                defer std.testing.allocator.free(data);
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data, "\"stage\":\"settings_open_ok\""));
+                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, data, "\"stage\":\"create_begin\""));
+                const raise = std.mem.lastIndexOf(u8, data, "\"stage\":\"settings_open_enter\"").?;
+                try std.testing.expect(std.mem.indexOf(u8, data[raise..], "\"stage\":\"create_") == null);
             }
         }.body);
     }
