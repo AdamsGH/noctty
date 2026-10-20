@@ -104,6 +104,7 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
     if ($Streaming) { $config[-1] += ' -Stream' }
     if ($HoldSync) { $config[-1] += ' -HoldSync' }
     if ($SplitDim) {
+        $config[-1] += ' -HideCursor'
         $config += 'unfocused-split-opacity=' + $SplitOpacity.ToString([Globalization.CultureInfo]::InvariantCulture)
         if ($SplitFill) { $config += 'unfocused-split-fill=#' + $SplitFill }
     }
@@ -335,8 +336,8 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             # Both panes run the fixture; the split's new pane, on the right,
             # takes focus. The dim is the fill blended at 1 - opacity in sRGB
             # space, so each dimmed capture must equal its undimmed capture
-            # blended that way, except in the cursor cell, whose shape follows
-            # keyboard focus.
+            # blended that way, every pixel within two levels. The fixture
+            # hides the cursor here: its shape follows keyboard focus.
             $fillHex = if ($SplitFill) { $SplitFill } else { '101010' } # the fixture's background
             $fill = @(0, 2, 4 | ForEach-Object { [Convert]::ToInt32($fillHex.Substring($_, 2), 16) })
             $alpha = [int][Math]::Round((1 - $SplitOpacity) * 255, [MidpointRounding]::AwayFromZero)
@@ -345,7 +346,7 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
                 param($Dimmed, $Undimmed, $What, [int]$Alpha = $alpha)
                 $check = [RendererNative]::BlendCheck($Dimmed.path, $Undimmed.path, $fill[0], $fill[1], $fill[2], $Alpha, 2) | ConvertFrom-Json
                 if ($Alpha -gt 0 -and $check.changed -lt 1000) { throw "${What}: the dim changed only $($check.changed) pixels." }
-                if ($check.mismatches -gt 0 -and ($check.bboxWidth -gt 64 -or $check.bboxHeight -gt 64)) { throw "${What}: $($check.mismatches) pixels in a $($check.bboxWidth)x$($check.bboxHeight) box are not the fill blended in sRGB space." }
+                if ($check.mismatches -gt 0) { throw "${What}: $($check.mismatches) pixels in a $($check.bboxWidth)x$($check.bboxHeight) box are not the fill blended in sRGB space." }
                 return $check
             }
             # The dim state reaches the renderer through its mailbox; poll

@@ -1,4 +1,4 @@
-param([switch]$Stream, [switch]$HoldSync, [int]$IntervalMs=10)
+param([switch]$Stream, [switch]$HoldSync, [switch]$HideCursor, [int]$IntervalMs=10)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $e=[char]27
@@ -21,6 +21,9 @@ foreach($line in $lines) { [Console]::Write($line+"`r`n") }
 # The existing parsed-grid benchmark hook observes the beginning of the top row.
 # Write its token only after the complete fixture, then restore the steady cursor.
 [Console]::Write("$e[1;1HRENDERER_FIXTURE_READY: D3D11 beta parity, shared terminal core$e[K$e[14;1H")
+# The split-dim cases compare a pane with itself across focus changes, and
+# the cursor's shape follows keyboard focus.
+if ($HideCursor) { [Console]::Write("$e[?25l") }
 if ($env:NOCTTY_RENDERER_TEST_KITTY -eq '1') { [Console]::Write("$e`_Ga=T,f=24,s=1,v=1,c=1,r=1,i=1; /wAA$e\".Replace('; ', ';')) }; if ($env:NOCTTY_RENDERER_READY_PATH) { [IO.File]::WriteAllText($env:NOCTTY_RENDERER_READY_PATH,'fixture-written') }; if ($Stream) {
  Start-Sleep -Seconds 2
  $clock=[Diagnostics.Stopwatch]::StartNew()

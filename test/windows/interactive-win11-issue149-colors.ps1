@@ -130,6 +130,9 @@ function Write-Issue149Config(
     $lines.Add('window-width = 90')
     $lines.Add('window-height = 24')
     $lines.Add('background-opacity = 1')
+    # The new-split phase reads both panes for the exact configured colors;
+    # the default dim of the pane that loses focus would blend them.
+    $lines.Add('unfocused-split-opacity = 1')
     if ($Case -ne 'default') { $lines.Add('theme = Cobalt2') }
     if ($Case -eq 'explicit') {
         # These follow the theme on purpose: explicit values must win.

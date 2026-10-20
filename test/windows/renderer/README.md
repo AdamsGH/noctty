@@ -35,9 +35,9 @@ be exact (a 1024x768 hosted runner records why it skipped the upscale).
 The split-dim cases (`unfocused-split-opacity`, #408; `-SplitDimOnly` runs
 just them) split the window so both panes show the fixture and check that
 each dimmed capture equals its undimmed capture blended toward the fill at
-`1 - opacity` in sRGB space, pixel for pixel within two levels, outside the
-cursor cell, whose shape follows keyboard focus. They move focus with
-`goto_split`, zoom and unzoom, recreate the D3D11 device, reload with a
+`1 - opacity` in sRGB space, every pixel within two levels (the fixture hides
+the cursor for them, because its shape follows keyboard focus). They move
+focus with `goto_split`, zoom and unzoom, recreate the D3D11 device, reload with a
 custom shader (the dim lands after it; D3D11 moves to OpenGL and keeps it)
 and with opacity 1, close a pane, and compare the dimmed frame across
 backends with the parity tolerances above. `-WarpOnly` runs the WARP case

@@ -489,6 +489,7 @@ fn drainMailbox(self: *Thread) !bool {
     while (self.mailbox.pop()) |message| {
         handled_any = true;
         log.debug("mailbox message={}", .{message});
+        self.held_frame.noteMessage(std.meta.activeTag(message));
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
 
@@ -553,10 +554,7 @@ fn drainMailbox(self: *Thread) !bool {
                 }
             },
 
-            .split_dimmed => |v| {
-                self.renderer.setSplitDimmed(v);
-                self.held_frame.notePixelsChanged();
-            },
+            .split_dimmed => |v| self.renderer.setSplitDimmed(v),
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
@@ -1213,10 +1211,11 @@ const HeldFrame = struct {
         }
     }
 
-    /// The renderer itself changed what the frame shows (a split's dim),
-    /// which the terminal holding its output does not hold back.
-    fn notePixelsChanged(self: *HeldFrame) void {
-        self.repaint_owed = true;
+    /// A mailbox message that changes what the frame shows by itself (a
+    /// split's dim): the terminal holding its output does not hold that
+    /// back, and the message's wake alone does not present a held frame.
+    fn noteMessage(self: *HeldFrame, message: std.meta.Tag(rendererpkg.Message)) void {
+        if (message == .split_dimmed) self.repaint_owed = true;
     }
 
     fn presents(self: HeldFrame, pass: RenderPass, draw_active: bool) bool {
@@ -1284,11 +1283,16 @@ test "a split dim change presents a frame synchronized output holds" {
     const Source = rendererpkg.State.WakeSource;
 
     // The change arrives as a mailbox message, whose wake alone does not
-    // present a held frame; the message makes the pass present it.
+    // present a held frame; the message makes the pass present it. Messages
+    // that change no pixels the renderer draws by itself do not.
     var held: HeldFrame = .{};
     held.noteWake(.{ .wake = Source.mailbox.bit() });
     try testing.expect(!held.presents(.{ .wake = Source.mailbox.bit() }, false));
-    held.notePixelsChanged();
+    held.noteMessage(.focus);
+    held.noteMessage(.visible);
+    held.noteMessage(.reset_cursor_blink);
+    try testing.expect(!held.presents(.{ .wake = Source.mailbox.bit() }, false));
+    held.noteMessage(std.meta.activeTag(rendererpkg.Message{ .split_dimmed = true }));
     try testing.expect(held.presents(.{ .wake = Source.mailbox.bit() }, false));
     // Pacing put the pass off: the follow-up that runs it presents.
     try testing.expect(held.presents(.followup, false));
