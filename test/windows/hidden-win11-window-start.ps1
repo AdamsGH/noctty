@@ -1,7 +1,9 @@
 #requires -Version 7.0
 <#
 Portable, hidden-desktop integration regression for the state a new window
-starts in: `maximize` and `fullscreen` (#496). Run with -Bin <source bin
+starts in: `maximize` and `fullscreen` (#496), and the window keys a
+`+new-window` forward sets over the state the new window copies from the
+running one (position, size, decorations, opacity). Run with -Bin <source bin
 directory> -Run <new evidence directory>. The run directory must not already
 exist. Every file the app reads or writes is a sample this script creates
 beside a portable copy of the app: the real %LOCALAPPDATA%\noctty is never
@@ -12,12 +14,13 @@ global hotkey: the only keys are posted F11 (`toggle_fullscreen`), F12
 nothing) messages, the last two bound in the case's config, and nothing it
 does can copy. The clipboard sequence number is logged before and after and a
 change fails the run. Every launch uses `--single-instance=false` and a class
-of its own, except the forwarding case, whose two copies share a class no
-other process uses. Results contain only window geometry, window state,
-process IDs and assertions. It exits 1 when a check fails, so it can be run
-against a build that still has the problem to show what fails; the saved
-maximized session and the plain normal window are the positive controls that
-pass on either.
+of its own, except the two forwarding cases, each a pair of copies sharing a
+class no other process uses. Results contain only window geometry, window
+state, process IDs and assertions. It exits 1 when a check fails, so it can be
+run against a build that still has the problem to show what fails; the saved
+maximized session, the plain normal window, and the running window's caption
+buttons and the plain forwarded copy of it are the positive controls that pass
+on either.
 #>
 [CmdletBinding()]
 param(
@@ -60,6 +63,21 @@ public static class Ws {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MonInfo info);
     [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint flags,uint ms,out IntPtr result);
+    [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr h,out uint key,out byte alpha,out uint flags);
+    // What WM_NCHITTEST answers at screen point (x, y), physical pixels.
+    public static int HitTest(IntPtr h,int x,int y) {
+        IntPtr result; long point=((long)(y & 0xFFFF) << 16) | (long)(x & 0xFFFF);
+        if(SendMessageTimeoutW(h,0x84,IntPtr.Zero,new IntPtr(point),0x2,5000,out result)==IntPtr.Zero) throw new Exception("WM_NCHITTEST timed out");
+        return result.ToInt32();
+    }
+    // The layered alpha of a host, or -1 when it is not layered with LWA_ALPHA.
+    public static int Alpha(IntPtr h) {
+        if((GetWindowLongPtr(h,-20).ToInt64() & 0x00080000L)==0) return -1;
+        uint key,flags; byte alpha;
+        if(!GetLayeredWindowAttributes(h,out key,out alpha,out flags) || (flags & 0x2)==0) return -1;
+        return alpha;
+    }
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int show);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
     delegate bool EnumProc(IntPtr h,IntPtr p);
@@ -254,6 +272,79 @@ try {
         }
         $f=Sample 'forward-source-after' $first
         Check 'forwarding left the running window normal' (-not $f.Zoomed -and -not $f.Popup) 'normal' @{Zoomed=$f.Zoomed; Popup=$f.Popup}
+    } finally { Stop-Case $primary }
+
+    # Forwarded window keys: a new window copies the running window's size
+    # (cascaded), decorations and opacity, and what the forwarded argv sets
+    # wins over that copy. The reference is a first window whose config has
+    # the forwarded size. Caption buttons tell a decorated window: an
+    # undecorated one keeps its frame on Windows 11, so its style is the same.
+    $case=Start-Case (New-Case 'keys-reference' @('window-save-state = never','window-width = 60','window-height = 20'))
+    try { $reference=Sample 'keys-reference' $case.Host } finally { Stop-Case $case }
+    function Close-Button($h,$s) { return [Ws]::HitTest($h,$s.Rect.Right-30,$s.Rect.Top+20) }
+    $class="noctty-test-issue496-$runId-keys"
+    $primary=Start-Case (New-Case 'keys-primary' @('window-save-state = never','quit-after-last-window-closed = false') -Class $class)
+    $second=New-Case 'keys-second' @('window-save-state = never') -Class $class
+    function Forward([string]$Name,[string]$Arguments) {
+        $before=@(Hosts-With-Pane $primary.Process)
+        $p=Spawn-Owned $second "+new-window --class=$class --timeout=10000 $Arguments" -Action
+        Stop-Process-Exact $p 15000
+        $ok=Wait-Until { @(Hosts-With-Pane $primary.Process).Count -eq $before.Count+1 } 15
+        Check "${Name}: +new-window opened a window in the running noctty" ($p.ExitCode -eq 0 -and $ok) 'exit 0, one more window' @{ExitCode=$p.ExitCode; Windows=@(Hosts-With-Pane $primary.Process).Count}
+        Start-Sleep -Milliseconds 1200
+        $made=@(Hosts-With-Pane $primary.Process|Where-Object {$before -notcontains $_})
+        if($made.Count -ne 1) { return $null }
+        return $made[0]
+    }
+    function Close-Window($h) {
+        [void][Ws]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero)
+        [void](Wait-Until { -not [Ws]::Alive($h) } 10)
+    }
+    try {
+        $first=$primary.Host
+        $f=Sample 'keys-primary' $first
+        $hit=Close-Button $first $f
+        Check 'control: the running window has caption buttons and is opaque' ($hit -eq 20 -and [Ws]::Alpha($first) -eq -1) 'HTCLOSE, not layered' @{HitTest=$hit; Alpha=[Ws]::Alpha($first)}
+        # Nothing forwarded but the class: the copy, at the configured place.
+        $h=Forward 'keys-plain' ''
+        if($h) {
+            $s=Sample 'keys-plain' $h; $hit=Close-Button $h $s
+            Check 'control: a plain forwarded window copies the running one' ((Rect-Same $s.Rect $f.Rect) -and $hit -eq 20 -and [Ws]::Alpha($h) -eq -1) (Rect-Array $f.Rect) @{Rect=(Rect-Array $s.Rect); HitTest=$hit; Alpha=[Ws]::Alpha($h)}
+            Close-Window $h
+        }
+        $h=Forward 'keys-position' '--window-position-x=400 --window-position-y=300'
+        if($h) {
+            $s=Sample 'keys-position' $h
+            $want=[pscustomobject]@{ Left=400; Top=300; Right=400+($f.Rect.Right-$f.Rect.Left); Bottom=300+($f.Rect.Bottom-$f.Rect.Top) }
+            Check 'forwarded --window-position-*: placed there, at the copied size' (Rect-Same $s.Rect $want 0) (Rect-Array $want) (Rect-Array $s.Rect)
+            Close-Window $h
+        }
+        $h=Forward 'keys-size' '--window-width=60 --window-height=20'
+        if($h) {
+            $s=Sample 'keys-size' $h
+            Check 'forwarded --window-width/height: the size it asked for' (((Size $s.Client) -join 'x') -eq ((Size $reference.Client) -join 'x')) (Size $reference.Client) (Size $s.Client)
+            Close-Window $h
+        }
+        $h=Forward 'keys-decoration' '--window-decoration=none'
+        if($h) {
+            $s=Sample 'keys-decoration' $h; $hit=Close-Button $h $s
+            Check 'forwarded --window-decoration=none: no caption buttons' ($hit -ne 20) 'not HTCLOSE' $hit
+            Close-Window $h
+        }
+        $h=Forward 'keys-opacity' '--background-opacity=0.6'
+        if($h) {
+            $alpha=[Ws]::Alpha($h)
+            Check 'forwarded --background-opacity: the window is translucent' ($alpha -gt 0 -and $alpha -lt 255) '0 < alpha < 255' $alpha
+            Close-Window $h
+        }
+        # With no window open there is nothing to copy.
+        Close-Window $first
+        Check 'quit-after-last-window-closed = false: the instance kept running' (-not $primary.Process.HasExited -and @(Hosts-With-Pane $primary.Process).Count -eq 0) 'running, no window' @{Exited=$primary.Process.HasExited; Windows=@(Hosts-With-Pane $primary.Process).Count}
+        $h=Forward 'keys-none-open' '--window-position-x=400 --window-position-y=300 --window-width=60 --window-height=20 --window-decoration=none'
+        if($h) {
+            $s=Sample 'keys-none-open' $h; $hit=Close-Button $h $s
+            Check 'no window open: the forwarded place, size and decorations' ($s.Rect.Left -eq 400 -and $s.Rect.Top -eq 300 -and ((Size $s.Client) -join 'x') -eq ((Size $reference.Client) -join 'x') -and $hit -ne 20) @{Left=400; Top=300; Client=(Size $reference.Client); HitTest='not HTCLOSE'} @{Left=$s.Rect.Left; Top=$s.Rect.Top; Client=(Size $s.Client); HitTest=$hit}
+        }
     } finally { Stop-Case $primary }
 
     # Session restore: a saved normal window with `maximize = true` is
