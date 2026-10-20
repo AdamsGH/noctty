@@ -503,25 +503,28 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
         if ($caseSuccessful -and $case.teardown -ne 'graceful') { throw 'Successful renderer case did not close gracefully.' }
     }
 }
-try {
-    # These cases need no GL driver and run on x64 and native ARM64 CI too.
-    if ($SplitDimOnly) {
-        $splitGL = Invoke-Case 'split-dim-opengl' 'opengl' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitGL
-        $splitHardware = Invoke-Case 'split-dim-hardware' 'd3d11' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitHardware
-        $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
-        $splitDefault = Invoke-Case 'split-dim-default-fill' 'd3d11' -SplitDim -NoShaderReload; $result.runs += $splitDefault
-        # OpenGL only: D3D11 on a hidden desktop is always occluded, and its
-        # paced present retry would carry the dim through a hold anyway.
-        $splitHeldGL = Invoke-Case 'split-dim-held-opengl' 'opengl' -SplitDim -HoldSync; $result.runs += $splitHeldGL
-        # Same dim on every backend: hardware exactly, WARP within its edge tolerance.
-        foreach ($candidate in @($splitHardware, $splitWarp)) {
-            $diff = [RendererNative]::Diff($splitGL.splitLeft.path, $candidate.splitLeft.path, (Join-Path $OutputDirectory ($candidate.label + '-dimmed-diff.png'))) | ConvertFrom-Json
-            $result.comparisons += @{ label = $candidate.label + '-dimmed'; diff = $diff }
-            if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware dims differently from OpenGL.' }
-            if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP dim exceeds documented edge quantization tolerance.' }
-        }
-        $result.status = 'pass'; return
+# The split-dim cases, shared by -SplitDimOnly and the full run. Like
+# Invoke-Case, they add to the script's $result in place.
+function Invoke-SplitDimCases {
+    $splitGL = Invoke-Case 'split-dim-opengl' 'opengl' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitGL
+    $splitHardware = Invoke-Case 'split-dim-hardware' 'd3d11' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitHardware
+    $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
+    $result.runs += Invoke-Case 'split-dim-default-fill' 'd3d11' -SplitDim -NoShaderReload
+    # OpenGL only: D3D11 on a hidden desktop is always occluded, and its
+    # paced present retry would carry the dim through a hold anyway.
+    $result.runs += Invoke-Case 'split-dim-held-opengl' 'opengl' -SplitDim -HoldSync
+    # Same dim on every backend: hardware exactly, WARP within its edge tolerance.
+    foreach ($candidate in @($splitHardware, $splitWarp)) {
+        $diff = [RendererNative]::Diff($splitGL.splitLeft.path, $candidate.splitLeft.path, (Join-Path $OutputDirectory ($candidate.label + '-dimmed-diff.png'))) | ConvertFrom-Json
+        $result.comparisons += @{ label = $candidate.label + '-dimmed'; diff = $diff }
+        if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware dims differently from OpenGL.' }
+        if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP dim exceeds documented edge quantization tolerance.' }
     }
+}
+try {
+    # The split-dim cases include OpenGL runs, so they need an OpenGL 4.3 driver.
+    if ($SplitDimOnly) { Invoke-SplitDimCases; $result.status = 'pass'; return }
+    # These cases need no GL driver and run on x64 and native ARM64 CI too.
     $startupFallback = Invoke-Case 'opengl-startup-fallback' 'opengl' @{NOCTTY_RENDERER_FAIL_OPENGL_VERSION='1'} -OpenGLStartupFallback
     $result.runs += $startupFallback
     if ($OpenGLStartupOnly) { $result.status = 'pass'; return }
@@ -551,20 +554,7 @@ try {
         if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware differs from OpenGL.' }
         if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP exceeds documented edge quantization tolerance.' }
     }
-    $splitGL = Invoke-Case 'split-dim-opengl' 'opengl' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitGL
-    $splitHardware = Invoke-Case 'split-dim-hardware' 'd3d11' -SplitDim -SplitFill 'ffffff'; $result.runs += $splitHardware
-    $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
-    $splitDefault = Invoke-Case 'split-dim-default-fill' 'd3d11' -SplitDim -NoShaderReload; $result.runs += $splitDefault
-    # OpenGL only: D3D11 on a hidden desktop is always occluded, and its
-    # paced present retry would carry the dim through a hold anyway.
-    $splitHeldGL = Invoke-Case 'split-dim-held-opengl' 'opengl' -SplitDim -HoldSync; $result.runs += $splitHeldGL
-    # Same dim on every backend: hardware exactly, WARP within its edge tolerance.
-    foreach ($candidate in @($splitHardware, $splitWarp)) {
-        $diff = [RendererNative]::Diff($splitGL.splitLeft.path, $candidate.splitLeft.path, (Join-Path $OutputDirectory ($candidate.label + '-dimmed-diff.png'))) | ConvertFrom-Json
-        $result.comparisons += @{ label = $candidate.label + '-dimmed'; diff = $diff }
-        if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware dims differently from OpenGL.' }
-        if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP dim exceeds documented edge quantization tolerance.' }
-    }
+    Invoke-SplitDimCases
     $noDevice = Invoke-Case 'no-device' 'd3d11' @{ NOCTTY_RENDERER_FAIL_DEVICE = '1' }; $result.runs += $noDevice
     if ($noDevice.initial.status.backend -ne 'opengl') { throw 'Unavailable D3D11 did not select OpenGL.' }
     $noLibrary = Invoke-Case 'no-library' 'd3d11' @{ NOCTTY_RENDERER_FAIL_LIBRARY = '1' }; $result.runs += $noLibrary
