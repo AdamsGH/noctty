@@ -762,7 +762,9 @@ const DerivedConfig = struct {
             .window_padding_balance = config.@"window-padding-balance",
             .window_height = config.@"window-height",
             .window_width = config.@"window-width",
-            .title = config.title,
+            // Copied: `config` is not owned past this call. It is a
+            // conditional-state clone, or a reload config the caller frees.
+            .title = if (config.title) |title| try alloc.dupeZ(u8, title) else null,
             .title_report = config.@"title-report",
             .links = links,
             .link_previews = config.@"link-previews",
@@ -841,6 +843,31 @@ const DerivedConfig = struct {
             input.Link.Highlight{ .hover_mods = input.ctrlOrSuper(.{}) },
             derived.links[1].highlight,
         );
+    }
+
+    test "DerivedConfig owns its title" {
+        const testing = std.testing;
+
+        // The config a DerivedConfig is built from dies first: the
+        // conditional-state clone at the end of Surface.init and
+        // updateConfig, or the reload config App.updateConfig's caller
+        // frees. So the derived title must not borrow the source's bytes.
+        var source = try configpkg.Config.default(testing.allocator);
+        var source_alive = true;
+        defer if (source_alive) source.deinit();
+        const title = try source._arena.?.allocator().dupeZ(u8, "pinned title");
+        source.title = title;
+
+        var derived = try DerivedConfig.init(testing.allocator, &source);
+        defer derived.deinit();
+
+        // Stands in for the freed source's memory being reused.
+        @memset(title, 'x');
+        try testing.expectEqualStrings("pinned title", derived.title.?);
+
+        source.deinit();
+        source_alive = false;
+        try testing.expectEqualStrings("pinned title", derived.title.?);
     }
 
     fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
