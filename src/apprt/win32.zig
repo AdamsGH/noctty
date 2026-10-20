@@ -8230,7 +8230,8 @@ pub const App = struct {
                 if (host.hwnd != null and (host.chrome_brush == null or
                     host.overlay_brush == null or host.edit_brush == null or
                     host.chrome_font == null or host.preview_font == null or
-                    host.titlebar_caption_icon_font == null or host.titlebar_action_icon_font == null or
+                    (!host.titlebar_icons_geometric and
+                        (host.titlebar_caption_icon_font == null or host.titlebar_action_icon_font == null)) or
                     // The search font stays lazy. Only a failed attempt, not
                     // its intentionally unused state, needs another chance.
                     (host.search_icon_font_resolved and host.search_icon_font == null))) break true;
@@ -12653,31 +12654,110 @@ fn createIconFontForFace(face: [*:0]const u16, height_px: i32) ?*anyopaque {
     return sys.CreateFontIndirectW(&lf);
 }
 
-/// Whether `font` has a glyph for every search bar button. This, not the
-/// face name, decides whether the Codicons font is used: GDI never fails a
-/// missing face but hands back a substitute such as Arial, which has none of
-/// these private-use code points, and an older "Symbols Nerd Font" installed
-/// on the system can shadow the registered one without having them all.
-/// Any GDI failure counts as missing, so the buttons fall back to
-/// `win32_icons` rather than risk empty boxes.
+/// Every search bar button's Codicon, one UTF-16 unit each.
+const search_codicon_glyphs = glyphs: {
+    var units: [search_bar_button_roles.len]u16 = undefined;
+    for (search_bar_button_roles, &units) |role, *unit| unit.* = searchButtonCodicon(role)[0];
+    break :glyphs units;
+};
+
+/// Whether `font` has a glyph for every search bar button. An older
+/// "Symbols Nerd Font" installed on the system can shadow the registered one
+/// without having them all. A failed check counts as missing.
 fn fontHasSearchCodicons(font: *anyopaque) bool {
-    const hdc = sys.CreateCompatibleDC(null) orelse return false;
+    return fontGlyphCoverage(font, &search_codicon_glyphs) == .all;
+}
+
+/// What `fontGlyphCoverage` found.
+const GlyphCoverage = enum {
+    all,
+    /// At least one glyph is not in the font.
+    missing,
+    /// GDI failed before it could say. Unlike `missing`, a later attempt
+    /// may succeed.
+    unknown,
+};
+
+/// Tests set this to fail `fontGlyphCoverage` as a GDI error would, which
+/// nothing else can do on demand.
+var test_glyph_check_fails: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+/// Whether `font` has a glyph for every UTF-16 unit in `units`. This, not
+/// the face name, decides whether an icon font is used: GDI never fails a
+/// missing face but hands back a substitute such as Arial, which has none of
+/// these private-use code points.
+fn fontGlyphCoverage(font: *anyopaque, units: []const u16) GlyphCoverage {
+    if (builtin.is_test) {
+        if (test_glyph_check_fails) return .unknown;
+    }
+    const hdc = sys.CreateCompatibleDC(null) orelse return .unknown;
     defer _ = sys.DeleteDC(hdc);
-    const old_font = sys.SelectObject(hdc, font) orelse return false;
+    const old_font = sys.SelectObject(hdc, font) orelse return .unknown;
     defer _ = sys.SelectObject(hdc, old_font);
-    for (search_bar_button_roles) |role| {
-        const glyph = searchButtonCodicon(role);
+    for (units) |unit| {
+        const glyph = [1]u16{unit};
         var index: [1]u16 = undefined;
         if (sys.GetGlyphIndicesW(
             hdc,
-            glyph.ptr,
+            &glyph,
             1,
             &index,
             c.GGI_MARK_NONEXISTING_GLYPHS,
-        ) != 1) return false;
-        if (index[0] == 0xFFFF) return false;
+        ) != 1) return .unknown;
+        if (index[0] == 0xFFFF) return .missing;
     }
-    return true;
+    return .all;
+}
+
+/// The titlebar icon faces, best first. Windows 11 ships Segoe Fluent Icons;
+/// Windows 10 ships only Segoe MDL2 Assets, which has the same code points.
+const titlebar_icon_faces = [_][*:0]const u16{ titlebar_icon_font_fluent, titlebar_icon_font_mdl2 };
+
+/// Every glyph `drawTitlebarGlyph` draws. Both titlebar icon fonts must have
+/// all of them, so the caption buttons and the tab row's buttons come from
+/// the same face.
+const titlebar_icon_glyphs = glyphs: {
+    const kinds = std.enums.values(TitlebarGlyphKind);
+    var units: [kinds.len]u16 = undefined;
+    for (kinds, &units) |kind, *unit| unit.* = titlebarGlyphText(kind)[0];
+    break :glyphs units;
+};
+
+/// An icon font from `createIconFontWithGlyphs`.
+const IconFontChoice = struct {
+    font: ?*anyopaque = null,
+    /// No font: every face was created and checked, and none has the
+    /// glyphs, so the caller draws `win32_icons` by design. Without this, a
+    /// null font means GDI failed to create or check one, which a later
+    /// theme message retries.
+    geometric: bool = false,
+};
+
+/// The first of `faces` whose font has every one of `glyphs`, at a
+/// `height_px` device-pixel em. `CreateFontIndirectW` succeeding says
+/// nothing: it substitutes another face for a missing one (Arial for
+/// "Segoe Fluent Icons" on Windows 10), so the glyph table decides. A face
+/// GDI failed to create or check is passed over like a missing one, but
+/// the result is then not `geometric`.
+fn createIconFontWithGlyphs(
+    faces: []const [*:0]const u16,
+    glyphs: []const u16,
+    height_px: i32,
+) IconFontChoice {
+    var checked_every_face = true;
+    for (faces) |face| {
+        const font = createIconFontForFace(face, height_px) orelse {
+            checked_every_face = false;
+            continue;
+        };
+        switch (fontGlyphCoverage(font, glyphs)) {
+            .all => return .{ .font = font },
+            .missing => {},
+            .unknown => checked_every_face = false,
+        }
+        _ = sys.DeleteObject(font);
+    }
+    return .{ .geometric = checked_every_face };
 }
 
 /// The Codicon for each search bar button, by its Nerd Fonts code point.
@@ -13358,8 +13438,15 @@ const Host = struct {
     /// proportional, which would misrepresent whitespace and column
     /// alignment in the very bytes the user is judging.
     preview_font: ?*anyopaque = null, // HFONT, owned
+    /// Icon fonts for the caption buttons and the tab row's new-tab and
+    /// dropdown buttons (`recreateTitlebarIconFonts`). Null when no face has
+    /// the glyphs, and `win32_icons` draws them.
     titlebar_caption_icon_font: ?*anyopaque = null, // HFONT, owned
     titlebar_action_icon_font: ?*anyopaque = null, // HFONT, owned
+    /// Both titlebar icon fonts are null because no icon face has the
+    /// glyphs, not because GDI failed to create or check one, so
+    /// `reconfigureSystemTheme` does not count them as missing.
+    titlebar_icons_geometric: bool = false,
     /// Codicons for the search bar buttons (`search_icon_font_face`). Null
     /// until first use (`searchIconFont`), and when the font is unavailable.
     search_icon_font: ?*anyopaque = null, // HFONT, owned
@@ -21377,9 +21464,8 @@ const Host = struct {
         return sys.CreateFontIndirectW(&lf);
     }
 
-    fn createTitlebarIconFont(self: *Host, logical_px: i32) ?*anyopaque {
-        return createIconFontForFace(titlebar_icon_font_fluent, self.scaled(logical_px)) orelse
-            createIconFontForFace(titlebar_icon_font_mdl2, self.scaled(logical_px));
+    fn createTitlebarIconFont(self: *Host, faces: []const [*:0]const u16, logical_px: i32) IconFontChoice {
+        return createIconFontWithGlyphs(faces, &titlebar_icon_glyphs, self.scaled(logical_px));
     }
 
     /// The search bar's Codicons font, created at its first use rather than
@@ -21421,11 +21507,18 @@ const Host = struct {
     }
 
     fn recreateTitlebarIconFonts(self: *Host) void {
+        self.recreateTitlebarIconFontsFrom(&titlebar_icon_faces);
+    }
+
+    fn recreateTitlebarIconFontsFrom(self: *Host, faces: []const [*:0]const u16) void {
         if (self.titlebar_caption_icon_font) |old| _ = sys.DeleteObject(old);
         if (self.titlebar_action_icon_font) |old| _ = sys.DeleteObject(old);
         if (self.search_icon_font) |old| _ = sys.DeleteObject(old);
-        self.titlebar_caption_icon_font = self.createTitlebarIconFont(10);
-        self.titlebar_action_icon_font = self.createTitlebarIconFont(12);
+        const caption = self.createTitlebarIconFont(faces, 10);
+        const action = self.createTitlebarIconFont(faces, 12);
+        self.titlebar_caption_icon_font = caption.font;
+        self.titlebar_action_icon_font = action.font;
+        self.titlebar_icons_geometric = caption.geometric and action.geometric;
         self.search_icon_font = null;
         self.search_icon_font_resolved = false;
     }
@@ -23756,16 +23849,21 @@ const Host = struct {
         try std.testing.expectEqual(applied, app.theme_rebuilds);
 
         inline for (.{ "preview_font", "titlebar_caption_icon_font", "titlebar_action_icon_font", "chrome_font" }) |name| {
-            const slot = &@field(host, name);
-            const font = slot.* orelse return error.FontCreateFailed;
-            _ = sys.DeleteObject(font);
-            slot.* = null;
-            const before = app.theme_rebuilds;
-            app.reconfigureSystemTheme();
-            try std.testing.expectEqual(before + 1, app.theme_rebuilds);
-            try std.testing.expect(slot.* != null);
-            app.reconfigureSystemTheme();
-            try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+            // Null by design without an icon face that has the glyphs; the
+            // geometric titlebar icons test retries those fonts instead.
+            const by_design = comptime std.mem.startsWith(u8, name, "titlebar_");
+            if (!(by_design and host.titlebar_icons_geometric)) {
+                const slot = &@field(host, name);
+                const font = slot.* orelse return error.FontCreateFailed;
+                _ = sys.DeleteObject(font);
+                slot.* = null;
+                const before = app.theme_rebuilds;
+                app.reconfigureSystemTheme();
+                try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+                try std.testing.expect(slot.* != null);
+                app.reconfigureSystemTheme();
+                try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+            }
         }
         // A previous failed lazy search-font attempt must get another chance.
         host.search_icon_font_resolved = true;
@@ -23775,6 +23873,85 @@ const Host = struct {
         try std.testing.expect(!host.search_icon_font_resolved);
         app.reconfigureSystemTheme();
         try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+    }
+
+    test "titlebar icons are drawn geometrically when no icon face has the glyphs, and a failed check is retried" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(geometricTitlebarIconsTestBody);
+    }
+
+    /// The titlebar icon fonts as the default faces leave them on this
+    /// machine: from `face`, the first icon face it has (Segoe MDL2 Assets
+    /// where Segoe Fluent Icons is missing), or the geometric state when
+    /// `face` is null.
+    fn expectDefaultTitlebarIconFonts(self: *const Host, face: ?[*:0]const u16) !void {
+        try std.testing.expectEqual(face == null, self.titlebar_icons_geometric);
+        inline for (.{ "titlebar_caption_icon_font", "titlebar_action_icon_font" }) |name| {
+            if (@field(self, name)) |font| {
+                try std.testing.expect(try fontIsFaceForTest(font, face orelse return error.TestUnexpectedFont));
+                try std.testing.expectEqual(GlyphCoverage.all, fontGlyphCoverage(font, &titlebar_icon_glyphs));
+            } else try std.testing.expect(face == null);
+        }
+    }
+
+    fn geometricTitlebarIconsTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host, .register = true }} });
+        defer session.deinit();
+        defer {
+            inline for (.{ "chrome_font", "preview_font", "titlebar_caption_icon_font", "titlebar_action_icon_font", "search_icon_font", "chrome_brush", "overlay_brush", "edit_brush" }) |name| {
+                if (@field(host, name)) |object| _ = sys.DeleteObject(object);
+            }
+        }
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        app.reconfigureSystemTheme();
+        const installed_face = try installedTitlebarIconFaceForTest();
+        try host.expectDefaultTitlebarIconFonts(installed_face);
+
+        // Every face missing, as Segoe Fluent Icons is on Windows 10.
+        host.recreateTitlebarIconFontsFrom(&.{icon_font_test_missing_face});
+        try std.testing.expect(host.titlebar_caption_icon_font == null);
+        try std.testing.expect(host.titlebar_action_icon_font == null);
+        try std.testing.expect(host.titlebar_icons_geometric);
+
+        // `win32_icons` draws the tab row's buttons and the caption buttons.
+        const canvas = try BannerTestCanvas.init(32, 32);
+        defer canvas.deinit();
+        const rect: RECT = .{ .left = 0, .top = 0, .right = 32, .bottom = 32 };
+        const background: u32 = 0x000000;
+        for (std.enums.values(TitlebarGlyphKind)) |kind| {
+            fillSolidRect(canvas.dc, rect, background);
+            host.drawTitlebarGlyph(canvas.dc, rect, kind, 0xFFFFFF, kind != .new_tab and kind != .dropdown);
+            _ = BannerTestCanvas.raw.GdiFlush();
+            try std.testing.expect(canvas.inked(rect, background) > 0);
+        }
+
+        // Fonts absent by design are not a failed resource: an unchanged
+        // theme message leaves them alone.
+        const geometric_rebuilds = app.theme_rebuilds;
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(geometric_rebuilds, app.theme_rebuilds);
+        try std.testing.expect(host.titlebar_icons_geometric);
+
+        // A glyph check GDI failed is no verdict: the fonts count as
+        // missing, and the next unchanged theme message rebuilds them from
+        // the default faces.
+        {
+            test_glyph_check_fails = true;
+            defer test_glyph_check_fails = false;
+            host.recreateTitlebarIconFonts();
+        }
+        try std.testing.expect(host.titlebar_caption_icon_font == null);
+        try std.testing.expect(host.titlebar_action_icon_font == null);
+        try std.testing.expect(!host.titlebar_icons_geometric);
+        const failed_rebuilds = app.theme_rebuilds;
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(failed_rebuilds + 1, app.theme_rebuilds);
+        try host.expectDefaultTitlebarIconFonts(installed_face);
     }
 
     fn setWindowActive(self: *Host, active: bool) void {
@@ -55015,6 +55192,81 @@ test "win32 search bar codicons are rejected in a substitute font" {
     ) orelse return error.FontCreateFailed;
     defer _ = sys.DeleteObject(font);
     try std.testing.expect(!fontHasSearchCodicons(font));
+}
+
+/// A face no machine has. GDI still creates a font for it, from a substitute.
+const icon_font_test_missing_face = std.unicode.utf8ToUtf16LeStringLiteral("noctty test icon face that is not installed");
+
+/// Whether GDI realized `font` from `face` itself rather than a substitute,
+/// judged by the face name and not by the glyph check under test.
+fn fontIsFaceForTest(font: *anyopaque, face: [*:0]const u16) !bool {
+    const hdc = sys.CreateCompatibleDC(null) orelse return error.DcCreateFailed;
+    defer _ = sys.DeleteDC(hdc);
+    const old_font = sys.SelectObject(hdc, font) orelse return error.FontSelectFailed;
+    defer _ = sys.SelectObject(hdc, old_font);
+    var name: [c.LF_FACESIZE]u16 = undefined;
+    if (sys.GetTextFaceW(hdc, name.len, &name) <= 0) return error.TextFaceFailed;
+    return std.mem.eql(u16, std.mem.sliceTo(&name, 0), std.mem.span(face));
+}
+
+/// The first of `titlebar_icon_faces` this machine has, which the default
+/// titlebar icon fonts must come from; null when it has neither.
+fn installedTitlebarIconFaceForTest() !?[*:0]const u16 {
+    for (titlebar_icon_faces) |face| {
+        const font = createIconFontForFace(face, 12) orelse return error.FontCreateFailed;
+        defer _ = sys.DeleteObject(font);
+        if (try fontIsFaceForTest(font, face)) return face;
+    }
+    return null;
+}
+
+test "win32 icon font choice passes over a substituted face by its glyphs" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // The trap: a face that is not installed still gets a font.
+    const substitute = createIconFontForFace(icon_font_test_missing_face, 12) orelse return error.FontCreateFailed;
+    defer _ = sys.DeleteObject(substitute);
+    try std.testing.expectEqual(GlyphCoverage.missing, fontGlyphCoverage(substitute, &titlebar_icon_glyphs));
+
+    // With no face that has the glyphs, there is no font, and the caller
+    // draws `win32_icons` by design rather than after a GDI failure.
+    const none = createIconFontWithGlyphs(&.{icon_font_test_missing_face}, &titlebar_icon_glyphs, 12);
+    try std.testing.expectEqual(@as(?*anyopaque, null), none.font);
+    try std.testing.expect(none.geometric);
+
+    // A missing first face falls through to the next one. The embedded
+    // Codicons font stands in for Segoe MDL2 Assets, which a machine need
+    // not have.
+    search_icon_font_registration.call();
+    const faces = [_][*:0]const u16{ icon_font_test_missing_face, search_icon_font_face };
+    const next = createIconFontWithGlyphs(&faces, &search_codicon_glyphs, search_icon_font_px);
+    const font = next.font orelse return error.TestExpectedFont;
+    defer _ = sys.DeleteObject(font);
+    try std.testing.expect(!next.geometric);
+    try std.testing.expect(fontHasSearchCodicons(font));
+
+    // The face check the Host tests rely on tells the two fonts apart.
+    try std.testing.expect(!try fontIsFaceForTest(substitute, icon_font_test_missing_face));
+    try std.testing.expect(try fontIsFaceForTest(font, search_icon_font_face));
+}
+
+test "win32 icon font choice does not take a failed glyph check for a missing glyph" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // A font handle GDI rejects fails the check itself.
+    const stale = createIconFontForFace(search_icon_font_face, search_icon_font_px) orelse return error.FontCreateFailed;
+    _ = sys.DeleteObject(stale);
+    try std.testing.expectEqual(GlyphCoverage.unknown, fontGlyphCoverage(stale, &search_codicon_glyphs));
+
+    // A check that fails for every face, even a missing one, leaves no font
+    // and no geometric verdict, so the caller retries.
+    search_icon_font_registration.call();
+    test_glyph_check_fails = true;
+    defer test_glyph_check_fails = false;
+    const faces = [_][*:0]const u16{ icon_font_test_missing_face, search_icon_font_face };
+    const failed = createIconFontWithGlyphs(&faces, &search_codicon_glyphs, search_icon_font_px);
+    try std.testing.expectEqual(@as(?*anyopaque, null), failed.font);
+    try std.testing.expect(!failed.geometric);
 }
 
 test "win32 search bar icon font is created at first use and dropped on a DPI or theme change" {
