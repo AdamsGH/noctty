@@ -14481,6 +14481,9 @@ const Host = struct {
         // As the close it redoes: the session's last tab is saved as it goes.
         const saved_here = self.tabs.items.len == 1 and self.app.closingEndsSession(self);
         if (saved_here) self.app.saveSessionAsItEnds();
+        errdefer if (saved_here) {
+            self.app.session_state_saved_before_last_host_close = false;
+        };
         var removed = self.tabs.orderedRemove(index);
         self.destroyTabButton(&removed);
         removed.button_placement = .{};
@@ -14504,7 +14507,6 @@ const Host = struct {
             if (self.activeSurface()) |next| if (next.shell_id) |pane| try hook(self.app, pane);
         }
         if (shell_prepared) |*prepared| prepared.commitRetryingInterleavedFocus(&self.app.shell_runtime) catch |err| {
-            if (saved_here) self.app.session_state_saved_before_last_host_close = false;
             try self.tabs.insert(self.app.core_app.alloc, index, removed);
             value.tab = null;
             self.active_tab = previous_active;
