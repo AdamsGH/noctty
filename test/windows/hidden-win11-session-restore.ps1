@@ -236,7 +236,7 @@ function Stop-Case($case) {
 $lastWindowConfig=@('keybind = f2=new_window','keybind = f3=close_all_windows','keybind = f4=new_tab','keybind = f5=close_tab:this',
     'keybind = f6=close_surface','keybind = f7=quit','keybind = f8=toggle_quick_terminal','keybind = f9=undo',
     'quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%')
-$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78 }
+$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78; Down=0x28 }
 # The pane that is on screen in `$h`, or any pane when none is.
 function Pane($h) {
     $all=@([HiddenLocal]::Surfaces($h)); $shown=@($all|Where-Object {([Sr]::Read($_)).Visible})
@@ -254,7 +254,10 @@ function Post-Close($h) { if(-not [Sr]::PostMessageW($h,0x10,[IntPtr]::Zero,[Int
 # and a move saves nothing by itself, so the moved rect can only reach the
 # file through the save as the session ends. The process is never closed by
 # the harness before the file is read: a harness WM_CLOSE would save it.
-function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@()) {
+# -SetAside: the restored pane's program ends before any key reached it, so
+# the restore failed and the saved session must be moved aside, not saved
+# back (it would open and close again at every launch).
+function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(),[switch]$SetAside) {
     $seedX=$work.Left+180; $seedY=$work.Top+140
     $case=New-Case $Name @{ 'session-state.json'=(Session-Json $seedX $seedY 900 600 'normal' (Join-Path $Run "$Name\bin") $false) } ($lastWindowConfig + $Extra)
     $path=Join-Path $case.Dir 'session-state.json'
@@ -299,7 +302,11 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
             'close-surface' { Press (Pane $main) $Vk.CloseSurface 0 }
             'quit' { Press (Pane $main) $Vk.Quit 0 }
             'close-all-windows' { Press (Pane $main) $Vk.CloseAll 0 }
-            'shell-exit' { }    # the configured command exits by itself
+            'shell-exit' {
+                # The configured command exits by itself. A key while it runs
+                # makes the restored pane one the user has used.
+                if(-not $SetAside) { Press (Pane $main) $Vk.Down 0 }
+            }
             'quick-terminal-quit' {
                 Post-Close $main
                 if(-not (Wait-Until { -not [Sr]::Alive($main) } 8)) { throw "$($Name): window did not close." }
@@ -325,6 +332,17 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
         if(-not $case.Process.HasExited) { $case.Process.Kill(); [void]$case.Process.WaitForExit(5000) }
     }
     Check "${Name}: the process ended by itself" $exited $true $exited
+    if($SetAside) {
+        $aside="$path.restore-failed"
+        $left=Test-Path -LiteralPath $path; $moved_aside=Test-Path -LiteralPath $aside
+        Check "${Name}: nothing is saved back" (-not $left) 'absent' $(if($left){'present'}else{'absent'})
+        Check "${Name}: the saved session was moved aside" $moved_aside 'present' $(if($moved_aside){'present'}else{'absent'})
+        if($moved_aside) {
+            $held=@((Get-Content -LiteralPath $aside -Raw | ConvertFrom-Json).windows)
+            Check "${Name}: the moved session still holds its window" ($held.Count -eq 1) 1 $held.Count
+        }
+        return
+    }
     $kept=Test-Path -LiteralPath $path
     Check "${Name}: the saved session is still there" $kept 'present' $(if($kept){'present'}else{'deleted'})
     if(-not $kept -or -not $moved) { return }
@@ -349,7 +367,10 @@ try {
             # the default undo-timeout (the window and process go when it runs out).
             @{ Name='close-tab' },
             @{ Name='close-surface' },
-            @{ Name='shell-exit'; Extra=@('command = cmd.exe /d /c ping -n 10 127.0.0.1 >nul') },
+            # The restored pane's shell exits by itself after a key: saved.
+            @{ Name='shell-exit'; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
+            # The same with no key: that restore failed, and is moved aside.
+            @{ Name='shell-exit-untouched'; End='shell-exit'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
             @{ Name='quit' },
             @{ Name='close-all-windows' },
             # A quick terminal is never a session window: the last real window
@@ -370,7 +391,8 @@ try {
         foreach($ending in $endings) {
             # One case failing to run is that case's failure, not the others'.
             $tabs=if($ending.Tabs){$ending.Tabs}else{1}
-            try { Last-Window $ending.Name $ending.Name $tabs @($ending.Extra | Where-Object { $_ }) }
+            $end=if($ending.End){$ending.End}else{$ending.Name}
+            try { Last-Window $ending.Name $end $tabs @($ending.Extra | Where-Object { $_ }) -SetAside:([bool]$ending.SetAside) }
             catch { $script:checks.Add(@{Name="$($ending.Name): case ran"; Passed=$false; Error=$_.Exception.Message}) }
         }
     }

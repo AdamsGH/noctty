@@ -1122,17 +1122,29 @@ checkpoints use the same ownership, scrollback opt-in and sensitive-input
 exclusions as the save when the last window goes; startup restoration
 completes before checkpointing is enabled.
 
-The saved session is what the last window held just before it went, however
-it went: its close button, Alt+F4 or the taskbar, `close_window`, the X of its
-only tab, `close_tab:this` on its last tab (saved as the tab closes, not when
-its undo time runs out), `close_surface` on its last pane, its last shell
-exiting, `quit`, `close_all_windows`, or an update install. The quick terminal
-is never a session window, and neither is a window left empty after its last
-tab closed, which stays only for undo. Undo history is never saved: a tab or
-pane closed while other tabs or windows stayed open does not come back on the
-next launch, even if noctty quits before its undo time runs out. Undoing the
-close of the last tab, or opening a new tab or window, continues the session.
-No save deletes the file: with no window to record, a save writes nothing.
+The saved session is what was open when the session ended, taken just before
+it went. When windows close one at a time, that is what the last window held,
+however it went: its close button, Alt+F4 or the taskbar, `close_window`, the
+X of its only tab, `close_tab:this` on its last tab (saved as the tab closes,
+not when its undo time runs out), `close_surface` on its last pane, or its last
+shell exiting. A `quit`, `close_all_windows` or an update install saves every
+window it closes. The quick terminal is never a session window, and neither is
+a window left empty after its last tab closed, which stays only for undo. Undo
+history is never saved: a tab or pane closed while other tabs or windows stayed
+open does not come back on the next launch, even if noctty quits before its
+undo time runs out. Undoing the close of the last tab, or opening a new tab or
+window, continues the session. No save deletes the file: with no window to
+record, a save writes nothing.
+
+One exception: when everything the session holds as it ends is panes the saved
+session put there whose programs ended by themselves before any key or click
+reached them (a WSL distribution that fails to start, say), that restore
+failed, and saving it back would open and close it again at every launch.
+noctty then renames the saved session to `session-state.json.restore-failed`
+(or `.1` up to `.4`) instead, as it does for a session that keeps ending the
+process while it is restored, and the next launch opens a fresh window. Rename
+the file back to try that session again. With all five names taken, the file is
+left where it is.
 The save at sign-out, shutdown or reboot is the last one: the sign-out also
 ends the shells, and the panes they leave are not saved over it. A launch that forwards
 to a running noctty, a window opened with `--working-directory` (Explorer's

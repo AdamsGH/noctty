@@ -198,7 +198,8 @@ dumps, and SSH host cache go there.
   environment variables write diagnostic traces to the files you name.
 - **Housekeeping:** `.lock` files beside some of these, a `.corrupt` copy of
   any session or layout file Noctty could not read, and a `.restore-failed`
-  copy of a saved session that repeatedly stopped Noctty while restoring it
+  copy of a saved session that repeatedly stopped Noctty while restoring it,
+  or whose restored panes all ended by themselves before any input
   (up to five copies of each; older `.restore-failed` copies are never
   replaced).
 
