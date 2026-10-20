@@ -593,6 +593,29 @@ if ($recoveryCanaryCalls.Count -ne 1 -or
     throw 'Interrupted High Contrast recovery must retain its marker until the fresh-process presentation canary succeeds.'
 }
 
+# The accessibility harness restores High Contrast just before this one in the
+# release job, so a fresh-process presentation proof must come before the
+# story's first window and first screen-pixel read (EVIDENCE-PIXEL-DIAG-01).
+$paletteMainStatements = @($paletteMainTry.Body.Statements)
+$preflightCanaryCalls = @(Get-NamedCommands -Ast $paletteMainTry.Body -Name 'Invoke-PostHighContrastPresentationCanary' |
+    Where-Object { Test-CommandHasStringArgument -Command $_ -Value 'palette-theme-preflight-canary' })
+$preflightCanaryIndex = if ($preflightCanaryCalls.Count -eq 1) {
+    [Array]::IndexOf($paletteMainStatements, (Get-DirectStatementBlockChild -Node $preflightCanaryCalls[0] -StatementBlock $paletteMainTry.Body))
+} else { -1 }
+$firstStoryIndex = -1
+for ($statementIndex = 0; $statementIndex -lt $paletteMainStatements.Count; $statementIndex++) {
+    $storyStart = @(Get-NamedCommands -Ast $paletteMainStatements[$statementIndex] -Name 'Start-StatefulApp' |
+        Where-Object { Test-CommandHasStringArgument -Command $_ -Value 'palette-theme-normal' })
+    $pixelReads = @(Get-NamedCommands -Ast $paletteMainStatements[$statementIndex] -Name 'Get-StatefulPixel')
+    if ($storyStart.Count -ne 0 -or $pixelReads.Count -ne 0) { $firstStoryIndex = $statementIndex; break }
+}
+if ($preflightCanaryCalls.Count -ne 1 -or $preflightCanaryIndex -lt 0 -or $firstStoryIndex -lt 0 -or
+    $preflightCanaryIndex -ge $firstStoryIndex -or
+    $preflightCanaryCalls[0].CommandElements.Count -ne 3 -or
+    (Get-VariableExpressionName -Node $preflightCanaryCalls[0].CommandElements[2]) -ne 'draculaRgb') {
+    throw 'Palette theme must prove fresh-process Dracula presentation before its story starts and before any screen-pixel read.'
+}
+
 if ($paletteThemeHarnessText -notmatch
         [regex]::Escape('SystemParametersInfo(0x42, $activeHc.cbSize, [ref]$activeHc, 0)') -or
     $paletteThemeHarnessText -notmatch

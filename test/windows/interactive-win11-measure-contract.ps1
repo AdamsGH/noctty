@@ -100,8 +100,13 @@ $sourceReceipt = [ordered]@{
 [void] [IO.Directory]::CreateDirectory((Split-Path -Parent $layout.Exe))
 [IO.File]::WriteAllText($layout.Exe, 'synthetic non-PE executable receipt fixture')
 [IO.File]::WriteAllText($layout.Cli, 'synthetic non-PE console shim fixture')
+$measureBuildArguments = (Get-InteractiveWin11MeasureBuildArguments 'Debug') -join ' '
+if ($measureBuildArguments -cne '-Demit-exe=true -Dcustom-shaders=true -Doptimize=Debug') {
+    throw 'The measurement build must carry custom shader support for the job''s shader leaves.'
+}
 $buildReceipt = [ordered]@{
-    Schema = 2; State = 'complete'; Head = $script:measureContractHead; RepoRoot = $layout.Repo
+    Schema = 3; State = 'complete'; Head = $script:measureContractHead; RepoRoot = $layout.Repo
+    BuildArguments = $measureBuildArguments
     Patch = $sourceReceipt.Patch; Aumid = 'io.github.amanthanvi.noctty.measure'
     NotifierAumid = $sourceReceipt.NotifierAumid
     ArchiveSHA256 = $sourceReceipt.ArchiveSHA256
@@ -239,6 +244,14 @@ $buildReceipt.Aumid = 'io.github.amanthanvi.noctty'
 [IO.File]::WriteAllText($layout.Receipt, ($buildReceipt | ConvertTo-Json))
 Assert-MeasureContractRejected 'product identity receipt' { Assert-MeasureFixture }
 $buildReceipt.Aumid = 'io.github.amanthanvi.noctty.measure'
+$buildReceipt.BuildArguments = '-Demit-exe=true -Doptimize=Debug'
+[IO.File]::WriteAllText($layout.Receipt, ($buildReceipt | ConvertTo-Json))
+Assert-MeasureContractRejected 'build without custom shaders' { Assert-MeasureFixture }
+$buildReceipt.BuildArguments = $measureBuildArguments
+$buildReceipt.Schema = 2
+[IO.File]::WriteAllText($layout.Receipt, ($buildReceipt | ConvertTo-Json))
+Assert-MeasureContractRejected 'schema 2 receipt that does not bind build arguments' { Assert-MeasureFixture }
+$buildReceipt.Schema = 3
 [IO.File]::WriteAllText($layout.Receipt, ($buildReceipt | ConvertTo-Json))
 $heldLock = [IO.File]::Open((Join-Path $layout.Root 'build.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 try { Assert-MeasureContractRejected 'in-progress build lock' { Assert-MeasureFixture } }

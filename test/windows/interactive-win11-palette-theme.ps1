@@ -136,6 +136,10 @@ try {
         $originalHc = [InteractiveWin11WindowNative+HIGHCONTRAST]::new(); $originalHc.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($originalHc)
         if (-not [InteractiveWin11WindowNative]::SystemParametersInfo(0x42, $originalHc.cbSize, [ref]$originalHc, 0)) { throw 'SPI_GETHIGHCONTRAST failed.' }
     }
+    # In the release job the accessibility harness turns High Contrast off just
+    # before this one runs. Prove that a fresh process presents the configured
+    # theme before the first pixel assertion, retrying once with a new process.
+    Invoke-PostHighContrastPresentationCanary 'palette-theme-preflight-canary' $draculaRgb
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $run = Start-StatefulApp $layout $exe $repoRoot 'palette-theme-normal'; $runs.Add($run)
     $hostHwnd = Wait-StatefulHost $run $deadline
