@@ -1609,6 +1609,9 @@ pub const SettingsWindow = struct {
     close_prompt_measure_quitting: bool = false,
     close_prompt_measure_height: i32 = 0,
     fields: FieldWindows = std.mem.zeroes(FieldWindows),
+    /// The sections whose rows exist. `open` makes the selected section's; the
+    /// others are made the first time they are shown (`materializeSection`).
+    materialized: std.EnumSet(Section) = .initEmpty(),
     active_section: Section = .appearance,
     dpi: u32 = 96,
     /// Class atoms lazily registered the first time `open` runs.
@@ -2745,37 +2748,41 @@ pub const SettingsWindow = struct {
         self.releaseTextUiaProviders();
         self.text_uia_prev_proc = null;
         if (!self.canInitializeCustomUiaProviders()) return;
-        for (0..settings_text_count) |index| {
-            const text = self.textHwnd(index) orelse continue;
-            const role: SettingsControlRole = switch (index) {
-                text_status_index, text_close_prompt_index => .live_text,
-                else => .text,
-            };
-            const provider = win32_uia.SettingsControlProvider.create(std.heap.page_allocator, text, role, null) catch |err| {
-                std.log.warn("settings text UIA provider unavailable index={} err={}", .{ index, err });
-                continue;
-            };
-            const previous = sys.SetWindowLongPtrW(
-                text,
-                GWLP_WNDPROC,
-                @as(LONG_PTR, @intCast(@intFromPtr(&settingsTextProc))),
-            );
-            if (previous == 0) {
-                _ = win32_uia.SettingsControlProvider.Release(&provider.base);
-                continue;
-            }
-            const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
-            if (self.text_uia_prev_proc) |existing| {
-                if (existing != proc) {
-                    _ = sys.SetWindowLongPtrW(text, GWLP_WNDPROC, previous);
-                    _ = win32_uia.SettingsControlProvider.Release(&provider.base);
-                    continue;
-                }
-            } else {
-                self.text_uia_prev_proc = proc;
-            }
-            self.text_uia_providers[index] = provider;
+        for (0..settings_text_count) |index| self.attachTextUiaProvider(index);
+    }
+
+    /// The UIA provider of text `index`, if that text exists. The caller
+    /// checks that custom providers are enabled.
+    fn attachTextUiaProvider(self: *SettingsWindow, index: usize) void {
+        const text = self.textHwnd(index) orelse return;
+        const role: SettingsControlRole = switch (index) {
+            text_status_index, text_close_prompt_index => .live_text,
+            else => .text,
+        };
+        const provider = win32_uia.SettingsControlProvider.create(std.heap.page_allocator, text, role, null) catch |err| {
+            std.log.warn("settings text UIA provider unavailable index={} err={}", .{ index, err });
+            return;
+        };
+        const previous = sys.SetWindowLongPtrW(
+            text,
+            GWLP_WNDPROC,
+            @as(LONG_PTR, @intCast(@intFromPtr(&settingsTextProc))),
+        );
+        if (previous == 0) {
+            _ = win32_uia.SettingsControlProvider.Release(&provider.base);
+            return;
         }
+        const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
+        if (self.text_uia_prev_proc) |existing| {
+            if (existing != proc) {
+                _ = sys.SetWindowLongPtrW(text, GWLP_WNDPROC, previous);
+                _ = win32_uia.SettingsControlProvider.Release(&provider.base);
+                return;
+            }
+        } else {
+            self.text_uia_prev_proc = proc;
+        }
+        self.text_uia_providers[index] = provider;
     }
 
     fn releaseControlUiaProviders(self: *SettingsWindow) void {
@@ -2801,6 +2808,7 @@ pub const SettingsWindow = struct {
     /// it, for a window that is gone.
     fn forgetFormWindows(self: *SettingsWindow) void {
         self.fields = .{};
+        self.materialized = .initEmpty();
         self.viewport = null;
         self.framed_invalid_field = null;
         self.help_shown = false;
@@ -2882,31 +2890,38 @@ pub const SettingsWindow = struct {
                 break :blk null;
             };
         }
-        for (settings_control_specs, 0..) |spec, index| {
-            const control = self.controlHwnd(index) orelse continue;
-            const provider = win32_uia.SettingsControlProvider.create(
-                std.heap.page_allocator,
-                control,
-                spec.role,
-                spec.name,
-            ) catch |err| {
-                std.log.warn("settings control UIA provider unavailable index={} err={}", .{ index, err });
-                continue;
-            };
-            const previous = sys.SetWindowLongPtrW(
-                control,
-                GWLP_WNDPROC,
-                @as(LONG_PTR, @intCast(@intFromPtr(&settingsControlProc))),
-            );
-            if (previous == 0) {
-                _ = win32_uia.SettingsControlProvider.Release(&provider.base);
-                continue;
-            }
-            provider.help_text = spec.help;
-            self.control_uia_prev_procs[index] = @ptrFromInt(@as(usize, @intCast(previous)));
-            self.control_uia_providers[index] = provider;
-            if (spec.role == .combo_box) SettingsComboPopup.attach(control);
+        for (0..settings_control_count) |index| self.attachControlUiaProvider(index);
+    }
+
+    /// The UIA provider of control `index`, if that control exists. It
+    /// subclasses the control, so a dropdown's or a text field's own subclass
+    /// has to be installed first. The caller checks that custom providers are
+    /// enabled.
+    fn attachControlUiaProvider(self: *SettingsWindow, index: usize) void {
+        const control = self.controlHwnd(index) orelse return;
+        const spec = settings_control_specs[index];
+        const provider = win32_uia.SettingsControlProvider.create(
+            std.heap.page_allocator,
+            control,
+            spec.role,
+            spec.name,
+        ) catch |err| {
+            std.log.warn("settings control UIA provider unavailable index={} err={}", .{ index, err });
+            return;
+        };
+        const previous = sys.SetWindowLongPtrW(
+            control,
+            GWLP_WNDPROC,
+            @as(LONG_PTR, @intCast(@intFromPtr(&settingsControlProc))),
+        );
+        if (previous == 0) {
+            _ = win32_uia.SettingsControlProvider.Release(&provider.base);
+            return;
         }
+        provider.help_text = spec.help;
+        self.control_uia_prev_procs[index] = @ptrFromInt(@as(usize, @intCast(previous)));
+        self.control_uia_providers[index] = provider;
+        if (spec.role == .combo_box) SettingsComboPopup.attach(control);
     }
 
     fn sectionButton(self: *const SettingsWindow, section: Section) ?HWND {
@@ -2990,8 +3005,10 @@ pub const SettingsWindow = struct {
     /// they are still hidden, swapped in for the old ones, and painted before
     /// this returns, so no frame shows a field that has not drawn itself yet.
     /// Only the form and the header text repaint; the frame window does not.
+    /// The first time a section is shown its rows are made here, hidden.
     fn setActiveSection(self: *SettingsWindow, next: Section) void {
         const changed = self.active_section != next;
+        self.materializeSection(next);
         self.active_section = next;
         if (self.section_uia_group) |group| group.setSelected(@intFromEnum(next));
         self.content_scroll_y = 0;
@@ -4256,8 +4273,10 @@ pub const SettingsWindow = struct {
     /// Open settings at the exact native control that owns `field`.
     pub fn openField(self: *SettingsWindow, field: SettingField) !void {
         try self.open();
+        const section = self.settingDestination(field).section;
+        self.setActiveSection(section);
+        // Asked again: the section's rows may have been made just now.
         const destination = self.settingDestination(field);
-        self.setActiveSection(destination.section);
         if (destination.hwnd) |control| {
             self.ensureControlVisible(control);
             // Unsupported controls are disabled: focus stays on the section.
@@ -4506,42 +4525,9 @@ pub const SettingsWindow = struct {
         // have help.
         var help_buf: [help_text_bytes]u8 = undefined;
         self.text_help = self.finishChild(makeStatic(form, hinstance, self.helpText(&help_buf), WS_GROUP), self.ui_font, .control);
-        // Each section's rows in the order they are laid out, a label right
-        // before its control. A section's first row, a label and its control,
-        // and a row next to text start an arrow-key group, so the arrows never
-        // run from one section into the next or onto a static row.
-        var previous_text = false;
-        inline for (comptime std.enums.values(Section)) |section| {
-            const visible: u32 = if (section == selected) WS_VISIBLE else 0;
-            inline for (comptime formItemsForSection(section), 0..) |item, index| {
-                const spec = comptime settings_control_specs[item.control_index];
-                const text = comptime spec.role == .text;
-                var group = formGroupStarts(index, previous_text, text);
-                if (item.label_index) |i| {
-                    self.field_labels[i] = self.finishChild(makeStatic(form, hinstance, spec.label.?, visible | WS_GROUP), self.secondary_font, .control);
-                    if (self.field_labels[i] != null) group = true;
-                }
-                const style: u32 = visible | if (group) WS_GROUP else 0;
-                if (comptime item.control_index < field_model.form_fields.len) {
-                    const row = comptime field_model.form_fields[item.control_index];
-                    @field(self.fields, spec.binding) = switch (comptime row.kind()) {
-                        .choice => makeCombo(form, hinstance, spec.id, settings_combo_popup_height, &field_model.Combo(row.field.?).labels, style),
-                        .boolean, .blur => makeCheckbox(form, hinstance, spec.id, std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), style),
-                        else => makeEdit(form, hinstance, spec.id, style | if (row.kind() == .integer) ES_NUMBER else 0),
-                    };
-                    if (@field(self.fields, spec.binding)) |control| {
-                        if (row.descriptor.support != .available) _ = sys.EnableWindow(control, 0);
-                        if (spec.role == .edit and row.descriptor.placeholder.len != 0)
-                            _ = sys.SendMessageW(control, 0x1501, 0, @bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(row.descriptor.placeholder)))); // EM_SETCUEBANNER
-                    }
-                } else {
-                    @field(self.fields, spec.binding) = makeDisplayControl(form, hinstance, spec, style);
-                }
-                const font = if (comptime spec.role == .check_box) self.secondary_font else self.ui_font;
-                if (self.finishChild(@field(self.fields, spec.binding), font, if (comptime spec.role == .combo_box) .combo else .control) != null)
-                    previous_text = text;
-            }
-        }
+        // Only the selected section's rows: the others are made the first
+        // time they are shown (`materializeSection`).
+        self.createSectionRows(selected, true);
         self.initializeTextUiaProviders();
         stamps.mark(.create_form);
 
@@ -4562,18 +4548,7 @@ pub const SettingsWindow = struct {
         self.btn_close_keep_editing = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Keep editing"), BTN_CLOSE_KEEP_EDITING, 112, 0), self.ui_font, .control);
         stamps.mark(.create_actions);
 
-        // Painted field labels keep the native dark visual treatment, while
-        // MSAA annotations give the existing EDIT/COMBO HWNDs stable names
-        // through the UI Automation bridge. Values remain owned by the native
-        // controls and are not conflated with their accessible names.
-        annotateAccessibleControls(self);
-        // Before the UIA providers: they subclass the same HWNDs and call
-        // down to whatever procedure is installed when they arrive.
-        for (self.comboControls()) |combo| if (combo) |control| subclassKeepingPrevious(control, &settingsComboProc);
-        for (self.editControls()) |edit| if (edit) |control| subclassKeepingPrevious(control, &settingsEditProc);
-        // The stock EDIT answered the frame request at creation; the
-        // subclass owns it now.
-        self.refreshFieldFrames();
+        self.prepareSectionRows(selected);
         stamps.mark(.create_annotate);
         // Establish native values before providers cache their initial state.
         self.refreshAllControls();
@@ -4587,6 +4562,150 @@ pub const SettingsWindow = struct {
         _ = sys.SetForegroundWindow(hwnd);
         if (self.sectionButton(selected)) |button| _ = sys.SetFocus(button);
         stamps.mark(.create_end);
+    }
+
+    /// Make `section`'s rows the first time it is shown, hidden: the caller
+    /// lays them out and shows them with the rest of the section
+    /// (`setActiveSection`). Each row gets what `open` gives the selected
+    /// section's rows, from the window's current draft, theme, fonts and DPI,
+    /// so a section first shown late ends up as one made at open would.
+    fn materializeSection(self: *SettingsWindow, section: Section) void {
+        if (self.materialized.contains(section) or self.viewport == null) return;
+        self.createSectionRows(section, false);
+        const providers = self.canInitializeCustomUiaProviders();
+        if (providers) for (formItemsForSection(section)) |item| {
+            if (item.label_index) |index| self.attachTextUiaProvider(text_first_label_index + index);
+        };
+        self.prepareSectionRows(section);
+        // Values before the providers, which cache their initial state.
+        self.displaySectionRows(section);
+        if (providers) for (formItemsForSection(section)) |item| self.attachControlUiaProvider(item.control_index);
+    }
+
+    /// Make `section`'s labels and controls in the viewport, each in its final
+    /// form (`finishChild`), in the order they are laid out: a label right
+    /// before its control. A section's first row, a label and its control, and
+    /// a row next to text start an arrow-key group, so the arrows never run
+    /// from one section into the next or onto a static row.
+    ///
+    /// Tab and the arrow keys follow z-order, and a new window goes to the
+    /// bottom of it. So when a later section's rows already exist, each new
+    /// row is moved in behind the one before it, starting after the rows of
+    /// the nearest earlier section: in whatever order the sections are first
+    /// shown, the viewport ends up as if they had all been made in order.
+    fn createSectionRows(self: *SettingsWindow, section: Section, visible: bool) void {
+        const form = self.viewport orelse return;
+        const hinstance = self.handle.hinstance;
+        const shown: u32 = if (visible) WS_VISIBLE else 0;
+        var order: RowOrder = if (self.laterSectionMaterialized(section))
+            .{ .insert = true, .after = self.lastFormWindowBefore(section) }
+        else
+            .{ .insert = false, .after = null };
+        var previous_text = false;
+        switch (section) {
+            inline else => |made| inline for (comptime formItemsForSection(made), 0..) |item, index| {
+                const spec = comptime settings_control_specs[item.control_index];
+                const text = comptime spec.role == .text;
+                var group = formGroupStarts(index, previous_text, text);
+                if (item.label_index) |i| {
+                    self.field_labels[i] = self.finishChild(makeStatic(form, hinstance, spec.label.?, shown | WS_GROUP), self.secondary_font, .control);
+                    order.place(self.field_labels[i]);
+                    if (self.field_labels[i] != null) group = true;
+                }
+                const style: u32 = shown | if (group) WS_GROUP else 0;
+                if (comptime item.control_index < field_model.form_fields.len) {
+                    const row = comptime field_model.form_fields[item.control_index];
+                    @field(self.fields, spec.binding) = switch (comptime row.kind()) {
+                        .choice => makeCombo(form, hinstance, spec.id, settings_combo_popup_height, &field_model.Combo(row.field.?).labels, style),
+                        .boolean, .blur => makeCheckbox(form, hinstance, spec.id, std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), style),
+                        else => makeEdit(form, hinstance, spec.id, style | if (row.kind() == .integer) ES_NUMBER else 0),
+                    };
+                    if (@field(self.fields, spec.binding)) |control| {
+                        if (row.descriptor.support != .available) _ = sys.EnableWindow(control, 0);
+                        if (spec.role == .edit and row.descriptor.placeholder.len != 0)
+                            _ = sys.SendMessageW(control, 0x1501, 0, @bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(row.descriptor.placeholder)))); // EM_SETCUEBANNER
+                    }
+                } else {
+                    @field(self.fields, spec.binding) = makeDisplayControl(form, hinstance, spec, style);
+                }
+                const font = if (comptime spec.role == .check_box) self.secondary_font else self.ui_font;
+                if (self.finishChild(@field(self.fields, spec.binding), font, if (comptime spec.role == .combo_box) .combo else .control)) |control| {
+                    order.place(control);
+                    previous_text = text;
+                }
+            },
+        }
+        self.materialized.insert(section);
+    }
+
+    /// Where the next row goes in the viewport's z-order.
+    const RowOrder = struct {
+        /// Rows are moved only when a later section's rows exist; otherwise a
+        /// new window already lands where it belongs, at the bottom.
+        insert: bool,
+        /// The window the next row goes behind.
+        after: ?HWND,
+
+        fn place(self: *RowOrder, window: ?HWND) void {
+            const row = window orelse return;
+            if (!self.insert) return;
+            _ = SetWindowPos(row, self.after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            self.after = row;
+        }
+    };
+
+    fn laterSectionMaterialized(self: *const SettingsWindow, section: Section) bool {
+        for (std.enums.values(Section)) |other| {
+            if (@intFromEnum(other) > @intFromEnum(section) and self.materialized.contains(other)) return true;
+        }
+        return false;
+    }
+
+    /// The viewport window that `section`'s rows follow: the last row of the
+    /// nearest earlier section that has rows, or else the help text, the
+    /// viewport's first window.
+    fn lastFormWindowBefore(self: *const SettingsWindow, section: Section) ?HWND {
+        var earlier = @intFromEnum(section);
+        while (earlier > 0) {
+            earlier -= 1;
+            if (!self.materialized.contains(@enumFromInt(earlier))) continue;
+            const items = formItemsForSection(@enumFromInt(earlier));
+            var index = items.len;
+            while (index > 0) {
+                index -= 1;
+                if (self.controlHwnd(items[index].control_index)) |control| return control;
+                if (items[index].label_index) |label| if (self.field_labels[label]) |window| return window;
+            }
+        }
+        return self.text_help;
+    }
+
+    /// What a section's rows need once they exist: the names MSAA clients
+    /// read for its text fields and dropdowns, then their subclasses, then
+    /// each text field's frame. The subclasses come before the UIA providers,
+    /// which subclass the same windows and call down to whatever procedure is
+    /// installed when they arrive; and the stock EDIT answered the frame
+    /// request at creation, which its subclass owns now.
+    fn prepareSectionRows(self: *SettingsWindow, section: Section) void {
+        annotateAccessibleControls(self, section);
+        const items = formItemsForSection(section);
+        for (items) |item| if (settings_control_specs[item.control_index].role == .combo_box) {
+            if (self.controlHwnd(item.control_index)) |control| subclassKeepingPrevious(control, &settingsComboProc);
+        };
+        for (items) |item| if (settings_control_specs[item.control_index].role == .edit) {
+            if (self.controlHwnd(item.control_index)) |control| subclassKeepingPrevious(control, &settingsEditProc);
+        };
+        for (items) |item| if (settings_control_specs[item.control_index].role == .edit) {
+            if (self.controlHwnd(item.control_index)) |control|
+                _ = SetWindowPos(control, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        };
+    }
+
+    /// Show the draft's values in `section`'s controls.
+    fn displaySectionRows(self: *SettingsWindow, section: Section) void {
+        inline for (field_model.form_fields) |row| {
+            if (nativeSection(row.descriptor.section) == section) @field(field_adapters, row.native.binding).display(self);
+        }
     }
 };
 
@@ -4655,20 +4774,29 @@ fn setAccessibleName(service: *IAccPropServices, hwnd_opt: ?HWND, comptime name:
     }
 }
 
-fn annotateAccessibleControls(self: *SettingsWindow) void {
-    const service = createAccPropServices() orelse {
-        std.log.warn("settings: accessibility annotation service unavailable", .{});
-        return;
-    };
-    defer service.release();
-
+/// Painted field labels keep the native dark visual treatment, while MSAA
+/// annotations give `section`'s EDIT and COMBOBOX windows stable names through
+/// the UI Automation bridge. Values remain owned by the native controls and
+/// are not conflated with their accessible names.
+fn annotateAccessibleControls(self: *SettingsWindow, section: Section) void {
     // The names the custom UIA providers serve, so a client that falls back to
     // MSAA (`customUiaProvidersEnabled` false) hears the same ones. Only for
     // the fields and dropdowns, whose captions are separate labels. A checkbox
     // or button already speaks its own caption, and a name that leaves the
     // caption out breaks voice control ("click Discard changes").
+    const named = for (formItemsForSection(section)) |item| {
+        const role = settings_control_specs[item.control_index].role;
+        if (role == .edit or role == .combo_box) break true;
+    } else false;
+    if (!named) return;
+    const service = createAccPropServices() orelse {
+        std.log.warn("settings: accessibility annotation service unavailable", .{});
+        return;
+    };
+    defer service.release();
     inline for (settings_control_specs, 0..) |spec, index| {
-        if (spec.role == .edit or spec.role == .combo_box) setAccessibleName(service, self.controlHwnd(index), spec.name);
+        if ((spec.role == .edit or spec.role == .combo_box) and spec.section == section)
+            setAccessibleName(service, self.controlHwnd(index), spec.name);
     }
 }
 
@@ -5653,7 +5781,7 @@ test "settings open stamps each creation step once when traced" {
     }.body);
 }
 
-test "settings open creates each window once in its final form" {
+test "settings open and a first visit create each window once in its final form" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
             const Work = dialog_test.OpenWork;
@@ -5673,9 +5801,10 @@ test "settings open creates each window once in its final form" {
                 std.debug.print("settings open: {d} windows, {d} messages to them\n", .{ tree.len, totals.messages });
                 Work.print(&tree);
             }
-            // The frame, its 19 children (one is the viewport) and the
-            // viewport's 52.
-            try std.testing.expectEqual(@as(usize, 72), tree.len);
+            // The frame, its 19 children (one is the viewport), and in the
+            // viewport the help text and Appearance's 11 fields and 9 labels.
+            // The other sections' 31 rows are made when they are first shown.
+            try std.testing.expectEqual(@as(usize, 41), tree.len);
             for (tree.slice()) |hwnd| {
                 const counts = Work.of(hwnd);
                 try std.testing.expectEqual(@as(u16, 1), counts.created);
@@ -5695,6 +5824,51 @@ test "settings open creates each window once in its final form" {
             }
             // The fonts are built once, before any child, and the theme
             // notifications the children send back rebuild nothing.
+            try std.testing.expectEqual(@as(u32, 1), settings.font_builds);
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+
+            // A section's first visit makes its rows the same way, hidden until
+            // the switch shows them. Privacy comes after every section made so
+            // far, so its rows land where they belong; Terminal comes before
+            // Privacy, so each of its rows is moved in once, behind Appearance's.
+            const visits = [_]struct { section: Section, windows: usize, moved: u16 }{
+                .{ .section = .privacy, .windows = 12, .moved = 0 },
+                .{ .section = .terminal, .windows = 7, .moved = 1 },
+            };
+            for (visits) |visit| {
+                errdefer std.debug.print("settings first visit to {s}\n", .{@tagName(visit.section)});
+                try Work.measureStep(settings, .{ .show = visit.section });
+                try std.testing.expect(!Work.overflowed);
+                var made: usize = 0;
+                var lists: usize = 0;
+                for (Work.created()) |counts| {
+                    errdefer Work.print(&Work.Tree.of(fixture.hwnd()));
+                    try std.testing.expectEqual(@as(u16, 1), counts.created);
+                    // A dropdown's list is a window of its own, outside the tree.
+                    if (IsChild(settings.viewport.?, counts.hwnd) == 0) {
+                        lists += 1;
+                        continue;
+                    }
+                    made += 1;
+                    try std.testing.expectEqual(visit.moved, counts.z_moves);
+                    try std.testing.expectEqual(@as(u16, 0), counts.style_rewrites);
+                    try std.testing.expectEqual(@as(u16, 0), counts.hidden);
+                    try std.testing.expectEqual(@as(u16, 1), counts.shown);
+                    try std.testing.expectEqual(@as(u16, 1), counts.fonts);
+                    if (totals.themes != 0) try std.testing.expectEqual(@as(u16, 1), counts.themes);
+                    try std.testing.expectEqual(@as(u16, @intFromBool(settings.isEditControl(counts.hwnd))), counts.frame_changes);
+                }
+                try std.testing.expectEqual(visit.windows, made);
+                var combos: usize = 0;
+                for (formItemsForSection(visit.section)) |item| combos += @intFromBool(settings_control_specs[item.control_index].role == .combo_box);
+                try std.testing.expectEqual(combos, lists);
+            }
+            // A section shown before makes nothing.
+            try Work.measureStep(settings, .{ .show = .privacy });
+            try std.testing.expectEqual(@as(usize, 0), Work.created().len);
+            // Every section shown: the whole form, and still one font build.
+            for (std.enums.values(Section)) |section| settings.setActiveSection(section);
+            try std.testing.expectEqual(@as(usize, 72), Work.Tree.of(fixture.hwnd()).len);
             try std.testing.expectEqual(@as(u32, 1), settings.font_builds);
             try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
         }
@@ -5731,6 +5905,129 @@ test "settings open on any section ends as a switch to it would leave it" {
                 }
                 settings.closeNow(fixture.hwnd());
             }
+        }
+    }.body);
+}
+
+test "settings sections shown in any order leave the window as one made whole at open" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            // Later sections first, so most rows are moved in behind earlier
+            // ones; then back to where the window opened.
+            const order = [_]Section{ .advanced, .shell, .privacy, .terminal, .keybindings, .updates, .appearance };
+            var states: [2]State = undefined;
+            var providers: [2][settings_control_count + settings_text_count]bool = undefined;
+            for ([_]bool{ true, false }, 0..) |whole, index| {
+                const fixture = try dialog_test.Fixture.startWith(true);
+                defer fixture.finish();
+                const settings = &fixture.settings;
+                // Every section made at open, in order, as before sections
+                // were made when first shown.
+                if (whole) dialog_test.makeAllSections(settings);
+                for (order) |section| settings.setActiveSection(section);
+                states[index] = State.of(settings);
+                for (0..settings_control_count) |control| providers[index][control] = settings.control_uia_providers[control] != null;
+                for (0..settings_text_count) |text| providers[index][settings_control_count + text] = settings.text_uia_providers[text] != null;
+            }
+            // Every window in the same z-order, with the same styles, place,
+            // client area, check, dropdown heights, text and font, and every
+            // field and text with its UIA provider.
+            try std.testing.expectEqual(@as(usize, 72), states[0].len);
+            try State.expectSame(&states[0], &states[1]);
+            try std.testing.expectEqual(providers[0], providers[1]);
+            for (providers[1]) |provided| try std.testing.expect(provided);
+        }
+    }.body);
+}
+
+test "settings a section first shown after a DPI or High Contrast change looks as one made at open" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            const Change = enum { dpi, high_contrast };
+            const sections = comptime std.enums.values(Section);
+            for (std.enums.values(Change)) |change| {
+                errdefer std.debug.print("settings after a {s} change\n", .{@tagName(change)});
+                var states: [2][sections.len]State = undefined;
+                var pixels: [2][sections.len]u64 = undefined;
+                for ([_]bool{ true, false }, 0..) |whole, index| {
+                    const fixture = try dialog_test.Fixture.start();
+                    defer fixture.finish();
+                    const settings = &fixture.settings;
+                    if (whole) dialog_test.makeAllSections(settings);
+                    switch (change) {
+                        .dpi => dialog_test.simulateDpi(fixture.hwnd(), 144),
+                        .high_contrast => {
+                            fixture.high_contrast = true;
+                            settings.themeChanged();
+                        },
+                    }
+                    for (sections, 0..) |section, at| {
+                        settings.setActiveSection(section);
+                        dialog_test.flushPaint(fixture.hwnd());
+                        // What is shown: hidden rows of other sections are
+                        // the difference between the two windows.
+                        const all = State.of(settings);
+                        states[index][at] = all.shown();
+                        const capture = try dialog_test.Capture.take(fixture.hwnd());
+                        defer capture.deinit();
+                        pixels[index][at] = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(capture.pixels));
+                    }
+                }
+                for (sections, 0..) |section, at| {
+                    errdefer std.debug.print("settings on {s}\n", .{@tagName(section)});
+                    try State.expectSame(&states[0][at], &states[1][at]);
+                    try std.testing.expectEqual(pixels[0][at], pixels[1][at]);
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings a field in a section not shown yet is reached by openField, UIA and a config change" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try std.testing.expect(settings.fields.combo_clipboard_read == null);
+            try std.testing.expect(settings.fields.edit_scrollback == null);
+
+            // A file edit before Privacy is first shown: its dropdown shows
+            // the new value when it is made.
+            var disk = try Config.default(std.testing.allocator);
+            defer disk.deinit();
+            disk.@"clipboard-read" = .allow;
+            settings.externalConfigChanged(&disk, 100);
+            try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+            // The palette's setting rows open on the field itself.
+            try settings.openField(.clipboard_write);
+            const write = settings.fields.combo_clipboard_write.?;
+            try std.testing.expectEqual(write, sys.GetFocus().?);
+            try std.testing.expect(sys.IsWindowVisible(write) != 0);
+            try std.testing.expectEqual(
+                @as(LRESULT, @intCast(field_model.Combo(.clipboard_read).toIndex(.allow))),
+                sys.SendMessageW(settings.fields.combo_clipboard_read.?, CB_GETCURSEL, 0, 0),
+            );
+            try std.testing.expect(settings.control_uia_providers[settings.controlIndex(write).?] != null);
+
+            // UIA selects a section the way a click does, inside the window
+            // procedure, and its rows are there and shown when Select returns.
+            const updates = settings.sectionProvider(.updates).?;
+            try std.testing.expectEqual(win32_uia.S_OK, updates.selection_iface.vtbl.Select(&updates.selection_iface));
+            try std.testing.expectEqual(Section.updates, settings.active_section);
+            try std.testing.expect(sys.IsWindowVisible(settings.fields.combo_auto_update.?) != 0);
+
+            // Opened again on a section of its own, a field elsewhere makes
+            // that section and the field's, and no other.
+            settings.closeNow(fixture.hwnd());
+            settings.active_section = .advanced;
+            try settings.openField(.scrollback_limit);
+            try std.testing.expectEqual(settings.fields.edit_scrollback.?, sys.GetFocus().?);
+            try std.testing.expect(settings.fields.btn_open_editor != null);
+            try std.testing.expect(settings.fields.edit_command == null);
+            try std.testing.expect(settings.fields.edit_font_size == null);
         }
     }.body);
 }
@@ -6061,6 +6358,7 @@ test "settings an invalid field marks its rail section, the title and UIA" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const hwnd = fixture.hwnd();
             const Marker = win32_uia.SettingsSectionMarker;
 
@@ -6143,6 +6441,7 @@ test "settings status and close prompt are live regions" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const Role = win32_uia.SettingsControlProvider.Role;
 
             try std.testing.expectEqual(Role.live_text, settings.text_uia_providers[text_status_index].?.role);
@@ -6201,6 +6500,7 @@ test "settings a failed Save and close is spoken when the prompt goes away" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const events = win32_uia.events;
 
             _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
@@ -6434,18 +6734,19 @@ test "SET correcting shown invalid scalars preserves Discard for unsaved values"
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
-            const cases = [_]struct { field: RawScalarField, edit: HWND, value: []const u8 }{
-                .{ .field = .font_size, .edit = settings.fields.edit_font_size.?, .value = "16" },
-                .{ .field = .background_opacity, .edit = settings.fields.edit_bg_opacity.?, .value = "0.5" },
-                .{ .field = .scrollback_limit, .edit = settings.fields.edit_scrollback.?, .value = "12345" },
-                .{ .field = .window_padding_x, .edit = settings.fields.edit_pad_x.?, .value = "9" },
-                .{ .field = .window_padding_y, .edit = settings.fields.edit_pad_y.?, .value = "11" },
+            const cases = [_]struct { field: RawScalarField, value: []const u8 }{
+                .{ .field = .font_size, .value = "16" },
+                .{ .field = .background_opacity, .value = "0.5" },
+                .{ .field = .scrollback_limit, .value = "12345" },
+                .{ .field = .window_padding_x, .value = "9" },
+                .{ .field = .window_padding_y, .value = "11" },
             };
             for (cases) |case| {
                 settings.setActiveSection(settings.rawScalarDestination(case.field).section);
+                const edit = settings.rawScalarEdit(case.field).?;
                 var saved_buffer: [128]u8 = undefined;
-                const saved = readEditUtf8(case.edit, &saved_buffer).?;
-                typeInto(case.edit, "");
+                const saved = readEditUtf8(edit, &saved_buffer).?;
+                typeInto(edit, "");
                 settings.showRawScalarErrors(null);
                 try std.testing.expectEqual(case.field, settings.active_raw_validation.?);
                 settings.discardChanges();
@@ -6453,7 +6754,7 @@ test "SET correcting shown invalid scalars preserves Discard for unsaved values"
 
                 // Clearing raw validation must not briefly hide this question
                 // before the valid value reaches the typed transaction.
-                typeInto(case.edit, case.value);
+                typeInto(edit, case.value);
                 try std.testing.expect(settings.hasPendingChanges());
                 try std.testing.expect(!settings.hasRawScalarEdits());
                 try std.testing.expect(settings.validation_control == null);
@@ -6467,15 +6768,15 @@ test "SET correcting shown invalid scalars preserves Discard for unsaved values"
 
                 // A correction back to the saved value really is clean, and
                 // may dismiss the question without taking focus from typing.
-                typeInto(case.edit, "");
+                typeInto(edit, "");
                 settings.showRawScalarErrors(null);
                 settings.discardChanges();
                 try std.testing.expect(settings.discard_prompt);
-                _ = sys.SetFocus(case.edit);
-                typeInto(case.edit, saved);
+                _ = sys.SetFocus(edit);
+                typeInto(edit, saved);
                 try std.testing.expect(!settings.hasPendingChanges());
                 try std.testing.expect(!settings.close_prompt_visible);
-                try std.testing.expectEqual(case.edit, sys.GetFocus().?);
+                try std.testing.expectEqual(edit, sys.GetFocus().?);
             }
         }
     }.body);
@@ -7687,6 +7988,12 @@ const dialog_test = struct {
         _ = SendMessageW(hwnd, WM_DPICHANGED, (@as(usize, dpi) << 16) | dpi, @bitCast(@intFromPtr(&rect)));
     }
 
+    /// Make every section's rows, as if each had been shown once, for a test
+    /// that reaches into sections it does not show.
+    fn makeAllSections(settings: *SettingsWindow) void {
+        for (std.enums.values(Section)) |section| settings.materializeSection(section);
+    }
+
     /// Dispatch the messages that are queued for this thread: posted ones and
     /// a timer that has come due.
     fn pump() void {
@@ -7826,6 +8133,8 @@ const dialog_test = struct {
         /// Whether a live preview writes into `config`, as the App's does into
         /// `app.config`, which is what `currentConfig` hands back.
         live_previews: bool = false,
+        /// What the window's High Contrast probe answers.
+        high_contrast: bool = false,
 
         fn start() !*Fixture {
             return startWith(false);
@@ -7862,6 +8171,7 @@ const dialog_test = struct {
                 .notifySuccess = &notifySuccess,
                 .customUiaProvidersEnabled = &customUia,
                 .previewField = &previewField,
+                .highContrast = &highContrast,
                 .onClosed = &onClosed,
             });
             self.settings.wheel_lines_override = 3;
@@ -7908,6 +8218,11 @@ const dialog_test = struct {
         fn customUia(ctx: *anyopaque) bool {
             const self: *Fixture = @ptrCast(@alignCast(ctx));
             return self.custom_uia;
+        }
+
+        fn highContrast(ctx: *anyopaque) bool {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            return self.high_contrast;
         }
 
         fn notifySuccess(_: *anyopaque, _: []const u8, _: []const u8) void {}
@@ -8046,6 +8361,13 @@ const dialog_test = struct {
 
         /// Open `settings` with the hooks installed.
         fn measure(settings: *SettingsWindow) !void {
+            try measureStep(settings, .open);
+        }
+
+        const Step = union(enum) { open, show: Section };
+
+        /// Run `step` with the hooks installed, counting from zero.
+        fn measureStep(settings: *SettingsWindow, step: Step) !void {
             seen_len = 0;
             overflowed = false;
             const thread = sys.GetCurrentThreadId();
@@ -8053,7 +8375,23 @@ const dialog_test = struct {
             defer _ = UnhookWindowsHookEx(creation_hook);
             const message_hook = SetWindowsHookExW(WH_CALLWNDPROC, &sent, null, thread) orelse return error.HookUnavailable;
             defer _ = UnhookWindowsHookEx(message_hook);
-            try settings.open();
+            switch (step) {
+                .open => try settings.open(),
+                .show => |section| settings.setActiveSection(section),
+            }
+        }
+
+        /// The windows the last measured step created.
+        fn created() []const Counts {
+            const Storage = struct {
+                var windows: [256]Counts = undefined;
+            };
+            var len: usize = 0;
+            for (seen[0..seen_len]) |counts| if (counts.created != 0) {
+                Storage.windows[len] = counts;
+                len += 1;
+            };
+            return Storage.windows[0..len];
         }
 
         /// The window's tree: the window itself first, then its descendants.
@@ -8120,8 +8458,13 @@ const dialog_test = struct {
             hwnd: HWND,
             id: c_int,
             style: u32,
+            /// Relative to the Settings window's rectangle.
             rect: RECT,
+            /// The client area's size: a text field's frame insets show here.
+            client: [2]i32,
             check: usize,
+            /// A dropdown's selection-field and list item heights.
+            items: [2]isize,
             text: u64,
             font: Font,
         };
@@ -8135,13 +8478,19 @@ const dialog_test = struct {
 
         fn of(settings: *const SettingsWindow) OpenState {
             const tree = OpenWork.Tree.of(settings.hwnd.?);
+            var origin: RECT = undefined;
+            _ = GetWindowRect(settings.hwnd.?, &origin);
             var state: OpenState = .{};
             for (tree.slice()) |hwnd| {
                 var rect: RECT = undefined;
                 _ = GetWindowRect(hwnd, &rect);
+                var client: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                _ = GetClientRect(hwnd, &client);
                 var class_w: [16]u16 = undefined;
                 const class_len = GetClassNameW(hwnd, &class_w, class_w.len);
-                const button = std.mem.eql(u16, class_w[0..@intCast(@max(0, class_len))], std.unicode.utf8ToUtf16LeStringLiteral("Button"));
+                const class = class_w[0..@intCast(@max(0, class_len))];
+                const button = std.mem.eql(u16, class, std.unicode.utf8ToUtf16LeStringLiteral("Button"));
+                const combo = std.mem.eql(u16, class, std.unicode.utf8ToUtf16LeStringLiteral("ComboBox"));
                 var text_w: [2048]u16 = undefined;
                 const text_len = sys.GetWindowTextW(hwnd, &text_w, text_w.len);
                 const font: HGDIOBJ = @ptrFromInt(@as(usize, @bitCast(sys.SendMessageW(hwnd, WM_GETFONT, 0, 0))));
@@ -8149,8 +8498,13 @@ const dialog_test = struct {
                     .hwnd = hwnd,
                     .id = sys.GetDlgCtrlID(hwnd),
                     .style = styleOf(hwnd) & kept_styles,
-                    .rect = rect,
+                    .rect = .{ .left = rect.left - origin.left, .top = rect.top - origin.top, .right = rect.right - origin.left, .bottom = rect.bottom - origin.top },
+                    .client = .{ client.right, client.bottom },
                     .check = if (button) @bitCast(sys.SendMessageW(hwnd, BM_GETCHECK, 0, 0)) else 0,
+                    .items = if (combo) .{
+                        sys.SendMessageW(hwnd, CB_GETITEMHEIGHT, std.math.maxInt(WPARAM), 0),
+                        sys.SendMessageW(hwnd, CB_GETITEMHEIGHT, 0, 0),
+                    } else .{ 0, 0 },
                     .text = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(text_w[0..@intCast(@max(0, text_len))])),
                     .font = if (font == null) .none else if (font == settings.ui_font) .ui else if (font == settings.secondary_font) .secondary else if (font == settings.emphasis_font) .emphasis else if (font == settings.header_font) .header else .other,
                 };
@@ -8163,9 +8517,32 @@ const dialog_test = struct {
             return self.windows[0..self.len];
         }
 
+        /// The windows shown now, which the user sees and reaches: what a
+        /// section looks like does not depend on the hidden rows of others.
+        fn shown(self: *const OpenState) OpenState {
+            var result: OpenState = .{};
+            for (self.slice()) |window| if (window.style & WS_VISIBLE != 0) {
+                result.windows[result.len] = window;
+                result.len += 1;
+            };
+            return result;
+        }
+
+        /// Two windows' states, `a` and `b`, the same in everything but the
+        /// handle: two Settings windows built two ways.
+        fn expectSame(a: *const OpenState, b: *const OpenState) !void {
+            try std.testing.expectEqual(a.len, b.len);
+            for (a.slice(), b.slice()) |first, second| {
+                var other = second;
+                other.hwnd = first.hwnd;
+                errdefer print(first, second);
+                try std.testing.expectEqualDeep(first, other);
+            }
+        }
+
         fn print(at_open: Window, after_switch: Window) void {
-            std.debug.print("  id={d} at open: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) text={x}\n", .{ at_open.id, at_open.style, at_open.check, @tagName(at_open.font), at_open.rect.left, at_open.rect.top, at_open.rect.right, at_open.rect.bottom, at_open.text });
-            std.debug.print("  id={d} switched: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) text={x}\n", .{ after_switch.id, after_switch.style, after_switch.check, @tagName(after_switch.font), after_switch.rect.left, after_switch.rect.top, after_switch.rect.right, after_switch.rect.bottom, after_switch.text });
+            std.debug.print("  id={d} at open: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) client={d}x{d} items={d},{d} text={x}\n", .{ at_open.id, at_open.style, at_open.check, @tagName(at_open.font), at_open.rect.left, at_open.rect.top, at_open.rect.right, at_open.rect.bottom, at_open.client[0], at_open.client[1], at_open.items[0], at_open.items[1], at_open.text });
+            std.debug.print("  id={d} switched: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) client={d}x{d} items={d},{d} text={x}\n", .{ after_switch.id, after_switch.style, after_switch.check, @tagName(after_switch.font), after_switch.rect.left, after_switch.rect.top, after_switch.rect.right, after_switch.rect.bottom, after_switch.client[0], after_switch.client[1], after_switch.items[0], after_switch.items[1], after_switch.text });
         }
     };
 };
@@ -8420,14 +8797,28 @@ test "settings generated form labels immediately precede their controls" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            // Sections are made when first shown. Later ones first, so the
+            // rows of most sections are made after rows that follow them.
+            for ([_]Section{ .advanced, .shell, .privacy, .terminal, .keybindings, .updates }) |section| {
+                settings.setActiveSection(section);
+            }
+            // Tab and the arrow keys follow z-order: the help text, then each
+            // section's rows in order, a label right before its control, as if
+            // every section had been made at once.
+            const GW_HWNDNEXT: UINT = 2;
+            const GW_CHILD: UINT = 5;
+            var window = sys.GetWindow(settings.viewport.?, GW_CHILD);
+            try std.testing.expectEqual(settings.text_help.?, window.?);
             for (std.enums.values(Section)) |section| for (formItemsForSection(section)) |item| {
+                errdefer std.debug.print("settings form order breaks in {s} at control {d}\n", .{ @tagName(section), item.control_index });
                 if (item.label_index) |index| {
-                    try std.testing.expectEqual(
-                        settings.field_labels[index].?,
-                        sys.GetWindow(settings.controlHwnd(item.control_index).?, 3).?, // GW_HWNDPREV
-                    );
+                    window = sys.GetWindow(window.?, GW_HWNDNEXT);
+                    try std.testing.expectEqual(settings.field_labels[index].?, window.?);
                 }
+                window = sys.GetWindow(window.?, GW_HWNDNEXT);
+                try std.testing.expectEqual(settings.controlHwnd(item.control_index).?, window.?);
             };
+            try std.testing.expectEqual(@as(?HWND, null), sys.GetWindow(window.?, GW_HWNDNEXT));
         }
     }.body);
 }
@@ -8740,6 +9131,7 @@ test "settings fields, labels and help live in a viewport that clips them" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const hwnd = fixture.hwnd();
 
             const viewport = sys.GetParent(settings.fields.edit_font_size.?).?;
@@ -8843,6 +9235,7 @@ test "settings dropdowns are as tall as text fields and the text sits in the mid
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const hwnd = fixture.hwnd();
 
             for ([_]u32{ 144, 96, 192, 288 }) |dpi| {
@@ -9154,6 +9547,12 @@ test "settings viewport stays out of the UIA control view" {
             const provider = settings.viewport_uia_provider.?;
             try std.testing.expectEqual(settings.viewport.?, provider.hwnd);
             try std.testing.expectEqual(win32_uia.SettingsControlProvider.Role.layout_pane, provider.role);
+            // Each control that exists has its provider: the action bar and
+            // the shown section's at open, the rest once their section is.
+            for (0..settings_control_count) |index| {
+                try std.testing.expectEqual(settings.controlHwnd(index) != null, settings.control_uia_providers[index] != null);
+            }
+            dialog_test.makeAllSections(settings);
             for (0..settings_control_count) |index| try std.testing.expect(settings.control_uia_providers[index] != null);
         }
     }.body);
@@ -9401,6 +9800,7 @@ test "settings labels fit on one line in the narrowest two-column lane" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             for ([_]u32{ 96, 144, 192 }) |dpi| {
                 dialog_test.simulateDpi(fixture.hwnd(), dpi);
                 const lane = @divTrunc(scaleForDpi(settings_two_column_min_width, dpi) - scaleForDpi(settings_column_gap, dpi), 2);
@@ -9527,6 +9927,7 @@ test "settings dropdowns list the text of their labels in order" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
 
             const Case = struct { combo: ?HWND, labels: []const []const u8 };
             const cases = [_]Case{
@@ -9593,6 +9994,7 @@ test "settings descriptor support matches every native editor enabled state" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             inline for (field_model.descriptors) |spec| {
                 const expected_enabled = spec.support == .available;
                 if (spec.field) |field| {
@@ -9621,9 +10023,10 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
             var combos: usize = 0;
             for (settings_control_specs, 0..) |spec, index| {
                 if (spec.role != .check_box and spec.role != .combo_box) continue;
+                // A section's controls and their providers exist once it is shown.
+                settings.setActiveSection(settings.controlSection(index).?);
                 const provider = settings.control_uia_providers[index].?;
                 const control = settings.controlHwnd(index).?;
-                settings.setActiveSection(settings.controlSection(index).?);
                 settings.ensureControlVisible(control);
                 const events = @import("win32_uia/events.zig");
                 const changes_before = events.testing_property_changes;
@@ -9735,6 +10138,7 @@ test "CHROME unsupported settings are disabled and UIA names explain why" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
 
             for ([_]HWND{ settings.fields.chk_bg_blur.?, settings.fields.combo_link_previews.? }) |control| {
                 try std.testing.expect(sys.IsWindowEnabled(control) == 0);
@@ -9759,10 +10163,12 @@ test "CHROME unsupported link previews retain their config value and palette foc
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            // Privacy has not been shown yet: its dropdown shows the draft's
+            // value when it is made.
+            try std.testing.expect(settings.fields.combo_link_previews == null);
             settings.pending.?.@"link-previews" = .osc8;
-            settings.displayCombo(.link_previews);
-            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(settings.fields.combo_link_previews.?, CB_GETCURSEL, 0, 0));
             try settings.openField(.link_previews);
+            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(settings.fields.combo_link_previews.?, CB_GETCURSEL, 0, 0));
             try std.testing.expectEqual(Section.privacy, settings.active_section);
             try std.testing.expectEqual(settings.sectionButton(.privacy).?, sys.GetFocus().?);
             try std.testing.expectEqual(@as(@FieldType(Config, "link-previews"), .osc8), settings.pending.?.@"link-previews");
@@ -9783,6 +10189,7 @@ test "settings status line says whether an edit previews or waits for a save" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             var buf: [256]u8 = undefined;
 
             // Nothing edited: the disabled Save says why in words.
@@ -9843,6 +10250,7 @@ test "settings outcome messages show over a conflict and do not outlive their ed
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             var buf: [256]u8 = undefined;
 
             _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
