@@ -183,10 +183,11 @@ checksummed and bound to the canonical release workflow by GitHub build
 provenance. The legacy `SHA256SUMS.txt` file remains an x64 auto-update
 compatibility alias.
 
-A Chocolatey package (`noctty`) is built by the release workflow but has not
-been published yet, so `choco install noctty` does not work today. It will
-after the first push clears chocolatey.org moderation, which can take weeks;
-until a version is approved, later pushes are refused with `403`. See
+A Chocolatey package (`noctty`) is built by the release workflow, but
+chocolatey.org has no approved version of it, so `choco install noctty` does
+not work today. Another community account owns the `noctty` id there, and
+chocolatey.org refuses this repository's pushes with `403` until the id is
+handed over and a version is approved; see
 [chocolatey-publishing.md](chocolatey-publishing.md).
 
 [getting-started.md](getting-started.md) covers download and install,
