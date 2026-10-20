@@ -1142,8 +1142,9 @@ the panes it still holds has ended by itself (a WSL distribution that fails to
 start, say), saving it back would open and close it again at every launch.
 "Used" means input reached a pane while its program ran: a key, a click, the
 mouse wheel, a paste or drop, a command run from the command palette, or text
-sent by automation. Opening a tab, pane, window or the quick terminal counts
-too. A key pressed in a pane whose program has already ended only closes it,
+sent by automation (`+send-text`). Opening a tab, pane, window or the quick
+terminal counts too. An action sent with `+perform-action` counts only when
+it opens one of those: it cannot send input to a program. A key pressed in a pane whose program has already ended only closes it,
 and does not count. When the session ends that way, noctty renames the saved
 session to `session-state.json.restore-ended` (or `.1` up to `.4`) instead of
 saving it, writes no checkpoint for it meanwhile, and the next launch opens a

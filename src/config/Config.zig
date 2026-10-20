@@ -2314,9 +2314,9 @@ keybind: Keybinds = .{},
 /// The next launch restores what was open when the session ended; undo
 /// history is not saved, and no save deletes the file. One exception: a
 /// session restored at startup that nothing used (no input reached a running
-/// program, and no tab, pane or window was opened) and whose programs all
-/// ended by themselves is not saved back, since it would open and close
-/// again at every launch. Its saved file is renamed to
+/// program, and no tab, pane, window or quick terminal was opened) and
+/// whose programs all ended by themselves is not saved back, since it would
+/// open and close again at every launch. Its saved file is renamed to
 /// `session-state.json.restore-ended` instead (up to five copies; with all
 /// five taken it is left in place), and the next launch starts fresh.
 /// Checkpoints use the same ownership and privacy rules as the save when the

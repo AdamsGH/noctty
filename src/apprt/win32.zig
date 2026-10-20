@@ -2879,21 +2879,21 @@ pub const App = struct {
     test_failed_restores_set_aside: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     /// Set only in the process that restored the saved session, or was
     /// eligible to and started with its first window instead. Only that
-    /// process saves or deletes `session-state.json`: a launch that forwarded
-    /// to the primary, an Explorer "Open noctty here" window, an `-Embedding`
-    /// handoff server or a second `single-instance = false` instance never
-    /// loaded it, so writing their own windows (or none) over it destroys the
-    /// user's workspace.
+    /// process saves `session-state.json` or moves it aside: a launch that
+    /// forwarded to the primary, an Explorer "Open noctty here" window, an
+    /// `-Embedding` handoff server or a second `single-instance = false`
+    /// instance never loaded it, so writing their own windows over it
+    /// destroys the user's workspace.
     session_owner: ?SessionOwnerLock = null,
     /// The saved session is not this build's to replace: a newer build wrote
     /// it, or it is larger than any session this build writes. This process
     /// neither restores it nor takes ownership, so it never saves over it or
-    /// deletes it.
+    /// moves it aside.
     session_state_left_alone: bool = false,
     /// Set once WM_ENDSESSION(TRUE) has saved for a sign-out, shutdown or
     /// reboot. That snapshot is final: shells the logoff kills afterwards
     /// close their panes, and the saves those closes would run must not
-    /// shrink or delete it.
+    /// shrink it or move it aside.
     session_ending: bool = false,
     /// `GetTickCount64` of the last `checkpointSessionState`.
     session_checkpoint_ms: ?u64 = null,
@@ -3185,9 +3185,10 @@ pub const App = struct {
         // Be asked to end before the shells under it. Every process starts at
         // the default level 0x280, and Windows ends processes on one level
         // in no set order, so a sign-out could otherwise end the shells
-        // first: each pane closes, the last window goes, and `terminate`
-        // would delete the saved session before WM_ENDSESSION could save
-        // it. A higher level is ended first.
+        // first: each pane closes, and the last one's close would save a
+        // shrunken snapshot (or move aside a restore nobody had used) before
+        // WM_ENDSESSION could save the whole session. A higher level is
+        // ended first.
         if (sys.SetProcessShutdownParameters(0x2FF, 0) == 0) {
             log.warn("win32 SetProcessShutdownParameters failed err={}", .{windows.GetLastError()});
         }
@@ -3465,7 +3466,7 @@ pub const App = struct {
             }
         } else if (!self.embedding_mode and self.config.@"initial-window") {
             // Ownership starts only once the first window exists: a launch
-            // that fails here must not delete, on its way out, the session
+            // that fails here must not save over, on its way out, the session
             // it could not bring back, and a save while restore is half done
             // would keep only the windows restored so far.
             const owner_lock = if (self.sessionRestoreEligible()) self.acquireSessionOwnerLock() else null;
@@ -3829,8 +3830,8 @@ pub const App = struct {
 
     fn sessionStateEnabled(self: *const App) bool {
         // Only the owner, the process that was eligible to restore the saved
-        // session and then got its first window, may replace or delete it.
-        // The restore policy is re-checked so a config reload
+        // session and then got its first window, may replace it or move it
+        // aside. The restore policy is re-checked so a config reload
         // (window-save-state = never) still stops it.
         return self.session_owner != null and self.sessionRestoreEligible();
     }
@@ -3881,7 +3882,7 @@ pub const App = struct {
         // an empty window list here says nothing about what the user closed.
         // Latched even when the save fails: any later save would come from
         // panes closing as their shells die, and could only shrink the
-        // previous snapshot or, from `terminate` with no hosts, delete it.
+        // previous snapshot or move it aside as a restore nobody used.
         _ = self.saveSessionState(.checkpoint);
         self.session_ending = true;
     }
@@ -37093,8 +37094,8 @@ pub const Surface = struct {
             error.TestGLContextFailed,
             app.createWindowSurface(&app.config, default_title, .{}),
         );
-        // No window opened, so `terminate` must keep that snapshot rather
-        // than delete the session for an app with no windows.
+        // No window opened, so that snapshot must stand: no checkpoint may
+        // write over it until a terminal opens.
         try std.testing.expect(app.session_state_saved_before_last_host_close);
         const host_hwnd = Stage.host_hwnd.?;
         defer if (sys.IsWindow(host_hwnd) != 0) {
@@ -53942,8 +53943,8 @@ test "win32 session state is saved only by the process that owns it" {
     app.config.@"initial-command" = null;
 
     // A launch that forwarded to the primary, lost the IPC race or failed
-    // before its first window never took the session, and with no windows
-    // its save would delete it.
+    // before its first window never took the session, and must not save
+    // its own windows over it.
     app.session_owner = null;
     try std.testing.expect(!app.sessionStateEnabled());
 
