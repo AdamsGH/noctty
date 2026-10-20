@@ -33298,8 +33298,27 @@ fn bannerMessageDurationMs() UINT {
 /// before a harness can read it through UIA; the renderer harness's OpenGL
 /// startup fallback case sets this switch so it can read the banner.
 fn infoBannersExpire() bool {
-    if (comptime !build_config.renderer_test_tools) return true;
+    return infoBannersExpireIn(build_config.renderer_test_tools);
+}
+
+/// `infoBannersExpire` for a build with or without test tools, so that the
+/// default test build, which is what CI runs, checks both.
+fn infoBannersExpireIn(comptime test_tools: bool) bool {
+    if (!test_tools) return true;
     return !std.process.hasEnvVarConstant("NOCTTY_RENDERER_KEEP_NOTICES");
+}
+
+test "infoBannersExpire reads NOCTTY_RENDERER_KEEP_NOTICES only with test tools" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_RENDERER_KEEP_NOTICES");
+    defer _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+    _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+    try std.testing.expect(infoBannersExpireIn(true));
+    try std.testing.expect(infoBannersExpireIn(false));
+    if (windows.kernel32.SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) == 0) return lastError();
+    try std.testing.expect(!infoBannersExpireIn(true));
+    try std.testing.expect(infoBannersExpireIn(false));
+    try std.testing.expectEqual(infoBannersExpireIn(build_config.renderer_test_tools), infoBannersExpire());
 }
 
 /// Mouse on a banner button, or null for a message it leaves alone. The
