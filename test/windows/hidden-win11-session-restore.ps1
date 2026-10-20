@@ -9,7 +9,8 @@ app reads or writes is a sample this script creates beside a portable copy of
 the app: the real %LOCALAPPDATA%\noctty is never written or deleted, and only
 the hash and time of its startup state file are read, before and after. Never switches desktops,
 injects real input or registers a global hotkey (the last-window cases press
-in-app keybinds with key messages sent to the pane, and one case clicks it), and nothing it does can copy (the
+in-app keybinds with key messages sent to the pane, one case sends an arrow, one only Shift, and one clicks
+the pane), and nothing it does can copy (the
 clipboard belongs to the window station, not the desktop); the clipboard sequence number is logged
 before and after and a change fails the run. Optional
 ExpectedStartupHash/ExpectedStartupModified pin an adopted baseline.
@@ -275,7 +276,7 @@ function Stop-Case($case) {
 $lastWindowConfig=@('keybind = f2=new_window','keybind = f3=close_all_windows','keybind = f4=new_tab','keybind = f5=close_tab:this',
     'keybind = f6=close_surface','keybind = f7=quit','keybind = f8=toggle_quick_terminal','keybind = f9=undo',
     'quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%')
-$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78; Down=0x28 }
+$Vk=@{ NewWindow=0x71; CloseAll=0x72; NewTab=0x73; CloseTab=0x74; CloseSurface=0x75; Quit=0x76; QuickTerminal=0x77; Undo=0x78; Down=0x28; Shift=0x10 }
 # The pane that is on screen in `$h`, or any pane when none is.
 function Pane($h) {
     $all=@([HiddenLocal]::Surfaces($h)); $shown=@($all|Where-Object {([Sr]::Read($_)).Visible})
@@ -350,6 +351,11 @@ function Last-Window([string]$Name,[string]$End,[int]$Tabs=1,[string[]]$Extra=@(
                 # The same with a click instead of a key.
                 [Sr]::Click((Pane $main))
             }
+            'shell-exit-modifier' {
+                # Only Shift, pressed and released while the program runs:
+                # a modifier alone is not input for it.
+                Press (Pane $main) $Vk.Shift 0
+            }
             'quick-terminal-quit' {
                 Post-Close $main
                 if(-not (Wait-Until { -not [Sr]::Alive($main) } 8)) { throw "$($Name): window did not close." }
@@ -418,6 +424,8 @@ try {
             @{ Name='shell-exit-clicked'; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul','copy-on-select = false') },
             # The same with no key: that restore failed, and is moved aside.
             @{ Name='shell-exit-untouched'; End='shell-exit'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
+            # The same with only Shift pressed and released: still unused.
+            @{ Name='shell-exit-modifier'; SetAside=$true; Extra=@('command = cmd.exe /d /c ping -n 12 127.0.0.1 >nul') },
             @{ Name='quit' },
             @{ Name='close-all-windows' },
             # A quick terminal is never a session window: the last real window
@@ -556,7 +564,7 @@ try {
 } finally {
     $remaining=@($script:processes | Where-Object {Get-Process -Id $_.Pid -ErrorAction SilentlyContinue})
     Check 'owned runtime processes exited' ($remaining.Count -eq 0) 0 $remaining.Count
-    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, in-app keybinds pressed with key messages sent to the pane, and one click sent to a pane; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
+    @{Checks=$script:checks; Samples=$script:samples; Processes=$script:processes; Limit='Win32 window state on a never-switched desktop with sample session files written by this script, in-app keybinds, one arrow and one Shift pressed with key messages sent to the pane, and one click sent to a pane; real pointer and keyboard input, typed shell input, an update install, a top or left taskbar and a removed monitor are not exercised (a missing monitor is a rect where none is).'} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Run 'session-results.json')
 }
 $failed=@($script:checks|Where-Object {-not $_.Passed})
 if($failed.Count){ $failed | ForEach-Object { Write-Host ("FAIL: " + $_.Name) }; exit 1 }
