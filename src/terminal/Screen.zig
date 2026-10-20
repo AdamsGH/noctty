@@ -11898,6 +11898,42 @@ test "Screen: last-command extracts most recent completed semantic regions" {
     try testing.expectEqualStrings("  Write-Output second", command);
 }
 
+test "Screen: last-command survives a prompt on the top row after reset" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 40, .rows = 8, .max_scrollback = 1000 });
+    defer s.deinit();
+    try s.testWriteString("before reset");
+
+    // RIS leaves the cursor at the top-left on the pin the page reset
+    // marked garbage. The prompt and output pins below copy it, and a
+    // garbage prompt or output pin makes the record unavailable.
+    s.reset();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("PS> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.semanticPromptStartInput();
+    try s.testWriteString("Write-Output first");
+    s.cursorSetSemanticContent(.output);
+    try s.semanticPromptStartOutput();
+    try s.testWriteString("\nfirst output");
+    try s.semanticPromptEndCommand();
+
+    // Fail rather than panic on null, so a run without the fix still
+    // reports the tests after this one.
+    const output = try s.lastCommandOutputString(alloc) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(output);
+    try testing.expectEqualStrings("first output", output);
+
+    const command = try s.lastCommandString(alloc) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(command);
+    try testing.expectEqualStrings("Write-Output first", command);
+}
+
 test "Screen: last-command has no region without shell integration or D" {
     const testing = std.testing;
     const alloc = testing.allocator;
