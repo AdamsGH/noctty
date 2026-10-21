@@ -3034,11 +3034,11 @@ pub const App = struct {
     pending_toast_activation: ?win32_toast_activation.ActivationTarget = null,
     /// The command line's one-shot `--launch-layout=<name>`, which `run`
     /// opens instead of the first window (or forwards to the running
-    /// instance). Owned. `init` moves it here out of the app config
+    /// instance). `init` moves it here out of the app config
     /// (`claimStartupLaunchLayout`), because every app config change drops
     /// `launch-layout` as a request already honored, and on a dark system
     /// `init`'s own color-scheme sync is one.
-    startup_launch_layout: ?[]u8 = null,
+    startup_launch_layout: StartupLaunchLayout = .none,
     /// Ephemeral recovery launch: default config, no saved workspace restore.
     safe_mode: bool = false,
     /// COM SCM activation for the Windows default-terminal handoff server.
@@ -3347,6 +3347,17 @@ pub const App = struct {
         }
     }
 
+    pub const StartupLaunchLayout = union(enum) {
+        none,
+        /// Owned by `core_app.alloc`.
+        name: []u8,
+        /// Asked for, but the name could not be copied. Still a layout
+        /// request: taken for none, it would make the launch restore and own
+        /// the session, open nothing under `initial-window = false`, or
+        /// forward as a plain new window.
+        lost,
+    };
+
     /// Move the command line's `launch-layout` out of the app config into
     /// `startup_launch_layout`, for `run`. Left in the config, it would not
     /// last until `run`: the `.app` `config_change` arm drops it from every
@@ -3354,11 +3365,49 @@ pub const App = struct {
     /// a dark system the color-scheme sync at the end of `init` soft-reloads.
     fn claimStartupLaunchLayout(self: *App) void {
         const name = self.config.@"launch-layout" orelse return;
-        self.startup_launch_layout = self.core_app.alloc.dupe(u8, name) catch |err| owned: {
-            log.err("startup launch-layout dropped err={}", .{err});
-            break :owned null;
+        self.startup_launch_layout = if (self.core_app.alloc.dupe(u8, name)) |owned|
+            .{ .name = owned }
+        else |err| lost: {
+            log.warn("startup launch-layout name could not be kept err={}", .{err});
+            break :lost .lost;
         };
         forgetLaunchLayout(&self.config);
+    }
+
+    /// Done with the startup layout request, tried or not.
+    fn releaseStartupLaunchLayout(self: *App) void {
+        switch (self.startup_launch_layout) {
+            .name => |name| self.core_app.alloc.free(name),
+            .none, .lost => {},
+        }
+        self.startup_launch_layout = .none;
+    }
+
+    /// Open the command line's layout as the first window, if it asked for
+    /// one, and say whether it did. It is honored even when `initial-window`
+    /// is disabled, because the user asked for this exact window, and it
+    /// takes the place of session restore. It is also one-shot: `init` took
+    /// it out of the app config, every config installed since drops it
+    /// (`forgetLaunchLayout`), and it is released here once tried, so later
+    /// ordinary new windows and reloads cannot replay it. A layout that
+    /// cannot be opened, or whose name was lost, gets an ordinary window
+    /// that says so.
+    fn openStartupLaunchLayout(self: *App) !bool {
+        const launched = switch (self.startup_launch_layout) {
+            .none => return false,
+            .name => |name| self.launchNamedLayout(name, null),
+            .lost => false,
+        };
+        self.releaseStartupLaunchLayout();
+        if (!launched) {
+            // Handled, as for a skipped restore window.
+            gl_startup.clearOpenGLStartupFailure();
+            try self.createWindow(default_title);
+            if (self.primarySurface()) |surface| if (surface.host) |host| {
+                host.setBanner(.err, "Layout could not be opened.") catch {};
+            };
+        }
+        return true;
     }
 
     /// Drop a command-line `launch-layout` from `config`, which is about to
@@ -3483,26 +3532,11 @@ pub const App = struct {
         // instances' attempts, this one is no longer the last in memory.
         var initial_windows_created = false;
         errdefer if (!initial_windows_created) self.markRecoveryOpenGLUnavailable();
-        if (!self.embedding_mode and self.startup_launch_layout != null) {
-            const name = self.startup_launch_layout.?;
-            // An explicit CLI layout request is honored even when
-            // `initial-window` is disabled, because the user asked for this
-            // exact window. It is also one-shot: `init` took it out of the
-            // app config, every config installed since drops it
-            // (`forgetLaunchLayout`), and it is gone from here once tried,
-            // so later ordinary new windows and reloads cannot replay it.
-            const launched = self.launchNamedLayout(name, null);
-            self.core_app.alloc.free(name);
-            self.startup_launch_layout = null;
-            if (!launched) {
-                // Handled, as for a skipped restore window.
-                gl_startup.clearOpenGLStartupFailure();
-                try self.createWindow(default_title);
-                if (self.primarySurface()) |surface| if (surface.host) |host| {
-                    host.setBanner(.err, "Layout could not be opened.") catch {};
-                };
-            }
-        } else if (!self.embedding_mode and self.config.@"initial-window") {
+        if (self.embedding_mode) {
+            // Every window comes from a terminal handoff.
+        } else if (try self.openStartupLaunchLayout()) {
+            // The command line's layout, or the window saying it failed.
+        } else if (self.config.@"initial-window") {
             // Ownership starts only once the first window exists: a launch
             // that fails here must not save over, on its way out, the session
             // it could not bring back, and a save while restore is half done
@@ -3517,7 +3551,7 @@ pub const App = struct {
                     if (surface.host) |host| _ = host.toggleProfileOverlay();
                 }
             }
-        } else if (!self.embedding_mode) {
+        } else {
             log.info("initial-window is disabled; win32 runtime waiting without a window", .{});
         }
         initial_windows_created = true;
@@ -3795,10 +3829,7 @@ pub const App = struct {
             self.startup_cwd = null;
         }
         // Still set when `run` forwarded the launch or never got that far.
-        if (self.startup_launch_layout) |name| {
-            self.core_app.alloc.free(name);
-            self.startup_launch_layout = null;
-        }
+        self.releaseStartupLaunchLayout();
         deinitImeWindowFormsTracePath(self.core_app.alloc);
         self.config.deinit();
         if (self.com_initialized) {
@@ -47859,7 +47890,7 @@ test "win32 a command-line launch-layout outlasts the color-scheme sync that end
         try session.init(.{ .core_app = &core_app, .app = &app });
         defer session.deinit();
         defer testFreeConfigProblems(&app, alloc);
-        defer if (app.startup_launch_layout) |name| alloc.free(name);
+        defer app.releaseStartupLaunchLayout();
 
         try testLoadStartupArgv(&app, &.{"--launch-layout=shot"});
         if (case.conditional) app.config._conditional_set.insert(.theme);
@@ -47887,8 +47918,10 @@ test "win32 a command-line launch-layout outlasts the color-scheme sync that end
         // `run` still has the layout to open (before the fix it read the
         // app config, which had lost it here), and the config has nothing
         // of it for a reload or a window to bring back.
-        const claimed = app.startup_launch_layout orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("shot", claimed);
+        switch (app.startup_launch_layout) {
+            .name => |claimed| try std.testing.expectEqualStrings("shot", claimed),
+            .none, .lost => return error.TestUnexpectedResult,
+        }
         try testExpectNoLaunchLayout(&app.config);
     }
 }
@@ -47927,14 +47960,14 @@ test "win32 a reload after run took the startup launch-layout does not bring it 
     try session.init(.{ .core_app = &core_app, .app = &app });
     defer session.deinit();
     defer testFreeConfigProblems(&app, alloc);
-    defer if (app.startup_launch_layout) |name| alloc.free(name);
+    defer app.releaseStartupLaunchLayout();
 
     const argv: []const []const u8 = &.{"--launch-layout=Project Alpha"};
     try testLoadStartupArgv(&app, argv);
     app.claimStartupLaunchLayout();
+    try std.testing.expect(app.startup_launch_layout == .name);
     // As `run` does once it has tried the layout.
-    alloc.free(app.startup_launch_layout.?);
-    app.startup_launch_layout = null;
+    app.releaseStartupLaunchLayout();
 
     // A hard reload or a Settings save parses the same command line again.
     var reloaded = try configpkg.Config.default(alloc);
@@ -47944,20 +47977,71 @@ test "win32 a reload after run took the startup launch-layout does not bring it 
     try reloaded.finalize();
     try std.testing.expectEqualStrings("Project Alpha", reloaded.@"launch-layout".?);
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &reloaded }));
-    try std.testing.expect(app.startup_launch_layout == null);
+    try std.testing.expect(app.startup_launch_layout == .none);
     try testExpectNoLaunchLayout(&app.config);
 
     // A theme change after it replays the installed config.
     app.config._conditional_set.insert(.theme);
     const scheme: apprt.ColorScheme = if (core_app.config_conditional_state.theme == .light) .dark else .light;
     try core_app.colorSchemeEvent(&app, scheme);
-    try std.testing.expect(app.startup_launch_layout == null);
+    try std.testing.expect(app.startup_launch_layout == .none);
     try testExpectNoLaunchLayout(&app.config);
 
     // A new window's config is a clone of the app config.
     var window = try apprt.surface.newConfig(&core_app, &app.config, .window);
     defer window.deinit();
     try testExpectNoLaunchLayout(&window);
+}
+
+test "win32 a startup launch-layout whose name could not be kept still opens as a failed layout" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            defer app.releaseStartupLaunchLayout();
+            // `run` opens the layout in place of session restore and of
+            // `initial-window`, so neither may decide this launch.
+            app.config.@"initial-window" = false;
+
+            // Nothing asked for: `run` goes on to session restore or, as
+            // here, waits without a window.
+            try std.testing.expect(!try app.openStartupLaunchLayout());
+            try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
+
+            // Copying the name fails. The app config still forgets the
+            // request, which `init`'s color-scheme sync would drop anyway.
+            try testLoadStartupArgv(app, &.{"--launch-layout=shot"});
+            const alloc = fixture.core_app.alloc;
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            fixture.core_app.alloc = failing.allocator();
+            app.claimStartupLaunchLayout();
+            fixture.core_app.alloc = alloc;
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(app.startup_launch_layout == .lost);
+            try testExpectNoLaunchLayout(&app.config);
+            try expectFailedLayoutWindow(&fixture);
+
+            // It ends as a name that opens no layout does. That name is
+            // freed (the testing allocator reports a leak otherwise).
+            app.startup_launch_layout = .{ .name = try alloc.dupe(u8, "CON") };
+            try expectFailedLayoutWindow(&fixture);
+        }
+
+        /// `run`'s first window for a layout it could not open: one ordinary
+        /// window that says so, and no request left to open later.
+        fn expectFailedLayoutWindow(fixture: *WindowStartTestApp) !void {
+            const app = &fixture.app;
+            try std.testing.expect(try app.openStartupLaunchLayout());
+            try std.testing.expect(app.startup_launch_layout == .none);
+            try std.testing.expectEqual(@as(usize, 1), app.windows.items.len);
+            const host = app.primarySurface().?.host.?;
+            try std.testing.expectEqualStrings("Layout could not be opened.", host.banner_text.?);
+            fixture.closeWindows();
+        }
+    }.body);
 }
 
 test "win32 an OpenGL retry on a window reuses the pixel format it set" {
