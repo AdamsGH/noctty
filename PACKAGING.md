@@ -388,8 +388,8 @@ its Chocolatey step runs after Scoop and WinGet, so a refusal there cannot hold
 them back. It skips `choco pack` and `choco push` cleanly when
 `CHOCO_API_KEY` is absent, and the step does not run while `CHOCOLATEY_PUBLISH`
 is `off`. chocolatey.org refuses the push with `403` while another account
-owns the id (one has since 2026-10-16) and until a first version is approved,
-which can take weeks; the step then fails after everything else has published.
+owns the id, or while a version is in moderation and none is approved, which
+can take weeks; the step then fails after everything else has published.
 [docs/chocolatey-publishing.md](docs/chocolatey-publishing.md) has the id's
 state, how to turn the push off and back on, and the steps for resubmitting a
 version during moderation; do not rerun a published Release for that. To push a

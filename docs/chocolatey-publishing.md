@@ -1,21 +1,28 @@
 # Publish noctty on Chocolatey
 
 Every stable release builds a Chocolatey package, `noctty`, and the last step of
-the `Release` workflow pushes it to the community repository. No push from this
-repository has been accepted yet, because another account owns the id: the
-community maintainer `virtualex` submitted `noctty` 1.3.131 on 2026-10-16 from
-their package auto-updater. On 2026-10-19 that version was still waiting in
-moderation (`Submitted`) and the feed listed no approved version. Chocolatey
-refuses a push of a package another account owns with `403`, which is what the
-1.3.132 push from the Chocolatey Publish workflow (2026-10-17) and the 1.3.133
-release's push (2026-10-18) got.
+the `Release` workflow pushes it to the community repository. The community
+maintainer `virtualex` created the package: they submitted `noctty` 1.3.131 on
+2026-10-16 from their package auto-updater, so their account owned the id, and
+Chocolatey refused this repository's pushes with `403` (the 1.3.132 push from
+the Chocolatey Publish workflow on 2026-10-17 and the 1.3.133 release's push on
+2026-10-18).
 
-On 2026-10-19 the maintainer asked `virtualex` to hand the package over
-([virtualex-itv/chocolatey-packages#35](https://github.com/virtualex-itv/chocolatey-packages/issues/35)
-and by email). Chocolatey's
-[package triage process](https://docs.chocolatey.org/en-us/community-repository/users/package-triage-process/)
-says to wait 7 days for the maintainers to answer, then contact the site
-admins to become the package's maintainer.
+On 2026-10-20, as agreed in
+[virtualex-itv/chocolatey-packages#35](https://github.com/virtualex-itv/chocolatey-packages/issues/35),
+`virtualex` added `amanthanvi` as a maintainer of the package, stayed on as a
+co-maintainer, and rejected 1.3.131
+([its page](https://community.chocolatey.org/packages/noctty/1.3.131)). On
+2026-10-21 the Chocolatey Publish workflow pushed 1.3.134 (dry run
+[39578632348](https://github.com/amanthanvi/noctty/actions/runs/39578632348),
+push [39578893616](https://github.com/amanthanvi/noctty/actions/runs/39578893616):
+`noctty.1.3.134.nupkg was pushed successfully`). Read at 10:21 UTC that day,
+the feed's
+[entry for it](https://community.chocolatey.org/api/v2/Packages(Id='noctty',Version='1.3.134'))
+had `PackageStatus` `Submitted`, `PackageSubmittedStatus` `Pending`,
+`IsApproved` `false`, `PackageValidationResultStatus` `Passing` (since 10:16
+UTC) and `PackageTestResultStatus` `Pending`. No version of `noctty` is
+approved yet.
 
 ## Turning the release push off and on
 
@@ -35,9 +42,12 @@ does not read the variable: it runs only when someone starts it, and it is the
 way to try a push while the release step is off.
 
 Chocolatey accepts a push only when this repository's account owns (or
-co-maintains) the id, and it refuses every push while the package has a version
-in moderation and none approved. Once the id is handed over and a version is
-approved, delete the variable, and each release pushes again:
+co-maintains) the id; `amanthanvi` has maintained it since 2026-10-20. While
+the package has a version in moderation and none approved, which has been the
+case since 1.3.134 was pushed on 2026-10-21, Chocolatey also refuses every new
+version. (A corrected package that a moderator asks for keeps the version in
+moderation; see below.) So the variable stays `off` until a version is
+approved. Then delete it, and each release pushes again:
 
 ```powershell
 gh variable delete CHOCOLATEY_PUBLISH --repo amanthanvi/noctty
@@ -168,14 +178,14 @@ run the **Chocolatey Publish** workflow again for that version, with
 `resubmit` so that the listed version is not skipped:
 
 ```powershell
-gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.133 -f push=true -f resubmit=true
+gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.134 -f push=true -f resubmit=true
 ```
 
 Do not rerun the release instead: it would rebuild its installers.
 Chocolatey's [moderation page](https://docs.chocolatey.org/en-us/community-repository/moderation/)
 says to "resubmit the exact same version" with the required changes; this
-repository has not done that yet, because no push from it has been accepted,
-so the `resubmit` path is untested against the live feed.
+repository has not done that yet, so the `resubmit` path is untested against
+the live feed.
 
 The package script checks every downloaded installer against the release's
 `SHA256SUMS` before it writes the checksums into the package, so the
@@ -191,7 +201,7 @@ The workflow is these two scripts, so the same steps run from a checkout of
 Actions is unavailable:
 
 ```powershell
-$version = "1.3.133"   # the version the moderator asked about
+$version = "1.3.134"   # the version the moderator asked about
 $ErrorActionPreference = "Stop"
 function Assert-Exit([string] $What) { if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" } }
 git switch main; Assert-Exit "git switch"
@@ -206,9 +216,9 @@ try { ./scripts/release-publish-chocolatey.ps1 -Version $version -Resubmit }   #
 finally { Remove-Item Env:CHOCO_API_KEY }
 ```
 
-Until a first version is approved, Chocolatey refuses every further push with
-`403`: one of the causes it documents is "Package has a version in moderation
-and no approved versions"
+While a version is in moderation and none is approved, Chocolatey refuses every
+new version with `403`: one of the causes it documents is "Package has a
+version in moderation and no approved versions"
 ([common errors](https://docs.chocolatey.org/en-us/community-repository/maintainers/common-errors/)).
 The releases in that window still publish everywhere else. The Chocolatey step
 runs last so that it cannot hold back WinGet; it fails, the run turns red, and

@@ -254,8 +254,8 @@ that govern each symbol you change, or that none does.
   and its C mirror (`value_c`, `Command.cval`), `+edit-config` and opening
   the config file, adding config keys.
 - [app-lifecycle.md](docs/agents/log/app-lifecycle.md): `App.init` and
-  startup stalls, a cold `--launch-layout`, startup attempts and safe mode,
-  session state and
+  startup stalls, a cold `--launch-layout` (`App.startup_launch_layout`,
+  `forgetLaunchLayout`), startup attempts and safe mode, session state and
   state-file schemas, IPC and single instance (`win32/ipc_server.zig`), AUMID
   and portable identity, the jump list, toasts and desktop notifications, the
   bell, taskbar progress and icon, crash minidumps and Sentry, the COM
