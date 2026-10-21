@@ -861,6 +861,11 @@ fn trySendStartupLaunchLayoutIpc(
     name: ?[]const u8,
 ) !?bool {
     const layout_name = name orelse return null;
+    // A name the layout request cannot carry is not forwarded, and not
+    // handed to the generic argv forward either: this process opens it, and
+    // `run` refuses it with a banner in its first window. An error here would
+    // end the launch in a failure dialog, its startup attempt unresolved.
+    win32_ipc.validateLaunchLayoutName(layout_name) catch return false;
     return try sendLaunchLayoutIpc(
         alloc,
         pipe_name,
@@ -1756,7 +1761,7 @@ pub fn tryForwardStartupToExistingInstance(self: *App) !bool {
         self.core_app.alloc,
         pipe_name,
         self.is_elevated,
-        self.config.@"launch-layout",
+        self.startup_launch_layout,
     )) |forwarded| return forwarded;
 
     const arguments = try collectStartupForwardArguments(self.core_app.alloc);
@@ -2946,9 +2951,11 @@ test "win32 startup layout forwarding intercepts before generic argv" {
         @as(?bool, null),
         try trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, null),
     );
-    try std.testing.expectError(
-        error.InvalidAutomationAction,
-        trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, "CON"),
+    // Not forwarded, and not passed on to the generic argv either: this
+    // process opens it, and `run` refuses it in its own window.
+    try std.testing.expectEqual(
+        @as(?bool, false),
+        try trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, "CON"),
     );
 }
 
