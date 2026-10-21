@@ -178,7 +178,7 @@ run the **Chocolatey Publish** workflow again for that version, with
 `resubmit` so that the listed version is not skipped:
 
 ```powershell
-gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.133 -f push=true -f resubmit=true
+gh workflow run chocolatey-publish.yml --repo amanthanvi/noctty --ref main -f version=1.3.134 -f push=true -f resubmit=true
 ```
 
 Do not rerun the release instead: it would rebuild its installers.
@@ -201,7 +201,7 @@ The workflow is these two scripts, so the same steps run from a checkout of
 Actions is unavailable:
 
 ```powershell
-$version = "1.3.133"   # the version the moderator asked about
+$version = "1.3.134"   # the version the moderator asked about
 $ErrorActionPreference = "Stop"
 function Assert-Exit([string] $What) { if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" } }
 git switch main; Assert-Exit "git switch"
