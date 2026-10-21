@@ -275,8 +275,8 @@ Win32-validated VT protocol coverage is tracked in
   who submitted `noctty` 1.3.131 on 2026-10-16, added `amanthanvi` as a
   maintainer on 2026-10-20, stayed on as a co-maintainer, and rejected 1.3.131.
   The Chocolatey Publish workflow pushed 1.3.134 on 2026-10-21, and it is
-  waiting in moderation. chocolatey.org refuses every push while a version is
-  in moderation and none is approved, so the repository variable
+  waiting in moderation. chocolatey.org refuses every new version while a
+  version is in moderation and none is approved, so the repository variable
   `CHOCOLATEY_PUBLISH = off` skips the release step until a version is
   approved; see [chocolatey-publishing.md](chocolatey-publishing.md). A
   released version is pushed with the manual Chocolatey Publish workflow.

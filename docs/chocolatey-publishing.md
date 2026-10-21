@@ -16,13 +16,13 @@ co-maintainer, and rejected 1.3.131
 2026-10-21 the Chocolatey Publish workflow pushed 1.3.134 (dry run
 [39578632348](https://github.com/amanthanvi/noctty/actions/runs/39578632348),
 push [39578893616](https://github.com/amanthanvi/noctty/actions/runs/39578893616):
-`noctty.1.3.134.nupkg was pushed successfully`). Read at 09:49 UTC that day,
+`noctty.1.3.134.nupkg was pushed successfully`). Read at 10:21 UTC that day,
 the feed's
 [entry for it](https://community.chocolatey.org/api/v2/Packages(Id='noctty',Version='1.3.134'))
 had `PackageStatus` `Submitted`, `PackageSubmittedStatus` `Pending`,
-`IsApproved` `false`, and `PackageValidationResultStatus` and
-`PackageTestResultStatus` both `Pending`. No version of `noctty` is approved
-yet.
+`IsApproved` `false`, `PackageValidationResultStatus` `Passing` (since 10:16
+UTC) and `PackageTestResultStatus` `Pending`. No version of `noctty` is
+approved yet.
 
 ## Turning the release push off and on
 
@@ -42,11 +42,12 @@ does not read the variable: it runs only when someone starts it, and it is the
 way to try a push while the release step is off.
 
 Chocolatey accepts a push only when this repository's account owns (or
-co-maintains) the id, which `amanthanvi` has done since 2026-10-20. It also
-refuses every push while the package has a version in moderation and none
-approved, which has been the case since 1.3.134 was pushed on 2026-10-21. So
-the variable stays `off` until a version is approved. Then delete it, and each
-release pushes again:
+co-maintains) the id; `amanthanvi` has maintained it since 2026-10-20. While
+the package has a version in moderation and none approved, which has been the
+case since 1.3.134 was pushed on 2026-10-21, Chocolatey also refuses every new
+version. (A corrected package that a moderator asks for keeps the version in
+moderation; see below.) So the variable stays `off` until a version is
+approved. Then delete it, and each release pushes again:
 
 ```powershell
 gh variable delete CHOCOLATEY_PUBLISH --repo amanthanvi/noctty
@@ -215,9 +216,9 @@ try { ./scripts/release-publish-chocolatey.ps1 -Version $version -Resubmit }   #
 finally { Remove-Item Env:CHOCO_API_KEY }
 ```
 
-Until a first version is approved, Chocolatey refuses every further push with
-`403`: one of the causes it documents is "Package has a version in moderation
-and no approved versions"
+While a version is in moderation and none is approved, Chocolatey refuses every
+new version with `403`: one of the causes it documents is "Package has a
+version in moderation and no approved versions"
 ([common errors](https://docs.chocolatey.org/en-us/community-repository/maintainers/common-errors/)).
 The releases in that window still publish everywhere else. The Chocolatey step
 runs last so that it cannot hold back WinGet; it fails, the run turns red, and
