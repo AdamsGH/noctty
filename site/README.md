@@ -57,7 +57,10 @@ follow the visitor's system until they press the toggle, which then sticks.
 Geist sets all text and JetBrains Mono sets commands and terminals. Both are
 self-hosted, OFL-licensed, and ship with their licenses. `geist.woff2` is
 `Geist-Variable` from the `geist` npm package 1.8.1, instanced to weights
-400 to 600 and subset to Latin with fontTools.
+400 to 600 and subset to Latin with fontTools, keeping its name records.
+`OFL-Geist.txt` is `OFL.txt` from `vercel/geist-font`, whose copyright notice
+is the one in the font; the npm package's own `LICENSE.txt` carries an older
+notice.
 
 Only the hero demo moves. It pauses off-screen and in hidden tabs, and under
 `prefers-reduced-motion` it shows still frames that the step buttons switch
@@ -66,7 +69,9 @@ showed for "split" in the captures. `tests/terminal.test.mjs` checks each
 row's title, description, action and shown shortcut, the status format, and
 every key chip on the landing page against `src/input/command.zig`,
 `src/cli/testdata/default_keybinds_windows.txt` and
-`src/apprt/win32/labels.zig`; `tests/install.test.mjs` checks that each copy
+`src/apprt/win32/labels.zig`; `tests/demo.test.mjs` runs the demo itself
+against a fake DOM and a hand-advanced clock (pause, resume, step switches,
+a hidden page, reduced motion); `tests/install.test.mjs` checks that each copy
 button copies the command shown beside it.
 
 The `shot-*.webp` files are real captures of the app, one per theme, from a
