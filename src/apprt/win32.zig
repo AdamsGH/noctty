@@ -8190,12 +8190,17 @@ pub const App = struct {
     /// arguments' `finalize` builds the config again from its replay steps,
     /// which would drop the profile's variables, line and directory. A
     /// directory the arguments carry still wins over the profile's own.
+    /// That rebuild replays the files as they were last read, which during a
+    /// palette theme preview is newer than the app config's profiles and
+    /// launch (`keepProfileSources`), so those are put back after it; the
+    /// arguments cannot set any of them (`forwardedKeyAllowed`).
     fn applyNewWindowLaunch(
         self: *const App,
         config: *configpkg.Config,
         arguments: ?[]const [:0]const u8,
     ) !?*const windows_shell.Profile {
         try applyNewWindowArguments(self.core_app.alloc, config, arguments);
+        if (arguments) |argv| if (argv.len > 0) try keepProfileSources(config, &self.config);
         const forwarded_directory = if (arguments) |argv| forwardedArgvSetsKey(argv, "working-directory") else false;
         const directory = config.@"working-directory";
         const profile = try self.applyDefaultProfileLaunch(config);
@@ -32631,6 +32636,9 @@ const storedProfileKeyEquals = labels.storedProfileKeyEquals;
 /// the same reason `dst` keeps the launch `src` resolved: `command` and the
 /// `default-profile` profile, which `finalize` found from the files read
 /// again, so a new tab would run an edited default profile's definition.
+/// A forwarded new window's config, built again from those files when a
+/// theme is set, gets them back from the app config the same way
+/// (`App.applyNewWindowLaunch`).
 fn keepProfileSources(dst: *configpkg.Config, src: *const configpkg.Config) !void {
     const alloc = dst._arena.?.allocator();
     dst.command = if (src.command) |command| try command.clone(alloc) else null;
@@ -53905,23 +53913,44 @@ test "win32 a forwarded new window keeps the default-profile launch when a theme
     var app: App = undefined;
     app.core_app = &core_app;
 
-    inline for (.{
-        .{ &[_][:0]const u8{"--font-size=14"}, "D:\\pinned" },
-        // A directory the arguments carry wins over the profile's.
-        .{ &[_][:0]const u8{ "--font-size=14", "--working-directory=C:\\fwd" }, "C:\\fwd" },
-    }) |case| {
-        var config = base.shallowClone(alloc);
-        defer config.deinit();
-        const profile = (try app.applyNewWindowLaunch(&config, case[0])).?;
-        try std.testing.expectEqualStrings("user:py", profile.key);
-        try std.testing.expectEqual(@as(f32, 14), config.@"font-size");
-        try std.testing.expectEqual(@as(u8, 0x10), config.background.r);
-        try std.testing.expectEqualStrings("profile", config.env.map.get("MODE") orelse "");
-        try std.testing.expectEqualStrings("cmd.exe /k py", if (config._profile_launch) |launch| launch.command_line else "");
-        try std.testing.expectEqualStrings(case[1], switch (config.@"working-directory".?) {
-            .path => |path| path,
-            else => "",
-        });
+    // A palette theme preview of files that edited the profile since (and
+    // set a theme, so a window's config is built again): the app config
+    // keeps the running profile, but its replay steps are the new files'.
+    var preview = try configpkg.Config.default(alloc);
+    defer preview.deinit();
+    var preview_args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+        .iterator = cli_args.sliceIterator(&.{
+            theme_arg,
+            "--profile-command=py: cmd.exe /k new",
+            "--profile-env=py: MODE=new",
+            "--profile-working-directory=py: D:\\new",
+            "--default-profile=py",
+        }),
+    };
+    try preview.loadIter(alloc, &preview_args);
+    try Host.finishPaletteThemeConfig(&preview, &base, theme);
+
+    for ([_]*const configpkg.Config{ &base, &preview }) |app_config| {
+        app.config = app_config.*;
+        inline for (.{
+            .{ &[_][:0]const u8{"--font-size=14"}, "D:\\pinned" },
+            // A directory the arguments carry wins over the profile's.
+            .{ &[_][:0]const u8{ "--font-size=14", "--working-directory=C:\\fwd" }, "C:\\fwd" },
+        }) |case| {
+            var config = app.config.shallowClone(alloc);
+            defer config.deinit();
+            const profile = (try app.applyNewWindowLaunch(&config, case[0])).?;
+            try std.testing.expectEqualStrings("user:py", profile.key);
+            try std.testing.expectEqual(@as(f32, 14), config.@"font-size");
+            try std.testing.expectEqual(@as(u8, 0x10), config.background.r);
+            try std.testing.expectEqualStrings("profile", config.env.map.get("MODE") orelse "");
+            try std.testing.expectEqualStrings("cmd.exe /k py", if (config._profile_launch) |launch| launch.command_line else "");
+            try std.testing.expectEqualStrings(case[1], switch (config.@"working-directory".?) {
+                .path => |path| path,
+                else => "",
+            });
+            try std.testing.expect(!userProfileKeysChanged(&base, &config));
+        }
     }
 }
 
