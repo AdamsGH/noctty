@@ -722,20 +722,26 @@ package.
 ## Notifications and progress
 
 Desktop notifications use WinRT toasts when available and fall back to
-in-app banners when notifications are turned off for noctty or for the user,
-or when app identity or runtime availability prevents a toast. Focus Assist
-(Do not disturb) does not cause a banner: Windows files the toast in Action
-Center without showing it. `desktop-notifications` gates every
+in-app banners when Windows refuses a toast: when notifications are turned
+off for noctty or for the user, or when app identity or runtime availability
+prevents one. Under Focus Assist (Do not disturb) Windows may refuse the toast,
+which brings the banner, or file it in Action Center without a popup, which
+does not; which one happens has not been measured for noctty.
+`desktop-notifications` gates every
 toast, including command-finish toasts, which additionally need
 `notify-on-command-finish` and a `notify-on-command-finish-action` that
 includes `notify`, and [program status](#program-status-osc-7501) toasts.
 
-Every toast a terminal sends (OSC 9, OSC 777, command finished and program
-status) ends with a line that names its tab, `Tab 2: <tab title>`, or
-`Tab 2 of window 1: <tab title>` while more than one window is open. The tab
-title is that of the tab's focused pane, without bidirectional overrides,
+Every toast from a terminal pane (OSC 9, OSC 777, command finished, program
+status, and noctty's own "Copied ... to clipboard" notices) ends with a line
+that names its tab: `Tab 2: <tab title>`, `Tab 2 of window 1: <tab title>`
+while more than one window is open, or `Tab 1 of the quick terminal: <tab
+title>`. The quick terminal is not counted as a window. A window's number
+appears nowhere else in noctty and can change when another window closes. The
+tab title is that of the tab's focused pane, without bidirectional overrides,
 invisible characters or control characters, and cut to 64 bytes. An OSC 9
-notification, which has no title, is titled by its tab. Clicking the toast's
+notification, which has no title, is titled by its tab. When the toast falls
+back to a banner, the banner ends with the same tab line. Clicking the toast's
 popup focuses the pane that sent it: noctty restores its window if it is
 minimized, switches to its tab and pane, and asks Windows to bring the window
 forward, which Windows may refuse. Whether clicking an older entry in Action

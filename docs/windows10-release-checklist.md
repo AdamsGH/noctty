@@ -298,8 +298,8 @@ carries the AppUserModelID. Set `notify-on-command-finish = always` and
 another window. Expected: a toast named "noctty" with the noctty
 icon whose last line reads `Tab 1: <tab title>`, in Action Center afterwards;
 clicking its popup focuses the pane. Turn Focus Assist to "Alarms only" and repeat.
-Expected: either the toast in Action Center without a popup, or an in-app banner;
-never nothing. Then revert to the clean snapshot and repeat with the portable copy only:
+Expected: either the toast (record whether it pops up or only reaches Action
+Center) or an in-app banner ending in the same tab line; never nothing. Then revert to the clean snapshot and repeat with the portable copy only:
 it creates the AppUserModelID registration where none exists
 ([App identity](windows.md#app-identity)). Portable toast delivery has not been
 confirmed: record whether the toast appears, its icon and Action Center entry,

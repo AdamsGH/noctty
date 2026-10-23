@@ -421,12 +421,12 @@ input, and `quick-terminal-space-behavior` has no Windows effect.
 WinRT toasts use noctty's AppUserModelID and fall back to a host banner, then
 the log, when native delivery fails. `desktop-notifications` gates every
 toast. Command-finish toasts additionally need `notify-on-command-finish` and
-a `notify-on-command-finish-action` that includes `notify`. Every toast a
-terminal sends (OSC 9, OSC 777, command finished and
-[program status](windows.md#program-status-osc-7501)) names its tab (and its
-window while several are open) in a final attribution line, carries a launch
-argument, and focuses the originating pane when its popup is clicked. Focus
-Assist files a toast in Action Center without a banner. Reliable cold-start
+a `notify-on-command-finish-action` that includes `notify`. Every toast from
+a terminal pane (OSC 9, OSC 777, command finished,
+[program status](windows.md#program-status-osc-7501) and the clipboard-copy
+notices) names its tab (and its window while several are open) in a final
+attribution line, carries a launch argument, and focuses the originating pane
+when its popup is clicked. Reliable cold-start
 activation depends on the installed Start menu shortcut.
 `notify-on-command-finish-after` and the focus policy are applied before the
 bell or toast; command marks come from shell integration or OSC 133, which
