@@ -31,7 +31,9 @@ the first with two tabs, the second of them split, the second with one tab):
 
 Safety. Only this run's portable copies are registered with Restart Manager:
 their noctty.exe and DLLs, never OpenConsole.exe (an RmUnknownApp that fails
-every non-forced shutdown, and that the installer does not register). Before
+every non-forced shutdown). Leaving it out models the registration set the
+planned installer exclusion (RMCLOSE-4) produces; today Setup still registers
+it. Before
 RmShutdown the script checks that Restart Manager lists exactly the copy it
 started (PID and start time, read fresh) and aborts otherwise. It never calls
 RmShutdown with the force flag, RmRestart (which starts on the visible
