@@ -1122,6 +1122,22 @@ fn applyDefaultProfileConfig(config: *configpkg.Config) !?*const windows_shell.P
     return profile;
 }
 
+/// Put back `directory`, which the launch asked for explicitly (on the
+/// command line, or in a forwarded new window's arguments), over the
+/// directory `default-profile`'s profile pinned: the default replaces what
+/// runs, not where such a launch starts. An SSH profile keeps its hardening
+/// (`applySshLaunchHardening`), as a new tab from an SSH pane does: a local
+/// directory means nothing to the remote shell.
+fn keepExplicitWorkingDirectory(
+    config: *configpkg.Config,
+    profile: ?*const windows_shell.Profile,
+    directory: ?configpkg.Config.WorkingDirectory,
+) void {
+    const applied = profile orelse return;
+    if (applied.kind == .ssh) return;
+    config.@"working-directory" = directory;
+}
+
 /// `default-profile`'s profile when `key` names it. A pane it started
 /// carries its key, and the config holds the profile resolved, so a split,
 /// an elevated window or a restore of that pane needs no list (no WSL probe
@@ -2717,13 +2733,24 @@ fn sessionRestorePolicyAllows(
     initial_window: bool,
     has_initial_command: bool,
     startup_profile_picker: bool,
-    explicit_startup_working_directory: bool,
+    /// A directory or a profile named on the command line.
+    explicit_startup: bool,
 ) bool {
     return sessionStatePolicyAllows(safe_mode, policy) and
         initial_window and
         !has_initial_command and
         !startup_profile_picker and
-        !explicit_startup_working_directory;
+        !explicit_startup;
+}
+
+/// A profile named on the command line (`--default-profile=<reference>`,
+/// which a jump-list link to a user profile carries) makes an explicit
+/// launch, as an explicit directory does: it neither restores nor saves the
+/// session, and its first window runs that profile. A link to a profile
+/// with a directory of its own has no `--working-directory=` to say so.
+fn startupNamesProfile(config: *const configpkg.Config) bool {
+    const reference = config._default_profile_cli orelse return false;
+    return reference.len > 0;
 }
 
 const SessionSaveKind = enum { final, checkpoint };
@@ -4104,7 +4131,7 @@ pub const App = struct {
             self.config.@"initial-window",
             self.config.@"initial-command" != null,
             self.startup_profile_picker,
-            self.explicit_startup_working_directory,
+            self.explicit_startup_working_directory or startupNamesProfile(&self.config),
         );
     }
 
@@ -8189,7 +8216,8 @@ pub const App = struct {
     /// `applyDefaultProfileLaunch`. In that order: with a theme set, the
     /// arguments' `finalize` builds the config again from its replay steps,
     /// which would drop the profile's variables, line and directory. A
-    /// directory the arguments carry still wins over the profile's own.
+    /// directory the arguments carry still wins over the profile's own,
+    /// except an SSH profile's (`keepExplicitWorkingDirectory`).
     /// That rebuild replays the files as they were last read, which during a
     /// palette theme preview is newer than the app config's profiles and
     /// launch (`keepProfileSources`), so those are put back after it; the
@@ -8204,7 +8232,7 @@ pub const App = struct {
         const forwarded_directory = if (arguments) |argv| forwardedArgvSetsKey(argv, "working-directory") else false;
         const directory = config.@"working-directory";
         const profile = try self.applyDefaultProfileLaunch(config);
-        if (forwarded_directory) config.@"working-directory" = directory;
+        if (forwarded_directory) keepExplicitWorkingDirectory(config, profile, directory);
         return profile;
     }
 
@@ -8460,7 +8488,11 @@ pub const App = struct {
         }
         var config = try apprt.surface.newConfig(self.core_app, &self.config, .window);
         defer config.deinit();
+        const directory = config.@"working-directory";
         const profile = try self.applyDefaultProfileLaunch(&config);
+        // Explorer's "Open in noctty" and a jump-list folder start a first
+        // window with `--working-directory=` when no instance runs.
+        if (self.explicit_startup_working_directory) keepExplicitWorkingDirectory(&config, profile, directory);
         const surface = try self.createWindowSurface(&config, title, .{});
         if (profile) |value| try self.noteProfileLaunch(surface, value);
     }
@@ -43270,7 +43302,7 @@ fn uninitializedInertStorage(comptime T: type) T {
 /// storage, not valid live instances.
 const TestSession = struct {
     const max_hosts = 4;
-    const max_surfaces = 10;
+    const max_surfaces = 12;
 
     const HostOptions = struct {
         storage: *Host,
@@ -53650,7 +53682,7 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     var app: App = undefined;
     var host: Host = undefined;
     var source: Surface = undefined;
-    var created: [9]Surface = undefined;
+    var created: [11]Surface = undefined;
     var session: TestSession = .{};
     var surfaces: [1 + created.len]TestSession.SurfaceOptions = undefined;
     surfaces[0] = .{ .storage = &source, .host = &host, .register = true, .free_launch_profile_key_on_deinit = true };
@@ -53812,6 +53844,7 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     // Restore does not connect over SSH by itself, so with an SSH default a
     // pane it would reach gets the automatic shell (a session saves an SSH
     // pane without its profile).
+    const py_profile = app.config._default_profile.?;
     const ssh_argv = [_][:0]const u8{ "C:\\Windows\\System32\\OpenSSH\\ssh.exe", "prod" };
     app.config._default_profile = .{ .kind = .ssh, .key = "ssh:prod", .label = "prod", .command = .{ .direct = &ssh_argv } };
     app.config.command = app.config._default_profile.?.command;
@@ -53820,6 +53853,26 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     try std.testing.expect(Hook.seen.mode == null and Hook.seen.line == null);
     try std.testing.expect(created[8].launch_profile_key == null);
     try std.testing.expect(!created[8].launched_ssh);
+
+    // A first window started with `--working-directory=` (Explorer's "Open
+    // in noctty", a jump-list folder, with no instance running) starts
+    // there, not in the profile's pinned directory. An SSH default keeps
+    // its hardening and starts ssh.exe in the user's profile directory.
+    app.explicit_startup_working_directory = true;
+    defer app.explicit_startup_working_directory = false;
+    app.config.@"working-directory" = .{ .path = "C:\\cli" };
+    try app.createWindow(default_title);
+    try std.testing.expectEqualStrings("ssh:prod", created[9].launch_profile_key orelse "");
+    try appendOwnedString(alloc, &created[9].tab_title_override, null);
+    try std.testing.expect(!std.mem.eql(u8, "C:\\cli", Hook.seen.dir orelse ""));
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (try windows_ssh_hosts.userProfileDir(&home_buf)) |home| {
+        try std.testing.expectEqualStrings(home, Hook.seen.dir orelse "");
+    }
+    app.config._default_profile = py_profile;
+    app.config.command = py_profile.command;
+    try app.createWindow(default_title);
+    try Expect.profile(&created[10], "C:\\cli");
     try std.testing.expectEqual(created.len, Hook.next);
 }
 
@@ -53929,6 +53982,31 @@ test "win32 a forwarded new window keeps the default-profile launch when a theme
     };
     try preview.loadIter(alloc, &preview_args);
     try Host.finishPaletteThemeConfig(&preview, &base, theme);
+
+    // Every single-instance launch forwards its own directory, which an SSH
+    // default does not take: ssh.exe starts in the user's profile directory
+    // on every path (`applySshLaunchHardening`).
+    var ssh_base = try configpkg.Config.default(alloc);
+    defer ssh_base.deinit();
+    try ssh_base.finalize();
+    app.config = ssh_base;
+    const ssh_argv = [_][:0]const u8{ "C:\\Windows\\System32\\OpenSSH\\ssh.exe", "prod" };
+    app.config._default_profile = .{ .kind = .ssh, .key = "ssh:prod", .label = "prod", .command = .{ .direct = &ssh_argv } };
+    app.config.command = app.config._default_profile.?.command;
+    app.config._command_defaulted = true;
+    var ssh_window = app.config.shallowClone(alloc);
+    defer ssh_window.deinit();
+    const ssh_profile = (try app.applyNewWindowLaunch(&ssh_window, &.{ "--font-size=14", "--working-directory=C:\\fwd" })).?;
+    try std.testing.expectEqualStrings("ssh:prod", ssh_profile.key);
+    const ssh_directory = switch (ssh_window.@"working-directory".?) {
+        .path => |path| path,
+        else => "",
+    };
+    try std.testing.expect(!std.mem.eql(u8, "C:\\fwd", ssh_directory));
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (try windows_ssh_hosts.userProfileDir(&home_buf)) |home| {
+        try std.testing.expectEqualStrings(home, ssh_directory);
+    }
 
     for ([_]*const configpkg.Config{ &base, &preview }) |app_config| {
         app.config = app_config.*;
@@ -56008,6 +56086,7 @@ test "win32 session state is saved only by the process that owns it" {
     app.config.@"window-save-state" = .always;
     app.config.@"initial-window" = true;
     app.config.@"initial-command" = null;
+    app.config._default_profile_cli = null;
 
     // A launch that forwarded to the primary, lost the IPC race or failed
     // before its first window never took the session, and must not save
@@ -56030,6 +56109,29 @@ test "win32 session state is saved only by the process that owns it" {
     app.explicit_startup_working_directory = true;
     try std.testing.expect(!app.sessionStateEnabled());
     app.explicit_startup_working_directory = false;
+
+    // Nor a jump-list link to a user profile, which names it with
+    // `--default-profile=` and, when the profile has a directory of its
+    // own, carries no `--working-directory=`.
+    {
+        const running = app.config;
+        defer app.config = running;
+        inline for (.{
+            .{ &[_][:0]const u8{ "--single-instance=false", "--command=", "--initial-command=", "--default-profile=user:py" }, false },
+            .{ &[_][:0]const u8{ "--single-instance=false", "--command=", "--initial-command=" }, true },
+            .{ &[_][:0]const u8{ "--default-profile=user:py", "--default-profile=" }, true },
+        }) |case| {
+            var config = try configpkg.Config.default(std.testing.allocator);
+            defer config.deinit();
+            var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{ .iterator = cli_args.sliceIterator(case[0]) };
+            try config.loadIter(std.testing.allocator, &args);
+            try config.finalize();
+            config.@"window-save-state" = .always;
+            app.config = config;
+            try std.testing.expectEqual(case[1], app.sessionRestoreEligible());
+            try std.testing.expectEqual(case[1], app.sessionStateEnabled());
+        }
+    }
 
     // A reload to window-save-state = never still stops the owner.
     app.config.@"window-save-state" = .never;
@@ -56057,6 +56159,7 @@ test "win32 a structural change arms one session checkpoint, only in the session
     app.config.@"window-save-state" = .always;
     app.config.@"initial-window" = true;
     app.config.@"initial-command" = null;
+    app.config._default_profile_cli = null;
     app.session_state_excluded_for_elevation = false;
     app.session_ending = false;
     app.session_state_saved_before_last_host_close = false;

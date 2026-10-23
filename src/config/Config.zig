@@ -1201,7 +1201,10 @@ palette: Palette = .{},
 /// a session would still fail; use `command = wsl.exe` to choose it. With
 /// `default-profile` set, its profile runs in place of that default, and a
 /// `command` set in a config file overrides it (reported as a config
-/// problem; `--command` on the command line overrides it quietly). A launch
+/// problem; `--command` on the command line overrides it quietly).
+/// `--command` and `--initial-command` on the command line win over those
+/// lines in a file included with `config-file`, though it is read after the
+/// command line. A launch
 /// with `--safe-mode` always starts `cmd.exe /D`: no PowerShell profile and no
 /// `AutoRun` command can get in the way of recovery.
 ///
@@ -1704,7 +1707,10 @@ class: ?[:0]const u8 = null,
 /// The profile brings its command, its `profile-env` variables and its
 /// `profile-working-directory`. Without a directory of its own it starts
 /// where `working-directory` and the `*-inherit-working-directory` settings
-/// say, as `command` does. The terminal remembers the profile, so its splits
+/// say, as `command` does. A directory the launch asks for (on the command
+/// line, or from a second `noctty` forwarding to a running one) wins over the
+/// profile's, except an SSH profile's. The terminal remembers the profile, so
+/// its splits
 /// and a restored session run it again, and the profile picker opens on it
 /// until another profile is chosen there.
 ///
@@ -1716,7 +1722,8 @@ class: ?[:0]const u8 = null,
 /// config problem, and the automatic default runs. Finding the profile
 /// starts nothing and lists nothing: WSL is not asked for its distributions.
 /// Safe mode does not read it. On the command line it also wins over a
-/// `default-profile` line in a file included with `config-file`.
+/// `default-profile` line in a file included with `config-file`, and makes
+/// an explicit launch, which starts without the saved session.
 @"default-profile": ?[:0]const u8 = null,
 
 /// A profile to list first in the profile picker and the command palette;
@@ -3656,6 +3663,13 @@ _command_from_file: bool = false,
 /// line, and the jump list's profile links name their profile this way.
 _default_profile_cli: ?[:0]const u8 = null,
 
+/// `--command=` and `--initial-command=` on the command line, as typed,
+/// applied again in `finalize` over every config file for the same reason:
+/// a jump-list profile link resets both with empty values, which a `command`
+/// or `initial-command` line in an included file would otherwise undo.
+_command_cli: ?[:0]const u8 = null,
+_initial_command_cli: ?[:0]const u8 = null,
+
 /// `--elevated-profile-env=KEY=VALUE` on the command line, which
 /// `new_window_elevated:user:<id>` passes for each of the profile's
 /// variables. `finalize` puts them over `env` once every config file has
@@ -5116,6 +5130,7 @@ pub fn finalize(self: *Config) !void {
     // Before the default command: `default-profile` can name a user profile,
     // which has to have passed these checks.
     try self.finalizeProfiles();
+    try self.finalizeCliLaunch();
     try self.finalizeDefaultProfileSetting();
     // `default-profile` stands in for the automatic default below. Tests
     // resolve it through fixed lookups (no PATH search), so they load it
@@ -5281,6 +5296,28 @@ pub fn finalize(self: *Config) !void {
     self.@"key-remap".finalize();
 }
 
+/// `--command=` and `--initial-command=` from the command line once every
+/// layer has been read, over a `command` or `initial-command` line in an
+/// included file (read after the command line). A value the command line's
+/// own parse refused is left as it was; that parse reported it.
+fn finalizeCliLaunch(self: *Config) Allocator.Error!void {
+    if (self._command_cli) |value| {
+        if (try self.applyCliValue("command", value)) {
+            self._command_defaulted = false;
+            self._command_from_file = false;
+        }
+    }
+    if (self._initial_command_cli) |value| _ = try self.applyCliValue("initial-command", value);
+}
+
+fn applyCliValue(self: *Config, comptime key: []const u8, value: []const u8) Allocator.Error!bool {
+    cli.args.parseIntoField(Config, self._arena.?.allocator(), self, key, value) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return false;
+    };
+    return true;
+}
+
 /// `default-profile` once every layer has been read: a command-line value
 /// wins over the files (included ones are read after the command line), and
 /// one that a `command` from a config file overrides is a config problem.
@@ -5431,13 +5468,54 @@ test "default-profile gives way to a command from any layer, and says so only fo
         try testing.expectEqualStrings("user:py", cfg._default_profile.?.key);
     }
 
-    // An included file is read after the command line, so its command wins
-    // over that reset, and is a file's command.
+    // An included file is read after the command line, but the command
+    // line's command and initial command still win over its lines: a
+    // jump-list link's resets hold, so the profile runs.
     {
-        var cfg = try testLoadDefaultProfile(alloc, profile ++ "default-profile = py\n", &.{"--command="}, "command = vim.exe\n");
+        var cfg = try testLoadDefaultProfile(
+            alloc,
+            profile ++ "default-profile = py\n",
+            &.{ "--command=", "--initial-command=" },
+            "command = vim.exe\ninitial-command = other.exe\n",
+        );
+        defer cfg.deinit();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqualStrings("user:py", cfg._default_profile.?.key);
+        try testing.expect(cfg._command_defaulted);
+        try testing.expect(cfg.@"initial-command" == null);
+        // And after a rebuild for a conditional state (a theme).
+        cfg._conditional_set.insert(.theme);
+        var replayed = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+        defer replayed.deinit();
+        try testing.expectEqualStrings("user:py", replayed._default_profile.?.key);
+        try testing.expect(replayed.@"initial-command" == null);
+        // A copy keeps them.
+        var copy = try cfg.clone(alloc);
+        defer copy.deinit();
+        try testing.expectEqualStrings("", copy._command_cli.?);
+        try testing.expectEqualStrings("", copy._initial_command_cli.?);
+    }
+    // A command on the command line wins over an included one too, quietly.
+    {
+        var cfg = try testLoadDefaultProfile(alloc, profile ++ "default-profile = py\n", &.{"--command=vim.exe"}, "command = other.exe\n");
+        defer cfg.deinit();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqualStrings("vim.exe", cfg.command.?.shell);
+        try testing.expect(cfg._default_profile == null);
+    }
+    // With nothing on the command line, an included file's command is a
+    // file's command, which leaves the profile unused.
+    {
+        var cfg = try testLoadDefaultProfile(alloc, profile ++ "default-profile = py\n", &.{}, "command = vim.exe\n");
         defer cfg.deinit();
         try testing.expectEqual(@as(usize, 1), testDefaultProfileProblems(&cfg));
         try testing.expect(cfg._default_profile == null);
+    }
+    // `-e` after `--initial-command=` still runs.
+    {
+        var cfg = try testLoadDefaultProfile(alloc, profile, &.{ "--initial-command=", "-e", "vim.exe" }, "");
+        defer cfg.deinit();
+        try testing.expectEqualStrings("vim.exe", cfg.@"initial-command".?.direct[0]);
     }
 
     // `default-profile` on the command line wins over the files, the
@@ -5901,8 +5979,17 @@ pub fn parseManuallyHook(
     iter: anytype,
 ) !bool {
     if (std.mem.eql(u8, arg, "--command") or std.mem.startsWith(u8, arg, "--command=")) {
+        const location = try cli.Location.fromIter(iter, alloc);
         self._command_defaulted = false;
-        self._command_from_file = (try cli.Location.fromIter(iter, alloc)) == .file;
+        self._command_from_file = location == .file;
+        if (location == .cli and std.mem.startsWith(u8, arg, "--command=")) {
+            self._command_cli = try alloc.dupeZ(u8, arg["--command=".len..]);
+        }
+    }
+    if (std.mem.startsWith(u8, arg, "--initial-command=")) {
+        if ((try cli.Location.fromIter(iter, alloc)) == .cli) {
+            self._initial_command_cli = try alloc.dupeZ(u8, arg["--initial-command=".len..]);
+        }
     }
     if (std.mem.startsWith(u8, arg, "--default-profile=")) {
         if ((try cli.Location.fromIter(iter, alloc)) == .cli) {
@@ -5916,6 +6003,9 @@ pub fn parseManuallyHook(
     }
 
     if (std.mem.eql(u8, arg, "-e")) {
+        // `-e` comes after any `--initial-command=` and wins over it.
+        self._initial_command_cli = null;
+
         // Add the special -e marker. This prevents:
         // (1) config-file from adding args to the end (see #2908)
         // (2) dark/light theme from making this conditional
@@ -6187,6 +6277,8 @@ pub fn clone(
     result._command_defaulted = self._command_defaulted;
     result._command_from_file = self._command_from_file;
     if (self._default_profile_cli) |value| result._default_profile_cli = try alloc_arena.dupeZ(u8, value);
+    if (self._command_cli) |value| result._command_cli = try alloc_arena.dupeZ(u8, value);
+    if (self._initial_command_cli) |value| result._initial_command_cli = try alloc_arena.dupeZ(u8, value);
     if (self._default_profile) |profile| result._default_profile = try profile.clone(alloc_arena);
     if (self._undecodable_file) |skipped| result._undecodable_file = try alloc_arena.dupeZ(u8, skipped);
 
