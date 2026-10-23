@@ -55678,6 +55678,31 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     app.cli_config_override_path = null;
     try std.testing.expectEqual(@as(u32, 5), Fake.registers);
     try std.testing.expect(!app.restart_registered);
+
+    // A committed close keeps the registration, since Setup's restart step
+    // reads it after noctty has gone: not taken back by the commit
+    // (WM_ENDSESSION(TRUE) with ENDSESSION_CLOSEAPP), by a later query of
+    // the same round, or by one after the quit began.
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 6), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 5), Fake.unregisters);
+    defer {
+        app.session_ending = false;
+        app.end_session_quit_pending = false;
+        app.quitting = false;
+        app.running = true;
+    }
+    _ = hostWindowProc(hwnd, c.WM_ENDSESSION, 1, @bitCast(c.ENDSESSION_CLOSEAPP));
+    try std.testing.expect(app.session_ending);
+    try std.testing.expect(app.end_session_quit_pending);
+    try std.testing.expect(app.restart_registered);
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    app.quitting = true;
+    app.running = false;
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 6), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 5), Fake.unregisters);
+    try std.testing.expect(app.restart_registered);
 }
 
 test "win32 a snapshot with no session window leaves the saved session alone" {
