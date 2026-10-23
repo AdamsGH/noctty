@@ -5028,7 +5028,7 @@ pub const App = struct {
             try self.applyRestoredProfileConfig(&config, host, key)
         else
             false;
-        const default_profile = if (profile_applied) null else try self.applyDefaultProfileLaunch(&config);
+        const default_profile = if (profile_applied) null else try self.applyRestoredDefaultLaunch(&config);
         if (pane.cwd) |cwd| {
             const alloc = config._arena.?.allocator();
             config.@"working-directory" = .{ .path = try alloc.dupe(u8, cwd) };
@@ -8187,6 +8187,19 @@ pub const App = struct {
     fn applyDefaultProfileLaunch(self: *const App, config: *configpkg.Config) !?*const windows_shell.Profile {
         if (!self.defaultProfileApplies(config)) return null;
         return try applyDefaultProfileConfig(config);
+    }
+
+    /// `applyDefaultProfileLaunch` for a restored pane whose own profile did
+    /// not apply, except that restore never connects over SSH by itself: with
+    /// an SSH `default-profile` the pane gets the automatic shell, in place
+    /// of the SSH command `Config` made the default.
+    fn applyRestoredDefaultLaunch(self: *const App, config: *configpkg.Config) !?*const windows_shell.Profile {
+        if (self.defaultProfileApplies(config) and config._default_profile.?.kind == .ssh) {
+            config.command = null;
+            try config.resolveWindowsDefaultCommand();
+            return null;
+        }
+        return try self.applyDefaultProfileLaunch(config);
     }
 
     fn defaultProfileApplies(self: *const App, config: *const configpkg.Config) bool {
@@ -53529,7 +53542,7 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     var app: App = undefined;
     var host: Host = undefined;
     var source: Surface = undefined;
-    var created: [8]Surface = undefined;
+    var created: [9]Surface = undefined;
     var session: TestSession = .{};
     var surfaces: [1 + created.len]TestSession.SurfaceOptions = undefined;
     surfaces[0] = .{ .storage = &source, .host = &host, .register = true, .free_launch_profile_key_on_deinit = true };
@@ -53683,11 +53696,22 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     var transaction = SessionRestoreTransaction.init(&app);
     _ = try app.restoreSessionPane(.{ .profile = "user:gone", .cwd = "C:\\saved" }, &host, null, host.tabs.items.len, .right, &transaction);
     try Expect.profile(&created[6], "C:\\saved");
-    // So does an SSH pane, which restore never reopens: the default profile
-    // runs, as it would for `default-profile = ssh:<alias>` (docs/windows.md).
+    // So does an SSH pane, which restore never reopens.
     _ = try app.restoreSessionPane(.{ .profile = "ssh:prod", .cwd = "C:\\saved" }, &host, null, host.tabs.items.len, .right, &transaction);
     try Expect.profile(&created[7], "C:\\saved");
     try std.testing.expect(!created[7].launched_ssh);
+
+    // Restore does not connect over SSH by itself, so with an SSH default a
+    // pane it would reach gets the automatic shell (a session saves an SSH
+    // pane without its profile).
+    const ssh_argv = [_][:0]const u8{ "C:\\Windows\\System32\\OpenSSH\\ssh.exe", "prod" };
+    app.config._default_profile = .{ .kind = .ssh, .key = "ssh:prod", .label = "prod", .command = .{ .direct = &ssh_argv } };
+    app.config.command = app.config._default_profile.?.command;
+    _ = try app.restoreSessionPane(.{}, &host, null, host.tabs.items.len, .right, &transaction);
+    try std.testing.expect(std.mem.indexOf(u8, Hook.seen.program, "ssh") == null);
+    try std.testing.expect(Hook.seen.mode == null and Hook.seen.line == null);
+    try std.testing.expect(created[8].launch_profile_key == null);
+    try std.testing.expect(!created[8].launched_ssh);
     try std.testing.expectEqual(created.len, Hook.next);
 }
 

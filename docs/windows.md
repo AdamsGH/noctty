@@ -484,14 +484,13 @@ turns the file into a one-click surface.
 
 SSH entries run without shell integration, which is injected into a local
 shell and cannot apply to a remote session. Session restore does not reopen
-them: an SSH pane comes back as the default shell rather than dialing the host
-the saved session names. The default shell is what your config says, though:
-with `default-profile = ssh:<alias>` (or a `command` that runs `ssh`) a
-restored pane, an SSH pane included, connects to that alias, as every new
-terminal does. SSH entries sort after the detected shells and your own
-[user profiles](#user-profiles). `profile-order` can move any profile, an SSH
-entry included, and `profile-hidden` can take one out of the lists (see
-[Default profile, order and hidden profiles](#default-profile-order-and-hidden-profiles)).
+them: an SSH pane comes back as the default shell rather than dialing out
+unattended. Restore does not connect for `default-profile = ssh:<alias>`
+either: a restored pane that would run it gets the automatic shell, while a
+new tab or window still connects. SSH entries sort after the detected shells
+and your own [user profiles](#user-profiles). `profile-order` can move any
+profile, an SSH entry included, and `profile-hidden` can take one out of the
+lists (see [Default profile, order and hidden profiles](#default-profile-order-and-hidden-profiles)).
 The older `NOCTTY_WIN32_PROFILE_ORDER` environment variable is used only when
 `profile-order` is unset, and orders the detected shell profiles only. There
 is no bundled SSH client, secrets vault, or fleet/connection management.
@@ -639,7 +638,7 @@ What a new terminal runs, highest first:
 | Rank | Setting                   | Where it applies                                                                                                                                                                                                                                                         |
 | ---- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1    | `initial-command`, `-e`   | The first window of the launch only.                                                                                                                                                                                                                                     |
-| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone, or an SSH pane (never reopened), falls through to rank 4 or below, in its saved directory.                                                                                          |
+| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone, or an SSH pane (never reopened), falls through to rank 4 or below, in its saved directory; an SSH `default-profile` is skipped there (rank 6).                                      |
 | 3    | A profile you choose      | The picker, the palette, a quick slot, the [▾] menu, `new_window_elevated:<key>`, and a tab or split an automation command opens from a pane (it keeps that pane's launch).                                                                                              |
 | 4    | `command`                 | From any config file or the command line. Set in a file together with `default-profile`, it wins and the unused `default-profile` is reported as a config problem; `--command` on the command line wins without one, and `--command=` (empty) undoes a file's `command`. |
 | 5    | `default-profile`         | Everything else: a new tab, a new window, the quick terminal, a split of a pane that runs no profile.                                                                                                                                                                    |
