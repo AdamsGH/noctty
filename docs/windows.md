@@ -1527,7 +1527,8 @@ program turned on bracketed paste (mode 2004), after the usual paste
 protection.
 
 When a paste finds no text on the clipboard, such as an image copied from a
-screenshot tool, and the program has bracketed paste on, noctty sends an empty
+screenshot tool, and the program has bracketed paste on in a writable pane,
+noctty sends an empty
 bracketed paste, `ESC[200~ESC[201~`, the same twelve bytes Windows Terminal
 sends. A program can take that as "the user pasted" and read the clipboard
 itself, which is how herdr and opencode attach an image. noctty transfers no
@@ -1544,11 +1545,11 @@ Drops, automation `send_text`, quick select and typed text never send an
 empty paste, and neither does a program's OSC 52 read of an empty clipboard,
 which still gets its empty reply.
 
-With bracketed paste off, nothing is sent and the paste action counts as not
-performed. The default Ctrl+Shift+V binding is `performable`, so on a
-clipboard without text it still reaches the program as a key. With bracketed
-paste on it no longer does: the empty paste consumes it, as in Windows
-Terminal. A program that exits without turning bracketed paste off leaves the
+With bracketed paste off, or in a read-only pane, nothing is sent and the paste
+action counts as not performed. The default Ctrl+Shift+V binding is
+`performable`, so on a clipboard without text it still reaches the program as
+a key. With bracketed paste on, in a writable pane, it no longer does: the
+empty paste consumes it, as in Windows Terminal. A program that exits without turning bracketed paste off leaves the
 shell receiving the empty paste on such a clipboard.
 
 ## Quick terminal and global hotkeys
