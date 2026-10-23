@@ -4019,7 +4019,15 @@ pub const App = struct {
     /// replays only the launch argv's `--config-file` and `--class`
     /// (`installerRestartCommandLine`); Windows adds the executable.
     fn registerInstallerRestart(self: *App) void {
-        if (self.restart_registered or !self.sessionStateEnabled() or !self.hasSessionWindows()) return;
+        if (!self.sessionStateEnabled() or !self.hasSessionWindows()) return;
+        // Another noctty process's in-app Install is running this Setup, which
+        // starts noctty through /RELAUNCH=1: a restart would be a second
+        // start. Asked before the once-per-round check, so that it also takes
+        // back a registration an earlier round left.
+        if (self.restart_api.installer_apply_running(self.core_app.alloc)) {
+            return self.unregisterInstallerRestart();
+        }
+        if (self.restart_registered) return;
         const line = installerRestartCommandLine(
             self.core_app.alloc,
             self.cli_config_override_path,
@@ -12984,8 +12992,9 @@ fn buildInstallerApplyArgs(alloc: Allocator, install_dir: []const u8, log_path: 
     // /RELAUNCH=1 is ours, not Inno's: dist/windows/noctty.iss starts noctty
     // again when it is given and Setup is silent. noctty has quit by the time
     // Setup replaces its files, and a process applying an update never
-    // registers for a restart (`App.onQueryEndSession`), so
-    // /RESTARTAPPLICATIONS has nothing of this process to restart.
+    // registers for a restart (`App.onQueryEndSession`), nor does another
+    // noctty process while this Setup runs (`App.registerInstallerRestart`),
+    // so /RESTARTAPPLICATIONS has no noctty to restart.
     try buf.appendSlice(alloc, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /RELAUNCH=1");
     try appendInnoQuotedArg(alloc, &buf, " /DIR=", install_dir);
     try appendInnoQuotedArg(alloc, &buf, " /LOG=", log_path);
@@ -30579,19 +30588,31 @@ const restart_max_cmd_line = 1024;
 /// Not RESTART_NO_PATCH, which is the flag that stops an installer's restart.
 const restart_flags: DWORD = 0x1 | 0x2 | 0x8;
 
-/// kernel32's restart registration. A test build defaults to stand-ins that
-/// register nothing, so no test makes the test runner restartable.
+/// kernel32's restart registration, and whether another noctty's in-app
+/// Install is running Setup. A test build defaults to stand-ins that register
+/// nothing and read no update state, so no test makes the test runner
+/// restartable or reads the user's profile.
 const RestartApi = struct {
     register: *const fn (?LPCWSTR, DWORD) callconv(.winapi) windows.HRESULT =
         if (builtin.is_test) &inertRegisterRestart else &sys.RegisterApplicationRestart,
     unregister: *const fn () callconv(.winapi) windows.HRESULT =
         if (builtin.is_test) &inertUnregisterRestart else &sys.UnregisterApplicationRestart,
+    installer_apply_running: *const fn (Allocator) bool =
+        if (builtin.is_test) &inertApplyRunning else &stagedInstallerRunning,
 
     fn inertRegisterRestart(_: ?LPCWSTR, _: DWORD) callconv(.winapi) windows.HRESULT {
         return 0;
     }
     fn inertUnregisterRestart() callconv(.winapi) windows.HRESULT {
         return 0;
+    }
+    fn inertApplyRunning(_: Allocator) bool {
+        return false;
+    }
+    fn stagedInstallerRunning(alloc: Allocator) bool {
+        const state_path = updatepkg.defaultStatePath(alloc) catch return false;
+        defer alloc.free(state_path);
+        return updatepkg.stagedInstallerRunning(alloc, state_path);
     }
 };
 
@@ -55543,6 +55564,18 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     app.cli_class = &class;
     defer app.cli_class = null;
 
+    // A decline (a program running in a terminal) registers nothing, and has
+    // nothing to take back.
+    surface.core_surface.readonly = true;
+    surface.core_initialized = true;
+    const first_declined = Rm.query(hwnd);
+    surface.core_initialized = false;
+    surface.core_surface.readonly = false;
+    try std.testing.expectEqual(@as(LRESULT, 0), first_declined);
+    try std.testing.expectEqual(@as(u32, 0), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 0), Fake.unregisters);
+    try std.testing.expect(!app.restart_registered);
+
     // Agreeing registers once, with flags 11 and the launch's config file and
     // class; the other windows' queries of the round do not register again.
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
@@ -55589,6 +55622,27 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     try std.testing.expectEqual(@as(u32, 3), Fake.registers);
     try std.testing.expectEqual(@as(u32, 3), Fake.unregisters);
 
+    // So does another noctty process's in-app Install: while its Setup runs,
+    // an idle owner beside it agrees and is not restarted, and a
+    // registration an earlier round left is taken back.
+    const OtherInstall = struct {
+        var running = false;
+        fn probe(_: Allocator) bool {
+            return running;
+        }
+    };
+    app.restart_api.installer_apply_running = &OtherInstall.probe;
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 4), Fake.registers);
+    OtherInstall.running = true;
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 4), Fake.unregisters);
+    try std.testing.expect(!app.restart_registered);
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 4), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 4), Fake.unregisters);
+    OtherInstall.running = false;
+
     // A process that does not restore the session agrees and is not
     // restarted: no owner, the default-terminal server, safe mode, and an
     // owner whose only window holds nothing the session records.
@@ -55605,7 +55659,7 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     host.quick_terminal = true;
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
     host.quick_terminal = false;
-    try std.testing.expectEqual(@as(u32, 3), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 4), Fake.registers);
 
     // A command line too long to register: the close still goes ahead.
     var long_path: [1100]u8 = undefined;
@@ -55613,7 +55667,7 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     app.cli_config_override_path = &long_path;
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
     app.cli_config_override_path = null;
-    try std.testing.expectEqual(@as(u32, 3), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 4), Fake.registers);
     try std.testing.expect(!app.restart_registered);
 }
 

@@ -37,7 +37,13 @@ the first with two tabs, the second of them split, the second with one tab):
                     copy (not the session owner) agrees and is not restartable.
   restartable-busy  confirm-close-surface = always: the declining owner is not
                     restartable.
-These two only list (RmGetList) and send the query and end messages
+  restartable-install-running
+                    another noctty's in-app Install is running Setup (the
+                    copy's update state names a staged installer whose file a
+                    shared-read handle holds, which refuses write access as a
+                    running image does): the owner agrees and is not
+                    restartable; once the handle is closed, it is again.
+These three only list (RmGetList) and send the query and end messages
 themselves; they never call RmShutdown.
 
 Safety. Only this run's portable copies are registered with Restart Manager:
@@ -334,7 +340,7 @@ function Quote-Arg([string]$Arg) {
 }
 $notFound='0x80070490'
 
-$all=@('idle-two-windows','busy-always','busy-ping','settings-dirty','cancel','signout','restartable','restartable-busy')
+$all=@('idle-two-windows','busy-always','busy-ping','settings-dirty','cancel','signout','restartable','restartable-busy','restartable-install-running')
 $selected=if($Cases) { @($Cases -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $all }
 foreach($name in $selected) { if($all -notcontains $name) { throw "Unknown case $name." } }
 
@@ -506,6 +512,35 @@ foreach($name in $selected) {
                 Check "${name}: declined" (@($r.Queries | Where-Object { $_ -ne 0 }).Count -eq 0 -and $r.Queries.Count -eq 2) '0,0' ($r.Queries -join ',')
                 Check "${name}: and not restartable" ($r.Declined.Hr -eq $notFound -and $r.Listed -eq $false) "$notFound, False" "$($r.Declined.Hr), $($r.Listed)"
             } finally { Stop-Case $case }
+        }
+        'restartable-install-running' {
+            # No update check may rewrite the state the case writes.
+            $case=Start-Case $name @('auto-update = off')
+            $held=$null
+            try {
+                $p=$case.Process
+                $setup=Join-Path $Run "$name\staged-setup.exe"
+                Set-Content -LiteralPath $setup -Value 'not a program' -NoNewline
+                $state=[ordered]@{ staged_version='1.3.999'; staged_kind='installer'; staged_installer_path=$setup; staged_sha256='00' } | ConvertTo-Json -Compress
+                Set-Content -LiteralPath (Join-Path $case.Dir 'update-state.json') -Value $state -NoNewline -Encoding utf8NoBOM
+                $held=[IO.File]::Open($setup,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                $r.Queries=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.Running=Restart-Settings $p
+                $r.ListedRunning=(Rm-Restartable $case @($p))[$p.Id]
+                [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                $held.Dispose(); $held=$null
+                # Setup has exited: the same owner registers again.
+                $r.QueriesAfter=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.After=Restart-Settings $p
+                $r.ListedAfter=(Rm-Restartable $case @($p))[$p.Id]
+                [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                Check "${name}: every window agrees" (@($r.Queries | Where-Object { $_ -ne 1 }).Count -eq 0 -and $r.Queries.Count -eq 2) '1,1' ($r.Queries -join ',')
+                Check "${name}: and the owner is not restartable while that Setup runs" ($r.Running.Hr -eq $notFound -and $r.ListedRunning -eq $false) "$notFound, False" "$($r.Running.Hr), $($r.ListedRunning)"
+                Check "${name}: once it has exited, the owner is restartable again" ($r.After.Hr -eq '0x00000000' -and $r.After.Flags -eq 11 -and $r.ListedAfter -eq $true) '0x00000000 / 11, True' "$($r.After.Hr) / $($r.After.Flags), $($r.ListedAfter)"
+            } finally {
+                if($held) { $held.Dispose() }
+                Stop-Case $case
+            }
         }
     }
     $results.Cases[$name]=$r

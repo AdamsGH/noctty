@@ -1076,6 +1076,19 @@ fn installerImageInUse(path: []const u8) bool {
     return false;
 }
 
+/// Whether the staged installer is running now, which is how the in-app
+/// Install runs Setup. The state is the user's, so this sees an Install that
+/// any noctty process started. False when the state cannot be read. The
+/// updater's own short verification opens also read as running, as do a
+/// staged installer the user started by hand and a permission failure
+/// (`installerImageInUse`).
+pub fn stagedInstallerRunning(alloc: Allocator, state_path: []const u8) bool {
+    var state = loadState(alloc, state_path) catch return false;
+    defer state.deinit(alloc);
+    if (state.staged_kind != .installer) return false;
+    return installerImageInUse(state.staged_installer_path orelse return false);
+}
+
 /// Called at start-up. Install quits the app right after launching Setup and
 /// nothing watches Setup's result, so this is the first chance to find out
 /// whether it worked: a recorded apply request while this build is still
@@ -3910,6 +3923,48 @@ test "a start while Setup is still running leaves the request for a later start"
     const message = (try takeFailedInstallerApply(alloc, state_path, old_build)).?;
     defer alloc.free(message);
     try std.testing.expect(std.mem.indexOf(u8, message, "did not finish installing") != null);
+}
+
+test "the staged installer reads as running only while its image is in use" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+    try tmp.dir.writeFile(.{ .sub_path = "setup.exe", .data = "setup" });
+    const installer_path = try std.fs.path.join(alloc, &.{ root, "setup.exe" });
+    defer alloc.free(installer_path);
+
+    // No state, and no staged installer.
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+    var state: State = .{
+        .staged_version = try alloc.dupe(u8, "1.3.200"),
+        .staged_kind = .installer,
+        .staged_installer_path = try alloc.dupe(u8, installer_path),
+        .staged_sha256 = try alloc.dupe(u8, "00"),
+    };
+    defer state.deinit(alloc);
+    try saveState(state_path, &state);
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+
+    // Running, as the read-only-share open stands in for a mapped image
+    // (see "a start while Setup is still running ..."), with or without a
+    // recorded request: the request is written after Setup has started.
+    {
+        var running = try openLockedInstaller(installer_path);
+        defer running.close();
+        try std.testing.expect(stagedInstallerRunning(alloc, state_path));
+        // A staged portable update has no Setup.
+        state.staged_kind = .portable;
+        try saveState(state_path, &state);
+        try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+        state.staged_kind = .installer;
+        try saveState(state_path, &state);
+    }
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
 }
 
 test "a start leaves a portable apply request to the portable recovery" {

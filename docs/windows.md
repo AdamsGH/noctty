@@ -1399,8 +1399,10 @@ when quitting would ask nothing: it saves every window, tab and split, as
 Windows to let Setup start it again when Setup finishes, with the same
 `--config-file` and `--class` it was started with, and that start restores
 the session. Another noctty process closes and is not started again; the
-session owner brings the session back. Setup's restart of noctty itself has
-not been tried on a real install.
+session owner brings the session back. Setup starts noctty before its last
+page, so in the setup wizard, leaving **Launch noctty** checked there opens
+one more window. Setup's restart of noctty itself has not been tried on a real
+install.
 
 noctty declines, without a prompt, while a terminal runs a program (the
 programs `confirm-close-surface` asks about) or while Settings has unsaved
