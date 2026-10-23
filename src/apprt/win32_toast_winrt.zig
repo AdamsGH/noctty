@@ -280,17 +280,31 @@ pub fn xmlEscape(writer: *std.Io.Writer, input: []const u8) std.Io.Writer.Error!
     }
 }
 
+/// What one toast shows. Every slice is borrowed for the call.
+pub const ToastRequest = struct {
+    title: []const u8,
+    /// Shown under the title; an empty body shows no line.
+    body: []const u8,
+    /// noctty's own line at the bottom of the toast
+    /// (`<text placement="attribution">`, Windows 10 1607 and later),
+    /// styled apart from the program's text: which tab the toast is from.
+    attribution: ?[]const u8 = null,
+    /// The toast element's launch argument, for click activation.
+    launch: ?[]const u8 = null,
+};
+
 /// Build complete toast XML. Caller owns the returned UTF-16 slice.
-/// `launch` is XML-escaped into the toast element's launch attribute so
-/// click activation can recover the target surface, tab, window, and action.
-fn buildToastXml(alloc: Allocator, title: []const u8, body: []const u8, severity: Severity, launch: ?[]const u8) (Allocator.Error || error{InvalidUtf8})![]const u16 {
+/// Every string is XML-escaped; `launch` goes into the toast element's
+/// launch attribute so click activation can recover the target surface,
+/// tab, window, and action.
+fn buildToastXml(alloc: Allocator, request: ToastRequest, severity: Severity) (Allocator.Error || error{InvalidUtf8})![]const u16 {
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
 
     const writer = &buf.writer;
 
     writer.writeAll("<toast") catch return error.OutOfMemory;
-    if (launch) |l| {
+    if (request.launch) |l| {
         writer.writeAll(" launch=\"") catch return error.OutOfMemory;
         xmlEscape(writer, l) catch return error.OutOfMemory;
         writer.writeAll("\"") catch return error.OutOfMemory;
@@ -303,10 +317,19 @@ fn buildToastXml(alloc: Allocator, title: []const u8, body: []const u8, severity
     }
 
     writer.writeAll("<visual><binding template=\"ToastGeneric\"><text>") catch return error.OutOfMemory;
-    xmlEscape(writer, title) catch return error.OutOfMemory;
-    writer.writeAll("</text><text>") catch return error.OutOfMemory;
-    xmlEscape(writer, body) catch return error.OutOfMemory;
-    writer.writeAll("</text></binding></visual></toast>") catch return error.OutOfMemory;
+    xmlEscape(writer, request.title) catch return error.OutOfMemory;
+    writer.writeAll("</text>") catch return error.OutOfMemory;
+    if (request.body.len > 0) {
+        writer.writeAll("<text>") catch return error.OutOfMemory;
+        xmlEscape(writer, request.body) catch return error.OutOfMemory;
+        writer.writeAll("</text>") catch return error.OutOfMemory;
+    }
+    if (request.attribution) |attribution| {
+        writer.writeAll("<text placement=\"attribution\">") catch return error.OutOfMemory;
+        xmlEscape(writer, attribution) catch return error.OutOfMemory;
+        writer.writeAll("</text>") catch return error.OutOfMemory;
+    }
+    writer.writeAll("</binding></visual></toast>") catch return error.OutOfMemory;
 
     const utf8 = buf.written();
     const utf16_len = std.unicode.calcUtf16LeLen(utf8) catch return error.InvalidUtf8;
@@ -530,20 +553,11 @@ pub const WinrtToast = struct {
         self.* = undefined;
     }
 
-    pub fn show(self: *WinrtToast, title: []const u8, body: []const u8, severity: Severity) ShowError!void {
-        return self.showWithLaunch(title, body, severity, null);
-    }
-
-    /// Show a toast with an optional launch string for click activation.
-    /// `null` produces a generic toast with no target context.
-    pub fn showWithLaunch(
-        self: *WinrtToast,
-        title: []const u8,
-        body: []const u8,
-        severity: Severity,
-        launch: ?[]const u8,
-    ) ShowError!void {
-        const xml_utf16 = buildToastXml(self.alloc, title, body, severity, launch) catch |e| switch (e) {
+    /// Show a toast. A request with a launch string gets a click handler
+    /// that hands the string to the activation callback; one without is a
+    /// generic toast with no target context.
+    pub fn show(self: *WinrtToast, request: ToastRequest, severity: Severity) ShowError!void {
+        const xml_utf16 = buildToastXml(self.alloc, request, severity) catch |e| switch (e) {
             error.OutOfMemory => return ShowError.OutOfMemory,
             error.InvalidUtf8 => return ShowError.InvalidUtf8,
         };
@@ -606,7 +620,7 @@ pub const WinrtToast = struct {
             if (!notifierSettingAllowsDisplay(setting)) return ShowError.NotifierDisabled;
         }
 
-        if (launch) |value| {
+        if (request.launch) |value| {
             if (self.activation_callback == null or self.activation_ctx == null) {
                 std.log.warn("winrt toast activation callback/context missing for launch toast", .{});
                 return ShowError.ActivationFailed;
@@ -794,7 +808,7 @@ test "WinrtToast WinRT string lengths are bounded to u32" {
 
 test "WinrtToast buildToastXml - info severity no audio" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "Title", "Body", .info, null);
+    const xml = try buildToastXml(alloc, .{ .title = "Title", .body = "Body" }, .info);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -807,7 +821,7 @@ test "WinrtToast buildToastXml - info severity no audio" {
 
 test "WinrtToast buildToastXml - err severity has audio" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "Error", "Oops", .err, null);
+    const xml = try buildToastXml(alloc, .{ .title = "Error", .body = "Oops" }, .err);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -818,7 +832,7 @@ test "WinrtToast buildToastXml - err severity has audio" {
 
 test "WinrtToast buildToastXml - warn severity has audio" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "Warning", "Careful", .warn, null);
+    const xml = try buildToastXml(alloc, .{ .title = "Warning", .body = "Careful" }, .warn);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -829,7 +843,7 @@ test "WinrtToast buildToastXml - warn severity has audio" {
 
 test "WinrtToast buildToastXml - success severity no audio" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "Done", "All good", .success, null);
+    const xml = try buildToastXml(alloc, .{ .title = "Done", .body = "All good" }, .success);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -840,7 +854,7 @@ test "WinrtToast buildToastXml - success severity no audio" {
 
 test "WinrtToast buildToastXml - escapes special chars in title and body" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "A & B", "<tag>", .info, null);
+    const xml = try buildToastXml(alloc, .{ .title = "A & B", .body = "<tag>" }, .info);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -857,7 +871,7 @@ test "WinrtToast buildToastXml - escapes special chars in title and body" {
 
 test "WinrtToast buildToastXml - valid XML structure" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "T", "B", .info, null);
+    const xml = try buildToastXml(alloc, .{ .title = "T", .body = "B" }, .info);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -870,7 +884,7 @@ test "WinrtToast buildToastXml - valid XML structure" {
 
 test "WinrtToast buildToastXml - includes launch attribute when provided" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "T", "B", .info, "wgh://activate?surface=42");
+    const xml = try buildToastXml(alloc, .{ .title = "T", .body = "B", .launch = "wgh://activate?surface=42" }, .info);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -882,7 +896,7 @@ test "WinrtToast buildToastXml - includes launch attribute when provided" {
 
 test "WinrtToast buildToastXml - launch attribute is XML-escaped" {
     const alloc = std.testing.allocator;
-    const xml = try buildToastXml(alloc, "T", "B", .info, "wgh://activate?surface=1&tab=2");
+    const xml = try buildToastXml(alloc, .{ .title = "T", .body = "B", .launch = "wgh://activate?surface=1&tab=2" }, .info);
     defer alloc.free(xml);
 
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
@@ -891,6 +905,40 @@ test "WinrtToast buildToastXml - launch attribute is XML-escaped" {
     // A raw `&` in the query string would abort WinRT XML parsing.
     try std.testing.expect(std.mem.indexOf(u8, utf8, "surface=1&amp;tab=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, utf8, "surface=1&tab=2\"") == null);
+}
+
+test "buildToastXml emits an escaped attribution line only when given one" {
+    const alloc = std.testing.allocator;
+
+    const plain = try buildToastXml(alloc, .{ .title = "T", .body = "B" }, .info);
+    defer alloc.free(plain);
+    const plain_utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, plain);
+    defer alloc.free(plain_utf8);
+    try std.testing.expect(std.mem.indexOf(u8, plain_utf8, "placement") == null);
+
+    const xml = try buildToastXml(alloc, .{
+        .title = "T",
+        .body = "B",
+        .attribution = "Tab 2: <a & \"b\">",
+    }, .info);
+    defer alloc.free(xml);
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, xml);
+    defer alloc.free(utf8);
+    // The attribution is the last text of the binding, after the body.
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        utf8,
+        "<text>T</text><text>B</text>" ++
+            "<text placement=\"attribution\">Tab 2: &lt;a &amp; &quot;b&quot;&gt;</text>" ++
+            "</binding></visual></toast>",
+    ));
+
+    // A toast with nothing but a title and its tab has no empty body line.
+    const untitled = try buildToastXml(alloc, .{ .title = "T", .body = "", .attribution = "Tab 1: x" }, .info);
+    defer alloc.free(untitled);
+    const untitled_utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, untitled);
+    defer alloc.free(untitled_utf8);
+    try std.testing.expect(std.mem.indexOf(u8, untitled_utf8, "<text>T</text><text placement=\"attribution\">Tab 1: x</text>") != null);
 }
 
 test "WinrtToast GUID sizes are 16 bytes" {

@@ -159,9 +159,11 @@ Win32-validated VT protocol coverage is tracked in
   input, and `quick-terminal-space-behavior` has no Windows effect.
 - WinRT Action Center notifications with an in-app banner/log fallback,
   gated by `desktop-notifications`. Command-finish toasts also need
-  `notify-on-command-finish` and a `notify` action. Command-finish and
-  program status ([OSC 7501](windows.md#program-status-osc-7501)) toasts focus
-  the originating pane when clicked; OSC 9 / OSC 777 toasts are display-only.
+  `notify-on-command-finish` and a `notify` action. Every toast from a
+  terminal pane (OSC 9, OSC 777, command finished, program status
+  ([OSC 7501](windows.md#program-status-osc-7501)) and the "Copied ... to
+  clipboard" notices) names its tab and focuses its pane when its popup is
+  clicked; a click on an older entry in Action Center is not confirmed.
   Command-finish toasts depend on OSC 133 command marks, which plain
   `cmd.exe` does not supply (Clink with the shipped script does).
 - Taskbar progress for the active pane in each host window, driven by

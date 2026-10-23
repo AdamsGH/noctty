@@ -722,13 +722,30 @@ package.
 ## Notifications and progress
 
 Desktop notifications use WinRT toasts when available and fall back to
-in-app banners when Windows notification policy, Focus Assist, app identity,
-or runtime availability prevents a toast. `desktop-notifications` gates every
+in-app banners when Windows refuses a toast: when notifications are turned
+off for noctty or for the user, or when app identity or runtime availability
+prevents one. Under Focus Assist (Do not disturb) Windows may refuse the toast,
+which brings the banner, or file it in Action Center without a popup, which
+does not; which one happens has not been measured for noctty.
+`desktop-notifications` gates every
 toast, including command-finish toasts, which additionally need
 `notify-on-command-finish` and a `notify-on-command-finish-action` that
 includes `notify`, and [program status](#program-status-osc-7501) toasts.
-Command-finish and program status toasts focus the originating pane when
-clicked; OSC 9 and OSC 777 toasts are display-only.
+
+Every toast from a terminal pane (OSC 9, OSC 777, command finished, program
+status, and noctty's own "Copied ... to clipboard" notices) ends with a line
+that names its tab: `Tab 2: <tab title>`, `Tab 2 of window 1: <tab title>`
+while more than one window is open, or `Tab 1 of the quick terminal: <tab
+title>`. The quick terminal is not counted as a window. A window's number
+appears nowhere else in noctty and can change when another window closes. The
+tab title is that of the tab's focused pane, without bidirectional overrides,
+invisible characters or control characters, and cut to 64 bytes. An OSC 9
+notification, which has no title, is titled by its tab. When the toast falls
+back to a banner, the banner ends with the same tab line. Clicking the toast's
+popup focuses the pane that sent it: noctty restores its window if it is
+minimized, switches to its tab and pane, and asks Windows to bring the window
+forward, which Windows may refuse. Whether clicking an older entry in Action
+Center does the same has not been confirmed.
 
 Terminal progress reports map to Windows taskbar progress for the active
 surface in each host window when `progress-style` is enabled; with
@@ -785,9 +802,9 @@ goto_attention` runs it from scripts.
   request or result raises a property-change event; progress updates
   don't.
 
-Program text shown outside the terminal (in toasts and UI Automation) has
-bidirectional overrides and invisible formatting characters removed and is
-cut to 240 bytes. noctty never sends anything a program reported back to a
+Program status text shown outside the terminal (in toasts and UI
+Automation) has bidirectional overrides and invisible formatting characters
+removed and is cut to 240 bytes. noctty never sends anything a program reported back to a
 program.
 
 With Windows' built-in console host, replies to OSC queries, including this

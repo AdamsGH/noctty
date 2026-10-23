@@ -466,10 +466,14 @@ pub const max_shown_text_bytes = 240;
 
 /// Write `text` for display outside the terminal grid: without bidi
 /// controls and invisible formatting characters, so a program can't
-/// reorder or hide what the notification says, and with line and
-/// paragraph separators as spaces. Cuts at `max_bytes` on a codepoint
-/// boundary and marks the cut with an ellipsis. Text that isn't valid
-/// UTF-8 is skipped byte by byte; the parser only lets valid UTF-8 through.
+/// reorder or hide what the notification says, and with control
+/// characters, U+FFFE and U+FFFF, and line and paragraph separators as
+/// spaces (XML 1.0 cannot carry controls or those two noncharacters even
+/// escaped; a tab title can hold controls, and both a tab title and
+/// program status text can hold U+FFFE and U+FFFF, which the OSC 7501
+/// parser lets through). Cuts at `max_bytes` on a codepoint boundary and
+/// marks the cut with an ellipsis. Text that isn't valid UTF-8 is skipped
+/// byte by byte; the parser only lets valid UTF-8 through.
 pub fn writeSanitized(
     writer: *std.Io.Writer,
     text: []const u8,
@@ -491,7 +495,8 @@ pub fn writeSanitized(
         const bytes = text[i..][0..len];
         i += len;
         if (isHidden(cp)) continue;
-        const out: []const u8 = if (cp == 0x2028 or cp == 0x2029) " " else bytes;
+        const control = cp < 0x20 or (cp >= 0x7F and cp <= 0x9F) or cp == 0xFFFE or cp == 0xFFFF;
+        const out: []const u8 = if (control or cp == 0x2028 or cp == 0x2029) " " else bytes;
         if (written + out.len > max_bytes) {
             try writer.writeAll(ellipsis);
             return;
@@ -943,6 +948,16 @@ test "sanitized text drops bidi controls and invisible characters" {
     w = .fixed(&buf);
     try writeSanitized(&w, "abc", 3);
     try testing.expectEqualStrings("abc", w.buffered());
+
+    // C0, DEL and C1 controls, which a tab title can hold.
+    w = .fixed(&buf);
+    try writeSanitized(&w, "a\tb\x07c\x7Fd\u{9B}e", 100);
+    try testing.expectEqualStrings("a b c d e", w.buffered());
+
+    // The two noncharacters XML 1.0 forbids; U+FFFD and U+FFFC are text.
+    w = .fixed(&buf);
+    try writeSanitized(&w, "a\u{FFFE}b\u{FFFF}c\u{FFFD}\u{FFFC}", 100);
+    try testing.expectEqualStrings("a b c\u{FFFD}\u{FFFC}", w.buffered());
 }
 
 test "status lines name the record and say what it needs" {

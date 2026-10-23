@@ -2990,9 +2990,13 @@ pub const App = struct {
     link_hover_tracker: win32_link_preview.HoverTracker = undefined,
     /// Windows Action Center toast notifier. `null` when WinRT init
     /// fails (e.g. corporate lockdown, missing combase.dll), in which
-    /// case `showDesktopNotification` falls back to the in-app banner
-    /// path. One notifier per App, released in `App.terminate`.
+    /// case `showToast` falls back to the in-app banner path. One
+    /// notifier per App, released in `App.terminate`.
     winrt_toast: ?win32_toast_winrt.WinrtToast = null,
+    /// Where `showToast` sends toasts: `winrt_toast` in the product, a
+    /// recorder in tests, so no test can reach Action Center. `null`
+    /// sends every notification to the banner fallback.
+    toast_sink: ?ToastSink = null,
     /// Taskbar progress COM object. `null` when the taskbar API is
     /// unavailable, in which case progress continues to render only in
     /// the window title/status text.
@@ -3205,14 +3209,17 @@ pub const App = struct {
         }
 
         // Boot the WinRT toast notifier. Failure falls back to the
-        // host banner/log path in `showDesktopNotificationWithLaunch`.
+        // host banner/log path in `showToast`.
         // MUST run AFTER `setProcessAumid` so `CreateToastNotifierWithId`
-        // attributes toasts to our AUMID.
+        // attributes toasts to our AUMID. A test build never creates one, so
+        // no test can reach Action Center; tests install a recorder as
+        // `toast_sink` instead.
         const aumid_utf16 = std.unicode.utf8ToUtf16LeStringLiteral("io.github.amanthanvi.noctty");
-        self.winrt_toast = win32_toast_winrt.WinrtToast.init(core_app.alloc, aumid_utf16) catch |err| blk: {
+        self.winrt_toast = if (builtin.is_test) null else win32_toast_winrt.WinrtToast.init(core_app.alloc, aumid_utf16) catch |err| blk: {
             std.log.warn("winrt toast init failed err={}; falling back to host notifications", .{err});
             break :blk null;
         };
+        if (self.winrt_toast) |*toast| self.toast_sink = .winrt(toast);
 
         // Install the PowerShell shell-integration script into
         // %LOCALAPPDATA%\noctty\shell-integration\powershell\
@@ -3805,6 +3812,7 @@ pub const App = struct {
         if (uia_disconnect_hr != 0) {
             log.warn("win32 UIA disconnect-all failed hr=0x{x}", .{@as(u32, @bitCast(uia_disconnect_hr))});
         }
+        self.toast_sink = null;
         if (self.winrt_toast) |*toast| {
             toast.deinit();
             self.winrt_toast = null;
@@ -11902,53 +11910,170 @@ pub const App = struct {
         try std.testing.expect(!surface.bell_ringing);
     }
 
-    fn showDesktopNotificationWithLaunch(
+    /// Show a toast; when none can be shown, a banner in the target's
+    /// window; failing that, a log line. `sender_title` is the title the
+    /// notification arrived with, which the banner uses: a toast titled by
+    /// its tab names that tab in its attribution line already.
+    fn showToast(
         self: *App,
         target: apprt.Target,
-        title: []const u8,
-        body: []const u8,
-        launch: ?[]const u8,
+        request: ToastRequest,
+        sender_title: []const u8,
     ) !void {
-        const caption = if (title.len > 0) title else "noctty";
-        const message = if (title.len > 0 and !std.mem.eql(u8, title, "noctty"))
-            try std.fmt.allocPrint(self.core_app.alloc, "{s}: {s}", .{ caption, body })
-        else
-            try self.core_app.alloc.dupe(u8, body);
-        defer self.core_app.alloc.free(message);
+        var shown = request;
+        if (shown.title.len == 0) shown.title = "noctty";
 
-        // Primary path: Action Center toast via WinRT. This persists
-        // in Action Center history and surfaces system-level badging.
-        // On success we SKIP the in-app banner — showing both would
-        // double-notify on the same event. Any show error (Focus
-        // Assist, notifications disabled, runtime unavailable) falls
-        // back to the banner so the user still gets feedback.
-        if (self.winrt_toast) |*toast| {
-            const result = if (launch) |value|
-                toast.showWithLaunch(caption, body, .info, value)
-            else
-                toast.show(caption, body, .info);
-            if (result) |_| {
+        // Primary path: an Action Center toast. It persists in Action
+        // Center history and surfaces system-level badging. On success we
+        // SKIP the in-app banner: showing both would double-notify on the
+        // same event. A show error (notifications turned off for noctty or
+        // for the user, the runtime unavailable, XML rejected) falls back
+        // to the banner so the user still gets feedback. Under Focus Assist
+        // (Do not disturb) Windows may instead accept the toast and file it
+        // in Action Center without a popup, and then no banner appears;
+        // which of the two it does has not been measured for noctty.
+        if (self.toast_sink) |sink| {
+            if (sink.show(sink.ctx, shown)) |_| {
                 return;
             } else |err| {
+                // test/windows/interactive-win11-command-finish.ps1 matches
+                // this line's opening words; keep them.
                 std.log.warn("winrt toast show failed err={}; falling back to banner", .{err});
             }
         }
 
-        if (try self.showHostBanner(target, .info, message)) return;
-        // Final local fallback: pass the composed `message` as the body so
-        // notifications with an empty `body` (e.g. settings-save
-        // success, where title alone carries the signal) still render
-        // something readable.
-        try showInfoMessage(target, caption, message);
+        var message: std.Io.Writer.Allocating = .init(self.core_app.alloc);
+        defer message.deinit();
+        composeToastFallback(&message.writer, sender_title, request.body, request.attribution) catch
+            return error.OutOfMemory;
+        if (try self.showHostBanner(target, .info, message.written())) return;
+        // Final local fallback: pass the composed message as the body so
+        // notifications with an empty `body` (e.g. settings-save success,
+        // where title alone carries the signal) still render something
+        // readable.
+        const caption = if (toastFallbackTitled(sender_title)) sender_title else "noctty";
+        try showInfoMessage(target, caption, message.written());
     }
 
+    fn toastFallbackTitled(title: []const u8) bool {
+        return title.len > 0 and !std.mem.eql(u8, title, "noctty");
+    }
+
+    /// The banner says what the toast would have: `<title>: <body>`, the
+    /// body alone when the title is empty or just "noctty", and the tab
+    /// the toast came from after a dash.
+    fn composeToastFallback(
+        writer: *std.Io.Writer,
+        title: []const u8,
+        body: []const u8,
+        attribution: ?[]const u8,
+    ) std.Io.Writer.Error!void {
+        const titled = toastFallbackTitled(title);
+        if (titled) try writer.writeAll(title);
+        if (body.len > 0) {
+            if (titled) try writer.writeAll(": ");
+            try writer.writeAll(body);
+        }
+        if (attribution) |line| try writer.print(" \u{2014} {s}", .{line});
+    }
+
+    /// A notification a program asked for (OSC 9, OSC 777), one noctty
+    /// shows about a pane (the core's clipboard-copy notices, titled
+    /// "noctty"), or one noctty shows for itself (an `.app` target, such as
+    /// a config reload). One from a pane names its tab and focuses the pane
+    /// when clicked. The core sends both kinds a pane can cause the same
+    /// way, so they are not told apart; by the title they could not be, as
+    /// a program can send an OSC 777 titled "noctty" too.
     fn showDesktopNotification(
         self: *App,
         target: apprt.Target,
-        title: [:0]const u8,
-        body: [:0]const u8,
+        title: []const u8,
+        body: []const u8,
     ) !void {
-        try self.showDesktopNotificationWithLaunch(target, title, body, null);
+        switch (target) {
+            .app => {},
+            .surface => if (self.findSurfaceForTarget(target)) |surface| {
+                return self.showSurfaceToast(surface, title, body);
+            },
+        }
+        try self.showToast(target, .{ .title = title, .body = body }, title);
+    }
+
+    /// The most of a tab's title a toast shows, in bytes, before the
+    /// ellipsis.
+    const toast_tab_title_max = 64;
+
+    /// Show a toast from `surface` that says which tab it came from and
+    /// focuses `surface` when clicked. An untitled one (OSC 9 has no title)
+    /// is titled by its tab, as Windows Terminal does. Showing a toast is a
+    /// cross-process COM call that can pump messages: callers must not
+    /// touch `surface` after it.
+    fn showSurfaceToast(
+        self: *App,
+        surface: *Surface,
+        title: []const u8,
+        body: []const u8,
+    ) !void {
+        var title_buf: [toast_tab_title_max + "\u{2026}".len]u8 = undefined;
+        var tab_title: std.Io.Writer = .fixed(&title_buf);
+        var context_buf: [160]u8 = undefined;
+        var context: std.Io.Writer = .fixed(&context_buf);
+        const attribution: ?[]const u8 = if (self.findTabForSurface(surface)) |found| context: {
+            const name = toastTabName(found.tab, surface);
+            try self.writeToastContext(&context, found.host, found.index, name);
+            if (title.len == 0) {
+                try win32_program_status.writeSanitized(&tab_title, name, toast_tab_title_max);
+            }
+            break :context context.buffered();
+        } else null;
+
+        const launch = try buildToastLaunchForSurface(self.core_app.alloc, surface);
+        defer self.core_app.alloc.free(launch);
+        try self.showToast(.{ .surface = surface.core() }, .{
+            .title = if (title.len > 0) title else tab_title.buffered(),
+            .body = body,
+            .attribution = attribution,
+            .launch = launch,
+        }, title);
+    }
+
+    /// What the user knows a tab by: the title of its focused pane.
+    fn toastTabName(tab: *const Tab, surface: *Surface) []const u8 {
+        const shown = tab.focusedSurface() orelse surface;
+        return shown.effectiveTitle() orelse "noctty";
+    }
+
+    /// The line a toast from tab `index` of `host` carries, naming the
+    /// tab: `Tab N: <title>`, `Tab N of window M: <title>` while more than
+    /// one window is open, or `Tab N of the quick terminal: <title>`. The
+    /// quick terminal is not counted as a window, so a window and an idle
+    /// quick terminal don't number the window. The numbers are noctty's
+    /// own, so a program can't pass for another tab; the title is
+    /// sanitized and cut to `toast_tab_title_max` bytes.
+    fn writeToastContext(
+        self: *const App,
+        writer: *std.Io.Writer,
+        host: *const Host,
+        index: usize,
+        tab_name: []const u8,
+    ) std.Io.Writer.Error!void {
+        try writer.print("Tab {d}", .{index + 1});
+        if (host.quick_terminal) {
+            try writer.writeAll(" of the quick terminal");
+        } else {
+            var window_count: usize = 0;
+            var number: ?usize = null;
+            for (self.hosts.items) |item| {
+                if (item.quick_terminal) continue;
+                window_count += 1;
+                if (item == host) number = window_count;
+            }
+            if (window_count > 1) {
+                if (number) |n| try writer.print(" of window {d}", .{n});
+            }
+        }
+        try writer.writeAll(": ");
+        try win32_program_status.writeSanitized(writer, tab_name, toast_tab_title_max);
     }
 
     fn showChildExited(
@@ -12035,9 +12160,7 @@ pub const App = struct {
             );
         defer self.core_app.alloc.free(body);
 
-        const launch = try buildToastLaunchForSurface(self.core_app.alloc, surface);
-        defer self.core_app.alloc.free(launch);
-        try self.showDesktopNotificationWithLaunch(target, "Command finished", body, launch);
+        try self.showSurfaceToast(surface, "Command finished", body);
     }
 
     /// Apply a program status event (OSC 7501) to `surface`'s records, then
@@ -12132,40 +12255,23 @@ pub const App = struct {
         record: *const win32_program_status.Record,
     ) !void {
         // The tab title is what the user knows the tab by. It names the
-        // program when the record has no title or app. The body says which
-        // tab and window this is, so a program can't pass for another one.
-        const tab = &host.tabs.items[index];
-        const tab_surface = tab.focusedSurface() orelse surface;
-        const tab_title = tab_surface.effectiveTitle() orelse "noctty";
+        // program when the record has no title or app. The toast's
+        // attribution line says which tab and window this is, so a program
+        // can't pass for another one.
+        const tab_title = toastTabName(&host.tabs.items[index], surface);
 
         var title_buf: [256]u8 = undefined;
         var title: std.Io.Writer = .fixed(&title_buf);
         try win32_program_status.writeStatusLine(&title, &surface.program_status, record, tab_title, false);
 
-        var body_buf: [512]u8 = undefined;
+        var body_buf: [win32_program_status.max_shown_text_bytes + "\u{2026}".len]u8 = undefined;
         var body: std.Io.Writer = .fixed(&body_buf);
         if (record.msg) |msg| {
             try win32_program_status.writeSanitized(&body, msg, win32_program_status.max_shown_text_bytes);
-            try body.writeAll(" \u{2014} ");
         }
-        try body.print("Tab {d}", .{index + 1});
-        if (self.hosts.items.len > 1) {
-            if (std.mem.indexOfScalar(*Host, self.hosts.items, host)) |window| {
-                try body.print(" of window {d}", .{window + 1});
-            }
-        }
-        try body.writeAll(": ");
-        try win32_program_status.writeSanitized(&body, tab_title, 64);
 
         log.debug("program status notification tab={d} title={s}", .{ index + 1, title.buffered() });
-        const launch = try buildToastLaunchForSurface(self.core_app.alloc, surface);
-        defer self.core_app.alloc.free(launch);
-        try self.showDesktopNotificationWithLaunch(
-            .{ .surface = surface.core() },
-            title.buffered(),
-            body.buffered(),
-            launch,
-        );
+        try self.showSurfaceToast(surface, title.buffered(), body.buffered());
     }
 
     /// Deliver program status notifications the rate limit held back: for
@@ -29049,6 +29155,25 @@ fn settingsNotifySuccessThunk(ctx: *anyopaque, title: []const u8, body: []const 
         std.log.warn("settings: desktop notification failed err={}", .{err});
     };
 }
+
+const ToastRequest = win32_toast_winrt.ToastRequest;
+
+/// Where `App.showToast` sends a toast: WinRT in the product
+/// (`ToastSink.winrt`), a recorder in tests, so no test can reach Action
+/// Center.
+const ToastSink = struct {
+    ctx: *anyopaque,
+    show: *const fn (ctx: *anyopaque, request: ToastRequest) anyerror!void,
+
+    fn winrt(toast: *win32_toast_winrt.WinrtToast) ToastSink {
+        return .{ .ctx = toast, .show = showWinrt };
+    }
+
+    fn showWinrt(ctx: *anyopaque, request: ToastRequest) anyerror!void {
+        const toast: *win32_toast_winrt.WinrtToast = @ptrCast(@alignCast(ctx));
+        try toast.show(request, .info);
+    }
+};
 
 fn buildToastLaunchForSurface(
     alloc: Allocator,
@@ -48045,6 +48170,9 @@ test "win32 runtime can initialize config" {
     defer app.terminate();
 
     try std.testing.expect(@intFromPtr(app.hinstance) != 0);
+    // A test's App never holds the real toast notifier.
+    try std.testing.expect(app.winrt_toast == null);
+    try std.testing.expect(app.toast_sink == null);
 }
 
 /// Load `argv` into `app`'s config as `Config.load` does a command line:
@@ -56020,6 +56148,352 @@ test "win32 buildToastLaunchForSurface includes host tab id" {
     try std.testing.expectEqual(@as(?u32, 44), parsed.tab_id);
     try std.testing.expectEqual(@as(?u32, host.id), parsed.window_id);
     try std.testing.expectEqual(@as(?win32_toast_activation.Action, .focus), parsed.action);
+}
+
+/// Records what `App.showToast` hands its sink, in place of WinRT.
+const TestToastRecorder = struct {
+    alloc: Allocator = std.testing.allocator,
+    shown: usize = 0,
+    /// Refuse every toast with this error, as Windows does when
+    /// notifications are turned off for noctty; the request is still
+    /// recorded.
+    refuse: ?anyerror = null,
+    title: ?[]u8 = null,
+    body: ?[]u8 = null,
+    attribution: ?[]u8 = null,
+    launch: ?[]u8 = null,
+
+    fn sink(self: *TestToastRecorder) ToastSink {
+        return .{ .ctx = self, .show = record };
+    }
+
+    fn record(ctx: *anyopaque, request: ToastRequest) anyerror!void {
+        const self: *TestToastRecorder = @ptrCast(@alignCast(ctx));
+        self.clear();
+        self.shown += 1;
+        self.title = try self.alloc.dupe(u8, request.title);
+        self.body = try self.alloc.dupe(u8, request.body);
+        if (request.attribution) |value| self.attribution = try self.alloc.dupe(u8, value);
+        if (request.launch) |value| self.launch = try self.alloc.dupe(u8, value);
+        if (self.refuse) |err| return err;
+    }
+
+    fn clear(self: *TestToastRecorder) void {
+        inline for (.{ "title", "body", "attribution", "launch" }) |name| {
+            if (@field(self, name)) |value| self.alloc.free(value);
+            @field(self, name) = null;
+        }
+    }
+
+    /// Fails with an error, never a panic, when the field is missing: a
+    /// panic would end the test process and hide every later failure.
+    fn expect(
+        self: *const TestToastRecorder,
+        comptime field: enum { title, body, attribution },
+        expected: []const u8,
+    ) !void {
+        const actual = @field(self, @tagName(field)) orelse return error.TestExpectedText;
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+
+    fn expectLaunchFor(self: *const TestToastRecorder, surface: *Surface, tab_id: u32) !void {
+        const parsed = try win32_toast_activation.parseLaunchArg(self.launch orelse return error.TestExpectedLaunch);
+        try std.testing.expectEqual(@as(?u64, surface.core().id), parsed.surface_id);
+        try std.testing.expectEqual(@as(?u32, tab_id), parsed.tab_id);
+        try std.testing.expectEqual(@as(?u32, surface.host_id), parsed.window_id);
+        try std.testing.expectEqual(@as(?win32_toast_activation.Action, .focus), parsed.action);
+    }
+};
+
+/// One window whose second tab holds the background pane `p`, which a
+/// toast is about, while the first tab is active.
+const ToastTestWindow = struct {
+    core_app: CoreApp = undefined,
+    app: App = undefined,
+    host: Host = undefined,
+    other_host: Host = undefined,
+    front: Surface = undefined,
+    p: Surface = undefined,
+    /// In no tab until a test splits the tab of `p` with it.
+    q: Surface = undefined,
+    other: Surface = undefined,
+    session: TestSession = .{},
+    recorder: TestToastRecorder = .{},
+
+    fn init(self: *ToastTestWindow, two_windows: bool) !void {
+        self.* = .{};
+        try self.session.init(.{
+            .core_app = &self.core_app,
+            .app = &self.app,
+            .hosts = &.{
+                .{ .storage = &self.host, .id = 7, .register = true },
+                .{ .storage = &self.other_host, .id = 8, .register = two_windows },
+            },
+            .surfaces = &.{
+                .{ .storage = &self.front, .host = &self.host, .register = true },
+                .{ .storage = &self.p, .host = &self.host, .register = true },
+                .{ .storage = &self.q, .host = &self.host, .register = true },
+                .{ .storage = &self.other, .host = &self.other_host, .register = two_windows },
+            },
+            .tabs = &.{
+                .{ .host = &self.host, .surface = &self.front, .id = 1 },
+                .{ .host = &self.host, .surface = &self.p, .id = 2 },
+                .{ .host = &self.other_host, .surface = &self.other, .id = 1 },
+            },
+        });
+        self.front.core_surface.id = 0x1001;
+        self.p.core_surface.id = 0x2002;
+        self.q.core_surface.id = 0x2003;
+        self.other.core_surface.id = 0x3003;
+        self.front.title = "pwsh";
+        self.p.title = "cargo build";
+        self.app.toast_sink = self.recorder.sink();
+    }
+
+    fn deinit(self: *ToastTestWindow) void {
+        self.recorder.clear();
+        self.p.program_status.deinit(std.testing.allocator);
+        self.session.deinit();
+    }
+
+    fn osc(self: *ToastTestWindow, surface: *Surface, title: [:0]const u8, body: [:0]const u8) !void {
+        try std.testing.expect(try self.app.performAction(
+            .{ .surface = surface.core() },
+            .desktop_notification,
+            .{ .title = title, .body = body },
+        ));
+    }
+};
+
+test "win32 OSC 9 toast carries its pane's launch target" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(false);
+    defer w.deinit();
+
+    try w.osc(&w.p, "", "tests passed");
+    try std.testing.expectEqual(@as(usize, 1), w.recorder.shown);
+    try w.recorder.expectLaunchFor(&w.p, 2);
+    try w.recorder.expect(.body, "tests passed");
+    try w.recorder.expect(.attribution, "Tab 2: cargo build");
+
+    // An app notification, such as a config reload, has no pane to focus
+    // and no tab to name.
+    try std.testing.expect(try w.app.performAction(.app, .desktop_notification, .{
+        .title = "",
+        .body = "Configuration reloaded",
+    }));
+    try std.testing.expectEqual(@as(usize, 2), w.recorder.shown);
+    try w.recorder.expect(.title, "noctty");
+    try std.testing.expect(w.recorder.launch == null);
+    try std.testing.expect(w.recorder.attribution == null);
+}
+
+test "win32 untitled OSC 9 toast is titled by its tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(false);
+    defer w.deinit();
+
+    try w.osc(&w.p, "", "tests passed");
+    try w.recorder.expect(.title, "cargo build");
+
+    // A title is shown without its bidi overrides and invisible
+    // characters, with controls as spaces, and cut to 64 bytes on a
+    // code point.
+    w.p.title = "a\u{202E}<b>&\u{200B}\x07c";
+    try w.osc(&w.p, "", "x");
+    try w.recorder.expect(.title, "a<b>& c");
+    try w.recorder.expect(.attribution, "Tab 2: a<b>& c");
+
+    // U+FFFE and U+FFFF, which XML 1.0 cannot carry, so Windows would
+    // refuse the toast.
+    w.p.title = "x\u{FFFE}y\u{FFFF}z";
+    try w.osc(&w.p, "", "x");
+    try w.recorder.expect(.title, "x y z");
+    try w.recorder.expect(.attribution, "Tab 2: x y z");
+
+    w.p.title = "安" ** 30;
+    try w.osc(&w.p, "", "x");
+    // Cut on a code point: 21 three-byte characters fit in 64 bytes.
+    try w.recorder.expect(.title, "安" ** 21 ++ "\u{2026}");
+    try w.recorder.expect(.attribution, "Tab 2: " ++ "安" ** 21 ++ "\u{2026}");
+
+    // A tab with no title at all.
+    w.p.title = null;
+    try w.osc(&w.p, "", "x");
+    try w.recorder.expect(.title, "noctty");
+    try w.recorder.expect(.attribution, "Tab 2: noctty");
+
+    // The tab is known by its focused pane's title, also when another of
+    // its panes sends the toast. That pane is still the one a click
+    // focuses.
+    w.p.title = "cargo build";
+    w.q.title = "vim";
+    const inserted = try SplitTreeSurface.init(std.testing.allocator, &w.q);
+    defer {
+        var cleanup = inserted;
+        cleanup.deinit();
+    }
+    const tab = &w.host.tabs.items[1];
+    var prev_tree = tab.tree;
+    tab.tree = try prev_tree.split(std.testing.allocator, tab.focused, .right, 0.5, &inserted);
+    prev_tree.deinit();
+    // The split moved `p` behind the new split node and `q`.
+    tab.focused = @enumFromInt(2);
+    try std.testing.expectEqual(@as(?*Surface, &w.p), tab.focusedSurface());
+    try w.osc(&w.q, "", "x");
+    try w.recorder.expect(.title, "cargo build");
+    try w.recorder.expect(.attribution, "Tab 2: cargo build");
+    try w.recorder.expectLaunchFor(&w.q, 2);
+}
+
+test "win32 OSC 777 toast keeps its title and gains tab context" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(false);
+    defer w.deinit();
+
+    try w.osc(&w.p, "deploy", "rolled out");
+    try std.testing.expectEqual(@as(usize, 1), w.recorder.shown);
+    try w.recorder.expect(.title, "deploy");
+    try w.recorder.expect(.body, "rolled out");
+    try w.recorder.expect(.attribution, "Tab 2: cargo build");
+    try w.recorder.expectLaunchFor(&w.p, 2);
+}
+
+test "win32 command-finished toast names its tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(false);
+    defer w.deinit();
+
+    const config = &w.p.core().config;
+    config.desktop_notifications = true;
+    config.notify_on_command_finish = .always;
+    config.notify_on_command_finish_action = .{ .bell = false, .notify = true };
+    config.notify_on_command_finish_after = .{ .duration = 0 };
+    try std.testing.expect(try w.app.performAction(.{ .surface = w.p.core() }, .command_finished, .{
+        .exit_code = 0,
+        .duration = .{ .duration = 2 * std.time.ns_per_s },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), w.recorder.shown);
+    try w.recorder.expect(.title, "Command finished");
+    try w.recorder.expect(.body, "Command finished with exit code 0 | Runtime: 2.00s");
+    try w.recorder.expect(.attribution, "Tab 2: cargo build");
+    try w.recorder.expectLaunchFor(&w.p, 2);
+
+    // `desktop-notifications = false` still shows nothing.
+    config.desktop_notifications = false;
+    try std.testing.expect(try w.app.performAction(.{ .surface = w.p.core() }, .command_finished, .{
+        .exit_code = 0,
+        .duration = .{ .duration = 2 * std.time.ns_per_s },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), w.recorder.shown);
+}
+
+test "win32 toast context names the window only when several are open" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(true);
+    defer w.deinit();
+
+    w.other.title = "ssh";
+    try w.osc(&w.p, "", "x");
+    try w.recorder.expect(.attribution, "Tab 2 of window 1: cargo build");
+    try w.osc(&w.other, "", "x");
+    try w.recorder.expect(.attribution, "Tab 1 of window 2: ssh");
+    try w.recorder.expectLaunchFor(&w.other, 1);
+
+    // The quick terminal is not a numbered window: it is named, and beside
+    // it the one window needs no number.
+    w.other_host.quick_terminal = true;
+    try w.osc(&w.other, "", "x");
+    try w.recorder.expect(.attribution, "Tab 1 of the quick terminal: ssh");
+    try w.osc(&w.p, "", "x");
+    try w.recorder.expect(.attribution, "Tab 2: cargo build");
+    w.other_host.quick_terminal = false;
+
+    // Once the other window is gone, one window needs no number.
+    _ = w.app.hosts.orderedRemove(1);
+    try w.osc(&w.p, "", "x");
+    try w.recorder.expect(.attribution, "Tab 2: cargo build");
+}
+
+test "win32 program status toast says which tab it is from in its attribution line" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(true);
+    defer w.deinit();
+
+    const alloc = std.testing.allocator;
+    var parser: terminal.osc.Parser = .init(alloc);
+    defer parser.deinit();
+    // msg "Allow edit?"
+    parser.nextSlice("7501;state=blocked:kind=permission:app=claude:msg=QWxsb3cgZWRpdD8");
+    const blocked = (try w.p.program_status.apply(alloc, parser.end('\x1b').?.program_status.report)).?;
+    try w.app.showProgramStatusToast(&w.p, &w.host, 1, blocked);
+    try w.recorder.expect(.title, "claude needs permission");
+    try w.recorder.expect(.body, "Allow edit?");
+    try w.recorder.expect(.attribution, "Tab 2 of window 1: cargo build");
+    try w.recorder.expectLaunchFor(&w.p, 2);
+
+    // Without a message the toast is its title and its tab.
+    parser.reset();
+    parser.nextSlice("7501;state=done:app=claude");
+    const done = (try w.p.program_status.apply(alloc, parser.end('\x1b').?.program_status.report)).?;
+    try w.app.showProgramStatusToast(&w.p, &w.host, 1, done);
+    try w.recorder.expect(.title, "claude is done");
+    try w.recorder.expect(.body, "");
+    try w.recorder.expect(.attribution, "Tab 2 of window 1: cargo build");
+}
+
+test "win32 a refused toast becomes a banner that names its tab once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var w: ToastTestWindow = .{};
+    try w.init(false);
+    defer w.deinit();
+    // As when notifications are turned off for noctty in Windows Settings.
+    w.recorder.refuse = error.NotifierDisabled;
+
+    // An untitled OSC 9 toast is titled by its tab, but the banner does not
+    // repeat the tab's title before the tab line.
+    try w.osc(&w.p, "", "tests passed");
+    try w.recorder.expect(.title, "cargo build");
+    try std.testing.expectEqual(HostBannerKind.info, w.host.banner_kind);
+    try std.testing.expectEqualStrings("tests passed \u{2014} Tab 2: cargo build", w.host.banner_text.?);
+
+    try w.osc(&w.p, "deploy", "rolled out");
+    try std.testing.expectEqualStrings("deploy: rolled out \u{2014} Tab 2: cargo build", w.host.banner_text.?);
+
+    // The core's clipboard-copy notice arrives from its pane exactly as an
+    // OSC 777 titled "noctty" would, so it names its tab and focuses the
+    // pane like any other toast from a pane.
+    try w.osc(&w.front, "noctty", "Copied selection to clipboard");
+    try w.recorder.expect(.title, "noctty");
+    try w.recorder.expect(.attribution, "Tab 1: pwsh");
+    try w.recorder.expectLaunchFor(&w.front, 1);
+    try std.testing.expectEqualStrings("Copied selection to clipboard \u{2014} Tab 1: pwsh", w.host.banner_text.?);
+
+    // An app notification names no tab; one with only a title (a Settings
+    // save) is its title.
+    try std.testing.expect(try w.app.performAction(.app, .desktop_notification, .{
+        .title = "",
+        .body = "Configuration reloaded",
+    }));
+    try std.testing.expectEqualStrings("Configuration reloaded", w.host.banner_text.?);
+    try std.testing.expect(try w.app.performAction(.app, .desktop_notification, .{
+        .title = "Settings saved",
+        .body = "",
+    }));
+    try std.testing.expectEqualStrings("Settings saved", w.host.banner_text.?);
+    try std.testing.expectEqual(@as(usize, 5), w.recorder.shown);
+
+    // With no window to hold a banner the same text goes to the log.
+    var line: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line.deinit();
+    try App.composeToastFallback(&line.writer, "claude is done", "", "Tab 2: cargo build");
+    try std.testing.expectEqualStrings("claude is done \u{2014} Tab 2: cargo build", line.written());
 }
 
 test "win32 commandFinishPlan enforces threshold and focus policy" {
