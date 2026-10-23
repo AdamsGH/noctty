@@ -542,7 +542,11 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             $p.longHead = & $compose 3 2 'preedit-long-caret-head'; & $expectBar $p.longHead -5 'Caret in the cut head'
             $p.longEnd = & $compose 3 208 'preedit-long-caret-end'
             $cells = ($p.longEnd.caret.x0 - $p.caret0.caret.x0) / $cw
-            if ($p.longEnd.caret.count -ne $bar.count -or $cells -ne [Math]::Floor($cells) -or $cells -lt 90 -or $p.longEnd.caret.x0 + $cw -gt $p.longEnd.caret.width) { throw "Caret at the end of an overlong composition is not on the last column: $($p.longEnd.caret | ConvertTo-Json -Compress)." }
+            # The last column: its cell ends inside the right padding (at
+            # least the left padding, cell.x0) and another cell would not.
+            $right = $cell.x0 + ($cells + 1) * $cw
+            $limit = $p.longEnd.caret.width - $cell.x0
+            if ($p.longEnd.caret.count -ne $bar.count -or $cells -ne [Math]::Floor($cells) -or $right -gt $limit -or $right + $cw -le $limit) { throw "Caret at the end of an overlong composition is not on the last column: $($p.longEnd.caret | ConvertTo-Json -Compress)." }
             $p.longEndColumn = $cells
             # Blink ticks with no output rebuild frames in which no row is
             # dirty, so the preedit's cells are kept from an earlier frame
