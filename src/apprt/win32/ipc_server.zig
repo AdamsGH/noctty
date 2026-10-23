@@ -725,7 +725,7 @@ fn forwardedKeyLoggable(key: []const u8) bool {
 /// Returns true when a forwarded `--working-directory` value is one the
 /// server is willing to honor.
 ///
-/// The startup forwarder always sends the launching process's realpath'd cwd
+/// The startup forwarder sends the launching process's realpath'd cwd
 /// (`collectStartupForwardArguments`), so this key cannot be rejected
 /// outright without breaking every single-instance launch. It is instead
 /// constrained to the symbolic values, a home-relative path, or a local
@@ -1062,7 +1062,22 @@ fn allocForwardedWorkingDirectoryArg(
     );
 }
 
-fn collectStartupForwardArguments(alloc: Allocator) !?[]const [:0]const u8 {
+/// Whether a launch that names no `--working-directory=` forwards the
+/// directory it was started in, which a plain new window then starts in.
+/// Not when the launch's `default-profile` (from a config file, which the
+/// running instance reads too; a command-line one is not forwarded) pins a
+/// directory: that instance's default launch puts it there, as this launch's
+/// own first window would. The launcher's directory (System32 from Win+R,
+/// whatever a shortcut names) is nothing the user asked for, and a forwarded
+/// directory wins over the pinned one (`App.applyNewWindowLaunch`).
+pub fn forwardsLauncherDirectory(config: *const configpkg.Config) bool {
+    if (!config._command_defaulted or config._default_profile_cli != null) return true;
+    const profile = config._default_profile orelse return true;
+    const directory = profile.working_directory orelse return true;
+    return directory == .inherit;
+}
+
+fn collectStartupForwardArguments(alloc: Allocator, forward_cwd: bool) !?[]const [:0]const u8 {
     var iter = try cli_args.argsIterator(alloc);
     defer iter.deinit();
 
@@ -1082,7 +1097,7 @@ fn collectStartupForwardArguments(alloc: Allocator) !?[]const [:0]const u8 {
         }
     }
 
-    if (!working_directory_seen) {
+    if (forward_cwd and !working_directory_seen) {
         const cwd = std.fs.cwd();
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const wd = try cwd.realpath(".", &cwd_buf);
@@ -1769,7 +1784,10 @@ pub fn tryForwardStartupToExistingInstance(self: *App) !bool {
         self.startup_launch_layout,
     )) |forwarded| return forwarded;
 
-    const arguments = try collectStartupForwardArguments(self.core_app.alloc);
+    const arguments = try collectStartupForwardArguments(
+        self.core_app.alloc,
+        forwardsLauncherDirectory(&self.config),
+    );
     defer win32_ipc.freeOwnedArguments(self.core_app.alloc, arguments);
 
     return try sendNewWindowIpc(
@@ -2915,6 +2933,36 @@ test "win32 IPC server start and stop cycles leak no handles" {
         server.stop();
     }
     try std.testing.expectEqual(before, try testProcessHandleCount());
+}
+
+test "win32 a launch forwards its own directory unless default-profile pins one" {
+    const alloc = std.testing.allocator;
+    const py = "--profile-command=py: cmd.exe /k py";
+    const default = "--default-profile=py";
+    inline for (.{
+        .{ &[_][]const u8{}, true },
+        .{ &[_][]const u8{ py, default }, true },
+        .{ &[_][]const u8{ py, "--profile-working-directory=py: inherit", default }, true },
+        .{ &[_][]const u8{ py, "--profile-working-directory=py: D:\\pinned", default }, false },
+        .{ &[_][]const u8{ py, "--profile-working-directory=py: home", default }, false },
+        // A command runs instead of the profile, so nothing is pinned.
+        .{ &[_][]const u8{ py, "--profile-working-directory=py: D:\\pinned", default, "--command=cmd.exe" }, true },
+    }) |case| {
+        var config = try configpkg.Config.default(alloc);
+        defer config.deinit();
+        var iter: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+            .iterator = cli_args.sliceIterator(case[0]),
+        };
+        try config.loadIter(alloc, &iter);
+        try config.finalize();
+        // As if the files set it: the running instance reads them too.
+        config._default_profile_cli = null;
+        try std.testing.expectEqual(case[1], forwardsLauncherDirectory(&config));
+        // It does not read a launch's command-line `default-profile`, so
+        // such a launch says where it was started.
+        config._default_profile_cli = "py";
+        try std.testing.expect(forwardsLauncherDirectory(&config));
+    }
 }
 
 test "win32 launch-layout IPC argument scan isolates the layout name" {

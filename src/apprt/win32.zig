@@ -1150,6 +1150,18 @@ fn defaultProfileForKey(config: *const configpkg.Config, key: []const u8) ?*cons
     return null;
 }
 
+/// The profile `new_window_elevated` hands the elevated process: the
+/// action's own, else the pane's. None for the config files'
+/// `default-profile`: the elevated process reads the same files and starts
+/// that profile itself, so its variables stay off the elevated command line
+/// (`buildRelaunchParameters`). A command-line `default-profile` (a jump-list
+/// link's) is not passed on, so its profile still is.
+fn elevatedProfileKey(config: *const configpkg.Config, action_key: []const u8, pane_key: ?[]const u8) ?[]const u8 {
+    const key = if (action_key.len > 0) action_key else pane_key orelse return null;
+    if (config._default_profile_cli == null and defaultProfileForKey(config, key) != null) return null;
+    return key;
+}
+
 fn splitWorkingDirectoryCandidate(live_pwd: ?[]const u8, cached_pwd: ?[]const u8) ?[]const u8 {
     if (live_pwd) |pwd| {
         if (pwd.len > 0) return pwd;
@@ -6899,12 +6911,11 @@ pub const App = struct {
                 defer if (temporary_profiles) |profiles| {
                     windows_shell.deinitProfiles(alloc, profiles);
                 };
-                const profile_key: ?[]const u8 = if (value.profile_key.len > 0)
-                    value.profile_key
-                else if (source) |surface|
-                    surface.launch_profile_key
-                else
-                    null;
+                const profile_key = elevatedProfileKey(
+                    &self.config,
+                    value.profile_key,
+                    if (source) |surface| surface.launch_profile_key else null,
+                );
                 if (profile_key) |key| {
                     const source_host: ?*Host = if (source) |surface|
                         surface.host
@@ -8346,7 +8357,10 @@ pub const App = struct {
             try applySplitProfileConfigFromSource(&config, source);
         // A split of a pane that runs no profile runs the default one.
         const default_profile = try self.applyDefaultProfileLaunch(&config);
-        if (shouldInheritSplitWorkingDirectory(source.launched_ssh)) {
+        // An SSH default keeps its hardened directory, as an SSH source's
+        // split does: a local pane's directory means nothing to ssh.exe.
+        const default_ssh = if (default_profile) |profile| profile.kind == .ssh else false;
+        if (shouldInheritSplitWorkingDirectory(source.launched_ssh or default_ssh)) {
             _ = try applySplitWorkingDirectoryFromSource(self, &config, source, self.startup_cwd);
         }
         if (working_directory) |cwd| try applyAutomationWorkingDirectory(&config, cwd);
@@ -53876,6 +53890,63 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     try std.testing.expectEqual(created.len, Hook.next);
 }
 
+test "win32 a split of a local pane into an SSH default keeps the SSH directory" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = (try windows_ssh_hosts.userProfileDir(&home_buf)) orelse return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var source: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &source, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &source, .id = 1 }},
+    });
+    defer session.deinit();
+
+    const Hook = struct {
+        var directory: [std.fs.max_path_bytes]u8 = undefined;
+        var directory_len: usize = 0;
+        fn pwd(alloc: Allocator, _: *Surface) anyerror!?[]const u8 {
+            return try alloc.dupe(u8, "C:\\local-project");
+        }
+        fn create(_: *App, config: *const configpkg.Config, _: LPCWSTR, _: SurfaceInitOptions) anyerror!*Surface {
+            const path = switch (config.@"working-directory".?) {
+                .path => |value| value,
+                else => "",
+            };
+            @memcpy(directory[0..path.len], path);
+            directory_len = path.len;
+            return error.LaunchCaptured;
+        }
+    };
+    app.test_create_window_surface = &Hook.create;
+    app.test_automation_pwd = &Hook.pwd;
+
+    // A local pane that runs no profile (the first window's `-e cmd.exe`).
+    const argv = [_][:0]const u8{ "C:\\Windows\\System32\\OpenSSH\\ssh.exe", "prod" };
+    app.config._default_profile = .{ .kind = .ssh, .key = "ssh:prod", .label = "prod", .command = .{ .direct = &argv } };
+    app.config.command = app.config._default_profile.?.command;
+    app.config._command_defaulted = true;
+    app.config.@"split-inherit-working-directory" = true;
+    source.launched_ssh = false;
+    source.launch_profile_key = null;
+    try std.testing.expectError(error.LaunchCaptured, app.createNewSplit(&source, .right, null, false));
+    try std.testing.expectEqualStrings(home, Hook.directory[0..Hook.directory_len]);
+
+    // A local default still splits into the pane's own directory.
+    const local = [_][:0]const u8{"cmd.exe"};
+    app.config._default_profile = .{ .kind = .cmd, .key = "cmd.exe", .label = "Command Prompt", .command = .{ .direct = &local } };
+    app.config.command = app.config._default_profile.?.command;
+    try std.testing.expectError(error.LaunchCaptured, app.createNewSplit(&source, .right, null, false));
+    try std.testing.expectEqualStrings("C:\\local-project", Hook.directory[0..Hook.directory_len]);
+}
+
 test "win32 a split or an elevated window of a default-profile pane needs no profile list" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -53931,6 +54002,18 @@ test "win32 a split or an elevated window of a default-profile pane needs no pro
     const listed_profile = (try app.elevatedWindowProfile(&listed, "PWSH.EXE", &temporary)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("pwsh.exe", listed_profile.key);
     try std.testing.expect((try app.elevatedWindowProfile(&listed, "cmd.exe", &temporary)) == null);
+
+    // The elevated process starts the files' default itself, so neither its
+    // command nor its variables go on the elevated command line; another
+    // profile's do, and so does a command-line default's.
+    try std.testing.expect(elevatedProfileKey(&app.config, "", "USER:PY") == null);
+    try std.testing.expect(elevatedProfileKey(&app.config, "user:py", null) == null);
+    try std.testing.expect(elevatedProfileKey(&app.config, "", null) == null);
+    try std.testing.expectEqualStrings("pwsh.exe", elevatedProfileKey(&app.config, "", "pwsh.exe") orelse "");
+    try std.testing.expectEqualStrings("pwsh.exe", elevatedProfileKey(&app.config, "pwsh.exe", "USER:PY") orelse "");
+    app.config._default_profile_cli = "py";
+    defer app.config._default_profile_cli = null;
+    try std.testing.expectEqualStrings("USER:PY", elevatedProfileKey(&app.config, "", "USER:PY") orelse "");
 }
 
 test "win32 a forwarded new window keeps the default-profile launch when a theme is set" {
@@ -53983,9 +54066,9 @@ test "win32 a forwarded new window keeps the default-profile launch when a theme
     try preview.loadIter(alloc, &preview_args);
     try Host.finishPaletteThemeConfig(&preview, &base, theme);
 
-    // Every single-instance launch forwards its own directory, which an SSH
-    // default does not take: ssh.exe starts in the user's profile directory
-    // on every path (`applySshLaunchHardening`).
+    // A directory the arguments carry, which an SSH default does not take:
+    // ssh.exe starts in the user's profile directory on every path
+    // (`applySshLaunchHardening`).
     var ssh_base = try configpkg.Config.default(alloc);
     defer ssh_base.deinit();
     try ssh_base.finalize();
@@ -54010,6 +54093,23 @@ test "win32 a forwarded new window keeps the default-profile launch when a theme
 
     for ([_]*const configpkg.Config{ &base, &preview }) |app_config| {
         app.config = app_config.*;
+        // A launch that names no directory forwards none when its own
+        // default-profile pins one (`forwardsLauncherDirectory`), so a second
+        // Start-menu launch opens where the first one did.
+        {
+            var file_default = app.config;
+            file_default._default_profile_cli = null;
+            try std.testing.expect(!ipc_server.forwardsLauncherDirectory(&file_default));
+            var config = app.config.shallowClone(alloc);
+            defer config.deinit();
+            const profile = (try app.applyNewWindowLaunch(&config, null)).?;
+            try std.testing.expectEqualStrings("user:py", profile.key);
+            try std.testing.expectEqualStrings("profile", config.env.map.get("MODE") orelse "");
+            try std.testing.expectEqualStrings("D:\\pinned", switch (config.@"working-directory".?) {
+                .path => |path| path,
+                else => "",
+            });
+        }
         inline for (.{
             .{ &[_][:0]const u8{"--font-size=14"}, "D:\\pinned" },
             // A directory the arguments carry wins over the profile's.

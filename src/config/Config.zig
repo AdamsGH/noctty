@@ -1688,10 +1688,12 @@ class: ?[:0]const u8 = null,
 /// an `env` one, a profile `PATH` is the shell's whole `PATH`: noctty's own
 /// folder is no longer put first, and `%PATH%` holds it only if noctty's
 /// own `PATH` does (`GHOSTTY_BIN_DIR` still names it). An elevated window
-/// (`new_window_elevated:user:<id>`) receives these variables on its
-/// command line, which is not private (process tools and process-creation
-/// auditing can show it), so keep secrets out of a profile you open
-/// elevated.
+/// of a profile (`new_window_elevated:user:<id>`, or New Elevated Window from
+/// a pane that runs it) receives these variables on its command line, which
+/// is not private (process tools and process-creation auditing can show it),
+/// so keep secrets out of a profile you open elevated. The exception is the
+/// `default-profile` of the config files: the elevated window reads the same
+/// files and starts that profile itself.
 @"profile-env": ProfileMap.Env = .{},
 
 /// The profile a terminal runs when nothing else chose one, in place of the
@@ -1707,12 +1709,13 @@ class: ?[:0]const u8 = null,
 /// The profile brings its command, its `profile-env` variables and its
 /// `profile-working-directory`. Without a directory of its own it starts
 /// where `working-directory` and the `*-inherit-working-directory` settings
-/// say, as `command` does. A directory the launch asks for (on the command
-/// line, or from a second `noctty` forwarding to a running one) wins over the
-/// profile's, except an SSH profile's. The terminal remembers the profile, so
-/// its splits
-/// and a restored session run it again, and the profile picker opens on it
-/// until another profile is chosen there.
+/// say, as `command` does. A directory the launch asks for with
+/// `--working-directory` (also on a second `noctty` that forwards to a
+/// running one), or the directory `noctty +new-window` runs in, wins over the
+/// profile's, except an SSH profile's; a second `noctty` that names none
+/// opens in the profile's directory, as the first one did. The terminal
+/// remembers the profile, so its splits and a restored session run it again,
+/// and the profile picker opens on it until another profile is chosen there.
 ///
 /// `command` wins when it is set. Set in a config file, that is reported as a
 /// config problem, since this setting then does nothing; `--command` on the

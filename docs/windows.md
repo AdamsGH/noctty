@@ -608,11 +608,13 @@ no profile, and a restored pane whose profile no longer exists. It brings the
 profile's command, its `profile-env` variables and its
 `profile-working-directory`; a profile without a directory of its own starts
 where `working-directory` and the `*-inherit-working-directory` settings say,
-as `command` does. A directory the launch asks for, with `--working-directory`
-on the command line (Explorer's "Open noctty here", a jump-list recent folder)
-or from a second `noctty` that hands its arguments to a running one, wins over
-the profile's `profile-working-directory`; an SSH profile always starts in
-your user profile directory. The pane remembers the profile, so its splits
+as `command` does. A directory the launch asks for with `--working-directory`
+(Explorer's "Open noctty here", a jump-list recent folder, or the option on a
+second `noctty` that hands its arguments to a running one), or the directory
+`noctty +new-window` runs in, wins over the profile's
+`profile-working-directory`. A second `noctty` that names no directory (from
+the Start menu, say) opens in the profile's directory, as the first one did.
+An SSH profile always starts in your user profile directory. The pane remembers the profile, so its splits
 and a restored session run it again, and the profile picker opens on it until
 you choose another there.
 
@@ -671,7 +673,11 @@ Limits:
   has read every config file, so an `env` line in an included file does not
   replace them, and a `command` line there does not replace the command. The
   variables and the command apply to the whole elevated window, not only its
-  first pane.
+  first pane. New Elevated Window (`new_window_elevated:` with no key) does
+  the same for the profile of the pane it is opened from. The exception is
+  the config files' `default-profile`: the elevated process reads the same
+  files and starts that profile itself, so nothing of it goes on the command
+  line.
   A command line is not private (process tools and process-creation auditing
   can show it), so do not keep a secret in the `profile-env` of a profile you
   open elevated.
