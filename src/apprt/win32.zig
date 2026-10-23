@@ -2778,10 +2778,11 @@ pub const App = struct {
         text: [:0]const u8,
         confirmed: bool,
     ) anyerror!void = null,
-    /// Test-only stand-in for the system clipboard read behind a paste or an
-    /// OSC 52 read, so no test opens the real clipboard. Returns null for a
-    /// clipboard without text; the text is owned by the given allocator.
-    test_clipboard_read: ?*const fn (alloc: Allocator) anyerror!?[:0]u8 = null,
+    /// Test-only stand-in for the open system clipboard behind a paste or an
+    /// OSC 52 read, so no test opens the real clipboard. The production
+    /// choice between its text and its files (`selectClipboardContents`)
+    /// still runs on what it offers.
+    test_clipboard_source: ?ClipboardSource = null,
     /// Test-only interleaving seam for the focus revision race between a
     /// structural prepare and commit (a split undone, a tab closed again).
     /// `pane` is one whose focus the test moves.
@@ -29566,15 +29567,107 @@ fn surfaceConfirmWriteCancel(userdata: ?*anyopaque, _: ConfirmCancelReason) void
     surface.pending_clipboard_op = null;
 }
 
-/// IDropTarget payload callback. Runs on the STA UI thread (COM
-/// guarantees). `payload` is owned by the module and lives only for
-/// the duration of this callback — the apprt must not retain it.
+/// What a clipboard read found.
+const ClipboardContents = union(enum) {
+    /// No text and, for a read that takes files, no copied files (an image,
+    /// say).
+    none,
+    /// CF_UNICODETEXT, with LF line endings.
+    text: [:0]u8,
+    /// CF_HDROP, from Explorer's Copy: the paths as a drop formats them, in
+    /// one string.
+    files: [:0]u8,
+
+    /// The paths of a borrowed HDROP, which stays its owner's. Every field is
+    /// owned by `alloc`.
+    fn fromHdrop(alloc: std.mem.Allocator, hdrop: *anyopaque) !ClipboardContents {
+        const payload = try win32_ole.extractHdrop(alloc, hdrop, .{});
+        defer alloc.free(payload);
+        if (payload.len == 0) return .none;
+        return .{ .files = try alloc.dupeZ(u8, payload) };
+    }
+};
+
+/// The two formats of an open clipboard that a paste reads. The system
+/// clipboard is one source (`system_clipboard`); a test supplies its own, so
+/// `selectClipboardContents` is the code both run.
+const ClipboardSource = struct {
+    /// The CF_UNICODETEXT text, with LF line endings, owned by `alloc`; null
+    /// when there is none.
+    text: *const fn (alloc: std.mem.Allocator) anyerror!?[:0]u8,
+    /// The CF_HDROP handle, borrowed from the clipboard; null when there is
+    /// none.
+    hdrop: *const fn () ?*anyopaque,
+};
+
+/// What `source` holds for a request: its text, else (for `include_files`,
+/// a user's paste) the paths of its copied files, else nothing. An empty
+/// text is no text when files may be taken, so copied files that sit beside
+/// one paste; a program's read (`include_files` false) takes the text as it
+/// is and never looks for files.
+fn selectClipboardContents(
+    alloc: std.mem.Allocator,
+    include_files: bool,
+    source: ClipboardSource,
+) !ClipboardContents {
+    if (try source.text(alloc)) |text| {
+        if (text.len > 0 or !include_files) return .{ .text = text };
+        alloc.free(text);
+    }
+    if (!include_files) return .none;
+
+    const hdrop = source.hdrop() orelse return .none;
+    return try ClipboardContents.fromHdrop(alloc, hdrop);
+}
+
+/// Pastes the paths of dropped or copied files. `payload` is borrowed and
+/// NUL-terminated.
 ///
 /// Route through `completeClipboardRequest(.paste, …, confirmed=false)`
 /// rather than `textCallback` so `clipboard-paste-protection`
 /// actually applies. `textCallback` hard-codes `allow_unsafe=true`
 /// (it's the terminal-typed path, where newlines ARE the user's
-/// intent), which would defeat paste protection for dropped content.
+/// intent), which would defeat paste protection for file names.
+fn pasteFilePayload(surface: *Surface, payload: [:0]const u8) !void {
+    // Defense-in-depth classifier pass.
+    //
+    // Core's `isSafe` only flags newlines + bracketed-paste-end
+    // sequences. That's correct for generic clipboard pastes but
+    // insufficient for file names where a crafted name like
+    // `%USERPROFILE%\x.txt` (cmd `%VAR%`), `$HOME.txt` (PowerShell),
+    // or a name containing control bytes / a URL embedded in
+    // other text would bypass confirmation. Consult the full
+    // `win32_paste_protection.inspect` verdict — which covers
+    // control_chars, shell_metachar, AND mixed_content — not just
+    // `hasShellMetachar`. When the verdict isn't `.safe`, fire the
+    // same confirm path as the core `.UnsafePaste` branch.
+    if (surface.app.config.@"clipboard-paste-protection") {
+        const verdict = win32_paste_protection.inspect(payload);
+        if (verdict.severity != .safe) {
+            std.log.info("file payload flagged severity={s} reason={s}", .{
+                @tagName(verdict.severity),
+                verdict.reason,
+            });
+            // Non-modal confirm overlay; dupes payload so it survives
+            // the caller's teardown. Paste completes asynchronously
+            // on accept via `surfaceConfirmPasteAccept`.
+            try surface.requestPasteConfirm(.paste, payload);
+            return;
+        }
+    }
+
+    surface.core_surface.completeClipboardRequest(.paste, payload, false) catch |err| switch (err) {
+        // Unsafe content (newlines, control sequences, etc.). Defer to
+        // the non-modal confirm overlay; the Accept callback re-submits
+        // with `confirmed = true`.
+        error.UnsafePaste, error.UnauthorizedPaste => try surface.requestPasteConfirm(.paste, payload),
+        else => return err,
+    };
+}
+
+/// IDropTarget payload callback. Runs on the STA UI thread (COM
+/// guarantees). `payload` is owned by the module and lives only for
+/// the duration of this callback — the apprt must not retain it.
 fn surfaceDropPayloadCallback(ctx: *anyopaque, payload: []const u8) void {
     const surface: *Surface = @ptrCast(@alignCast(ctx));
     if (payload.len == 0) return;
@@ -29586,47 +29679,8 @@ fn surfaceDropPayloadCallback(ctx: *anyopaque, payload: []const u8) void {
     };
     defer alloc.free(payload_z);
 
-    // Defense-in-depth classifier pass.
-    //
-    // Core's `isSafe` only flags newlines + bracketed-paste-end
-    // sequences. That's correct for generic clipboard pastes but
-    // insufficient for drop payloads where a crafted filename like
-    // `%USERPROFILE%\x.txt` (cmd `%VAR%`), `$HOME.txt` (PowerShell),
-    // or a filename containing control bytes / a URL embedded in
-    // other text would bypass confirmation. Consult the full
-    // `win32_paste_protection.inspect` verdict — which covers
-    // control_chars, shell_metachar, AND mixed_content — not just
-    // `hasShellMetachar`. When the verdict isn't `.safe`, fire the
-    // same confirm path as the core `.UnsafePaste` branch.
-    if (surface.app.config.@"clipboard-paste-protection") {
-        const verdict = win32_paste_protection.inspect(payload_z);
-        if (verdict.severity != .safe) {
-            std.log.info("drop payload flagged severity={s} reason={s}", .{
-                @tagName(verdict.severity),
-                verdict.reason,
-            });
-            // Non-modal confirm overlay; dupes payload so it survives
-            // the callback teardown. Paste completes asynchronously
-            // on accept via `surfaceConfirmPasteAccept`.
-            surface.requestPasteConfirm(.paste, payload_z) catch |err| {
-                std.log.warn("drop payload paste-protection confirm failed err={}", .{err});
-            };
-            return;
-        }
-    }
-
-    surface.core_surface.completeClipboardRequest(.paste, payload_z, false) catch |err| switch (err) {
-        error.UnsafePaste, error.UnauthorizedPaste => {
-            // Unsafe content (newlines, control sequences, etc.).
-            // Defer to the non-modal confirm overlay; the Accept
-            // callback re-submits with `confirmed = true`.
-            surface.requestPasteConfirm(.paste, payload_z) catch |inner| {
-                std.log.warn("drop payload protected paste confirm failed err={}", .{inner});
-            };
-        },
-        else => {
-            std.log.warn("drop payload paste failed err={}", .{err});
-        },
+    pasteFilePayload(surface, payload_z) catch |err| {
+        std.log.warn("drop payload paste failed err={}", .{err});
     };
 }
 
@@ -38190,20 +38244,40 @@ pub const Surface = struct {
             };
         }
 
-        const text = if (self.app.test_clipboard_read) |read|
-            try read(self.app.core_app.alloc)
+        // Only a user's paste takes copied files; a program's read is text.
+        const include_files = state == .paste;
+        const contents = if (self.app.test_clipboard_source) |source|
+            try selectClipboardContents(self.app.core_app.alloc, include_files, source)
         else
-            try self.readClipboardText();
-        return self.completeClipboardRead(state, text);
+            try self.readClipboard(include_files);
+        return self.completeClipboardRead(state, contents);
     }
 
-    /// Finishes a clipboard request with what the clipboard held: `text` is
-    /// null when it holds no text at all, and owned by `core_app.alloc`.
+    /// Finishes a clipboard request with what the clipboard held, owned by
+    /// `core_app.alloc`.
     fn completeClipboardRead(
         self: *Surface,
         state: apprt.ClipboardRequest,
-        text: ?[:0]u8,
+        contents: ClipboardContents,
     ) !bool {
+        const text: ?[:0]u8 = switch (contents) {
+            .none => null,
+            .text => |held| held,
+            .files => |paths| files: {
+                defer self.app.core_app.alloc.free(paths);
+                // Copied files (Explorer's Copy) paste as their paths, the
+                // way a drop types them, after the same paste protection.
+                // A program's OSC 52 read never sees a file name.
+                if (state == .paste and paths.len > 0) {
+                    pasteFilePayload(self, paths) catch |err| {
+                        std.log.warn("clipboard file paths paste failed err={}", .{err});
+                        return false;
+                    };
+                    return true;
+                }
+                break :files null;
+            },
+        };
         // `str` is always owned by `core_app.alloc`, so one defer covers both
         // clipboard reads and the synthesized empty-string fallback.
         const str: [:0]u8 = text orelse switch (state) {
@@ -43014,10 +43088,29 @@ pub const Surface = struct {
         );
     }
 
-    fn readClipboardText(self: *Surface) !?[:0]u8 {
+    /// What the clipboard holds: its text, else (for `include_files`) the
+    /// paths of copied files, else nothing. An open failure is an error, never
+    /// an empty clipboard.
+    fn readClipboard(self: *Surface, include_files: bool) !ClipboardContents {
         if (!openClipboard(self.hwnd)) return lastError();
         defer _ = sys.CloseClipboard();
 
+        return try selectClipboardContents(self.app.core_app.alloc, include_files, system_clipboard);
+    }
+
+    /// The open system clipboard, for `selectClipboardContents`.
+    const system_clipboard: ClipboardSource = .{
+        .text = &readOpenClipboardText,
+        .hdrop = &readOpenClipboardHdrop,
+    };
+
+    fn readOpenClipboardHdrop() ?*anyopaque {
+        if (sys.IsClipboardFormatAvailable(c.CF_HDROP) == 0) return null;
+        // The clipboard owns this HDROP: borrow it, never `DragFinish` it.
+        return sys.GetClipboardData(c.CF_HDROP);
+    }
+
+    fn readOpenClipboardText(alloc: std.mem.Allocator) anyerror!?[:0]u8 {
         if (sys.IsClipboardFormatAvailable(c.CF_UNICODETEXT) == 0) return null;
 
         const handle = sys.GetClipboardData(c.CF_UNICODETEXT) orelse return null;
@@ -43026,7 +43119,6 @@ pub const Surface = struct {
 
         const text_w: [*:0]const u16 = @ptrCast(@alignCast(locked));
         const slice_w = std.mem.sliceTo(text_w, 0);
-        const alloc = self.app.core_app.alloc;
         return try lfLineEndings(alloc, try clipboardTextToUtf8(alloc, slice_w));
     }
 
@@ -45415,19 +45507,80 @@ test "win32 OSC 52 read Allow still replies with the approved contents" {
 }
 
 /// Stands in for the system clipboard in the empty bracketed paste tests: the
-/// text it holds, or null for a clipboard with no text at all. No test opens
-/// the real clipboard, which a hidden desktop shares with the user.
+/// text it holds, or null for a clipboard with no text at all, and the files
+/// a CF_HDROP beside it names. No test opens the real clipboard, which a
+/// hidden desktop shares with the user.
 const EmptyPasteClipboard = struct {
     var text: ?[]const u8 = null;
+    var files: ?[]const []const u8 = null;
+    /// Whether the read looked at the CF_HDROP format at all.
+    var hdrop_read = false;
+    /// The HDROP lent out by the last read.
+    var held: ?*anyopaque = null;
 
-    fn read(alloc: Allocator) anyerror!?[:0]u8 {
+    /// A DROPFILES block (an HDROP) naming `paths` in wide characters, in
+    /// global memory the caller frees.
+    fn dropFiles(paths: []const []const u8) !*anyopaque {
+        const Header = extern struct {
+            pFiles: u32 = @sizeOf(@This()),
+            point: win32_types.POINT = .{ .x = 0, .y = 0 },
+            fNC: i32 = 0,
+            fWide: i32 = 1,
+        };
+        const alloc = std.testing.allocator;
+        var names: std.ArrayListUnmanaged(u16) = .empty;
+        defer names.deinit(alloc);
+        for (paths) |path| {
+            const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, path);
+            defer alloc.free(wide);
+            try names.appendSlice(alloc, wide);
+            try names.append(alloc, 0);
+        }
+        try names.append(alloc, 0);
+        const name_bytes = std.mem.sliceAsBytes(names.items);
+        const header: Header = .{};
+        const handle = sys.GlobalAlloc(2, @sizeOf(Header) + name_bytes.len) orelse return error.OutOfMemory;
+        errdefer _ = sys.GlobalFree(handle);
+        const locked: [*]u8 = @ptrCast(sys.GlobalLock(handle) orelse return error.OutOfMemory);
+        @memcpy(locked[0..@sizeOf(Header)], std.mem.asBytes(&header));
+        @memcpy(locked[@sizeOf(Header)..][0..name_bytes.len], name_bytes);
+        _ = sys.GlobalUnlock(handle);
+        return handle;
+    }
+
+    /// The text format: a copy of the text, or null when there is none.
+    fn readText(alloc: Allocator) anyerror!?[:0]u8 {
         const value = text orelse return null;
         return try alloc.dupeZ(u8, value);
     }
 
+    /// The CF_HDROP format, borrowed as the system clipboard lends its own:
+    /// the caller frees nothing, `release` does.
+    fn readHdrop() ?*anyopaque {
+        hdrop_read = true;
+        const paths = files orelse return null;
+        release();
+        held = dropFiles(paths) catch @panic("DROPFILES block");
+        return held;
+    }
+
+    /// Frees the HDROP the last read lent out.
+    fn release() void {
+        if (held) |handle| _ = sys.GlobalFree(handle);
+        held = null;
+    }
+
     fn install(fixture: *ClipboardReplyFixture, value: ?[]const u8) void {
         text = value;
-        fixture.app.test_clipboard_read = &read;
+        files = null;
+        hdrop_read = false;
+        fixture.app.test_clipboard_source = .{ .text = &readText, .hdrop = &readHdrop };
+    }
+
+    /// A clipboard holding copied files and no text.
+    fn installFiles(fixture: *ClipboardReplyFixture, paths: []const []const u8) void {
+        install(fixture, null);
+        files = paths;
     }
 };
 
@@ -45574,6 +45727,148 @@ test "win32 empty-bracketed-paste: the paste action reports whether it pasted" {
     fixture.setBracketedPaste(true);
     try std.testing.expect(try core.performBindingAction(.paste_from_clipboard));
     try fixture.expectReply(empty_bracketed_pair);
+}
+
+/// What the pty is sent, joined, once `fixture` has written; the mailbox is
+/// left empty. `buf` holds the bytes.
+fn takePastedBytes(fixture: *ClipboardReplyFixture, buf: []u8) ![]const u8 {
+    const queue = fixture.surface.core_surface.io.mailbox.spsc.queue;
+    var len: usize = 0;
+    while (queue.pop()) |message| {
+        defer message.deinit();
+        const piece: []const u8 = switch (message) {
+            .write_small => |v| v.data[0..v.len],
+            .write_stable => |v| v,
+            .write_alloc => |v| v.data,
+            else => return error.UnexpectedClipboardReply,
+        };
+        @memcpy(buf[len..][0..piece.len], piece);
+        len += piece.len;
+    }
+    return buf[0..len];
+}
+
+test "win32 copied-files-paste: a clipboard of only copied files pastes their quoted paths" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    defer EmptyPasteClipboard.release();
+    var buf: [256]u8 = undefined;
+    const core = &fixture.surface.core_surface;
+    EmptyPasteClipboard.installFiles(&fixture, &.{ "C:\\a b\\x.txt", "C:\\plain\\y.txt" });
+    const payload = "\"C:\\a b\\x.txt\" C:\\plain\\y.txt";
+
+    // Bracketed, as Windows Terminal sends a path; ours takes every file.
+    fixture.setBracketedPaste(true);
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqualStrings("\x1b[200~" ++ payload ++ "\x1b[201~", try takePastedBytes(&fixture, &buf));
+    try std.testing.expect(EmptyPasteClipboard.hdrop_read);
+
+    // Not bracketed: the plain paths, and the action reports a paste.
+    fixture.setBracketedPaste(false);
+    try std.testing.expect(try core.performBindingAction(.paste_from_clipboard));
+    try std.testing.expectEqualStrings(payload, try takePastedBytes(&fixture, &buf));
+}
+
+test "win32 copied-files-paste: a path that could run a command asks first" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    defer EmptyPasteClipboard.release();
+    var buf: [256]u8 = undefined;
+    fixture.setBracketedPaste(true);
+    EmptyPasteClipboard.installFiles(&fixture, &.{"C:\\drop\\a& echo PROBE &.txt"});
+    const payload = "\"C:\\drop\\a& echo PROBE &.txt\"";
+
+    // Nothing reaches the program until the user allows it.
+    fixture.app.config.@"clipboard-paste-protection" = true;
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqual(HostOverlayMode.confirm, fixture.host.overlay_mode);
+    try std.testing.expectEqualStrings(payload, fixture.surface.pending_clipboard_op.?.paste.data);
+    try fixture.expectSilent();
+    fixture.host.invokeConfirmCancel();
+    try std.testing.expect(fixture.surface.pending_clipboard_op == null);
+    try fixture.expectSilent();
+
+    // Allow pastes the same bytes, between the fences.
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    fixture.host.invokeConfirmAccept();
+    try std.testing.expectEqualStrings("\x1b[200~" ++ payload ++ "\x1b[201~", try takePastedBytes(&fixture, &buf));
+
+    // With the protection off, as for a drop, it pastes at once.
+    fixture.app.config.@"clipboard-paste-protection" = false;
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqual(HostOverlayMode.none, fixture.host.overlay_mode);
+    try std.testing.expectEqualStrings("\x1b[200~" ++ payload ++ "\x1b[201~", try takePastedBytes(&fixture, &buf));
+}
+
+test "win32 copied-files-paste: the reader takes text over files, an empty text for no text, and files only for a paste" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    defer EmptyPasteClipboard.release();
+    var buf: [256]u8 = undefined;
+    fixture.setBracketedPaste(true);
+    fixture.surface.core_surface.config.clipboard_read = .allow;
+
+    // A clipboard with text and files pastes the text, and never looks at
+    // the files.
+    EmptyPasteClipboard.installFiles(&fixture, &.{"C:\\f.txt"});
+    EmptyPasteClipboard.text = "ab";
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqualStrings("\x1b[200~ab\x1b[201~", try takePastedBytes(&fixture, &buf));
+    try std.testing.expect(!EmptyPasteClipboard.hdrop_read);
+
+    // An empty text beside files is no text: the files paste.
+    EmptyPasteClipboard.text = "";
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqualStrings("\x1b[200~C:\\f.txt\x1b[201~", try takePastedBytes(&fixture, &buf));
+    try std.testing.expect(EmptyPasteClipboard.hdrop_read);
+
+    // An empty text and no files: the empty paste of a clipboard with no text.
+    EmptyPasteClipboard.install(&fixture, "");
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqualStrings(empty_bracketed_pair, try takePastedBytes(&fixture, &buf));
+    try std.testing.expect(EmptyPasteClipboard.hdrop_read);
+
+    // Neither text nor files: the same.
+    EmptyPasteClipboard.install(&fixture, null);
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqualStrings(empty_bracketed_pair, try takePastedBytes(&fixture, &buf));
+
+    // A program's OSC 52 read of a clipboard holding only files, or an empty
+    // text beside them, never looks at the files and gets the empty reply,
+    // with no fences.
+    EmptyPasteClipboard.installFiles(&fixture, &.{"C:\\f.txt"});
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .osc_52_read = .standard }));
+    try std.testing.expect(!EmptyPasteClipboard.hdrop_read);
+    try fixture.expectReply("\x1b]52;c;\x1b\\");
+    EmptyPasteClipboard.text = "";
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .osc_52_read = .standard }));
+    try std.testing.expect(!EmptyPasteClipboard.hdrop_read);
+    try fixture.expectReply("\x1b]52;c;\x1b\\");
+
+    // Were the files handed over anyway, they would still not be sent.
+    const alloc = fixture.core_app.alloc;
+    const paths = try alloc.dupeZ(u8, "C:\\f.txt");
+    try std.testing.expect(try fixture.surface.completeClipboardRead(.{ .osc_52_read = .standard }, .{ .files = paths }));
+    try fixture.expectReply("\x1b]52;c;\x1b\\");
+}
+
+test "win32 copied-files-paste: a drop pastes through the same path as a copy" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var buf: [256]u8 = undefined;
+    fixture.setBracketedPaste(true);
+    surfaceDropPayloadCallback(&fixture.surface, "\"C:\\a b\\x.txt\"");
+    try std.testing.expectEqualStrings("\x1b[200~\"C:\\a b\\x.txt\"\x1b[201~", try takePastedBytes(&fixture, &buf));
+    surfaceDropPayloadCallback(&fixture.surface, "");
+    try fixture.expectSilent();
 }
 
 test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {

@@ -1543,8 +1543,20 @@ Pasting a clipboard that holds text sends the text, bracketed when the
 program turned on bracketed paste (mode 2004), after the usual paste
 protection.
 
-When a paste finds no text on the clipboard, such as an image copied from a
-screenshot tool, and the program has bracketed paste on in a writable pane,
+Files copied in Explorer (Copy, Ctrl+C) put no text on the clipboard, only
+their names. Pasting such a clipboard types the paths of all the copied files,
+space-separated and quoted the way a drop quotes them (`"C:\a b\x.txt"
+C:\plain\y.txt`); Windows Terminal pastes only the first. The paths go through
+the same paste protection as a drop: with `clipboard-paste-protection` on, a
+path with shell metacharacters (`&`, `;`, `%VAR%` and so on) or control
+characters raises the paste prompt, and the paths are typed only once you
+allow it. Text on the clipboard always wins over copied files, a program's
+OSC 52 read never returns file names, and a clipboard with neither text nor
+files falls through to the empty paste below.
+
+When a paste finds no text and no copied files on the clipboard, such as an
+image copied from a screenshot tool, and the program has bracketed paste on in
+a writable pane,
 noctty sends an empty
 bracketed paste, `ESC[200~ESC[201~`, the same twelve bytes Windows Terminal
 sends. A program can take that as "the user pasted" and read the clipboard
@@ -1562,14 +1574,21 @@ Drops, automation `send_text`, quick select and typed text never send an
 empty paste, and neither does a program's OSC 52 read of an empty clipboard,
 which still gets its empty reply.
 
-With bracketed paste off, or in a read-only pane, nothing is sent and the paste
-action counts as not performed. The default Ctrl+Shift+V binding is
-`performable`, so on a clipboard without text, in a writable pane with
-bracketed paste off, it still reaches the program as a key; a read-only pane
-discards the key, as it discards all input. With bracketed paste on, in a
-writable pane, the key no longer reaches the program: the empty paste consumes
-it, as in Windows Terminal. A program that exits without turning bracketed
-paste off leaves the shell receiving the empty paste on such a clipboard.
+With bracketed paste off, or in a read-only pane, a clipboard with neither
+text nor copied files sends nothing and the paste action counts as not
+performed. The default Ctrl+Shift+V binding is `performable`, so on such a
+clipboard, in a writable pane with bracketed paste off, it still reaches the
+program as a key; a read-only pane discards the key, as it discards all input.
+With bracketed paste on, in a writable pane, the key no longer reaches the
+program: the empty paste consumes it, as in Windows Terminal. A program that
+exits without turning bracketed paste off leaves the shell receiving the empty
+paste on such a clipboard.
+
+A clipboard of copied files is a paste like one of text, so Ctrl+Shift+V is
+consumed whether bracketed paste is on or off, and a paste prompt for a flagged
+path takes the key too. The files are read on the UI thread with the clipboard
+open, as text is, so a source that renders them late (Explorer on a large
+folder or a network share) can stall the window for a moment.
 
 ## Quick terminal and global hotkeys
 
