@@ -42,7 +42,8 @@ the first with two tabs, the second of them split, the second with one tab):
                     copy's update state names a staged installer whose file a
                     shared-read handle holds, which refuses write access as a
                     running image does): the owner agrees and is not
-                    restartable; once the handle is closed, it is again.
+                    restartable; once the handle is closed, it is again, and
+                    a read-only leftover installer does not stop it.
 These three only list (RmGetList) and send the query and end messages
 themselves; they never call RmShutdown.
 
@@ -534,11 +535,21 @@ foreach($name in $selected) {
                 $r.After=Restart-Settings $p
                 $r.ListedAfter=(Rm-Restartable $case @($p))[$p.Id]
                 [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                # A read-only leftover also refuses write access, but no Setup
+                # runs from it: an unrelated upgrade still restarts the owner.
+                (Get-Item -LiteralPath $setup).IsReadOnly=$true
+                $r.QueriesReadOnly=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.ReadOnly=Restart-Settings $p
+                $r.ListedReadOnly=(Rm-Restartable $case @($p))[$p.Id]
+                [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                (Get-Item -LiteralPath $setup).IsReadOnly=$false
                 Check "${name}: every window agrees" (@($r.Queries | Where-Object { $_ -ne 1 }).Count -eq 0 -and $r.Queries.Count -eq 2) '1,1' ($r.Queries -join ',')
                 Check "${name}: and the owner is not restartable while that Setup runs" ($r.Running.Hr -eq $notFound -and $r.ListedRunning -eq $false) "$notFound, False" "$($r.Running.Hr), $($r.ListedRunning)"
                 Check "${name}: once it has exited, the owner is restartable again" ($r.After.Hr -eq '0x00000000' -and $r.After.Flags -eq 11 -and $r.ListedAfter -eq $true) '0x00000000 / 11, True' "$($r.After.Hr) / $($r.After.Flags), $($r.ListedAfter)"
+                Check "${name}: a read-only leftover installer does not stop the restart" ($r.ReadOnly.Hr -eq '0x00000000' -and $r.ReadOnly.Flags -eq 11 -and $r.ListedReadOnly -eq $true) '0x00000000 / 11, True' "$($r.ReadOnly.Hr) / $($r.ReadOnly.Flags), $($r.ListedReadOnly)"
             } finally {
                 if($held) { $held.Dispose() }
+                if(Test-Path -LiteralPath $setup) { (Get-Item -LiteralPath $setup).IsReadOnly=$false }
                 Stop-Case $case
             }
         }

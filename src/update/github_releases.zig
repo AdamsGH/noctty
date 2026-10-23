@@ -1078,15 +1078,36 @@ fn installerImageInUse(path: []const u8) bool {
 
 /// Whether the staged installer is running now, which is how the in-app
 /// Install runs Setup. The state is the user's, so this sees an Install that
-/// any noctty process started. False when the state cannot be read. The
-/// updater's own short verification opens also read as running, as do a
-/// staged installer the user started by hand and a permission failure
-/// (`installerImageInUse`).
+/// any noctty process started. False when the state cannot be read. Only a
+/// sharing violation on a write open counts, which is what a mapped image
+/// gives: unlike `installerImageInUse`, a read-only file or a permission
+/// failure does not (Zig's `OpenFile` reports both as `AccessDenied`, hence
+/// kernel32). The updater's own short verification opens, which share reads
+/// only, also read as running, as does a staged installer the user started
+/// by hand.
 pub fn stagedInstallerRunning(alloc: Allocator, state_path: []const u8) bool {
+    if (builtin.os.tag != .windows) return false;
     var state = loadState(alloc, state_path) catch return false;
     defer state.deinit(alloc);
     if (state.staged_kind != .installer) return false;
-    return installerImageInUse(state.staged_installer_path orelse return false);
+    const path = state.staged_installer_path orelse return false;
+    const windows = std.os.windows;
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
+    defer alloc.free(path_w);
+    const handle = windows.kernel32.CreateFileW(
+        path_w.ptr,
+        windows.GENERIC_WRITE,
+        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        null,
+        windows.OPEN_EXISTING,
+        windows.FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (handle == windows.INVALID_HANDLE_VALUE) {
+        return windows.kernel32.GetLastError() == .SHARING_VIOLATION;
+    }
+    windows.CloseHandle(handle);
+    return false;
 }
 
 /// Called at start-up. Install quits the app right after launching Setup and
@@ -3965,6 +3986,25 @@ test "the staged installer reads as running only while its image is in use" {
         try saveState(state_path, &state);
     }
     try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+
+    // A read-only leftover refuses write access too, but is not running:
+    // an unrelated upgrade must not read it as an Install under way.
+    {
+        var file = try tmp.dir.openFile("setup.exe", .{ .mode = .read_write });
+        defer file.close();
+        try file.setPermissions(.{ .inner = .{ .attributes = std.os.windows.FILE_ATTRIBUTE_READONLY } });
+        defer file.setPermissions(.{ .inner = .{ .attributes = std.os.windows.FILE_ATTRIBUTE_NORMAL } }) catch {};
+        try std.testing.expect(installerImageInUse(installer_path));
+        try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+    }
+
+    // A mapped image: this test runner's own.
+    const self_exe = try std.fs.selfExePathAlloc(alloc);
+    defer alloc.free(self_exe);
+    alloc.free(state.staged_installer_path.?);
+    state.staged_installer_path = try alloc.dupe(u8, self_exe);
+    try saveState(state_path, &state);
+    try std.testing.expect(stagedInstallerRunning(alloc, state_path));
 }
 
 test "a start leaves a portable apply request to the portable recovery" {
