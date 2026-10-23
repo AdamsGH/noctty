@@ -1151,14 +1151,16 @@ fn defaultProfileForKey(config: *const configpkg.Config, key: []const u8) ?*cons
 }
 
 /// The profile `new_window_elevated` hands the elevated process: the
-/// action's own, else the pane's. None for the config files'
-/// `default-profile`: the elevated process reads the same files and starts
+/// action's own, else the pane's. None for a `default-profile` the config
+/// files alone give: the elevated process reads the same files and starts
 /// that profile itself, so its variables stay off the elevated command line
-/// (`buildRelaunchParameters`). A command-line `default-profile` (a jump-list
-/// link's) is not passed on, so its profile still is.
+/// (`buildRelaunchParameters`). It is given no command-line launch settings,
+/// so a profile that depends on one (a `--default-profile=`, a jump-list
+/// link's; a `--command=` reset of a file's `command`) is still passed.
 fn elevatedProfileKey(config: *const configpkg.Config, action_key: []const u8, pane_key: ?[]const u8) ?[]const u8 {
     const key = if (action_key.len > 0) action_key else pane_key orelse return null;
-    if (config._default_profile_cli == null and defaultProfileForKey(config, key) != null) return null;
+    const files_alone = config._default_profile_cli == null and config._command_cli == null;
+    if (files_alone and defaultProfileForKey(config, key) != null) return null;
     return key;
 }
 
@@ -54012,7 +54014,12 @@ test "win32 a split or an elevated window of a default-profile pane needs no pro
     try std.testing.expectEqualStrings("pwsh.exe", elevatedProfileKey(&app.config, "", "pwsh.exe") orelse "");
     try std.testing.expectEqualStrings("pwsh.exe", elevatedProfileKey(&app.config, "pwsh.exe", "USER:PY") orelse "");
     app.config._default_profile_cli = "py";
-    defer app.config._default_profile_cli = null;
+    try std.testing.expectEqualStrings("USER:PY", elevatedProfileKey(&app.config, "", "USER:PY") orelse "");
+    app.config._default_profile_cli = null;
+    // A `--command=` reset of a file's `command`: the elevated process would
+    // run the file's command.
+    app.config._command_cli = "";
+    defer app.config._command_cli = null;
     try std.testing.expectEqualStrings("USER:PY", elevatedProfileKey(&app.config, "", "USER:PY") orelse "");
 }
 

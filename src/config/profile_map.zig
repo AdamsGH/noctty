@@ -85,7 +85,7 @@ pub fn ProfileMap(comptime kind: Kind) type {
                 self.entries.clearRetainingCapacity();
                 return;
             }
-            const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidValue;
+            const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.MissingProfileId;
             const id = std.mem.trim(u8, value[0..colon], &std.ascii.whitespace);
             const text = std.mem.trim(u8, value[colon + 1 ..], &std.ascii.whitespace);
 
@@ -225,7 +225,7 @@ test "profile map: text values are kept byte for byte and keep first-seen order"
     try testing.expectEqual(@as(usize, 1), map.count());
     try testing.expect(map.get("b") == null);
 
-    try testing.expectError(error.InvalidValue, map.parseCLI(alloc, "no colon here"));
+    try testing.expectError(error.MissingProfileId, map.parseCLI(alloc, "no colon here"));
     try map.parseCLI(alloc, "");
     try testing.expectEqual(@as(usize, 0), map.count());
 }

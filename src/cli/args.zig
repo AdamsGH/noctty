@@ -24,6 +24,10 @@ pub const Error = error{
     ValueRequired,
     InvalidField,
     InvalidValue,
+    /// A profile line (`profile-command`, `profile-env`, ...) without its
+    /// `<id>:`. Unlike `InvalidValue`, the message does not quote the value,
+    /// which may hold a command line or a secret.
+    MissingProfileId,
 };
 
 /// Parse the command line arguments from iter into dst.
@@ -167,6 +171,7 @@ pub fn parse(
                 error.InvalidField => "unknown field",
                 error.ValueRequired => formatValueRequired(T, arena_alloc, key) catch "value required",
                 error.InvalidValue => formatInvalidValue(T, arena_alloc, key, value) catch "invalid value",
+                error.MissingProfileId => "needs a profile id and a ':' before the value (the value is not shown)",
                 else => try std.fmt.allocPrintSentinel(
                     arena_alloc,
                     "unknown error {}",

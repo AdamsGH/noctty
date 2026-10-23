@@ -675,9 +675,10 @@ Limits:
   variables and the command apply to the whole elevated window, not only its
   first pane. New Elevated Window (`new_window_elevated:` with no key) does
   the same for the profile of the pane it is opened from. The exception is
-  the config files' `default-profile`: the elevated process reads the same
-  files and starts that profile itself, so nothing of it goes on the command
-  line.
+  a `default-profile` the config files give on their own (no `--command` or
+  `--default-profile` on noctty's command line): the elevated process reads
+  the same files and starts that profile itself, so nothing of it goes on the
+  command line.
   A command line is not private (process tools and process-creation auditing
   can show it), so do not keep a secret in the `profile-env` of a profile you
   open elevated.

@@ -1691,9 +1691,10 @@ class: ?[:0]const u8 = null,
 /// of a profile (`new_window_elevated:user:<id>`, or New Elevated Window from
 /// a pane that runs it) receives these variables on its command line, which
 /// is not private (process tools and process-creation auditing can show it),
-/// so keep secrets out of a profile you open elevated. The exception is the
-/// `default-profile` of the config files: the elevated window reads the same
-/// files and starts that profile itself.
+/// so keep secrets out of a profile you open elevated. The exception is a
+/// `default-profile` the config files give on their own (no `--command` or
+/// `--default-profile` on the command line): the elevated window reads the
+/// same files and starts that profile itself.
 @"profile-env": ProfileMap.Env = .{},
 
 /// The profile a terminal runs when nothing else chose one, in place of the
@@ -5915,6 +5916,25 @@ test "profile keys report each refused entry as a config problem" {
     try testing.expect(std.mem.indexOf(u8, formatted, "profile-name = ok: Fine\n") != null);
     try testing.expect(std.mem.indexOf(u8, formatted, "ghost") == null);
     try testing.expect(std.mem.indexOf(u8, formatted, "mine") == null);
+}
+
+test "a profile line without an id is a config problem that does not show the line" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var cfg = try testLoadProfileText(alloc,
+        \\profile-env = API_KEY=secret
+        \\profile-command = tool.exe --token=abc
+        \\
+    );
+    defer cfg.deinit();
+    const found = cfg._diagnostics.list.items;
+    try testing.expectEqual(@as(usize, 2), found.len);
+    for (found, [_][]const u8{ "profile-env", "profile-command" }) |got, key| {
+        try testing.expectEqualStrings(key, got.key);
+        try testing.expect(std.mem.startsWith(u8, got.message, "needs a profile id"));
+        try testing.expect(std.mem.indexOf(u8, got.message, "secret") == null);
+        try testing.expect(std.mem.indexOf(u8, got.message, "token") == null);
+    }
 }
 
 /// Resolve the automatic Windows command without hiding whether it was explicit.
