@@ -4019,12 +4019,15 @@ pub const App = struct {
     /// replays only the launch argv's `--config-file` and `--class`
     /// (`installerRestartCommandLine`); Windows adds the executable.
     fn registerInstallerRestart(self: *App) void {
-        if (!self.sessionStateEnabled() or !self.hasSessionWindows()) return;
-        // Another noctty process's in-app Install is running this Setup, which
-        // starts noctty through /RELAUNCH=1: a restart would be a second
-        // start. Asked before the once-per-round check, so that it also takes
-        // back a registration an earlier round left.
-        if (self.restart_api.installer_apply_running(self.core_app.alloc)) {
+        // Both are asked before the once-per-round check, so that they also
+        // take back a registration an earlier round left: this process may
+        // have stopped qualifying since (its last restorable window closed,
+        // or a reload turned saving off), or another noctty process's in-app
+        // Install is running this Setup, which starts noctty through
+        // /RELAUNCH=1, so a restart would be a second start.
+        if (!self.sessionStateEnabled() or !self.hasSessionWindows() or
+            self.restart_api.installer_apply_running(self.core_app.alloc))
+        {
             return self.unregisterInstallerRestart();
         }
         if (self.restart_registered) return;
@@ -55645,10 +55648,16 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
 
     // A process that does not restore the session agrees and is not
     // restarted: no owner, the default-terminal server, safe mode, and an
-    // owner whose only window holds nothing the session records.
+    // owner whose only window holds nothing the session records. An owner
+    // that registered and then stopped qualifying takes the registration back
+    // at its next agreeing query.
+    try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 5), Fake.registers);
     const owner = app.session_owner;
     app.session_owner = null;
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
+    try std.testing.expectEqual(@as(u32, 5), Fake.unregisters);
+    try std.testing.expect(!app.restart_registered);
     app.session_owner = owner;
     app.embedding_mode = true;
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
@@ -55659,7 +55668,7 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     host.quick_terminal = true;
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
     host.quick_terminal = false;
-    try std.testing.expectEqual(@as(u32, 4), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 5), Fake.registers);
 
     // A command line too long to register: the close still goes ahead.
     var long_path: [1100]u8 = undefined;
@@ -55667,7 +55676,7 @@ test "win32 agreeing to a Restart Manager close registers the session owner for 
     app.cli_config_override_path = &long_path;
     try std.testing.expectEqual(@as(LRESULT, 1), Rm.query(hwnd));
     app.cli_config_override_path = null;
-    try std.testing.expectEqual(@as(u32, 4), Fake.registers);
+    try std.testing.expectEqual(@as(u32, 5), Fake.registers);
     try std.testing.expect(!app.restart_registered);
 }
 
