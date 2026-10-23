@@ -363,6 +363,15 @@ pub const Action = union(enum) {
     insert_last_command,
 
     /// Paste the contents of the default clipboard.
+    ///
+    /// On Windows, when the clipboard holds no text (an image, say) and the
+    /// program has turned bracketed paste on (mode 2004) in a writable
+    /// (not read-only) pane, this sends an empty bracketed paste,
+    /// `ESC[200~ESC[201~`, as Windows Terminal does, and counts as performed,
+    /// so a `performable:` binding does not also reach the program as a key.
+    /// The program can read the clipboard itself; no image data is
+    /// transferred. Without bracketed paste, or in a read-only pane, nothing
+    /// is sent and the action is not performed.
     paste_from_clipboard,
 
     /// Paste the contents of the selection clipboard.

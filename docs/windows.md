@@ -1520,6 +1520,40 @@ multiplier. If a mouse-reporting TUI scrolls too quickly, try
 `mouse-scroll-multiplier = discrete:1`; this also slows normal viewport
 scrolling.
 
+## Clipboard and paste
+
+Pasting a clipboard that holds text sends the text, bracketed when the
+program turned on bracketed paste (mode 2004), after the usual paste
+protection.
+
+When a paste finds no text on the clipboard, such as an image copied from a
+screenshot tool, and the program has bracketed paste on in a writable pane,
+noctty sends an empty
+bracketed paste, `ESC[200~ESC[201~`, the same twelve bytes Windows Terminal
+sends. A program can take that as "the user pasted" and read the clipboard
+itself, which is how herdr and opencode attach an image. noctty transfers no
+image bytes: the program reads the clipboard through its own means, so it
+works only where the program runs on this machine or has its own clipboard
+bridge. An empty text on the clipboard counts as no text.
+
+This applies to every way of pasting from the clipboard: `paste_from_clipboard`
+(Ctrl+Shift+V, Shift+Insert, the Paste key, the command palette, your own
+bindings), the context menu's Paste, `right-click-action = paste` and
+`copy-or-paste` with nothing selected, and the middle mouse button. A program
+that has mouse reporting on receives the mouse gestures instead, as before.
+Drops, automation `send_text`, quick select and typed text never send an
+empty paste, and neither does a program's OSC 52 read of an empty clipboard,
+which still gets its empty reply.
+
+With bracketed paste off, or in a read-only pane, nothing is sent and the paste
+action counts as not performed. The default Ctrl+Shift+V binding is
+`performable`, so on a clipboard without text, in a writable pane with
+bracketed paste off, it still reaches the program as a key; a read-only pane
+discards the key, as it discards all input. With bracketed paste on, in a
+writable pane, the key no longer reaches the program: the empty paste consumes
+it, as in Windows Terminal. A program that exits without turning bracketed
+paste off leaves the shell receiving the empty paste on such a clipboard.
+
 ## Quick terminal and global hotkeys
 
 The quick terminal uses the same `toggle_quick_terminal` action and
