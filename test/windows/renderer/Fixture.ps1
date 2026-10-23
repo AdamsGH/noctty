@@ -1,4 +1,4 @@
-param([switch]$Stream, [switch]$HoldSync, [switch]$HideCursor, [int]$IntervalMs=10)
+param([switch]$Stream, [switch]$HoldSync, [switch]$HideCursor, [switch]$Tick, [int]$IntervalMs=10)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $e=[char]27
@@ -46,6 +46,14 @@ if ($env:NOCTTY_RENDERER_TEST_KITTY -eq '1') { [Console]::Write("$e`_Ga=T,f=24,s
   }
   Start-Sleep -Milliseconds $IntervalMs
  }
+}
+# Once the harness creates <ready>.tick, write to row 20 every 200 ms and
+# put the cursor back: output that leaves the cursor's row clean.
+if ($Tick) {
+ $clock=[Diagnostics.Stopwatch]::StartNew()
+ while(!(Test-Path -LiteralPath ($env:NOCTTY_RENDERER_READY_PATH+'.tick')) -and $clock.Elapsed.TotalSeconds -lt 85) { Start-Sleep -Milliseconds 50 }
+ $count=0
+ while($clock.Elapsed.TotalSeconds -lt 85) { [Console]::Write("${e}7$e[20;1HTICK $count$e[K${e}8"); $count++; Start-Sleep -Milliseconds 200 }
 }
 # Hold synchronized output (mode 2026) open: termio ends a hold after 1 s,
 # and each new BSU restarts that clock. Only what the renderer presents on its

@@ -194,15 +194,24 @@ test "renderer state records PTY output progress" {
     try std.testing.expectEqual(@as(u64, 22), progress.benchmark_end_marker_output_bytes);
 }
 
-/// The pre-edit state. See Surface.preeditCallback for more information.
+/// The pre-edit state. See Surface.preeditCaretCallback for more information.
 pub const Preedit = struct {
     /// The codepoints to render as preedit text.
     codepoints: []const Codepoint = &.{},
+
+    /// The composition caret as an index into `codepoints`, from 0 (before
+    /// the first) through `codepoints.len` (after the last), or null when
+    /// the input method reports none (dead keys, an IME without one).
+    caret: ?usize = null,
 
     /// A single codepoint to render as preedit text.
     pub const Codepoint = struct {
         codepoint: u21,
         wide: bool = false,
+
+        fn cells(self: Codepoint) usize {
+            return if (self.wide) 2 else 1;
+        }
     };
 
     /// Deinit this preedit that was cre
@@ -214,102 +223,214 @@ pub const Preedit = struct {
     pub fn clone(self: *const Preedit, alloc: Allocator) !Preedit {
         return .{
             .codepoints = try alloc.dupe(Codepoint, self.codepoints),
+            .caret = self.caret,
         };
     }
 
     /// The width in cells of all codepoints in the preedit.
     pub fn width(self: *const Preedit) usize {
         var result: usize = 0;
-        for (self.codepoints) |cp| {
-            result += if (cp.wide) 2 else 1;
-        }
-
+        for (self.codepoints) |cp| result += cp.cells();
         return result;
     }
 
-    /// Range returns the start and end x position of the preedit text
-    /// along with any codepoint offset necessary to fit the preedit
-    /// into the available space.
-    pub fn range(
+    /// Where the preedit is drawn on a row whose last column is `max`.
+    pub const Layout = struct {
+        /// The first and last cell the drawn codepoints cover, `max` at
+        /// most. The terminal's own cells in this span are not drawn.
+        start: terminalpkg.size.CellCountInt,
+        end: terminalpkg.size.CellCountInt,
+        /// The first codepoint drawn, at `start`. The codepoints after it
+        /// are drawn up to `end`.
+        cp_offset: usize,
+        /// The cell whose left edge the caret is drawn on, or null.
+        caret_x: ?terminalpkg.size.CellCountInt,
+    };
+
+    /// Lay the preedit out from the terminal cursor at `start` on a row
+    /// whose last column is `max`. When it does not fit, the head is cut,
+    /// so the text nearest the caret stays visible, and `start` stays at the
+    /// cursor unless not even one codepoint fits there. A caret after the
+    /// last codepoint takes a cell of its own, and a caret inside the cut
+    /// head brings its codepoint back as the first one drawn.
+    pub fn layout(
         self: *const Preedit,
         start: terminalpkg.size.CellCountInt,
         max: terminalpkg.size.CellCountInt,
-    ) struct {
-        start: terminalpkg.size.CellCountInt,
-        end: terminalpkg.size.CellCountInt,
-        cp_offset: usize,
-    } {
-        // If our width is greater than the number of cells we have
-        // then we need to adjust our codepoint start to a point where
-        // our width would be less than the number of cells we have.
-        const w, const cp_offset = width: {
-            // max is inclusive, so we need to add 1 to it.
-            const max_width = max - start + 1;
-
-            // Rebuild our width in reverse order. This is because we want
-            // to offset by the end cells, not the start cells (if we have to).
-            var w: terminalpkg.size.CellCountInt = 0;
-            for (0..self.codepoints.len) |i| {
-                const reverse_i = self.codepoints.len - i - 1;
-                const cp = self.codepoints[reverse_i];
-                w += if (cp.wide) 2 else 1;
-                if (w > max_width) {
-                    break :width .{ w, reverse_i };
-                }
-            }
-
-            // Width fit in the max width so no offset necessary.
-            break :width .{ w, 0 };
+    ) Layout {
+        const CellCountInt = terminalpkg.size.CellCountInt;
+        const cps = self.codepoints;
+        if (cps.len == 0 or start > max) return .{
+            .start = start,
+            .end = start,
+            .cp_offset = 0,
+            .caret_x = null,
         };
+        const caret: ?usize = if (self.caret) |c| @min(c, cps.len) else null;
+        // Cells from the cursor through the last column.
+        const avail: usize = @as(usize, max - start) + 1;
 
-        // If our preedit goes off the end of the screen, we adjust it so
-        // that it shifts left.
-        const end = if (w > 0) start + (w - 1) else start;
-        const start_offset = if (end > max) end - max else 0;
+        // The longest tail that fits, with a cell for a caret after it.
+        var first = cps.len;
+        var need: usize = if (caret == cps.len) 1 else 0;
+        while (first > 0 and need + cps[first - 1].cells() <= avail) {
+            first -= 1;
+            need += cps[first].cells();
+        }
+
+        // A caret in the cut head: its codepoint is drawn first and the
+        // tail is cut instead.
+        if (caret) |c| slide: {
+            if (c >= first) break :slide;
+            const at = cps[c].cells();
+            // From the last column, a wide codepoint moves left to fit.
+            const from: CellCountInt = if (at > avail) @intCast((@as(usize, max) + 1) -| at) else start;
+            var end: usize = from + at - 1;
+            for (cps[c + 1 ..]) |cp| {
+                if (end + cp.cells() > max) break;
+                end += cp.cells();
+            }
+            return .{
+                .start = from,
+                .end = @intCast(@min(end, max)),
+                .cp_offset = c,
+                .caret_x = from,
+            };
+        }
+
+        // Not even the last codepoint fits beside the cursor (a wide one in
+        // the last column, or any one with the caret after it): move it
+        // left until it does.
+        var from = start;
+        if (first == cps.len) {
+            first = cps.len - 1;
+            need += cps[first].cells();
+            from = @intCast((@as(usize, max) + 1) -| need);
+        }
+
+        var text: usize = 0;
+        for (cps[first..]) |cp| text += cp.cells();
+        const caret_x: ?CellCountInt = if (caret) |c| caret_x: {
+            var x: usize = from;
+            for (cps[first..c]) |cp| x += cp.cells();
+            break :caret_x @intCast(@min(x, max));
+        } else null;
         return .{
-            .start = start -| start_offset,
-            .end = end -| start_offset,
-            .cp_offset = cp_offset,
+            .start = from,
+            .end = @intCast(@min(@as(usize, from) + text - 1, max)),
+            .cp_offset = first,
+            .caret_x = caret_x,
         };
     }
 };
 
 const test_hangul_ga: u21 = 0xAC00; // U+AC00 HANGUL SYLLABLE GA
 
-test "preedit range covers exact cell width" {
+/// Checks what `rebuildCells` draws for a layout: codepoints from
+/// `cp_offset` cover exactly `start..end`, and nothing lands past `max`.
+fn expectLayout(
+    p: Preedit,
+    start: terminalpkg.size.CellCountInt,
+    max: terminalpkg.size.CellCountInt,
+    expected: Preedit.Layout,
+) !void {
     const testing = std.testing;
-
-    {
-        const p: Preedit = .{
-            .codepoints = &.{.{ .codepoint = 'a' }},
-        };
-        const range = p.range(2, 9);
-        try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 2), range.start);
-        try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 2), range.end);
-        try testing.expectEqual(@as(usize, 0), range.cp_offset);
+    const l = p.layout(start, max);
+    try testing.expectEqual(expected, l);
+    var x: usize = l.start;
+    for (p.codepoints[l.cp_offset..]) |cp| {
+        if (x + cp.cells() - 1 > l.end) break;
+        x += cp.cells();
     }
-
-    {
-        const p: Preedit = .{
-            .codepoints = &.{.{ .codepoint = test_hangul_ga, .wide = true }},
-        };
-        const range = p.range(2, 9);
-        try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 2), range.start);
-        try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 3), range.end);
-        try testing.expectEqual(@as(usize, 0), range.cp_offset);
-    }
+    try testing.expectEqual(@as(usize, l.end) + 1, x);
+    try testing.expect(l.end <= max);
+    if (l.caret_x) |caret_x| try testing.expect(caret_x <= max);
 }
 
-test "preedit range shifts left at right edge" {
-    const testing = std.testing;
+test "preedit layout covers exact cell width" {
+    try expectLayout(.{
+        .codepoints = &.{.{ .codepoint = 'a' }},
+    }, 2, 9, .{ .start = 2, .end = 2, .cp_offset = 0, .caret_x = null });
 
-    const p: Preedit = .{
+    try expectLayout(.{
         .codepoints = &.{.{ .codepoint = test_hangul_ga, .wide = true }},
-    };
-    const range = p.range(9, 9);
-    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 8), range.start);
-    try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), range.end);
-    try testing.expectEqual(@as(usize, 0), range.cp_offset);
+    }, 2, 9, .{ .start = 2, .end = 3, .cp_offset = 0, .caret_x = null });
+}
+
+test "preedit layout shifts left at right edge" {
+    try expectLayout(.{
+        .codepoints = &.{.{ .codepoint = test_hangul_ga, .wide = true }},
+    }, 9, 9, .{ .start = 8, .end = 9, .cp_offset = 0, .caret_x = null });
+    try expectLayout(.{
+        .codepoints = &.{ .{ .codepoint = 'a' }, .{ .codepoint = test_hangul_ga, .wide = true } },
+    }, 9, 9, .{ .start = 8, .end = 9, .cp_offset = 1, .caret_x = null });
+}
+
+test "preedit layout draws no cell past max when it truncates" {
+    // main's range() returned cp_offset 4 here and so drew 11 cells, the
+    // last one at x = 10, past the last column.
+    const narrow: [15]Preedit.Codepoint = @splat(.{ .codepoint = 'a' });
+    try expectLayout(.{ .codepoints = &narrow }, 0, 9, .{ .start = 0, .end = 9, .cp_offset = 5, .caret_x = null });
+}
+
+test "preedit layout never starts left of the cursor" {
+    // main's range() started this one at column 4, over the cell left of
+    // the cursor.
+    const narrow: [15]Preedit.Codepoint = @splat(.{ .codepoint = 'a' });
+    try expectLayout(.{ .codepoints = &narrow }, 5, 9, .{ .start = 5, .end = 9, .cp_offset = 10, .caret_x = null });
+}
+
+test "preedit layout places the caret inside the text" {
+    const narrow: [8]Preedit.Codepoint = @splat(.{ .codepoint = 'a' });
+    try expectLayout(.{ .codepoints = &narrow, .caret = 5 }, 0, 79, .{ .start = 0, .end = 7, .cp_offset = 0, .caret_x = 5 });
+    try expectLayout(.{ .codepoints = &narrow, .caret = 0 }, 3, 79, .{ .start = 3, .end = 10, .cp_offset = 0, .caret_x = 3 });
+    // A caret past the end clamps to the end.
+    try expectLayout(.{ .codepoints = &narrow, .caret = 99 }, 0, 79, .{ .start = 0, .end = 7, .cp_offset = 0, .caret_x = 8 });
+}
+
+test "preedit layout reserves a cell for a caret at the end" {
+    const narrow: [10]Preedit.Codepoint = @splat(.{ .codepoint = 'a' });
+    // Fits with its caret cell.
+    try expectLayout(.{ .codepoints = narrow[0..8], .caret = 8 }, 0, 9, .{ .start = 0, .end = 7, .cp_offset = 0, .caret_x = 8 });
+    // Ten cells of text fill the row: the head loses one more codepoint
+    // than without a caret, and the caret sits on the last column.
+    try expectLayout(.{ .codepoints = &narrow, .caret = 10 }, 0, 9, .{ .start = 0, .end = 8, .cp_offset = 1, .caret_x = 9 });
+    try expectLayout(.{ .codepoints = &narrow }, 0, 9, .{ .start = 0, .end = 9, .cp_offset = 0, .caret_x = null });
+    // From the last column, the text moves left by the caret's cell.
+    try expectLayout(.{ .codepoints = narrow[0..3], .caret = 3 }, 9, 9, .{ .start = 8, .end = 8, .cp_offset = 2, .caret_x = 9 });
+}
+
+test "preedit layout brings a caret in the cut head into view" {
+    const narrow: [15]Preedit.Codepoint = @splat(.{ .codepoint = 'a' });
+    // Codepoints 5..15 are what fits; a caret before 5 is drawn first and
+    // the tail is cut instead.
+    try expectLayout(.{ .codepoints = &narrow, .caret = 2 }, 0, 9, .{ .start = 0, .end = 9, .cp_offset = 2, .caret_x = 0 });
+    try expectLayout(.{ .codepoints = &narrow, .caret = 0 }, 5, 9, .{ .start = 5, .end = 9, .cp_offset = 0, .caret_x = 5 });
+    // A caret inside the visible tail leaves the window alone.
+    try expectLayout(.{ .codepoints = &narrow, .caret = 7 }, 0, 9, .{ .start = 0, .end = 9, .cp_offset = 5, .caret_x = 2 });
+    // A wide codepoint at the caret, on the last column, moves left to fit.
+    const wide: [5]Preedit.Codepoint = @splat(.{ .codepoint = test_hangul_ga, .wide = true });
+    try expectLayout(.{ .codepoints = &wide, .caret = 1 }, 9, 9, .{ .start = 8, .end = 9, .cp_offset = 1, .caret_x = 8 });
+}
+
+test "preedit layout places the caret between wide codepoints" {
+    const wide: [4]Preedit.Codepoint = @splat(.{ .codepoint = test_hangul_ga, .wide = true });
+    try expectLayout(.{ .codepoints = &wide, .caret = 0 }, 2, 79, .{ .start = 2, .end = 9, .cp_offset = 0, .caret_x = 2 });
+    try expectLayout(.{ .codepoints = &wide, .caret = 1 }, 2, 79, .{ .start = 2, .end = 9, .cp_offset = 0, .caret_x = 4 });
+    try expectLayout(.{ .codepoints = &wide, .caret = 3 }, 2, 79, .{ .start = 2, .end = 9, .cp_offset = 0, .caret_x = 8 });
+    try expectLayout(.{ .codepoints = &wide, .caret = 4 }, 2, 79, .{ .start = 2, .end = 9, .cp_offset = 0, .caret_x = 10 });
+    // Truncated: a wide codepoint that does not fit beside the caret cell
+    // is cut whole.
+    try expectLayout(.{ .codepoints = &wide, .caret = 4 }, 0, 7, .{ .start = 0, .end = 5, .cp_offset = 1, .caret_x = 6 });
+}
+
+test "preedit clone keeps the caret" {
+    const testing = std.testing;
+    const p: Preedit = .{ .codepoints = &.{ .{ .codepoint = 'a' }, .{ .codepoint = 'b' } }, .caret = 1 };
+    const copy = try p.clone(testing.allocator);
+    defer copy.deinit(testing.allocator);
+    try testing.expectEqual(@as(?usize, 1), copy.caret);
+    try testing.expectEqualSlices(Preedit.Codepoint, p.codepoints, copy.codepoints);
 }
 
 test "renderer state accumulates wake sources until taken" {
