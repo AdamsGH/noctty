@@ -28,6 +28,17 @@ the first with two tabs, the second of them split, the second with one tab):
                     ENDSESSION_CLOSEAPP, as a sign-out sends them: noctty saves,
                     latches (a later checkpoint writes nothing) and does not
                     quit by itself (Windows ends the process).
+  restartable       registration for Setup's restart: not restartable at
+                    start; after an accepted query the session owner is
+                    restartable in RmGetList and GetApplicationRestartSettings
+                    returns its --config-file and --class with flags 11
+                    (RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
+                    WM_ENDSESSION(FALSE) removes it; a second instance of the
+                    copy (not the session owner) agrees and is not restartable.
+  restartable-busy  confirm-close-surface = always: the declining owner is not
+                    restartable.
+These two only list (RmGetList) and send the query and end messages
+themselves; they never call RmShutdown.
 
 Safety. Only this run's portable copies are registered with Restart Manager:
 their noctty.exe and DLLs, never OpenConsole.exe (an RmUnknownApp that fails
@@ -80,6 +91,15 @@ public static class Rm {
     [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint h, out uint needed, ref uint count, [In, Out] ProcessInfo[] info, out uint reasons);
     [DllImport("rstrtmgr.dll")] static extern int RmShutdown(uint h, uint flags, IntPtr status);
     [DllImport("rstrtmgr.dll")] public static extern int RmEndSession(uint h);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern int GetApplicationRestartSettings(IntPtr process, StringBuilder cmd, ref int size, out int flags);
+    // What the process registered with RegisterApplicationRestart: its
+    // HRESULT (0x80070490, not found, when nothing is registered), command
+    // line and flags.
+    public static object[] RestartSettings(IntPtr process) {
+        var cmd=new StringBuilder(1100); int size=1100, flags=0;
+        int hr=GetApplicationRestartSettings(process,cmd,ref size,out flags);
+        return new object[] { hr, hr==0 ? cmd.ToString() : null, flags };
+    }
     public static ProcessInfo[] List(uint h, out int err) {
         uint needed=0, count=0, reasons; var list=new ProcessInfo[0];
         err=RmGetList(h,out needed,ref count,null,out reasons);
@@ -271,8 +291,50 @@ function Lock-Held([string]$State) {
 function Send-All($case,[uint32]$Message,[long]$W,[long]$L) {
     return @(@([HiddenLocal]::Hosts($case.Process.Id)) | ForEach-Object { [Rm]::Send($_,$Message,$W,$L) })
 }
+# Restart Manager's view of the copy's processes, without shutting anything
+# down: each listed PID with its RmGetList bRestartable. Throws when it lists a
+# process this run did not start (exact PID and start time, read fresh).
+function Rm-Restartable($case,[Diagnostics.Process[]]$Ours) {
+    $key=[Text.StringBuilder]::new(64); [uint32]$h=0
+    $err=[Rm]::RmStartSession([ref]$h,0,$key); if($err) { throw "RmStartSession failed: $err" }
+    try {
+        $files=@(Get-ChildItem -LiteralPath $case.Dir -File | Where-Object { $_.Extension -in '.exe','.dll' -and $_.Name -ne 'OpenConsole.exe' } | ForEach-Object FullName)
+        $err=[Rm]::RmRegisterResources($h,[uint32]$files.Count,[string[]]$files,0,[IntPtr]::Zero,0,$null); if($err) { throw "RmRegisterResources failed: $err" }
+        [int]$listErr=0
+        $listed=@([Rm]::List($h,[ref]$listErr))
+        if($listErr) { throw "RmGetList failed: $listErr" }
+        $out=@{}
+        foreach($entry in $listed) {
+            $p=@($Ours | Where-Object { $_.Id -eq $entry.Process.Pid })
+            $fresh=Get-Process -Id $entry.Process.Pid -ErrorAction SilentlyContinue
+            $mine=$p.Count -eq 1 -and $null -ne $fresh -and $fresh.Path -eq $p[0].Path -and
+                [Math]::Abs(([Rm]::StartTime($entry) - $fresh.StartTime.ToUniversalTime()).TotalMilliseconds) -lt 1000
+            if(-not $mine) { throw "Restart Manager lists a process this run did not start ($($entry.Process.Pid))." }
+            $out[[int]$entry.Process.Pid]=$entry.Restartable
+        }
+        return $out
+    } finally { [void][Rm]::RmEndSession($h) }
+}
+function Restart-Settings([Diagnostics.Process]$P) {
+    $r=[Rm]::RestartSettings($P.Handle)
+    return [ordered]@{ Hr=('0x{0:X8}' -f $r[0]); Line=$r[1]; Flags=$r[2] }
+}
+# One argument as CommandLineToArgvW reads it back (what the restart
+# registration quotes).
+function Quote-Arg([string]$Arg) {
+    if($Arg.Length -and $Arg -notmatch '[ \t\r\n"]') { return $Arg }
+    $sb=[Text.StringBuilder]::new('"'); $slashes=0
+    foreach($ch in $Arg.ToCharArray()) {
+        if($ch -eq '\') { $slashes++; continue }
+        if($ch -eq '"') { [void]$sb.Append([char]'\',2*$slashes+1) } elseif($slashes) { [void]$sb.Append([char]'\',$slashes) }
+        $slashes=0; [void]$sb.Append($ch)
+    }
+    if($slashes) { [void]$sb.Append([char]'\',2*$slashes) }
+    return $sb.Append('"').ToString()
+}
+$notFound='0x80070490'
 
-$all=@('idle-two-windows','busy-always','busy-ping','settings-dirty','cancel','signout')
+$all=@('idle-two-windows','busy-always','busy-ping','settings-dirty','cancel','signout','restartable','restartable-busy')
 $selected=if($Cases) { @($Cases -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $all }
 foreach($name in $selected) { if($all -notcontains $name) { throw "Unknown case $name." } }
 
@@ -386,6 +448,63 @@ foreach($name in $selected) {
                 Check "${name}: the session is saved as it ends" ($r.Saved -and $r.ShapeAfter -eq $seededShape) "saved, $seededShape" "$($r.Saved), $($r.ShapeAfter)"
                 Check "${name}: and latched: a later checkpoint writes nothing" $r.LatchedAfter $true $r.LatchedAfter
                 Check "${name}: noctty does not quit by itself" ($r.Alive -and $r.Hosts -eq 2) 'alive, 2 windows' "alive=$($r.Alive), $($r.Hosts) windows"
+            } finally { Stop-Case $case }
+        }
+        'restartable' {
+            $case=Start-Case $name @()
+            $second=$null
+            try {
+                $p=$case.Process
+                $expected=(Quote-Arg ('--config-file=' + (Join-Path $case.Dir 'case.ghostty'))) + ' ' + (Quote-Arg "--class=$runClass")
+                $r.AtStart=Restart-Settings $p
+                $r.ListedAtStart=(Rm-Restartable $case @($p))[$p.Id]
+                $r.Queries=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.Accepted=Restart-Settings $p
+                $r.ListedAccepted=(Rm-Restartable $case @($p))[$p.Id]
+                $r.Ends=@(Send-All $case $Msg.EndSession 0 $closeApp)
+                $r.Cancelled=Restart-Settings $p
+                $r.ListedCancelled=(Rm-Restartable $case @($p))[$p.Id]
+                Check "${name}: not restartable at start" ($r.AtStart.Hr -eq $notFound -and $r.ListedAtStart -eq $false) "$notFound, False" "$($r.AtStart.Hr), $($r.ListedAtStart)"
+                Check "${name}: every window agrees to the query" (@($r.Queries | Where-Object { $_ -ne 1 }).Count -eq 0 -and $r.Queries.Count -eq 2) '1,1' ($r.Queries -join ',')
+                Check "${name}: the agreeing owner is restartable" ($r.ListedAccepted -eq $true) $true $r.ListedAccepted
+                Check "${name}: with its config file and class, and flags 11" ($r.Accepted.Hr -eq '0x00000000' -and $r.Accepted.Line -ceq $expected -and $r.Accepted.Flags -eq 11) "$expected / 11" "$($r.Accepted.Hr) $($r.Accepted.Line) / $($r.Accepted.Flags)"
+                Check "${name}: WM_ENDSESSION(FALSE) removes the registration" ($r.Cancelled.Hr -eq $notFound -and $r.ListedCancelled -eq $false) "$notFound, False" "$($r.Cancelled.Hr), $($r.ListedCancelled)"
+
+                # A second instance of the same copy: the session lock is held,
+                # so it is not the owner and opens a window of its own.
+                $exe=Join-Path $case.Dir 'noctty.exe'
+                $cfg=Join-Path $case.Dir 'case.ghostty'
+                $pi=[HiddenLocal]::Spawn($exe,('"{0}" --config-file="{1}" --single-instance=false --class={2}' -f $exe,$cfg,$runClass),$case.Dir,"WinSta0\$DesktopName")
+                try { $second=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$second.Handle }
+                finally { [void][HiddenLocal]::CloseHandle($pi.thread); [void][HiddenLocal]::CloseHandle($pi.process) }
+                $script:processes.Add(@{ Case="$name-second"; Pid=$second.Id; StartTime=$second.StartTime.ToUniversalTime().ToString('o') })
+                $secondCase=@{ Name="$name-second"; Dir=$case.Dir; Process=$second }
+                if(-not (Wait-Until { @([HiddenLocal]::Hosts($second.Id)).Count -ge 1 } 30)) { throw "${name}: the second instance opened no window." }
+                foreach($h in @([HiddenLocal]::Hosts($second.Id))) { if([HiddenLocal]::WindowDesktop($h) -ne $DesktopName) { throw "${name}: a second-instance window is not on the private desktop." } }
+                Start-Sleep -Seconds 3
+                $r.SecondQueries=@(Send-All $secondCase $Msg.QueryEndSession 0 $closeApp)
+                $r.SecondAccepted=Restart-Settings $second
+                $listed=Rm-Restartable $case @($p,$second)
+                $r.SecondListed=$listed[$second.Id]
+                $r.OwnerStillLock=Lock-Held $case.State
+                [void](Send-All $secondCase $Msg.EndSession 0 $closeApp)
+                Check "${name}: the second instance agrees" (@($r.SecondQueries | Where-Object { $_ -ne 1 }).Count -eq 0 -and $r.SecondQueries.Count -ge 1) '1' ($r.SecondQueries -join ',')
+                Check "${name}: and is not restartable" ($r.SecondAccepted.Hr -eq $notFound -and $r.SecondListed -eq $false) "$notFound, False" "$($r.SecondAccepted.Hr), $($r.SecondListed)"
+            } finally {
+                if($second) { Stop-Case @{ Process=$second } }
+                Stop-Case $case
+            }
+        }
+        'restartable-busy' {
+            $case=Start-Case $name @('confirm-close-surface = always')
+            try {
+                $p=$case.Process
+                $r.Queries=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.Declined=Restart-Settings $p
+                $r.Listed=(Rm-Restartable $case @($p))[$p.Id]
+                [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                Check "${name}: declined" (@($r.Queries | Where-Object { $_ -ne 0 }).Count -eq 0 -and $r.Queries.Count -eq 2) '0,0' ($r.Queries -join ',')
+                Check "${name}: and not restartable" ($r.Declined.Hr -eq $notFound -and $r.Listed -eq $false) "$notFound, False" "$($r.Declined.Hr), $($r.Listed)"
             } finally { Stop-Case $case }
         }
     }

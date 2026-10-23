@@ -1390,6 +1390,33 @@ Portable apply fails closed until a release publishes that signed complete-file
 manifest. Releases without it are not downloaded or staged for portable apply;
 the update notice opens the normal GitHub release page for manual updating.
 
+### Installing and upgrading while noctty runs
+
+Setup (run by hand, by WinGet or by Chocolatey) asks a running noctty to close
+through Windows Restart Manager before it replaces the files. noctty agrees
+when quitting would ask nothing: it saves every window, tab and split, as
+`quit` does, and closes. The process that owns the saved session also asks
+Windows to let Setup start it again when Setup finishes, with the same
+`--config-file` and `--class` it was started with, and that start restores
+the session. Another noctty process closes and is not started again; the
+session owner brings the session back. Setup's restart of noctty itself has
+not been tried on a real install.
+
+noctty declines, without a prompt, while a terminal runs a program (the
+programs `confirm-close-surface` asks about) or while Settings has unsaved
+edits. Nothing closes and nothing is lost, but Setup cannot replace the files
+and stops; a silent Setup under a package manager exits with code 5. Finish
+or close those programs and run the upgrade again. For the same reason an
+upgrade started from inside a noctty tab is declined: the package manager is
+a program running in that terminal, and closing noctty would end it. Run it
+from another terminal.
+
+When the copy being upgraded is 1.3.134 or older, the running old version
+answers Setup, so it behaves as that version did: Setup may fail to close it,
+or close its windows one at a time so that the saved session keeps only the
+last one. Quit noctty before such an upgrade. The in-app **Install** is not
+affected: it quits noctty itself and starts it again as described above.
+
 ## Quick select & copy mode
 
 `Ctrl+Shift+Space` runs `toggle_quick_select` for the focused terminal
