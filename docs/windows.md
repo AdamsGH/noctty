@@ -273,7 +273,10 @@ broke, and Command Prompt loads no profile (`/D` also skips the `AutoRun`
 command that a registry value or Clink can hang there). The profile
 picker, its dropdown check mark and a right or middle click on the new-tab
 button start on the profile this default runs, or on the one
-`default-profile` names; a `command` you set does not move that choice.
+`default-profile` names; a `command` you set does not move that choice. Once
+you choose a profile in the picker, the palette or a quick slot, they start on
+that one instead, and a reload that changes `default-profile` moves them only
+until you do.
 
 Discovery also skips drive aliases that map to a folder, such as `subst` drives.
 In safe mode, right or middle click deliberately opens the plain Command Prompt
@@ -606,7 +609,8 @@ profile's command, its `profile-env` variables and its
 `profile-working-directory`; a profile without a directory of its own starts
 where `working-directory` and the `*-inherit-working-directory` settings say,
 as `command` does. The pane remembers the profile, so its splits and a
-restored session run it again, and the profile picker opens on it.
+restored session run it again, and the profile picker opens on it until you
+choose another there.
 
 `profile-order` lists profiles first in the picker and the palette, in the
 order of its lines, and `profile-hidden` takes profiles out of the picker, the

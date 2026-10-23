@@ -1198,7 +1198,10 @@ palette: Palette = .{},
 /// PowerShell 7 (`pwsh.exe`) when it is found on `PATH`, else Windows
 /// PowerShell, else Command Prompt (`cmd.exe`). WSL is never the default,
 /// because `wsl.exe --status` can report a healthy installation when starting
-/// a session would still fail; use `command = wsl.exe` to choose it. A launch
+/// a session would still fail; use `command = wsl.exe` to choose it. With
+/// `default-profile` set, its profile runs in place of that default, and a
+/// `command` set in a config file overrides it (reported as a config
+/// problem; `--command` on the command line overrides it quietly). A launch
 /// with `--safe-mode` always starts `cmd.exe /D`: no PowerShell profile and no
 /// `AutoRun` command can get in the way of recovery.
 ///
@@ -1702,7 +1705,8 @@ class: ?[:0]const u8 = null,
 /// `profile-working-directory`. Without a directory of its own it starts
 /// where `working-directory` and the `*-inherit-working-directory` settings
 /// say, as `command` does. The terminal remembers the profile, so its splits
-/// and a restored session run it again, and the profile picker opens on it.
+/// and a restored session run it again, and the profile picker opens on it
+/// until another profile is chosen there.
 ///
 /// `command` wins when it is set. Set in a config file, that is reported as a
 /// config problem, since this setting then does nothing; `--command` on the

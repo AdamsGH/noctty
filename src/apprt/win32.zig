@@ -6794,11 +6794,7 @@ pub const App = struct {
                         return true;
                     }
                 }
-                // Before the forwarded arguments, so a directory they carry
-                // wins over the profile's own.
-                const default_profile = try self.applyDefaultProfileLaunch(&config);
-                applyNewWindowArguments(
-                    self.core_app.alloc,
+                const default_profile = self.applyNewWindowLaunch(
                     &config,
                     forwarded_arguments,
                 ) catch |err| switch (err) {
@@ -8187,6 +8183,24 @@ pub const App = struct {
     fn applyDefaultProfileLaunch(self: *const App, config: *configpkg.Config) !?*const windows_shell.Profile {
         if (!self.defaultProfileApplies(config)) return null;
         return try applyDefaultProfileConfig(config);
+    }
+
+    /// A new window's forwarded arguments (`applyNewWindowArguments`), then
+    /// `applyDefaultProfileLaunch`. In that order: with a theme set, the
+    /// arguments' `finalize` builds the config again from its replay steps,
+    /// which would drop the profile's variables, line and directory. A
+    /// directory the arguments carry still wins over the profile's own.
+    fn applyNewWindowLaunch(
+        self: *const App,
+        config: *configpkg.Config,
+        arguments: ?[]const [:0]const u8,
+    ) !?*const windows_shell.Profile {
+        try applyNewWindowArguments(self.core_app.alloc, config, arguments);
+        const forwarded_directory = if (arguments) |argv| forwardedArgvSetsKey(argv, "working-directory") else false;
+        const directory = config.@"working-directory";
+        const profile = try self.applyDefaultProfileLaunch(config);
+        if (forwarded_directory) config.@"working-directory" = directory;
+        return profile;
     }
 
     /// `applyDefaultProfileLaunch` for a restored pane whose own profile did
@@ -18641,20 +18655,31 @@ const Host = struct {
 
     /// Select the profile `preferredProfileIndex` picks, else the default
     /// shell's, else the one at the current index (the first when that is
-    /// past the end). `profiles` is not empty.
+    /// past the end). `profiles` is not empty. Only a profile chosen in the
+    /// picker, the palette or a quick slot is stored as the selection: one
+    /// picked here is picked again for each new list, so after a reload that
+    /// changes `default-profile` the picker starts on the new one.
     fn selectPreferredProfile(self: *Host, profiles: []const windows_shell.Profile) !void {
-        const index = preferredProfileIndex(
+        if (preferredProfileIndex(
             profiles,
             self.selected_profile_key,
             self.app.launcher_profile_key,
+            null,
+            null,
+            self.selected_profile,
+        )) |chosen| {
+            _ = try self.setSelectedProfileIndex(chosen);
+            return;
+        }
+        self.selected_profile = preferredProfileIndex(
+            profiles,
+            null,
+            null,
             if (self.app.config._default_profile) |profile| profile.key else null,
             self.app.launcher_profile_hint,
             self.selected_profile,
-        ) orelse self.app.defaultShellProfileIndex(profiles) orelse current: {
-            if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-            break :current self.selected_profile;
-        };
-        _ = try self.setSelectedProfileIndex(index);
+        ) orelse self.app.defaultShellProfileIndex(profiles) orelse
+            if (self.selected_profile < profiles.len) self.selected_profile else 0;
     }
 
     /// For actions that need a list now (open a profile by key or index,
@@ -32602,9 +32627,17 @@ const storedProfileKeyEquals = labels.storedProfileKeyEquals;
 /// on a reload (`config_change`), which then sees the change. They are not
 /// dropped here: the open palette borrows its host's profile strings.
 /// Choosing a theme (`commitPaletteTheme`) saves it and reloads through
-/// `settingsSaveAndReload`, so that reload applies any profile edits.
+/// `settingsSaveAndReload`, so that reload applies any profile edits. For
+/// the same reason `dst` keeps the launch `src` resolved: `command` and the
+/// `default-profile` profile, which `finalize` found from the files read
+/// again, so a new tab would run an edited default profile's definition.
 fn keepProfileSources(dst: *configpkg.Config, src: *const configpkg.Config) !void {
     const alloc = dst._arena.?.allocator();
+    dst.command = if (src.command) |command| try command.clone(alloc) else null;
+    dst._command_defaulted = src._command_defaulted;
+    dst._command_from_file = src._command_from_file;
+    dst.@"default-profile" = if (src.@"default-profile") |reference| try alloc.dupeZ(u8, reference) else null;
+    dst._default_profile = if (src._default_profile) |profile| try profile.clone(alloc) else null;
     dst.@"ssh-config-hosts" = src.@"ssh-config-hosts";
     dst.@"profile-command" = try src.@"profile-command".clone(alloc);
     dst.@"profile-name" = try src.@"profile-name".clone(alloc);
@@ -48374,6 +48407,73 @@ test "win32 a palette theme preview keeps the running profile definitions until 
     try std.testing.expect(userProfileKeysChanged(&preview, &reloaded));
 }
 
+test "win32 a palette theme preview keeps the default-profile launch until a reload" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "preview-theme", .data = "background = #102030\n" });
+    const theme = try tmp.dir.realpathAlloc(alloc, "preview-theme");
+    defer alloc.free(theme);
+
+    const Launch = struct {
+        fn expect(config: *const configpkg.Config, line: []const u8, mode: []const u8) !void {
+            var clone = config.shallowClone(std.testing.allocator);
+            defer clone.deinit();
+            _ = (try applyDefaultProfileConfig(&clone)).?;
+            try std.testing.expectEqualStrings(line, clone._profile_launch.?.command_line);
+            try std.testing.expectEqualStrings(mode, clone.env.map.get("MODE").?);
+        }
+    };
+
+    // The running config: `default-profile = py`, resolved.
+    var running = try configpkg.Config.default(alloc);
+    defer running.deinit();
+    var running_args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+        .iterator = cli_args.sliceIterator(&.{ "--profile-command=py: old.exe", "--profile-env=py: MODE=old", "--default-profile=py" }),
+    };
+    try running.loadIter(alloc, &running_args);
+    try running.finalize();
+    try Launch.expect(&running, "old.exe", "old");
+
+    // The files read again for the preview: the same `default-profile`
+    // with its profile edited since, and one that names another profile.
+    inline for (.{
+        &[_][]const u8{ "--profile-command=py: new.exe", "--profile-env=py: MODE=new", "--default-profile=py" },
+        &[_][]const u8{ "--profile-command=py: old.exe", "--profile-env=py: MODE=old", "--profile-command=other: other.exe", "--default-profile=other" },
+    }) |edited| {
+        var preview = try configpkg.Config.default(alloc);
+        defer preview.deinit();
+        var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{ .iterator = cli_args.sliceIterator(edited) };
+        try preview.loadIter(alloc, &args);
+        try Host.finishPaletteThemeConfig(&preview, &running, theme);
+        try std.testing.expectEqual(@as(u8, 0x10), preview.background.r);
+        // A new tab runs the definition the lists hold: the running one.
+        try std.testing.expectEqualStrings("old.exe", preview.@"profile-command".get("py").?);
+        try std.testing.expectEqualStrings("py", preview.@"default-profile".?);
+        try Launch.expect(&preview, "old.exe", "old");
+        try std.testing.expect(!userProfileKeysChanged(&running, &preview));
+    }
+
+    // With no `default-profile` running, files that add one start nothing
+    // new before the reload either.
+    var plain = try configpkg.Config.default(alloc);
+    defer plain.deinit();
+    try plain.finalize();
+    var added = try configpkg.Config.default(alloc);
+    defer added.deinit();
+    var added_args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+        .iterator = cli_args.sliceIterator(&.{ "--profile-command=py: new.exe", "--default-profile=py" }),
+    };
+    try added.loadIter(alloc, &added_args);
+    try Host.finishPaletteThemeConfig(&added, &plain, theme);
+    try std.testing.expect(added._default_profile == null);
+    try std.testing.expect(added.command == null);
+    var clone = added.shallowClone(alloc);
+    defer clone.deinit();
+    try std.testing.expect(try applyDefaultProfileConfig(&clone) == null);
+}
+
 test "win32 a reload after run took the startup launch-layout does not bring it back" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -53770,6 +53870,109 @@ test "win32 a split or an elevated window of a default-profile pane needs no pro
     const listed_profile = (try app.elevatedWindowProfile(&listed, "PWSH.EXE", &temporary)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("pwsh.exe", listed_profile.key);
     try std.testing.expect((try app.elevatedWindowProfile(&listed, "cmd.exe", &temporary)) == null);
+}
+
+test "win32 a forwarded new window keeps the default-profile launch when a theme is set" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "window-theme", .data = "background = #102030\n" });
+    const theme = try tmp.dir.realpathAlloc(alloc, "window-theme");
+    defer alloc.free(theme);
+    const theme_arg = try std.fmt.allocPrint(alloc, "--theme={s}", .{theme});
+    defer alloc.free(theme_arg);
+
+    // The app config, with a theme: the forwarded arguments' `finalize`
+    // builds the window's config again from its replay steps.
+    var base = try configpkg.Config.default(alloc);
+    defer base.deinit();
+    var base_args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+        .iterator = cli_args.sliceIterator(&.{
+            theme_arg,
+            "--profile-command=py: cmd.exe /k py",
+            "--profile-env=py: MODE=profile",
+            "--profile-working-directory=py: D:\\pinned",
+            "--default-profile=py",
+        }),
+    };
+    try base.loadIter(alloc, &base_args);
+    try base.finalize();
+    try std.testing.expectEqual(@as(u8, 0x10), base.background.r);
+
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    app.core_app = &core_app;
+
+    inline for (.{
+        .{ &[_][:0]const u8{"--font-size=14"}, "D:\\pinned" },
+        // A directory the arguments carry wins over the profile's.
+        .{ &[_][:0]const u8{ "--font-size=14", "--working-directory=C:\\fwd" }, "C:\\fwd" },
+    }) |case| {
+        var config = base.shallowClone(alloc);
+        defer config.deinit();
+        const profile = (try app.applyNewWindowLaunch(&config, case[0])).?;
+        try std.testing.expectEqualStrings("user:py", profile.key);
+        try std.testing.expectEqual(@as(f32, 14), config.@"font-size");
+        try std.testing.expectEqual(@as(u8, 0x10), config.background.r);
+        try std.testing.expectEqualStrings("profile", config.env.map.get("MODE") orelse "");
+        try std.testing.expectEqualStrings("cmd.exe /k py", if (config._profile_launch) |launch| launch.command_line else "");
+        try std.testing.expectEqualStrings(case[1], switch (config.@"working-directory".?) {
+            .path => |path| path,
+            else => "",
+        });
+    }
+}
+
+test "win32 the picker follows a changed default-profile until a profile is chosen in it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var first: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &first, .register = true, .id = 1 }},
+    });
+    defer session.deinit();
+    defer testFreeHostProfiles(&app, &.{&first});
+    const keys = [_][]const u8{ "pwsh.exe", "cmd.exe", "git-bash" };
+
+    const Reload = struct {
+        const argv = [_][:0]const u8{"x.exe"};
+
+        fn run(host: *Host, default_key: []const u8, list_keys: []const []const u8) !void {
+            // `config_change`: a new `default-profile`, every list dropped.
+            host.app.config._default_profile = .{ .kind = .cmd, .key = default_key, .label = default_key, .command = .{ .direct = &argv } };
+            host.invalidateProfiles();
+            _ = try host.applyProfiles(.{ .profiles = try testProfileList(host.app.core_app.alloc, list_keys), .complete = true });
+        }
+        fn selected(host: *Host) []const u8 {
+            return host.selectedProfile().?.key;
+        }
+    };
+
+    try Reload.run(&first, "cmd.exe", &keys);
+    try std.testing.expectEqualStrings("cmd.exe", Reload.selected(&first));
+    // The choice is the default's, not the user's: nothing is stored for a
+    // new window to start on.
+    try std.testing.expect(first.selected_profile_key == null and app.launcher_profile_key == null);
+
+    try Reload.run(&first, "git-bash", &keys);
+    try std.testing.expectEqualStrings("git-bash", Reload.selected(&first));
+
+    // A profile chosen in the picker stays chosen across a reload.
+    _ = try first.setSelectedProfileIndex(0);
+    try Reload.run(&first, "cmd.exe", &keys);
+    try std.testing.expectEqualStrings("pwsh.exe", Reload.selected(&first));
+    try std.testing.expectEqualStrings("pwsh.exe", app.launcher_profile_key.?);
+
+    // Once that profile is gone from the list, the default is picked again.
+    try Reload.run(&first, "cmd.exe", &.{ "cmd.exe", "git-bash" });
+    try std.testing.expectEqualStrings("cmd.exe", Reload.selected(&first));
 }
 
 test "win32 a restored pane keeps its own profile over default-profile" {
