@@ -1617,6 +1617,19 @@ pub fn deactivateInspector(self: *Surface) void {
 /// True if the surface requires confirmation to quit. This should be called
 /// by apprt to determine if the surface should confirm before quitting.
 pub fn needsConfirmQuit(self: *Surface) bool {
+    return self.confirmQuitAnswer(true).?;
+}
+
+/// `needsConfirmQuit` for a caller that must not wait for the renderer
+/// mutex: null when another holder has it. The holder can be the calling
+/// thread itself, below a sent message (the copy path holds it across
+/// `EmptyClipboard`, which dispatches incoming sent messages), and the mutex
+/// is not recursive. Treat null as needing confirmation.
+pub fn needsConfirmQuitNoWait(self: *Surface) ?bool {
+    return self.confirmQuitAnswer(false);
+}
+
+fn confirmQuitAnswer(self: *Surface, comptime wait: bool) ?bool {
     // If the surface is in read-only mode, always require confirmation
     if (self.readonly) return true;
 
@@ -1629,7 +1642,9 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
-            self.renderer_state.mutex.lock();
+            if (wait) {
+                self.renderer_state.mutex.lock();
+            } else if (!self.renderer_state.mutex.tryLock()) return null;
             defer self.renderer_state.mutex.unlock();
             break :true !self.io.terminal.cursorIsAtPrompt();
         },

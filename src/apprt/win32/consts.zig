@@ -144,6 +144,7 @@ pub const WM_SETCURSOR = 0x0020;
 pub const WM_SETFOCUS = 0x0007;
 pub const WM_SETTINGCHANGE = 0x001A;
 pub const ENDSESSION_CLOSEAPP: usize = 0x00000001;
+pub const WM_QUERYENDSESSION = 0x0011;
 pub const WM_ENDSESSION = 0x0016;
 pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_SIZE = 0x0005;
