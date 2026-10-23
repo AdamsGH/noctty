@@ -135,6 +135,8 @@ Pane focus on `Alt+Arrow` is Windows-specific.
 | Close tab                   | `Ctrl+Shift+W`                      |
 | Undo / redo                 | `Ctrl+Shift+Z` / `Ctrl+Shift+Y`     |
 | Next / previous tab         | `Ctrl+Tab` / `Ctrl+Shift+Tab`       |
+| Go to tab 1-8               | `Alt+1` through `Alt+8`              |
+| Go to last tab              | `Alt+9`                             |
 | Split pane right            | `Ctrl+Shift+\`                      |
 | Split pane down             | `Ctrl+Shift+E`                      |
 | Move between panes          | `Alt+Arrow`                         |
