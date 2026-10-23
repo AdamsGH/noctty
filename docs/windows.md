@@ -722,13 +722,24 @@ package.
 ## Notifications and progress
 
 Desktop notifications use WinRT toasts when available and fall back to
-in-app banners when Windows notification policy, Focus Assist, app identity,
-or runtime availability prevents a toast. `desktop-notifications` gates every
+in-app banners when notifications are turned off for noctty or for the user,
+or when app identity or runtime availability prevents a toast. Focus Assist
+(Do not disturb) does not cause a banner: Windows files the toast in Action
+Center without showing it. `desktop-notifications` gates every
 toast, including command-finish toasts, which additionally need
 `notify-on-command-finish` and a `notify-on-command-finish-action` that
 includes `notify`, and [program status](#program-status-osc-7501) toasts.
-Command-finish and program status toasts focus the originating pane when
-clicked; OSC 9 and OSC 777 toasts are display-only.
+
+Every toast a terminal sends (OSC 9, OSC 777, command finished and program
+status) ends with a line that names its tab, `Tab 2: <tab title>`, or
+`Tab 2 of window 1: <tab title>` while more than one window is open. The tab
+title is that of the tab's focused pane, without bidirectional overrides,
+invisible characters or control characters, and cut to 64 bytes. An OSC 9
+notification, which has no title, is titled by its tab. Clicking the toast's
+popup focuses the pane that sent it: noctty restores its window if it is
+minimized, switches to its tab and pane, and asks Windows to bring the window
+forward, which Windows may refuse. Whether clicking an older entry in Action
+Center does the same has not been confirmed.
 
 Terminal progress reports map to Windows taskbar progress for the active
 surface in each host window when `progress-style` is enabled; with

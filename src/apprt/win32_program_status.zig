@@ -466,8 +466,10 @@ pub const max_shown_text_bytes = 240;
 
 /// Write `text` for display outside the terminal grid: without bidi
 /// controls and invisible formatting characters, so a program can't
-/// reorder or hide what the notification says, and with line and
-/// paragraph separators as spaces. Cuts at `max_bytes` on a codepoint
+/// reorder or hide what the notification says, and with control
+/// characters and line and paragraph separators as spaces (a tab title
+/// can hold controls; program status text never does). Cuts at
+/// `max_bytes` on a codepoint
 /// boundary and marks the cut with an ellipsis. Text that isn't valid
 /// UTF-8 is skipped byte by byte; the parser only lets valid UTF-8 through.
 pub fn writeSanitized(
@@ -491,7 +493,8 @@ pub fn writeSanitized(
         const bytes = text[i..][0..len];
         i += len;
         if (isHidden(cp)) continue;
-        const out: []const u8 = if (cp == 0x2028 or cp == 0x2029) " " else bytes;
+        const control = cp < 0x20 or (cp >= 0x7F and cp <= 0x9F);
+        const out: []const u8 = if (control or cp == 0x2028 or cp == 0x2029) " " else bytes;
         if (written + out.len > max_bytes) {
             try writer.writeAll(ellipsis);
             return;
@@ -943,6 +946,11 @@ test "sanitized text drops bidi controls and invisible characters" {
     w = .fixed(&buf);
     try writeSanitized(&w, "abc", 3);
     try testing.expectEqualStrings("abc", w.buffered());
+
+    // C0, DEL and C1 controls, which a tab title can hold.
+    w = .fixed(&buf);
+    try writeSanitized(&w, "a\tb\x07c\x7Fd\u{9B}e", 100);
+    try testing.expectEqualStrings("a b c d e", w.buffered());
 }
 
 test "status lines name the record and say what it needs" {
