@@ -38,12 +38,15 @@ the first with two tabs, the second of them split, the second with one tab):
   restartable-busy  confirm-close-surface = always: the declining owner is not
                     restartable.
   restartable-install-running
-                    another noctty's in-app Install is running Setup (the
-                    copy's update state names a staged installer whose file a
-                    shared-read handle holds, which refuses write access as a
-                    running image does): the owner agrees and is not
-                    restartable; once the handle is closed, it is again, and
-                    a read-only leftover installer does not stop it.
+                    another noctty's in-app Install is running Setup (a
+                    staged installer under the copy's updates\<version>
+                    whose file a shared-read handle holds, which refuses
+                    write access as a running image does): the owner agrees
+                    and is not restartable, also once the update state no
+                    longer names that installer (an update check with
+                    another feed clears it); once the handle is closed, it
+                    is again, and a read-only leftover installer does not
+                    stop it.
 These three only list (RmGetList) and send the query and end messages
 themselves; they never call RmShutdown.
 
@@ -520,7 +523,9 @@ foreach($name in $selected) {
             $held=$null
             try {
                 $p=$case.Process
-                $setup=Join-Path $Run "$name\staged-setup.exe"
+                $stage=Join-Path $case.Dir 'updates\1.3.999'
+                [void](New-Item -ItemType Directory -Force -Path $stage)
+                $setup=Join-Path $stage 'noctty-1.3.999-windows-x64-setup.exe'
                 Set-Content -LiteralPath $setup -Value 'not a program' -NoNewline
                 $state=[ordered]@{ staged_version='1.3.999'; staged_kind='installer'; staged_installer_path=$setup; staged_sha256='00' } | ConvertTo-Json -Compress
                 Set-Content -LiteralPath (Join-Path $case.Dir 'update-state.json') -Value $state -NoNewline -Encoding utf8NoBOM
@@ -528,6 +533,13 @@ foreach($name in $selected) {
                 $r.Queries=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
                 $r.Running=Restart-Settings $p
                 $r.ListedRunning=(Rm-Restartable $case @($p))[$p.Id]
+                [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                # Another feed's update check clears the staged record; it
+                # cannot delete the running file, and Setup still runs.
+                Set-Content -LiteralPath (Join-Path $case.Dir 'update-state.json') -Value '{}' -NoNewline -Encoding utf8NoBOM
+                $r.QueriesCleared=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.Cleared=Restart-Settings $p
+                $r.ListedCleared=(Rm-Restartable $case @($p))[$p.Id]
                 [void](Send-All $case $Msg.EndSession 0 $closeApp)
                 $held.Dispose(); $held=$null
                 # Setup has exited: the same owner registers again.
@@ -545,6 +557,7 @@ foreach($name in $selected) {
                 (Get-Item -LiteralPath $setup).IsReadOnly=$false
                 Check "${name}: every window agrees" (@($r.Queries | Where-Object { $_ -ne 1 }).Count -eq 0 -and $r.Queries.Count -eq 2) '1,1' ($r.Queries -join ',')
                 Check "${name}: and the owner is not restartable while that Setup runs" ($r.Running.Hr -eq $notFound -and $r.ListedRunning -eq $false) "$notFound, False" "$($r.Running.Hr), $($r.ListedRunning)"
+                Check "${name}: also once the update state no longer names it" ($r.Cleared.Hr -eq $notFound -and $r.ListedCleared -eq $false) "$notFound, False" "$($r.Cleared.Hr), $($r.ListedCleared)"
                 Check "${name}: once it has exited, the owner is restartable again" ($r.After.Hr -eq '0x00000000' -and $r.After.Flags -eq 11 -and $r.ListedAfter -eq $true) '0x00000000 / 11, True' "$($r.After.Hr) / $($r.After.Flags), $($r.ListedAfter)"
                 Check "${name}: a read-only leftover installer does not stop the restart" ($r.ReadOnly.Hr -eq '0x00000000' -and $r.ReadOnly.Flags -eq 11 -and $r.ListedReadOnly -eq $true) '0x00000000 / 11, True' "$($r.ReadOnly.Hr) / $($r.ReadOnly.Flags), $($r.ListedReadOnly)"
             } finally {
