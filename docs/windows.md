@@ -249,7 +249,8 @@ new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
 literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
 relative PATH entries such as `.`, still select programs relative to the pane.
 
-With `command` unset, a new tab runs the first of these that is found:
+With `command` and [`default-profile`](#default-profile-order-and-hidden-profiles)
+unset, a new tab runs the first of these that is found:
 
 1. `pwsh.exe` (PowerShell 7+) on `PATH`.
 2. Windows PowerShell, from the Windows system directory.
@@ -271,8 +272,8 @@ lists the executable a new tab runs. `noctty --safe-mode` always starts
 broke, and Command Prompt loads no profile (`/D` also skips the `AutoRun`
 command that a registry value or Clink can hang there). The profile
 picker, its dropdown check mark and a right or middle click on the new-tab
-button start on the profile this default runs; a `command` you set does not
-move that choice.
+button start on the profile this default runs, or on the one
+`default-profile` names; a `command` you set does not move that choice.
 
 Discovery also skips drive aliases that map to a folder, such as `subst` drives.
 In safe mode, right or middle click deliberately opens the plain Command Prompt
@@ -485,9 +486,12 @@ SSH entries run without shell integration, which is injected into a local
 shell and cannot apply to a remote session. Session restore does not reopen
 them: an SSH pane comes back as the default shell rather than dialing out
 unattended. SSH entries sort after the detected shells and your own
-[user profiles](#user-profiles); `NOCTTY_WIN32_PROFILE_ORDER` covers the
-detected shell profiles only. There is no bundled SSH client, secrets vault,
-or fleet/connection management.
+[user profiles](#user-profiles). `profile-order` can move any profile, an SSH
+entry included, and `profile-hidden` can take one out of the lists (see
+[Default profile, order and hidden profiles](#default-profile-order-and-hidden-profiles)).
+The older `NOCTTY_WIN32_PROFILE_ORDER` environment variable is used only when
+`profile-order` is unset, and orders the detected shell profiles only. There
+is no bundled SSH client, secrets vault, or fleet/connection management.
 
 ## User profiles
 
@@ -573,7 +577,8 @@ config-file = ?profiles.ghostty
 ```
 
 User profiles are listed after the detected local shells and before the SSH
-hosts, in the order of their first `profile-command` line. A session or a
+hosts, in the order of their first `profile-command` line, unless
+`profile-order` moves them (below). A session or a
 named layout remembers a pane's profile by its id (`user:<id>`), so renaming
 the label keeps it; changing the id makes a new profile, and a saved pane that
 named the old id comes back as the default shell, as a pane whose shell was
@@ -581,6 +586,65 @@ uninstalled does. A restored pane returns to the directory it was in. A tab or
 split that an automation command opens from a user profile pane keeps the
 command and environment that pane started with, even after a reload; an
 ordinary split reads the profile's current definition.
+
+### Default profile, order and hidden profiles
+
+```
+default-profile = vs18-cmd
+profile-order = vs18-cmd
+profile-order = pwsh
+profile-hidden = wsl:docker-desktop
+```
+
+`default-profile` names the profile a terminal runs when nothing else chose
+one, in place of the automatic shell above: the first window, a new tab
+(Ctrl+Shift+T), a new window, the quick terminal, a split of a pane that runs
+no profile, and a restored pane whose profile no longer exists. It brings the
+profile's command, its `profile-env` variables and its
+`profile-working-directory`; a profile without a directory of its own starts
+where `working-directory` and the `*-inherit-working-directory` settings say,
+as `command` does. The pane remembers the profile, so its splits and a
+restored session run it again, and the profile picker opens on it.
+
+`profile-order` lists profiles first in the picker and the palette, in the
+order of its lines, and `profile-hidden` takes profiles out of the picker, the
+palette, the [▾] menu, the taskbar jump list and the quick slots. A hidden
+profile still runs where something names it: `default-profile`, a restored
+session or layout, `new_window_elevated:<key>`, a split of a pane that runs
+it. A quick slot pinned to it keeps the pin but does not show it.
+
+All three take a profile by name: the id of a user profile (`vs18-cmd`, or
+`user:vs18-cmd`), a detected profile's key (`pwsh.exe`, `powershell.exe`,
+`cmd.exe`, `git-bash`, `wsl-default`, `wsl:<distribution>`, `ssh:<alias>`), or
+a name `NOCTTY_WIN32_PROFILE_ORDER` takes (`pwsh`, `git`, `cmd`, `wsl`, a
+distribution's own name). A bare word is a user profile's id first, so a user
+profile with the id `git` takes `git` from Git Bash. In `profile-order` and
+`profile-hidden` a name can stand for several profiles: `profile-hidden = wsl`
+hides every WSL profile. `default-profile` finds its profile without listing
+any: `wsl:Ubuntu` starts `wsl.exe -d Ubuntu` without asking WSL for its
+distributions, and `ssh:<alias>` starts `ssh.exe <alias>` without reading the
+SSH config. A `default-profile` that names no profile that can start here is
+reported as a config problem, and the automatic shell runs.
+`NOCTTY_WIN32_DEFAULT_PROFILE` still chooses where the picker starts when
+`default-profile` is unset, and `NOCTTY_WIN32_PROFILE_ORDER` still orders the
+detected shells when `profile-order` is unset.
+
+What a new terminal runs, highest first:
+
+| Rank | Setting                   | Where it applies                                                                                                                                                                                                                                                         |
+| ---- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | `initial-command`, `-e`   | The first window of the launch only.                                                                                                                                                                                                                                     |
+| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone falls through to rank 4 or below, in its saved directory.                                                                                                                            |
+| 3    | A profile you choose      | The picker, the palette, a quick slot, the [▾] menu, `new_window_elevated:<key>`, and a tab or split an automation command opens from a pane (it keeps that pane's launch).                                                                                              |
+| 4    | `command`                 | From any config file or the command line. Set in a file together with `default-profile`, it wins and the unused `default-profile` is reported as a config problem; `--command` on the command line wins without one, and `--command=` (empty) undoes a file's `command`. |
+| 5    | `default-profile`         | Everything else: a new tab, a new window, the quick terminal, a split of a pane that runs no profile.                                                                                                                                                                    |
+| 6    | The automatic shell       | PowerShell 7, else Windows PowerShell, else Command Prompt.                                                                                                                                                                                                              |
+
+Safe mode reads none of your config, so it never runs a default profile.
+`default-profile` on the command line also wins over a `default-profile` line
+in a file included with `config-file`, which is otherwise read after the
+command line. None of the three is accepted from a second `noctty` that hands
+its arguments to a running one (single-instance forwarding).
 
 Limits:
 
@@ -608,7 +672,13 @@ Limits:
   interactive PowerShell line. A line with `-Command` or `-File`, such as the
   Developer PowerShell above, runs as written without it, as in Windows
   Terminal. A cmd.exe line gets cmd's integration.
-- User profiles are not in the taskbar jump list yet.
+- A user profile's taskbar jump-list entry names the profile
+  (`--command= --initial-command= --default-profile=user:<id>`) rather than
+  carrying its command and variables, so the new process reads the profile
+  from your config files. A profile defined only in a file the running noctty
+  was given with `--config-file` is not known to it, and a `command` line in a
+  file included with `config-file` replaces the empty `--command=` and runs
+  instead, as it does for every jump-list entry.
 - The Settings window does not edit these lines; it leaves them as they are
   when it saves.
 
@@ -789,10 +859,12 @@ become a window.
   `%LOCALAPPDATA%\noctty\jump-list-recents.json`. To clear them, close
   noctty, delete that file, and start noctty once so Windows receives the
   empty list.
-- Profiles: the detected shell profiles. Selecting one launches noctty with
-  that profile's command. [User profiles](#user-profiles) are not listed: a
-  jump-list entry is stored on disk and would have to carry the profile's
-  environment.
+- Profiles: the profiles the picker shows (`profile-hidden` ones are left
+  out). Selecting a detected one launches noctty with that profile's command.
+  A [user profile](#user-profiles)'s entry names the profile instead
+  (`--default-profile=user:<id>`): a jump-list entry is stored on disk and can
+  roam with your Windows profile, so it never holds the profile's environment
+  variables, and the new process reads them from your config.
 
 From 1.3.133 a portable copy builds no jump list and writes no
 `jump-list-recents.json`, so a machine with only a portable copy gets none;

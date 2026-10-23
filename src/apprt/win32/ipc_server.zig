@@ -1993,6 +1993,10 @@ test "win32 new-window IPC refuses the user profile keys" {
         "--profile-working-directory=x: C:\\",
         "--profile-env=x: PATH=C:\\evil",
         "--elevated-profile-env=PATH=C:\\evil",
+        // Which profile a new window runs, and which ones the lists show.
+        "--default-profile=x",
+        "--profile-order=x",
+        "--profile-hidden=pwsh.exe",
     }) |arg| {
         try std.testing.expect(!newWindowIpcArgumentsAccepted(&.{arg}));
     }

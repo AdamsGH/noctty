@@ -21,8 +21,9 @@ const formatterpkg = @import("formatter.zig");
 pub const max_id_len = 64;
 
 /// The keys of the profiles noctty detects. A user id may not reuse one: the
-/// stored key of a user profile is `user:<id>`, but the order and default
-/// references of part 2 accept a bare word, which must name one profile.
+/// stored key of a user profile is `user:<id>`, but `default-profile`,
+/// `profile-order` and `profile-hidden` take a bare word, which must name one
+/// profile.
 pub const reserved_ids = [_][]const u8{
     "pwsh.exe",
     "powershell.exe",
