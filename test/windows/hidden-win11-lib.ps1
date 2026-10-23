@@ -279,6 +279,9 @@ public static class HiddenWin {
     public sealed class DesktopWindowObservation {
         public int ProcessId, ThreadId;
         public bool CompletedAttempt;
+        // Recorded on the private desktop only: the owned window's class and visibility.
+        public string ClassName;
+        public bool Visible;
     }
     // EnumWindows sees the calling thread's desktop. Call only from the outer Default driver.
     // No window titles or unrelated window metadata are retained.
@@ -323,7 +326,7 @@ public static class HiddenWin {
                 bool complete = EnumDesktopWindows(desktop, (h, p) => {
                     int id; int tid = GetWindowThreadProcessId(h, out id);
                     if (tid == 0) { ownerFailed = true; ownerError = Marshal.GetLastWin32Error(); return false; }
-                    if (ids.Contains(id)) rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid });
+                    if (ids.Contains(id)) rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid, ClassName = Class(h), Visible = IsWindowVisible(h) });
                     return true;
                 }, IntPtr.Zero);
                 int error = ownerFailed ? ownerError : Marshal.GetLastWin32Error();
@@ -408,7 +411,13 @@ function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $Re
     if ($RequiredWindowPid -gt 0 -and ($ids -notcontains $RequiredWindowPid -or @($rows | Where-Object { $_.ProcessId -eq $RequiredWindowPid -and $_.CompletedAttempt -eq $true }).Count -eq 0)) {
         throw 'Window startup required process window is absent; further input is blocked.'
     }
-    if ($NoWindows -and $rows.Count) { throw 'Hidden desktop unexpected private job window; further launches are blocked.' }
+    # noctty's lifecycle window is top-level so that Restart Manager can ask a process with no other
+    # window to close, and it is never shown. Windows gives the thread that owns a top-level window its
+    # default IME windows (class IME, and MSCTFIME UI under Text Services), also hidden; a message-only
+    # window gets none. -NoWindows tolerates exactly those classes, and only while hidden.
+    $toleratedHidden = @('noctty.win32.lifecycle', 'IME', 'MSCTFIME UI')
+    $unexpectedRows = @($rows | Where-Object { -not ($toleratedHidden -ccontains $_.ClassName -and $_.Visible -eq $false) })
+    if ($NoWindows -and $unexpectedRows.Count) { throw 'Hidden desktop unexpected private job window; further launches are blocked.' }
 }
 
 # The child cannot launch noctty until the Default observer validates this receipt.
@@ -515,18 +524,9 @@ function Assert-MeasureAumid([string] $Exe, [switch] $AllowProductAumid) {
     }
 }
 
-# The measurement AUMID does not isolate Server.register's real COM CLSID. An idle server
-# could receive the user's live console handoff while noctty is their delegated terminal.
-# Read only that one selection and fail closed on an unreadable key; there is no bypass.
-function Assert-EmbeddingDelegationSafe {
-    try { $selection = Get-ItemProperty -LiteralPath 'HKCU:\Console\%%Startup' -ErrorAction Stop }
-    catch [Management.Automation.ItemNotFoundException] { return }
-    $terminal = [guid]::Empty
-    if ([guid]::TryParse([string]$selection.DelegationTerminal, [ref]$terminal) -and
-        $terminal -eq [guid]'33368C6F-D328-410C-B225-26DC9F12C728') {
-        throw 'Embedding launch blocked: noctty is the selected delegated terminal. The measurement AUMID does not isolate the real COM handoff CLSID; use a sandbox with independent console delegation.'
-    }
-}
+# Assert-EmbeddingDelegationSafe, the -Embedding delegation guard, has one copy, shared with
+# hidden-win11-local-lib.ps1.
+. (Join-Path $PSScriptRoot 'hidden-win11-embedding-guard.ps1')
 
 function Copy-PortableBin([string] $Source, [string] $Destination) {
     [void](New-Item -ItemType Directory -Path $Destination)

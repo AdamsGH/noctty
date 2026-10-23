@@ -248,8 +248,10 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class TYPE_NAME {
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
-    public class DesktopWindowObservation { public int ProcessId, ThreadId; public bool CompletedAttempt; }
+    public class DesktopWindowObservation { public int ProcessId, ThreadId; public bool CompletedAttempt; public string ClassName; public bool Visible; }
     public static bool OpenFails, EnumFails, OwnerFails, CloseFails;
+    static string Class(IntPtr h) { return "class-" + h.ToInt32(); }
+    static bool IsWindowVisible(IntPtr h) { return h.ToInt32() == 2; }
     public static int Opens, Enums, Closes;
     static int[] JobProcessIds(IntPtr job) { if (job != new IntPtr(7)) throw new Exception("wrong job"); return new[] { 41, 42 }; }
     static IntPtr OpenDesktopW(string name, uint flags, bool inherit, uint access) {
@@ -279,9 +281,11 @@ METHOD
         if ([bool]$failure -ne [bool]$fixture.Api -or ($failure -and ($failure.Message -cne $fixture.Api -or $failure.NativeErrorCode -ne $fixture.Code))) { throw 'Private desktop API failure changed or was accepted.' }
         if ($type::Opens -ne 1 -or $type::Closes -ne [int](-not $fixture.OpenFails)) { throw 'Private desktop read handle was leaked.' }
         if (-not $failure -and ($type::Enums -ne 1 -or $rows.Count -ne 2 -or @($rows | Where-Object { $_.ProcessId -ne 42 -or -not $_.CompletedAttempt }).Count)) { throw 'Private desktop oracle omitted actual windows or accepted wrong PID.' }
+        if (-not $failure -and ($rows[0].ClassName -cne 'class-1' -or $rows[0].Visible -or $rows[1].ClassName -cne 'class-2' -or -not $rows[1].Visible)) { throw 'Private desktop oracle lost the class or visibility of an owned window.' }
         if ($fixture.Cleanup -and ($failure.Data['CleanupApi'] -cne 'CloseDesktop' -or $failure.Data['CleanupCode'] -ne 6)) { throw 'Private desktop oracle lost secondary cleanup error.' }
     }
 }
+Assert-HiddenMutation 'private native visibility not recorded' $privateWindows ($privateWindows.Replace('Visible = IsWindowVisible(h)', 'Visible = false')) ${function:Test-PrivateWindowNative}
 Assert-HiddenMutation 'private native wrong PID included' $privateWindows ($privateWindows.Replace('if (ids.Contains(id))', 'if (true)')) ${function:Test-PrivateWindowNative}
 Assert-HiddenMutation 'private native read handle inheritable' $privateWindows ($privateWindows.Replace('OpenDesktopW(desktopName, 0, false, 0x0001)', 'OpenDesktopW(desktopName, 0, true, 0x0001)')) ${function:Test-PrivateWindowNative}
 Assert-HiddenMutation 'private native errors ignored' $privateWindows ($privateWindows.Replace('throw failure;', '')) ${function:Test-PrivateWindowNative}
@@ -319,6 +323,8 @@ public static class TYPE_NAME {
     }
     static bool EnumWindows(EnumWindow cb, IntPtr state) { return RunEnum(cb, state); }
     static bool EnumDesktopWindows(IntPtr h, EnumWindow cb, IntPtr state) { return RunEnum(cb, state); }
+    static string Class(IntPtr h) { return "fixture"; }
+    static bool IsWindowVisible(IntPtr h) { return false; }
 METHODS
 }
 '@
@@ -597,6 +603,9 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         @{ WrongCurrent = $true; Blocked = $true }, @{ BadName = $true; Blocked = $true }
         @{ NoWindows = $true; Blocked = $true }, @{ Empty = $true; NoWindows = $true }
         @{ Stale = $true }, @{ Stale = $true; Required = 42; Blocked = $true }, @{ Stale = $true; NoWindows = $true; Blocked = $true }
+        @{ Class = 'noctty.win32.lifecycle'; NoWindows = $true }, @{ Class = 'noctty.win32.lifecycle'; Visible = $true; NoWindows = $true; Blocked = $true }
+        @{ Class = 'IME'; NoWindows = $true }, @{ Class = 'MSCTFIME UI'; NoWindows = $true }, @{ Class = 'IME'; Visible = $true; NoWindows = $true; Blocked = $true }
+        @{ Class = 'noctty.win32.host'; NoWindows = $true; Blocked = $true }
         @{ Native = 'OpenDesktopW'; Code = 5; Blocked = $true }
         @{ Native = 'EnumDesktopWindows'; Code = 170; Blocked = $true }
         @{ Native = 'GetWindowThreadProcessId'; Code = 1400; Blocked = $true }
@@ -621,7 +630,8 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         }
         if ($fixture.Observed) { [HiddenDesktopContract]::Failure.Data['ObservedWindows'] = @(@{ ProcessId = 42; ThreadId = 123 }, @{ ProcessId = 'secret'; ThreadId = 'secret' }) }
         [HiddenDesktopContract]::Current = if ($fixture.WrongCurrent) { 'Default' } else { $name }
-        [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{ ProcessId = $(if ($fixture.WrongPid) { 99 } else { 42 }); ThreadId = $(if ($fixture.ZeroTid) { 0 } else { 123 }); CompletedAttempt = -not $fixture.Stale } })
+        [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{ ProcessId = $(if ($fixture.WrongPid) { 99 } else { 42 }); ThreadId = $(if ($fixture.ZeroTid) { 0 } else { 123 }); CompletedAttempt = -not $fixture.Stale
+            ClassName = $fixture.Class; Visible = [bool]$fixture.Visible } })
         $blocked = $false
         try { Assert-HiddenDesktop -Job ([IntPtr]7) -DesktopName $(if ($fixture.BadName) { 'Default' } else { $name }) -ReceiptPath 'unused.jsonl' -RequiredWindowPid ([int]$fixture.Required) -NoWindows:([bool]$fixture.NoWindows) } catch { $blocked = $true; if ($fixture.Required -and $_.Exception.Message.StartsWith('Hidden desktop')) { throw 'Missing readiness window must remain an ordinary startup failure.' } }
         if ($blocked -ne [bool]$fixture.Blocked -or $receipts.Count -ne 1 -or $receipts[0].Contains('secret')) { throw 'Private desktop oracle lost failure rejection or sanitized receipt.' }
@@ -647,7 +657,9 @@ Assert-HiddenMutation 'private wrong PID accepted' $desktopAssertion ($desktopAs
 Assert-HiddenMutation 'private wrong self desktop accepted' $desktopAssertion ($desktopAssertion.Replace('[HiddenDesktopContract]::CurrentDesktopName() -cne $DesktopName', '$false')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private missing ready window accepted' $desktopAssertion ($desktopAssertion.Replace('$RequiredWindowPid -gt 0 -and', '$false -and')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private stale ready window accepted' $desktopAssertion ($desktopAssertion.Replace(' -and $_.CompletedAttempt -eq $true', '')) ${function:Test-HiddenDesktopAssertion}
-Assert-HiddenMutation 'private idle window accepted' $desktopAssertion ($desktopAssertion.Replace('$NoWindows -and $rows.Count', '$false')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private idle window accepted' $desktopAssertion ($desktopAssertion.Replace('$NoWindows -and $unexpectedRows.Count', '$false')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private visible lifecycle window accepted' $desktopAssertion ($desktopAssertion.Replace(' -and $_.Visible -eq $false', '')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private lifecycle exemption covers every class' $desktopAssertion ($desktopAssertion.Replace("`$toleratedHidden -ccontains `$_.ClassName", '$true')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'desktop receipt removed' $desktopAssertion ($desktopAssertion.Replace('Add-Content -LiteralPath $ReceiptPath', 'Out-Null')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private native receipt code lost' $desktopAssertion ($desktopAssertion.Replace('$errorCode = $failure.NativeErrorCode', '$errorCode = $null')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private arbitrary native label disclosed' $desktopAssertion ($desktopAssertion.Replace('$nativeStages -ccontains $failure.Message', '$true')) ${function:Test-HiddenDesktopAssertion}
@@ -1277,7 +1289,9 @@ Assert-HiddenMutation 'PowerShell wrong readiness PID accepted' $promptWait ($pr
 Assert-HiddenMutation 'PowerShell readiness without forwarded OSC accepted' $promptWait ($promptWait.Replace('$ready.CwdOscForwarded -eq $true', '$true')) ${function:Test-PowerShellPromptWait}
 Assert-HiddenMutation 'PowerShell readiness without history isolation accepted' $promptWait ($promptWait.Replace("`$ready.HistorySaveStyle -ceq 'SaveNothing'", '$true')) ${function:Test-PowerShellPromptWait}
 
-$delegationGuard = Get-HiddenFunction $hiddenLibText 'Assert-EmbeddingDelegationSafe'
+# The -Embedding delegation guard has one copy, which both hidden libraries dot-source.
+$embeddingGuardText = Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-embedding-guard.ps1') -Raw)
+$delegationGuard = Get-HiddenFunction $embeddingGuardText 'Assert-EmbeddingDelegationSafe'
 function Test-EmbeddingDelegationGuard([string] $Code) {
     . ([scriptblock]::Create($Code))
     foreach ($value in @($null, '', '{11111111-1111-1111-1111-111111111111}', '{33368c6f-d328-410c-b225-26dc9f12c728}', '33368C6F-D328-410C-B225-26DC9F12C728', 'missing-key', 'unreadable')) {
@@ -1301,6 +1315,36 @@ function Test-EmbeddingGuardCalls([string] $Code) {
         $Code -notmatch '(?m)^Assert-EmbeddingDelegationSafe\r?\n\$started = Start-HiddenNoctty') { throw 'Embedding launch lost the entry/prelaunch delegation guard.' }
 }
 Assert-HiddenMutation 'delegation guard call removed' $embeddingText ($embeddingText -replace '(?m)^Assert-EmbeddingDelegationSafe\r?\n', '') ${function:Test-EmbeddingGuardCalls}
+Assert-HiddenMutation 'unreadable delegation key accepted' $delegationGuard ($delegationGuard.Replace('catch [Management.Automation.ItemNotFoundException] { return }', 'catch { return }')) ${function:Test-EmbeddingDelegationGuard}
+
+# Every harness that starts -Embedding gets the guard from that one file: no private copy that
+# no fixture above exercises.
+$localLibText = Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-local-lib.ps1') -Raw)
+$restartManagerText = Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-restart-manager.ps1') -Raw)
+function Test-DelegationGuardSource([string] $Code) {
+    if ($Code -notmatch "(?m)^\. \(Join-Path \`$PSScriptRoot 'hidden-win11-embedding-guard\.ps1'\)\r?$" -or
+        $Code -match '(?im)^\s*function\s+[\w-]*Delegation') { throw 'A hidden library lost the shared delegation guard or carries a copy of its own.' }
+}
+foreach ($libText in @($hiddenLibText, $localLibText)) {
+    Assert-HiddenMutation 'shared delegation guard not dot-sourced' $libText ($libText -replace "(?m)^\. \(Join-Path \`$PSScriptRoot 'hidden-win11-embedding-guard\.ps1'\)\r?\n", '') ${function:Test-DelegationGuardSource}
+}
+# The Restart Manager harness's embedding-idle case runs by default: the guard runs before the
+# driver starts whenever that case is selected, right before the only -Embedding launch, and the
+# harness defines no guard of its own.
+function Test-RestartManagerGuardCalls([string] $Code) {
+    $entry = [regex]::Match($Code, "(?m)^if\(\`$requestedCases -contains 'embedding-idle'\) \{ Assert-EmbeddingDelegationSafe \}\r?$")
+    $driver = $Code.IndexOf('Invoke-LocalHiddenDriver')
+    $launches = @([regex]::Matches($Code, '(?m)^.*\bStart-Case\b[^\r\n]*\s-Embedding\b'))
+    $guarded = @([regex]::Matches($Code, '(?m)^\s*Assert-EmbeddingDelegationSafe\r?\n.*\bStart-Case\b[^\r\n]*\s-Embedding\b'))
+    if (-not $entry.Success -or $driver -lt 0 -or $entry.Index -gt $driver -or
+        $Code -notmatch "(?m)^\`$requestedCases=if\(\`$Cases\) \{[^\r\n]*\} else \{ @\('embedding-idle'\) \}\r?$" -or
+        $launches.Count -lt 1 -or $guarded.Count -ne $launches.Count -or
+        $Code -match '(?im)^\s*function\s+[\w-]*Delegation') { throw 'The Restart Manager harness lost its entry or prelaunch delegation guard, or carries a copy of its own.' }
+}
+Assert-HiddenMutation 'Restart Manager entry delegation guard removed' $restartManagerText ($restartManagerText -replace "(?m)^if\(\`$requestedCases -contains 'embedding-idle'\) \{ Assert-EmbeddingDelegationSafe \}\r?\n", '') ${function:Test-RestartManagerGuardCalls}
+Assert-HiddenMutation 'Restart Manager entry guard skipped by default' $restartManagerText ($restartManagerText.Replace("else { @('embedding-idle') }", 'else { @() }')) ${function:Test-RestartManagerGuardCalls}
+Assert-HiddenMutation 'Restart Manager prelaunch delegation guard removed' $restartManagerText ($restartManagerText -replace '(?m)^\s*Assert-EmbeddingDelegationSafe\r?\n(?=.*\bStart-Case\b[^\r\n]*\s-Embedding\b)', '') ${function:Test-RestartManagerGuardCalls}
+Assert-HiddenMutation 'Restart Manager private delegation guard' $restartManagerText ($restartManagerText -replace '(?m)^(\$requestedCases=)', "function Assert-RmEmbeddingDelegationSafe { }`n`$1") ${function:Test-RestartManagerGuardCalls}
 
 $requiredProfileLoop = [regex]::Match($profileText, '(?ms)^foreach \(\$key in \$Profile\).*?^}').Value
 $requiredProfileForwarding = [regex]::Match($profileText, '(?m)^    if \(\$RequireAll\)[^\r\n]*').Value
