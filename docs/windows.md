@@ -1396,9 +1396,9 @@ Setup (run by hand, by WinGet or by Chocolatey) asks a running noctty to close
 through Windows Restart Manager before it replaces the files. noctty agrees
 when quitting would ask nothing: it saves every window, tab and split, as
 `quit` does, and closes. The process that owns the saved session also asks
-Windows to let Setup start it again when Setup finishes, with the same
-`--config-file` and `--class` it was started with, and that start restores
-the session. Another noctty process closes and is not started again; the
+Windows to let Setup start it again when Setup finishes, with the last
+`--config-file` and the `--class` it was started with (no other arguments,
+and no earlier `--config-file`), and that start restores the session. Another noctty process closes and is not started again; the
 session owner brings the session back. Setup starts noctty before its last
 page, so in the setup wizard, leaving **Launch noctty** checked there opens
 one more window. Setup's restart of noctty itself has not been tried on a real

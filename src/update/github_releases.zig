@@ -1076,21 +1076,43 @@ fn installerImageInUse(path: []const u8) bool {
     return false;
 }
 
-/// Whether the staged installer is running now, which is how the in-app
-/// Install runs Setup. The state is the user's, so this sees an Install that
-/// any noctty process started. False when the state cannot be read. Only a
-/// sharing violation on a write open counts, which is what a mapped image
-/// gives: unlike `installerImageInUse`, a read-only file or a permission
-/// failure does not (Zig's `OpenFile` reports both as `AccessDenied`, hence
-/// kernel32). The updater's own short verification opens, which share reads
-/// only, also read as running, as does a staged installer the user started
-/// by hand.
+/// Whether an installer staged by the updater is running now, which is how
+/// the in-app Install runs Setup. The stage directory is the user's, so this
+/// sees an Install that any noctty process started. It looks at every `.exe`
+/// directly inside a version directory under `updates`, not at the path the
+/// state records: another process may clear or replace that record while
+/// Setup runs (an update check with another feed, a new release staged), and
+/// a running image cannot be deleted, so the file stays where it was staged.
+/// Only a sharing violation on a write open counts, which is what a mapped
+/// image gives: a read-only file or a permission failure does not (Zig's
+/// `OpenFile` reports all of them as `AccessDenied`, hence kernel32, and
+/// unlike `installerImageInUse`). False when the directory cannot be read.
+/// The updater's own short verification opens, which share reads only, also
+/// read as running, as does a staged installer the user started by hand.
 pub fn stagedInstallerRunning(alloc: Allocator, state_path: []const u8) bool {
     if (builtin.os.tag != .windows) return false;
-    var state = loadState(alloc, state_path) catch return false;
-    defer state.deinit(alloc);
-    if (state.staged_kind != .installer) return false;
-    const path = state.staged_installer_path orelse return false;
+    const state_dir = std.fs.path.dirname(state_path) orelse return false;
+    const updates_dir = std.fs.path.join(alloc, &.{ state_dir, "updates" }) catch return false;
+    defer alloc.free(updates_dir);
+    var updates = std.fs.openDirAbsolute(updates_dir, .{ .iterate = true }) catch return false;
+    defer updates.close();
+    var versions = updates.iterate();
+    while (versions.next() catch return false) |version| {
+        if (version.kind != .directory) continue;
+        var stage = updates.openDir(version.name, .{ .iterate = true }) catch continue;
+        defer stage.close();
+        var files = stage.iterate();
+        while (files.next() catch null) |file| {
+            if (file.kind != .file or !std.ascii.endsWithIgnoreCase(file.name, ".exe")) continue;
+            const path = std.fs.path.join(alloc, &.{ updates_dir, version.name, file.name }) catch return false;
+            defer alloc.free(path);
+            if (writeOpenSharingViolation(alloc, path)) return true;
+        }
+    }
+    return false;
+}
+
+fn writeOpenSharingViolation(alloc: Allocator, path: []const u8) bool {
     const windows = std.os.windows;
     const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
     defer alloc.free(path_w);
@@ -3946,7 +3968,7 @@ test "a start while Setup is still running leaves the request for a later start"
     try std.testing.expect(std.mem.indexOf(u8, message, "did not finish installing") != null);
 }
 
-test "the staged installer reads as running only while its image is in use" {
+test "a staged installer reads as running only while its image is in use" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3955,42 +3977,59 @@ test "the staged installer reads as running only while its image is in use" {
     defer alloc.free(root);
     const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
     defer alloc.free(state_path);
-    try tmp.dir.writeFile(.{ .sub_path = "setup.exe", .data = "setup" });
-    const installer_path = try std.fs.path.join(alloc, &.{ root, "setup.exe" });
-    defer alloc.free(installer_path);
 
-    // No state, and no staged installer.
+    // No stage directory.
     try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
-    var state: State = .{
-        .staged_version = try alloc.dupe(u8, "1.3.200"),
-        .staged_kind = .installer,
-        .staged_installer_path = try alloc.dupe(u8, installer_path),
-        .staged_sha256 = try alloc.dupe(u8, "00"),
-    };
-    defer state.deinit(alloc);
-    try saveState(state_path, &state);
+
+    const name = "noctty-1.3.200-windows-x64-setup.exe";
+    try tmp.dir.makePath("updates/1.3.200/backup");
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.200/" ++ name, .data = "setup" });
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.200/noctty-1.3.200-windows-x64-portable.zip", .data = "zip" });
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.200/backup/noctty.exe", .data = "old" });
+    const installer_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.200", name });
+    defer alloc.free(installer_path);
     try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+
+    // Neither a portable archive nor a portable backup is a Setup.
+    inline for (.{ "noctty-1.3.200-windows-x64-portable.zip", "backup\\noctty.exe" }) |other| {
+        const other_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.200", other });
+        defer alloc.free(other_path);
+        var held = try openLockedInstaller(other_path);
+        defer held.close();
+        try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+    }
 
     // Running, as the read-only-share open stands in for a mapped image
-    // (see "a start while Setup is still running ..."), with or without a
-    // recorded request: the request is written after Setup has started.
+    // (see "a start while Setup is still running ..."). It stays running
+    // after the state stops naming it: an update check with another feed
+    // clears the staged record, and cannot delete the running file.
     {
+        var state: State = .{
+            .release_feed_url = try alloc.dupe(u8, "https://example.invalid/a"),
+            .staged_version = try alloc.dupe(u8, "1.3.200"),
+            .staged_kind = .installer,
+            .staged_installer_path = try alloc.dupe(u8, installer_path),
+            .staged_sha256 = try alloc.dupe(u8, "00"),
+        };
+        defer state.deinit(alloc);
+        try saveState(state_path, &state);
         var running = try openLockedInstaller(installer_path);
         defer running.close();
         try std.testing.expect(stagedInstallerRunning(alloc, state_path));
-        // A staged portable update has no Setup.
-        state.staged_kind = .portable;
-        try saveState(state_path, &state);
-        try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
-        state.staged_kind = .installer;
-        try saveState(state_path, &state);
+        try std.testing.expect(try invalidateForeignFeedState(alloc, state_path, &state, "https://example.invalid/b"));
+        var cleared = try loadState(alloc, state_path);
+        defer cleared.deinit(alloc);
+        try std.testing.expect(cleared.staged_installer_path == null);
+        try std.testing.expect(cleared.staged_kind == null);
+        try std.fs.accessAbsolute(installer_path, .{});
+        try std.testing.expect(stagedInstallerRunning(alloc, state_path));
     }
     try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
 
     // A read-only leftover refuses write access too, but is not running:
     // an unrelated upgrade must not read it as an Install under way.
     {
-        var file = try tmp.dir.openFile("setup.exe", .{ .mode = .read_write });
+        var file = try std.fs.openFileAbsolute(installer_path, .{ .mode = .read_write });
         defer file.close();
         try file.setPermissions(.{ .inner = .{ .attributes = std.os.windows.FILE_ATTRIBUTE_READONLY } });
         defer file.setPermissions(.{ .inner = .{ .attributes = std.os.windows.FILE_ATTRIBUTE_NORMAL } }) catch {};
@@ -3998,13 +4037,10 @@ test "the staged installer reads as running only while its image is in use" {
         try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
     }
 
-    // A mapped image: this test runner's own.
+    // A mapped image gives the same violation: this test runner's own.
     const self_exe = try std.fs.selfExePathAlloc(alloc);
     defer alloc.free(self_exe);
-    alloc.free(state.staged_installer_path.?);
-    state.staged_installer_path = try alloc.dupe(u8, self_exe);
-    try saveState(state_path, &state);
-    try std.testing.expect(stagedInstallerRunning(alloc, state_path));
+    try std.testing.expect(writeOpenSharingViolation(alloc, self_exe));
 }
 
 test "a start leaves a portable apply request to the portable recovery" {

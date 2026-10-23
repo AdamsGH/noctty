@@ -30593,7 +30593,7 @@ const restart_flags: DWORD = 0x1 | 0x2 | 0x8;
 
 /// kernel32's restart registration, and whether another noctty's in-app
 /// Install is running Setup. A test build defaults to stand-ins that register
-/// nothing and read no update state, so no test makes the test runner
+/// nothing and look at no update stage, so no test makes the test runner
 /// restartable or reads the user's profile.
 const RestartApi = struct {
     register: *const fn (?LPCWSTR, DWORD) callconv(.winapi) windows.HRESULT =
