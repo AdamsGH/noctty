@@ -1547,10 +1547,12 @@ which still gets its empty reply.
 
 With bracketed paste off, or in a read-only pane, nothing is sent and the paste
 action counts as not performed. The default Ctrl+Shift+V binding is
-`performable`, so on a clipboard without text it still reaches the program as
-a key. With bracketed paste on, in a writable pane, it no longer does: the
-empty paste consumes it, as in Windows Terminal. A program that exits without turning bracketed paste off leaves the
-shell receiving the empty paste on such a clipboard.
+`performable`, so on a clipboard without text, in a writable pane with
+bracketed paste off, it still reaches the program as a key; a read-only pane
+discards the key, as it discards all input. With bracketed paste on, in a
+writable pane, the key no longer reaches the program: the empty paste consumes
+it, as in Windows Terminal. A program that exits without turning bracketed
+paste off leaves the shell receiving the empty paste on such a clipboard.
 
 ## Quick terminal and global hotkeys
 
