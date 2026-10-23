@@ -76,6 +76,27 @@ $chocolateyIconUrl = "https://noctty.com/assets/favicon.svg"
 $packageDescription = @"
 noctty is a Windows terminal emulator that reuses Ghostty's terminal core under a native Win32 front end.
 "@.Trim()
+# The Chocolatey page shows the description as Markdown, so it carries the notes a
+# user needs before installing: the signing certificate, PATH and updates.
+$chocolateyDescription = @'
+noctty is a Windows terminal emulator that reuses Ghostty's terminal core under a native Win32 front end. It requires Windows 10 version 1809 or later, or Windows 11, on __ARCHITECTURES__.
+
+### Features
+
+* Tabs and splits, with session restore of windows, tabs, splits and working directories (running programs are not restored)
+* A shell picker for PowerShell, cmd, Git Bash, and WSL distributions
+* A command palette
+* Most Ghostty options and themes work as they are
+* No telemetry; noctty uploads no crash reports (Windows Error Reporting follows your Windows settings)
+
+### Package Notes
+
+* The installer is signed with a self-signed certificate rather than one from a public certificate authority. This package checks each download against the SHA-256 published with the release.
+* The installer does not add noctty to PATH.
+* noctty checks GitHub Releases for updates and never installs one on its own: by default its notice opens the release page. Update with `choco upgrade noctty`, run from a terminal other than noctty, so Chocolatey's version record stays right. Set `auto-update = off` in the config to turn the check off.
+'@.Trim()
+# Name only the architectures this package carries installers for.
+$chocolateyDescription = $chocolateyDescription.Replace('__ARCHITECTURES__', (($Architectures | ForEach-Object { if ($_ -eq 'arm64') { 'ARM64' } else { $_ } }) -join ' or '))
 
 function Reset-Directory {
     param([string]$Path)
@@ -263,6 +284,7 @@ foreach ($arch in $Architectures) {
 Set-Content -LiteralPath $scoopManifestPath -Value ($scoopManifest | ConvertTo-Json -Depth 5)
 
 $escapedDescription = [System.Security.SecurityElement]::Escape($packageDescription)
+$escapedChocolateyDescription = [System.Security.SecurityElement]::Escape($chocolateyDescription)
 $chocolateyNuspec = @"
 <?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
@@ -281,10 +303,10 @@ $chocolateyNuspec = @"
     <iconUrl>$chocolateyIconUrl</iconUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <summary>$escapedDescription</summary>
-    <description>$escapedDescription</description>
+    <description>$escapedChocolateyDescription</description>
     <releaseNotes>$releaseUrl</releaseNotes>
     <copyright>Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors</copyright>
-    <tags>noctty terminal emulator windows ghostty</tags>
+    <tags>noctty terminal terminal-emulator emulator console windows ghostty foss</tags>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />
