@@ -39,14 +39,15 @@ the first with two tabs, the second of them split, the second with one tab):
                     restartable.
   restartable-install-running
                     another noctty's in-app Install is running Setup (a
-                    staged installer under the copy's updates\<version>
-                    whose file a shared-read handle holds, which refuses
-                    write access as a running image does): the owner agrees
+                    stand-in Setup, a copy of ping.exe that shows no
+                    window, running from a read-only staged installer
+                    under the copy's updates\<version>): the owner agrees
                     and is not restartable, also once the update state no
                     longer names that installer (an update check with
-                    another feed clears it); once the handle is closed, it
-                    is again, and a read-only leftover installer does not
-                    stop it.
+                    another feed clears it). Once it has exited, the owner
+                    is restartable again, also while a shared-read handle
+                    holds the installer as the updater's verification does,
+                    and beside a read-only leftover installer.
 These three only list (RmGetList) and send the query and end messages
 themselves; they never call RmShutdown.
 
@@ -520,16 +521,27 @@ foreach($name in $selected) {
         'restartable-install-running' {
             # No update check may rewrite the state the case writes.
             $case=Start-Case $name @('auto-update = off')
-            $held=$null
+            $held=$null; $setupCase=$null; $setup=$null
             try {
                 $p=$case.Process
                 $stage=Join-Path $case.Dir 'updates\1.3.999'
                 [void](New-Item -ItemType Directory -Force -Path $stage)
                 $setup=Join-Path $stage 'noctty-1.3.999-windows-x64-setup.exe'
-                Set-Content -LiteralPath $setup -Value 'not a program' -NoNewline
+                # The stand-in Setup: a console program started with no
+                # window, on this desktop, inside the owned job. Read-only, as
+                # a write open then fails with access denied, not a sharing
+                # violation, so only a process check sees it.
+                Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\PING.EXE') -Destination $setup
+                (Get-Item -LiteralPath $setup).IsReadOnly=$true
                 $state=[ordered]@{ staged_version='1.3.999'; staged_kind='installer'; staged_installer_path=$setup; staged_sha256='00' } | ConvertTo-Json -Compress
                 Set-Content -LiteralPath (Join-Path $case.Dir 'update-state.json') -Value $state -NoNewline -Encoding utf8NoBOM
-                $held=[IO.File]::Open($setup,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                $pi=[HiddenLocal]::Spawn($setup,('"{0}" -n 600 127.0.0.1' -f $setup),$stage,"WinSta0\$DesktopName")
+                try { $sp=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$sp.Handle }
+                finally { [void][HiddenLocal]::CloseHandle($pi.thread); [void][HiddenLocal]::CloseHandle($pi.process) }
+                $setupCase=@{ Process=$sp }
+                $script:processes.Add(@{ Case="$name-setup"; Pid=$sp.Id; StartTime=$sp.StartTime.ToUniversalTime().ToString('o') })
+                Start-Sleep -Seconds 1
+                $r.SetupAlive=-not $sp.HasExited
                 $r.Queries=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
                 $r.Running=Restart-Settings $p
                 $r.ListedRunning=(Rm-Restartable $case @($p))[$p.Id]
@@ -541,28 +553,39 @@ foreach($name in $selected) {
                 $r.Cleared=Restart-Settings $p
                 $r.ListedCleared=(Rm-Restartable $case @($p))[$p.Id]
                 [void](Send-All $case $Msg.EndSession 0 $closeApp)
-                $held.Dispose(); $held=$null
+                $r.SetupStillAlive=-not $sp.HasExited
+                Stop-Case $setupCase; $setupCase=$null
                 # Setup has exited: the same owner registers again.
                 $r.QueriesAfter=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
                 $r.After=Restart-Settings $p
                 $r.ListedAfter=(Rm-Restartable $case @($p))[$p.Id]
                 [void](Send-All $case $Msg.EndSession 0 $closeApp)
-                # A read-only leftover also refuses write access, but no Setup
-                # runs from it: an unrelated upgrade still restarts the owner.
-                (Get-Item -LiteralPath $setup).IsReadOnly=$true
+                # A read-only leftover is no Setup: an unrelated upgrade still
+                # restarts the owner.
                 $r.QueriesReadOnly=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
                 $r.ReadOnly=Restart-Settings $p
                 $r.ListedReadOnly=(Rm-Restartable $case @($p))[$p.Id]
                 [void](Send-All $case $Msg.EndSession 0 $closeApp)
                 (Get-Item -LiteralPath $setup).IsReadOnly=$false
+                # Nor is the updater's verification open (shared reads only),
+                # which refuses write access as a running image does.
+                $held=[IO.File]::Open($setup,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                $r.QueriesVerifying=@(Send-All $case $Msg.QueryEndSession 0 $closeApp)
+                $r.Verifying=Restart-Settings $p
+                $r.ListedVerifying=(Rm-Restartable $case @($p))[$p.Id]
+                [void](Send-All $case $Msg.EndSession 0 $closeApp)
+                $held.Dispose(); $held=$null
+                Check "${name}: the stand-in Setup ran throughout" ($r.SetupAlive -and $r.SetupStillAlive) 'True, True' "$($r.SetupAlive), $($r.SetupStillAlive)"
                 Check "${name}: every window agrees" (@($r.Queries | Where-Object { $_ -ne 1 }).Count -eq 0 -and $r.Queries.Count -eq 2) '1,1' ($r.Queries -join ',')
                 Check "${name}: and the owner is not restartable while that Setup runs" ($r.Running.Hr -eq $notFound -and $r.ListedRunning -eq $false) "$notFound, False" "$($r.Running.Hr), $($r.ListedRunning)"
                 Check "${name}: also once the update state no longer names it" ($r.Cleared.Hr -eq $notFound -and $r.ListedCleared -eq $false) "$notFound, False" "$($r.Cleared.Hr), $($r.ListedCleared)"
                 Check "${name}: once it has exited, the owner is restartable again" ($r.After.Hr -eq '0x00000000' -and $r.After.Flags -eq 11 -and $r.ListedAfter -eq $true) '0x00000000 / 11, True' "$($r.After.Hr) / $($r.After.Flags), $($r.ListedAfter)"
                 Check "${name}: a read-only leftover installer does not stop the restart" ($r.ReadOnly.Hr -eq '0x00000000' -and $r.ReadOnly.Flags -eq 11 -and $r.ListedReadOnly -eq $true) '0x00000000 / 11, True' "$($r.ReadOnly.Hr) / $($r.ReadOnly.Flags), $($r.ListedReadOnly)"
+                Check "${name}: nor does the updater's verification handle" ($r.Verifying.Hr -eq '0x00000000' -and $r.Verifying.Flags -eq 11 -and $r.ListedVerifying -eq $true) '0x00000000 / 11, True' "$($r.Verifying.Hr) / $($r.Verifying.Flags), $($r.ListedVerifying)"
             } finally {
                 if($held) { $held.Dispose() }
-                if(Test-Path -LiteralPath $setup) { (Get-Item -LiteralPath $setup).IsReadOnly=$false }
+                if($setupCase) { Stop-Case $setupCase }
+                if($setup -and (Test-Path -LiteralPath $setup)) { (Get-Item -LiteralPath $setup).IsReadOnly=$false }
                 Stop-Case $case
             }
         }
