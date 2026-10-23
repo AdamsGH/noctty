@@ -544,9 +544,25 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
             $cells = ($p.longEnd.caret.x0 - $p.caret0.caret.x0) / $cw
             if ($p.longEnd.caret.count -ne $bar.count -or $cells -ne [Math]::Floor($cells) -or $cells -lt 90 -or $p.longEnd.caret.x0 + $cw -gt $p.longEnd.caret.width) { throw "Caret at the end of an overlong composition is not on the last column: $($p.longEnd.caret | ConvertTo-Json -Compress)." }
             $p.longEndColumn = $cells
-            # Output on another row and a blink interval later, with no new
-            # composition and no redraw request, the caret is where it was.
+            # Blink ticks with no output rebuild frames in which no row is
+            # dirty, so the preedit's cells are kept from an earlier frame
+            # and only a caret set on every rebuild is still drawn. The
+            # fixture turns blinking on and then writes nothing; the
+            # renderer counts the rebuilds that drew the caret with the
+            # preedit row clean, and the captures ask for no redraw.
             $p.beforeTicks = & $compose 1 5 'preedit-before-ticks'; & $expectBar $p.beforeTicks 0 'Cursor 5 again'
+            Set-Content -LiteralPath ($environment.NOCTTY_RENDERER_READY_PATH + '.blink') -Value 'blink'
+            Start-Sleep -Milliseconds 500
+            $p.blinkStart = & $capture 'preedit-blink-start' -NoReplay
+            $p.blinkStart.caret = & $box $p.blinkStart
+            & $expectBar $p.blinkStart 0 'After blinking was turned on'
+            Start-Sleep -Milliseconds 2500
+            $p.blinkEnd = & $capture 'preedit-blink-end' -NoReplay
+            $p.blinkEnd.caret = & $box $p.blinkEnd
+            $p.cleanRebuilds = $p.blinkEnd.status.preedit_caret_clean_rebuilds - $p.blinkStart.status.preedit_caret_clean_rebuilds
+            if ($null -eq $p.blinkEnd.status.preedit_caret_clean_rebuilds -or $p.cleanRebuilds -lt 2) { throw "No blink frames rebuilt with the preedit row clean ($($p.cleanRebuilds) in 2.5 s)." }
+            & $expectBar $p.blinkEnd 0 'After blink frames with no output'
+            # Output on another row: the cursor moves to it and back.
             Set-Content -LiteralPath ($environment.NOCTTY_RENDERER_READY_PATH + '.tick') -Value 'tick'
             Start-Sleep -Milliseconds 1500
             $p.afterTicks = & $capture 'preedit-after-ticks' -NoReplay

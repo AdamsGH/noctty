@@ -47,11 +47,19 @@ if ($env:NOCTTY_RENDERER_TEST_KITTY -eq '1') { [Console]::Write("$e`_Ga=T,f=24,s
   Start-Sleep -Milliseconds $IntervalMs
  }
 }
-# Once the harness creates <ready>.tick, write to row 20 every 200 ms and
-# put the cursor back: output that leaves the cursor's row clean.
+# Once the harness creates <ready>.blink, make the block cursor blink (DECSCUSR
+# 1; the harness config sets cursor-style-blink, which makes DEC mode 12 a
+# no-op) and write nothing more until <ready>.tick: each blink tick then
+# rebuilds a frame in which no row is dirty. After <ready>.tick, make it
+# steady again (DECSCUSR 2), then write to row 20 every 200 ms and put the
+# cursor back. That is output on another row, but both cursor moves dirty the
+# cursor's row as well.
 if ($Tick) {
  $clock=[Diagnostics.Stopwatch]::StartNew()
+ while(!(Test-Path -LiteralPath ($env:NOCTTY_RENDERER_READY_PATH+'.blink')) -and $clock.Elapsed.TotalSeconds -lt 85) { Start-Sleep -Milliseconds 50 }
+ [Console]::Write("$e[1 q")
  while(!(Test-Path -LiteralPath ($env:NOCTTY_RENDERER_READY_PATH+'.tick')) -and $clock.Elapsed.TotalSeconds -lt 85) { Start-Sleep -Milliseconds 50 }
+ [Console]::Write("$e[2 q")
  $count=0
  while($clock.Elapsed.TotalSeconds -lt 85) { [Console]::Write("${e}7$e[20;1HTICK $count$e[K${e}8"); $count++; Start-Sleep -Milliseconds 200 }
 }

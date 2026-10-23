@@ -45,8 +45,8 @@ without the shader reload. The held case keeps synchronized output open in
 the fixture and captures without a redraw, so only what the renderer presents
 itself is read; it runs on OpenGL, because a D3D11 pane on a hidden desktop is
 always occluded and its paced present retry carries any change through a hold.
-The IME composition caret cases (#527; `-PreeditCaretOnly` runs just them,
-and `-WarpOnly` runs the WARP one) show a composition through the test-tools
+The IME composition caret cases (#527; `-PreeditCaretOnly` runs just them, and
+`-WarpOnly` runs the WARP one) show a composition through the test-tools
 message `0x8059`, which skips only the IMM read: `wParam` picks a fixture (1
 `zhongguo`, 2 three CJK characters, 3 208 letters, wider than the grid, 0
 clears) and `lParam` is the `GCS_CURSORPOS` value (-1 for none). The cursor
@@ -56,9 +56,15 @@ colour afterwards. Each case checks a bar on the left edge of the sixth
 preedit cell at cursor 5, moved one cell left at 4, at the first cell at 0,
 one cell past the text at 8, between wide characters, at the first column for
 a caret in the cut head of an overlong composition and on the last column for
-one at its end, no bar for -1, the bar unchanged after the fixture writes to
-another row for a second and a half with no new composition or redraw
-request, and the block cursor back after clearing. They run on OpenGL, D3D11
+one at its end, no bar for -1, and the block cursor back when the last step
+clears the composition. Before that, captures that ask for no redraw check
+that the bar stays put through frames the composition did not cause. After the
+fixture turns cursor blinking on and writes nothing, at least two blink frames
+in 2.5 s must rebuild with the preedit row clean (the renderer counts them in
+its status as `preedit_caret_clean_rebuilds`), the frames a caret drawn only
+with the preedit's cells would vanish from. Then the fixture writes to another
+row for a second and a half; that output also dirties the cursor's row,
+because the cursor moves there and back. The cases run on OpenGL, D3D11
 hardware and WARP (hardware matching OpenGL exactly, WARP within the
 tolerances above) and once with the fixture's cursor hidden (DECTCEM off).
 No IME is installed, switched or driven.

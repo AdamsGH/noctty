@@ -490,6 +490,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// a large screen.
         terminal_state_frame_count: usize = 0,
 
+        /// Renderer test tools only: rebuilds that drew the IME caret while
+        /// the preedit's own row was not rebuilt, so the parity harness can
+        /// tell such frames happened.
+        preedit_caret_clean_rebuilds: if (build_config.renderer_test_tools) u64 else void =
+            if (build_config.renderer_test_tools) 0 else {},
+
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
@@ -2336,7 +2342,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Move CPU frame preparation to another graphics API. GPU resources
         /// are freshly initialized; font, terminal and search state survive.
         pub fn transferCpuState(self: *Self, target: anytype) void {
-            const transferred = .{ "grid_metrics", "size", "focused", "split_dimmed", "scrollbar", "scrollbar_dirty", "last_bottom_node", "last_bottom_y", "search_matches", "search_selected_match", "search_matches_dirty", "cells", "bg_cells_dirty", "fg_cells_dirty_from", "fg_cell_count", "uniforms", "custom_shader_uniforms", "first_frame_time", "last_frame_time", "font_shaper", "font_shaper_cache", "terminal_state", "terminal_state_frame_count", "overlay" };
+            const transferred = .{ "grid_metrics", "size", "focused", "split_dimmed", "scrollbar", "scrollbar_dirty", "last_bottom_node", "last_bottom_y", "search_matches", "search_selected_match", "search_matches_dirty", "cells", "bg_cells_dirty", "fg_cells_dirty_from", "fg_cell_count", "uniforms", "custom_shader_uniforms", "first_frame_time", "last_frame_time", "font_shaper", "font_shaper_cache", "terminal_state", "terminal_state_frame_count", "preedit_caret_clean_rebuilds", "overlay" };
             // These fields own API-specific resources, shared ownership, or
             // fresh-renderer synchronization state. A backport must classify
             // every new field explicitly instead of silently dropping state.
@@ -2940,6 +2946,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :caret_color state.colors.foreground;
                     };
                     self.addCursorAt(.bar, false, caret_x, cursor_vp.y, caret_color);
+                    if (comptime build_config.renderer_test_tools) {
+                        if (preedit_range == null) self.preedit_caret_clean_rebuilds += 1;
+                    }
                     break :cursor;
                 }
 
