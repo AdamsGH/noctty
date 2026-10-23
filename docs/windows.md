@@ -199,13 +199,13 @@ XDG helpers still honor `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and
 `XDG_CACHE_HOME` when set on Windows; `%LOCALAPPDATA%` is the fallback in
 the normal packaged app environment.
 
-| Path                                       | Purpose                                                                                                                                                                                                                                                           |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                                             |
-| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`.                              |
-| `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                                                 |
-| `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                                                        |
-| `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                                                        |
+| Path                                       | Purpose                                                                                                                                                                                                                              |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                |
+| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`. |
+| `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                    |
+| `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                           |
+| `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                           |
 
 [PRIVACY.md](../PRIVACY.md) describes the other files and registry entries
 noctty writes, including the jump list, command palette history, and update
@@ -779,7 +779,7 @@ terminfo capability, so a program can check before it reports.
   look, so repeating it works through them. It has no default key binding;
   bind it with, for example,
   `keybind = ctrl+shift+g=goto_attention`. `noctty +perform-action
-  goto_attention` runs it from scripts.
+goto_attention` runs it from scripts.
 - **Screen readers.** Each tab's UI Automation `ItemStatus` reads the status,
   such as "claude needs permission: Allow edit to main.rs?". A new state,
   request or result raises a property-change event; progress updates
@@ -1703,6 +1703,41 @@ config.
 
 WSL fails to launch: set `command = wsl.exe` explicitly. If it still fails,
 verify the distribution starts in a normal PowerShell session first.
+
+### A copy does not reach a Remote Desktop session
+
+noctty writes a copy in one Win32 clipboard transaction, owned by the
+pane's window. `Surface.writeClipboardText` in `src/apprt/win32.zig`
+writes `CF_UNICODETEXT`; `Surface.writeClipboardHtml` also writes
+`HTML Format` in the same transaction for a formatted copy. Windows adds
+`CF_LOCALE`, `CF_TEXT` and `CF_OEMTEXT`. noctty never writes an OLE data
+object.
+
+A program can replace that copy with its own clipboard write. Claude Code
+on Windows also runs Windows PowerShell 5.1 `Set-Clipboard` about a quarter
+second after its OSC 52 write. That second, OLE write happens in several
+steps, and RDP clipboard redirection can announce an offer with no text
+formats. Windows Terminal users have reported the same failure:
+[anthropics/claude-code#101328](https://github.com/anthropics/claude-code/issues/101328)
+and [#87480](https://github.com/anthropics/claude-code/issues/87480) describe
+the two writes and the RDP observations.
+
+To check which write remains, inspect metadata only: list formats with
+`EnumClipboardFormats` and the owner with `GetClipboardOwner`, without
+reading the contents. `DataObject` plus `Ole Private Data` with no owner
+means the last writer was not noctty. A missing owner alone does not
+identify the writer.
+
+Hold Shift while dragging so noctty makes the selection, then use noctty's
+copy binding (Ctrl+Shift+C by default). `mouse-shift-capture` controls
+whether Shift goes to the program; if the program overrides the default,
+set `mouse-shift-capture = never` to keep Shift selection in noctty.
+`copy-on-select` also works with a Shift selection. A copy binding with no
+noctty selection copies nothing, leaving the program's earlier write on
+the clipboard.
+
+The clipboard writers were compared in an isolated window station. RDP
+itself was not exercised.
 
 ### Neovim types base64 after an OSC 52 paste
 
