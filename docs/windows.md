@@ -1708,10 +1708,12 @@ verify the distribution starts in a normal PowerShell session first.
 
 noctty writes a copy in one Win32 clipboard transaction, owned by the
 pane's window. `Surface.writeClipboardText` in `src/apprt/win32.zig`
-writes `CF_UNICODETEXT`; `Surface.writeClipboardHtml` also writes
-`HTML Format` in the same transaction for a formatted copy. Windows adds
-`CF_LOCALE`, `CF_TEXT` and `CF_OEMTEXT`. noctty never writes an OLE data
-object.
+writes `CF_UNICODETEXT` for `copy_to_clipboard:plain` and a program's OSC 52
+write. The default copy bindings (including Ctrl+Shift+C) and
+`copy-on-select` use the `mixed` format: `Surface.writeClipboardHtml`
+writes `HTML Format` and `CF_UNICODETEXT` together. `copy_to_clipboard:html`
+also uses that writer. Windows adds `CF_LOCALE`, `CF_TEXT` and
+`CF_OEMTEXT`. noctty never writes an OLE data object.
 
 A program can replace that copy with its own clipboard write. Claude Code
 on Windows also runs Windows PowerShell 5.1 `Set-Clipboard` about a quarter
@@ -1720,7 +1722,9 @@ steps, and RDP clipboard redirection can announce an offer with no text
 formats. Windows Terminal users have reported the same failure:
 [anthropics/claude-code#101328](https://github.com/anthropics/claude-code/issues/101328)
 and [#87480](https://github.com/anthropics/claude-code/issues/87480) describe
-the two writes and the RDP observations.
+the two writes and the RDP observations. Both reports concern copies out
+of a session. The same double write is a likely cause when copying into
+one, but that direction has not been measured.
 
 To check which write remains, inspect metadata only: list formats with
 `EnumClipboardFormats` and the owner with `GetClipboardOwner`, without
