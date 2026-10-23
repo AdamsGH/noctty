@@ -802,9 +802,9 @@ terminfo capability, so a program can check before it reports.
   request or result raises a property-change event; progress updates
   don't.
 
-Program text shown outside the terminal (in toasts and UI Automation) has
-bidirectional overrides and invisible formatting characters removed and is
-cut to 240 bytes. noctty never sends anything a program reported back to a
+Program status text shown outside the terminal (in toasts and UI
+Automation) has bidirectional overrides and invisible formatting characters
+removed and is cut to 240 bytes. noctty never sends anything a program reported back to a
 program.
 
 With Windows' built-in console host, replies to OSC queries, including this

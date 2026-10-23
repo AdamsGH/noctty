@@ -468,10 +468,12 @@ pub const max_shown_text_bytes = 240;
 /// controls and invisible formatting characters, so a program can't
 /// reorder or hide what the notification says, and with control
 /// characters, U+FFFE and U+FFFF, and line and paragraph separators as
-/// spaces (a tab title can hold controls and those two noncharacters,
-/// which XML 1.0 cannot carry even escaped; program status text never
-/// does). Cuts at `max_bytes` on a codepoint boundary and marks the cut with an ellipsis. Text that isn't valid
-/// UTF-8 is skipped byte by byte; the parser only lets valid UTF-8 through.
+/// spaces (XML 1.0 cannot carry controls or those two noncharacters even
+/// escaped; a tab title can hold controls, and both a tab title and
+/// program status text can hold U+FFFE and U+FFFF, which the OSC 7501
+/// parser lets through). Cuts at `max_bytes` on a codepoint boundary and
+/// marks the cut with an ellipsis. Text that isn't valid UTF-8 is skipped
+/// byte by byte; the parser only lets valid UTF-8 through.
 pub fn writeSanitized(
     writer: *std.Io.Writer,
     text: []const u8,
