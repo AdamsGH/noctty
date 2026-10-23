@@ -1394,24 +1394,31 @@ the update notice opens the normal GitHub release page for manual updating.
 
 Setup (run by hand, by WinGet or by Chocolatey) asks a running noctty to close
 through Windows Restart Manager before it replaces the files. noctty agrees
-when quitting would ask nothing: it saves every window, tab and split, as
-`quit` does, and closes. The process that owns the saved session also asks
-Windows to let Setup start it again when Setup finishes, with the last
+when quitting would ask nothing, and closes. Unless sessions are not saved
+(`window-save-state = never`, among the cases
+[Session restore and recovery](#session-restore-and-recovery) lists), it
+first saves its windows, tabs and splits, as `quit` does; the quick terminal
+is not saved. The process that owns the saved session also asks Windows to
+let Setup start it again when Setup finishes, with the last
 `--config-file` and the `--class` it was started with (no other arguments,
-and no earlier `--config-file`), and that start restores the session. Another noctty process closes and is not started again; the
-session owner brings the session back. Setup starts noctty before its last
-page, so in the setup wizard, leaving **Launch noctty** checked there opens
-one more window. Setup's restart of noctty itself has not been tried on a real
-install.
+and no earlier `--config-file`), and that start restores the session; the
+programs that ran in its terminals are not started again. Another noctty
+process closes and is not started again; the session owner brings the
+session back. Setup starts noctty before its last page, so in the setup
+wizard, leaving **Launch noctty** checked there opens one more window.
+Setup's restart of noctty itself has not been tried on a real install.
 
-noctty declines, without a prompt, while a terminal runs a program (the
-programs `confirm-close-surface` asks about) or while Settings has unsaved
-edits. Nothing closes and nothing is lost, but Setup cannot replace the files
-and stops; a silent Setup under a package manager exits with code 5. Finish
-or close those programs and run the upgrade again. For the same reason an
-upgrade started from inside a noctty tab is declined: the package manager is
-a program running in that terminal, and closing noctty would end it. Run it
-from another terminal.
+With the default `confirm-close-surface`, noctty declines, without a prompt,
+while a terminal runs a program (the programs `confirm-close-surface` asks
+about), and it always declines while Settings has unsaved edits. Nothing
+closes and nothing is lost, but Setup cannot replace the files and stops; a
+silent Setup under a package manager exits with code 5. Finish or close those
+programs and run the upgrade again. For the same reason an upgrade started
+from inside a noctty tab is declined: the package manager is a program
+running in that terminal, and closing noctty would end it. Run it from
+another terminal. With `confirm-close-surface = false`, noctty asks about no
+program, so it agrees and closes even while a package manager runs in one of
+its tabs, which ends that upgrade.
 
 When the copy being upgraded is 1.3.134 or older, the running old version
 answers Setup, so it behaves as that version did: Setup may fail to close it,
