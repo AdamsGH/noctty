@@ -46,6 +46,16 @@ pub const ShowError = error{
     NotifierDisabled,
     OutOfMemory,
     InvalidUtf8,
+    /// The toast's Tag or Group could not be set. It is not shown: a
+    /// toast without them could never be removed.
+    IdentitySetupFailed,
+};
+
+pub const HistoryError = error{
+    HistoryUnavailable,
+    RemoveFailed,
+    OutOfMemory,
+    InvalidUtf8,
 };
 
 pub const Severity = enum { info, warn, err, success };
@@ -61,6 +71,9 @@ const NotificationSetting = enum(i32) {
 const IID_IUnknown = GUID.parse("{00000000-0000-0000-C000-000000000046}");
 const IID_IInspectable = GUID.parse("{AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90}");
 const IID_IToastNotificationManagerStatics = GUID.parse("{50AC103F-D235-4598-BBEF-98FE4D1A3AD4}");
+const IID_IToastNotificationManagerStatics2 = GUID.parse("{7AB93C52-0E48-4750-BA9D-1A4113981847}");
+const IID_IToastNotification2 = GUID.parse("{9DFB9FD1-143A-490E-90BF-B9FBA7132DE7}");
+const IID_IToastNotificationHistory = GUID.parse("{5CADDC63-01D3-4C97-986F-0533483FEE14}");
 const IID_IToastNotificationFactory = GUID.parse("{04124B20-82C6-4229-B109-FD9ED4662B53}");
 const IID_IXmlDocument = GUID.parse("{F7F3A506-1E87-42D6-BCFB-B8C809FA5494}");
 const IID_IXmlDocumentIO = GUID.parse("{6CD0E74E-EE65-4489-9EBF-CA43E87BA637}");
@@ -98,10 +111,47 @@ const IToastNotificationManagerStaticsVtbl = extern struct {
     GetIids: *const fn (*anyopaque, *u32, *?[*]GUID) callconv(.winapi) HRESULT,
     GetRuntimeClassName: *const fn (*anyopaque, *?HSTRING) callconv(.winapi) HRESULT,
     GetTrustLevel: *const fn (*anyopaque, *i32) callconv(.winapi) HRESULT,
-    // IToastNotificationManagerStatics
+    // IToastNotificationManagerStatics. `get_History` is not here: it is
+    // the only method of IToastNotificationManagerStatics2.
     CreateToastNotifier: *const fn (*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT,
     CreateToastNotifierWithId: *const fn (*anyopaque, HSTRING, *?*anyopaque) callconv(.winapi) HRESULT,
+    GetTemplateContent: *const fn (*anyopaque, i32, *?*anyopaque) callconv(.winapi) HRESULT,
+};
+
+const IToastNotificationManagerStatics2Vtbl = extern struct {
+    // IUnknown (3)
+    QueryInterface: *const fn (*anyopaque, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
+    Release: *const fn (*anyopaque) callconv(.winapi) u32,
+    // IInspectable (3)
+    GetIids: *const fn (*anyopaque, *u32, *?[*]GUID) callconv(.winapi) HRESULT,
+    GetRuntimeClassName: *const fn (*anyopaque, *?HSTRING) callconv(.winapi) HRESULT,
+    GetTrustLevel: *const fn (*anyopaque, *i32) callconv(.winapi) HRESULT,
+    // IToastNotificationManagerStatics2
     get_History: *const fn (*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT,
+};
+
+const IToastNotificationHistoryVtbl = extern struct {
+    // IUnknown (3)
+    QueryInterface: *const fn (*anyopaque, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
+    Release: *const fn (*anyopaque) callconv(.winapi) u32,
+    // IInspectable (3)
+    GetIids: *const fn (*anyopaque, *u32, *?[*]GUID) callconv(.winapi) HRESULT,
+    GetRuntimeClassName: *const fn (*anyopaque, *?HSTRING) callconv(.winapi) HRESULT,
+    GetTrustLevel: *const fn (*anyopaque, *i32) callconv(.winapi) HRESULT,
+    // IToastNotificationHistory. Only the `WithId` removals are called: an
+    // unpackaged app names its AUMID. `Clear` and `ClearWithId` are here for
+    // the slot order only and are never called, because every noctty
+    // process (installed and portable) shares the AUMID and they would
+    // delete the other processes' toasts too.
+    RemoveGroup: *const fn (*anyopaque, HSTRING) callconv(.winapi) HRESULT,
+    RemoveGroupWithId: *const fn (*anyopaque, HSTRING, HSTRING) callconv(.winapi) HRESULT,
+    RemoveGroupedTagWithId: *const fn (*anyopaque, HSTRING, HSTRING, HSTRING) callconv(.winapi) HRESULT,
+    RemoveGroupedTag: *const fn (*anyopaque, HSTRING, HSTRING) callconv(.winapi) HRESULT,
+    Remove: *const fn (*anyopaque, HSTRING) callconv(.winapi) HRESULT,
+    Clear: *const fn (*anyopaque) callconv(.winapi) HRESULT,
+    ClearWithId: *const fn (*anyopaque, HSTRING) callconv(.winapi) HRESULT,
 };
 
 const IToastNotifierVtbl = extern struct {
@@ -142,6 +192,24 @@ const IToastNotificationVtbl = extern struct {
     remove_Activated: *const fn (*anyopaque, i64) callconv(.winapi) HRESULT,
     add_Failed: *const fn (*anyopaque, *anyopaque, *i64) callconv(.winapi) HRESULT,
     remove_Failed: *const fn (*anyopaque, i64) callconv(.winapi) HRESULT,
+};
+
+const IToastNotification2Vtbl = extern struct {
+    // IUnknown (3)
+    QueryInterface: *const fn (*anyopaque, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
+    Release: *const fn (*anyopaque) callconv(.winapi) u32,
+    // IInspectable (3)
+    GetIids: *const fn (*anyopaque, *u32, *?[*]GUID) callconv(.winapi) HRESULT,
+    GetRuntimeClassName: *const fn (*anyopaque, *?HSTRING) callconv(.winapi) HRESULT,
+    GetTrustLevel: *const fn (*anyopaque, *i32) callconv(.winapi) HRESULT,
+    // IToastNotification2
+    put_Tag: *const fn (*anyopaque, HSTRING) callconv(.winapi) HRESULT,
+    get_Tag: *const fn (*anyopaque, *?HSTRING) callconv(.winapi) HRESULT,
+    put_Group: *const fn (*anyopaque, HSTRING) callconv(.winapi) HRESULT,
+    get_Group: *const fn (*anyopaque, *?HSTRING) callconv(.winapi) HRESULT,
+    put_SuppressPopup: *const fn (*anyopaque, u8) callconv(.winapi) HRESULT,
+    get_SuppressPopup: *const fn (*anyopaque, *u8) callconv(.winapi) HRESULT,
 };
 
 const IToastNotificationFactoryVtbl = extern struct {
@@ -197,8 +265,11 @@ fn ComInterface(comptime Vtbl: type) type {
 
 const IInspectable = ComInterface(IInspectableVtbl);
 const IToastNotificationManagerStatics = ComInterface(IToastNotificationManagerStaticsVtbl);
+const IToastNotificationManagerStatics2 = ComInterface(IToastNotificationManagerStatics2Vtbl);
+const IToastNotificationHistory = ComInterface(IToastNotificationHistoryVtbl);
 const IToastNotifier = ComInterface(IToastNotifierVtbl);
 const IToastNotification = ComInterface(IToastNotificationVtbl);
+const IToastNotification2 = ComInterface(IToastNotification2Vtbl);
 const IToastNotificationFactory = ComInterface(IToastNotificationFactoryVtbl);
 const IXmlDocumentIO = ComInterface(IXmlDocumentIOVtbl);
 
@@ -266,6 +337,15 @@ fn createHStringFromSlice(fns: *const CombaseFns, s: []const u16) ShowError!HSTR
     return hs.?;
 }
 
+fn createHStringFromUtf8(alloc: Allocator, fns: *const CombaseFns, s: []const u8) error{ OutOfMemory, InvalidUtf8, ActivationFailed }!HSTRING {
+    const wide = std.unicode.utf8ToUtf16LeAlloc(alloc, s) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidUtf8,
+    };
+    defer alloc.free(wide);
+    return createHStringFromSlice(fns, wide) catch error.ActivationFailed;
+}
+
 /// Escape XML special characters in `input`, appending results to `writer`.
 pub fn xmlEscape(writer: *std.Io.Writer, input: []const u8) std.Io.Writer.Error!void {
     for (input) |c| {
@@ -291,6 +371,11 @@ pub const ToastRequest = struct {
     attribution: ?[]const u8 = null,
     /// The toast element's launch argument, for click activation.
     launch: ?[]const u8 = null,
+    /// `ToastNotification.Tag` and `.Group`: a newer toast with the same
+    /// pair replaces the older one in Action Center, and
+    /// `WinrtToast.removeGroupedTag` / `removeGroup` remove them.
+    tag: ?[]const u8 = null,
+    group: ?[]const u8 = null,
 };
 
 /// Build complete toast XML. Caller owns the returned UTF-16 slice.
@@ -639,8 +724,91 @@ pub const WinrtToast = struct {
             }
         }
 
+        if (request.tag != null or request.group != null) try self.applyTagAndGroup(notification, request);
+
         const show_hr = self.notifier.vtbl.Show(self.notifier.asRaw(), notification.asRaw());
         if (show_hr < 0) return ShowError.NotifierShowFailed;
+    }
+
+    /// Set the toast's Tag and Group (`IToastNotification2`). Any failure
+    /// fails the show before `Show` is called, so the caller falls back to
+    /// its banner: a toast missing either property is one noctty would
+    /// count as shown but could neither replace nor remove, since every
+    /// removal names both the tag and the process group.
+    fn applyTagAndGroup(self: *WinrtToast, notification: *IToastNotification, request: ToastRequest) ShowError!void {
+        var raw: ?*anyopaque = null;
+        const qi_hr = notification.queryInterface(&IID_IToastNotification2, &raw);
+        if (qi_hr < 0 or raw == null) {
+            std.log.warn("winrt toast: IToastNotification2 unavailable hr=0x{x:0>8}", .{hresultToU32(qi_hr)});
+            return ShowError.IdentitySetupFailed;
+        }
+        const toast2 = IToastNotification2.fromRaw(raw.?);
+        defer _ = toast2.release();
+        inline for (.{ .{ "tag", "put_Tag" }, .{ "group", "put_Group" } }) |pair| {
+            if (@field(request, pair[0])) |value| {
+                const hs = createHStringFromUtf8(self.alloc, &self.fns, value) catch |err| {
+                    std.log.warn("winrt toast: " ++ pair[0] ++ " not set err={}", .{err});
+                    return switch (err) {
+                        error.OutOfMemory => ShowError.OutOfMemory,
+                        else => ShowError.IdentitySetupFailed,
+                    };
+                };
+                defer _ = self.fns.delete_string(hs);
+                const hr = @field(toast2.vtbl, pair[1])(toast2.asRaw(), hs);
+                if (hr < 0) {
+                    std.log.warn("winrt toast: " ++ pair[1] ++ " failed hr=0x{x:0>8}", .{hresultToU32(hr)});
+                    return ShowError.IdentitySetupFailed;
+                }
+            }
+        }
+    }
+
+    /// Remove the toast tagged `tag` in `group` from Action Center, if it
+    /// is still there. Only this AUMID's toasts are searched.
+    pub fn removeGroupedTag(self: *WinrtToast, tag: []const u8, group: []const u8) HistoryError!void {
+        const history = try self.openHistory();
+        defer _ = history.release();
+        const tag_hs = createHStringFromUtf8(self.alloc, &self.fns, tag) catch |err| return historyStringError(err);
+        defer _ = self.fns.delete_string(tag_hs);
+        const group_hs = createHStringFromUtf8(self.alloc, &self.fns, group) catch |err| return historyStringError(err);
+        defer _ = self.fns.delete_string(group_hs);
+        const hr = history.vtbl.RemoveGroupedTagWithId(history.asRaw(), tag_hs, group_hs, self.aumid_hs);
+        if (hr < 0) return HistoryError.RemoveFailed;
+    }
+
+    /// Remove every toast in `group` from Action Center. Only this AUMID's
+    /// toasts are searched, and the group names one process, so other
+    /// noctty processes keep theirs.
+    pub fn removeGroup(self: *WinrtToast, group: []const u8) HistoryError!void {
+        const history = try self.openHistory();
+        defer _ = history.release();
+        const group_hs = createHStringFromUtf8(self.alloc, &self.fns, group) catch |err| return historyStringError(err);
+        defer _ = self.fns.delete_string(group_hs);
+        const hr = history.vtbl.RemoveGroupWithId(history.asRaw(), group_hs, self.aumid_hs);
+        if (hr < 0) return HistoryError.RemoveFailed;
+    }
+
+    /// `ToastNotificationManager.History`. The caller releases it.
+    fn openHistory(self: *WinrtToast) HistoryError!*IToastNotificationHistory {
+        const manager_hs = createHStringShow(&self.fns, toast_manager_class) catch return HistoryError.HistoryUnavailable;
+        defer _ = self.fns.delete_string(manager_hs);
+        var statics_raw: ?*anyopaque = null;
+        const factory_hr = self.fns.ro_get_factory(manager_hs, &IID_IToastNotificationManagerStatics2, &statics_raw);
+        if (factory_hr < 0 or statics_raw == null) return HistoryError.HistoryUnavailable;
+        const statics = IToastNotificationManagerStatics2.fromRaw(statics_raw.?);
+        defer _ = statics.release();
+        var history_raw: ?*anyopaque = null;
+        const hr = statics.vtbl.get_History(statics.asRaw(), &history_raw);
+        if (hr < 0 or history_raw == null) return HistoryError.HistoryUnavailable;
+        return IToastNotificationHistory.fromRaw(history_raw.?);
+    }
+
+    fn historyStringError(err: error{ OutOfMemory, InvalidUtf8, ActivationFailed }) HistoryError {
+        return switch (err) {
+            error.OutOfMemory => HistoryError.OutOfMemory,
+            error.InvalidUtf8 => HistoryError.InvalidUtf8,
+            error.ActivationFailed => HistoryError.RemoveFailed,
+        };
     }
 };
 
@@ -950,6 +1118,71 @@ test "WinrtToast GUID sizes are 16 bytes" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(@TypeOf(IID_IXmlDocumentIO)));
 }
 
+/// The 0-based vtable slot of `field`: three IUnknown and three IInspectable
+/// methods come first.
+fn vtblSlot(comptime Vtbl: type, comptime field: []const u8) usize {
+    return @offsetOf(Vtbl, field) / @sizeOf(usize);
+}
+
+test "WinrtToast toast history and tag vtables follow the SDK slot order" {
+    // Windows SDK 10.0.28000.0, winrt/windows.ui.notifications.h. The third
+    // method of IToastNotificationManagerStatics is GetTemplateContent;
+    // `get_History` is the only method of IToastNotificationManagerStatics2.
+    try std.testing.expect(@hasField(IToastNotificationManagerStaticsVtbl, "GetTemplateContent"));
+    try std.testing.expect(!@hasField(IToastNotificationManagerStaticsVtbl, "get_History"));
+    try std.testing.expectEqual(@as(usize, 6), vtblSlot(IToastNotificationManagerStaticsVtbl, "CreateToastNotifier"));
+    try std.testing.expectEqual(@as(usize, 7), vtblSlot(IToastNotificationManagerStaticsVtbl, "CreateToastNotifierWithId"));
+    if (comptime @hasField(IToastNotificationManagerStaticsVtbl, "GetTemplateContent")) {
+        try std.testing.expectEqual(@as(usize, 8), vtblSlot(IToastNotificationManagerStaticsVtbl, "GetTemplateContent"));
+    }
+    try std.testing.expectEqual(@as(usize, 9), @sizeOf(IToastNotificationManagerStaticsVtbl) / @sizeOf(usize));
+
+    try std.testing.expectEqual(@as(usize, 6), vtblSlot(IToastNotificationManagerStatics2Vtbl, "get_History"));
+    try std.testing.expectEqual(@as(usize, 7), @sizeOf(IToastNotificationManagerStatics2Vtbl) / @sizeOf(usize));
+
+    inline for (.{ "put_Tag", "get_Tag", "put_Group", "get_Group", "put_SuppressPopup", "get_SuppressPopup" }, 6..) |name, slot| {
+        try std.testing.expectEqual(@as(usize, slot), vtblSlot(IToastNotification2Vtbl, name));
+    }
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(IToastNotification2Vtbl) / @sizeOf(usize));
+
+    inline for (.{
+        "RemoveGroup",
+        "RemoveGroupWithId",
+        "RemoveGroupedTagWithId",
+        "RemoveGroupedTag",
+        "Remove",
+        "Clear",
+        "ClearWithId",
+    }, 6..) |name, slot| {
+        try std.testing.expectEqual(@as(usize, slot), vtblSlot(IToastNotificationHistoryVtbl, name));
+    }
+    try std.testing.expectEqual(@as(usize, 13), @sizeOf(IToastNotificationHistoryVtbl) / @sizeOf(usize));
+}
+
+test "WinrtToast toast history and tag IIDs match the SDK" {
+    const expected = [_]struct { iid: GUID, value: GUID }{
+        .{ .iid = IID_IToastNotificationManagerStatics2, .value = .{
+            .Data1 = 0x7ab93c52,
+            .Data2 = 0x0e48,
+            .Data3 = 0x4750,
+            .Data4 = .{ 0xba, 0x9d, 0x1a, 0x41, 0x13, 0x98, 0x18, 0x47 },
+        } },
+        .{ .iid = IID_IToastNotification2, .value = .{
+            .Data1 = 0x9dfb9fd1,
+            .Data2 = 0x143a,
+            .Data3 = 0x490e,
+            .Data4 = .{ 0x90, 0xbf, 0xb9, 0xfb, 0xa7, 0x13, 0x2d, 0xe7 },
+        } },
+        .{ .iid = IID_IToastNotificationHistory, .value = .{
+            .Data1 = 0x5caddc63,
+            .Data2 = 0x01d3,
+            .Data3 = 0x4c97,
+            .Data4 = .{ 0x98, 0x6f, 0x05, 0x33, 0x48, 0x3f, 0xee, 0x14 },
+        } },
+    };
+    for (expected) |pair| try std.testing.expect(iidEqual(&pair.iid, &pair.value));
+}
+
 test "WinrtToast COM interface wrappers have vtbl pointer at offset 0" {
     // COM requires the vtbl pointer at offset 0.
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(IInspectable, "vtbl"));
@@ -975,4 +1208,156 @@ test "WinrtToast ComInterface wrapper size equals pointer size" {
     try std.testing.expectEqual(@sizeOf(*anyopaque), @sizeOf(IInspectable));
     try std.testing.expectEqual(@sizeOf(*anyopaque), @sizeOf(IToastNotifier));
     try std.testing.expectEqual(@sizeOf(*anyopaque), @sizeOf(IXmlDocumentIO));
+}
+
+test "WinrtToast a toast whose Tag or Group cannot be set is not shown" {
+    // Every COM object and combase function here is an in-memory fake, so
+    // no toast reaches Windows.
+    const Fake = struct {
+        var xml: IInspectable = undefined;
+        var io: IXmlDocumentIO = undefined;
+        var factory: IToastNotificationFactory = undefined;
+        var notification: IToastNotification = undefined;
+        var identity: IToastNotification2 = undefined;
+        var identity_missing: bool = false;
+        var fail_tag: bool = false;
+        var fail_group: bool = false;
+        var tag_set: bool = false;
+        var group_set: bool = false;
+        var show_calls: usize = 0;
+        var shown_with_tag: bool = false;
+        var shown_with_group: bool = false;
+
+        fn release(_: *anyopaque) callconv(.winapi) u32 {
+            return 1;
+        }
+        fn query(_: *anyopaque, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
+            if (iidEqual(iid, &IID_IXmlDocumentIO)) {
+                out.* = io.asRaw();
+            } else if (iidEqual(iid, &IID_IToastNotification2) and !identity_missing) {
+                out.* = identity.asRaw();
+            } else if (iidEqual(iid, &IID_IXmlDocument)) {
+                out.* = xml.asRaw();
+            } else {
+                out.* = null;
+                return E_NOINTERFACE;
+            }
+            return S_OK;
+        }
+        fn createString(_: ?[*]const u16, _: u32, out: *?HSTRING) callconv(.winapi) HRESULT {
+            out.* = @ptrFromInt(1);
+            return S_OK;
+        }
+        fn deleteString(_: ?HSTRING) callconv(.winapi) HRESULT {
+            return S_OK;
+        }
+        fn activate(_: HSTRING, out: *?*anyopaque) callconv(.winapi) HRESULT {
+            out.* = xml.asRaw();
+            return S_OK;
+        }
+        fn getFactory(_: HSTRING, _: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
+            out.* = factory.asRaw();
+            return S_OK;
+        }
+        fn load(_: *anyopaque, _: HSTRING) callconv(.winapi) HRESULT {
+            return S_OK;
+        }
+        fn createNotification(_: *anyopaque, _: *anyopaque, out: *?*anyopaque) callconv(.winapi) HRESULT {
+            tag_set = false;
+            group_set = false;
+            out.* = notification.asRaw();
+            return S_OK;
+        }
+        fn setting(_: *anyopaque, out: *i32) callconv(.winapi) HRESULT {
+            out.* = 0;
+            return S_OK;
+        }
+        fn putTag(_: *anyopaque, _: HSTRING) callconv(.winapi) HRESULT {
+            if (fail_tag) return hresultFromU32(0x8007000E);
+            tag_set = true;
+            return S_OK;
+        }
+        fn putGroup(_: *anyopaque, _: HSTRING) callconv(.winapi) HRESULT {
+            if (fail_group) return hresultFromU32(0x8007000E);
+            group_set = true;
+            return S_OK;
+        }
+        fn show(_: *anyopaque, _: *anyopaque) callconv(.winapi) HRESULT {
+            show_calls += 1;
+            shown_with_tag = tag_set;
+            shown_with_group = group_set;
+            return S_OK;
+        }
+        fn reset(missing: bool, tag: bool, group: bool) void {
+            identity_missing = missing;
+            fail_tag = tag;
+            fail_group = group;
+            show_calls = 0;
+        }
+    };
+    var xml_v: IInspectableVtbl = undefined;
+    xml_v.QueryInterface = Fake.query;
+    xml_v.Release = Fake.release;
+    var io_v: IXmlDocumentIOVtbl = undefined;
+    io_v.LoadXml = Fake.load;
+    io_v.Release = Fake.release;
+    var factory_v: IToastNotificationFactoryVtbl = undefined;
+    factory_v.CreateToastNotification = Fake.createNotification;
+    factory_v.Release = Fake.release;
+    var notification_v: IToastNotificationVtbl = undefined;
+    notification_v.QueryInterface = Fake.query;
+    notification_v.Release = Fake.release;
+    var identity_v: IToastNotification2Vtbl = undefined;
+    identity_v.put_Tag = Fake.putTag;
+    identity_v.put_Group = Fake.putGroup;
+    identity_v.Release = Fake.release;
+    var notifier_v: IToastNotifierVtbl = undefined;
+    notifier_v.Show = Fake.show;
+    notifier_v.get_Setting = Fake.setting;
+    var notifier: IToastNotifier = .{ .vtbl = &notifier_v };
+    Fake.xml = .{ .vtbl = &xml_v };
+    Fake.io = .{ .vtbl = &io_v };
+    Fake.factory = .{ .vtbl = &factory_v };
+    Fake.notification = .{ .vtbl = &notification_v };
+    Fake.identity = .{ .vtbl = &identity_v };
+    var fns: CombaseFns = undefined;
+    fns.ro_activate = Fake.activate;
+    fns.ro_get_factory = Fake.getFactory;
+    fns.create_string = Fake.createString;
+    fns.delete_string = Fake.deleteString;
+    var toast: WinrtToast = .{
+        .alloc = std.testing.allocator,
+        .fns = fns,
+        .notifier = &notifier,
+        .aumid_hs = @ptrFromInt(1),
+        .ro_initialized = false,
+    };
+    const request: ToastRequest = .{ .title = "test", .body = "", .tag = "0000000000001001", .group = "noctty-1234" };
+
+    // Positive control: both properties set, the toast is shown with them.
+    Fake.reset(false, false, false);
+    try toast.show(request, .info);
+    try std.testing.expectEqual(@as(usize, 1), Fake.show_calls);
+    try std.testing.expect(Fake.shown_with_tag and Fake.shown_with_group);
+
+    // The Group setter fails after the Tag setter succeeded: no Show.
+    Fake.reset(false, false, true);
+    try std.testing.expectError(ShowError.IdentitySetupFailed, toast.show(request, .info));
+    try std.testing.expect(Fake.tag_set and !Fake.group_set);
+    try std.testing.expectEqual(@as(usize, 0), Fake.show_calls);
+
+    // The Tag setter fails: no Show.
+    Fake.reset(false, true, false);
+    try std.testing.expectError(ShowError.IdentitySetupFailed, toast.show(request, .info));
+    try std.testing.expectEqual(@as(usize, 0), Fake.show_calls);
+
+    // IToastNotification2 is unavailable: no Show.
+    Fake.reset(true, false, false);
+    try std.testing.expectError(ShowError.IdentitySetupFailed, toast.show(request, .info));
+    try std.testing.expectEqual(@as(usize, 0), Fake.show_calls);
+
+    // A toast with neither property never asks for them and is shown.
+    Fake.reset(true, false, false);
+    try toast.show(.{ .title = "test", .body = "" }, .info);
+    try std.testing.expectEqual(@as(usize, 1), Fake.show_calls);
 }

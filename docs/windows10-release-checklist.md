@@ -297,7 +297,22 @@ carries the AppUserModelID. Set `notify-on-command-finish = always` and
 `notify-on-command-finish-action = notify`, run `Start-Sleep 12` and switch to
 another window. Expected: a toast named "noctty" with the noctty
 icon whose last line reads `Tab 1: <tab title>`, in Action Center afterwards;
-clicking its popup focuses the pane. Turn Focus Assist to "Alarms only" and repeat.
+clicking its popup focuses the pane. Run it twice more without looking at the
+tab: Action Center holds one entry for the pane, the newest. Switch to the tab:
+the entry leaves Action Center. The next two checks test closing and
+quitting, so nothing may count as seeing the tab first: from the moment the
+toast is shown until the close or the quit, stay in the noctty window with
+the pane focused. Do not switch windows, open Action Center or click the
+popup in between: bringing noctty forward or focusing the pane counts as
+seeing the tab and removes the entry by itself. With `always` the toast shows
+while the pane is focused. Press `Ctrl+Shift+T`, run `Start-Sleep 12` in the
+new tab, wait for the popup (if none appears, the check does not count), then
+type `exit` there so its pane closes. Open Action Center: the entry is gone.
+Close Action Center, run `Start-Sleep 12` in the remaining tab, wait for the
+popup, then press `Ctrl+Shift+Q` without leaving the window. At an idle prompt
+no confirmation appears; if one does, the check does not count, so run it
+again. Open Action Center: the entry is gone. Start noctty again, turn Focus
+Assist to "Alarms only" and repeat the first toast.
 Expected: either the toast (record whether it pops up or only reaches Action
 Center) or an in-app banner ending in the same tab line; never nothing. Then revert to the clean snapshot and repeat with the portable copy only:
 it creates the AppUserModelID registration where none exists
