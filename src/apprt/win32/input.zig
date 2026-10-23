@@ -1681,6 +1681,58 @@ pub fn commitImeText(target: anytype, utf8: []const u8) CoreSurface.InputEffect 
     return effect;
 }
 
+/// What a `WM_IME_COMPOSITION` asks for once its result string, if any, is
+/// committed. Its lParam names the parts that changed.
+pub const ImeCompositionAction = enum { none, refresh, cancel };
+
+pub fn imeCompositionAction(parts: u32) ImeCompositionAction {
+    // No parts at all: the composition was cancelled, and Microsoft says the
+    // application should erase what it shows of it.
+    if (parts == 0) return .cancel;
+    // An IME can move the caret, or change the clause attributes, without
+    // changing the string.
+    if ((parts & (c.GCS_COMPSTR | c.GCS_CURSORPOS | c.GCS_COMPATTR)) != 0) return .refresh;
+    return .none;
+}
+
+/// The composition caret as a codepoint index into `units`, from the
+/// `GCS_CURSORPOS` value: a count of UTF-16 units before the caret, or a
+/// negative error (`IMM_ERROR_NODATA`, `IMM_ERROR_GENERAL`) when there is
+/// none. A position inside a surrogate pair counts the pair as after the
+/// caret; one past the end is the end.
+pub fn imeCaretCodepointIndex(units: []const u16, cursor: i32) ?usize {
+    if (cursor < 0) return null;
+    const end = @min(@as(usize, @intCast(cursor)), units.len);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < end) : (count += 1) {
+        const pair = std.unicode.utf16IsHighSurrogate(units[i]) and
+            i + 1 < units.len and std.unicode.utf16IsLowSurrogate(units[i + 1]);
+        const step: usize = if (pair) 2 else 1;
+        if (i + step > end) break;
+        i += step;
+    }
+    return count;
+}
+
+/// Show a composition string with its caret: `cursor` is the
+/// `GCS_CURSORPOS` value read with `units`. An empty string, or one that is
+/// not valid UTF-16, clears the preedit; a negative `cursor` shows the text
+/// without a caret. `target` supplies
+/// `preeditCaretCallback(?[]const u8, ?usize)`.
+pub fn applyImeComposition(
+    target: anytype,
+    alloc: std.mem.Allocator,
+    units: []const u16,
+    cursor: i32,
+    stack: []u8,
+) void {
+    if (units.len == 0) return target.preeditCaretCallback(null, null);
+    const text = imeTextUtf8(alloc, units, stack) catch return target.preeditCaretCallback(null, null);
+    defer text.deinit(alloc);
+    target.preeditCaretCallback(text.bytes, imeCaretCodepointIndex(units, cursor));
+}
+
 /// Commit one typed character as a key event with no physical key.
 fn commitChar(target: anytype, codepoint: u21, lParam: LPARAM) CoreSurface.InputEffect {
     var utf8_buf: [8]u8 = undefined;
@@ -2542,6 +2594,94 @@ test "win32 IME text of any length converts to UTF-8" {
         error.DanglingSurrogateHalf,
         imeTextUtf8(alloc, &.{0xD83D}, &stack),
     );
+}
+
+test "win32 IME composition messages refresh on any part that moves the caret" {
+    const testing = std.testing;
+    // No parts at all: Microsoft documents a cancelled composition.
+    try testing.expectEqual(ImeCompositionAction.cancel, imeCompositionAction(0));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_COMPSTR));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_CURSORPOS));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_COMPATTR));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_COMPSTR | c.GCS_CURSORPOS | c.GCS_COMPATTR));
+    // A commit alone is handled before this and leaves the preedit to
+    // WM_IME_ENDCOMPOSITION, as before.
+    try testing.expectEqual(ImeCompositionAction.none, imeCompositionAction(c.GCS_RESULTSTR));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_RESULTSTR | c.GCS_CURSORPOS));
+}
+
+test "win32 IME caret position counts codepoints, not UTF-16 units" {
+    const testing = std.testing;
+    const ascii = [_]u16{ 'z', 'h', 'o', 'n', 'g' };
+    for (0..ascii.len + 1) |i| {
+        try testing.expectEqual(@as(?usize, i), imeCaretCodepointIndex(&ascii, @intCast(i)));
+    }
+    // Past the end clamps to the end.
+    try testing.expectEqual(@as(?usize, 5), imeCaretCodepointIndex(&ascii, 6));
+    try testing.expectEqual(@as(?usize, 5), imeCaretCodepointIndex(&ascii, std.math.maxInt(i32)));
+    // Negative is IMM_ERROR_NODATA or IMM_ERROR_GENERAL: no caret.
+    try testing.expectEqual(@as(?usize, null), imeCaretCodepointIndex(&ascii, -1));
+    try testing.expectEqual(@as(?usize, null), imeCaretCodepointIndex(&ascii, -2));
+
+    const cjk = [_]u16{ 0x4E2D, 0x56FD };
+    try testing.expectEqual(@as(?usize, 1), imeCaretCodepointIndex(&cjk, 1));
+    try testing.expectEqual(@as(?usize, 2), imeCaretCodepointIndex(&cjk, 2));
+
+    // U+1F642 is two units. A position between them clamps down to the
+    // start of the pair.
+    const pair = [_]u16{ 'a', 0xD83D, 0xDE42, 'b' };
+    try testing.expectEqual(@as(?usize, 1), imeCaretCodepointIndex(&pair, 1));
+    try testing.expectEqual(@as(?usize, 1), imeCaretCodepointIndex(&pair, 2));
+    try testing.expectEqual(@as(?usize, 2), imeCaretCodepointIndex(&pair, 3));
+    try testing.expectEqual(@as(?usize, 3), imeCaretCodepointIndex(&pair, 4));
+    try testing.expectEqual(@as(?usize, 0), imeCaretCodepointIndex(&.{}, 0));
+}
+
+test "win32 IME composition reaches the surface with its caret" {
+    const testing = std.testing;
+    const Target = struct {
+        calls: usize = 0,
+        text: ?[]const u8 = null,
+        caret: ?usize = null,
+        buf: [64]u8 = undefined,
+
+        fn preeditCaretCallback(self: *@This(), text: ?[]const u8, caret: ?usize) void {
+            self.calls += 1;
+            self.caret = caret;
+            self.text = if (text) |t| blk: {
+                @memcpy(self.buf[0..t.len], t);
+                break :blk self.buf[0..t.len];
+            } else null;
+        }
+    };
+    var stack: [32]u8 = undefined;
+
+    var target: Target = .{};
+    const zhongguo = [_]u16{ 'z', 'h', 'o', 'n', 'g', 'g', 'u', 'o' };
+    applyImeComposition(&target, testing.allocator, &zhongguo, 5, &stack);
+    try testing.expectEqualStrings("zhongguo", target.text.?);
+    try testing.expectEqual(@as(?usize, 5), target.caret);
+
+    // A caret after a surrogate pair is an index into the UTF-8 text's
+    // codepoints.
+    const pair = [_]u16{ 0x4E2D, 0xD83D, 0xDE42, 'x' };
+    applyImeComposition(&target, testing.allocator, &pair, 3, &stack);
+    try testing.expectEqualStrings("\u{4E2D}\u{1F642}x", target.text.?);
+    try testing.expectEqual(@as(?usize, 2), target.caret);
+
+    // No caret keeps the text.
+    applyImeComposition(&target, testing.allocator, &zhongguo, -1, &stack);
+    try testing.expectEqualStrings("zhongguo", target.text.?);
+    try testing.expectEqual(@as(?usize, null), target.caret);
+
+    // An empty composition clears, and so does one that cannot convert.
+    applyImeComposition(&target, testing.allocator, &.{}, 0, &stack);
+    try testing.expectEqual(@as(?[]const u8, null), target.text);
+    applyImeComposition(&target, testing.allocator, &zhongguo, 2, &stack);
+    applyImeComposition(&target, testing.allocator, &.{0xD83D}, 1, &stack);
+    try testing.expectEqual(@as(?[]const u8, null), target.text);
+    try testing.expectEqual(@as(?usize, null), target.caret);
+    try testing.expectEqual(@as(usize, 6), target.calls);
 }
 
 test "win32 IME commit reports the effect that closed the surface" {

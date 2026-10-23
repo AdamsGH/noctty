@@ -490,6 +490,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// a large screen.
         terminal_state_frame_count: usize = 0,
 
+        /// Renderer test tools only: rebuilds that drew the IME caret while
+        /// the preedit's own row was not rebuilt, so the parity harness can
+        /// tell such frames happened.
+        preedit_caret_clean_rebuilds: if (build_config.renderer_test_tools) u64 else void =
+            if (build_config.renderer_test_tools) 0 else {},
+
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
@@ -2336,7 +2342,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Move CPU frame preparation to another graphics API. GPU resources
         /// are freshly initialized; font, terminal and search state survive.
         pub fn transferCpuState(self: *Self, target: anytype) void {
-            const transferred = .{ "grid_metrics", "size", "focused", "split_dimmed", "scrollbar", "scrollbar_dirty", "last_bottom_node", "last_bottom_y", "search_matches", "search_selected_match", "search_matches_dirty", "cells", "bg_cells_dirty", "fg_cells_dirty_from", "fg_cell_count", "uniforms", "custom_shader_uniforms", "first_frame_time", "last_frame_time", "font_shaper", "font_shaper_cache", "terminal_state", "terminal_state_frame_count", "overlay" };
+            const transferred = .{ "grid_metrics", "size", "focused", "split_dimmed", "scrollbar", "scrollbar_dirty", "last_bottom_node", "last_bottom_y", "search_matches", "search_selected_match", "search_matches_dirty", "cells", "bg_cells_dirty", "fg_cells_dirty_from", "fg_cell_count", "uniforms", "custom_shader_uniforms", "first_frame_time", "last_frame_time", "font_shaper", "font_shaper_cache", "terminal_state", "terminal_state_frame_count", "preedit_caret_clean_rebuilds", "overlay" };
             // These fields own API-specific resources, shared ownership, or
             // fresh-renderer synchronization state. A backport must classify
             // every new field explicitly instead of silently dropping state.
@@ -2840,7 +2846,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // unconditionally add preedit cells when this is set.
                 if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
 
-                const range = preedit_v.range(
+                const range = preedit_v.layout(
                     cursor_vp.x,
                     state.cols - 1,
                 );
@@ -2921,8 +2927,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .{};
                 };
 
-                // If we have preedit text, we don't setup a cursor
-                if (preedit != null) break :cursor;
+                // A preedit replaces the cursor. When the input method
+                // reports a caret inside it, a steady bar marks it, on every
+                // rebuild: the cursor lists were cleared above, and the
+                // preedit's own cells are only rebuilt with its row.
+                if (preedit) |preedit_v| {
+                    const caret_x = preedit_v.layout(
+                        cursor_vp.x,
+                        state.cols - 1,
+                    ).caret_x orelse break :cursor;
+                    const caret_color = caret_color: {
+                        if (state.colors.cursor) |v| break :caret_color v;
+                        if (self.config.cursor_color) |v| switch (v) {
+                            .color => |color| break :caret_color color.toTerminalRGB(),
+                            // A cell's colours are not the preedit's.
+                            .@"cell-foreground", .@"cell-background" => {},
+                        };
+                        break :caret_color state.colors.foreground;
+                    };
+                    self.addCursorAt(.bar, false, caret_x, cursor_vp.y, caret_color);
+                    if (comptime build_config.renderer_test_tools) {
+                        if (preedit_range == null) self.preedit_caret_clean_rebuilds += 1;
+                    }
+                    break :cursor;
+                }
 
                 // If there isn't a cursor visual style requested then
                 // we don't render a cursor.
@@ -3057,6 +3085,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const range = preedit_range orelse break :preedit;
                 var x = range.x[0];
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
+                    // A caret in the cut head cuts the tail instead.
+                    if (x + @as(usize, @intFromBool(cp.wide)) > range.x[1]) break;
                     self.addPreeditCell(
                         cp,
                         .{ .x = x, .y = range.y },
@@ -3732,7 +3762,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // to the actual character.
                 break :cell .{ true, cursor_vp.x - 1 };
             };
+            self.addCursorAt(cursor_style, wide, x, cursor_vp.y, cursor_color);
+        }
 
+        /// Draw a cursor of `cursor_style` at cell (`x`, `y`), two cells
+        /// wide when `wide`.
+        fn addCursorAt(
+            self: *Self,
+            cursor_style: renderer.CursorStyle,
+            wide: bool,
+            x: terminal.size.CellCountInt,
+            y: terminal.size.CellCountInt,
+            cursor_color: terminal.color.RGB,
+        ) void {
             const alpha: u8 = if (!self.focused) 255 else alpha: {
                 const alpha = 255 * self.config.cursor_opacity;
                 break :alpha @intFromFloat(@ceil(alpha));
@@ -3789,7 +3831,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, y },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },

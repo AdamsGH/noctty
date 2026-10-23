@@ -353,7 +353,7 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
     const file = try std.fs.cwd().createFile(status_path, .{});
     defer file.close();
     const json = switch (self.active) {
-        .opengl => |v| try std.json.Stringify.valueAlloc(self.alloc, .{ .backend = "opengl", .split_dimmed = v.split_dimmed }, .{}),
+        .opengl => |v| try std.json.Stringify.valueAlloc(self.alloc, .{ .backend = "opengl", .split_dimmed = v.split_dimmed, .preedit_caret_clean_rebuilds = v.preedit_caret_clean_rebuilds }, .{}),
         .d3d11 => |v| report: {
             const receipt = v.api.stats();
             var max_image_id: u32 = 0;
@@ -364,6 +364,7 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
             break :report try std.json.Stringify.valueAlloc(self.alloc, .{
                 .backend = "d3d11",
                 .split_dimmed = v.split_dimmed,
+                .preedit_caret_clean_rebuilds = v.preedit_caret_clean_rebuilds,
                 .warp = receipt.warp != 0,
                 .adapter = std.mem.sliceTo(&receipt.adapter_name, 0),
                 .feature_level = receipt.feature_level,

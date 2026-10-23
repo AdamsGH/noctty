@@ -8,6 +8,7 @@ param(
     [switch]$WarpOnly,
     [switch]$OpenGLStartupOnly,
     [switch]$SplitDimOnly,
+    [switch]$PreeditCaretOnly,
     [switch]$Driver,
     [string]$RealProfile = '',
     [string]$DesktopName = ''
@@ -63,6 +64,7 @@ if (!$Driver) {
         if ($WarpOnly) { $command += ' -WarpOnly' }
         if ($OpenGLStartupOnly) { $command += ' -OpenGLStartupOnly' }
         if ($SplitDimOnly) { $command += ' -SplitDimOnly' }
+        if ($PreeditCaretOnly) { $command += ' -PreeditCaretOnly' }
         if (![RendererNative]::CreateProcessW($exe, [Text.StringBuilder]::new($command), [IntPtr]::Zero, [IntPtr]::Zero, $false, 0x08004000, [IntPtr]::Zero, $PSScriptRoot, [ref]$si, [ref]$pi)) { throw 'Hidden driver CreateProcess failed.' }
         Write-Output "Hidden renderer driver PID=$($pi.pid) desktop=$DesktopName"
         $wait = [Diagnostics.Stopwatch]::StartNew()
@@ -86,7 +88,7 @@ if (!$Driver) {
 if ([RendererNative]::DesktopName() -ne $DesktopName -or !$DesktopName.StartsWith('renderer-test-')) { throw 'Driver is not on its verified hidden desktop.' }
 [void][RendererNative]::SetThreadDpiAwarenessContext([IntPtr]-4)
 $result = [ordered]@{ status = 'error'; hiddenDesktop = $DesktopName; profileBefore = $before; binarySHA256 = (Get-FileHash -LiteralPath $Binary).Hash; runs = @(); comparisons = @() }
-function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironment = @{}, [string[]]$ExtraConfig = @(), [switch]$Lifecycle, [switch]$MultiPane, [switch]$Streaming, [int]$FailureAction = 0, [switch]$ReloadUnsupported, [switch]$ReloadImages, [switch]$RetryHardware, [switch]$OpenGLStartupFallback, [switch]$SplitDim, [switch]$HoldSync, [switch]$NoShaderReload, [string]$SplitFill = '', [double]$SplitOpacity = 0.7) {
+function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironment = @{}, [string[]]$ExtraConfig = @(), [switch]$Lifecycle, [switch]$MultiPane, [switch]$Streaming, [int]$FailureAction = 0, [switch]$ReloadUnsupported, [switch]$ReloadImages, [switch]$RetryHardware, [switch]$OpenGLStartupFallback, [switch]$SplitDim, [switch]$HoldSync, [switch]$NoShaderReload, [string]$SplitFill = '', [double]$SplitOpacity = 0.7, [switch]$PreeditCaret, [switch]$HideCursor) {
     [void](Assert-Profile $before)
     $run = Join-Path $OutputDirectory $Label
     $bin = Join-Path $run 'bin'
@@ -103,6 +105,12 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
     $config += 'command=direct:"' + (Get-Command pwsh).Source + '" -NoProfile -File "' + (Join-Path $bin 'Fixture.ps1') + '"'
     if ($Streaming) { $config[-1] += ' -Stream' }
     if ($HoldSync) { $config[-1] += ' -HoldSync' }
+    if ($HideCursor) { $config[-1] += ' -HideCursor' }
+    if ($PreeditCaret) {
+        $config[-1] += ' -Tick'
+        # The caret is drawn in the cursor colour; no fixture text has it.
+        $config += 'cursor-color=#13f7a9'
+    }
     if ($SplitDim) {
         $config[-1] += ' -HideCursor'
         $config += 'unfocused-split-opacity=' + $SplitOpacity.ToString([Globalization.CultureInfo]::InvariantCulture)
@@ -487,6 +495,89 @@ function Invoke-Case([string]$Label, [string]$Backend, [hashtable]$ExtraEnvironm
                 $case.alone = & $paneCapture $right 'alone-right' $false
             }
         }
+        if ($PreeditCaret) {
+            # An IME composition goes in through the test-tools hook (0x8059),
+            # past only the IMM read: fixture 1 is "zhongguo", 2 three CJK
+            # characters, 3 208 letters, wider than the grid. Its caret is
+            # the only thing in the cursor colour; the visible terminal
+            # cursor, a block in that colour, gives the cell geometry.
+            $tolerance = if ($case.initial.status.warp) { 4 } else { 0 }
+            $box = { param($Frame) [RendererNative]::ColorBox($Frame.path, 0x13, 0xf7, 0xa9, $tolerance) | ConvertFrom-Json }
+            $compose = {
+                param([int]$Fixture, [int]$Cursor, [string]$Name)
+                if (![RendererNative]::Preedit($surfaceWindow, $Fixture, $Cursor)) { throw "IME composition hook rejected fixture $Fixture, cursor $Cursor." }
+                Start-Sleep -Milliseconds 300
+                $frame = & $capture $Name
+                $frame.caret = & $box $frame
+                return $frame
+            }
+            $p = [ordered]@{ cursorCell = (& $box $case.initial) }
+            $case.preedit = $p
+            if ($HideCursor) {
+                if ($p.cursorCell.count -ne 0) { throw 'The fixture did not hide its cursor.' }
+            } elseif ($p.cursorCell.count -lt 20) { throw 'No terminal cursor in the cursor colour to measure the cell by.' }
+            $p.caret5 = & $compose 1 5 'preedit-caret-5'
+            $bar = $p.caret5.caret
+            if ($bar.count -lt 4) { throw "No composition caret drawn at cursor 5 (count $($bar.count))." }
+            if ($HideCursor) { $caseSuccessful = $true; return $case }
+            $cell = $p.cursorCell
+            $cw = $cell.x1 - $cell.x0 + 1
+            $p.cellWidth = $cw
+            # A bar, not a block: it straddles the left edge of the sixth
+            # preedit cell and spans the cell's height.
+            $edge = $cell.x0 + 5 * $cw
+            if ($bar.x1 - $bar.x0 + 1 -gt [Math]::Max(1, [int]($cw / 2)) -or $bar.x0 -gt $edge -or $bar.x1 + 1 -lt $edge) { throw "Caret at cursor 5 is not a bar on the cell edge at x=${edge}: $($bar | ConvertTo-Json -Compress)." }
+            if ([Math]::Abs($bar.y0 - $cell.y0) -gt 1 -or [Math]::Abs($bar.y1 - $cell.y1) -gt 1) { throw "Caret height differs from the cell: $($bar | ConvertTo-Json -Compress)." }
+            $expectBar = {
+                param($Frame, [int]$Cells, [string]$What)
+                $c = $Frame.caret
+                if ($c.count -ne $bar.count -or $c.x0 -ne $bar.x0 + $Cells * $cw -or $c.x1 -ne $bar.x1 + $Cells * $cw -or $c.y0 -ne $bar.y0 -or $c.y1 -ne $bar.y1) { throw "${What}: expected the cursor-5 bar moved $Cells cells, found $($c | ConvertTo-Json -Compress)." }
+            }
+            $p.caret4 = & $compose 1 4 'preedit-caret-4'; & $expectBar $p.caret4 -1 'Cursor 4'
+            $p.caret0 = & $compose 1 0 'preedit-caret-0'; & $expectBar $p.caret0 -5 'Cursor 0'
+            $p.caret8 = & $compose 1 8 'preedit-caret-end'; & $expectBar $p.caret8 3 'Cursor 8 (the end)'
+            $p.noCaret = & $compose 1 -1 'preedit-no-caret'
+            if ($p.noCaret.caret.count -ne 0) { throw 'A composition without a caret drew one.' }
+            $p.wide = & $compose 2 1 'preedit-wide-caret-1'; & $expectBar $p.wide -3 'Wide caret 1'
+            $p.longHead = & $compose 3 2 'preedit-long-caret-head'; & $expectBar $p.longHead -5 'Caret in the cut head'
+            $p.longEnd = & $compose 3 208 'preedit-long-caret-end'
+            $cells = ($p.longEnd.caret.x0 - $p.caret0.caret.x0) / $cw
+            # The last column: its cell ends inside the right padding (at
+            # least the left padding, cell.x0) and another cell would not.
+            $right = $cell.x0 + ($cells + 1) * $cw
+            $limit = $p.longEnd.caret.width - $cell.x0
+            if ($p.longEnd.caret.count -ne $bar.count -or $cells -ne [Math]::Floor($cells) -or $right -gt $limit -or $right + $cw -le $limit) { throw "Caret at the end of an overlong composition is not on the last column: $($p.longEnd.caret | ConvertTo-Json -Compress)." }
+            $p.longEndColumn = $cells
+            # Blink ticks with no output rebuild frames in which no row is
+            # dirty, so the preedit's cells are kept from an earlier frame
+            # and only a caret set on every rebuild is still drawn. The
+            # fixture turns blinking on and then writes nothing; the
+            # renderer counts the rebuilds that drew the caret with the
+            # preedit row clean, and the captures ask for no redraw.
+            $p.beforeTicks = & $compose 1 5 'preedit-before-ticks'; & $expectBar $p.beforeTicks 0 'Cursor 5 again'
+            Set-Content -LiteralPath ($environment.NOCTTY_RENDERER_READY_PATH + '.blink') -Value 'blink'
+            Start-Sleep -Milliseconds 500
+            $p.blinkStart = & $capture 'preedit-blink-start' -NoReplay
+            $p.blinkStart.caret = & $box $p.blinkStart
+            & $expectBar $p.blinkStart 0 'After blinking was turned on'
+            Start-Sleep -Milliseconds 2500
+            $p.blinkEnd = & $capture 'preedit-blink-end' -NoReplay
+            $p.blinkEnd.caret = & $box $p.blinkEnd
+            $p.cleanRebuilds = $p.blinkEnd.status.preedit_caret_clean_rebuilds - $p.blinkStart.status.preedit_caret_clean_rebuilds
+            if ($null -eq $p.blinkEnd.status.preedit_caret_clean_rebuilds -or $p.cleanRebuilds -lt 2) { throw "No blink frames rebuilt with the preedit row clean ($($p.cleanRebuilds) in 2.5 s)." }
+            & $expectBar $p.blinkEnd 0 'After blink frames with no output'
+            # Output on another row: the cursor moves to it and back.
+            Set-Content -LiteralPath ($environment.NOCTTY_RENDERER_READY_PATH + '.tick') -Value 'tick'
+            Start-Sleep -Milliseconds 1500
+            $p.afterTicks = & $capture 'preedit-after-ticks' -NoReplay
+            $p.afterTicks.caret = & $box $p.afterTicks
+            $p.tickDiff = [RendererNative]::Diff($p.beforeTicks.path, $p.afterTicks.path, (Join-Path $run 'preedit-ticks-diff.png')) | ConvertFrom-Json
+            if ($p.tickDiff.different -lt 10) { throw 'The fixture output on another row never reached a frame.' }
+            & $expectBar $p.afterTicks 0 'After output on another row'
+            $p.cleared = & $compose 0 0 'preedit-cleared'
+            $c = $p.cleared.caret
+            if ($c.count -ne $cell.count -or $c.x0 -ne $cell.x0 -or $c.y0 -ne $cell.y0) { throw "Clearing the composition did not bring the terminal cursor back: $($c | ConvertTo-Json -Compress)." }
+        }
         if ($MultiPane) {
             if (![RendererNative]::Action($surfaceWindow, 2)) { throw 'Split action rejected.' }
             Start-Sleep -Milliseconds 1500
@@ -565,9 +656,28 @@ function Invoke-SplitDimCases {
         if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP dim exceeds documented edge quantization tolerance.' }
     }
 }
+# The IME composition caret on every backend: hardware matches OpenGL
+# exactly, WARP within its edge tolerance; a hidden terminal cursor keeps it.
+function Invoke-PreeditCaretCases {
+    $preeditGL = Invoke-Case 'preedit-caret-opengl' 'opengl' -PreeditCaret; $result.runs += $preeditGL
+    $preeditHardware = Invoke-Case 'preedit-caret-hardware' 'd3d11' -PreeditCaret; $result.runs += $preeditHardware
+    $preeditWarp = Invoke-Case 'preedit-caret-warp' 'd3d11-warp' -PreeditCaret; $result.runs += $preeditWarp
+    $hidden = Invoke-Case 'preedit-caret-hidden-cursor' 'opengl' -PreeditCaret -HideCursor; $result.runs += $hidden
+    $a = $hidden.preedit.caret5.caret; $b = $preeditGL.preedit.caret5.caret
+    if ($a.count -ne $b.count -or $a.x0 -ne $b.x0 -or $a.y0 -ne $b.y0) { throw 'The caret moved or vanished with the terminal cursor hidden.' }
+    foreach ($candidate in @($preeditHardware, $preeditWarp)) {
+        foreach ($frame in @('caret5', 'longEnd')) {
+            $diff = [RendererNative]::Diff($preeditGL.preedit[$frame].path, $candidate.preedit[$frame].path, (Join-Path $OutputDirectory ($candidate.label + '-' + $frame + '-diff.png'))) | ConvertFrom-Json
+            $result.comparisons += @{ label = $candidate.label + '-' + $frame; diff = $diff }
+            if (!$candidate.initial.status.warp -and $diff.different -ne 0) { throw 'Hardware draws the composition differently from OpenGL.' }
+            if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP composition exceeds documented edge quantization tolerance.' }
+        }
+    }
+}
 try {
     # The split-dim cases include OpenGL runs, so they need an OpenGL 4.3 driver.
     if ($SplitDimOnly) { Invoke-SplitDimCases; $result.status = 'pass'; return }
+    if ($PreeditCaretOnly) { Invoke-PreeditCaretCases; $result.status = 'pass'; return }
     # These cases need no GL driver and run on x64 and native ARM64 CI too.
     $startupFallback = Invoke-Case 'opengl-startup-fallback' 'opengl' @{NOCTTY_RENDERER_FAIL_OPENGL_VERSION='1'} -OpenGLStartupFallback
     $result.runs += $startupFallback
@@ -583,6 +693,7 @@ try {
         $result.runs += $warp
         if (!$warp.initial.status.warp) { throw 'Forced WARP selected hardware.' }
         $splitWarp = Invoke-Case 'split-dim-warp' 'd3d11-warp' -SplitDim -SplitFill 'ffffff' -NoShaderReload; $result.runs += $splitWarp
+        $result.runs += Invoke-Case 'preedit-caret-warp' 'd3d11-warp' -PreeditCaret
         $result.status = 'pass'
         return
     }
@@ -599,6 +710,7 @@ try {
         if ($candidate.initial.status.warp -and ($diff.maxChannelDelta -gt 4 -or $diff.different -gt $diff.pixels * 0.01 -or $diff.over2 -gt $diff.pixels * 0.001)) { throw 'WARP exceeds documented edge quantization tolerance.' }
     }
     Invoke-SplitDimCases
+    Invoke-PreeditCaretCases
     $noDevice = Invoke-Case 'no-device' 'd3d11' @{ NOCTTY_RENDERER_FAIL_DEVICE = '1' }; $result.runs += $noDevice
     if ($noDevice.initial.status.backend -ne 'opengl') { throw 'Unavailable D3D11 did not select OpenGL.' }
     $noLibrary = Invoke-Case 'no-library' 'd3d11' @{ NOCTTY_RENDERER_FAIL_LIBRARY = '1' }; $result.runs += $noLibrary

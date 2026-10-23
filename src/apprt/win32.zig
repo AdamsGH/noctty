@@ -35893,8 +35893,12 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
                     // the pane, which frees the surface before this returns.
                     if (v.handleImeResult() == .closed) return 0;
                 }
-                if ((parts & c.GCS_COMPSTR) != 0) {
-                    v.handleImeComposition();
+                switch (win32_input.imeCompositionAction(parts)) {
+                    .refresh => v.handleImeComposition(),
+                    .cancel => if (v.core_initialized) {
+                        v.core_surface.preeditCallback(null) catch {};
+                    },
+                    .none => {},
                 }
                 return 0;
             }
@@ -36105,6 +36109,33 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
                 }
             }
             return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        0x8059 => { // Test-only IME composition, past the IMM read only.
+            if (build_config.renderer_test_tools) {
+                if (surface) |v| {
+                    if (!v.core_initialized) return 0;
+                    // 3 is wider than any test window: a-z repeated.
+                    var long: [208]u16 = undefined;
+                    for (&long, 0..) |*unit, i| unit.* = 'a' + @as(u16, @intCast(i % 26));
+                    const units: []const u16 = switch (wParam) {
+                        0 => &.{},
+                        1 => std.unicode.utf8ToUtf16LeStringLiteral("zhongguo"),
+                        2 => std.unicode.utf8ToUtf16LeStringLiteral("\u{4E2D}\u{56FD}\u{4EBA}"),
+                        3 => &long,
+                        else => return 0,
+                    };
+                    var utf8_stack: [512]u8 = undefined;
+                    win32_input.applyImeComposition(
+                        Surface.KeyTarget{ .surface = v },
+                        v.app.core_app.alloc,
+                        units,
+                        @truncate(@as(isize, lParam)),
+                        &utf8_stack,
+                    );
+                    return 1;
+                }
+            }
+            return 0;
         },
         0x8056 => { // Test-only actions through the production binding path.
             if (build_config.renderer_test_tools) {
@@ -41857,6 +41888,10 @@ pub const Surface = struct {
         pub fn preeditCallback(self: KeyTarget, preedit: ?[]const u8) void {
             self.surface.core_surface.preeditCallback(preedit) catch {};
         }
+
+        pub fn preeditCaretCallback(self: KeyTarget, preedit: ?[]const u8, caret: ?usize) void {
+            self.surface.core_surface.preeditCaretCallback(preedit, caret) catch {};
+        }
     };
 
     fn positionImeWindow(self: *Surface) void {
@@ -41886,25 +41921,57 @@ pub const Surface = struct {
     ) ?win32_input.ImeText {
         const surface_hwnd = self.hwnd orelse return null;
         const himc = sys.ImmGetContext(surface_hwnd) orelse return null;
-        defer _ = sys.ImmReleaseContext(surface_hwnd, himc);
+        var units_stack: [128]u16 = undefined;
+        const units = readImeUnits(himc, alloc, which, &units_stack);
+        _ = sys.ImmReleaseContext(surface_hwnd, himc);
+        const read = units orelse return null;
+        defer read.deinit(alloc);
+        return win32_input.imeTextUtf8(alloc, read.units(), utf8_stack) catch null;
+    }
 
+    /// One IME string's UTF-16 units, in the caller's `stack` when they fit
+    /// there and on the heap otherwise.
+    const ImeUnits = struct {
+        buf: []u16,
+        len: usize,
+        heap: bool,
+
+        fn units(self: ImeUnits) []const u16 {
+            return self.buf[0..self.len];
+        }
+
+        fn deinit(self: ImeUnits, alloc: std.mem.Allocator) void {
+            if (self.heap) alloc.free(self.buf);
+        }
+    };
+
+    /// Read IME string `which` from `himc`, or null when there is none or it
+    /// cannot be read.
+    fn readImeUnits(
+        himc: *anyopaque,
+        alloc: std.mem.Allocator,
+        which: u32,
+        stack: []u16,
+    ) ?ImeUnits {
         const byte_len = sys.ImmGetCompositionStringW(himc, which, null, 0);
         if (byte_len <= 0) return null;
         const len: u32 = @intCast(byte_len);
         const wchar_count = len / 2;
 
         // Most IME strings are short; longer ones go to the heap.
-        var stack_buf: [128]u16 = undefined;
-        const buf: []u16 = if (wchar_count <= stack_buf.len)
-            stack_buf[0..wchar_count]
+        const heap = wchar_count > stack.len;
+        const buf: []u16 = if (!heap)
+            stack[0..wchar_count]
         else
             alloc.alloc(u16, wchar_count) catch return null;
-        defer if (wchar_count > stack_buf.len) alloc.free(buf);
 
         const read = sys.ImmGetCompositionStringW(himc, which, buf.ptr, len);
-        if (read <= 0) return null;
+        if (read <= 0) {
+            if (heap) alloc.free(buf);
+            return null;
+        }
         const actual_bytes: usize = @intCast(read);
-        return win32_input.imeTextUtf8(alloc, buf[0 .. actual_bytes / 2], utf8_stack) catch null;
+        return .{ .buf = buf, .len = @min(actual_bytes / 2, buf.len), .heap = heap };
     }
 
     /// Commit the IME's result string. Returns the core's effect: committing
@@ -41931,15 +41998,29 @@ pub const Surface = struct {
     fn handleImeComposition(self: *Surface) void {
         if (!self.core_initialized) return;
         const alloc = self.app.core_app.alloc;
-        var utf8_stack: [512]u8 = undefined;
-        const text = self.readImeString(alloc, c.GCS_COMPSTR, &utf8_stack) orelse {
+
+        // The string and its caret come from one input context, released
+        // before the core sees them.
+        var units_stack: [128]u16 = undefined;
+        const read: ?ImeUnits, const cursor: i32 = read: {
+            const surface_hwnd = self.hwnd orelse break :read .{ null, -1 };
+            const himc = sys.ImmGetContext(surface_hwnd) orelse break :read .{ null, -1 };
+            defer _ = sys.ImmReleaseContext(surface_hwnd, himc);
+            const units = readImeUnits(himc, alloc, c.GCS_COMPSTR, &units_stack) orelse
+                break :read .{ null, -1 };
+            // GCS_CURSORPOS comes back as the return value: UTF-16 units
+            // before the caret, or negative when there is none.
+            break :read .{ units, sys.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0) };
+        };
+        const units = read orelse {
             self.core_surface.preeditCallback(null) catch {};
             return;
         };
-        defer text.deinit(alloc);
+        defer units.deinit(alloc);
 
         // Update preedit display and reposition IME window
-        self.core_surface.preeditCallback(text.bytes) catch {};
+        var utf8_stack: [512]u8 = undefined;
+        win32_input.applyImeComposition(KeyTarget{ .surface = self }, alloc, units.units(), cursor, &utf8_stack);
         self.positionImeWindow();
     }
 

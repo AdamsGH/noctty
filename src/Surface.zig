@@ -4414,6 +4414,14 @@ fn balancePaddingIfNeeded(self: *Surface) void {
 ///
 /// The preedit input must be UTF-8 encoded.
 pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
+    try self.preeditCaretCallback(preedit_, null);
+}
+
+/// `preeditCallback` with the input method's composition caret: `caret` is
+/// a codepoint index into `preedit_` (0 is before the first codepoint), or
+/// null when the input method reports none. Any change, the caret alone
+/// included, redraws the preedit.
+pub fn preeditCaretCallback(self: *Surface, preedit_: ?[]const u8, caret: ?usize) !void {
     // log.debug("text preeditCallback value={any}", .{preedit_});
 
     // Crash metadata in case we crash in here
@@ -4443,45 +4451,86 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     // Mark preedit dirty flag
     self.io.terminal.flags.dirty.preedit = true;
 
-    // If we have no text, we're done. We queue a render in case we cleared
-    // a prior preedit (likely).
-    const text = preedit_ orelse {
-        try self.queueRender();
-        return;
-    };
+    // With no text, or none that takes a cell, we're done. We queue a
+    // render in case we cleared a prior preedit (likely).
+    if (preedit_) |text| {
+        self.renderer_state.preedit = try preeditFromText(self.alloc, text, caret);
+    }
+    try self.queueRender();
+}
 
-    // We convert the UTF-8 text to codepoints.
+/// The preedit the renderer draws for UTF-8 `text`, or null when no
+/// codepoint in it takes a cell. Codepoints with no width are dropped (I've
+/// never seen a preedit text with a zero-width character; in theory it's
+/// possible but we can't really handle it right now), so `caret`, a
+/// codepoint index into `text`, becomes the number of kept codepoints
+/// before it.
+fn preeditFromText(
+    alloc: Allocator,
+    text: []const u8,
+    caret: ?usize,
+) !?rendererpkg.State.Preedit {
     const view = try std.unicode.Utf8View.init(text);
     var it = view.iterator();
 
-    // Allocate the codepoints slice
     const Codepoint = rendererpkg.State.Preedit.Codepoint;
     var codepoints: std.ArrayListUnmanaged(Codepoint) = .{};
-    defer codepoints.deinit(self.alloc);
-    while (it.nextCodepoint()) |cp| {
+    defer codepoints.deinit(alloc);
+    var kept_before_caret: usize = 0;
+    var source: usize = 0;
+    while (it.nextCodepoint()) |cp| : (source += 1) {
         const width: usize = @intCast(unicode.table.get(cp).width);
-
-        // I've never seen a preedit text with a zero-width character. In
-        // theory its possible but we can't really handle it right now.
-        // Let's just ignore it.
         if (width <= 0) continue;
-
-        try codepoints.append(
-            self.alloc,
-            .{ .codepoint = cp, .wide = width >= 2 },
-        );
+        if (caret) |c| {
+            if (source < c) kept_before_caret += 1;
+        }
+        try codepoints.append(alloc, .{ .codepoint = cp, .wide = width >= 2 });
     }
+    if (codepoints.items.len == 0) return null;
 
-    // If we have no codepoints, then we're done.
-    if (codepoints.items.len == 0) {
-        try self.queueRender();
-        return;
-    }
-
-    self.renderer_state.preedit = .{
-        .codepoints = try codepoints.toOwnedSlice(self.alloc),
+    return .{
+        .codepoints = try codepoints.toOwnedSlice(alloc),
+        .caret = if (caret != null) kept_before_caret else null,
     };
-    try self.queueRender();
+}
+
+test "preedit caret maps onto the codepoints that take a cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        // U+0301 has no width and is dropped, so a caret after it counts
+        // only the codepoints that are drawn.
+        const p = (try preeditFromText(alloc, "e\u{0301}x", 2)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(usize, 2), p.codepoints.len);
+        try testing.expectEqual(@as(?usize, 1), p.caret);
+    }
+    {
+        const p = (try preeditFromText(alloc, "e\u{0301}x", 3)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, 2), p.caret);
+    }
+    {
+        // Past the end clamps to the end.
+        const p = (try preeditFromText(alloc, "\u{4E2D}\u{56FD}", 9)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, 2), p.caret);
+        try testing.expect(p.codepoints[0].wide);
+    }
+    {
+        const p = (try preeditFromText(alloc, "ab", 0)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, 0), p.caret);
+    }
+    {
+        // No caret stays none.
+        const p = (try preeditFromText(alloc, "ab", null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, null), p.caret);
+    }
+    try testing.expect((try preeditFromText(alloc, "", 0)) == null);
+    try testing.expect((try preeditFromText(alloc, "\u{0301}", 1)) == null);
 }
 
 fn applyKeyRemaps(

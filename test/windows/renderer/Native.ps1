@@ -78,6 +78,11 @@ public static class RendererNative {
  public static void Readback(string bmp,string png) {using(var image=new Bitmap(bmp)){image.Save(png,ImageFormat.Png);} }
  public static bool Capture(IntPtr h,string path) { RECT r;GetClientRect(h,out r); using(var b=new Bitmap(Math.Max(1,r.r),Math.Max(1,r.b),PixelFormat.Format32bppArgb)) { bool ok;using(var g=Graphics.FromImage(b)){g.Clear(Color.Magenta);IntPtr dc=g.GetHdc();try{IntPtr result;ok=SendMessageTimeoutW(h,0x0318,dc,(IntPtr)4,2,5000,out result)!=IntPtr.Zero && result!=IntPtr.Zero;}finally{g.ReleaseHdc(dc);}}b.Save(path,ImageFormat.Png);return ok;} }
  public static string PixelStats(string path) { using(var b=new Bitmap(path)){var c=new HashSet<int>();long nonblack=0;for(int y=0;y<b.Height;y++)for(int x=0;x<b.Width;x++){int p=b.GetPixel(x,y).ToArgb()&0xffffff;c.Add(p);if(p!=0)nonblack++;}return string.Format(System.Globalization.CultureInfo.InvariantCulture,"{{\"width\":{0},\"height\":{1},\"colors\":{2},\"nonblack\":{3}}}",b.Width,b.Height,c.Count,nonblack);} }
+ // Shows IME composition fixture `fixture` (0 clears) with its caret at UTF-16
+ // unit `cursor` (-1 for none) through the test-tools hook, past the IMM read.
+ public static bool Preedit(IntPtr surf,int fixture,int cursor) { IntPtr result;return SendMessageTimeoutW(surf,0x8059,(IntPtr)fixture,(IntPtr)cursor,2,5000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
+ // Counts the pixels within `tolerance` of one colour and their bounding box.
+ public static string ColorBox(string path,int r,int g,int b,int tolerance) {using(var image=new Bitmap(path)){long count=0;int x0=-1,y0=-1,x1=-1,y1=-1;for(int y=0;y<image.Height;y++)for(int x=0;x<image.Width;x++){var p=image.GetPixel(x,y);if(Math.Abs(p.R-r)>tolerance||Math.Abs(p.G-g)>tolerance||Math.Abs(p.B-b)>tolerance)continue;count++;if(x0<0||x<x0)x0=x;if(y0<0||y<y0)y0=y;if(x>x1)x1=x;if(y>y1)y1=y;}return string.Format(System.Globalization.CultureInfo.InvariantCulture,"{{\"count\":{0},\"x0\":{1},\"y0\":{2},\"x1\":{3},\"y1\":{4},\"width\":{5}}}",count,x0,y0,x1,y1,image.Width);} }
  public static int Left(IntPtr h) { RECT r; if(!GetWindowRect(h,out r))throw new Exception("Cannot read a pane rect"); return r.l; }
  // Checks `dimmed` against `undimmed` blended toward the fill in sRGB (gamma)
  // space, round((u*(255-a) + f*a)/255) per channel. Pixels off by more than
