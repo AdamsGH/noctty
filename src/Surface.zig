@@ -8908,6 +8908,44 @@ fn completeClipboardPaste(
     };
 }
 
+/// What a program with bracketed paste on receives for a user paste that found
+/// no text on the clipboard: the two fences and nothing between them. It tells
+/// a program that reads the clipboard itself (an image, say) that the user
+/// pasted, which is what Windows Terminal sends in the same case.
+const empty_bracketed_paste = "\x1b[200~\x1b[201~";
+
+/// A user's paste found no text on the clipboard. Writes an empty bracketed
+/// paste if the program turned bracketed paste (DECSET 2004) on and returns
+/// true; otherwise writes nothing and returns false, so the caller can report
+/// "nothing was pasted" and a `performable:` binding falls through to the
+/// program as a key.
+///
+/// This is not `completeClipboardPaste` with empty data on purpose: that
+/// function ignores empty data, and the callers that share it (`textCallback`,
+/// automation `send_text`, drops, quick select, insert-last-command) must keep
+/// sending nothing for empty input. Only the apprt knows a user gesture found
+/// the clipboard without text, and it must never call this for an OSC 52 read.
+pub fn completeClipboardPasteWithoutText(self: *Surface) !bool {
+    if (self.readonly) return false;
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
+        if (!opts.bracketed) return false;
+
+        // Like every paste, jump to the bottom (lock held).
+        self.scrollToBottom() catch |err| {
+            log.warn("error scrolling to bottom err={}", .{err});
+        };
+    }
+
+    // One write, so the pair cannot be split by other input.
+    self.queueIo(.{ .write_stable = empty_bracketed_paste }, .unlocked);
+    return true;
+}
+
 /// Insert uses the same unsafe-paste detector as clipboard paste, then applies
 /// a stricter contract than a normal paste: one non-empty UTF-8 line with no
 /// control or Unicode line-separator characters. The recovered text is never

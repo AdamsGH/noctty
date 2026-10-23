@@ -2778,6 +2778,10 @@ pub const App = struct {
         text: [:0]const u8,
         confirmed: bool,
     ) anyerror!void = null,
+    /// Test-only stand-in for the system clipboard read behind a paste or an
+    /// OSC 52 read, so no test opens the real clipboard. Returns null for a
+    /// clipboard without text; the text is owned by the given allocator.
+    test_clipboard_read: ?*const fn (alloc: Allocator) anyerror!?[:0]u8 = null,
     /// Test-only interleaving seam for the focus revision race between a
     /// structural prepare and commit (a split undone, a tab closed again).
     /// `pane` is one whose focus the test moves.
@@ -37889,14 +37893,37 @@ pub const Surface = struct {
             };
         }
 
+        const text = if (self.app.test_clipboard_read) |read|
+            try read(self.app.core_app.alloc)
+        else
+            try self.readClipboardText();
+        return self.completeClipboardRead(state, text);
+    }
+
+    /// Finishes a clipboard request with what the clipboard held: `text` is
+    /// null when it holds no text at all, and owned by `core_app.alloc`.
+    fn completeClipboardRead(
+        self: *Surface,
+        state: apprt.ClipboardRequest,
+        text: ?[:0]u8,
+    ) !bool {
         // `str` is always owned by `core_app.alloc`, so one defer covers both
         // clipboard reads and the synthesized empty-string fallback.
-        const str: [:0]u8 = (try self.readClipboardText()) orelse switch (state) {
-            .paste => return false,
+        const str: [:0]u8 = text orelse switch (state) {
+            // A user's paste of a clipboard with no text (an image, say):
+            // tell a program with bracketed paste on that a paste happened,
+            // as Windows Terminal does. A program's OSC 52 read gets the
+            // empty reply below and never an empty paste.
+            .paste => return try self.core_surface.completeClipboardPasteWithoutText(),
             .osc_52_read => try self.app.core_app.alloc.dupeZ(u8, ""),
             .osc_52_write => unreachable,
         };
         defer self.app.core_app.alloc.free(str);
+
+        // An empty text is no text to paste either; the core ignores it.
+        if (state == .paste and str.len == 0) {
+            return try self.core_surface.completeClipboardPasteWithoutText();
+        }
 
         self.core_surface.completeClipboardRequest(
             state,
@@ -44888,6 +44915,7 @@ const ClipboardReplyFixture = struct {
     host: Host = undefined,
     surface: Surface = undefined,
     session: TestSession = .{},
+    mutex: std.Thread.Mutex = .{},
 
     fn init(self: *ClipboardReplyFixture) !void {
         try self.session.init(.{
@@ -44904,6 +44932,10 @@ const ClipboardReplyFixture = struct {
         core.readonly = false;
         core.rt_surface = &self.surface;
         core.io.mailbox = try @import("../termio.zig").Mailbox.initSPSC(self.core_app.alloc);
+        errdefer core.io.mailbox.deinit(self.core_app.alloc);
+        // The terminal's modes decide whether a paste is bracketed.
+        core.io.terminal = try terminal.Terminal.init(self.core_app.alloc, .{ .cols = 10, .rows = 10 });
+        core.renderer_state = .{ .mutex = &self.mutex, .terminal = &core.io.terminal };
         self.surface.core_initialized = true;
     }
 
@@ -44912,8 +44944,13 @@ const ClipboardReplyFixture = struct {
         self.surface.core_initialized = false;
         if (self.surface.pending_clipboard_op) |*op| op.deinit(self.core_app.alloc);
         self.surface.pending_clipboard_op = null;
+        self.surface.core_surface.io.terminal.deinit(self.core_app.alloc);
         self.surface.core_surface.io.mailbox.deinit(self.core_app.alloc);
         self.session.deinit();
+    }
+
+    fn setBracketedPaste(self: *ClipboardReplyFixture, on: bool) void {
+        self.surface.core_surface.io.terminal.modes.set(.bracketed_paste, on);
     }
 
     fn expectSilent(self: *ClipboardReplyFixture) !void {
@@ -45028,6 +45065,168 @@ test "win32 OSC 52 read Allow still replies with the approved contents" {
     fixture.host.invokeConfirmCancel();
     captured.on_cancel.?(captured.userdata, .explicit);
     try fixture.expectSilent();
+}
+
+/// Stands in for the system clipboard in the empty bracketed paste tests: the
+/// text it holds, or null for a clipboard with no text at all. No test opens
+/// the real clipboard, which a hidden desktop shares with the user.
+const EmptyPasteClipboard = struct {
+    var text: ?[]const u8 = null;
+
+    fn read(alloc: Allocator) anyerror!?[:0]u8 {
+        const value = text orelse return null;
+        return try alloc.dupeZ(u8, value);
+    }
+
+    fn install(fixture: *ClipboardReplyFixture, value: ?[]const u8) void {
+        text = value;
+        fixture.app.test_clipboard_read = &read;
+    }
+};
+
+const empty_bracketed_pair = "\x1b[200~\x1b[201~";
+
+/// A user's paste of a clipboard holding `held` (null: no text format). It
+/// sends the empty pair and reports success only for a writable pane whose
+/// program turned bracketed paste on; otherwise nothing is written and it
+/// reports false, so a `performable:` binding falls through.
+fn expectUserPasteWithoutText(held: ?[]const u8, brackets: bool, readonly: bool) !void {
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.setBracketedPaste(brackets);
+    fixture.surface.core_surface.readonly = readonly;
+    EmptyPasteClipboard.install(&fixture, held);
+
+    const pasted = try fixture.surface.clipboardRequest(.standard, .{ .paste = {} });
+    if (brackets and !readonly) {
+        try std.testing.expect(pasted);
+        try fixture.expectReply(empty_bracketed_pair);
+    } else {
+        try std.testing.expect(!pasted);
+        try fixture.expectSilent();
+    }
+}
+
+test "win32 empty-bracketed-paste: a clipboard with no text format pastes the pair when brackets are on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectUserPasteWithoutText(null, true, false);
+}
+
+test "win32 empty-bracketed-paste: an empty text pastes the pair when brackets are on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectUserPasteWithoutText("", true, false);
+}
+
+test "win32 empty-bracketed-paste: a clipboard with no text format writes nothing and falls through when brackets are off" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectUserPasteWithoutText(null, false, false);
+}
+
+test "win32 empty-bracketed-paste: an empty text writes nothing and falls through when brackets are off" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectUserPasteWithoutText("", false, false);
+}
+
+test "win32 empty-bracketed-paste: a read-only pane gets nothing" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectUserPasteWithoutText(null, true, true);
+    try expectUserPasteWithoutText("", true, true);
+}
+
+test "win32 empty-bracketed-paste: a program's OSC 52 read of a clipboard with no text gets only the empty reply" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.setBracketedPaste(true);
+    fixture.surface.core_surface.config.clipboard_read = .allow;
+
+    EmptyPasteClipboard.install(&fixture, null);
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .osc_52_read = .standard }));
+    try fixture.expectReply("\x1b]52;c;\x1b\\");
+
+    // An empty text answers the same way.
+    EmptyPasteClipboard.install(&fixture, "");
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .osc_52_read = .standard }));
+    try fixture.expectReply("\x1b]52;c;\x1b\\");
+}
+
+test "win32 empty-bracketed-paste: text still pastes between the fences and unsafe text still asks" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.setBracketedPaste(true);
+
+    EmptyPasteClipboard.install(&fixture, "ab");
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    const queue = fixture.surface.core_surface.io.mailbox.spsc.queue;
+    var collected: [3][]const u8 = undefined;
+    var storage: [3][16]u8 = undefined;
+    for (&collected, &storage) |*piece, *buf| {
+        const message = queue.pop() orelse return error.MissingClipboardReply;
+        defer message.deinit();
+        switch (message) {
+            .write_small => |v| {
+                @memcpy(buf[0..v.len], v.data[0..v.len]);
+                piece.* = buf[0..v.len];
+            },
+            .write_stable => |v| {
+                @memcpy(buf[0..v.len], v);
+                piece.* = buf[0..v.len];
+            },
+            else => return error.UnexpectedClipboardReply,
+        }
+    }
+    try std.testing.expectEqualStrings("\x1b[200~", collected[0]);
+    try std.testing.expectEqualStrings("ab", collected[1]);
+    try std.testing.expectEqualStrings("\x1b[201~", collected[2]);
+    try fixture.expectSilent();
+
+    // Without brackets, text with a newline raises the confirm prompt as before.
+    fixture.setBracketedPaste(false);
+    fixture.surface.core_surface.config.clipboard_paste_protection = true;
+    EmptyPasteClipboard.install(&fixture, "a\nb");
+    try std.testing.expect(try fixture.surface.clipboardRequest(.standard, .{ .paste = {} }));
+    try std.testing.expectEqual(HostOverlayMode.confirm, fixture.host.overlay_mode);
+    try fixture.expectSilent();
+}
+
+test "win32 empty-bracketed-paste: input that is not a user paste of a clipboard stays silent" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.setBracketedPaste(true);
+    const core = &fixture.surface.core_surface;
+
+    // Typed text, automation `send_text`, drops and quick select all end in
+    // this completion; an empty text there is still nothing to send.
+    try core.textCallback("");
+    try fixture.expectSilent();
+    try core.completeClipboardRequest(.paste, "", false);
+    try fixture.expectSilent();
+    try core.completeClipboardRequest(.paste, "", true);
+    try fixture.expectSilent();
+}
+
+test "win32 empty-bracketed-paste: the paste action reports whether it pasted" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: ClipboardReplyFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const core = &fixture.surface.core_surface;
+    EmptyPasteClipboard.install(&fixture, null);
+
+    // A `performable:` binding falls through to the program when this is false.
+    fixture.setBracketedPaste(false);
+    try std.testing.expect(!try core.performBindingAction(.paste_from_clipboard));
+    try fixture.expectSilent();
+
+    fixture.setBracketedPaste(true);
+    try std.testing.expect(try core.performBindingAction(.paste_from_clipboard));
+    try fixture.expectReply(empty_bracketed_pair);
 }
 
 test "win32 a program's clipboard request asks in its own words and cannot be answered by a key in flight" {
