@@ -86,6 +86,8 @@ const IDC_ARROW: usize = 32512;
 const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 
 const WM_CLOSE: UINT = 0x0010;
+const WM_QUERYENDSESSION: UINT = 0x0011;
+const WM_ENDSESSION: UINT = 0x0016;
 const WM_NCCREATE: UINT = 0x0081;
 const WM_PAINT: UINT = 0x000F;
 const WM_ERASEBKGND: UINT = 0x0014;
@@ -1522,6 +1524,13 @@ pub const AppHandle = struct {
     /// the last terminal while settings is open does not auto-quit;
     /// once settings itself closes the timer can kick in).
     onClosed: *const fn (ctx: *anyopaque) void,
+    /// Optional. WM_QUERYENDSESSION and WM_ENDSESSION reach every top-level
+    /// window, this one included, and the app answers for all of its windows:
+    /// a Restart Manager close (`ENDSESSION_CLOSEAPP`) is declined while this
+    /// window has unsaved edits, and otherwise quits the whole app. Without
+    /// them, the window agrees and does nothing.
+    queryEndSession: ?*const fn (ctx: *anyopaque, lParam: LPARAM) bool = null,
+    endSession: ?*const fn (ctx: *anyopaque, ending: bool, lParam: LPARAM) void = null,
 };
 
 pub const SettingsWindow = struct {
@@ -6824,6 +6833,48 @@ test "SET close and quit switch the Discard prompt in place and preserve cancell
     }.body);
 }
 
+test "SET hands end-of-session messages to the app, which answers for every window" {
+    try dialog_test.onHiddenDesktop(struct {
+        var queries: u32 = 0;
+        var ends: u32 = 0;
+        var ending: ?bool = null;
+        var param: LPARAM = 0;
+
+        fn query(_: *anyopaque, lParam: LPARAM) bool {
+            queries += 1;
+            param = lParam;
+            return false;
+        }
+
+        fn end(_: *anyopaque, value: bool, lParam: LPARAM) void {
+            ends += 1;
+            ending = value;
+            param = lParam;
+        }
+
+        fn body() !void {
+            queries = 0;
+            ends = 0;
+            ending = null;
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            fixture.settings.handle.queryEndSession = &query;
+            fixture.settings.handle.endSession = &end;
+            try fixture.settings.open();
+            // ENDSESSION_CLOSEAPP: the app's answer is the window's.
+            try std.testing.expectEqual(@as(LRESULT, 0), sys.SendMessageW(fixture.hwnd(), WM_QUERYENDSESSION, 0, 1));
+            try std.testing.expectEqual(@as(u32, 1), queries);
+            try std.testing.expectEqual(@as(LPARAM, 1), param);
+            try std.testing.expectEqual(@as(LRESULT, 0), sys.SendMessageW(fixture.hwnd(), WM_ENDSESSION, 0, 1));
+            try std.testing.expectEqual(@as(u32, 1), ends);
+            try std.testing.expectEqual(@as(?bool, false), ending);
+            // The window stays open and closed nothing itself.
+            try std.testing.expect(fixture.settings.hwnd != null);
+            try std.testing.expectEqual(@as(u32, 0), fixture.closed);
+        }
+    }.body);
+}
+
 test "SET editor open errors are visible and announced with no pending edits" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
@@ -11358,6 +11409,14 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         },
         WM_CLOSE => {
             if (owner) |o| o.requestClose(hwnd);
+            return 0;
+        },
+        WM_QUERYENDSESSION => {
+            if (owner) |o| if (o.handle.queryEndSession) |query| return @intFromBool(query(o.handle.ctx, lParam));
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        WM_ENDSESSION => {
+            if (owner) |o| if (o.handle.endSession) |end| end(o.handle.ctx, wParam != 0, lParam);
             return 0;
         },
         WM_TIMER => {

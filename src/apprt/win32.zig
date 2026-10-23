@@ -2895,10 +2895,24 @@ pub const App = struct {
     /// moves it aside.
     session_state_left_alone: bool = false,
     /// Set once WM_ENDSESSION(TRUE) has saved for a sign-out, shutdown or
-    /// reboot. That snapshot is final: shells the logoff kills afterwards
-    /// close their panes, and the saves those closes would run must not
-    /// shrink it or move it aside.
+    /// reboot, or for a Restart Manager close noctty agreed to. That snapshot
+    /// is final: shells the logoff kills afterwards close their panes, and the
+    /// saves those closes would run must not shrink it or move it aside.
     session_ending: bool = false,
+    /// This process agreed to a Restart Manager close (`ENDSESSION_CLOSEAPP`)
+    /// and no WM_ENDSESSION has settled it yet. Restart Manager asks every
+    /// top-level window, so the later queries of the round re-run the checks
+    /// but do not save again (`onQueryEndSession`).
+    end_session_prepared: bool = false,
+    /// WM_ENDSESSION(TRUE, ENDSESSION_CLOSEAPP) committed the close: the
+    /// session is saved and latched, and the message loop runs `quitConfirmed`
+    /// at its next turn (`finishEndSessionClose`). Until then a host's
+    /// WM_CLOSE closes nothing, so Restart Manager's fallback cannot close the
+    /// windows one at a time.
+    end_session_quit_pending: bool = false,
+    /// Set as `run` enters its message loop: the startup restore and the
+    /// first window are done.
+    message_loop_started: bool = false,
     /// `GetTickCount64` of the last `checkpointSessionState`.
     session_checkpoint_ms: ?u64 = null,
     /// Thread timer that saves the session once a burst of structural
@@ -3303,6 +3317,8 @@ pub const App = struct {
             .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
             .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
             .onClosed = &settingsOnClosedThunk,
+            .queryEndSession = &settingsQueryEndSessionThunk,
+            .endSession = &settingsEndSessionThunk,
         });
         self.link_hover_tracker = win32_link_preview.HoverTracker.init();
         // The D3D11/DirectComposition/DirectWrite shell compositor is not
@@ -3624,10 +3640,12 @@ pub const App = struct {
         self.wakeup();
 
         var msg: MSG = undefined;
+        self.message_loop_started = true;
         while (true) {
             // Opens queued while the previous message was handled run here,
             // with no window procedure on the stack.
             if (try self.drainDeferredOpens()) break;
+            if (try self.finishEndSessionClose()) break;
             self.drainPendingHandoffs();
             self.applyPendingProfileDiscovery();
 
@@ -3955,15 +3973,102 @@ pub const App = struct {
         self.session_owner = null;
     }
 
-    /// WM_ENDSESSION(TRUE): Windows may end the process once every window
+    /// WM_QUERYENDSESSION, from any top-level window noctty owns (hosts, the
+    /// quick terminal among them, and Settings): true agrees to end. Without
+    /// `ENDSESSION_CLOSEAPP` it is a sign-out, shutdown or reboot, which noctty
+    /// never declines. With it, an installer asks through Restart Manager to
+    /// close noctty so it can replace its files. noctty agrees only when a
+    /// quit would ask nothing (`requestQuit`'s rules) and otherwise declines
+    /// without a word, raising no prompt or window: nobody may be at the
+    /// machine, and a declined close fails Setup safely (exit 5 under a
+    /// package manager) with nothing lost. Nothing closes here; WM_ENDSESSION
+    /// says whether the close goes ahead (`onEndSession`).
+    fn onQueryEndSession(self: *App, lParam: LPARAM) bool {
+        if (!endSessionClosesApp(lParam)) return true;
+        // A quit, a committed close or an update apply is under way: it has
+        // saved, or will, and ends the process itself.
+        if (!self.running or self.quitting or self.session_ending or
+            self.update_apply_queued or self.update_apply_in_flight) return true;
+        // First, so that a forced close after a decline still finds the
+        // session as it is now. Unthrottled, unlike `checkpointSessionState`;
+        // only an earlier query of this round that agreed stands in for it.
+        const saved = self.end_session_prepared or self.snapshotForEndSession();
+        const agree = self.message_loop_started and
+            !(self.settings_window.hwnd != null and self.settings_window.hasPendingChanges()) and
+            !self.anyTerminalNeedsCloseConfirmNoWait() and
+            saved;
+        self.end_session_prepared = agree;
+        return agree;
+    }
+
+    /// WM_ENDSESSION, from the same windows. `ending` false: the end was
+    /// called off (this or another window declined), and since nothing
+    /// closed, nothing is undone. True without `ENDSESSION_CLOSEAPP`: a
+    /// sign-out, shutdown or reboot (`saveForEndSession`). True with it:
+    /// Restart Manager closes noctty. Every window is saved while it is whole,
+    /// as a quit saves, and the snapshot is latched; the quit itself runs from
+    /// the message loop (`finishEndSessionClose`), never inside this sent
+    /// message, which may have arrived in the middle of other work, nor
+    /// through a posted quit, which a nested pump (`ShellExecuteW`, a menu, a
+    /// sizing loop) would run just the same. Once per process.
+    fn onEndSession(self: *App, ending: bool, lParam: LPARAM) void {
+        self.end_session_prepared = false;
+        if (!ending) return;
+        if (!endSessionClosesApp(lParam)) return self.saveForEndSession();
+        // A quit under way has saved its windows and ends the process itself.
+        if (self.session_ending or !self.running or self.quitting) return;
+        self.savePaletteMru();
+        if (self.hasSessionWindows()) self.saveSessionAsItEnds();
+        self.session_ending = true;
+        self.end_session_quit_pending = true;
+        self.wakeup();
+    }
+
+    fn endSessionClosesApp(lParam: LPARAM) bool {
+        return (@as(usize, @bitCast(lParam)) & c.ENDSESSION_CLOSEAPP) != 0;
+    }
+
+    /// The message loop's step for a Restart Manager close that WM_ENDSESSION
+    /// committed (`onEndSession`): quit as a confirmed `quit` does, whatever
+    /// `quit-after-last-window-closed` says, since an installer is waiting to
+    /// replace the files. The session was saved and latched at the commit, so
+    /// the quit saves nothing more. Returns whether the loop should exit.
+    fn finishEndSessionClose(self: *App) !bool {
+        if (!self.end_session_quit_pending) return false;
+        self.quitConfirmed();
+        self.end_session_quit_pending = false;
+        return self.finishLoopStep();
+    }
+
+    /// The Restart Manager query's save (`onQueryEndSession`). False only when
+    /// this process owns the saved session, has windows to put in it, and
+    /// could not write them.
+    fn snapshotForEndSession(self: *App) bool {
+        if (!self.sessionStateEnabled()) return true;
+        // Nothing to write over the file: the last window saved as it went,
+        // no window holds the session, or it is a restore that failed.
+        if (self.session_state_saved_before_last_host_close or
+            !self.hasSessionWindows() or self.sessionIsFailedRestore()) return true;
+        self.session_checkpoint_ms = sys.GetTickCount64();
+        return self.saveSessionState(.checkpoint);
+    }
+
+    /// Whether a quit would ask about a terminal (`pendingCloseAsk`), without
+    /// waiting for a renderer mutex (`Surface.needsCloseConfirmNoWait`).
+    fn anyTerminalNeedsCloseConfirmNoWait(self: *const App) bool {
+        for (self.hosts.items) |host| {
+            if (tabsCloseConfirmCountNoWait(host.tabs.items) > 0) return true;
+        }
+        return false;
+    }
+
+    /// A sign-out, shutdown or reboot (WM_ENDSESSION(TRUE) without
+    /// `ENDSESSION_CLOSEAPP`): Windows may end the process once every window
     /// has returned, without `GetMessage` returning, so `terminate` never
-    /// runs at sign-out, shutdown or reboot. Tear nothing down. A Restart
-    /// Manager close (an installer replacing files) may leave noctty
-    /// running, so only a real end of session latches the snapshot.
-    fn saveForEndSession(self: *App, close_app: bool) void {
+    /// runs. Tear nothing down.
+    fn saveForEndSession(self: *App) void {
         if (self.session_ending) return;
         self.savePaletteMru();
-        if (close_app) return self.checkpointSessionState();
         // A checkpoint, never `.final`: the sign-out also ends the shells, so
         // an empty window list here says nothing about what the user closed.
         // Latched even when the save fails: any later save would come from
@@ -3974,9 +4079,8 @@ pub const App = struct {
     }
 
     /// Crash insurance on a display-topology change, the moment a GPU
-    /// driver is most likely to fault (#299), and the save for a Restart
-    /// Manager close. Every host receives the same message, so one save per
-    /// second is plenty.
+    /// driver is most likely to fault (#299). Every host receives the same
+    /// message, so one save per second is plenty.
     fn checkpointSessionState(self: *App) void {
         const now = sys.GetTickCount64();
         if (self.session_checkpoint_ms) |last| if (now -% last < 1000) return;
@@ -13629,11 +13733,21 @@ fn closeScopePrompt(scope: CloseScope, count: usize, body_buf: *[256]u8) Confirm
 
 /// How many panes in `tabs` `confirm-close-surface` asks about.
 fn tabsCloseConfirmCount(tabs: []Tab) usize {
+    return countPanesWhere(tabs, Surface.needsCloseConfirm);
+}
+
+/// `tabsCloseConfirmCount` without waiting for a renderer mutex
+/// (`Surface.needsCloseConfirmNoWait`).
+fn tabsCloseConfirmCountNoWait(tabs: []Tab) usize {
+    return countPanesWhere(tabs, Surface.needsCloseConfirmNoWait);
+}
+
+fn countPanesWhere(tabs: []Tab, comptime predicate: fn (*Surface) bool) usize {
     var count: usize = 0;
     for (tabs) |*tab| {
         var it = tab.tree.iterator();
         while (it.next()) |entry| {
-            if (entry.view.needsCloseConfirm()) count += 1;
+            if (predicate(entry.view)) count += 1;
         }
     }
     return count;
@@ -29087,6 +29201,16 @@ fn settingsSaveAndReloadThunk(
     const app: *App = @ptrCast(@alignCast(ctx));
     return app.settingsSaveAndReload(pending, original);
 }
+fn settingsQueryEndSessionThunk(ctx: *anyopaque, lParam: LPARAM) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.onQueryEndSession(lParam);
+}
+
+fn settingsEndSessionThunk(ctx: *anyopaque, ending: bool, lParam: LPARAM) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.onEndSession(ending, lParam);
+}
+
 fn settingsOnClosedThunk(ctx: *anyopaque) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const restore_id = app.settings_restore_surface_id;
@@ -35156,12 +35280,17 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             return 1;
         },
 
-        // Sign-out, shutdown, reboot and Restart Manager closes. The save
-        // waits for WM_ENDSESSION, after which the process may be ended
-        // without `terminate` running; WM_QUERYENDSESSION is left to
-        // DefWindowProcW, which answers TRUE.
+        // Sign-out, shutdown and reboot, and an installer's Restart Manager
+        // close (`ENDSESSION_CLOSEAPP`), which noctty agrees to only when a
+        // quit would ask nothing, and then saves every window and quits from
+        // the message loop. The app answers for every window it owns
+        // (`App.onQueryEndSession`, `App.onEndSession`).
+        c.WM_QUERYENDSESSION => {
+            if (host) |v| return @intFromBool(v.app.onQueryEndSession(lParam));
+            return sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
         c.WM_ENDSESSION => {
-            if (wParam != 0) if (host) |v| v.app.saveForEndSession((@as(usize, @bitCast(lParam)) & c.ENDSESSION_CLOSEAPP) != 0);
+            if (host) |v| v.app.onEndSession(wParam != 0, lParam);
             return 0;
         },
         // Saved from the message loop rather than inside this sent message,
@@ -35272,7 +35401,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
 
         c.WM_CLOSE => {
             if (host) |v| {
-                v.close();
+                // A committed Restart Manager close quits every window at
+                // once from the message loop; its fallback WM_CLOSE must not
+                // close them one at a time first.
+                if (!v.app.end_session_quit_pending) v.close();
                 return 0;
             }
             _ = sys.DestroyWindow(hwnd);
@@ -37561,6 +37693,15 @@ pub const Surface = struct {
     /// than this pane. A pane whose core is not up has no process to lose.
     fn needsCloseConfirm(self: *Surface) bool {
         return self.core_initialized and self.core_surface.needsConfirmQuit();
+    }
+
+    /// `needsCloseConfirm` for a sent message (a Restart Manager query),
+    /// which can arrive while this thread holds the renderer mutex: the core's
+    /// copy path holds it across `EmptyClipboard`, which dispatches sent
+    /// messages while it waits, and the mutex is not recursive. A mutex it
+    /// cannot take counts as needing confirmation.
+    fn needsCloseConfirmNoWait(self: *Surface) bool {
+        return self.core_initialized and (self.core_surface.needsConfirmQuitNoWait() orelse true);
     }
 
     fn requestClose(self: *Surface) bool {
@@ -55245,35 +55386,262 @@ test "win32 a session a newer build wrote, or one too large to be ours, is left 
     app.releaseSessionOwnership();
 }
 
-test "win32 sign-out latches the session snapshot and a Restart Manager close does not" {
+test "win32 a sign-out latches the session snapshot, and a Restart Manager close saves once and leaves the quit to the loop" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
     var app: App = undefined;
-    app.session_state_excluded_for_elevation = false;
-    // Not an owner, so the saves themselves are no-ops here.
-    app.session_owner = null;
-    app.palette_mru = .{null} ** 5;
-    app.session_ending = false;
-    app.session_checkpoint_ms = null;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    app.running = true;
+    // Not an owner, so the saves themselves write nothing here.
+    const close_app: LPARAM = @bitCast(c.ENDSESSION_CLOSEAPP);
 
-    // ENDSESSION_CLOSEAPP: an installer may leave noctty running.
-    app.saveForEndSession(true);
+    // Called off after the query agreed: nothing is saved, latched or closed.
+    app.end_session_prepared = true;
+    app.onEndSession(false, close_app);
+    try std.testing.expect(!app.end_session_prepared);
     try std.testing.expect(!app.session_ending);
-    try std.testing.expect(app.session_checkpoint_ms != null);
+    try std.testing.expect(!app.end_session_quit_pending);
+    try std.testing.expectEqual(@as(u32, 0), app.test_session_saves_as_it_ends);
 
-    // A second host's copy of the same message is throttled.
+    // Committed: every window is saved once, while whole, the snapshot is
+    // latched, and the quit is left to the message loop.
+    app.onEndSession(true, close_app);
+    try std.testing.expect(app.session_ending);
+    try std.testing.expect(app.end_session_quit_pending);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+    try std.testing.expectEqual(@as(usize, 1), app.hosts.items.len);
+    try std.testing.expect(app.running);
+    // Another window's copy of the message saves nothing more, and a query
+    // that follows the commit agrees.
+    app.onEndSession(true, close_app);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+    try std.testing.expect(app.onQueryEndSession(close_app));
+
+    // A real sign-out is final: nothing saves after it, a Restart Manager
+    // close included, and nothing quits.
+    app.session_ending = false;
+    app.end_session_quit_pending = false;
+    app.session_state_saved_before_last_host_close = false;
+    try std.testing.expect(app.onQueryEndSession(0));
+    app.onEndSession(true, 0);
+    try std.testing.expect(app.session_ending);
+    try std.testing.expect(!app.end_session_quit_pending);
+    app.onEndSession(true, close_app);
+    try std.testing.expect(!app.end_session_quit_pending);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+
+    // The display-change checkpoint every host receives saves once a second.
     const now = sys.GetTickCount64();
     app.session_checkpoint_ms = now - 500;
-    app.saveForEndSession(true);
+    app.checkpointSessionState();
     try std.testing.expectEqual(now - 500, app.session_checkpoint_ms.?);
     app.session_checkpoint_ms = now - 1500;
     app.checkpointSessionState();
     try std.testing.expect(app.session_checkpoint_ms.? >= now);
+}
 
-    // A real sign-out is final: nothing saves after it.
-    app.saveForEndSession(false);
-    try std.testing.expect(app.session_ending);
+test "win32 a Restart Manager query agrees only when a quit would ask nothing, and never waits for a renderer lock" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var quick: Host = undefined;
+    var front: Surface = undefined;
+    var behind: Surface = undefined;
+    var other: Surface = undefined;
+    var dropdown: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+            .{ .storage = &quick, .id = 3, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &front, .host = &host_a, .register = true },
+            .{ .storage = &behind, .host = &host_a, .register = true, .window_visible = false },
+            .{ .storage = &other, .host = &host_b, .register = true },
+            .{ .storage = &dropdown, .host = &quick, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &front, .id = 1 },
+            .{ .host = &host_a, .surface = &behind, .id = 2 },
+            .{ .host = &host_b, .surface = &other, .id = 3 },
+            .{ .host = &quick, .surface = &dropdown, .id = 4 },
+        },
+    });
+    defer session.deinit();
+    quick.quick_terminal = true;
+    app.running = true;
+    app.message_loop_started = true;
+
+    // The query reaches window A's procedure, as Restart Manager sends it.
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    setWindowData(hwnd, &host_a);
+    defer setWindowData(hwnd, null);
+    const close_app: LPARAM = @bitCast(c.ENDSESSION_CLOSEAPP);
+    const Query = struct {
+        fn send(window: HWND, lParam: LPARAM) LRESULT {
+            return hostWindowProc(window, c.WM_QUERYENDSESSION, 0, lParam);
+        }
+    };
+
+    // Nothing running anywhere: agree.
+    try std.testing.expectEqual(@as(LRESULT, 1), Query.send(hwnd, close_app));
+    try std.testing.expect(app.end_session_prepared);
+
+    // A terminal a quit would ask about declines: in another window, in a
+    // tab behind, or in the quick terminal. A sign-out is never declined.
+    // `readonly` stands in for a busy terminal; the cores are cleared before
+    // anything else reads them.
+    for ([_]*Surface{ &other, &behind, &dropdown }) |busy| {
+        busy.core_surface.readonly = true;
+        busy.core_initialized = true;
+        const answer = Query.send(hwnd, close_app);
+        const sign_out = Query.send(hwnd, 0);
+        busy.core_initialized = false;
+        busy.core_surface.readonly = false;
+        try std.testing.expectEqual(@as(LRESULT, 0), answer);
+        try std.testing.expectEqual(@as(LRESULT, 1), sign_out);
+        try std.testing.expect(!app.end_session_prepared);
+    }
+
+    // A terminal whose renderer lock is held counts as busy, and the query
+    // does not wait for it: the holder can be this thread, below the sent
+    // message. The lock is held here, so the core is read no further.
+    var renderer_mutex: std.Thread.Mutex = .{};
+    other.core_surface.renderer_state.mutex = &renderer_mutex;
+    other.core_surface.config.confirm_close_surface = .true;
+    other.core_surface.child_exited = false;
+    renderer_mutex.lock();
+    other.core_initialized = true;
+    const locked = Query.send(hwnd, close_app);
+    other.core_initialized = false;
+    renderer_mutex.unlock();
+    try std.testing.expectEqual(@as(LRESULT, 0), locked);
+
+    // Unsaved Settings edits decline: a value typed and not saved, and a
+    // conflict with the file. Nothing here touches the window handle.
+    app.settings_window.hwnd = @ptrFromInt(0x1000);
+    defer app.settings_window.hwnd = null;
+    app.settings_window.raw_scalar_dirty[0] = true;
+    const dirty = Query.send(hwnd, close_app);
+    app.settings_window.raw_scalar_dirty[0] = false;
+    app.settings_window.owned_conflict[0] = true;
+    const conflict = Query.send(hwnd, close_app);
+    app.settings_window.owned_conflict[0] = false;
+    try std.testing.expectEqual(@as(LRESULT, 0), dirty);
+    try std.testing.expectEqual(@as(LRESULT, 0), conflict);
+    try std.testing.expectEqual(@as(LRESULT, 1), Query.send(hwnd, close_app));
+
+    // Before the message loop starts, the startup restore or the first
+    // window is still being made.
+    app.message_loop_started = false;
+    try std.testing.expectEqual(@as(LRESULT, 0), Query.send(hwnd, close_app));
+    app.message_loop_started = true;
+
+    // A quit or an update apply already under way agrees: it ends the process
+    // itself, whatever is running.
+    other.core_surface.readonly = true;
+    other.core_initialized = true;
+    app.update_apply_in_flight = true;
+    const applying = Query.send(hwnd, close_app);
+    app.update_apply_in_flight = false;
+    app.running = false;
+    const quitting = Query.send(hwnd, close_app);
+    app.running = true;
+    other.core_initialized = false;
+    other.core_surface.readonly = false;
+    try std.testing.expectEqual(@as(LRESULT, 1), applying);
+    try std.testing.expectEqual(@as(LRESULT, 1), quitting);
+
+    // The session's owner declines when the snapshot cannot be written (a
+    // test has no LOCALAPPDATA, so every write fails here)...
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(state_path);
+    app.config.@"window-save-state" = .always;
+    app.session_owner = (try SessionOwnerLock.acquire(std.testing.allocator, state_path)).?;
+    defer app.releaseSessionOwnership();
+    app.end_session_prepared = false;
     app.session_checkpoint_ms = null;
-    app.saveForEndSession(true);
+    try std.testing.expectEqual(@as(LRESULT, 0), Query.send(hwnd, close_app));
+    try std.testing.expect(app.session_checkpoint_ms != null);
+    // ...and a later query of a round that agreed does not save again.
+    app.end_session_prepared = true;
+    app.session_checkpoint_ms = null;
+    try std.testing.expectEqual(@as(LRESULT, 1), Query.send(hwnd, close_app));
     try std.testing.expectEqual(@as(?u64, null), app.session_checkpoint_ms);
+    // With nothing left to write (the last window saved as it went), it
+    // agrees.
+    app.end_session_prepared = false;
+    app.session_state_saved_before_last_host_close = true;
+    try std.testing.expectEqual(@as(LRESULT, 1), Query.send(hwnd, close_app));
+}
+
+test "win32 a committed Restart Manager close keeps every window through WM_CLOSE and quits them from the message loop" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            app.running = true;
+            app.recovery_ready_resolved = true;
+            app.config.@"quit-after-last-window-closed" = false;
+            try app.createWindow(default_title);
+            const first = fixture.newest();
+            try app.createWindow(default_title);
+            const second = fixture.newest();
+
+            // Nothing committed: the loop's step does nothing.
+            try std.testing.expect(!try app.finishEndSessionClose());
+            try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+
+            // Restart Manager's fallback WM_CLOSE closes nothing once the
+            // close is committed: one window at a time would leave the
+            // session with only the last.
+            app.end_session_quit_pending = true;
+            for ([_]*Surface{ first, second }) |surface| {
+                try std.testing.expectEqual(@as(LRESULT, 0), sys.SendMessageW(surface.windowHwnd().?, c.WM_CLOSE, 0, 0));
+            }
+            try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+            try std.testing.expectEqual(@as(usize, 2), app.windows.items.len);
+
+            // The loop's step quits them all, though
+            // quit-after-last-window-closed is off. The stand-in cores never
+            // started, so `destroy` leaves them registered; the core's own
+            // teardown would not.
+            for (app.windows.items) |surface| fixture.core_app.deleteSurface(surface);
+            try std.testing.expect(try app.finishEndSessionClose());
+            try std.testing.expect(!app.end_session_quit_pending);
+            try std.testing.expect(!app.running);
+            try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
+            try std.testing.expectEqual(@as(usize, 0), app.hosts.items.len);
+            var msg: MSG = undefined;
+            try std.testing.expect(sys.PeekMessageW(&msg, null, c.WM_QUIT, c.WM_QUIT, c.PM_REMOVE) != 0);
+        }
+    }.body);
 }
 
 test "win32 a snapshot with no session window leaves the saved session alone" {
