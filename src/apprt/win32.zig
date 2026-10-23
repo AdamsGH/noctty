@@ -50,6 +50,7 @@ const win32_surface_drop = @import("win32_surface_drop.zig");
 const win32_surface_drop_target = @import("win32_surface_drop_target.zig");
 const win32_ole = @import("win32_ole.zig");
 const win32_toast_activation = @import("win32_toast_activation.zig");
+const win32_toast_activator = @import("win32_toast_activator.zig");
 const win32_tab_drop_zones = @import("win32_tab_drop_zones.zig");
 const win32_tab_tooltip = @import("win32_tab_tooltip.zig");
 const win32_search_bar = @import("win32_search_bar.zig");
@@ -123,6 +124,7 @@ test {
     _ = @import("win32/focus_cue.zig");
     _ = @import("win32/first_frame.zig");
     _ = @import("win32_aumid.zig");
+    _ = @import("win32_toast_activator.zig");
     _ = @import("win32_program_status.zig");
     _ = @import("win32_bell.zig");
 }
@@ -3068,12 +3070,28 @@ pub const App = struct {
     /// chdir back to this value around `settingsSaveAndReload`'s
     /// reload so argv-relative paths re-resolve identically.
     startup_cwd: ?[]u8 = null,
-    /// Parsed `wgh://activate?...` launch argument from a cold-start
-    /// toast activation. `null` when no such argv entry is present.
-    /// Consumed once after the first window spawns. We first try the
-    /// requested surface/window identity and fall back to the newly
-    /// created primary surface when the IDs came from a prior process.
+    /// A toast activation waiting for a window: the one a cold
+    /// `-ToastActivated` start received (`awaitColdToastActivation`), a
+    /// `wgh://activate?...` argument, or one that arrived while no surface
+    /// existed. Consumed once after the first window spawns. Its ids are
+    /// resolved only when its pid is this process's
+    /// (`resolveToastActivationSurface`); otherwise the primary surface is
+    /// presented.
     pending_toast_activation: ?win32_toast_activation.ActivationTarget = null,
+    /// Started by COM for a click in Action Center (`win32_toast_activator`,
+    /// argv `-ToastActivated -Embedding`): `run` waits for the launch string
+    /// before deciding whether to forward it or start locally.
+    toast_activated: bool = false,
+    /// What a cold `-ToastActivated` start received, forwarded to the running
+    /// instance in place of this process's argv
+    /// (`ipc_server.tryForwardStartupToExistingInstance`).
+    cold_toast_activation: ?win32_toast_activation.ActivationTarget = null,
+    /// Drops the second delivery of one click (popup handler and COM).
+    toast_click_filter: win32_toast_activation.RepeatFilter = .{},
+    /// `run` has made its startup windows (or decided on none), so a toast
+    /// click with no surface to present opens one
+    /// (`receiveToastActivation`).
+    startup_windows_opened: bool = false,
     /// The command line's one-shot `--launch-layout=<name>`, which `run`
     /// opens instead of the first window (or forwards to the running
     /// instance). `init` moves it here out of the app config
@@ -3134,7 +3152,9 @@ pub const App = struct {
         core_app: *CoreApp,
         opts: struct { safe_mode: bool = false },
     ) !void {
-        const embedding_mode = win32_terminal_handoff.isEmbeddingProcess(core_app.alloc);
+        const com_start = ComStart.ofProcess(core_app.alloc);
+        const toast_activated = com_start == .toast_activator;
+        const embedding_mode = com_start == .terminal_handoff;
         const is_elevated = win32_elevation.isProcessElevated() catch |err| elevated: {
             log.warn(
                 "failed to query TokenElevation; treating process as elevated for title and IPC isolation err={}",
@@ -3175,6 +3195,7 @@ pub const App = struct {
             .session_state_excluded_for_elevation = session_state_excluded_for_elevation,
             .safe_mode = safe_mode,
             .embedding_mode = embedding_mode,
+            .toast_activated = toast_activated,
             .recovery_startup = recovery_startup,
             .hinstance = sys.GetModuleHandleW(null),
             .launcher_profile_hint = detectDefaultProfileHint(core_app.alloc),
@@ -3201,8 +3222,12 @@ pub const App = struct {
         self.cli_config_override_path = cliConfigFileOverride(core_app.alloc) catch null;
         // Snapshot the startup cwd for reload-time restoration.
         self.startup_cwd = std.process.getCwdAlloc(core_app.alloc) catch null;
-        // Scan argv for a cold-start toast activation arg. Silent on
-        // absence or malformed input — activation is opt-in.
+        // A `wgh://activate?...` argument on the command line. Windows never
+        // starts noctty with one: a click in Action Center reaches a cold
+        // start through COM (`-ToastActivated`, `awaitColdToastActivation`).
+        // It is honored for a launch by hand or a script, and the same string
+        // is what a cold start forwards to a running instance. Silent on
+        // absence or malformed input.
         self.pending_toast_activation = scanToastActivationArg(core_app.alloc);
         if (self.pending_toast_activation) |target| {
             log.info("toast activation received surface={?} tab={?} window={?} action={?}", .{
@@ -3494,6 +3519,16 @@ pub const App = struct {
 
         try self.ensureWindowClass();
 
+        // Declared first so it runs last, after the message window (whose
+        // channel the activator posts to) is closed.
+        defer win32_toast_activator.revoke();
+        if (self.toast_activated) {
+            const activation = self.awaitColdToastActivation();
+            self.cold_toast_activation = activation;
+            // Forwarded below, or presented once the first window exists.
+            self.pending_toast_activation = activation;
+        }
+
         const forwarded = if (self.embedding_mode or self.safe_mode)
             false
         else
@@ -3523,6 +3558,10 @@ pub const App = struct {
         ensureMessageQueue();
         try self.openAppWindows();
         @atomicStore(DWORD, &self.ui_thread_id, ui_thread_id, .release);
+        // Nothing since the cold wait has pumped messages, so a second
+        // `Activate` COM queued meanwhile is dispatched only after this binds
+        // the App channel.
+        self.startToastActivator();
         defer {
             self.stopUndoPruneTimer();
             self.stopQuitTimer();
@@ -3583,7 +3622,9 @@ pub const App = struct {
             // Every window comes from a terminal handoff.
         } else if (try self.openStartupLaunchLayout()) {
             // The command line's layout, or the window saying it failed.
-        } else if (self.config.@"initial-window") {
+        } else if (self.config.@"initial-window" or self.toast_activated) {
+            // A toast click that started this process gets a window to bring
+            // forward even under `initial-window = false`.
             // Ownership starts only once the first window exists: a launch
             // that fails here must not save over, on its way out, the session
             // it could not bring back, and a save while restore is half done
@@ -3602,6 +3643,7 @@ pub const App = struct {
             log.info("initial-window is disabled; win32 runtime waiting without a window", .{});
         }
         initial_windows_created = true;
+        self.startup_windows_opened = true;
 
         // Keep the banner text even without an initial window: every later
         // host receives its own copy when it is created.
@@ -6893,6 +6935,9 @@ pub const App = struct {
                         if (dropped_args > 0) {
                             std.log.warn("dropping {d} forwarded argv item(s) bundled with toast activation", .{dropped_args});
                         }
+                        // A cold start forwards a click this process may
+                        // also have had from the toast's popup handler.
+                        if (!self.admitToastActivation(activation)) return true;
                         if (self.handleToastActivation(activation)) return true;
                         self.pending_toast_activation = activation;
                         forwarded_arguments = null;
@@ -9793,6 +9838,12 @@ pub const App = struct {
         self: *App,
         activation: win32_toast_activation.ActivationTarget,
     ) ?*Surface {
+        // Ids are this process's only when the toast is: a click on another
+        // noctty's toast (COM hands it to whichever process registered the
+        // activator, or to a new one after that process ended) must not
+        // pick a window or tab that happens to share a number here.
+        if (activation.pid != sys.GetCurrentProcessId()) return self.primarySurface();
+
         if (activation.surface_id) |surface_id| {
             if (self.findSurfaceById(surface_id)) |surface| {
                 return surface;
@@ -9821,6 +9872,70 @@ pub const App = struct {
         const surface = self.resolveToastActivationSurface(activation) orelse return false;
         surface.present();
         return true;
+    }
+
+    /// Whether `activation` is a new click, not the second delivery of one
+    /// (the popup's in-process handler and the COM activator both report a
+    /// popup click when both exist).
+    fn admitToastActivation(self: *App, activation: win32_toast_activation.ActivationTarget) bool {
+        return self.toast_click_filter.admit(activation, std.time.milliTimestamp());
+    }
+
+    /// A click from the toast's popup handler or the COM activator. With no
+    /// surface to present (`initial-window = false`, or the last window
+    /// closed under `quit-after-last-window-closed = false`), it asks for a
+    /// window the way a forwarded click does, and that window presents it
+    /// (`consumePendingToastActivation`), as a cold start's would.
+    fn receiveToastActivation(self: *App, activation: win32_toast_activation.ActivationTarget) void {
+        if (!self.admitToastActivation(activation)) return;
+        if (self.handleToastActivation(activation)) return;
+        self.pending_toast_activation = activation;
+        // Before the startup windows exist the first of them takes it, and a
+        // terminal handoff server's windows come only from handoffs.
+        if (!self.startup_windows_opened or self.embedding_mode) return;
+        if (self.core_app.mailbox.push(.{ .new_window = .{} }, .instant) == 0)
+            log.warn("toast activation: could not request a window", .{});
+    }
+
+    /// The installed copy's toast activator: registered once the App's
+    /// message window exists, and posting to the same channel as the
+    /// toast's own `Activated` handler. Never in a test build, a terminal
+    /// handoff server or safe mode.
+    fn toastActivatorWanted(self: *App) bool {
+        if (builtin.is_test or self.embedding_mode or self.safe_mode or !self.com_initialized) return false;
+        const kind = self.installKind();
+        return win32_toast_activator.shouldRegister(kind == .installer, kind == .portable, self.is_elevated);
+    }
+
+    fn startToastActivator(self: *App) void {
+        if (!self.toastActivatorWanted()) return;
+        const delivery = self.delivery orelse return;
+        // Bound before registering, so the first call has somewhere to go.
+        win32_toast_activator.bind(toastActivatorSink(delivery));
+        win32_toast_activator.register() catch {};
+    }
+
+    /// A cold start by COM for a click in Action Center. The launch string
+    /// arrives in `Activate` only after the class object is registered, so
+    /// register it, pump messages until the call (COM dispatches it to this
+    /// STA) or `cold_toast_activation_wait_ms`, and return what came. A call
+    /// that never came, or carried a launch noctty cannot read, yields the
+    /// empty target, which presents the primary window: the user clicked a
+    /// noctty toast either way, and nothing from it is applied as argv.
+    fn awaitColdToastActivation(self: *App) win32_toast_activation.ActivationTarget {
+        if (!self.toastActivatorWanted()) {
+            log.info("toast activation start in a copy that registers no activator", .{});
+            return .{};
+        }
+        var capture: ColdToastCapture = .{};
+        win32_toast_activator.bind(capture.sink());
+        // `startToastActivator` binds the App channel once it exists.
+        defer win32_toast_activator.bind(null);
+        win32_toast_activator.register() catch return .{};
+
+        if (!pumpUntilColdToastActivation(&capture, cold_toast_activation_wait_ms))
+            log.warn("toast activation start: no activation within {d} ms", .{cold_toast_activation_wait_ms});
+        return capture.target();
     }
 
     fn consumePendingToastActivation(self: *App) void {
@@ -13372,6 +13487,136 @@ fn winrtToastActivationCallback(ctx: *anyopaque, launch: []const u8) void {
     if (!delivery.post(c.WM_WINHOSTTY_TOAST_ACTIVATION, .{ .toast = parsed })) {
         delivery.toast_pending.store(false, .release);
     }
+}
+
+/// The toast activator's sink in a running App: the channel the toast's own
+/// `Activated` handler posts to, so a click resolves the same way whichever
+/// route it took.
+fn toastActivatorSink(delivery: *AppDelivery) win32_toast_activator.Sink {
+    return .{
+        .ctx = delivery,
+        .deliver = winrtToastActivationCallback,
+        .retain = retainToastDelivery,
+        .release = releaseToastDelivery,
+    };
+}
+
+/// How long a cold `-ToastActivated` start waits for COM's `Activate`. COM
+/// calls it as soon as the class object is registered; the wait only bounds
+/// a start that never gets the call (run by hand, or COM gave up).
+const cold_toast_activation_wait_ms = 5000;
+
+/// Dispatch this thread's messages until `capture` has its call or
+/// `timeout_ms` has passed, and say whether the call came. COM hands an
+/// incoming call to this STA as a message, so the dispatch is what runs
+/// `Activate`. The deadline is the wait's own, with no timer that could fail
+/// to arm, and a quit met on the way is put back for the main loop.
+fn pumpUntilColdToastActivation(capture: *const ColdToastCapture, timeout_ms: u32) bool {
+    const deadline = sys.GetTickCount64() + timeout_ms;
+    var msg: MSG = undefined;
+    while (!capture.received) {
+        while (sys.PeekMessageW(&msg, null, 0, 0, c.PM_REMOVE) != 0) {
+            if (msg.message == c.WM_QUIT) {
+                sys.PostQuitMessage(@bitCast(@as(u32, @truncate(msg.wParam))));
+                return capture.received;
+            }
+            _ = sys.TranslateMessage(&msg);
+            _ = sys.DispatchMessageW(&msg);
+            if (capture.received) return true;
+        }
+        const now = sys.GetTickCount64();
+        if (now >= deadline) break;
+        const remaining: DWORD = @intCast(deadline - now);
+        if (sys.MsgWaitForMultipleObjectsEx(0, null, remaining, c.QS_ALLINPUT, c.MWMO_INPUTAVAILABLE) == c.WAIT_FAILED) break;
+    }
+    return capture.received;
+}
+
+const ColdToastWaitTest = struct {
+    const Timer = struct {
+        var capture: ColdToastCapture = .{};
+
+        fn fire(_: ?HWND, _: UINT, id: UINT_PTR, _: DWORD) callconv(.winapi) void {
+            _ = sys.KillTimer(null, id);
+            ColdToastCapture.deliver(&capture, "wgh://activate?surface=3&pid=8&action=focus");
+        }
+    };
+
+    fn body() !void {
+        // Nothing comes: the wait returns at its deadline, not later.
+        var none: ColdToastCapture = .{};
+        const start = sys.GetTickCount64();
+        try std.testing.expect(!pumpUntilColdToastActivation(&none, 60));
+        const waited = sys.GetTickCount64() - start;
+        try std.testing.expect(waited >= 40);
+        try std.testing.expect(waited < 2000);
+
+        // A call dispatched by the pump (here a timer procedure, as COM's call
+        // is a dispatched message) ends it well before the deadline.
+        Timer.capture = .{};
+        try std.testing.expect(sys.SetTimer(null, 0, 10, @ptrCast(&Timer.fire)) != 0);
+        const call_start = sys.GetTickCount64();
+        try std.testing.expect(pumpUntilColdToastActivation(&Timer.capture, 10_000));
+        try std.testing.expect(sys.GetTickCount64() - call_start < 5000);
+        try std.testing.expect(Timer.capture.target().eql(.{ .surface_id = 3, .pid = 8, .action = .focus }));
+
+        // A quit ends the wait and stays queued for the main loop.
+        var quit_capture: ColdToastCapture = .{};
+        sys.PostQuitMessage(7);
+        try std.testing.expect(!pumpUntilColdToastActivation(&quit_capture, 10_000));
+        var msg: MSG = undefined;
+        try std.testing.expect(sys.PeekMessageW(&msg, null, c.WM_QUIT, c.WM_QUIT, c.PM_REMOVE) != 0);
+        try std.testing.expectEqual(@as(WPARAM, 7), msg.wParam);
+    }
+};
+
+test "the cold toast activation wait ends on its call or at its deadline" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // A fresh thread, so the pump dispatches nothing another test queued.
+    try runOnHiddenDesktop(ColdToastWaitTest.body);
+}
+
+/// Receives the first `Activate` of a cold start, before the App channel
+/// exists. `Activate` runs on this thread, inside the wait's message pump.
+const ColdToastCapture = struct {
+    received: bool = false,
+    activation: win32_toast_activation.ActivationTarget = .{},
+
+    fn sink(self: *ColdToastCapture) win32_toast_activator.Sink {
+        return .{ .ctx = self, .deliver = deliver };
+    }
+
+    fn deliver(ctx: *anyopaque, launch: []const u8) void {
+        const self: *ColdToastCapture = @ptrCast(@alignCast(ctx));
+        if (self.received) return;
+        self.received = true;
+        self.activation = win32_toast_activation.parseLaunchArg(launch) catch .{};
+    }
+
+    fn target(self: *const ColdToastCapture) win32_toast_activation.ActivationTarget {
+        return self.activation;
+    }
+};
+
+test "a cold toast activation start keeps the first call and reads nothing else as a target" {
+    const callback = win32_toast_activator.testCallback();
+    const aumid = std.unicode.utf8ToUtf16LeStringLiteral("io.github.amanthanvi.noctty");
+
+    var capture: ColdToastCapture = .{};
+    win32_toast_activator.bind(capture.sink());
+    defer win32_toast_activator.bind(null);
+    _ = callback.vtbl.Activate(callback, aumid, std.unicode.utf8ToUtf16LeStringLiteral("wgh://activate?surface=3&pid=8&action=focus"), null, 0);
+    _ = callback.vtbl.Activate(callback, aumid, std.unicode.utf8ToUtf16LeStringLiteral("wgh://activate?surface=4&pid=8"), null, 0);
+    try std.testing.expect(capture.received);
+    try std.testing.expect(capture.target().eql(.{ .surface_id = 3, .pid = 8, .action = .focus }));
+
+    // A call that carried nothing readable still ends the wait, and its
+    // target is the empty one, which only presents the primary window.
+    var unreadable: ColdToastCapture = .{};
+    win32_toast_activator.bind(unreadable.sink());
+    _ = callback.vtbl.Activate(callback, aumid, std.unicode.utf8ToUtf16LeStringLiteral("--command=evil.exe"), null, 0);
+    try std.testing.expect(unreadable.received);
+    try std.testing.expect(unreadable.target().eql(.{}));
 }
 
 fn retainToastDelivery(ctx: *anyopaque) void {
@@ -29613,6 +29858,7 @@ fn buildToastLaunchForSurface(
         .surface_id = surface.core().id,
         .tab_id = tab_id,
         .window_id = surface.host_id,
+        .pid = sys.GetCurrentProcessId(),
         .action = .focus,
     });
 }
@@ -30904,11 +31150,36 @@ comptime {
 
 /// Scan argv for a `wgh://activate?...` entry. Malformed activation
 /// strings are swallowed so they cannot be misrouted as startup args.
+/// Windows does not pass a toast's launch string on the command line of an
+/// unpackaged app: Action Center clicks arrive through the COM activator.
+/// This reads a launch by hand or a script.
 fn scanToastActivationArg(alloc: std.mem.Allocator) ?win32_toast_activation.ActivationTarget {
     const argv = std.process.argsAlloc(alloc) catch return null;
     defer std.process.argsFree(alloc, argv);
     return win32_toast_activation.scanLaunchArgs(argv[1..]);
 }
+
+/// Which COM server, if any, started this process. COM appends -Embedding to
+/// every `LocalServer32` command, the toast activator's
+/// (`"noctty.exe" -ToastActivated`) included, so -Embedding alone does not
+/// make a terminal handoff server.
+const ComStart = enum {
+    none,
+    terminal_handoff,
+    toast_activator,
+
+    fn ofArgs(argv: []const []const u8) ComStart {
+        if (win32_toast_activator.hasLaunchSwitch(argv)) return .toast_activator;
+        if (win32_terminal_handoff.isEmbeddingArgs(argv)) return .terminal_handoff;
+        return .none;
+    }
+
+    fn ofProcess(alloc: std.mem.Allocator) ComStart {
+        const argv = std.process.argsAlloc(alloc) catch return .none;
+        defer std.process.argsFree(alloc, argv);
+        return ofArgs(argv);
+    }
+};
 
 pub fn scanForwardedToastActivation(
     arguments: ?[]const [:0]const u8,
@@ -30945,8 +31216,10 @@ fn cliConfigFileOverrideArgs(alloc: std.mem.Allocator, argv: []const []const u8)
     var files: configpkg.RepeatablePath = .{};
     for (argv[@min(1, argv.len)..]) |arg| {
         // Config.parseManuallyHook consumes everything after -e as child argv,
-        // and stops at the COM activation switch.
-        if (std.mem.eql(u8, arg, "-e") or std.ascii.eqlIgnoreCase(arg, "-Embedding")) break;
+        // and stops at a COM activation switch.
+        if (std.mem.eql(u8, arg, "-e") or
+            std.ascii.eqlIgnoreCase(arg, "-Embedding") or
+            std.ascii.eqlIgnoreCase(arg, win32_toast_activator.launch_switch)) break;
         const value: ?[]const u8 = if (std.mem.eql(u8, arg, key))
             null
         else if (std.mem.startsWith(u8, arg, key ++ "="))
@@ -31947,6 +32220,9 @@ test "win32 settings save target is the last config file the loader takes from t
         // The COM activation switch ends the options, in any case.
         &.{ "noctty", "--config-file=a.conf", "-Embedding", "--config-file=b.conf" },
         &.{ "noctty", "--config-file=a.conf", "-embedding", "--config-file=b.conf" },
+        // So does the toast activator's, which comes before COM's -Embedding.
+        &.{ "noctty", "--config-file=a.conf", "-ToastActivated", "--config-file=b.conf" },
+        &.{ "noctty", "--config-file=a.conf", "-toastactivated", "--config-file=b.conf", "-Embedding" },
         // Keys are case sensitive and exact.
         &.{ "noctty", "--CONFIG-FILE=a.conf", "--config-file-extra=b.conf" },
     };
@@ -33321,7 +33597,7 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
                 },
                 .toast => |activation| {
                     defer delivery.toast_pending.store(false, .release);
-                    if (!app.handleToastActivation(activation)) app.pending_toast_activation = activation;
+                    app.receiveToastActivation(activation);
                 },
                 .uia_disconnect => |pending| processDeferredUiaDisconnect(delivery, pending),
             }
@@ -33676,6 +33952,204 @@ test "win32 App delivery drains title and UIA in native popup while close and qu
 test "win32 App delivery validates owned tokens by kind HWND and single consumption" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     try runOnHiddenDesktop(Pkg19NativeDeliveryTest.capabilitiesBody);
+}
+
+/// The COM toast activator against a real App message window. Nothing is
+/// registered with COM: the tests call `Activate` through the class factory
+/// the way COM does, with the App's own sink bound.
+const ToastActivatorDeliveryTest = struct {
+    const aumid = std.unicode.utf8ToUtf16LeStringLiteral("io.github.amanthanvi.noctty");
+
+    fn launchFor(alloc: Allocator, target: win32_toast_activation.ActivationTarget) ![:0]u16 {
+        const launch = try win32_toast_activation.buildLaunchArg(alloc, target);
+        defer alloc.free(launch);
+        return std.unicode.utf8ToUtf16LeAllocZ(alloc, launch);
+    }
+
+    /// Dispatch the one queued activation message, as the App's pump would.
+    fn dispatch(app: *App) !void {
+        const msg = try Pkg19NativeDeliveryTest.queued(app.message_hwnd.?, c.WM_WINHOSTTY_TOAST_ACTIVATION);
+        _ = sys.SendMessageW(app.message_hwnd.?, msg.message, msg.wParam, msg.lParam);
+    }
+
+    fn routesBody() !void {
+        const alloc = std.testing.allocator;
+        var core: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core, .app = &app });
+        defer session.deinit();
+        try app.createMessageWindow();
+        defer Pkg19NativeDeliveryTest.closeAppWindow(&app);
+        win32_toast_activator.bind(toastActivatorSink(app.delivery.?));
+        defer win32_toast_activator.bind(null);
+        const callback = win32_toast_activator.testCallback();
+
+        const target: win32_toast_activation.ActivationTarget = .{ .window_id = 19, .tab_id = 7, .pid = sys.GetCurrentProcessId(), .action = .focus };
+        const launch = try launchFor(alloc, target);
+        defer alloc.free(launch);
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, launch, null, 0));
+        // Activate only posted: the App has not seen it yet.
+        try std.testing.expect(app.pending_toast_activation == null);
+        try dispatch(&app);
+        // With no surface the activation waits for one, exactly as a click
+        // through the popup's handler does.
+        try std.testing.expect(target.eql(app.pending_toast_activation.?));
+        try std.testing.expect(!app.delivery.?.toast_pending.load(.acquire));
+
+        // What noctty cannot read posts nothing and changes nothing.
+        app.pending_toast_activation = null;
+        const malformed = std.unicode.utf8ToUtf16LeStringLiteral("wgh://activate?surface=x");
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, malformed, null, 0));
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, null, null, 0));
+        try std.testing.expectError(error.TestMissingDeliveryMessage, dispatch(&app));
+        try std.testing.expect(app.pending_toast_activation == null);
+    }
+
+    fn onceBody() !void {
+        const alloc = std.testing.allocator;
+        var core: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core, .app = &app });
+        defer session.deinit();
+        try app.createMessageWindow();
+        defer Pkg19NativeDeliveryTest.closeAppWindow(&app);
+        win32_toast_activator.bind(toastActivatorSink(app.delivery.?));
+        defer win32_toast_activator.bind(null);
+        const callback = win32_toast_activator.testCallback();
+
+        const target: win32_toast_activation.ActivationTarget = .{ .surface_id = 41, .pid = sys.GetCurrentProcessId(), .action = .focus };
+        const launch = try win32_toast_activation.buildLaunchArg(alloc, target);
+        defer alloc.free(launch);
+        const launch_w = try launchFor(alloc, target);
+        defer alloc.free(launch_w);
+
+        // The popup's own handler delivers the click first.
+        winrtToastActivationCallback(app.delivery.?, launch);
+        try dispatch(&app);
+        try std.testing.expect(target.eql(app.pending_toast_activation.?));
+        app.pending_toast_activation = null;
+
+        // Then COM delivers the same click: it is dropped.
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, launch_w, null, 0));
+        try dispatch(&app);
+        try std.testing.expect(app.pending_toast_activation == null);
+
+        // So is the same click forwarded by a cold start, which would
+        // otherwise open a window here.
+        const launch_z = try alloc.dupeZ(u8, launch);
+        defer alloc.free(launch_z);
+        try std.testing.expect(try app.performAction(.app, .new_window, .{ .arguments = &.{launch_z} }));
+        try std.testing.expect(app.pending_toast_activation == null);
+        try std.testing.expectEqual(@as(usize, 0), app.hosts.items.len);
+
+        // Another toast is another click.
+        const other: win32_toast_activation.ActivationTarget = .{ .surface_id = 42, .pid = sys.GetCurrentProcessId(), .action = .focus };
+        const other_w = try launchFor(alloc, other);
+        defer alloc.free(other_w);
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, other_w, null, 0));
+        try dispatch(&app);
+        try std.testing.expect(other.eql(app.pending_toast_activation.?));
+    }
+
+    fn windowBody() !void {
+        const alloc = std.testing.allocator;
+        var core: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core, .app = &app });
+        defer session.deinit();
+        try app.createMessageWindow();
+        defer Pkg19NativeDeliveryTest.closeAppWindow(&app);
+        win32_toast_activator.bind(toastActivatorSink(app.delivery.?));
+        defer win32_toast_activator.bind(null);
+        const callback = win32_toast_activator.testCallback();
+
+        const Hook = struct {
+            var windows_made: usize = 0;
+            fn createSurface(_: *App, _: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+                // A new window of its own, not a tab of some host.
+                if (opts.host_id != null) return error.TestUnexpectedTab;
+                windows_made += 1;
+                return error.TestWindowCreateFailed;
+            }
+        };
+        Hook.windows_made = 0;
+        app.test_create_window_surface = &Hook.createSurface;
+        app.startup_windows_opened = true;
+
+        // A running App with no window: the click asks for one, which then
+        // presents it.
+        const target: win32_toast_activation.ActivationTarget = .{ .surface_id = 5, .pid = sys.GetCurrentProcessId(), .action = .focus };
+        const launch = try launchFor(alloc, target);
+        defer alloc.free(launch);
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, launch, null, 0));
+        try dispatch(&app);
+        try std.testing.expect(target.eql(app.pending_toast_activation.?));
+        try core.tick(&app);
+        try std.testing.expectEqual(@as(usize, 1), Hook.windows_made);
+
+        // The same click again asks for nothing more.
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, launch, null, 0));
+        try dispatch(&app);
+        try core.tick(&app);
+        try std.testing.expectEqual(@as(usize, 1), Hook.windows_made);
+
+        // Before the startup windows exist, the first of them takes the
+        // click instead.
+        app.startup_windows_opened = false;
+        app.pending_toast_activation = null;
+        const early: win32_toast_activation.ActivationTarget = .{ .surface_id = 6, .pid = sys.GetCurrentProcessId(), .action = .focus };
+        const early_w = try launchFor(alloc, early);
+        defer alloc.free(early_w);
+        try std.testing.expectEqual(win32_uia.S_OK, callback.vtbl.Activate(callback, aumid, early_w, null, 0));
+        try dispatch(&app);
+        try core.tick(&app);
+        try std.testing.expect(early.eql(app.pending_toast_activation.?));
+        try std.testing.expectEqual(@as(usize, 1), Hook.windows_made);
+    }
+};
+
+test "Activate routes invokedArgs through the toast delivery channel" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(ToastActivatorDeliveryTest.routesBody);
+}
+
+test "one click arriving twice activates once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(ToastActivatorDeliveryTest.onceBody);
+}
+
+test "a toast click with no window open opens one" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(ToastActivatorDeliveryTest.windowBody);
+}
+
+test "-ToastActivated is a launch argument, not a config diagnostic" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    // What COM starts: the installer's LocalServer32 command plus -Embedding.
+    const command_line = "--font-size=13 -ToastActivated -Embedding";
+    var cfg = try configpkg.Config.default(alloc);
+    defer cfg.deinit();
+    var iter = try std.process.ArgIteratorGeneral(.{}).init(alloc, command_line);
+    defer iter.deinit();
+    try cli_args.parse(configpkg.Config, alloc, &cfg, &iter);
+    try std.testing.expect(cfg._diagnostics.empty());
+    try std.testing.expectEqual(@as(f32, 13), cfg.@"font-size");
+
+    // It is a toast activation start, not a terminal handoff server, though
+    // COM's -Embedding is there too.
+    try std.testing.expectEqual(ComStart.toast_activator, ComStart.ofArgs(&.{ "noctty.exe", "--font-size=13", "-ToastActivated", "-Embedding" }));
+    try std.testing.expectEqual(ComStart.terminal_handoff, ComStart.ofArgs(&.{ "noctty.exe", "-Embedding" }));
+    try std.testing.expectEqual(ComStart.none, ComStart.ofArgs(&.{ "noctty.exe", "-e", "x.exe", "-ToastActivated", "-Embedding" }));
+    try std.testing.expectEqual(ComStart.none, ComStart.ofArgs(&.{"noctty.exe"}));
+
+    // The settings save target stops where the loader stops.
+    const saved = try cliConfigFileOverrideArgs(alloc, &.{ "noctty.exe", "--config-file=C:\\a.conf", "-ToastActivated", "--config-file=C:\\b.conf" });
+    defer if (saved) |path| alloc.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, saved.?, "a.conf"));
 }
 
 fn postDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) bool {
@@ -57315,6 +57789,7 @@ test "win32 resolveToastActivationSurface prefers exact surface id" {
     try app.windows.append(std.testing.allocator, &exact);
 
     const resolved = app.resolveToastActivationSurface(.{
+        .pid = sys.GetCurrentProcessId(),
         .surface_id = 202,
         .window_id = 999,
         .action = .focus,
@@ -57373,6 +57848,7 @@ test "win32 resolveToastActivationSurface finds split pane by exact surface id" 
     try app.windows.append(std.testing.allocator, &primary);
 
     const resolved = app.resolveToastActivationSurface(.{
+        .pid = sys.GetCurrentProcessId(),
         .surface_id = 502,
         .action = .focus,
     });
@@ -57408,6 +57884,7 @@ test "win32 resolveToastActivationSurface falls back to primary surface" {
     try app.windows.append(std.testing.allocator, &primary);
 
     const resolved = app.resolveToastActivationSurface(.{
+        .pid = sys.GetCurrentProcessId(),
         .surface_id = 999,
         .window_id = 999,
         .action = .focus,
@@ -57452,6 +57929,7 @@ test "win32 resolveToastActivationSurface prefers requested host tab when surfac
     try app.windows.append(std.testing.allocator, &tab1_surface);
 
     const resolved = app.resolveToastActivationSurface(.{
+        .pid = sys.GetCurrentProcessId(),
         .surface_id = 999,
         .tab_id = 2,
         .window_id = host.id,
@@ -57488,6 +57966,59 @@ test "win32 buildToastLaunchForSurface includes host tab id" {
     try std.testing.expectEqual(@as(?u32, 44), parsed.tab_id);
     try std.testing.expectEqual(@as(?u32, host.id), parsed.window_id);
     try std.testing.expectEqual(@as(?win32_toast_activation.Action, .focus), parsed.action);
+}
+
+test "launch string round-trips pid; a foreign pid only presents" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var app: App = undefined;
+    app.windows = .empty;
+    app.hosts = .empty;
+    defer app.windows.deinit(std.testing.allocator);
+    defer app.hosts.deinit(std.testing.allocator);
+
+    var host: Host = undefined;
+    host.id = 93;
+    host.tabs = .empty;
+    host.active_tab = 0;
+    defer {
+        for (host.tabs.items) |*tab| tab.deinit();
+        host.tabs.deinit(std.testing.allocator);
+    }
+
+    var first: Surface = undefined;
+    first.core_surface = undefined;
+    first.core_surface.id = 601;
+    first.host = &host;
+    first.host_id = host.id;
+
+    var second: Surface = undefined;
+    second.core_surface = undefined;
+    second.core_surface.id = 602;
+    second.host = &host;
+    second.host_id = host.id;
+
+    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 1, &first));
+    try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &second));
+    try app.hosts.append(std.testing.allocator, &host);
+    try app.windows.append(std.testing.allocator, &first);
+    try app.windows.append(std.testing.allocator, &second);
+
+    // The pane's own launch string names this process and routes to it.
+    const launch = try buildToastLaunchForSurface(std.testing.allocator, &second);
+    defer std.testing.allocator.free(launch);
+    const own = try win32_toast_activation.parseLaunchArg(launch);
+    try std.testing.expectEqual(@as(?u32, sys.GetCurrentProcessId()), own.pid);
+    try std.testing.expectEqual(@as(?*Surface, &second), app.resolveToastActivationSurface(own));
+
+    // The same ids from another process, or from a launch with no pid, are
+    // not this process's: only the primary surface is presented.
+    var foreign = own;
+    foreign.pid = sys.GetCurrentProcessId() +% 4;
+    try std.testing.expectEqual(@as(?*Surface, &first), app.resolveToastActivationSurface(foreign));
+    var unnamed = own;
+    unnamed.pid = null;
+    try std.testing.expectEqual(@as(?*Surface, &first), app.resolveToastActivationSurface(unnamed));
 }
 
 /// Records what `App.showToast` hands its sink, in place of WinRT.
