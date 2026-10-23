@@ -249,11 +249,16 @@ pub const UserProfiles = struct {
                 .env = env,
             };
         }
+        // Allocate everything before `arena` is copied into the result: a
+        // node the copy creates after that is known only to this local and
+        // would never be freed.
+        const order = try copyStrings(alloc, config.@"profile-order".list.items);
+        const hidden = try copyStrings(alloc, config.@"profile-hidden".list.items);
         return .{
             .arena = arena,
             .definitions = definitions,
-            .order = try copyStrings(alloc, config.@"profile-order".list.items),
-            .hidden = try copyStrings(alloc, config.@"profile-hidden".list.items),
+            .order = order,
+            .hidden = hidden,
         };
     }
 
@@ -2714,6 +2719,23 @@ test "listing applies profile-order and profile-hidden after SSH and the user pr
     const copy = try cloneProfiles(alloc, profiles);
     defer deinitProfiles(alloc, copy);
     try testing.expect(copy[3].hidden and !copy[2].hidden);
+}
+
+test "UserProfiles frees profile-order and profile-hidden when no profile is defined" {
+    // With no `profile-command` the definitions take no arena memory, so
+    // the first copy below creates the arena's first node.
+    const testing = std.testing;
+    const Config = @import("Config.zig");
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    const arena = cfg._arena.?.allocator();
+    try cfg.@"profile-hidden".parseCLI(arena, "wsl:docker-desktop");
+    try cfg.@"profile-order".parseCLI(arena, "cmd");
+    var user = try UserProfiles.init(testing.allocator, &cfg);
+    defer user.deinit();
+    try testing.expectEqual(@as(usize, 0), user.definitions.len);
+    try testing.expectEqualStrings("cmd", user.order[0]);
+    try testing.expectEqualStrings("wsl:docker-desktop", user.hidden[0]);
 }
 
 fn probeWslExecutableCached(alloc: Allocator, exe_path: []const u8) !bool {

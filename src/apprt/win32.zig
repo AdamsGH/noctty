@@ -1122,6 +1122,18 @@ fn applyDefaultProfileConfig(config: *configpkg.Config) !?*const windows_shell.P
     return profile;
 }
 
+/// `default-profile`'s profile when `key` names it. A pane it started
+/// carries its key, and the config holds the profile resolved, so a split,
+/// an elevated window or a restore of that pane needs no list (no WSL probe
+/// on the UI thread) and finds the profile though discovery may list none
+/// such: an alias outside the SSH config, a distribution WSL did not list.
+fn defaultProfileForKey(config: *const configpkg.Config, key: []const u8) ?*const windows_shell.Profile {
+    if (config._default_profile) |*profile| {
+        if (profileKeyEquals(profile.*, key)) return profile;
+    }
+    return null;
+}
+
 fn splitWorkingDirectoryCandidate(live_pwd: ?[]const u8, cached_pwd: ?[]const u8) ?[]const u8 {
     if (live_pwd) |pwd| {
         if (pwd.len > 0) return pwd;
@@ -5064,10 +5076,10 @@ pub const App = struct {
         host: ?*Host,
         key: []const u8,
     ) !bool {
-        // A pane of `default-profile` names a profile the config has already
-        // resolved: no list, so no WSL probe, is needed to restore it.
-        if (self.config._default_profile) |*profile| {
-            if (!startsWithIgnoreCase(key, "ssh:") and profileKeyEquals(profile.*, key)) {
+        // SSH stays refused below; any other pane of `default-profile`
+        // restores without a list.
+        if (!startsWithIgnoreCase(key, "ssh:")) {
+            if (defaultProfileForKey(&self.config, key)) |profile| {
                 if (!isSessionRestorableProfile(profile)) return false;
                 try applyProfileSurfaceConfig(config, profile);
                 return true;
@@ -6875,15 +6887,7 @@ pub const App = struct {
                         surface.host
                     else
                         null;
-                    const profile: ?*const windows_shell.Profile = if (source_host) |host|
-                        try host.profileForKey(key)
-                    else profile: {
-                        const profiles = try listProfilesForConfig(alloc, &self.config, windows_shell.listProfiles);
-                        temporary_profiles = profiles;
-                        const index = profileIndexByKey(profiles, key) orelse break :profile null;
-                        break :profile &profiles[index];
-                    };
-                    const found = profile orelse {
+                    const found = (try self.elevatedWindowProfile(source_host, key, &temporary_profiles)) orelse {
                         log.warn("elevated window profile not found key={s}", .{key});
                         return false;
                     };
@@ -8347,10 +8351,30 @@ pub const App = struct {
         source: *Surface,
     ) !?[]const u8 {
         const key = source.launch_profile_key orelse return null;
-        const host = source.host orelse return null;
-        const profile = (try host.profileForKey(key)) orelse return null;
+        const profile = defaultProfileForKey(config, key) orelse profile: {
+            const host = source.host orelse return null;
+            break :profile (try host.profileForKey(key)) orelse return null;
+        };
         try applyProfileLaunchConfig(config, profile);
         return profile.key;
+    }
+
+    /// The profile `new_window_elevated` runs for `key`: `default-profile`'s
+    /// own when the key is its, else the one in the source window's list,
+    /// else in a list built for the purpose, stored in `temporary` for the
+    /// caller to free.
+    fn elevatedWindowProfile(
+        self: *App,
+        source_host: ?*Host,
+        key: []const u8,
+        temporary: *?[]windows_shell.Profile,
+    ) !?*const windows_shell.Profile {
+        if (defaultProfileForKey(&self.config, key)) |profile| return profile;
+        if (source_host) |host| return try host.profileForKey(key);
+        const profiles = try listProfilesForConfig(self.core_app.alloc, &self.config, windows_shell.listProfiles);
+        temporary.* = profiles;
+        const index = profileIndexByKey(profiles, key) orelse return null;
+        return &profiles[index];
     }
 
     fn createProfileSurface(
@@ -29933,6 +29957,98 @@ test "win32 toggle_quick_terminal opens a fresh floating tab instead of showing 
     }.body);
 }
 
+/// What a quick terminal toggle hands `createWindowSurface`, for the
+/// `default-profile` test: the program and the profile's variable.
+const QuickTerminalDefaultProfile = struct {
+    /// Copies: the config is freed when the toggle returns.
+    var arena: std.heap.ArenaAllocator = undefined;
+    var program: ?[]const u8 = null;
+    var mode: ?[]const u8 = null;
+    var dir: ?[]const u8 = null;
+
+    fn see(config: *const configpkg.Config) !void {
+        const a = arena.allocator();
+        program = try a.dupe(u8, config.command.?.direct[0]);
+        mode = if (config.env.map.get("MODE")) |value| try a.dupe(u8, value) else null;
+        dir = if (config.@"working-directory") |wd| switch (wd) {
+            .path => |path| try a.dupe(u8, path),
+            else => null,
+        } else null;
+    }
+
+    fn fresh(app: *App, config: *const configpkg.Config, title: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+        try see(config);
+        return try QuickTerminalFreshTab.createSurface(app, config, title, opts);
+    }
+
+    fn create(_: *App, config: *const configpkg.Config, _: LPCWSTR, opts: SurfaceInitOptions) anyerror!*Surface {
+        try see(config);
+        try std.testing.expect(opts.host_id == null);
+        return error.TestWindowCreateFailed;
+    }
+};
+
+test "win32 toggle_quick_terminal runs default-profile in a new window and a fresh tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: QuickTerminalToggleFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const alloc = fixture.app.core_app.alloc;
+            const arena = fixture.app.config._arena.?.allocator();
+            try fixture.app.config.@"profile-command".parseCLI(arena, "py: cmd.exe /k py");
+            try fixture.app.config.@"profile-env".parseCLI(arena, "py: MODE=profile");
+            try fixture.app.config.@"profile-working-directory".parseCLI(arena, "py: D:\\pinned");
+            fixture.app.config.@"default-profile" = "py";
+            try fixture.app.config.finalize();
+            try std.testing.expectEqualStrings("user:py", if (fixture.app.config._default_profile) |profile| profile.key else "");
+            QuickTerminalDefaultProfile.arena = .init(std.testing.allocator);
+            defer QuickTerminalDefaultProfile.arena.deinit();
+
+            // An empty quick terminal host, as the fresh-tab test makes it.
+            fixture.app.shell_runtime_initialized = true;
+            var window = try fixture.app.shell_runtime.prepare(.create_window);
+            defer window.deinit();
+            try window.commit(&fixture.app.shell_runtime);
+            fixture.host.shell_id = window.created.window;
+            var close = try fixture.app.shell_runtime.prepare(.{ .detach_tab = window.created.tab.? });
+            defer close.deinit();
+            try close.commit(&fixture.app.shell_runtime);
+            var detached = fixture.host.tabs.orderedRemove(0);
+            defer detached.deinit();
+            fixture.surface.window_visible = false;
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expect(!fixture.visible());
+
+            // The fresh tab it opens runs the profile and keeps its key.
+            QuickTerminalFreshTab.fixture = &fixture;
+            QuickTerminalFreshTab.calls = 0;
+            QuickTerminalDefaultProfile.program = null;
+            fixture.app.test_create_window_surface = &QuickTerminalDefaultProfile.fresh;
+            defer appendOwnedString(alloc, &fixture.host.cached_window_title, null) catch unreachable;
+            defer appendOwnedString(alloc, &fixture.fresh.launch_profile_key, null) catch unreachable;
+            try fixture.app.toggleQuickTerminal();
+            try std.testing.expectEqual(@as(usize, 1), QuickTerminalFreshTab.calls);
+            try std.testing.expectEqualStrings("cmd.exe", QuickTerminalDefaultProfile.program orelse "");
+            try std.testing.expectEqualStrings("profile", QuickTerminalDefaultProfile.mode orelse "");
+            try std.testing.expectEqualStrings("D:\\pinned", QuickTerminalDefaultProfile.dir orelse "");
+            try std.testing.expectEqualStrings("user:py", fixture.fresh.launch_profile_key orelse "");
+
+            // With no quick terminal yet, the window it creates runs it too.
+            fixture.host.quick_terminal = false;
+            defer fixture.host.quick_terminal = true;
+            QuickTerminalDefaultProfile.program = null;
+            fixture.app.test_create_window_surface = &QuickTerminalDefaultProfile.create;
+            try std.testing.expectError(error.TestWindowCreateFailed, fixture.app.toggleQuickTerminal());
+            try std.testing.expectEqualStrings("cmd.exe", QuickTerminalDefaultProfile.program orelse "");
+            try std.testing.expectEqualStrings("profile", QuickTerminalDefaultProfile.mode orelse "");
+            // The app config is left as it was.
+            try std.testing.expect(fixture.app.config.env.map.get("MODE") == null);
+        }
+    }.body);
+}
+
 test "win32 toggle_quick_terminal keeps a pane a zoom hides out of view" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     try runOnHiddenDesktop(struct {
@@ -43100,7 +43216,7 @@ fn uninitializedInertStorage(comptime T: type) T {
 /// storage, not valid live instances.
 const TestSession = struct {
     const max_hosts = 4;
-    const max_surfaces = 8;
+    const max_surfaces = 10;
 
     const HostOptions = struct {
         storage: *Host,
@@ -53413,7 +53529,7 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     var app: App = undefined;
     var host: Host = undefined;
     var source: Surface = undefined;
-    var created: [7]Surface = undefined;
+    var created: [8]Surface = undefined;
     var session: TestSession = .{};
     var surfaces: [1 + created.len]TestSession.SurfaceOptions = undefined;
     surfaces[0] = .{ .storage = &source, .host = &host, .register = true, .free_launch_profile_key_on_deinit = true };
@@ -53435,7 +53551,7 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     const alloc = app.core_app.alloc;
     defer for (&created) |*surface| appendOwnedString(alloc, &surface.pwd, null) catch unreachable;
 
-    // `default-profile = py`, resolved as `Config.finalize` does outside tests.
+    // `default-profile = py`, which `Config.finalize` resolves.
     const arena = app.config._arena.?.allocator();
     try app.config.@"profile-command".parseCLI(arena, "py: cmd.exe /k py");
     try app.config.@"profile-env".parseCLI(arena, "py: MODE=profile");
@@ -53443,7 +53559,6 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     app.config.@"default-profile" = "py";
     app.config.@"split-inherit-working-directory" = false;
     try app.config.finalize();
-    try app.config.applyDefaultProfile(windows_shell.ReferenceHost{});
     try std.testing.expectEqualStrings("user:py", app.config._default_profile.?.key);
 
     // A profile the picker shows, for the explicit choices below.
@@ -53568,7 +53683,69 @@ test "win32 default-profile runs where nothing chose a launch, and only there" {
     var transaction = SessionRestoreTransaction.init(&app);
     _ = try app.restoreSessionPane(.{ .profile = "user:gone", .cwd = "C:\\saved" }, &host, null, host.tabs.items.len, .right, &transaction);
     try Expect.profile(&created[6], "C:\\saved");
+    // So does an SSH pane, which restore never reopens: the default profile
+    // runs, as it would for `default-profile = ssh:<alias>` (docs/windows.md).
+    _ = try app.restoreSessionPane(.{ .profile = "ssh:prod", .cwd = "C:\\saved" }, &host, null, host.tabs.items.len, .right, &transaction);
+    try Expect.profile(&created[7], "C:\\saved");
+    try std.testing.expect(!created[7].launched_ssh);
     try std.testing.expectEqual(created.len, Hook.next);
+}
+
+test "win32 a split or an elevated window of a default-profile pane needs no profile list" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var listed: Host = undefined;
+    var unlisted: Host = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &listed, .register = true, .id = 1 },
+            .{ .storage = &unlisted, .register = true, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    defer testFreeHostProfiles(&app, &.{ &listed, &unlisted });
+    const alloc = app.core_app.alloc;
+
+    const arena = app.config._arena.?.allocator();
+    try app.config.@"profile-command".parseCLI(arena, "py: cmd.exe /k py");
+    app.config.@"default-profile" = "py";
+    try app.config.finalize();
+    try std.testing.expectEqualStrings("user:py", if (app.config._default_profile) |profile| profile.key else "");
+
+    // One window has a list without the default profile (as when discovery
+    // misses an SSH alias or a WSL distribution); the other has none.
+    listed.profiles = try testProfileList(alloc, &.{"pwsh.exe"});
+    listed.profiles_complete = true;
+
+    // A split from a window with no list borrows none (and discovers
+    // nothing): the config has the profile.
+    var source: Surface = undefined;
+    source.launch_profile_key = "USER:PY";
+    source.host = &unlisted;
+    var config = app.config.shallowClone(alloc);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("user:py", (try App.applySplitProfileConfigFromSource(&config, &source)) orelse "");
+    try std.testing.expectEqualStrings("cmd.exe", config.command.?.direct[0]);
+    try std.testing.expect(unlisted.profiles == null);
+
+    // An elevated window finds it whether or not the list has it, and
+    // builds no list of its own.
+    var temporary: ?[]windows_shell.Profile = null;
+    for ([_]?*Host{ &listed, &unlisted, null }) |source_host| {
+        const found = (try app.elevatedWindowProfile(source_host, "user:py", &temporary)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("user:py", found.key);
+        try std.testing.expect(temporary == null);
+    }
+    try std.testing.expect(unlisted.profiles == null);
+    // Another key is still looked up in the window's list.
+    const listed_profile = (try app.elevatedWindowProfile(&listed, "PWSH.EXE", &temporary)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("pwsh.exe", listed_profile.key);
+    try std.testing.expect((try app.elevatedWindowProfile(&listed, "cmd.exe", &temporary)) == null);
 }
 
 test "win32 a restored pane keeps its own profile over default-profile" {
@@ -53581,7 +53758,6 @@ test "win32 a restored pane keeps its own profile over default-profile" {
     try base.@"profile-env".parseCLI(arena, "py: MODE=profile");
     base.@"default-profile" = "py";
     try base.finalize();
-    try base.applyDefaultProfile(windows_shell.ReferenceHost{});
 
     const pwsh_argv = [_][:0]const u8{"pwsh.exe"};
     var profiles = [_]windows_shell.Profile{.{ .kind = .pwsh, .key = "pwsh.exe", .label = "PowerShell", .command = .{ .direct = &pwsh_argv } }};

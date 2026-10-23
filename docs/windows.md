@@ -484,8 +484,11 @@ turns the file into a one-click surface.
 
 SSH entries run without shell integration, which is injected into a local
 shell and cannot apply to a remote session. Session restore does not reopen
-them: an SSH pane comes back as the default shell rather than dialing out
-unattended. SSH entries sort after the detected shells and your own
+them: an SSH pane comes back as the default shell rather than dialing the host
+the saved session names. The default shell is what your config says, though:
+with `default-profile = ssh:<alias>` (or a `command` that runs `ssh`) a
+restored pane, an SSH pane included, connects to that alias, as every new
+terminal does. SSH entries sort after the detected shells and your own
 [user profiles](#user-profiles). `profile-order` can move any profile, an SSH
 entry included, and `profile-hidden` can take one out of the lists (see
 [Default profile, order and hidden profiles](#default-profile-order-and-hidden-profiles)).
@@ -616,8 +619,10 @@ it. A quick slot pinned to it keeps the pin but does not show it.
 All three take a profile by name: the id of a user profile (`vs18-cmd`, or
 `user:vs18-cmd`), a detected profile's key (`pwsh.exe`, `powershell.exe`,
 `cmd.exe`, `git-bash`, `wsl-default`, `wsl:<distribution>`, `ssh:<alias>`), or
-a name `NOCTTY_WIN32_PROFILE_ORDER` takes (`pwsh`, `git`, `cmd`, `wsl`, a
-distribution's own name). A bare word is a user profile's id first, so a user
+a name `NOCTTY_WIN32_PROFILE_ORDER` takes (`pwsh`, `git`, `cmd`, `wsl`; in
+`profile-order` and `profile-hidden` also a distribution's own name, which
+`default-profile` takes only as `wsl:<distribution>`). A bare word is a user
+profile's id first, so a user
 profile with the id `git` takes `git` from Git Bash. In `profile-order` and
 `profile-hidden` a name can stand for several profiles: `profile-hidden = wsl`
 hides every WSL profile. `default-profile` finds its profile without listing
@@ -634,7 +639,7 @@ What a new terminal runs, highest first:
 | Rank | Setting                   | Where it applies                                                                                                                                                                                                                                                         |
 | ---- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1    | `initial-command`, `-e`   | The first window of the launch only.                                                                                                                                                                                                                                     |
-| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone falls through to rank 4 or below, in its saved directory.                                                                                                                            |
+| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone, or an SSH pane (never reopened), falls through to rank 4 or below, in its saved directory.                                                                                          |
 | 3    | A profile you choose      | The picker, the palette, a quick slot, the [▾] menu, `new_window_elevated:<key>`, and a tab or split an automation command opens from a pane (it keeps that pane's launch).                                                                                              |
 | 4    | `command`                 | From any config file or the command line. Set in a file together with `default-profile`, it wins and the unused `default-profile` is reported as a config problem; `--command` on the command line wins without one, and `--command=` (empty) undoes a file's `command`. |
 | 5    | `default-profile`         | Everything else: a new tab, a new window, the quick terminal, a split of a pane that runs no profile.                                                                                                                                                                    |

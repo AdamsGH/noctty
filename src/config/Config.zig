@@ -5113,6 +5113,14 @@ pub fn finalize(self: *Config) !void {
     // which has to have passed these checks.
     try self.finalizeProfiles();
     try self.finalizeDefaultProfileSetting();
+    // `default-profile` stands in for the automatic default below. Tests
+    // resolve it through fixed lookups (no PATH search), so they load it
+    // through this same call.
+    if (comptime builtin.os.tag == .windows) {
+        if (self.command == null) try self.applyDefaultProfile(
+            if (comptime builtin.is_test) TestDefaultProfileHost{} else windows_shell.ReferenceHost{},
+        );
+    }
 
     // The default for the working directory depends on the system.
     var wd: WorkingDirectory = self.@"working-directory" orelse if (probable_cli)
@@ -5154,10 +5162,7 @@ pub fn finalize(self: *Config) !void {
 
             switch (builtin.os.tag) {
                 .windows => {
-                    if (self.command == null) {
-                        try self.applyDefaultProfile(windows_shell.ReferenceHost{});
-                        try self.resolveWindowsDefaultCommand();
-                    }
+                    if (self.command == null) try self.resolveWindowsDefaultCommand();
 
                     if (wd == .home and !windows_shell.isWslCommand(self.command.?)) {
                         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -5346,8 +5351,8 @@ const TestDefaultProfileHost = struct {
 };
 
 /// A load as `Config.load` makes it: the config file, the command line,
-/// then an included file (read after the command line), then `finalize`
-/// and the default profile `finalize` looks for outside tests.
+/// then an included file (read after the command line), then `finalize`,
+/// which looks for the default profile.
 fn testLoadDefaultProfile(alloc: Allocator, file: []const u8, argv: []const []const u8, include: []const u8) !Config {
     var cfg = try Config.default(alloc);
     errdefer cfg.deinit();
@@ -5358,7 +5363,6 @@ fn testLoadDefaultProfile(alloc: Allocator, file: []const u8, argv: []const []co
     var included: std.Io.Reader = .fixed(include);
     try cfg.loadReader(alloc, &included, "C:\\noctty-test\\profiles.ghostty");
     try cfg.finalize();
-    try cfg.applyDefaultProfile(TestDefaultProfileHost{});
     return cfg;
 }
 
@@ -5495,7 +5499,6 @@ test "safe mode starts its recovery command over default-profile" {
     cfg.@"default-profile" = "pwsh";
     try cfg.useWindowsRecoveryCommand();
     try cfg.finalize();
-    try cfg.applyDefaultProfile(TestDefaultProfileHost{});
     try testing.expect(cfg._diagnostics.empty());
     try testing.expect(cfg._default_profile == null);
     try testing.expectEqualStrings("/D", cfg.command.?.direct[1]);
