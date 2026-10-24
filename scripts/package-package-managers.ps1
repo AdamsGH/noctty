@@ -322,6 +322,107 @@ $arm64SetupSha256 = if ($artifacts.Contains("arm64")) { $artifacts["arm64"].setu
 $chocolateyInstall = @'
 $ErrorActionPreference = 'Stop'
 
+# Setup closes a running noctty, and noctty declines to close while a pane runs a program. Run
+# from inside a noctty window, Chocolatey is that program, so Setup would stop with exit 5. Refuse
+# up front with a clear message instead, before the installer is downloaded. Nothing is stopped here:
+# closing noctty is Setup's job, through Restart Manager.
+function Open-NocttyRegistryBaseKey([Microsoft.Win32.RegistryHive] $Hive, [Microsoft.Win32.RegistryView] $View) {
+    [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, $View)
+}
+
+function Get-NocttyInstallDirectory {
+    # Setup reuses the previous directory, so a custom location is recorded in its uninstall key.
+    # Setup installs in 64-bit mode, so the machine-wide key is in the 64-bit registry view, which
+    # the HKLM: drive of a 32-bit PowerShell does not show. HKCU\SOFTWARE is the same in both views.
+    $uninstallKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\io.github.amanthanvi.winghostty_is1'
+    $location = $null
+    try {
+        $machine = Open-NocttyRegistryBaseKey -Hive LocalMachine -View Registry64
+        try {
+            $entry = $machine.OpenSubKey($uninstallKey)
+            if ($entry) {
+                try { $location = $entry.GetValue('InstallLocation') } finally { $entry.Close() }
+            }
+        } finally { $machine.Close() }
+    } catch {
+        $location = $null
+    }
+    if (-not $location) {
+        $entry = Get-ItemProperty -Path "HKCU:\$uninstallKey" -Name InstallLocation -ErrorAction SilentlyContinue
+        if ($entry) { $location = $entry.InstallLocation }
+    }
+    if ($location) { return ([string] $location).TrimEnd('\') }
+    $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    Join-Path $programFiles 'noctty'
+}
+
+function Assert-NotInsideNoctty {
+    # With no noctty running there is nothing for Setup to close, and nothing to query.
+    if (-not (Get-Process -Name 'noctty' -ErrorAction SilentlyContinue)) { return }
+
+    $insideMessage = 'noctty cannot be upgraded from one of its own windows: Setup has to close noctty, and noctty cannot close while Chocolatey is running in it. Run this from another terminal.'
+    $installPrefix = (Get-NocttyInstallDirectory) + [IO.Path]::DirectorySeparatorChar
+
+    # Walk this process's ancestors and refuse when one of them runs from the install directory.
+    $seen = @()
+    $current = $PID
+    $childStarted = $null
+    while ($current -and $seen -notcontains $current) {
+        $seen += $current
+        try {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $current" -OperationTimeoutSec 15 -ErrorAction Stop
+        } catch {
+            throw 'noctty is running, but the process list could not be read, so it cannot be checked whether Chocolatey is running inside a noctty window. Close noctty and run the upgrade again.'
+        }
+        if (-not $proc) { break }
+        # A parent that is not older than its child is a reused process ID: the real chain has ended.
+        if ($childStarted -and $proc.CreationDate -and $proc.CreationDate -ge $childStarted) { break }
+        if ($proc.ExecutablePath -and $proc.ExecutablePath.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw $insideMessage
+        }
+        $childStarted = $proc.CreationDate
+        $current = $proc.ParentProcessId
+    }
+
+    # A console that noctty hosts as the default terminal has no noctty ancestor: its host is
+    # Windows Terminal's OpenConsole and noctty runs as a separate COM server (noctty.exe -Embedding;
+    # COM adds -Embedding to the toast activator too, which has -ToastActivated and hosts nothing).
+    # Refuse when noctty is the default terminal, that server is running and this console is a pseudo
+    # console. Every pseudo console qualifies, a Windows Terminal tab included, so the message cannot
+    # say that this window is noctty's; it says which windows to close and where to run the upgrade.
+    # The server hosts the tabs and windows opened from its windows too, and exits a few seconds
+    # after its last one closes.
+    # This is best effort and can refuse when closing noctty would not end the console; if it cannot
+    # be evaluated, Restart Manager still makes the upgrade fail safely.
+    $handoffMessage = 'noctty is your default terminal and is hosting console windows, and this window may be one of them. Close the console windows noctty opened as the default terminal, and any tabs or windows opened from them, and wait a few seconds. Then run the upgrade again from a terminal app such as Windows Terminal: while noctty is the default terminal, new console windows open in noctty too.'
+    $handedOff = $false
+    try {
+        $startup = Get-ItemProperty -LiteralPath 'HKCU:\Console\%%Startup' -Name DelegationTerminal -ErrorAction SilentlyContinue
+        if ($startup -and $startup.DelegationTerminal -eq '{33368C6F-D328-410C-B225-26DC9F12C728}') {
+            # Like noctty itself, read the switches after the executable and before -e, after which
+            # everything belongs to the command a pane runs.
+            $server = @(Get-CimInstance Win32_Process -Filter "Name = 'noctty.exe'" -OperationTimeoutSec 15 -ErrorAction Stop) |
+                Where-Object {
+                    $switches = (($_.CommandLine -replace '^\s*(?:"[^"]*"|\S+)', '') -csplit '\s-e(?:\s|$)', 2)[0]
+                    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase) -and $switches -match '(^|\s)-Embedding(\s|$)' -and $switches -notmatch '(^|\s)-ToastActivated(\s|$)'
+                }
+            if ($server) {
+                Add-Type -Namespace NocttyGuard -Name Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int maxCount);'
+                $window = [NocttyGuard.Native]::GetConsoleWindow()
+                if ($window -ne [IntPtr]::Zero) {
+                    $className = New-Object System.Text.StringBuilder 256
+                    [void][NocttyGuard.Native]::GetClassName($window, $className, $className.Capacity)
+                    $handedOff = $className.ToString() -eq 'PseudoConsoleWindow'
+                }
+            }
+        }
+    } catch {
+        $handedOff = $false
+    }
+    if ($handedOff) { throw $handoffMessage }
+}
+Assert-NotInsideNoctty
+
 $installers = @{
     x64 = @{
         url = '__X64_SETUP_URL__'
