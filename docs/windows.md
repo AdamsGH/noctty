@@ -249,7 +249,8 @@ new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
 literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
 relative PATH entries such as `.`, still select programs relative to the pane.
 
-With `command` unset, a new tab runs the first of these that is found:
+With `command` and [`default-profile`](#default-profile-order-and-hidden-profiles)
+unset, a new tab runs the first of these that is found:
 
 1. `pwsh.exe` (PowerShell 7+) on `PATH`.
 2. Windows PowerShell, from the Windows system directory.
@@ -271,8 +272,11 @@ lists the executable a new tab runs. `noctty --safe-mode` always starts
 broke, and Command Prompt loads no profile (`/D` also skips the `AutoRun`
 command that a registry value or Clink can hang there). The profile
 picker, its dropdown check mark and a right or middle click on the new-tab
-button start on the profile this default runs; a `command` you set does not
-move that choice.
+button start on the profile this default runs, or on the one
+`default-profile` names; a `command` you set does not move that choice. Once
+you choose a profile in the picker, the palette or a quick slot, they start on
+that one instead, and a reload that changes `default-profile` moves them only
+until you do.
 
 Discovery also skips drive aliases that map to a folder, such as `subst` drives.
 In safe mode, right or middle click deliberately opens the plain Command Prompt
@@ -484,10 +488,15 @@ turns the file into a one-click surface.
 SSH entries run without shell integration, which is injected into a local
 shell and cannot apply to a remote session. Session restore does not reopen
 them: an SSH pane comes back as the default shell rather than dialing out
-unattended. SSH entries sort after the detected shells and your own
-[user profiles](#user-profiles); `NOCTTY_WIN32_PROFILE_ORDER` covers the
-detected shell profiles only. There is no bundled SSH client, secrets vault,
-or fleet/connection management.
+unattended. Restore does not connect for `default-profile = ssh:<alias>`
+either: a restored pane that would run it gets the automatic shell, while a
+new tab or window still connects. SSH entries sort after the detected shells
+and your own [user profiles](#user-profiles). `profile-order` can move any
+profile, an SSH entry included, and `profile-hidden` can take one out of the
+lists (see [Default profile, order and hidden profiles](#default-profile-order-and-hidden-profiles)).
+The older `NOCTTY_WIN32_PROFILE_ORDER` environment variable is used only when
+`profile-order` is unset, and orders the detected shell profiles only. There
+is no bundled SSH client, secrets vault, or fleet/connection management.
 
 ## User profiles
 
@@ -569,7 +578,7 @@ Some are taken because they already name a detected profile or a reference:
 
 Saved sessions and layouts remember a profile by its id, so change
 `profile-name` freely. A new id is a new profile: saved tabs of the old one
-open the default shell.
+open your `default-profile`, or the automatic shell when none is set.
 
 `profile-command = <id>:`, with nothing after the colon, removes a profile
 together with its other lines, including lines a file read later adds for it.
@@ -666,29 +675,114 @@ share `ghostty\config` with Ghostty on another machine, put profile lines in
 ### Order, restore and limits
 
 User profiles are listed after the detected local shells and before the SSH
-hosts, in the order of their first `profile-command` line. A session or a
-named layout remembers a pane's profile by its id (`user:<id>`); a saved pane
-that names an id that is gone, or removed, comes back as the default shell, as
-a pane whose shell was uninstalled does. A restored pane returns to the
-directory it was in. A tab or split that an automation command opens from a
-user profile pane keeps the command and environment that pane started with,
-even after a reload; an ordinary split reads the profile's current definition.
+hosts, in the order of their first `profile-command` line, unless
+`profile-order` moves them (below). A session or a named layout remembers a
+pane's profile by its id (`user:<id>`); a saved pane that names an id that is
+gone, or removed, comes back running your `default-profile` (or the automatic
+shell when none is set), as a pane whose shell was uninstalled does. A restored pane returns to the directory it was in. A tab or
+split that an automation command opens from a user profile pane keeps the
+command and environment that pane started with, even after a reload; an
+ordinary split reads the profile's current definition.
+
+### Default profile, order and hidden profiles
+
+```
+default-profile = py312
+profile-order = py312
+profile-order = pwsh
+profile-hidden = wsl:docker-desktop
+```
+
+`default-profile` names the profile a terminal runs when nothing else chose
+one, in place of the automatic shell above: the first window, a new tab
+(Ctrl+Shift+T), a new window, the quick terminal, a split of a pane that runs
+no profile, and a restored pane whose profile no longer exists. It brings the
+profile's command, its `profile-env` variables and its
+`profile-working-directory`; a profile without a directory of its own starts
+where `working-directory` and the `*-inherit-working-directory` settings say,
+as `command` does. A directory the launch asks for with `--working-directory`
+(Explorer's "Open noctty here", a jump-list recent folder, or the option on a
+second `noctty` that hands its arguments to a running one), or the directory
+`noctty +new-window` runs in, wins over the profile's
+`profile-working-directory`. A second `noctty` that names no directory (from
+the Start menu, say) opens in the profile's directory, as the first one did.
+An SSH profile always starts in your user profile directory. The pane remembers the profile, so its splits
+and a restored session run it again (except a detected `ssh:` profile, which
+restore never reconnects; a user profile that runs `ssh.exe` is restored like
+any other), and the profile picker opens on it until you choose another there.
+
+`profile-order` lists profiles first in the picker and the palette, in the
+order of its lines, and `profile-hidden` takes profiles out of the picker, the
+palette, the [▾] menu, the taskbar jump list and the quick slots. A hidden
+profile still runs where something names it: `default-profile`, a restored
+session or layout, `new_window_elevated:<key>`, a split of a pane that runs
+it. A quick slot pinned to it keeps the pin but does not show it.
+
+All three take a profile by its key: the id of one of your profiles (`py312`,
+or `user:py312`), a detected profile's key (`pwsh.exe`, `powershell.exe`,
+`cmd.exe`, `git-bash`, `wsl-default`, `wsl:<distribution>`, `ssh:<alias>`), or
+a short name (`pwsh`, `powershell`, `git`, `cmd`, `wsl`). In `profile-order`
+and `profile-hidden`, `wsl` names every WSL profile. A WSL distribution is
+always written `wsl:<distribution>`. Labels are not references, because they
+can change. A value that cannot name a profile (a typo, an id no
+`profile-command` line defines, a comment after the value) is reported as a
+config problem. One that names a shell this machine does not have
+(`wsl:docker-desktop`, an `ssh:` host) is not, so a shared config loads quietly
+everywhere. `default-profile` finds its profile without listing any:
+`wsl:Ubuntu` starts `wsl.exe -d Ubuntu` without asking WSL for its
+distributions, and `ssh:<alias>` starts `ssh.exe <alias>` without reading the
+SSH config. A `default-profile` that names no profile that can start here is
+reported as a config problem, and the automatic shell runs.
+`NOCTTY_WIN32_DEFAULT_PROFILE` still chooses where the picker starts when
+`default-profile` is unset, and `NOCTTY_WIN32_PROFILE_ORDER` still orders the
+detected shells when `profile-order` is unset.
+
+What a new terminal runs, highest first:
+
+| Rank | Setting                   | Where it applies                                                                                                                                                                                                                                                                                  |
+| ---- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `initial-command`, `-e`   | The first window of the launch only.                                                                                                                                                                                                                                                              |
+| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone, or an SSH pane (never reopened), falls through to rank 4 or below, in its saved directory; an SSH `default-profile` is skipped there (rank 6).                                                               |
+| 3    | A profile you choose      | The picker, the palette, a quick slot, the [▾] menu, `new_window_elevated:<key>`, and a tab or split an automation command opens from a pane (it keeps that pane's launch).                                                                                                                       |
+| 4    | `command`                 | From any config file or the command line. Set in a file together with `default-profile`, it wins and the unused `default-profile` is reported as a config problem; `--command` on the command line wins without one, and `--command=` (empty) undoes any file's `command`, an included one's too. |
+| 5    | `default-profile`         | Everything else: a new tab, a new window, the quick terminal, a split of a pane that runs no profile.                                                                                                                                                                                             |
+| 6    | The automatic shell       | PowerShell 7, else Windows PowerShell, else Command Prompt.                                                                                                                                                                                                                                       |
+
+Safe mode reads none of your config, so it never runs a default profile.
+`default-profile`, `profile-order` and `profile-hidden` are not accepted from
+a second `noctty` that hands its arguments to a running one (single-instance
+forwarding). On the command line, `default-profile`, `command` and
+`initial-command` win over those lines in a file included with
+`config-file`, which is otherwise read after the command line. The exception
+is `-e`: an `initial-command` line in a file included with `config-file`
+still replaces `-e` when the config is first loaded. A launch that names a
+profile with `--default-profile` (a jump-list entry for a user profile)
+starts without the saved session, as `-e` does.
 
 Limits:
 
-- `new_window_elevated:user:<id>` passes the profile's arguments and its
-  `profile-env` variables to the elevated process on its command line
-  (`--command=direct:...`, `--elevated-profile-env=...`), quoted again in the
-  standard way rather than as written, which differs only for cmd.exe's own
-  quoting idioms. The elevated process puts the variables over `env` after it
-  has read every config file, so an `env` line in an included file does not
-  replace them. The command does not have that guarantee: a `command` line in
-  a file included with `config-file` is read after the command line and
-  replaces it, as it does for every elevated window. The variables and the
-  command apply to the whole elevated window, not only its first pane.
-  A command line is not private (process tools and process-creation auditing
-  can show it), so do not keep a secret in the `profile-env` of a profile you
-  open elevated.
+- New Elevated Window for one of your profiles (`new_window_elevated:user:<id>`,
+  or New Elevated Window from a pane that runs it) names the profile
+  (`--command= --initial-command= --default-profile=user:<id>`), as a taskbar
+  entry does. The elevated process reads the same config files and starts the
+  profile itself, so its command line and variables reach it as written, a
+  `command` or `initial-command` line in an included file does not replace
+  it, and none of them appear on the elevated command line. It applies to the
+  whole elevated window, not only its first pane. `%NAME%` in the profile's
+  lines then reads the elevated process's own environment, which Windows
+  builds for the elevated token rather than copying noctty's: a variable that
+  only the shell that started noctty set is not there (an `env` line is). A
+  profile defined only by a
+  `--profile-command` option on noctty's command line, or given a variable by
+  a `--profile-env` option there, or any profile when that command line has
+  an `--env` option (which `%NAME%` may read), or any profile when UAC would
+  run the elevated window as another account (a standard user entering an
+  administrator's credentials; that account reads its own config files, which
+  need not define the profile), is still passed as
+  arguments (`--command=direct:...`, quoted again in the standard way, an empty `--initial-command=`, and
+  `--elevated-profile-env=...`), which process tools and process-creation
+  auditing can read, so do not keep a secret in such a profile's
+  `profile-env`. A default profile is passed the same way as any other.
 - An elevated user profile starts in the directory of the pane it was opened
   from, as every elevated window does, not in its `profile-working-directory`.
 - Profile lines take effect at a config reload. Previewing a theme in the
@@ -700,7 +794,14 @@ Limits:
   interactive PowerShell line. A line with `-Command` or `-File` runs as
   written without it, as in Windows Terminal. A cmd.exe line gets cmd's
   integration.
-- User profiles are not in the taskbar jump list yet.
+- A user profile's taskbar jump-list entry names the profile
+  (`--command= --initial-command= --default-profile=user:<id>`) rather than
+  carrying its command and variables, so the new process reads the profile
+  from your config files; the empty values undo a `command` or
+  `initial-command` line in any of them. A profile defined only in a file the
+  running noctty was given with `--config-file` is not known to it.
+- A profile that runs `ssh.exe` is restored with the session like any other
+  profile; a detected `ssh:` profile is not.
 - The Settings window does not edit these lines; it leaves them as they are
   when it saves.
 
@@ -883,10 +984,12 @@ become a window.
   `%LOCALAPPDATA%\noctty\jump-list-recents.json`. To clear them, close
   noctty, delete that file, and start noctty once so Windows receives the
   empty list.
-- Profiles: the detected shell profiles. Selecting one launches noctty with
-  that profile's command. [User profiles](#user-profiles) are not listed: a
-  jump-list entry is stored on disk and would have to carry the profile's
-  environment.
+- Profiles: the profiles the picker shows (`profile-hidden` ones are left
+  out). Selecting a detected one launches noctty with that profile's command.
+  A [user profile](#user-profiles)'s entry names the profile instead
+  (`--default-profile=user:<id>`): a jump-list entry is stored on disk and can
+  roam with your Windows profile, so it never holds the profile's environment
+  variables, and the new process reads them from your config.
 
 From 1.3.133 a portable copy builds no jump list and writes no
 `jump-list-recents.json`, so a machine with only a portable copy gets none;
@@ -1307,8 +1410,9 @@ The roadmap originally asked for a per-profile `run elevated` flag. There is no
 such profile property, for the detected shells or for
 [user profiles](#user-profiles); the per-profile equivalent is a
 `new_window_elevated:<profile-key>` binding, for example
-`new_window_elevated:user:vs18-cmd`. An elevated user profile gets its
-arguments and its `profile-env` variables, quoted again in the standard way.
+`new_window_elevated:user:py312`. An elevated user profile from a config file
+is named to the elevated process, which builds it from the same files (see
+[User profiles](#user-profiles), Limits).
 
 An elevated noctty is a separate process and a separate window. Its title is
 prefixed with `Administrator: `. Elevated and non-elevated tabs cannot be
@@ -1344,11 +1448,16 @@ because there is no non-elevated split-token counterpart to protect.
 Configuration and other per-user state still resolve from the same
 `%LOCALAPPDATA%\noctty\` profile as the non-elevated process.
 
-An elevated noctty loads the same `%LOCALAPPDATA%\noctty\config.ghostty` and
-the same explicit `--config-file` overrides as a non-elevated process. Those
-files remain writable by the ordinary user account, so anything that can
-modify the configuration, including `command`, `shell-integration`, and theme
-paths, runs at high integrity the next time an elevated window opens.
+An elevated noctty loads the same config files as the non-elevated process:
+`%LOCALAPPDATA%\noctty\config.ghostty` (unless that process was started with
+`--config-default-files=false`) and the same explicit `--config-file`
+overrides. Those files remain writable by the ordinary user account, so
+anything that can modify the configuration, including `command`,
+`shell-integration`, and theme paths, runs at high integrity the next time an
+elevated window opens. When a standard user enters an administrator's
+credentials instead, the elevated process runs as that administrator and reads
+that account's `%LOCALAPPDATA%` config; a forwarded `--config-file` still names
+the same file.
 
 At process startup, noctty restricts bare-name DLL resolution to the
 application directory, System32, and explicitly added DLL directories. The
@@ -1432,7 +1541,8 @@ ending the process from being moved aside.
 The save at sign-out, shutdown or reboot is the last one: the sign-out also
 ends the shells, and the panes they leave are not saved over it. A launch that forwards
 to a running noctty, a window opened with `--working-directory` (Explorer's
-"Open noctty here" and the jump list's recent folders) or with `-e` or
+"Open noctty here" and the jump list's recent folders), with
+`--default-profile` (the jump list's user profiles) or with `-e` or
 `initial-command`, the startup profile picker, a `--launch-layout` or
 `initial-window = false` run, a default terminal handoff and a second
 instance under `single-instance = false` start without the saved session and
