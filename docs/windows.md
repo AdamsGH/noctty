@@ -422,16 +422,36 @@ does. `wsl.exe` passes a Linux process only the Windows variables that
 flag so that a Windows program started from inside WSL does not get the Linux
 values back. It adds `TERM` too when the distribution has a terminfo entry for
 noctty's `term`, which noctty asks the distribution itself with `infocmp`; the
-answer for an explicitly selected distribution is remembered until noctty
-exits, so install the entry first, then start noctty again. An implicit
-distribution is probed for each launch, so changing WSL's default while
-noctty runs cannot reuse the previous distribution's answer. To give a
-distribution the entry, compile
+answer is remembered until noctty exits, so install the entry first, then
+start noctty again. For an implicit distribution, noctty reads the current
+default's ID from `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`
+(`DefaultDistribution`) and includes it in the cache key. A different default
+ID uses a separate cache entry. The probe reads that registration's
+`DistributionName` and selects it with `--distribution <name>`; a changed name
+also uses a separate entry. If a recheck observes a different default or name,
+that launch keeps the fallback.
+The session itself stays implicit, so a concurrent change after the final
+check can still affect which distribution starts. If the ID or name cannot be
+read or the name is outside WSL's `[A-Za-z0-9._-]` character set (1–256
+characters), the launch uses an unpinned, uncached probe. No registry value is
+changed.
+The long name selector and `--exec` are documented since
+[Windows build 17666](https://learn.microsoft.com/en-us/windows/wsl/release-notes#build-17666),
+before noctty's Windows 10 1809 floor. Noctty does
+not inject `--distribution-id`, which was added in
+[WSL 2.4.4 (pre-release)](https://github.com/microsoft/WSL/releases/tag/2.4.4)
+and first shipped in a stable release with
+[WSL 2.4.10](https://github.com/microsoft/WSL/releases/tag/2.4.10).
+To give a distribution the entry, compile
 `share/terminfo/ghostty.terminfo` from the noctty folder with `tic -x` inside
 it. Without the entry `TERM` stays `xterm-256color`, the value `wsl.exe` sets,
 and the other three are still forwarded. The first WSL tab of a stopped
-distribution waits for it to start, up to 15 seconds, before its shell
-appears; if it has not answered by then, that run keeps `xterm-256color`.
+distribution waits up to 15 seconds for the probe, plus up to 5 seconds for
+termination cleanup, before starting its shell. Tabs already waiting on that
+probe share its outcome; if it times out, they all keep `xterm-256color`
+without starting another probe. A new launch can try again. Timeouts and WSL's
+own failures (exit `-1`, including an invalid command-line argument) are not
+cached as missing terminfo.
 Entries already in `WSLENV`, their flags and their order are kept, and a
 `WSLENV` set with `env` in the configuration is the one extended. A `TERM` set
 with `env` is forwarded as it is. To keep one of these variables out of WSL,
@@ -447,8 +467,8 @@ shell started from inside cmd or PowerShell.
 An existing `/w` entry stays Windows-only; noctty does not override that
 choice. Automatic `TERM` probing uses the launch environment and working
 directory, including `--cd`, and caches answers separately for different
-environments or directories for explicit distribution selections. The
-optional probe resolves only a local `.exe`;
+environments or directories, including for implicit distribution selections.
+The optional probe resolves only a local `.exe`;
 if resolution would need a network/device path, a mapped network drive, or
 reparse traversal (including directory symlinks and junctions),
 it keeps the fallback. For shell-form commands, automatic `TERM` is limited
