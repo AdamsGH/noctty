@@ -137,6 +137,7 @@ if ([string]::IsNullOrWhiteSpace($env:ZIG_LOCAL_CACHE_DIR)) {
 # variables set above, and the three below).
 $bootstrap = @'
 @echo off
+echo Bootstrap: "%~f0"
 call "%NOCTTY_DEV_VSDEVCMD%" -arch=%NOCTTY_DEV_ARCH% || exit /b 1
 set "PATH=%NOCTTY_DEV_PATH%;%PATH%"
 echo == Versions ==
@@ -163,12 +164,28 @@ $env:NOCTTY_DEV_ARCH = $Architecture
 $env:NOCTTY_DEV_PATH = "$gitCmd;$gitUsrBin;$env:ZIG_HOME"
 try {
     [System.IO.File]::WriteAllText($bootstrapPath, $bootstrap.Replace("`r`n", "`n").Replace("`n", "`r`n"), [System.Text.Encoding]::ASCII)
-    # `call`, so that cmd /c never strips the quotes around a path with spaces or parentheses.
-    cmd.exe /d /c call $bootstrapPath
+    # Passing the path itself let PowerShell decide its quoting, and a path without
+    # spaces goes unquoted, so an `&` in it (a profile named A&B) started a new command,
+    # which could even exit 0. The path goes through a variable instead: cmd expands it
+    # once and never expands the result again, so a %NAME% in the path stays literal,
+    # and with /s cmd removes only the outer pair of quotes and reads the path inside
+    # its own, where &, ^ and spaces are literal. The argument has no spaces, and Legacy
+    # passing (what PowerShell 7 already uses for cmd.exe, and the only kind in 5.1)
+    # hands it over as written. No `call`: it expands % a second time. Still a native
+    # call, so the output stays in PowerShell's streams for a caller that captures it.
+    # Continue, as for vswhere above: under Stop, Windows PowerShell 5.1 turns a stderr
+    # line that a caller's 2>&1 redirects (VsDevCmd.bat writes some) into a terminating
+    # error; the exit code below still decides.
+    $env:NOCTTY_DEV_BOOTSTRAP = $bootstrapPath
+    & {
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandArgumentPassing = "Legacy"
+        & (Join-Path $env:SystemRoot "System32\cmd.exe") /d /s /c '""%NOCTTY_DEV_BOOTSTRAP%""'
+    }
     $bootstrapExit = $LASTEXITCODE
 } finally {
     Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction Ignore
-    Remove-Item -LiteralPath Env:NOCTTY_DEV_VSDEVCMD, Env:NOCTTY_DEV_ARCH, Env:NOCTTY_DEV_PATH -ErrorAction Ignore
+    Remove-Item -LiteralPath Env:NOCTTY_DEV_VSDEVCMD, Env:NOCTTY_DEV_ARCH, Env:NOCTTY_DEV_PATH, Env:NOCTTY_DEV_BOOTSTRAP -ErrorAction Ignore
 }
 # A script run with -File exits 0 when it ends normally, whatever its last native command returned.
 if ($bootstrapExit -ne 0) { throw "The Visual Studio developer shell bootstrap failed with exit code $bootstrapExit." }
