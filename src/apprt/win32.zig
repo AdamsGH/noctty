@@ -22001,6 +22001,7 @@ const Host = struct {
         // Same close zone as the pointer path, always at full alpha. An
         // inactive tab's fade never changes its accessibility affordance.
         const width = @min(self.scaled(host_tab_close_zone_width), rect.right - rect.left);
+        rect.top = @min(rect.bottom, rect.top + self.tabContentTopInset());
         return .{
             .left = @floatFromInt(rect.right - width),
             .top = @floatFromInt(rect.top),
@@ -24670,16 +24671,21 @@ const Host = struct {
         const border = colors.border;
         const fg = colors.fg;
 
+        const content_top_inset = if (tab_button) self.tabContentTopInset() else 0;
         // Erase with parent background, then draw rounded button
         const parent_bg = if (overlay) theme.overlay_bg else theme.chrome_bg;
         fillSolidRect(draw.hDC, draw.rcItem, parent_bg);
-        drawRoundedRect(draw.hDC, draw.rcItem, bg, border, self.scaled(4));
+        if (tab_button) {
+            gdi.drawTabButton(draw.hDC, draw.rcItem, bg, border, self.scaled(4), self.tabsFlushWithTop());
+        } else {
+            drawRoundedRect(draw.hDC, draw.rcItem, bg, border, self.scaled(4));
+        }
         if (tab_button and !overlay and !disabled and hovered and !active) {
             fillSolidRect(draw.hDC, .{
                 .left = draw.rcItem.left + self.scaled(5),
-                .top = draw.rcItem.top + self.scaled(3),
+                .top = draw.rcItem.top + content_top_inset + self.scaled(3),
                 .right = draw.rcItem.right - self.scaled(5),
-                .bottom = draw.rcItem.top + self.scaled(5),
+                .bottom = draw.rcItem.top + content_top_inset + self.scaled(5),
             }, border);
         }
         // An overlay button is the default button of a modal prompt: focus
@@ -24706,7 +24712,7 @@ const Host = struct {
             // Rounded focus ring inset inside the button, matching corner radius
             const inset_rect = RECT{
                 .left = draw.rcItem.left + self.scaled(2),
-                .top = draw.rcItem.top + self.scaled(2),
+                .top = draw.rcItem.top + content_top_inset + self.scaled(2),
                 .right = draw.rcItem.right - self.scaled(2),
                 .bottom = draw.rcItem.bottom - self.scaled(2),
             };
@@ -24755,6 +24761,7 @@ const Host = struct {
         _ = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
         _ = sys.SetTextColor(draw.hDC, fg);
         var text_rect = draw.rcItem;
+        text_rect.top += content_top_inset;
         if (!overlay) {
             text_rect.left += self.scaled(6);
             text_rect.right -= self.scaled(6);
@@ -24830,7 +24837,7 @@ const Host = struct {
                 _ = sys.SetTextColor(draw.hDC, blended);
                 var close_rect = RECT{
                     .left = draw.rcItem.right - close_zone_width,
-                    .top = draw.rcItem.top,
+                    .top = text_rect.top,
                     .right = draw.rcItem.right - self.scaled(2),
                     .bottom = draw.rcItem.bottom,
                 };
@@ -25235,6 +25242,20 @@ const Host = struct {
         else
             host_tab_height;
         return self.scaled(base);
+    }
+
+    fn tabsFlushWithTop(self: *const Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        const fullscreen = if (self.activeSurface()) |surface| surface.fullscreen else false;
+        return self.app.os_build >= c.OS_BUILD_WIN11_21H2 and
+            !self.quick_terminal and self.shouldShowTabBar() and
+            (fullscreen or ((self.usingIntegratedTitlebar() or self.clientCaptionHeight() == 0) and
+                sys.IsZoomed(hwnd) != 0));
+    }
+
+    /// Keep tab content and its close affordance below the newly added cap.
+    fn tabContentTopInset(self: *const Host) i32 {
+        return if (self.tabsFlushWithTop()) self.scaled(3) else 0;
     }
 
     fn contentBands(
@@ -26417,11 +26438,9 @@ const Host = struct {
         const caption_buttons_w = self.captionButtonsWidth();
         const tab_strip = self.tabStripGeometry(width);
         const button_width = tab_strip.button_width;
-        const button_y = self.scaled(3);
-        // Scale button height with the actual tab-bar height so
-        // buttons fill the integrated-titlebar row in Win11 (40 px)
-        // without a dead gap above the underline.
-        const button_height = @max(1, self.tabBarHeight() - self.scaled(6));
+        const tab_placement = chrome_layout.tabButtonPlacement(self.tabBarHeight(), self.current_dpi, self.tabsFlushWithTop());
+        const button_y = tab_placement.top;
+        const button_height = tab_placement.height;
         // `window-show-tab-bar = never` gives the strip zero height, but every
         // tab-strip child is a real HWND that keeps whatever visibility it was
         // created with, so laying them out unconditionally collapsed the tab
@@ -26504,6 +26523,7 @@ const Host = struct {
         const titlebar_actions = self.usingIntegratedTitlebar();
         const action_size = self.scaled(host_titlebar_action_button_size);
         const action_y = @max(0, @divTrunc(self.tabBarHeight() - action_size, 2));
+        const compact_action = chrome_layout.tabButtonPlacement(self.tabBarHeight(), self.current_dpi, false);
         var button_x = width - self.scaled(if (titlebar_actions) 4 else 8) - caption_buttons_w;
         // Unlike a tab button, the cluster has no membership test of its own:
         // it belongs to the strip whenever the strip exists. Its rect is kept
@@ -26518,9 +26538,9 @@ const Host = struct {
                 &self.overflow_placement,
                 childRect(
                     button_x,
-                    if (titlebar_actions) action_y else button_y,
+                    if (titlebar_actions) action_y else compact_action.top,
                     overflow_width,
-                    if (titlebar_actions) action_size else button_height,
+                    if (titlebar_actions) action_size else compact_action.height,
                 ),
             ) or changed.*;
             changed.* = applyChildVisibility(
@@ -26538,9 +26558,9 @@ const Host = struct {
                 &self.new_tab_placement,
                 childRect(
                     button_x,
-                    if (titlebar_actions) action_y else button_y,
+                    if (titlebar_actions) action_y else compact_action.top,
                     new_tab_width,
-                    if (titlebar_actions) action_size else button_height,
+                    if (titlebar_actions) action_size else compact_action.height,
                 ),
             ) or changed.*;
             changed.* = applyChildVisibility(
@@ -27264,10 +27284,9 @@ const Host = struct {
             };
             fillSolidRect(hdc, tab_rect, titlebar_theme.chrome_bg);
 
-            // Focused-tab accent underline. Lives in the 2 px gap
-            // between the tab button's bottom edge (button_height = tab_h
-            // - scaled(6), starting at y=scaled(3)) and the tab bar's
-            // 1 px bottom border. Drawn on the parent HWND so the single
+            // Focused-tab accent underline. Tabs keep their legacy bottom
+            // at scaled(3) + tab_h - scaled(6), including any fractional-DPI
+            // remainder before this lane. Drawn on the parent HWND so the single
             // rect can slide across child button boundaries; children
             // paint themselves above this region via WM_DRAWITEM and do
             // not occlude it. Inset 3 px on each horizontal edge to
@@ -27295,16 +27314,19 @@ const Host = struct {
             // DWM's own 1 px accent border and read as a thick blue rim
             // around the window, so there the band starts clean.
             if (!self.usingIntegratedTitlebar()) {
-                fillSolidRect(
-                    hdc,
-                    .{
-                        .left = 0,
-                        .top = 0,
-                        .right = client_rect.right,
-                        .bottom = @max(1, self.scaled(2)),
-                    },
-                    themeSurface(titlebar_theme, .tab_accent),
-                );
+                // A flush undecorated row has no continuous lane above its tabs.
+                if (!self.tabsFlushWithTop()) {
+                    fillSolidRect(
+                        hdc,
+                        .{
+                            .left = 0,
+                            .top = 0,
+                            .right = client_rect.right,
+                            .bottom = @max(1, self.scaled(2)),
+                        },
+                        themeSurface(titlebar_theme, .tab_accent),
+                    );
+                }
                 const cluster_left = @max(self.scaled(8), client_rect.right - self.rightButtonsWidth() - self.scaled(4));
                 const cluster_rect = RECT{
                     .left = cluster_left,
@@ -36521,17 +36543,18 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                     // answer, and the strip is about to relayout under it.
                     v.hideTabTooltip();
                     const down_x = signedLowWord(lParamBits(lParam));
+                    const down_y = signedHighWord(lParamBits(lParam));
                     var btn_rect: RECT = undefined;
                     _ = sys.GetClientRect(hwnd, &btn_rect);
                     const close_left = btn_rect.right - v.scaled(host_tab_close_zone_width);
-                    if (down_x >= close_left and tabCloseAction(v.tabs.items.len) != .none) {
+                    if (tabButtonCloseHit(down_x, down_y, close_left, v.tabContentTopInset()) and tabCloseAction(v.tabs.items.len) != .none) {
                         // Click in close zone — capture for mouseup but don't start drag
                         _ = sys.SetCapture(hwnd);
                     } else {
                         // Start potential drag: record origin
                         v.tab_drag_index = index;
                         v.tab_drag_start_x = down_x;
-                        v.tab_drag_start_y = signedHighWord(lParamBits(lParam));
+                        v.tab_drag_start_y = down_y;
                         v.tab_drag_active = false;
                         _ = sys.SetCapture(hwnd);
                     }
@@ -36563,7 +36586,9 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                         drag_index,
                         was_drag,
                         click_x,
+                        signedHighWord(lParamBits(lParam)),
                         close_left,
+                        v.tabContentTopInset(),
                         v.tabs.items.len,
                     )) {
                         .activate => {
@@ -37812,6 +37837,29 @@ fn desiredTabIndex(total: usize, current: usize, goto: apprt.action.GotoTab) ?us
     };
 }
 
+fn tabButtonCloseHit(x: i32, y: i32, close_left: i32, close_top: i32) bool {
+    return x >= close_left and y >= close_top;
+}
+
+test "TABGAP added top rows exclude the close zone on mouse down and up" {
+    for ([_]u32{ 96, 120, 144, 192 }) |dpi| {
+        const inset = win32_chrome_state.scaled(3, dpi);
+        for ([_]usize{ 1, 2, 20 }) |count| {
+            for (0..@intCast(inset)) |row| {
+                const y: i32 = @intCast(row);
+                try std.testing.expect(!tabButtonCloseHit(110, y, 100, inset));
+                try std.testing.expectEqual(TabButtonMouseUpAction.none, tabButtonMouseUpAction(null, false, 110, y, 100, inset, count));
+                try std.testing.expectEqual(TabButtonMouseUpAction.activate, tabButtonMouseUpAction(0, false, 110, y, 100, inset, count));
+            }
+            try std.testing.expect(tabButtonCloseHit(110, inset, 100, inset));
+            try std.testing.expectEqual(TabButtonMouseUpAction.close, tabButtonMouseUpAction(null, false, 110, inset, 100, inset, count));
+            // Restored tabs keep their old close target at button row zero.
+            try std.testing.expect(tabButtonCloseHit(110, 0, 100, 0));
+            try std.testing.expect(!tabButtonCloseHit(99, inset, 100, inset));
+        }
+    }
+}
+
 const TabButtonMouseUpAction = enum {
     none,
     activate,
@@ -37822,13 +37870,15 @@ fn tabButtonMouseUpAction(
     drag_index: ?usize,
     was_drag: bool,
     click_x: i32,
+    click_y: i32,
     close_left: i32,
+    close_top: i32,
     tab_count: usize,
 ) TabButtonMouseUpAction {
     if (drag_index != null) {
         return if (was_drag) .none else .activate;
     }
-    if (tabCloseAction(tab_count) != .none and click_x >= close_left) return .close;
+    if (tabCloseAction(tab_count) != .none and tabButtonCloseHit(click_x, click_y, close_left, close_top)) return .close;
     return .none;
 }
 
@@ -54161,6 +54211,292 @@ test "win32 new host starts with the client area its first frame change keeps" {
     ));
 }
 
+test "TABGAP integrated host tabs reach the maximized top and restore exactly" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            try testTabGapHost(true);
+        }
+    }.body);
+}
+
+test "TABGAP undecorated framed host tabs reach the maximized top and restore exactly" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            try testTabGapHost(false);
+        }
+    }.body);
+}
+
+fn testTabGapHost(decorated: bool) !void {
+    const previous_dpi = sys.SetThreadDpiAwarenessContext(-4);
+    defer _ = sys.SetThreadDpiAwarenessContext(previous_dpi);
+    var fixture: SafeModeAppFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    app.os_build = c.OS_BUILD_WIN11_21H2;
+    app.use_integrated_titlebar = true;
+    app.config.@"window-decoration" = if (decorated) .auto else .none;
+    const monitor = sys.MonitorFromPoint(.{ .x = 0, .y = 0 }, c.MONITOR_DEFAULTTOPRIMARY) orelse return error.SkipZigTest;
+    var monitor_info: sys.MONITORINFO = .{ .cbSize = @sizeOf(sys.MONITORINFO), .rcMonitor = undefined, .rcWork = undefined, .dwFlags = 0 };
+    try std.testing.expect(sys.GetMonitorInfoW(monitor, &monitor_info) != 0);
+    app.config.@"window-position-x" = @intCast(monitor_info.rcMonitor.left);
+    app.config.@"window-position-y" = @intCast(monitor_info.rcMonitor.top);
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{});
+    const hwnd = host.hwnd.?;
+    try std.testing.expectEqual(decorated, host.usingIntegratedTitlebar());
+    try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
+
+    // A plain BUTTON runs the real tab procedure. The manifest-less test
+    // binary cannot create the production layered Selection container.
+    var surface: Surface = undefined;
+    surface.host = null;
+    surface.decorations_visible = decorated;
+    surface.fullscreen = false;
+    surface.inspector_visible = false;
+    try host.tabs.ensureTotalCapacity(std.testing.allocator, 1);
+    host.tabs.appendAssumeCapacity(try Tab.init(std.testing.allocator, 1, &surface));
+    defer {
+        // No synthetic surface is registered with the app or owns a pane.
+        while (host.tabs.pop()) |value| {
+            var tab = value;
+            tab.deinit();
+        }
+    }
+    host.active_tab = 1;
+    const button = try createTestChromeChild(hwnd, prompt_button_class);
+    host.tabs.items[0].button_hwnd = button;
+    host.subclassButton(button, &tabButtonProc, &host.tabs.items[0].button_prev_proc);
+    defer destroySubclassedWindow(&host.tabs.items[0].button_hwnd, &host.tabs.items[0].button_prev_proc);
+    const container = try createTestChromeChild(hwnd, prompt_label_class);
+    host.tab_container_hwnd = container;
+    defer host.tab_container_hwnd = null;
+    defer _ = sys.DestroyWindow(container);
+    const action = try createTestChromeChild(hwnd, prompt_button_class);
+    host.new_tab_hwnd = action;
+    defer destroySubclassedWindow(&host.new_tab_hwnd, &host.chrome_button_prev_proc);
+    host.subclassButton(action, &hostButtonProc, &host.chrome_button_prev_proc);
+
+    var restored_rect: ?RECT = null;
+    for ([_]bool{ false, true, false }) |maximized| {
+        // Frame changes run full layout synchronously. Keep the stand-in
+        // surface out of that path, which otherwise reaches its absent core.
+        const saved_tabs = host.tabs.items;
+        host.tabs.items = &.{};
+        _ = sys.ShowWindow(hwnd, if (maximized) c.SW_MAXIMIZE else c.SW_RESTORE);
+        host.tabs.items = saved_tabs;
+        try std.testing.expectEqual(maximized, sys.IsZoomed(hwnd) != 0);
+        // Read physical origins afresh after each native state transition.
+        var window_rect: RECT = undefined;
+        var client: RECT = undefined;
+        var origin: POINT = .{ .x = 0, .y = 0 };
+        try std.testing.expect(sys.GetWindowRect(hwnd, &window_rect) != 0);
+        try std.testing.expect(sys.GetClientRect(hwnd, &client) != 0);
+        try std.testing.expect(sys.ClientToScreen(hwnd, &origin) != 0);
+        var changed = false;
+        _ = host.layoutChromeForRect(client, &changed);
+        var tab_rect: RECT = undefined;
+        try std.testing.expect(sys.GetWindowRect(button, &tab_rect) != 0);
+        const top = if (maximized) @as(i32, 0) else host.scaled(3);
+        const bottom = host.scaled(3) + host.tabBarHeight() - host.scaled(6);
+        try std.testing.expectEqual(origin.y + top, tab_rect.top);
+        try std.testing.expectEqual(origin.y + bottom, tab_rect.bottom);
+        const close_bounds = Host.tabCloseUiaBounds(@ptrCast(host), 1) orelse return error.TestUnexpectedResult;
+        const content_top = host.tabContentTopInset();
+        try std.testing.expectEqual(@as(f64, @floatFromInt(tab_rect.top + content_top)), close_bounds.top);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(tab_rect.bottom - tab_rect.top - content_top)), close_bounds.height);
+        if (maximized) {
+            const close_x: u16 = @intCast(tab_rect.right - tab_rect.left - 1);
+            // A sent down at the close column in the added cap starts tab selection,
+            // rather than the close-only capture path. Release is tested below and
+            // in the launched-app harness; this stand-in has no terminal core.
+            _ = sys.SendMessageW(button, c.WM_LBUTTONDOWN, 0, @intCast(close_x));
+            try std.testing.expectEqual(@as(?usize, 0), host.tab_drag_index);
+            _ = sys.ReleaseCapture();
+        }
+
+        try std.testing.expectEqual(top, host.tab_container_placement.rect.top);
+        try std.testing.expectEqual(bottom, host.tab_container_placement.rect.bottom);
+        const expected_action_top = if (decorated)
+            @divTrunc(host.tabBarHeight() - host.scaled(host_titlebar_action_button_size), 2)
+        else
+            host.scaled(3);
+        const expected_action_bottom = if (decorated)
+            expected_action_top + host.scaled(host_titlebar_action_button_size)
+        else
+            bottom;
+        try std.testing.expectEqual(expected_action_top, host.new_tab_placement.rect.top);
+        try std.testing.expectEqual(expected_action_bottom, host.new_tab_placement.rect.bottom);
+        if (!maximized) {
+            const relative = childRect(tab_rect.left - origin.x, tab_rect.top - origin.y, tab_rect.right - tab_rect.left, tab_rect.bottom - tab_rect.top);
+            if (restored_rect) |expected| {
+                try std.testing.expectEqual(expected.top, relative.top);
+                try std.testing.expectEqual(expected.bottom, relative.bottom);
+            } else restored_rect = relative;
+        }
+        const tab_x = @divTrunc(tab_rect.left + tab_rect.right, 2);
+        const empty_x = origin.x + @divTrunc(client.right * 2, 3);
+        const child = sys.ChildWindowFromPointEx(hwnd, .{ .x = tab_x - origin.x, .y = 0 }, c.CWP_SKIPINVISIBLE | c.CWP_SKIPDISABLED | c.CWP_SKIPTRANSPARENT);
+        if (maximized) {
+            try std.testing.expectEqual(@as(?HWND, button), child);
+            try std.testing.expectEqual(@as(LRESULT, c.HTCLIENT), testHitTest(button, tab_x, origin.y));
+            try std.testing.expectEqual(@as(LRESULT, c.HTCAPTION), testHitTest(hwnd, empty_x, origin.y));
+            const action_rect = host.new_tab_placement.rect;
+            const action_x = origin.x + @divTrunc(action_rect.left + action_rect.right, 2);
+            const action_y = origin.y + @divTrunc(action_rect.top + action_rect.bottom, 2);
+            try std.testing.expectEqual(@as(LRESULT, c.HTCLIENT), testHitTest(action, action_x, action_y));
+            try std.testing.expectEqual(@as(LRESULT, c.HTCAPTION), testHitTest(hwnd, action_x, origin.y));
+            app.os_build = 19045;
+            try std.testing.expect(!host.tabsFlushWithTop());
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            host.quick_terminal = true;
+            try std.testing.expect(!host.tabsFlushWithTop());
+            host.quick_terminal = false;
+        } else {
+            try std.testing.expect(child != button);
+            try std.testing.expectEqual(@as(LRESULT, c.HTTOP), testHitTest(hwnd, tab_x, origin.y));
+            if (!decorated) try std.testing.expectEqual(@as(LRESULT, c.HTTRANSPARENT), testHitTest(button, tab_x, origin.y + host.scaled(3)));
+        }
+        // The actual painter is exercised without composition or screen
+        // capture. Its upper stroke must be on row zero only when flush.
+        const canvas = try Host.BannerTestCanvas.init(tab_rect.right - tab_rect.left, bottom - top);
+        defer canvas.deinit();
+        const draw: DRAWITEMSTRUCT = .{
+            .CtlType = c.ODT_BUTTON,
+            .CtlID = 1000,
+            .itemID = 0,
+            .itemAction = 0,
+            .itemState = 0,
+            .hwndItem = button,
+            .hDC = canvas.dc,
+            .rcItem = childRect(0, 0, canvas.width, canvas.height),
+            .itemData = 0,
+        };
+        const theme = clientTitlebarTheme(&app.resolved_theme, &app.config, decorated, isHighContrastActive());
+        for ([_]bool{ false, true }) |active| {
+            host.active_tab = if (active) 0 else 1;
+            host.drawButton(&draw);
+            _ = Host.BannerTestCanvas.raw.GdiFlush();
+            const pixel = canvas.pixel(@divTrunc(canvas.width, 2), 0);
+            if (maximized) {
+                try std.testing.expect(pixel != theme.chrome_bg);
+                if (active and !isHighContrastActive()) try std.testing.expectEqual(tabAccentBorder(tabAccent(&theme), theme.is_dark), pixel);
+            } else try std.testing.expectEqual(theme.chrome_bg, pixel);
+        }
+        host.active_tab = 1;
+    }
+    // Windows 10 and quick-terminal branches retain their restored shape.
+    app.os_build = 19045;
+    try std.testing.expect(!host.tabsFlushWithTop());
+    app.os_build = c.OS_BUILD_WIN11_21H2;
+    host.quick_terminal = true;
+    try std.testing.expect(!host.tabsFlushWithTop());
+    host.quick_terminal = false;
+    host.active_tab = 0;
+    surface.fullscreen = true;
+    try std.testing.expect(host.tabsFlushWithTop());
+    host.quick_terminal = true;
+    try std.testing.expect(!host.tabsFlushWithTop());
+    host.quick_terminal = false;
+    app.os_build = 19045;
+    try std.testing.expect(!host.tabsFlushWithTop());
+    app.os_build = c.OS_BUILD_WIN11_21H2;
+    surface.fullscreen = false;
+    host.active_tab = 1;
+}
+
+test "TABGAP integrated caption has no invisible system menu icon" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            const previous_dpi = sys.SetThreadDpiAwarenessContext(-4);
+            defer _ = sys.SetThreadDpiAwarenessContext(previous_dpi);
+            var fixture: SafeModeAppFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            app.os_build = c.OS_BUILD_WIN11_21H2;
+            app.use_integrated_titlebar = true;
+            app.config.@"window-position-x" = 0;
+            app.config.@"window-position-y" = 0;
+            const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{});
+            const hwnd = host.hwnd.?;
+            const original_style = testWindowStyle(hwnd);
+            for ([_]bool{ false, true }) |maximized| {
+                _ = sys.SetWindowLongPtrW(hwnd, c.GWL_STYLE, @bitCast(@as(usize, original_style | (if (maximized) @as(u32, c.WS_MAXIMIZE) else 0))));
+                try std.testing.expect(sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_FRAMECHANGED) != 0);
+                var window_rect: RECT = undefined;
+                var origin: POINT = .{ .x = 0, .y = 0 };
+                try std.testing.expect(sys.GetWindowRect(hwnd, &window_rect) != 0);
+                try std.testing.expect(sys.ClientToScreen(hwnd, &origin) != 0);
+                for ([_]bool{ false, true }) |quick_terminal| {
+                    host.quick_terminal = quick_terminal;
+                    const x = origin.x + host.scaled(10);
+                    try std.testing.expectEqual(@as(LRESULT, if (maximized) c.HTCAPTION else c.HTTOP), testHitTest(hwnd, x, origin.y));
+                    try std.testing.expectEqual(@as(LRESULT, c.HTCAPTION), testHitTest(hwnd, x, origin.y + host.tabBarHeight() - 1));
+                    if (!maximized) try std.testing.expectEqual(@as(LRESULT, c.HTTOPLEFT), testHitTest(hwnd, window_rect.left + 1, window_rect.top + 1));
+                    // The keyboard window menu still has its native style/menu.
+                    try std.testing.expect(testWindowStyle(hwnd) & c.WS_SYSMENU != 0);
+                    try std.testing.expect(sys.GetSystemMenu(hwnd, 0) != null);
+                }
+                host.quick_terminal = false;
+            }
+        }
+    }.body);
+}
+
+test "TABGAP GDI tab paint reaches row zero with active inactive and HC palettes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const Palette = struct { background: u32, fill: u32, border: u32 };
+    for ([_]Palette{
+        .{ .background = rgb(24, 24, 28), .fill = rgb(42, 42, 50), .border = rgb(90, 160, 230) },
+        .{ .background = rgb(240, 240, 240), .fill = rgb(252, 252, 252), .border = rgb(160, 160, 160) },
+        .{ .background = rgb(10, 40, 70), .fill = rgb(28, 58, 92), .border = rgb(210, 180, 30) },
+        // Inject system-like HC colors; never change the user's HC setting.
+        .{ .background = rgb(0, 0, 0), .fill = rgb(0, 0, 0), .border = rgb(255, 255, 255) },
+    }) |palette| {
+        for ([_]u32{ 96, 144, 192, 288 }) |dpi| {
+            const scale = win32_chrome_state.scaled;
+            const width = scale(120, dpi);
+            const bottom = scale(3, dpi) + scale(40, dpi) - scale(6, dpi);
+            const canvas = try Host.BannerTestCanvas.init(width, scale(40, dpi));
+            defer canvas.deinit();
+            const full = childRect(0, 0, canvas.width, canvas.height);
+            for ([_]bool{ false, true, false }) |flush| {
+                fillSolidRect(canvas.dc, full, palette.background);
+                fillSolidRect(canvas.dc, childRect(@divTrunc(width, 2), scale(8, dpi), 1, 1), rgb(255, 0, 255));
+                gdi.drawTabButton(canvas.dc, childRect(0, 0, width, bottom), palette.fill, palette.border, scale(4, dpi), flush);
+                _ = Host.BannerTestCanvas.raw.GdiFlush();
+                const x = @divTrunc(width, 2);
+                try std.testing.expectEqual(if (flush) palette.border else palette.background, canvas.pixel(x, 0));
+                try std.testing.expectEqual(palette.fill, canvas.pixel(x, scale(8, dpi)));
+                // Parent-owned underline and separator rows remain untouched.
+                try std.testing.expectEqual(palette.background, canvas.pixel(x, scale(40, dpi) - scale(3, dpi)));
+                try std.testing.expectEqual(palette.background, canvas.pixel(x, canvas.height - 1));
+                // Compare the whole lower rounded region with the legacy painter,
+                // and require at least one pixel a square replacement would cover.
+                const reference = try Host.BannerTestCanvas.init(width, canvas.height);
+                defer reference.deinit();
+                fillSolidRect(reference.dc, full, palette.background);
+                gdi.drawRoundedRect(reference.dc, childRect(0, 0, width, bottom), palette.fill, palette.border, scale(4, dpi));
+                _ = Host.BannerTestCanvas.raw.GdiFlush();
+                var rounded_pixels: usize = 0;
+                var y = bottom - scale(4, dpi);
+                while (y < bottom - 1) : (y += 1) {
+                    var corner_x: i32 = 1;
+                    while (corner_x < width - 1) : (corner_x += 1) {
+                        try std.testing.expectEqual(reference.pixel(corner_x, y), canvas.pixel(corner_x, y));
+                        if (palette.fill != palette.background and corner_x < scale(4, dpi) and reference.pixel(corner_x, y) == palette.background) rounded_pixels += 1;
+                    }
+                }
+                if (palette.fill != palette.background) try std.testing.expect(rounded_pixels > 0);
+            }
+        }
+    }
+}
+
 test "win32 createHost frames an undecorated host for its Windows build" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -63755,7 +64091,7 @@ test "win32 tab button mouse-up still activates tab after capture release" {
 
     try std.testing.expectEqual(
         TabButtonMouseUpAction.activate,
-        tabButtonMouseUpAction(1, false, 40, 100, 3),
+        tabButtonMouseUpAction(1, false, 40, 0, 100, 0, 3),
     );
 }
 
@@ -63764,7 +64100,7 @@ test "win32 tab button mouse-up keeps drag releases from reactivating" {
 
     try std.testing.expectEqual(
         TabButtonMouseUpAction.none,
-        tabButtonMouseUpAction(1, true, 40, 100, 3),
+        tabButtonMouseUpAction(1, true, 40, 0, 100, 0, 3),
     );
 }
 
@@ -63773,11 +64109,11 @@ test "win32 tab button mouse-up only closes when released in close zone" {
 
     try std.testing.expectEqual(
         TabButtonMouseUpAction.close,
-        tabButtonMouseUpAction(null, false, 100, 100, 3),
+        tabButtonMouseUpAction(null, false, 100, 0, 100, 0, 3),
     );
     try std.testing.expectEqual(
         TabButtonMouseUpAction.none,
-        tabButtonMouseUpAction(null, false, 40, 100, 3),
+        tabButtonMouseUpAction(null, false, 40, 0, 100, 0, 3),
     );
 }
 
@@ -63791,7 +64127,7 @@ test "TABX a window's only tab closes the window and any other tab closes itself
     // No close zone, no close, with nothing to close.
     try std.testing.expectEqual(
         TabButtonMouseUpAction.none,
-        tabButtonMouseUpAction(null, false, 100, 100, 0),
+        tabButtonMouseUpAction(null, false, 100, 0, 100, 0, 0),
     );
 }
 
@@ -63800,15 +64136,15 @@ test "TABX the close zone of the only tab closes it, and a click elsewhere does 
 
     try std.testing.expectEqual(
         TabButtonMouseUpAction.close,
-        tabButtonMouseUpAction(null, false, 100, 100, 1),
+        tabButtonMouseUpAction(null, false, 100, 0, 100, 0, 1),
     );
     try std.testing.expectEqual(
         TabButtonMouseUpAction.none,
-        tabButtonMouseUpAction(null, false, 40, 100, 1),
+        tabButtonMouseUpAction(null, false, 40, 0, 100, 0, 1),
     );
     try std.testing.expectEqual(
         TabButtonMouseUpAction.activate,
-        tabButtonMouseUpAction(0, false, 40, 100, 1),
+        tabButtonMouseUpAction(0, false, 40, 0, 100, 0, 1),
     );
 }
 
