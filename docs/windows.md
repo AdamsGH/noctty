@@ -1747,7 +1747,10 @@ it for the rest of that run. The startup history (`startup-attempts.json`) is
 read the same way, and `integration.ps1` is not replaced by a build whose copy
 declares an older `noctty-integration-revision`. Builds that predate this
 still parse strictly, so downgrading to one while a saved state contains
-`scrollback` can quarantine that file as `.corrupt`.
+`scrollback` can quarantine that file as `.corrupt`. For a saved fullscreen
+window, v1.3.132 and later restore it as normal at its saved rectangle if they
+do not understand fullscreen; v1.3.131 and older reject the unknown state and
+move the session file aside as `.corrupt`.
 
 A restored window comes back at the rect it was saved with, in screen
 coordinates, and as maximized if it was or was minimized from maximized. If
@@ -1764,11 +1767,19 @@ way: they come back at their saved rect, not minimized.
 `--fullscreen=true` on the command line) apply to restored windows too: each
 is placed at its saved rect first and then maximized or made fullscreen, so
 the saved rect is the one it returns to. Without them a window comes back in
-its saved state. The saved session does not record fullscreen: a window that
-was fullscreen when the session was saved is saved as the window it leaves
-fullscreen to, at the rect it had before fullscreen and maximized if it was
-maximized then, and comes back as that window (fullscreen again with
-`fullscreen = true`).
+its saved state, including fullscreen. A window saved while fullscreen comes
+back fullscreen even with `fullscreen = false`. With `fullscreen = true`, every
+window starts fullscreen and is saved that way unless you leave fullscreen before
+the session saves. This includes windows made fullscreen by that setting.
+After changing it to `fullscreen = false`, restored windows still come back
+fullscreen until you leave fullscreen in each window (F11) and the session saves
+again; this matches Windows Terminal's persisted layouts. Leaving fullscreen returns to
+its saved normal rectangle, or to maximized if it was maximized before entering
+fullscreen; restoring that maximized window then returns to the saved normal
+rectangle. Named layouts continue to save only their tab and pane shape.
+The state file remains schema version 1: older builds that tolerate unknown
+state names restore a saved fullscreen window as normal at its saved rectangle
+and ignore the optional `fullscreen_maximized` field.
 
 A snapshot that merely exceeds the limits above (too many lines, a line over
 16 KiB, or the shared budget) is dropped on load and the window's layout still
