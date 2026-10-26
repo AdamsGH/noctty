@@ -360,14 +360,22 @@ the real profile, and it redirects PSReadLine's history (which ignores
 Scenarios marked `Expect = 'desync'` are known bugs: they pass while they
 still differ and fail once they stop, so the fix removes the mark. `-Scenario`
 runs a subset and `-ListScenarios` lists them. Missing optional programs
-(`pwsh.exe`, Git for Windows' `vim.exe`) skip their scenarios. The headless
-counterpart is `src/terminal/resize_replay.zig`.
+(`pwsh.exe`, Git for Windows' `vim.exe`) skip their scenarios, and so does the
+Clink scenario without `-Clink <extracted portable Clink>\clink_x64.exe`; that
+folder is copied into the sandbox and injected into cmd with a profile of its
+own (an empty `.inputrc`, an empty `--scripts` folder, `clink.autostart = nul`
+so no `clink_start.cmd` runs, and every inherited `CLINK_*` override removed). It is also skipped while script folders are
+registered with `clink installscripts`, which would load into it. Every cmd
+scenario starts `cmd.exe /d` with `CLINK_NOAUTORUN=1`, so a Clink installed for
+AutoRun stays out. The headless counterpart is
+`src/terminal/resize_replay.zig`.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-conpty-sync.ps1 -ResetState
 ```
 
-`.github/workflows/conpty-sync.yml` runs it with `-NoBuild -RequireAll` on a
+`.github/workflows/conpty-sync.yml` runs it with `-NoBuild -RequireAll` and the
+portable Clink 1.9.34 `test.yml` checks (same checksum) on a
 hosted `windows-2025` runner (x64 only) for pushes to `main` and for pull
 requests that touch the build inputs or the harness; it is not a required check.
 It is not part of the interactive composite. The composite is dispatch-only, so
