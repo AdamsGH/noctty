@@ -10206,6 +10206,8 @@ pub const App = struct {
         self.auditShellNativeMapping("tab-reorder");
         const surface = found.host.tabs.items[desired].focusedSurface() orelse return false;
         self.activateSurface(surface);
+        // An already-focused pane can skip host synchronization during activation.
+        runUiActionOrLog("tab reorder layout failed", found.host.layout());
         return true;
     }
 
@@ -39796,6 +39798,58 @@ test "win32 profile tab open inserts after active tab when window-new-tab-positi
     try std.testing.expectEqual(@as(u32, 2), host.tabs.items[2].id);
     try std.testing.expect(host.tabs.items[1].focusedSurface() == &created);
     try std.testing.expectEqualStrings("pwsh", created.launch_profile_key.?);
+}
+
+test "win32 moveTab immediately lays out focused tabs and updates numbered labels and UIA names" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            try app.createWindow(default_title);
+            const first = fixture.newest();
+            const host = first.host.?;
+            const second = try app.createWindowSurface(&app.config, default_title, .{ .host_id = first.host_id });
+            try appendOwnedString(std.testing.allocator, &first.title, "alpha");
+            try appendOwnedString(std.testing.allocator, &second.title, "beta");
+            try std.testing.expect(host.activateTabIndex(1));
+            const first_button = host.tabs.items[0].button_hwnd.?;
+            const second_button = host.tabs.items[1].button_hwnd.?;
+
+            // The activation fast path requires a visible host and focused pane.
+            try std.testing.expect(sys.IsWindowVisible(host.hwnd.?) != 0);
+            try std.testing.expect(second.window_visible and second.window_focused);
+            for ([_]isize{ -1, 1, 1, -1 }) |amount| {
+                try std.testing.expect(try app.moveTab(.{ .surface = &second.core_surface }, .{ .amount = amount }));
+                try std.testing.expect(host.tabs.items[host.active_tab].focusedSurface() == second);
+                try std.testing.expect(second.window_visible and second.window_focused);
+                var left: RECT = undefined;
+                var right: RECT = undefined;
+                try std.testing.expect(sys.GetWindowRect(host.tabs.items[0].button_hwnd.?, &left) != 0);
+                try std.testing.expect(sys.GetWindowRect(host.tabs.items[1].button_hwnd.?, &right) != 0);
+                try std.testing.expect(left.left < right.left);
+                for (host.tabs.items, 0..) |*tab, index| {
+                    try std.testing.expect(tab.button_hwnd == if (tab.focusedSurface() == first) first_button else second_button);
+                    var label: [256]u16 = undefined;
+                    const len = sys.GetWindowTextW(tab.button_hwnd.?, &label, label.len);
+                    try std.testing.expect(len > 0);
+                    const prefix = if (index == host.active_tab) @as(usize, 2) else 0;
+                    try std.testing.expectEqual(@as(u16, @intCast('1' + index)), label[prefix]);
+                    var name: [256]u8 = undefined;
+                    const uia_name = Host.tabItemUiaName(host, tab.id, &name);
+                    try std.testing.expect(std.mem.startsWith(u8, uia_name, if (index == 0) "1: " else "2: "));
+                    try std.testing.expectEqual(index == host.active_tab, Host.tabItemUiaSelected(host, tab.id));
+                    var bounds: win32_uia.UiaRect = undefined;
+                    const provider = tab.uia_provider.?;
+                    try std.testing.expectEqual(@as(i32, 0), provider.fragment.vtbl.get_BoundingRectangle(&provider.fragment, &bounds));
+                    const rect = if (index == 0) left else right;
+                    try std.testing.expectEqual(@as(f64, @floatFromInt(rect.left)), bounds.left);
+                }
+            }
+        }
+    }.body);
 }
 
 test "win32 moveTab invalidates current tab redo and structural history before reordering tabs" {
